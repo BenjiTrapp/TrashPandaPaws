@@ -1,0 +1,94 @@
+{
+  "board": {
+    "3dviewports": [],
+    "design_settings": {
+      "defaults": {
+        "board_outline_line_width": 0.1,
+        "copper_line_width": 0.2,
+        "copper_text_size_h": 1.5,
+        "copper_text_size_v": 1.5,
+        "copper_text_thickness": 0.3,
+        "other_line_width": 0.15,
+        "silk_line_width": 0.15,
+        "silk_text_size_h": 1.0,
+        "silk_text_size_v": 1.0,
+        "silk_text_thickness": 0.15
+      },
+      "diff_pair_dimensions": [],
+      "drc_exclusions": [],
+      "rules": {
+        "min_clearance": 0.15,
+        "min_track_width": 0.15,
+        "min_via_annular_width": 0.15,
+        "min_via_diameter": 0.5
+      },
+      "track_widths": [0.0, 0.2, 0.3, 0.5, 1.0, 1.5],
+      "via_dimensions": [{"diameter": 0.6, "drill": 0.3}]
+    },
+    "layer_presets": [],
+    "layers": {
+      "0": {"color": 0, "name": "F.Cu"},
+      "31": {"color": 0, "name": "B.Cu"},
+      "32": {"color": 0, "name": "B.Adhes"},
+      "33": {"color": 0, "name": "F.Adhes"},
+      "34": {"color": 0, "name": "B.Paste"},
+      "35": {"color": 0, "name": "F.Paste"},
+      "36": {"color": 0, "name": "B.SilkS"},
+      "37": {"color": 0, "name": "F.SilkS"},
+      "38": {"color": 0, "name": "B.Mask"},
+      "39": {"color": 0, "name": "F.Mask"},
+      "44": {"color": 0, "name": "Edge.Cuts"},
+      "45": {"color": 0, "name": "Margin"}
+    }
+  },
+  "meta": {
+    "filename": "raccoon-hat.kicad_pro",
+    "version": 1
+  },
+  "net_settings": {
+    "classes": [
+      {
+        "clearance": 0.2,
+        "name": "Default",
+        "track_width": 0.25,
+        "via_diameter": 0.6,
+        "via_drill": 0.3
+      },
+      {
+        "clearance": 0.3,
+        "name": "Power",
+        "track_width": 1.0,
+        "via_diameter": 0.8,
+        "via_drill": 0.4
+      },
+      {
+        "clearance": 0.15,
+        "name": "Ethernet",
+        "track_width": 0.2,
+        "via_diameter": 0.5,
+        "via_drill": 0.25
+      }
+    ]
+  },
+  "schematic": {
+    "drawing": {
+      "default_line_thickness": 6.0,
+      "default_text_size": 50.0,
+      "label_size_ratio": 0.375,
+      "pin_symbol_size": 25.0
+    },
+    "page_layout_descr_file": ""
+  },
+  "sheets": [
+    ["e63e39d7-6ac0-4ffd-8aa3-1841a4541b55", "Root"],
+    ["b1c2d3e4-f5a6-7b8c-9d0e-1f2a3b4c5d6e", "PoE Power Supply"],
+    ["c2d3e4f5-a6b7-8c9d-0e1f-2a3b4c5d6e7f", "USB Ethernet Controller"],
+    ["d3e4f5a6-b7c8-9d0e-1f2a-3b4c5d6e7f8a", "Connectors"]
+  ],
+  "text_variables": {
+    "TITLE": "Raccoon HAT - PoE Ethernet Tap for Raspberry Pi 4",
+    "REVISION": "1.0",
+    "COMPANY": "Raccoon Red Team Hardware",
+    "DATE": "2026-07-21"
+  }
+}

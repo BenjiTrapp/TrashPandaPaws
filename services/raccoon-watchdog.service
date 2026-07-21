@@ -1,0 +1,21 @@
+[Unit]
+Description=Raccoon Implant — Watchdog (monitors bridge + services)
+After=raccoon-implant.service
+Requires=raccoon-implant.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/raccoon
+ExecStart=/opt/raccoon/venv/bin/python -m software.watchdog
+Restart=always
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=raccoon-watchdog
+
+Environment="PYTHONPATH=/opt/raccoon"
+
+[Install]
+WantedBy=multi-user.target

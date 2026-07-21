@@ -1,0 +1,222 @@
+(kicad_sch
+  (version 20230121)
+  (generator "raccoon-implant")
+  (uuid "e63e39d7-6ac0-4ffd-8aa3-1841a4541b55")
+  (paper "A3")
+  (title_block
+    (title "Raccoon HAT — PoE Ethernet Tap for Raspberry Pi 4")
+    (date "2026-07-21")
+    (rev "1.0")
+    (company "Raccoon Red Team Hardware")
+    (comment 1 "Custom PCB HAT: PoE PD + USB GbE + Bridge Tap")
+    (comment 2 "Raspberry Pi 4 Model B compatible")
+  )
+
+  ; ── GPIO Header J1 (40-pin, connects to Pi 4) ──
+  (symbol
+    (lib_id "Connector_Generic:Conn_02x20_Odd_Even")
+    (at 50 80 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0001-0001-0001-000000000001")
+    (property "Reference" "J1" (at 50 55 0))
+    (property "Value" "Conn_02x20_RPi_GPIO" (at 50 57 0))
+    (property "Footprint" "Connector_PinHeader_2.54mm:PinHeader_2x20_P2.54mm_Vertical" (at 0 0 0))
+    (property "Description" "40-pin GPIO Header — Raspberry Pi HAT interface" (at 0 0 0))
+  )
+
+  ; ── PoE Header J14 (4-pin, from Pi's PoE pins) ──
+  (symbol
+    (lib_id "Connector_Generic:Conn_01x04")
+    (at 20 30 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0002-0002-0002-000000000002")
+    (property "Reference" "J14" (at 20 24 0))
+    (property "Value" "PoE_Header_4pin" (at 20 26 0))
+    (property "Footprint" "Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical" (at 0 0 0))
+    (property "Description" "PoE input from Pi ETH jack — VC1+, VC1-, VC2+, VC2-" (at 0 0 0))
+  )
+
+  ; ── PoE PD Controller U1 (SI3402-B) ──
+  (symbol
+    (lib_id "custom:SI3402-B")
+    (at 55 30 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0003-0003-0003-000000000003")
+    (property "Reference" "U1" (at 55 18 0))
+    (property "Value" "SI3402-B" (at 55 20 0))
+    (property "Footprint" "Package_DFN_QFN:QFN-20-1EP_4x4mm_P0.5mm_EP2.5x2.5mm" (at 0 0 0))
+    (property "Description" "IEEE 802.3af PoE Powered Device Controller" (at 0 0 0))
+    (property "MPN" "SI3402-B-FS" (at 0 0 0))
+  )
+
+  ; ── DC-DC Buck Converter U2 (TPS54302) ──
+  (symbol
+    (lib_id "custom:TPS54302")
+    (at 100 30 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0004-0004-0004-000000000004")
+    (property "Reference" "U2" (at 100 18 0))
+    (property "Value" "TPS54302" (at 100 20 0))
+    (property "Footprint" "Package_TO_SOT_SMD:SOT-23-6" (at 0 0 0))
+    (property "Description" "3A 28V Step-Down DC-DC Converter — 48V PoE to 5V" (at 0 0 0))
+    (property "MPN" "TPS54302DDCR" (at 0 0 0))
+  )
+
+  ; ── 3.3V LDO U4 (AP2112K-3.3) ──
+  (symbol
+    (lib_id "Regulator_Linear:AP2112K-3.3")
+    (at 140 30 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0005-0005-0005-000000000005")
+    (property "Reference" "U4" (at 140 22 0))
+    (property "Value" "AP2112K-3.3" (at 140 24 0))
+    (property "Footprint" "Package_TO_SOT_SMD:SOT-23-5" (at 0 0 0))
+    (property "Description" "3.3V 600mA LDO for RTL8153B + SPI Flash" (at 0 0 0))
+  )
+
+  ; ── USB-to-GbE Controller U3 (RTL8153B) ──
+  (symbol
+    (lib_id "custom:RTL8153B-VB-CG")
+    (at 100 70 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0006-0006-0006-000000000006")
+    (property "Reference" "U3" (at 100 54 0))
+    (property "Value" "RTL8153B-VB-CG" (at 100 56 0))
+    (property "Footprint" "Package_DFN_QFN:QFN-48-1EP_7x7mm_P0.5mm_EP5.45x5.45mm" (at 0 0 0))
+    (property "Description" "USB 3.0 to Gigabit Ethernet Controller" (at 0 0 0))
+    (property "MPN" "RTL8153B-VB-CG" (at 0 0 0))
+  )
+
+  ; ── SPI Flash U5 (W25Q16) ──
+  (symbol
+    (lib_id "Memory_Flash:W25Q16JV")
+    (at 140 70 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0007-0007-0007-000000000007")
+    (property "Reference" "U5" (at 140 62 0))
+    (property "Value" "W25Q16JVSSIQ" (at 140 64 0))
+    (property "Footprint" "Package_SO:SOP-8_3.9x4.9mm_P1.27mm" (at 0 0 0))
+    (property "Description" "16Mbit SPI Flash — RTL8153B firmware storage" (at 0 0 0))
+  )
+
+  ; ── 25MHz Crystal Y1 ──
+  (symbol
+    (lib_id "Device:Crystal")
+    (at 120 80 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0008-0008-0008-000000000008")
+    (property "Reference" "Y1" (at 120 76 0))
+    (property "Value" "25MHz" (at 120 78 0))
+    (property "Footprint" "Crystal:Crystal_SMD_3215-2Pin_3.2x1.5mm" (at 0 0 0))
+    (property "Description" "25MHz Crystal for RTL8153B" (at 0 0 0))
+  )
+
+  ; ── RJ45 with Magnetics J2 (downstream Ethernet) ──
+  (symbol
+    (lib_id "Connector:RJ45_Shielded_MagJack")
+    (at 50 120 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0009-0009-0009-000000000009")
+    (property "Reference" "J2" (at 50 105 0))
+    (property "Value" "HR911105A" (at 50 107 0))
+    (property "Footprint" "Connector_RJ:RJ45_Amphenol_RJHSE5380" (at 0 0 0))
+    (property "Description" "RJ45 w/ Integrated Magnetics — Downstream (to target device)" (at 0 0 0))
+    (property "MPN" "HR911105A" (at 0 0 0))
+  )
+
+  ; ── USB-A Male Connector J3 (to Pi USB 3.0 port) ──
+  (symbol
+    (lib_id "Connector:USB_A")
+    (at 150 120 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0010-0010-0010-000000000010")
+    (property "Reference" "J3" (at 150 112 0))
+    (property "Value" "USB3_A_Male" (at 150 114 0))
+    (property "Footprint" "Connector_USB:USB3_A_Molex_48393" (at 0 0 0))
+    (property "Description" "USB 3.0 Type-A Male — connects to Pi 4 USB3 port" (at 0 0 0))
+  )
+
+  ; ── PoE Flyback Transformer T1 ──
+  (symbol
+    (lib_id "custom:Transformer_Flyback")
+    (at 78 30 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0011-0011-0011-000000000011")
+    (property "Reference" "T1" (at 78 22 0))
+    (property "Value" "750342460" (at 78 24 0))
+    (property "Footprint" "custom:Transformer_Wuerth_750342460" (at 0 0 0))
+    (property "Description" "PoE Flyback Transformer 48V to 5V isolated" (at 0 0 0))
+  )
+
+  ; ── Power Inductor L1 ──
+  (symbol
+    (lib_id "Device:L")
+    (at 115 30 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0012-0012-0012-000000000012")
+    (property "Reference" "L1" (at 115 26 0))
+    (property "Value" "10uH" (at 115 28 0))
+    (property "Footprint" "Inductor_SMD:L_1210_3225Metric" (at 0 0 0))
+    (property "Description" "Power Inductor 10uH 3A — TPS54302 output" (at 0 0 0))
+  )
+
+  ; ── Schottky Diode D1 ──
+  (symbol
+    (lib_id "Device:D_Schottky")
+    (at 112 36 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0013-0013-0013-000000000013")
+    (property "Reference" "D1" (at 112 33 0))
+    (property "Value" "MBRS340" (at 112 39 0))
+    (property "Footprint" "Diode_SMD:D_SMA" (at 0 0 0))
+    (property "Description" "Schottky Diode 40V 3A — TPS54302 freewheeling" (at 0 0 0))
+  )
+
+  ; ── PTC Fuse F1 ──
+  (symbol
+    (lib_id "Device:Polyfuse")
+    (at 35 30 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0014-0014-0014-000000000014")
+    (property "Reference" "F1" (at 35 26 0))
+    (property "Value" "500mA" (at 35 28 0))
+    (property "Footprint" "Fuse:Fuse_1206_3216Metric" (at 0 0 0))
+    (property "Description" "Resettable PTC Fuse — PoE input protection" (at 0 0 0))
+  )
+
+  ; ── LEDs ──
+  (symbol
+    (lib_id "Device:LED")
+    (at 70 90 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0015-0015-0015-000000000015")
+    (property "Reference" "LED1" (at 70 87 0))
+    (property "Value" "Green" (at 70 93 0))
+    (property "Footprint" "LED_SMD:LED_0402_1005Metric" (at 0 0 0))
+    (property "Description" "Link/Activity LED" (at 0 0 0))
+  )
+  (symbol
+    (lib_id "Device:LED")
+    (at 80 90 0)
+    (unit 1)
+    (uuid "a1b2c3d4-0016-0016-0016-000000000016")
+    (property "Reference" "LED2" (at 80 87 0))
+    (property "Value" "Amber" (at 80 93 0))
+    (property "Footprint" "LED_SMD:LED_0402_1005Metric" (at 0 0 0))
+    (property "Description" "Power/Speed LED" (at 0 0 0))
+  )
+
+  ; ── Net labels for key connections ──
+  ; (Full wiring defined in design-guide.md — import this schematic
+  ;  into KiCad 8 and complete wiring in the GUI)
+  ;
+  ; KEY NETS:
+  ;   +48V_POE    — PoE rail from J14 via F1 to U1
+  ;   +5V         — 5V output from U2, feeds Pi via J1 pins 2/4
+  ;   +3V3_LOCAL  — 3.3V from U4, feeds U3/U5
+  ;   USB3_DP/DM  — USB 3.0 data from U3 to J3
+  ;   USB3_SSTX+/- — USB 3.0 SuperSpeed TX
+  ;   USB3_SSRX+/- — USB 3.0 SuperSpeed RX
+  ;   MDI0..3+/-  — Ethernet MDI pairs from U3 to J2
+  ;   GND         — Ground plane
+)
