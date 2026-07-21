@@ -1,6 +1,15 @@
-# TrashPandaPaws 🦝
+<p align="center">
+  <img src="static/trashpanda_logo.png" alt="TrashPandaPaws Logo" width="280">
+</p>
 
-[![GitHub](https://img.shields.io/badge/GitHub-TrashPandaPaws-181717?logo=github)](https://github.com/BenjiTrapp/TrashPandaPaws)
+<h1 align="center">TrashPandaPaws</h1>
+
+<p align="center">
+  <a href="https://github.com/BenjiTrapp/TrashPandaPaws"><img src="https://img.shields.io/badge/GitHub-TrashPandaPaws-181717?logo=github" alt="GitHub"></a>
+  <img src="https://img.shields.io/badge/platform-Raspberry%20Pi%204%20%7C%20CM4-c51a4a?logo=raspberrypi&logoColor=white" alt="Platform">
+  <img src="https://img.shields.io/badge/OS-ParrotOS%20ARM64-00e5ff?logo=linux&logoColor=white" alt="OS">
+  <img src="https://img.shields.io/badge/license-use%20responsibly-red" alt="License">
+</p>
 
 Red Team network hardware implant built on a Raspberry Pi 4 with a custom PCB HAT,
 running **ParrotOS** (ARM64). Designed for authorized penetration testing engagements.
