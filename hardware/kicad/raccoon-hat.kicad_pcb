@@ -1,0 +1,150 @@
+(kicad_pcb
+  (version 20221018)
+  (generator "raccoon-implant")
+  (general
+    (thickness 1.6)
+    (min_track_width 0.15)
+  )
+  (paper "A4")
+  (title_block
+    (title "Raccoon HAT — PoE Ethernet Tap PCB")
+    (date "2026-07-21")
+    (rev "1.0")
+    (company "Raccoon Red Team Hardware")
+  )
+
+  (layers
+    (0 "F.Cu" signal)
+    (31 "B.Cu" signal)
+    (32 "B.Adhes" user "B.Adhesive")
+    (33 "F.Adhes" user "F.Adhesive")
+    (34 "B.Paste" user)
+    (35 "F.Paste" user)
+    (36 "B.SilkS" user "B.Silkscreen")
+    (37 "F.SilkS" user "F.Silkscreen")
+    (38 "B.Mask" user "B.Mask")
+    (39 "F.Mask" user "F.Mask")
+    (44 "Edge.Cuts" user)
+    (45 "Margin" user)
+  )
+
+  (setup
+    (stackup
+      (layer "F.SilkS" (type "Top Silk Screen"))
+      (layer "F.Paste" (type "Top Solder Paste"))
+      (layer "F.Mask" (type "Top Solder Mask") (thickness 0.01))
+      (layer "F.Cu" (type "copper") (thickness 0.035))
+      (layer "dielectric 1" (type "core") (thickness 1.51) (material "FR4") (epsilon_r 4.5))
+      (layer "B.Cu" (type "copper") (thickness 0.035))
+      (layer "B.Mask" (type "Bottom Solder Mask") (thickness 0.01))
+      (layer "B.Paste" (type "Bottom Solder Paste"))
+      (layer "B.SilkS" (type "Bottom Silk Screen"))
+    )
+    (pad_to_mask_clearance 0.05)
+    (aux_axis_origin 0 0)
+    (grid_origin 0 0)
+  )
+
+  (net 0 "")
+  (net 1 "GND")
+  (net 2 "+5V")
+  (net 3 "+48V_POE")
+  (net 4 "+3V3_LOCAL")
+  (net 5 "USB3_DP")
+  (net 6 "USB3_DM")
+  (net 7 "USB3_SSTXP")
+  (net 8 "USB3_SSTXN")
+  (net 9 "USB3_SSRXP")
+  (net 10 "USB3_SSRXN")
+
+  ; ── Board Outline (Raspberry Pi HAT standard: 65mm x 56mm) ──
+  (gr_line (start 0 0) (end 65 0) (layer "Edge.Cuts") (width 0.1))
+  (gr_line (start 65 0) (end 65 56) (layer "Edge.Cuts") (width 0.1))
+  (gr_line (start 65 56) (end 0 56) (layer "Edge.Cuts") (width 0.1))
+  (gr_line (start 0 56) (end 0 0) (layer "Edge.Cuts") (width 0.1))
+
+  ; ── Corner radius cutouts (3mm radius at each corner) ──
+  (gr_arc (start 3 0) (mid 0.88 0.88) (end 0 3) (layer "Edge.Cuts") (width 0.1))
+  (gr_arc (start 65 3) (mid 64.12 0.88) (end 62 0) (layer "Edge.Cuts") (width 0.1))
+  (gr_arc (start 62 56) (mid 64.12 55.12) (end 65 53) (layer "Edge.Cuts") (width 0.1))
+  (gr_arc (start 0 53) (mid 0.88 55.12) (end 3 56) (layer "Edge.Cuts") (width 0.1))
+
+  ; ── Mounting Holes (M2.5, Pi HAT standard positions) ──
+  ; Hole 1: 3.5mm from left, 3.5mm from top
+  (footprint "MountingHole:MountingHole_2.7mm_M2.5_Pad_Via"
+    (at 3.5 3.5)
+    (layer "F.Cu")
+    (uuid "mh-0001")
+    (pad "1" thru_hole circle (at 0 0) (size 5.5 5.5) (drill 2.7) (layers "*.Cu" "*.Mask") (net 1 "GND"))
+  )
+  ; Hole 2: 61.5mm from left, 3.5mm from top
+  (footprint "MountingHole:MountingHole_2.7mm_M2.5_Pad_Via"
+    (at 61.5 3.5)
+    (layer "F.Cu")
+    (uuid "mh-0002")
+    (pad "1" thru_hole circle (at 0 0) (size 5.5 5.5) (drill 2.7) (layers "*.Cu" "*.Mask") (net 1 "GND"))
+  )
+  ; Hole 3: 3.5mm from left, 52.5mm from top
+  (footprint "MountingHole:MountingHole_2.7mm_M2.5_Pad_Via"
+    (at 3.5 52.5)
+    (layer "F.Cu")
+    (uuid "mh-0003")
+    (pad "1" thru_hole circle (at 0 0) (size 5.5 5.5) (drill 2.7) (layers "*.Cu" "*.Mask") (net 1 "GND"))
+  )
+  ; Hole 4: 61.5mm from left, 52.5mm from top
+  (footprint "MountingHole:MountingHole_2.7mm_M2.5_Pad_Via"
+    (at 61.5 52.5)
+    (layer "F.Cu")
+    (uuid "mh-0004")
+    (pad "1" thru_hole circle (at 0 0) (size 5.5 5.5) (drill 2.7) (layers "*.Cu" "*.Mask") (net 1 "GND"))
+  )
+
+  ; ── GPIO Header J1 placement (matches Pi 4 header position) ──
+  ; Pi GPIO header: starts at 7.1mm from left edge, centered vertically
+  (footprint "Connector_PinHeader_2.54mm:PinHeader_2x20_P2.54mm_Vertical"
+    (at 32.5 49.5)
+    (layer "F.Cu")
+    (uuid "j1-gpio")
+    (property "Reference" "J1")
+    (property "Value" "2x20_GPIO")
+  )
+
+  ; ── Component placement zones (silkscreen guides) ──
+  ; Zone: PoE Power Supply (top-left quadrant)
+  (gr_rect (start 1 1) (end 32 25) (layer "F.SilkS") (width 0.15))
+  (gr_text "PoE Power Supply" (at 16 2.5) (layer "F.SilkS")
+    (effects (font (size 1.5 1.5) (thickness 0.15))))
+
+  ; Zone: USB Ethernet (top-right quadrant)
+  (gr_rect (start 33 1) (end 64 25) (layer "F.SilkS") (width 0.15))
+  (gr_text "USB GbE Controller" (at 48 2.5) (layer "F.SilkS")
+    (effects (font (size 1.5 1.5) (thickness 0.15))))
+
+  ; Zone: Connectors (bottom)
+  (gr_rect (start 1 26) (end 64 42) (layer "F.SilkS") (width 0.15))
+  (gr_text "RJ45 / USB / Connectors" (at 32 27.5) (layer "F.SilkS")
+    (effects (font (size 1.5 1.5) (thickness 0.15))))
+
+  ; ── Board title on silkscreen ──
+  (gr_text "RACCOON HAT v1.0" (at 32.5 46) (layer "F.SilkS")
+    (effects (font (size 2 2) (thickness 0.3))))
+  (gr_text "PoE Ethernet Tap — Raspberry Pi 4" (at 32.5 54) (layer "B.SilkS")
+    (effects (font (size 1.2 1.2) (thickness 0.15)) (justify mirror)))
+
+  ; ── Ground pour (B.Cu) ──
+  (zone
+    (net 1)
+    (net_name "GND")
+    (layer "B.Cu")
+    (uuid "gnd-pour-back")
+    (hatch edge 0.5)
+    (connect_pads (clearance 0.3))
+    (min_thickness 0.2)
+    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))
+    (polygon
+      (pts
+        (xy 0.5 0.5) (xy 64.5 0.5) (xy 64.5 55.5) (xy 0.5 55.5)
+      )
+    )
+  )
+)

@@ -1,0 +1,26 @@
+[Unit]
+Description=Raccoon Implant — Network Tap & Cover Identity
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/raccoon
+ExecStart=/opt/raccoon/venv/bin/python -m software.main -c /opt/raccoon/configs/raccoon.yaml
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=raccoon
+
+PrivateTmp=true
+
+Environment="PYTHONPATH=/opt/raccoon"
+Environment="PATH=/opt/raccoon/venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+[Install]
+WantedBy=multi-user.target
