@@ -286,15 +286,33 @@ part pages on Mouser, DigiKey and LCSC — these are stable part-number URLs.
 | Cisco VoIP Phone | `cisco_phone` | HTTP :80, SIP :5060, RTP :10000 | VoIP-heavy environments |
 | HP Network Printer | `hp_printer` | HTTP :80, PJL :9100, LPD :515, IPP :631, SNMP :161, Telnet :23 | Office environments with network printers |
 
-**Cisco IP Phone 7960:**
-
-<p align="center"><img src="static/cover_cisco_phone.png" alt="Cisco Phone Cover" width="600"></p>
-
-**HP Color LaserJet Pro MFP M478:**
-
-<p align="center"><img src="static/cover_hp_printer.png" alt="HP Printer Cover" width="600"></p>
-
 Set `device_mode` at the top of `configs/raccoon.yaml` to switch.
+
+<details>
+<summary><strong>Demo: Cisco IP Phone 7960</strong> — click to expand</summary>
+<br>
+<p align="center">
+  <img src="static/cover_cisco_phone.png" alt="Cisco IP Phone 7960 — Login Page" width="700">
+</p>
+
+Emulates a Cisco Unified Communications login portal. Shows device model,
+firmware version, and MAC address. The warning banner ("Restricted to
+authorized personnel only") adds authenticity. Login attempts are captured
+and forwarded via notifications.
+</details>
+
+<details>
+<summary><strong>Demo: HP Color LaserJet Pro MFP M478</strong> — click to expand</summary>
+<br>
+<p align="center">
+  <img src="static/cover_hp_printer.png" alt="HP LaserJet MFP M478 — EWS Login" width="700">
+</p>
+
+Emulates the HP Embedded Web Server (EWS) with a full navigation bar
+(Home, Scan, Fax, Web Services, Network, Tools, Settings). Every tab
+requires authentication. The login card shows model, firmware, serial
+number, IP, and MAC — all matching the configured device profile.
+</details>
 
 ### Quick Setup
 
