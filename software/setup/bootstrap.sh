@@ -143,15 +143,15 @@ for svc in avahi-daemon cups bluetooth ModemManager; do
     fi
 done
 
-# ── Cover Mode Detection ──
-COVER_MODE=$(grep -oP 'mode:\s*"\K[^"]+' "${INSTALL_DIR}/configs/raccoon.yaml" 2>/dev/null || echo "cisco_phone")
-echo -e "${GREEN}[+] Cover mode: ${COVER_MODE}${NC}"
+# ── Device Mode ──
+COVER_MODE=$(grep -oP 'device_mode:\s*"\K[^"]+' "${INSTALL_DIR}/configs/raccoon.yaml" 2>/dev/null || echo "cisco_phone")
+echo -e "${GREEN}[+] Device mode: ${COVER_MODE}${NC}"
 
 # ── Hostname (derived from active cover config) ──
 echo -e "${GREEN}[+] Configuring hostname${NC}"
 # Read hostname from the active cover section in raccoon.yaml
 DEVICE_HOSTNAME=$(awk -v mode="$COVER_MODE" '
-    $0 ~ "^  "mode":" { in_section=1; next }
+    $0 ~ "^  " mode ":" { in_section=1; next }
     in_section && /^  [a-z]/ && $0 !~ "^    " { in_section=0 }
     in_section && /hostname:/ { gsub(/.*hostname:\s*"?|".*/, ""); print; exit }
 ' "${INSTALL_DIR}/configs/raccoon.yaml" 2>/dev/null)
@@ -181,7 +181,7 @@ RemainAfterExit=yes
 # Adjust MAC prefix per cover mode in raccoon.yaml
 ExecStart=/bin/bash -c '\
   CFG=/opt/raccoon/configs/raccoon.yaml; \
-  COVER=\$(grep -oP "mode:\\s*\\"\\K[^\\"]*" \$CFG 2>/dev/null || echo cisco_phone); \
+  COVER=\$(grep -oP "device_mode:\\s*\\"\\K[^\\"]*" \$CFG 2>/dev/null || echo cisco_phone); \
   PREFIX=\$(awk -v m="\$COVER" "\\$0 ~ \\"^  \\"m\\":\\" {s=1; next} s && /^  [a-z]/ && \\$0 !~ \\"^    \\" {s=0} s && /mac_prefix:/ {gsub(/.*mac_prefix:\\s*\\"?|\\".*/, \\"\\"); print; exit}" \$CFG 2>/dev/null); \
   [ -z "\$PREFIX" ] && PREFIX="00:1b:d5"; \
   UPSTREAM=\$(grep -oP "upstream_iface:\\s*\\"\\K[^\\"]*" \$CFG 2>/dev/null || echo eth0); \
@@ -208,7 +208,7 @@ echo -e "${GREEN}============================================${NC}"
 echo ""
 echo -e "${YELLOW}Next steps:${NC}"
 echo "  1. Edit ${INSTALL_DIR}/configs/raccoon.yaml"
-echo "     - Set cover.mode (cisco_phone / hp_printer)"
+echo "     - Set device_mode (cisco_phone / hp_printer)"
 echo "     - Set C2 callback URL and domain"
 echo "  2. Run: sudo ${PROJECT_DIR}/software/setup/configure_bridge.sh"
 echo "  3. Run: sudo ${PROJECT_DIR}/services/install.sh"

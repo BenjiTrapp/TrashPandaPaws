@@ -286,7 +286,7 @@ part pages on Mouser, DigiKey and LCSC — these are stable part-number URLs.
 | Cisco VoIP Phone | `cisco_phone` | HTTP :80, SIP :5060, RTP :10000 | VoIP-heavy environments |
 | HP Network Printer | `hp_printer` | HTTP :80, PJL :9100, LPD :515, IPP :631, SNMP :161, Telnet :23 | Office environments with network printers |
 
-Set `cover.mode` in `configs/raccoon.yaml` to switch.
+Set `device_mode` at the top of `configs/raccoon.yaml` to switch.
 
 ### Quick Setup
 
@@ -514,12 +514,13 @@ Edit [`configs/raccoon.yaml`](configs/raccoon.yaml) before deployment.
 
 #### Cover Identity
 
-Set `cover.mode` to choose the device the implant impersonates on the network:
+Set `device_mode` at the top of `raccoon.yaml` to choose the device the implant
+impersonates. This single flag controls hostname, MAC prefix, and all protocol
+emulation — the cover sections below provide the detailed device specs.
 
 ```yaml
-cover:
-  enabled: true
-  mode: "cisco_phone"    # or "hp_printer"
+# Top of raccoon.yaml — one switch for the entire setup
+device_mode: "cisco_phone"    # or "hp_printer"
 ```
 
 | Mode | Value | Best for | Emulated Services |

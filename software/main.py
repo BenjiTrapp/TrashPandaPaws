@@ -90,7 +90,7 @@ def main():
         logger.info("NAC bypass enabled — running in background")
 
     if config["cover"]["enabled"]:
-        cover_mode = config["cover"].get("mode", "cisco_phone")
+        cover_mode = config.get("device_mode", "cisco_phone")
         if cover_mode == "hp_printer":
             from software.cover.hp_printer import HPPrinterCover
             cover = HPPrinterCover(config)
