@@ -98,7 +98,11 @@ def main():
             from software.cover.cisco_phone import CiscoCover
             cover = CiscoCover(config)
         cover.start()
-        logger.info("Cover mode: %s", cover_mode)
+        cover_cfg = config["cover"].get(cover_mode, {})
+        logger.info("Cover mode: %s (hostname: %s, model: %s)",
+                     cover_mode,
+                     cover_cfg.get("hostname", "auto"),
+                     cover_cfg.get("model", "default"))
         components.append(("cover", cover))
 
     if config["c2"]["enabled"]:

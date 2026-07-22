@@ -143,13 +143,25 @@ for svc in avahi-daemon cups bluetooth ModemManager; do
     fi
 done
 
-# ── Hostname ──
-echo -e "${GREEN}[+] Configuring hostname${NC}"
+# ── Cover Mode Detection ──
 COVER_MODE=$(grep -oP 'mode:\s*"\K[^"]+' "${INSTALL_DIR}/configs/raccoon.yaml" 2>/dev/null || echo "cisco_phone")
-if [ "$COVER_MODE" = "hp_printer" ]; then
-    DEVICE_HOSTNAME="HP-LaserJet-$(head -c 2 /dev/urandom | xxd -p)"
-else
-    DEVICE_HOSTNAME=$(grep -oP 'hostname:\s*"\K[^"]+' "${INSTALL_DIR}/configs/raccoon.yaml" 2>/dev/null || echo "SEP001BD5A1B2C3")
+echo -e "${GREEN}[+] Cover mode: ${COVER_MODE}${NC}"
+
+# ── Hostname (derived from active cover config) ──
+echo -e "${GREEN}[+] Configuring hostname${NC}"
+# Read hostname from the active cover section in raccoon.yaml
+DEVICE_HOSTNAME=$(awk -v mode="$COVER_MODE" '
+    $0 ~ "^  "mode":" { in_section=1; next }
+    in_section && /^  [a-z]/ && $0 !~ "^    " { in_section=0 }
+    in_section && /hostname:/ { gsub(/.*hostname:\s*"?|".*/, ""); print; exit }
+' "${INSTALL_DIR}/configs/raccoon.yaml" 2>/dev/null)
+
+if [ -z "$DEVICE_HOSTNAME" ]; then
+    if [ "$COVER_MODE" = "hp_printer" ]; then
+        DEVICE_HOSTNAME="HP-LaserJet-$(head -c 2 /dev/urandom | xxd -p)"
+    else
+        DEVICE_HOSTNAME="SEP001BD5A1B2C3"
+    fi
 fi
 hostnamectl set-hostname "${DEVICE_HOSTNAME}" 2>/dev/null || hostname "${DEVICE_HOSTNAME}"
 echo -e "    Hostname: ${DEVICE_HOSTNAME}"
@@ -168,14 +180,12 @@ RemainAfterExit=yes
 # Spoof both interfaces with vendor-appropriate OUIs
 # Adjust MAC prefix per cover mode in raccoon.yaml
 ExecStart=/bin/bash -c '\
-  COVER=\$(grep -oP "mode:\\s*\\"\\K[^\\"]*" /opt/raccoon/configs/raccoon.yaml 2>/dev/null || echo cisco_phone); \
-  if [ "\$COVER" = "hp_printer" ]; then \
-    PREFIX="00:1e:0b"; \
-  else \
-    PREFIX="00:1b:d5"; \
-  fi; \
-  UPSTREAM=\$(grep -oP "upstream_iface:\\s*\\"\\K[^\\"]*" /opt/raccoon/configs/raccoon.yaml 2>/dev/null || echo eth0); \
-  DOWNSTREAM=\$(grep -oP "downstream_iface:\\s*\\"\\K[^\\"]*" /opt/raccoon/configs/raccoon.yaml 2>/dev/null || echo eth1); \
+  CFG=/opt/raccoon/configs/raccoon.yaml; \
+  COVER=\$(grep -oP "mode:\\s*\\"\\K[^\\"]*" \$CFG 2>/dev/null || echo cisco_phone); \
+  PREFIX=\$(awk -v m="\$COVER" "\\$0 ~ \\"^  \\"m\\":\\" {s=1; next} s && /^  [a-z]/ && \\$0 !~ \\"^    \\" {s=0} s && /mac_prefix:/ {gsub(/.*mac_prefix:\\s*\\"?|\\".*/, \\"\\"); print; exit}" \$CFG 2>/dev/null); \
+  [ -z "\$PREFIX" ] && PREFIX="00:1b:d5"; \
+  UPSTREAM=\$(grep -oP "upstream_iface:\\s*\\"\\K[^\\"]*" \$CFG 2>/dev/null || echo eth0); \
+  DOWNSTREAM=\$(grep -oP "downstream_iface:\\s*\\"\\K[^\\"]*" \$CFG 2>/dev/null || echo eth1); \
   ip link set \$UPSTREAM down 2>/dev/null; \
   macchanger -m \${PREFIX}:\$(openssl rand -hex 3 | sed "s/\\(..\\)/\\1:/g;s/:$//") \$UPSTREAM 2>/dev/null; \
   ip link set \$UPSTREAM up 2>/dev/null; \

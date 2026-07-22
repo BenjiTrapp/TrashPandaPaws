@@ -323,11 +323,10 @@ class CiscoCover:
         self.sip_port = cisco_cfg.get("sip_port", 5060)
         self.rtp_port = cisco_cfg.get("rtp_port", 10000)
 
-        dev = config.get("device", {})
-        self.device_model = dev.get("model", "Cisco IP Phone 7960")
-        self.firmware_version = dev.get("firmware", "P0S3-08-12-00")
-        self.mac_address = self._generate_cisco_mac()
-        self.device_name = f"SEP{self.mac_address.replace(':', '')}"
+        self.device_model = cisco_cfg.get("model", "Cisco IP Phone 7960")
+        self.firmware_version = cisco_cfg.get("firmware", "P0S3-08-12-00")
+        self.mac_address = self._generate_cisco_mac(cisco_cfg.get("mac_prefix", "00:1b:d5"))
+        self.device_name = cisco_cfg.get("hostname", f"SEP{self.mac_address.replace(':', '')}")
 
         self._running = False
         self._threads: list[threading.Thread] = []
@@ -342,8 +341,8 @@ class CiscoCover:
         self._last_invite_info: Optional[dict] = None
         self._last_invite_addr: Optional[tuple] = None
 
-    def _generate_cisco_mac(self) -> str:
-        prefix = random.choice(self.CISCO_OUIS)
+    def _generate_cisco_mac(self, mac_prefix: str = None) -> str:
+        prefix = mac_prefix.upper() if mac_prefix else random.choice(self.CISCO_OUIS)
         suffix = ":".join(f"{random.randint(0, 255):02X}" for _ in range(3))
         return f"{prefix}:{suffix}"
 
