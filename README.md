@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="static/trashpanda_logo.png" alt="TrashPandaPaws Logo" width="280">
+  <img src="static/trashpanda_logo.png" alt="TrashPandaPaws Logo">
 </p>
 
 <h1 align="center">TrashPandaPaws</h1>
