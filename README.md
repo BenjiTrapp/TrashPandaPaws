@@ -316,8 +316,39 @@ number, IP, and MAC — all matching the configured device profile.
 
 ### Quick Setup
 
+#### Option A: Image Builder (recommended)
+
+Build a ready-to-boot SD card from your workstation — no manual setup on the Pi needed.
+Runs on Linux, macOS, or WSL2.
+
 ```bash
-# On a fresh ParrotOS ARM64 installation (Raspberry Pi 4)
+# Flash SD card directly (interactive — confirms before writing)
+sudo ./software/setup/build_image.sh /dev/sdX
+
+# With WiFi for headless first boot
+sudo ./software/setup/build_image.sh /dev/sdX --wifi MyNetwork:MyPassword
+
+# With custom config and credentials
+sudo ./software/setup/build_image.sh /dev/sdX \
+  --config /path/to/raccoon.yaml \
+  --user operator:s3cret \
+  --wifi FieldOps:hunter2
+
+# Build image only (don't flash)
+sudo ./software/setup/build_image.sh --no-flash
+# → .build/output/trashpandapaws-6.2.img
+```
+
+The image builder downloads ParrotOS ARM64, injects the Raccoon software and config,
+and creates a first-boot provisioning service that installs all dependencies, configures
+networking, and enables all services automatically. Insert the SD card, power on, wait
+~5 minutes for first boot — done.
+
+#### Option B: Manual setup
+
+On a fresh ParrotOS ARM64 installation (Raspberry Pi 4):
+
+```bash
 sudo ./software/setup/bootstrap.sh       # system deps + ParrotOS hardening
 sudo ./software/setup/configure_bridge.sh # bridge eth0 <-> eth1
 sudo ./services/install.sh               # systemd + beacon persistence
