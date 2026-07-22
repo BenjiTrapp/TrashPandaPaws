@@ -14,8 +14,8 @@ network:
 
 nac_bypass:
   enabled: false
-  # Timeout for passive host discovery (seconds)
   discovery_timeout: 120
+  nat_port_range: "61000-62000"
 
 sniffer:
   enabled: true
@@ -24,6 +24,8 @@ sniffer:
   max_total_size_mb: 500
   rotate_count: 10
   bpf_filter: ""
+  encrypt_captures: false
+  gpg_recipient: ""
   # Interesting traffic filters (applied in addition to bpf_filter)
   capture_profiles:
     - name: "credentials"
@@ -98,6 +100,10 @@ c2:
 
   beacon_interval_seconds: 300
   jitter_percent: 20
+  # Base64-encoded 32-byte AES-GCM key for beacon encryption.
+  # If empty, derived from callback_url + dns_domain (deterministic).
+  # Generate with: python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+  encryption_key: ""
   # Exfiltration method: "dns" or "https"
   exfil_method: "https"
   exfil_chunk_size_bytes: 512

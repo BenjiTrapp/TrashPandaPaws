@@ -140,8 +140,8 @@ done
 
 # ── File rotation ──
 echo "── File Rotation ──"
-max_size=$(grep -oP 'capture_max_size:\s*\K\S+' "$CONFIG" 2>/dev/null || echo "")
-max_files=$(grep -oP 'capture_max_files:\s*\K\d+' "$CONFIG" 2>/dev/null || echo "")
+max_size=$(grep -oP 'max_pcap_size_mb:\s*\K\S+' "$CONFIG" 2>/dev/null || echo "")
+max_files=$(grep -oP 'rotate_count:\s*\K\d+' "$CONFIG" 2>/dev/null || echo "")
 
 if [ -n "$max_size" ]; then
     result "Max capture size configured: $max_size" OK

