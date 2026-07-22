@@ -160,7 +160,22 @@ sudo reboot
 | GPIO Header              | 2x20 pin 2.54mm      | Pi HAT interface              |
 
 Full BOM: [`hardware/bom.csv`](hardware/bom.csv)
-PCB Design: [`hardware/kicad/`](hardware/kicad/)
+PCB Design: [`hardware/kicad/`](hardware/kicad/) (Schematic + PCB, KiCad 10)
+
+<details>
+<summary><strong>PCB Layout</strong> — click to expand</summary>
+<br>
+<p align="center">
+  <img src="static/pcb_boardKiCad.png" alt="Raccoon HAT v1.0 — PCB Layout (KiCad)" width="800">
+</p>
+<p align="center">
+  <img src="static/pcb_board_KiCad.png" alt="Raccoon HAT v1.0 — PCB 3D Render" width="800">
+</p>
+
+65×56mm 2-layer board with SI3402-B PoE PD, TPS54302 DC-DC, RTL8153B USB-GbE,
+AP2112K LDO, W25Q16 SPI Flash, RJ45 downstream jack, USB-A 3.0 to Pi,
+2×20 GPIO header, and all passives (19 caps, 8 resistors). GND pour on back copper.
+</details>
 
 ### v2: Integrated Carrier Board (CM4)
 
