@@ -280,6 +280,8 @@ class HPPrinterCover:
     """Manages the HP Printer cover identity (HTTP + PJL + LPD + IPP + SNMP + Telnet)."""
 
     def __init__(self, config: dict):
+        global PRINTER_MODEL, FIRMWARE_VERSION
+
         self.host = "0.0.0.0"
 
         printer_cfg = config.get("cover", {}).get("hp_printer", {})
@@ -297,7 +299,6 @@ class HPPrinterCover:
         self.device_model = printer_cfg.get("model", PRINTER_MODEL)
         self.firmware_version = printer_cfg.get("firmware", FIRMWARE_VERSION)
 
-        global PRINTER_MODEL, FIRMWARE_VERSION
         PRINTER_MODEL = self.device_model
         FIRMWARE_VERSION = self.firmware_version
 

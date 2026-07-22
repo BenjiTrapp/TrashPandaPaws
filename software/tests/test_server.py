@@ -25,12 +25,12 @@ logging.basicConfig(
 )
 
 CISCO_CONFIG = {
-    "device": {
-        "model": "Cisco IP Phone 7960",
-        "firmware": "P0S3-08-12-00",
-    },
     "cover": {
         "cisco_phone": {
+            "hostname": "SEP001BD5A1B2C3",
+            "model": "Cisco IP Phone 7960",
+            "firmware": "P0S3-08-12-00",
+            "mac_prefix": "00:1b:d5",
             "http_port": 8080,
             "sip_port": 15060,
             "rtp_port": 15000,
@@ -42,6 +42,10 @@ CISCO_CONFIG = {
 PRINTER_CONFIG = {
     "cover": {
         "hp_printer": {
+            "hostname": "HP-LaserJet-M478",
+            "model": "HP Color LaserJet Pro MFP M478fdw",
+            "firmware": "2411C_001.2434A",
+            "mac_prefix": "00:1e:0b",
             "http_port": 8081,
             "pjl_port": 19100,
             "lpd_port": 10515,

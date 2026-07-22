@@ -286,6 +286,14 @@ part pages on Mouser, DigiKey and LCSC — these are stable part-number URLs.
 | Cisco VoIP Phone | `cisco_phone` | HTTP :80, SIP :5060, RTP :10000 | VoIP-heavy environments |
 | HP Network Printer | `hp_printer` | HTTP :80, PJL :9100, LPD :515, IPP :631, SNMP :161, Telnet :23 | Office environments with network printers |
 
+**Cisco IP Phone 7960:**
+
+<p align="center"><img src="static/cover_cisco_phone.png" alt="Cisco Phone Cover" width="600"></p>
+
+**HP Color LaserJet Pro MFP M478:**
+
+<p align="center"><img src="static/cover_hp_printer.png" alt="HP Printer Cover" width="600"></p>
+
 Set `device_mode` at the top of `configs/raccoon.yaml` to switch.
 
 ### Quick Setup
