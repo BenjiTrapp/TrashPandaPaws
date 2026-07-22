@@ -48,6 +48,15 @@ def check_bridge(name: str) -> bool:
         return False
 
 
+_bridge_tap_ref = None
+
+
+def set_bridge_tap(bridge_tap):
+    """Register the BridgeTap instance so the watchdog can restart capture."""
+    global _bridge_tap_ref
+    _bridge_tap_ref = bridge_tap
+
+
 def restart_bridge(upstream: str, downstream: str, bridge: str):
     logger.warning("Restarting bridge %s", bridge)
     cmds = [
@@ -61,6 +70,25 @@ def restart_bridge(upstream: str, downstream: str, bridge: str):
     ]
     for cmd in cmds:
         subprocess.run(cmd.split(), capture_output=True)
+
+    if _bridge_tap_ref is not None:
+        _restart_capture(_bridge_tap_ref)
+
+
+def _restart_capture(bridge_tap):
+    """Restart the sniffer capture thread after bridge recovery."""
+    import threading
+    try:
+        bridge_tap.stop()
+        t = threading.Thread(
+            target=bridge_tap.start_capture,
+            daemon=True,
+            name="sniffer",
+        )
+        t.start()
+        logger.info("Sniffer capture restarted after bridge recovery")
+    except Exception as e:
+        logger.error("Failed to restart capture: %s", e)
 
 
 def check_service(name: str) -> bool:

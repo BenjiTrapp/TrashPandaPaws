@@ -105,8 +105,11 @@ if [ ! -f /etc/modules-load.d/raccoon-bridge.conf ]; then
     echo "br_netfilter" > /etc/modules-load.d/raccoon-bridge.conf
 fi
 
-# ── Network: Disable bridge netfilter (transparent L2 forwarding) ──
-echo -e "${GREEN}[+] Configuring transparent bridging (disable netfilter on bridge)${NC}"
+# ── Network: Bridge netfilter defaults ──
+# Default to 0 for transparent L2 forwarding. NAC bypass Phase 3
+# toggles bridge-nf-call-iptables=1 at runtime so iptables SNAT
+# rules apply to bridged traffic, then restores 0 on teardown.
+echo -e "${GREEN}[+] Configuring transparent bridging (netfilter off by default)${NC}"
 sysctl -w net.bridge.bridge-nf-call-iptables=0 > /dev/null 2>&1 || true
 sysctl -w net.bridge.bridge-nf-call-ip6tables=0 > /dev/null 2>&1 || true
 sysctl -w net.bridge.bridge-nf-call-arptables=0 > /dev/null 2>&1 || true
