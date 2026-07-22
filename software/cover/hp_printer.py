@@ -88,8 +88,8 @@ def _get_local_ip() -> str:
         return "192.168.1.100"
 
 
-def _generate_hp_mac() -> str:
-    prefix = random.choice(HP_OUIS)
+def _generate_hp_mac(mac_prefix: str = None) -> str:
+    prefix = mac_prefix.upper() if mac_prefix else random.choice(HP_OUIS)
     suffix = ":".join(f"{random.randint(0, 255):02X}" for _ in range(3))
     return f"{prefix}:{suffix}"
 
@@ -291,9 +291,15 @@ class HPPrinterCover:
         self.telnet_port = printer_cfg.get("telnet_port", 23)
 
         self.local_ip = _get_local_ip()
-        self.mac_address = _generate_hp_mac()
+        self.mac_address = _generate_hp_mac(printer_cfg.get("mac_prefix"))
         self.mac_raw = self.mac_address.replace(":", "")
-        self.hostname = f"HP-LaserJet-{self.mac_raw[-4:]}"
+        self.hostname = printer_cfg.get("hostname", f"HP-LaserJet-{self.mac_raw[-4:]}")
+        self.device_model = printer_cfg.get("model", PRINTER_MODEL)
+        self.firmware_version = printer_cfg.get("firmware", FIRMWARE_VERSION)
+
+        global PRINTER_MODEL, FIRMWARE_VERSION
+        PRINTER_MODEL = self.device_model
+        FIRMWARE_VERSION = self.firmware_version
 
         self._running = False
         self._threads: list[threading.Thread] = []
