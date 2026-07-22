@@ -70,6 +70,86 @@ graph TB
 
 ## Hardware
 
+Three build variants — pick the one that fits your engagement:
+
+| | Lite (off-the-shelf) | v1 (Pi 4 + HAT) | v2 (CM4 carrier) |
+|---|---|---|---|
+| Custom PCB | None | 1 (2-layer HAT) | 1 (4-layer carrier) |
+| Boards | Pi + switch | 2 (stacked) | 1 |
+| Total size | Pi + switch box | 85×56 + 65×56mm | 85×56mm |
+| Cost | ~€95 | ~$75 + PCB | ~$53 + PCB |
+| PoE | External (UniFi switch) | Custom HAT | On-board |
+| Soldering | None | SMD (HAT) | Fine-pitch (CM4) |
+| Best for | Lab / quick deploy / training | Field deployment | Covert long-term |
+
+### Lite: Raspberry Pi + UniFi PoE Switch
+
+Zero soldering, fully off-the-shelf. A Raspberry Pi 4 with a USB Ethernet
+adapter and an external UniFi PoE switch for power and connectivity.
+Ideal for lab testing, training, and quick field deployments where
+stealth is less critical.
+
+```mermaid
+graph LR
+    UPLINK["Uplink Port<br/>(Target Network)"] -->|"RJ45"| UNIFI["UniFi USW-Flex-Mini<br/>PoE-powered switch"]
+    UNIFI -->|"RJ45 → eth0"| PI["Raspberry Pi 4<br/>ParrotOS ARM64"]
+    UNIFI -->|"PoE passthrough<br/>(or USB-C PSU)"| PI
+    PI -->|"USB 3.0"| USB_ETH["USB GbE Adapter<br/>RTL8153 → eth1"]
+    USB_ETH -->|"RJ45"| TGT["Target Device"]
+
+    style UPLINK fill:#4a9,stroke:#333,color:#fff
+    style TGT fill:#e74,stroke:#333,color:#fff
+    style PI fill:#47a,stroke:#333,color:#fff
+    style UNIFI fill:#888,stroke:#333,color:#fff
+```
+
+**Shopping List:**
+
+| Qty | Item | Search Term | Est. Price |
+|-----|------|-------------|------------|
+| 1 | Raspberry Pi 4 Model B 4GB | `Raspberry Pi 4 Model B 4GB RAM` | ~60 € |
+| 1 | USB 3.0 Gigabit Ethernet Adapter | `USB 3.0 Gigabit Ethernet Adapter RTL8153` | ~12 € |
+| 1 | microSD Card 32GB+ (A2) | `SanDisk Extreme 32GB microSD A2` | ~10 € |
+| 1 | UniFi USW-Flex-Mini | `Ubiquiti USW-Flex-Mini` | ~30 € |
+| 3 | Kurze Ethernet-Kabel (30cm) | `Cat6 Ethernet Kabel 30cm kurz` | ~8 € |
+| 1 | USB-C Netzteil 5V 3A (falls kein PoE) | `Raspberry Pi 4 USB-C Netzteil 5V 3A` | ~10 € |
+
+> **Total: ~€95** (ohne PoE-Injector) — alles bei Amazon/Alternate sofort bestellbar.
+
+**Power Options:**
+
+| Setup | Wie |
+|-------|-----|
+| PoE-powered switch | UniFi USW-Flex-Mini an einem PoE-Switch-Port — versorgt sich selbst |
+| PoE → Pi | USW-Flex-Mini + PoE-Splitter (z.B. `UCTRONICS PoE Splitter USB-C 5V`) → Pi USB-C |
+| Standalone | USB-C Netzteil für Pi + normaler Switch-Uplink |
+
+**Vorteile:**
+- Kein Löten, kein PCB — in 10 Minuten einsatzbereit
+- Leicht austauschbare Komponenten
+- UniFi Switch als "normales Netzwerkgerät" unauffällig
+- Perfekt für Red-Team-Trainings und PoC-Demos
+
+**Nachteile:**
+- Größer als v1/v2 (zwei separate Geräte)
+- Kein integriertes PoE für den Pi (Splitter oder USB-C nötig)
+- Weniger covert als Custom-Board im Telefon-/Drucker-Gehäuse
+
+**Quick Start (Lite):**
+
+```bash
+# 1. ParrotOS auf SD flashen
+# 2. Pi booten, USB-Ethernet anschließen
+sudo ./software/setup/bootstrap.sh
+sudo ./software/setup/configure_bridge.sh
+sudo ./services/install.sh
+
+# 3. UniFi Switch: Uplink an Target-Netzwerk, Pi an Port 2, Target an Port 3
+sudo reboot
+```
+
+### v1: Raspberry Pi 4 + Custom PoE HAT
+
 | Component               | Part                  | Purpose                        |
 |--------------------------|-----------------------|--------------------------------|
 | SBC                      | Raspberry Pi 4B 4GB   | Compute (ParrotOS ARM64)      |
@@ -119,24 +199,19 @@ graph LR
 Design guide: [`hardware/v2-integrated/design-guide.md`](hardware/v2-integrated/design-guide.md)
 BOM: [`hardware/v2-integrated/bom.csv`](hardware/v2-integrated/bom.csv)
 
-### Shopping List (Retail / Amazon)
+### Shopping List — v1 HAT Components (Retail)
 
-Ready-to-buy modules — no SMD soldering needed for these. Search by the exact
-product name on Amazon, AliExpress or your local retailer.
+Additional retail parts needed alongside the v1 HAT PCB:
 
 | Qty | Item | Search Term | Est. Price |
 |-----|------|-------------|------------|
 | 1 | Raspberry Pi 4 Model B 4GB | `Raspberry Pi 4 Model B 4GB RAM` | ~60 € |
-| 1 | USB 3.0 Gigabit Ethernet Adapter (RTL8153) | `USB 3.0 Gigabit Ethernet Adapter RTL8153` | ~12 € |
 | 1 | microSD Card 32GB+ (A2, U3) | `SanDisk Extreme 32GB microSD A2` | ~10 € |
-| 1 | USB-C Netzteil 5V 3A (Dev/Lab only) | `Raspberry Pi 4 USB-C Netzteil 5V 3A` | ~10 € |
 | 2 | Kurze Ethernet-Kabel (30cm, Cat6) | `Cat6 Ethernet Kabel 30cm kurz` | ~5 € |
-| 1 | Raspberry Pi 4 Gehäuse (optional, für Labortests) | `Raspberry Pi 4 Gehäuse` | ~8 € |
 
-> **Note:** In production the custom HAT provides PoE power and the second
-> Ethernet port directly — the USB adapter and USB-C power supply are only
-> needed during development. The cover shell (Cisco phone housing or printer
-> enclosure) replaces the Pi case.
+> **Note:** The v1 HAT provides PoE power and the second Ethernet port
+> on-board — no USB adapter or USB-C PSU needed in production. For lab
+> testing without the HAT, use the **Lite** variant above.
 
 ### Parts Sourcing (Electronic Distributors)
 
