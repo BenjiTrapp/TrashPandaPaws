@@ -1,3 +1,9 @@
+# ── Device Mode ──
+# Single switch that controls cover identity, hostname, MAC prefix,
+# and all protocol emulation. Everything below adapts to this value.
+# Valid: "cisco_phone", "hp_printer"
+device_mode: "cisco_phone"
+
 network:
   upstream_iface: "eth0"
   downstream_iface: "eth1"
@@ -35,10 +41,9 @@ sniffer:
 
 cover:
   enabled: true
-  # Cover identity: "cisco_phone" or "hp_printer"
-  mode: "cisco_phone"
+  # Device profiles — the active one is selected by device_mode (top of file)
 
-  # Cisco IP Phone 7960 settings (mode: cisco_phone)
+  # Cisco IP Phone 7960 profile
   cisco_phone:
     hostname: "SEP001BD5A1B2C3"
     model: "Cisco IP Phone 7960"
@@ -49,7 +54,7 @@ cover:
     sip_port: 5060
     rtp_port: 10000
 
-  # HP Color LaserJet Pro MFP M478 settings (mode: hp_printer)
+  # HP Color LaserJet Pro MFP M478 profile
   hp_printer:
     hostname: "HP-LaserJet-M478"
     model: "HP Color LaserJet Pro MFP M478fdw"
