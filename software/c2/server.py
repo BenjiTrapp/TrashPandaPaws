@@ -1602,6 +1602,7 @@ let pivotPanStart = null;
 let pivotZoom = 1;
 let pivotAnimId = null;
 let pivotTime = 0;
+let pivotDidDrag = false;
 
 if(!CanvasRenderingContext2D.prototype.roundRect){
   CanvasRenderingContext2D.prototype.roundRect = function(x,y,w,h,r){
@@ -1645,8 +1646,10 @@ async function showPivotMap(){
       <span><span class="dot" style="background:#555"></span> Offline</span>
       <span style="margin-left:auto;color:var(--text2);font-size:10px" id="pivot-zoom-label">100%</span>
     </div>
-    <canvas class="pivot-canvas" id="pivot-canvas" width="800" height="500"></canvas>
-    <div id="pivot-tooltip-wrap" style="position:relative"></div>
+    <div style="position:relative;flex:1;min-height:0">
+      <canvas class="pivot-canvas" id="pivot-canvas" width="800" height="500"></canvas>
+      <div id="pivot-tooltip-wrap" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10"></div>
+    </div>
   `);
 
   buildPivotGraph(info, allAgents);
@@ -2015,6 +2018,7 @@ function pivotScreenToWorld(sx, sy){
 }
 
 function pivotMouseDown(e){
+  pivotDidDrag = false;
   const canvas = e.target;
   const rect = canvas.getBoundingClientRect();
   const sx = e.clientX - rect.left;
@@ -2036,6 +2040,7 @@ function pivotMouseDown(e){
 }
 
 function pivotMouseMove(e){
+  pivotDidDrag = true;
   const canvas = e.target;
   const rect = canvas.getBoundingClientRect();
   if(pivotDrag){
@@ -2056,6 +2061,7 @@ function pivotMouseUp(e){
 }
 
 function pivotClick(e){
+  if(pivotDidDrag) return;
   const canvas = e.target;
   const rect = canvas.getBoundingClientRect();
   const sx = e.clientX - rect.left;
@@ -2082,10 +2088,9 @@ function showNodeTooltip(node, mx, my){
   const wrap = document.getElementById("pivot-tooltip-wrap");
   if(!wrap) return;
 
-  const panelBody = document.getElementById("panel-body");
-  const pRect = panelBody ? panelBody.getBoundingClientRect() : {left:0,top:0,width:800,height:600};
-  const tipX = Math.min(mx - pRect.left + 10, pRect.width - 280);
-  const tipY = Math.max(my - pRect.top - 60, 10);
+  const wRect = wrap.getBoundingClientRect();
+  const tipX = Math.max(0, Math.min(mx - wRect.left + 12, wRect.width - 280));
+  const tipY = Math.max(0, Math.min(my - wRect.top - 40, wRect.height - 200));
 
   let html = '<div class="pivot-tooltip" style="left:'+tipX+'px;top:'+tipY+'px;position:absolute">';
 
@@ -2281,7 +2286,15 @@ async function pollArpResult(){
     let parsed;
     try{ parsed = JSON.parse(last.output); }catch(e){ parsed = null; }
     if(parsed && parsed.entries){
-      const hosts = parsed.entries.filter(e => !e.self).map(e => ({
+      const seen = new Set();
+      const hosts = parsed.entries.filter(e => {
+        if(e.self) return false;
+        const o = parseInt(e.ip);
+        if(o >= 224 || o === 127) return false;
+        if(seen.has(e.ip)) return false;
+        seen.add(e.ip);
+        return true;
+      }).map(e => ({
         ip: e.ip, hostname: e.hostname||"", mac: e.mac||"",
         vendor: e.vendor||"", os_guess: e.os_guess||"",
         ports: e.ports||[], port_info: e.port_info||[],
