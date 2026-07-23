@@ -740,41 +740,84 @@ header .info{font-size:11px;color:var(--text2)}
 .toolbar button .ico{font-size:14px}
 
 /* File browser */
-.filebrowser{padding:8px 0}
+.filebrowser{display:flex;gap:0;height:100%;min-height:0}
+.fb-tree{
+  width:180px;min-width:120px;flex-shrink:0;overflow-y:auto;overflow-x:hidden;
+  border-right:1px solid var(--border);padding:6px 0;font-size:12px;
+  font-family:var(--mono);
+}
+.fb-tree::-webkit-scrollbar{width:4px}
+.fb-tree::-webkit-scrollbar-thumb{background:var(--red-dim);border-radius:2px}
+.fb-tree-node{
+  display:flex;align-items:center;gap:4px;padding:3px 8px;cursor:pointer;
+  color:var(--text2);white-space:nowrap;transition:all 0.1s;border-radius:3px;margin:0 4px;
+}
+.fb-tree-node:hover{background:rgba(255,26,26,0.08);color:var(--text)}
+.fb-tree-node.active{background:rgba(255,26,26,0.15);color:var(--red)}
+.fb-tree-node .t-ico{flex-shrink:0;font-size:12px;width:16px;text-align:center}
+.fb-tree-node .t-name{overflow:hidden;text-overflow:ellipsis}
+.fb-tree-children{padding-left:12px}
+.fb-main{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
 .fb-path{
-  display:flex;align-items:center;gap:8px;padding:6px 0;
-  font-family:var(--mono);font-size:13px;color:var(--text2);
+  display:flex;align-items:center;gap:8px;padding:6px 10px;flex-shrink:0;
+  font-family:var(--mono);font-size:12px;color:var(--text2);
+  border-bottom:1px solid rgba(255,255,255,0.03);
 }
 .fb-path button{
   background:var(--surface2);color:var(--text);border:1px solid var(--border);
-  border-radius:4px;padding:3px 10px;font-size:12px;cursor:pointer;font-family:var(--mono);
+  border-radius:4px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:var(--mono);
 }
 .fb-path button:hover{border-color:var(--red-dim);color:var(--red)}
-.fb-list{max-height:400px;overflow-y:auto}
+.fb-list{flex:1;overflow-y:auto;min-height:0;padding:0 2px}
 .fb-entry{
-  display:flex;align-items:center;gap:10px;padding:5px 10px;
-  border-radius:4px;cursor:pointer;font-family:var(--mono);font-size:13px;
+  display:flex;align-items:center;gap:8px;padding:4px 8px;
+  border-radius:4px;cursor:pointer;font-family:var(--mono);font-size:12px;
   transition:background 0.1s;
 }
 .fb-entry:hover{background:rgba(255,26,26,0.06)}
-.fb-entry .ico{width:20px;text-align:center;font-size:15px;flex-shrink:0}
+.fb-entry.selected{background:rgba(255,26,26,0.12)}
+.fb-entry .ico{width:18px;text-align:center;font-size:14px;flex-shrink:0}
 .fb-entry.dir .name{color:var(--red)}
 .fb-entry.file .name{color:var(--text)}
 .fb-entry .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.fb-entry .size{color:var(--text2);font-size:11px;flex-shrink:0}
-.fb-entry .perm{color:var(--text2);font-size:11px;width:80px;flex-shrink:0}
+.fb-entry .size{color:var(--text2);font-size:11px;flex-shrink:0;min-width:60px;text-align:right}
+.fb-entry .mtime{color:var(--text2);font-size:10px;flex-shrink:0;min-width:100px}
+.fb-entry .ftype{
+  font-size:9px;padding:1px 5px;border-radius:3px;flex-shrink:0;
+  background:rgba(255,255,255,0.04);color:var(--text2);text-transform:uppercase;min-width:40px;text-align:center;
+}
+.fb-entry .ftype.code{background:rgba(51,255,51,0.08);color:#55cc55}
+.fb-entry .ftype.cert{background:rgba(255,100,100,0.1);color:#ff8888}
+.fb-entry .ftype.binary{background:rgba(255,165,0,0.1);color:#ffaa55}
+.fb-entry .ftype.archive{background:rgba(187,102,204,0.1);color:#bb88dd}
+.fb-entry .ftype.database{background:rgba(85,136,204,0.1);color:#5588cc}
+.fb-entry .ftype.image{background:rgba(0,200,200,0.1);color:#44cccc}
+.fb-entry .perm{color:var(--text2);font-size:10px;flex-shrink:0;min-width:80px;font-family:var(--mono)}
 .fb-entry .actions{display:none;gap:4px;flex-shrink:0}
 .fb-entry:hover .actions{display:flex}
 .fb-entry .actions button{
   background:var(--surface2);color:var(--text2);border:1px solid var(--border);
-  border-radius:3px;padding:2px 7px;font-size:11px;cursor:pointer;
+  border-radius:3px;padding:2px 7px;font-size:10px;cursor:pointer;
   font-family:var(--mono);transition:all 0.1s;white-space:nowrap;
 }
 .fb-entry .actions button:hover{border-color:var(--red-dim);color:var(--red);background:rgba(255,26,26,0.1)}
+.fb-detail{
+  flex-shrink:0;border-top:1px solid var(--border);padding:10px 12px;
+  font-family:var(--mono);font-size:11px;max-height:180px;overflow-y:auto;
+  background:rgba(0,0,0,0.3);
+}
+.fb-detail .fd-header{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.fb-detail .fd-header .fd-ico{font-size:20px}
+.fb-detail .fd-header .fd-name{font-weight:700;font-size:13px;color:#fff;flex:1;word-break:break-all}
+.fb-detail .fd-grid{display:grid;grid-template-columns:80px 1fr;gap:2px 10px}
+.fb-detail .fd-lbl{color:var(--text2);text-align:right}
+.fb-detail .fd-val{color:var(--text);word-break:break-all}
+.fb-detail .fd-val.highlight{color:var(--green)}
+.fb-detail .fd-val.warn{color:var(--orange)}
 .fb-upload-zone{
-  border:2px dashed var(--border);border-radius:6px;padding:16px;margin:8px 0;
-  text-align:center;color:var(--text2);font-size:12px;cursor:pointer;
-  transition:all 0.15s;
+  border:2px dashed var(--border);border-radius:6px;padding:12px;margin:6px 8px;
+  text-align:center;color:var(--text2);font-size:11px;cursor:pointer;
+  transition:all 0.15s;flex-shrink:0;
 }
 .fb-upload-zone:hover,.fb-upload-zone.drag-over{
   border-color:var(--red-dim);color:var(--red);background:rgba(255,26,26,0.05);
@@ -1495,29 +1538,185 @@ async function pollProcsResult(procsCmd){
 // ── File browser ──
 let fbPath = "/";
 let fbVisible = false;
+let fbData = [];
+let fbTreeDirs = {};
+let fbSelected = null;
+
+const FB_ICONS = {
+  directory:"📁", code:"📝", text:"📄", image:"🖼️", archive:"📦",
+  binary:"⚙️", cert:"🔐", database:"🗄️", file:"📄"
+};
+
+function fbFormatSize(bytes){
+  if(bytes < 1024) return bytes + " B";
+  if(bytes < 1048576) return (bytes/1024).toFixed(1) + " KB";
+  if(bytes < 1073741824) return (bytes/1048576).toFixed(1) + " MB";
+  return (bytes/1073741824).toFixed(2) + " GB";
+}
 
 function openFileBrowser(path){
   if(!selectedAgent) return;
   if(!path && fbVisible){ closePanel(); return; }
   fbPath = path || "/";
   fbVisible = true;
-  quickCmd("ls", fbPath);
-  openPanel("Files: "+fbPath, `
+  fbSelected = null;
+
+  openPanel("File Browser", `
     <div class="filebrowser">
-      <div class="fb-path">
-        <button onclick="openFileBrowser(parentDir(fbPath))">&#11014; Up</button>
-        <span>&#128194; ${esc(fbPath)}</span>
-        <button onclick="openFileBrowser(fbPath)" style="margin-left:auto">&#8635;</button>
+      <div class="fb-tree" id="fb-tree"></div>
+      <div class="fb-main">
+        <div class="fb-path">
+          <button onclick="openFileBrowser(parentDir(fbPath))">&#11014;</button>
+          <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">` + esc(fbPath) + `</span>
+          <button onclick="openFileBrowser(fbPath)">&#8635;</button>
+        </div>
+        <div class="fb-upload-zone" id="fb-drop" onclick="fbUploadClick()"
+             ondragover="event.preventDefault();this.classList.add('drag-over')"
+             ondragleave="this.classList.remove('drag-over')"
+             ondrop="event.preventDefault();this.classList.remove('drag-over');fbDropUpload(event.dataTransfer.files)">
+          &#11014; Drop files or click to upload
+        </div>
+        <div class="fb-list" id="fb-list"><div class="t-pending">Loading...</div></div>
+        <div class="fb-detail" id="fb-detail" style="display:none"></div>
       </div>
-      <div class="fb-upload-zone" id="fb-drop" onclick="fbUploadClick()"
-           ondragover="event.preventDefault();this.classList.add('drag-over')"
-           ondragleave="this.classList.remove('drag-over')"
-           ondrop="event.preventDefault();this.classList.remove('drag-over');fbDropUpload(event.dataTransfer.files)">
-        &#11014; Drop files here or click to upload to <b>${esc(fbPath)}</b>
-      </div>
-      <div class="fb-list" id="fb-list"><div class="t-pending">Loading...</div></div>
     </div>`);
-  setTimeout(() => renderFBFromHistory(), 3000);
+
+  fbLoadDir(fbPath);
+}
+
+async function fbLoadDir(path){
+  fbPath = path;
+  fbSelected = null;
+  const detail = document.getElementById("fb-detail");
+  if(detail) detail.style.display = "none";
+  const pathEl = document.querySelector(".fb-path span");
+  if(pathEl) pathEl.textContent = fbPath;
+  const list = document.getElementById("fb-list");
+  if(list) list.innerHTML = '<div class="t-pending">Loading...</div>';
+
+  await api("/api/agents/"+selectedAgent+"/task",{
+    method:"POST", body:JSON.stringify({cmd:"lsjson", args:path, data:""})
+  });
+  pollHistory(selectedAgent);
+  setTimeout(fbPollResult, 1500);
+}
+
+async function fbPollResult(){
+  if(!fbVisible || !selectedAgent) return;
+  const hist = await api("/api/agents/"+selectedAgent+"/history");
+  const matches = hist.filter(h => h.cmd==="lsjson" && h.args===fbPath);
+  const last = matches[matches.length-1];
+  if(!last || last.status==="pending" || last.status===null){
+    setTimeout(fbPollResult, 1000);
+    return;
+  }
+  if(last.status==="ok" && last.output){
+    let parsed;
+    try{ parsed = JSON.parse(last.output); }catch(e){ parsed = null; }
+    if(parsed && parsed.entries){
+      fbData = parsed.entries;
+      fbRenderList();
+      fbUpdateTree();
+      return;
+    }
+  }
+  const list = document.getElementById("fb-list");
+  if(list) list.innerHTML = '<div class="t-system">Could not read directory</div>';
+}
+
+function fbRenderList(){
+  const list = document.getElementById("fb-list");
+  if(!list) return;
+  list.innerHTML = "";
+  const dirs = fbData.filter(e => e.is_dir).sort((a,b) => a.name.localeCompare(b.name));
+  const files = fbData.filter(e => !e.is_dir).sort((a,b) => a.name.localeCompare(b.name));
+  [...dirs, ...files].forEach(f => {
+    const entry = document.createElement("div");
+    const isDir = f.is_dir;
+    entry.className = "fb-entry " + (isDir ? "dir" : "file");
+    if(fbSelected && fbSelected.name === f.name) entry.classList.add("selected");
+    const fullPath = fbPath.endsWith("/") ? fbPath+f.name : fbPath+"/"+f.name;
+    const ico = FB_ICONS[f.type] || FB_ICONS.file;
+    const sizeStr = isDir ? "" : fbFormatSize(f.size||0);
+    const mtime = (f.mtime||"").substring(0,16);
+    const ftype = f.type || "";
+
+    let html = '<span class="ico">'+ico+'</span>'
+      +'<span class="name">'+esc(f.name)+(f.is_link?" → "+esc(f.link_target||""):"")+'</span>';
+    if(ftype && !isDir) html += '<span class="ftype '+esc(ftype)+'">'+esc(ftype)+'</span>';
+    html += '<span class="size">'+esc(sizeStr)+'</span>'
+      +'<span class="mtime">'+esc(mtime)+'</span>';
+    if(!isDir){
+      html += '<span class="actions">'
+        +'<button onclick="event.stopPropagation();fbDownloadFile(\''+esc(fullPath.replace(/'/g,"\\'"))+'\')">&#11015;</button>'
+        +'<button onclick="event.stopPropagation();document.getElementById(\'cmd-input\').value=\'cat '+esc(fullPath)+'\';document.getElementById(\'cmd-input\').focus()">&#128065;</button>'
+        +'</span>';
+    }
+    html += '<span class="perm">'+esc(f.mode||"")+'</span>';
+    entry.innerHTML = html;
+
+    entry.onclick = e => {
+      if(e.target.closest(".actions")) return;
+      if(isDir){ fbLoadDir(fullPath); return; }
+      fbSelected = f;
+      fbShowDetail(f, fullPath);
+      list.querySelectorAll(".fb-entry").forEach(el => el.classList.remove("selected"));
+      entry.classList.add("selected");
+    };
+    list.appendChild(entry);
+  });
+  if(!fbData.length) list.innerHTML = '<div class="t-system">Empty directory</div>';
+}
+
+function fbShowDetail(f, fullPath){
+  const detail = document.getElementById("fb-detail");
+  if(!detail) return;
+  detail.style.display = "block";
+  const ico = FB_ICONS[f.type] || FB_ICONS.file;
+  let html = '<div class="fd-header"><span class="fd-ico">'+ico+'</span>'
+    +'<span class="fd-name">'+esc(f.name)+'</span></div>'
+    +'<div class="fd-grid">';
+  html += '<span class="fd-lbl">Path</span><span class="fd-val">'+esc(fullPath)+'</span>';
+  html += '<span class="fd-lbl">Type</span><span class="fd-val highlight">'+esc(f.type||"file")+'</span>';
+  html += '<span class="fd-lbl">Size</span><span class="fd-val">'+esc(fbFormatSize(f.size||0))+' ('+esc(String(f.size||0))+' bytes)</span>';
+  html += '<span class="fd-lbl">Mode</span><span class="fd-val" style="font-family:var(--mono)">'+esc(f.mode||"?")+'</span>';
+  if(f.owner) html += '<span class="fd-lbl">Owner</span><span class="fd-val">'+esc(f.owner)+(f.group?":"+esc(f.group):"")+'</span>';
+  html += '<span class="fd-lbl">Modified</span><span class="fd-val">'+esc(f.mtime||"?")+'</span>';
+  html += '<span class="fd-lbl">Accessed</span><span class="fd-val">'+esc(f.atime||"?")+'</span>';
+  html += '<span class="fd-lbl">Created</span><span class="fd-val">'+esc(f.ctime||"?")+'</span>';
+  if(f.is_link) html += '<span class="fd-lbl">Link</span><span class="fd-val warn">→ '+esc(f.link_target||"?")+'</span>';
+  if(f.type==="cert") html += '<span class="fd-lbl">⚠</span><span class="fd-val warn">Certificate / Key file</span>';
+  html += '</div>';
+  detail.innerHTML = html;
+}
+
+function fbUpdateTree(){
+  const tree = document.getElementById("fb-tree");
+  if(!tree) return;
+  const dirs = fbData.filter(e => e.is_dir).sort((a,b) => a.name.localeCompare(b.name));
+  fbTreeDirs[fbPath] = dirs.map(d => d.name);
+  let html = '<div class="fb-tree-node'+(fbPath==="/"?" active":"")+'" onclick="fbLoadDir(\'/\')">'
+    +'<span class="t-ico">💻</span><span class="t-name">/</span></div>';
+  html += fbBuildTreeHTML("/", 0);
+  tree.innerHTML = html;
+}
+
+function fbBuildTreeHTML(path, depth){
+  if(depth > 6) return "";
+  const children = fbTreeDirs[path];
+  if(!children) return "";
+  let html = '<div class="fb-tree-children">';
+  children.forEach(name => {
+    const full = path.endsWith("/") ? path+name : path+"/"+name;
+    const isActive = fbPath === full;
+    const hasChildren = fbTreeDirs[full];
+    html += '<div class="fb-tree-node'+(isActive?" active":"")+'" onclick="fbLoadDir(\''+esc(full.replace(/'/g,"\\'"))+'\')">'
+      +'<span class="t-ico">'+(hasChildren?"📂":"📁")+'</span>'
+      +'<span class="t-name">'+esc(name)+'</span></div>';
+    if(hasChildren) html += fbBuildTreeHTML(full, depth+1);
+  });
+  html += '</div>';
+  return html;
 }
 
 function parentDir(p){
@@ -1553,51 +1752,12 @@ async function fbDropUpload(files){
   const zone = document.getElementById("fb-drop");
   if(zone) zone.innerHTML = "&#10003; "+files.length+" file"+(files.length>1?"s":"")+" queued for upload";
   pollHistory(selectedAgent);
-  setTimeout(() => openFileBrowser(fbPath), 4000);
+  setTimeout(() => fbLoadDir(fbPath), 4000);
 }
 
 function fbDownloadFile(path){
   if(!selectedAgent) return;
   quickCmd("download", path, "Download: "+path.split("/").pop());
-}
-
-async function renderFBFromHistory(){
-  if(!fbVisible || !selectedAgent) return;
-  const hist = await api("/api/agents/"+selectedAgent+"/history");
-  const lsEntries = hist.filter(h => h.cmd==="ls" && h.args===fbPath && h.status==="ok");
-  if(!lsEntries.length){
-    setTimeout(renderFBFromHistory, 1000);
-    return;
-  }
-  const output = lsEntries[lsEntries.length-1].output || "";
-  const list = document.getElementById("fb-list");
-  if(!list) return;
-  list.innerHTML = "";
-  const lines = output.split("\n").filter(l => l.trim());
-  lines.forEach(line => {
-    const entry = document.createElement("div");
-    const parts = line.trim().split(/\s+/);
-    const perm = parts[0] || "";
-    const size = parts.length > 1 ? parts[parts.length-2] : "";
-    const name = parts.length > 1 ? parts[parts.length-1] : line.trim();
-    const isDir = perm.startsWith("d") || name.endsWith("/");
-    entry.className = "fb-entry " + (isDir ? "dir" : "file");
-    const fullPath = fbPath.endsWith("/") ? fbPath+name : fbPath+"/"+name;
-    if(isDir){
-      entry.onclick = e => { if(!e.target.closest(".actions")) openFileBrowser(fullPath); };
-      entry.innerHTML = '<span class="ico">&#128193;</span><span class="name">'+esc(name)+'</span><span class="size">'+esc(size)+'</span><span class="perm">'+esc(perm)+'</span>';
-    } else {
-      entry.onclick = e => { if(!e.target.closest(".actions")){ document.getElementById("cmd-input").value = "cat "+fullPath; document.getElementById("cmd-input").focus(); }};
-      entry.innerHTML = '<span class="ico">&#128196;</span><span class="name">'+esc(name)+'</span><span class="size">'+esc(size)+'</span>'
-        +'<span class="actions">'
-        +'<button onclick="fbDownloadFile(\''+esc(fullPath.replace(/'/g,"\\'"))+'\')">&#11015; DL</button>'
-        +'<button onclick="event.stopPropagation();document.getElementById(\'cmd-input\').value=\'cat '+esc(fullPath)+'\';document.getElementById(\'cmd-input\').focus()">&#128065; View</button>'
-        +'</span>'
-        +'<span class="perm">'+esc(perm)+'</span>';
-    }
-    list.appendChild(entry);
-  });
-  if(!lines.length) list.innerHTML = '<div class="t-system">Empty directory</div>';
 }
 
 // ── Upload ──
@@ -2599,6 +2759,7 @@ async function refreshPivotMap(){
 const AC_COMMANDS = [
   {cmd:"shell", hint:"Execute shell command", args:true},
   {cmd:"ls", hint:"List directory", args:true},
+  {cmd:"lsjson", hint:"List directory (JSON with metadata)", args:true},
   {cmd:"cat", hint:"Read file", args:true},
   {cmd:"pwd", hint:"Print working directory", args:false},
   {cmd:"cd", hint:"Change directory", args:true},
