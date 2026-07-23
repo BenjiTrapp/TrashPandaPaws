@@ -25,6 +25,7 @@ TOKEN=""
 SSL=""
 CERT=""
 CERTKEY=""
+INTERACTIVE=""
 
 # ── Parse args ──
 while [[ $# -gt 0 ]]; do
@@ -37,17 +38,13 @@ while [[ $# -gt 0 ]]; do
         --ssl)        SSL="--ssl"; shift;;
         --cert)       CERT="$2"; shift 2;;
         --certkey)    CERTKEY="$2"; shift 2;;
+        --interactive|-i) INTERACTIVE="1"; shift;;
         -h|--help)
-            echo "Usage: $0 [--port 8443] [--host 0.0.0.0] [--key <b64>] [--derive-key <str>] [--token <str>] [--ssl] [--cert <file>] [--certkey <file>]"
+            echo "Usage: $0 [--port 8443] [--host 0.0.0.0] [--key <b64>] [--derive-key <str>] [--token <str>] [--ssl] [--cert <file>] [--certkey <file>] [-i|--interactive]"
             exit 0;;
         *) echo "Unknown option: $1"; exit 1;;
     esac
 done
-
-# ── Generate token if not set ──
-if [[ -z "$TOKEN" ]]; then
-    TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(24))" 2>/dev/null || openssl rand -base64 24 | tr -d '=/+' | head -c 32)
-fi
 
 # ── Banner ──
 clear 2>/dev/null || true
@@ -104,39 +101,118 @@ fi
 echo -e "${G}  [✓]${N} ${W}Flask${N}         ${D}$($PYTHON -c "import importlib.metadata; print(importlib.metadata.version('flask'))")${N}"
 echo -e "${G}  [✓]${N} ${W}Cryptography${N}  ${D}$($PYTHON -c "import importlib.metadata; print(importlib.metadata.version('cryptography'))")${N}"
 
-# ── Key info ──
-KEY_TYPE="DEFAULT (insecure!)"
-[[ -n "$KEY" ]] && KEY_TYPE="explicit (AES-256-GCM)"
-[[ -n "$DERIVE_KEY" ]] && KEY_TYPE="derived from callback:domain"
+# ── Interactive configuration ──
+if [[ -n "$INTERACTIVE" ]] || { [[ -z "$KEY" ]] && [[ -z "$DERIVE_KEY" ]] && [[ -t 0 ]]; }; then
+    echo ""
+    echo -e "${D}  ─────────────────────────────────────────────${N}"
+    echo -e "${Y}  Server Configuration${N}"
+    echo -e "${D}  ─────────────────────────────────────────────${N}"
+    echo ""
 
+    echo -ne "  ${C}Listen host${N} ${D}[${HOST}]${N}: "
+    read -r INPUT
+    [[ -n "$INPUT" ]] && HOST="$INPUT"
+
+    echo -ne "  ${C}Listen port${N} ${D}[${PORT}]${N}: "
+    read -r INPUT
+    [[ -n "$INPUT" ]] && PORT="$INPUT"
+
+    PROTO="http"
+    [[ -n "$SSL" ]] && PROTO="https"
+
+    echo ""
+    echo -e "${D}  ─────────────────────────────────────────────${N}"
+    echo -e "${Y}  Encryption Key${N}"
+    echo -e "${D}  ─────────────────────────────────────────────${N}"
+    echo ""
+    echo -e "  ${W}Enter a base64 AES-256-GCM key.${N}"
+    echo -e "  ${D}Agents must use the same key to communicate.${N}"
+    echo ""
+    echo -e "  ${D}Leave blank to auto-derive from:${N}"
+    echo -e "  ${C}SHA256(\"${PROTO}://${HOST}:${PORT}/api/v1/beacon:\")${N}"
+    echo ""
+    echo -ne "  ${Y}Key${N} ${D}(base64 or Enter to derive)${N}${W}: ${N}"
+    read -r INPUT
+
+    if [[ -n "$INPUT" ]]; then
+        KEY="$INPUT"
+    fi
+
+    echo ""
+    echo -ne "  ${C}Operator token${N} ${D}[random]${N}: "
+    read -r INPUT
+    [[ -n "$INPUT" ]] && TOKEN="$INPUT"
+
+    echo ""
+fi
+
+# ── Generate token if not set ──
+if [[ -z "$TOKEN" ]]; then
+    TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(24))" 2>/dev/null || openssl rand -base64 24 | tr -d '=/+' | head -c 32)
+fi
+
+# ── Compute the actual encryption key for display ──
 PROTO="http"
 [[ -n "$SSL" ]] && PROTO="https"
+
+if [[ -n "$KEY" ]]; then
+    ENC_KEY_B64="$KEY"
+    KEY_TYPE="explicit (AES-256-GCM)"
+elif [[ -n "$DERIVE_KEY" ]]; then
+    ENC_KEY_B64=$($PYTHON -c "
+import hashlib, base64
+k = hashlib.sha256('${DERIVE_KEY}'.encode()).digest()
+print(base64.b64encode(k).decode())
+")
+    KEY_TYPE="derived from --derive-key"
+else
+    CALLBACK="${PROTO}://${HOST}:${PORT}/api/v1/beacon"
+    ENC_KEY_B64=$($PYTHON -c "
+import hashlib, base64
+k = hashlib.sha256(':'.encode()).digest()
+print(base64.b64encode(k).decode())
+")
+    KEY_TYPE="DEFAULT — SHA256(\":\")"
+fi
+
+ENC_KEY_PREVIEW="${ENC_KEY_B64:0:32}..."
 
 echo ""
 echo -e "${D}  ┌──────────────────────────────────────────────────────┐${N}"
 echo -e "${D}  │${N}  ${W}Server Configuration${N}                                 ${D}│${N}"
 echo -e "${D}  ├──────────────────────────────────────────────────────┤${N}"
 echo -e "${D}  │${N}                                                      ${D}│${N}"
-echo -e "${D}  │${N}  ${C}Listen${N}       ${W}${PROTO}://${HOST}:${PORT}${N}$(printf '%*s' $((26 - ${#PROTO} - ${#HOST} - ${#PORT})) '')${D}│${N}"
-echo -e "${D}  │${N}  ${C}GUI${N}          ${W}${PROTO}://localhost:${PORT}${N}$(printf '%*s' $((28 - ${#PROTO} - ${#PORT})) '')${D}│${N}"
-echo -e "${D}  │${N}  ${C}Encryption${N}   ${W}${KEY_TYPE}${N}$(printf '%*s' $((32 - ${#KEY_TYPE})) '')${D}│${N}"
+
+LISTEN_STR="${PROTO}://${HOST}:${PORT}"
+GUI_STR="${PROTO}://localhost:${PORT}"
+PAD_L=$((38 - ${#LISTEN_STR}))
+PAD_G=$((38 - ${#GUI_STR}))
+[[ $PAD_L -lt 0 ]] && PAD_L=0
+[[ $PAD_G -lt 0 ]] && PAD_G=0
+
+echo -e "${D}  │${N}  ${C}Listen${N}       ${W}${LISTEN_STR}${N}$(printf '%*s' $PAD_L '')${D}│${N}"
+echo -e "${D}  │${N}  ${C}GUI${N}          ${W}${GUI_STR}${N}$(printf '%*s' $PAD_G '')${D}│${N}"
+
+PAD_K=$((38 - ${#KEY_TYPE}))
+[[ $PAD_K -lt 0 ]] && PAD_K=0
+KEY_COLOR="$R"
+[[ -n "$KEY" || -n "$DERIVE_KEY" ]] && KEY_COLOR="$G"
+echo -e "${D}  │${N}  ${C}Encryption${N}   ${KEY_COLOR}${KEY_TYPE}${N}$(printf '%*s' $PAD_K '')${D}│${N}"
+
 echo -e "${D}  │${N}                                                      ${D}│${N}"
 echo -e "${D}  ├──────────────────────────────────────────────────────┤${N}"
-echo -e "${D}  │${N}  ${Y}Operator Token (for GUI access):${N}                     ${D}│${N}"
+echo -e "${D}  │${N}  ${Y}Operator Token (for GUI login):${N}                      ${D}│${N}"
 echo -e "${D}  │${N}                                                      ${D}│${N}"
-echo -e "${D}  │${N}  ${G}${TOKEN}${N}$(printf '%*s' $((40 - ${#TOKEN})) '')${D}│${N}"
+PAD_T=$((52 - ${#TOKEN}))
+[[ $PAD_T -lt 0 ]] && PAD_T=0
+echo -e "${D}  │${N}  ${G}${TOKEN}${N}$(printf '%*s' $PAD_T '')${D}│${N}"
 echo -e "${D}  │${N}                                                      ${D}│${N}"
 echo -e "${D}  ├──────────────────────────────────────────────────────┤${N}"
-echo -e "${D}  │${N}  ${Y}Beacon registration key derivation:${N}                  ${D}│${N}"
+echo -e "${D}  │${N}  ${Y}Encryption Key (for agent registration):${N}             ${D}│${N}"
 echo -e "${D}  │${N}                                                      ${D}│${N}"
-if [[ -n "$KEY" ]]; then
-echo -e "${D}  │${N}  ${W}--key ${KEY:0:20}...${N}$(printf '%*s' $((27 - 20)) '')${D}│${N}"
-elif [[ -n "$DERIVE_KEY" ]]; then
-echo -e "${D}  │${N}  ${W}--derive-key ${DERIVE_KEY:0:24}...${N}$(printf '%*s' $((18 - 24)) '')${D}│${N}"
-else
-echo -e "${D}  │${N}  ${R}⚠  No key set — using SHA256(\":\")${N}                  ${D}│${N}"
-echo -e "${D}  │${N}  ${D}  Use --key <b64> or --derive-key <str>${N}             ${D}│${N}"
-fi
+PAD_E=$((52 - ${#ENC_KEY_B64}))
+[[ $PAD_E -lt 0 ]] && PAD_E=0
+echo -e "${D}  │${N}  ${C}${ENC_KEY_B64}${N}$(printf '%*s' $PAD_E '')${D}│${N}"
 echo -e "${D}  │${N}                                                      ${D}│${N}"
 echo -e "${D}  └──────────────────────────────────────────────────────┘${N}"
 echo ""
