@@ -122,21 +122,49 @@ if [[ -n "$INTERACTIVE" ]] || { [[ -z "$KEY" ]] && [[ -z "$DERIVE_KEY" ]] && [[ 
 
     echo ""
     echo -e "${D}  ─────────────────────────────────────────────${N}"
-    echo -e "${Y}  Encryption Key${N}"
+    echo -e "${Y}  Encryption${N}"
     echo -e "${D}  ─────────────────────────────────────────────${N}"
     echo ""
-    echo -e "  ${W}Enter a base64 AES-256-GCM key.${N}"
+    echo -e "  ${W}Use AES-256-GCM encryption for beacon comms?${N}"
     echo -e "  ${D}Agents must use the same key to communicate.${N}"
     echo ""
-    echo -e "  ${D}Leave blank to auto-derive from:${N}"
-    echo -e "  ${C}SHA256(\"${PROTO}://${HOST}:${PORT}/api/v1/beacon:\")${N}"
+    echo -e "  ${C}[1]${N} ${W}Auto-generate a random key${N}"
+    echo -e "  ${C}[2]${N} ${W}Enter a key manually (base64)${N}"
+    echo -e "  ${C}[3]${N} ${W}Derive from callback URL (default)${N}"
     echo ""
-    echo -ne "  ${Y}Key${N} ${D}(base64 or Enter to derive)${N}${W}: ${N}"
+    echo -ne "  ${Y}Choice${N} ${D}[3]${N}${W}: ${N}"
     read -r INPUT
 
-    if [[ -n "$INPUT" ]]; then
-        KEY="$INPUT"
-    fi
+    case "${INPUT:-3}" in
+        1)
+            KEY=$($PYTHON -c "
+import base64, os
+k = os.urandom(32)
+print(base64.b64encode(k).decode())
+")
+            echo ""
+            echo -e "  ${G}[✓]${N} ${W}Generated random AES-256-GCM key${N}"
+            echo -e "  ${C}${KEY}${N}"
+            echo -e "  ${R}  ⚠  Save this key — agents need it to connect!${N}"
+            ;;
+        2)
+            echo ""
+            echo -ne "  ${Y}Key${N} ${D}(base64 AES-256-GCM, 32 bytes)${N}${W}: ${N}"
+            read -r INPUT
+            if [[ -n "$INPUT" ]]; then
+                KEY="$INPUT"
+                echo -e "  ${G}[✓]${N} ${W}Using provided key${N}"
+            else
+                echo -e "  ${Y}[!]${N} ${W}No key entered — falling back to default derivation${N}"
+            fi
+            ;;
+        3|"")
+            echo -e "  ${D}[i]${N} ${W}Using default key: SHA256(\":\")${N}"
+            ;;
+        *)
+            echo -e "  ${D}[i]${N} ${W}Using default key: SHA256(\":\")${N}"
+            ;;
+    esac
 
     echo ""
     echo -ne "  ${C}Operator token${N} ${D}[random]${N}: "

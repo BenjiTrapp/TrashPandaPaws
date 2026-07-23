@@ -117,22 +117,55 @@ if (-not $NoPrompt -and -not $Key -and -not $DeriveKey) {
 
     Write-Host ""
     Write-Host "  ─────────────────────────────────────────────" -ForegroundColor DarkGray
-    Write-Host "  Encryption Key" -ForegroundColor Yellow
+    Write-Host "  Encryption" -ForegroundColor Yellow
     Write-Host "  ─────────────────────────────────────────────" -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  Enter a base64 AES-256-GCM key." -ForegroundColor White
+    Write-Host "  Use AES-256-GCM encryption for beacon comms?" -ForegroundColor White
     Write-Host "  Agents must use the same key to communicate." -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  Leave blank to auto-derive from:" -ForegroundColor DarkGray
-
-    $Callback = "${Proto}://${Host_}:${Port}/api/v1/beacon"
-    Write-Host "  SHA256(${Callback}:)" -ForegroundColor Cyan
+    Write-Host "  [1] " -ForegroundColor Cyan -NoNewline
+    Write-Host "Auto-generate a random key" -ForegroundColor White
+    Write-Host "  [2] " -ForegroundColor Cyan -NoNewline
+    Write-Host "Enter a key manually (base64)" -ForegroundColor White
+    Write-Host "  [3] " -ForegroundColor Cyan -NoNewline
+    Write-Host "Derive from callback URL (default)" -ForegroundColor White
     Write-Host ""
-    Write-Host "  Key " -ForegroundColor Yellow -NoNewline
-    Write-Host "(base64 or Enter to derive)" -ForegroundColor DarkGray -NoNewline
+    Write-Host "  Choice " -ForegroundColor Yellow -NoNewline
+    Write-Host "[3]" -ForegroundColor DarkGray -NoNewline
     Write-Host ": " -ForegroundColor White -NoNewline
     $Input_ = Read-Host
-    if ($Input_) { $Key = $Input_ }
+    if (-not $Input_) { $Input_ = "3" }
+
+    switch ($Input_) {
+        "1" {
+            $Key = & $Python -c "import base64, os; print(base64.b64encode(os.urandom(32)).decode())"
+            $Key = $Key.Trim()
+            Write-Host ""
+            Write-Host "  [+] " -ForegroundColor Green -NoNewline
+            Write-Host "Generated random AES-256-GCM key" -ForegroundColor White
+            Write-Host "  $Key" -ForegroundColor Cyan
+            Write-Host "  ! Save this key -- agents need it to connect!" -ForegroundColor Red
+        }
+        "2" {
+            Write-Host ""
+            Write-Host "  Key " -ForegroundColor Yellow -NoNewline
+            Write-Host "(base64 AES-256-GCM, 32 bytes)" -ForegroundColor DarkGray -NoNewline
+            Write-Host ": " -ForegroundColor White -NoNewline
+            $Input_ = Read-Host
+            if ($Input_) {
+                $Key = $Input_
+                Write-Host "  [+] " -ForegroundColor Green -NoNewline
+                Write-Host "Using provided key" -ForegroundColor White
+            } else {
+                Write-Host "  [!] " -ForegroundColor Yellow -NoNewline
+                Write-Host "No key entered -- falling back to default derivation" -ForegroundColor White
+            }
+        }
+        default {
+            Write-Host "  [i] " -ForegroundColor DarkGray -NoNewline
+            Write-Host 'Using default key: SHA256(":")' -ForegroundColor White
+        }
+    }
 
     Write-Host ""
     Write-Host "  Operator token " -ForegroundColor Cyan -NoNewline

