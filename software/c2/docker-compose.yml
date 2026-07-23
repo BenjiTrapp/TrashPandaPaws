@@ -1,0 +1,23 @@
+services:
+  raccoon-c2:
+    build: .
+    container_name: raccoon-c2
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - raccoon-data:/data/raccoon-c2
+    environment:
+      - RACCOON_PORT=8443
+      - RACCOON_HOST=0.0.0.0
+      # - RACCOON_KEY=<base64-aes-256-key>
+      # - RACCOON_DERIVE_KEY=https://c2.example.com/api/v1/beacon:c2.example.com
+      # - RACCOON_TOKEN=<fixed-operator-token>
+      # - RACCOON_SSL=1
+      # - RACCOON_CERT=/data/raccoon-c2/cert.pem
+      # - RACCOON_CERTKEY=/data/raccoon-c2/key.pem
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+
+volumes:
+  raccoon-data:

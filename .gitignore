@@ -11,6 +11,7 @@ captures/
 logs/
 *.pcap
 
+.history/
 hardware/gerber/*.gbr
 hardware/gerber/*.drl
 

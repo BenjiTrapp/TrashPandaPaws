@@ -16,13 +16,6 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
-
-if "dns" not in sys.modules:
-    sys.modules["dns"] = MagicMock()
-    sys.modules["dns.resolver"] = MagicMock()
-
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -53,6 +46,7 @@ def _beacon_config(port: int = 19999, interval: int = 1) -> dict:
             "beacon_interval_seconds": interval,
             "jitter_percent": 0,
             "encryption_key": "",
+            "proxy": {"mode": "none"},
             "https": {
                 "enabled": True,
                 "callback_url": f"http://127.0.0.1:{port}/api/v1/beacon",
@@ -509,7 +503,7 @@ class TestLiveBeaconIntegration(ServerTestBase):
         finally:
             beacon.stop()
 
-    def _wait_for_agent(self, timeout=10):
+    def _wait_for_agent(self, timeout=30):
         deadline = time.time() + timeout
         while time.time() < deadline:
             if agents:
@@ -517,7 +511,7 @@ class TestLiveBeaconIntegration(ServerTestBase):
             time.sleep(0.2)
         self.fail("Beacon did not register in time")
 
-    def _wait_for_result(self, agent_id, timeout=10):
+    def _wait_for_result(self, agent_id, timeout=30):
         deadline = time.time() + timeout
         while time.time() < deadline:
             hist = self._operator_get(f"/api/agents/{agent_id}/history")

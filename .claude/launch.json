@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "raccoon-c2",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["software/c2/server.py", "--port", "8443"],
+      "port": 8443
+    }
+  ]
+}

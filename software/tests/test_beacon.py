@@ -15,14 +15,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-# Mock dns.resolver before importing beacon (not installed on Windows dev)
-if "dns" not in sys.modules:
-    _dns_mock = MagicMock()
-    sys.modules["dns"] = _dns_mock
-    sys.modules["dns.resolver"] = _dns_mock
-
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
 
 def _make_config(**overrides):
     cfg = {
@@ -30,6 +22,7 @@ def _make_config(**overrides):
             "beacon_interval_seconds": 10,
             "jitter_percent": 20,
             "encryption_key": "",
+            "proxy": {"mode": "none"},
             "https": {
                 "enabled": True,
                 "callback_url": "https://c2.test/api/v1/beacon",
