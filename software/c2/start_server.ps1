@@ -71,7 +71,7 @@ Write-Host "$PyVer" -ForegroundColor DarkGray
 
 # Check dependencies
 $Missing = @()
-foreach ($pkg in @("flask", "cryptography")) {
+foreach ($pkg in @("flask", "cryptography", "impacket", "ldap3", "netexec", "lsassy")) {
     $check = & $Python -c "import $pkg" 2>&1
     if ($LASTEXITCODE -ne 0) { $Missing += $pkg }
 }
@@ -85,12 +85,24 @@ if ($Missing.Count -gt 0) {
 
 $FlaskVer = & $Python -c "import importlib.metadata; print(importlib.metadata.version('flask'))" 2>$null
 $CryptoVer = & $Python -c "import importlib.metadata; print(importlib.metadata.version('cryptography'))" 2>$null
+$ImpacketVer = & $Python -c "import importlib.metadata; print(importlib.metadata.version('impacket'))" 2>$null
+$NxcVer = & $Python -c "import importlib.metadata; print(importlib.metadata.version('netexec'))" 2>$null
+$LsassyVer = & $Python -c "import importlib.metadata; print(importlib.metadata.version('lsassy'))" 2>$null
 Write-Host "  [+] " -ForegroundColor Green -NoNewline
 Write-Host "Flask         " -ForegroundColor White -NoNewline
 Write-Host "$FlaskVer" -ForegroundColor DarkGray
 Write-Host "  [+] " -ForegroundColor Green -NoNewline
 Write-Host "Cryptography  " -ForegroundColor White -NoNewline
 Write-Host "$CryptoVer" -ForegroundColor DarkGray
+Write-Host "  [+] " -ForegroundColor Green -NoNewline
+Write-Host "Impacket      " -ForegroundColor White -NoNewline
+Write-Host "$ImpacketVer" -ForegroundColor DarkGray
+Write-Host "  [+] " -ForegroundColor Green -NoNewline
+Write-Host "NetExec       " -ForegroundColor White -NoNewline
+Write-Host "$NxcVer" -ForegroundColor DarkGray
+Write-Host "  [+] " -ForegroundColor Green -NoNewline
+Write-Host "Lsassy        " -ForegroundColor White -NoNewline
+Write-Host "$LsassyVer" -ForegroundColor DarkGray
 
 # -- Interactive configuration --
 $Proto = "http"

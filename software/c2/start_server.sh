@@ -87,7 +87,7 @@ echo -e "${G}  [✓]${N} ${W}Python${N}        ${D}$PYVER${N}"
 
 # Check dependencies
 MISSING=""
-for pkg in flask cryptography; do
+for pkg in flask cryptography impacket ldap3 netexec lsassy; do
     if ! $PYTHON -c "import $pkg" 2>/dev/null; then
         MISSING="$MISSING $pkg"
     fi
@@ -100,6 +100,9 @@ fi
 
 echo -e "${G}  [✓]${N} ${W}Flask${N}         ${D}$($PYTHON -c "import importlib.metadata; print(importlib.metadata.version('flask'))")${N}"
 echo -e "${G}  [✓]${N} ${W}Cryptography${N}  ${D}$($PYTHON -c "import importlib.metadata; print(importlib.metadata.version('cryptography'))")${N}"
+echo -e "${G}  [✓]${N} ${W}Impacket${N}      ${D}$($PYTHON -c "import importlib.metadata; print(importlib.metadata.version('impacket'))" 2>/dev/null || echo "not installed")${N}"
+echo -e "${G}  [✓]${N} ${W}NetExec${N}       ${D}$(nxc --version 2>/dev/null || echo "not installed")${N}"
+echo -e "${G}  [✓]${N} ${W}Lsassy${N}        ${D}$($PYTHON -c "import importlib.metadata; print(importlib.metadata.version('lsassy'))" 2>/dev/null || echo "not installed")${N}"
 
 # ── Interactive configuration ──
 if [[ -n "$INTERACTIVE" ]] || { [[ -z "$KEY" ]] && [[ -z "$DERIVE_KEY" ]] && [[ -t 0 ]]; }; then

@@ -17,13 +17,8 @@ import signal
 import sys
 import time
 from pathlib import Path
-from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-if "dns" not in sys.modules:
-    sys.modules["dns"] = MagicMock()
-    sys.modules["dns.resolver"] = MagicMock()
 
 from software.c2.beacon import Beacon
 
