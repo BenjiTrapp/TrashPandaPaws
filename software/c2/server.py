@@ -580,7 +580,7 @@ header .info{font-size:11px;color:var(--text2)}
 /* Side panel */
 .side-panel{
   width:420px;min-width:200px;max-width:70%;
-  display:none;flex-direction:column;overflow:hidden;
+  display:none;flex-direction:column;overflow:hidden;min-height:0;
 }
 .side-panel.open{display:flex}
 .side-panel-header{
@@ -598,10 +598,11 @@ header .info{font-size:11px;color:var(--text2)}
 }
 .side-panel-header button:hover{color:var(--red);background:rgba(255,26,26,0.1)}
 .side-panel-body{
-  flex:1;overflow-y:auto;padding:12px 16px;
+  flex:1;overflow-y:auto;padding:12px 16px;min-height:0;
   background:rgba(0,0,0,0.6);border-radius:0 0 8px 8px;border:1px solid var(--border);
   border-top:none;font-family:var(--mono);font-size:13px;line-height:1.6;
 }
+.side-panel-body.pivot-layout{display:flex;flex-direction:column;overflow:hidden}
 .side-panel-body::-webkit-scrollbar{width:6px}
 .side-panel-body::-webkit-scrollbar-thumb{background:var(--red-dim);border-radius:3px}
 
@@ -848,7 +849,7 @@ header .info{font-size:11px;color:var(--text2)}
 .pivot-canvas{width:100%;height:100%;display:block;cursor:grab}
 .pivot-canvas:active{cursor:grabbing}
 .pivot-controls{
-  display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap;
+  display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap;flex-shrink:0;
 }
 .pivot-controls button{
   padding:5px 12px;background:rgba(255,255,255,0.04);color:var(--text);border:1px solid var(--border);
@@ -856,7 +857,7 @@ header .info{font-size:11px;color:var(--text2)}
 }
 .pivot-controls button:hover{background:rgba(255,26,26,0.15);border-color:var(--red-dim);color:var(--red)}
 .pivot-legend{
-  display:flex;gap:14px;padding:6px 0;font-size:11px;color:var(--text2);flex-wrap:wrap;
+  display:flex;gap:14px;padding:6px 0;font-size:11px;color:var(--text2);flex-wrap:wrap;flex-shrink:0;
 }
 .pivot-legend span{display:flex;align-items:center;gap:4px}
 .pivot-legend .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
@@ -1266,12 +1267,14 @@ function formatUptime(s){
 // ── Side panel ──
 let panelPollTimer = null;
 
-function openPanel(title, content){
+function openPanel(title, content, layout){
   const panel = document.getElementById("side-panel");
   const body = document.getElementById("panel-body");
   const titleEl = document.getElementById("panel-title");
   titleEl.textContent = title;
   body.innerHTML = content;
+  body.classList.remove("pivot-layout");
+  if(layout === "pivot") body.classList.add("pivot-layout");
   panel.classList.add("open");
 }
 
@@ -1678,7 +1681,7 @@ async function showPivotMap(){
       <canvas class="pivot-canvas" id="pivot-canvas" width="800" height="500"></canvas>
       <div id="pivot-tooltip-wrap" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10"></div>
     </div>
-  `);
+  `, "pivot");
 
   buildPivotGraph(info, allAgents);
   setTimeout(pivotFitAll, 50);
@@ -1796,9 +1799,9 @@ function drawPivotFrame(){
   const canvas = document.getElementById("pivot-canvas");
   if(!canvas){ stopPivotAnim(); return; }
   if(!canvas.offsetParent){ stopPivotAnim(); return; }
-  const rect = canvas.parentElement.getBoundingClientRect();
-  const w = rect.width || 800;
-  const h = Math.max(rect.height - 80, 400);
+  const par = canvas.parentElement;
+  const w = par.clientWidth || 800;
+  const h = par.clientHeight || 400;
   if(canvas.width !== w) canvas.width = w;
   if(canvas.height !== h) canvas.height = h;
   const ctx = canvas.getContext("2d");
