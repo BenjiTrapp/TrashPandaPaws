@@ -112,6 +112,7 @@ agents: dict[str, dict] = {}
 task_queues: dict[str, list] = {}
 results: dict[str, dict] = {}
 history: dict[str, list] = {}
+scan_store: dict[str, list] = {}
 _name_counter = 0
 
 
@@ -131,6 +132,7 @@ def _save_state(data_dir: Path):
     state = {
         "agents": agents,
         "history": history,
+        "scan_store": scan_store,
         "name_counter": _name_counter,
     }
     (data_dir / "state.json").write_text(json.dumps(state, indent=2))
@@ -143,6 +145,7 @@ def _load_state(data_dir: Path):
         state = json.loads(state_file.read_text())
         agents.update(state.get("agents", {}))
         history.update(state.get("history", {}))
+        scan_store.update(state.get("scan_store", {}))
         _name_counter = state.get("name_counter", 0)
         for aid in agents:
             task_queues.setdefault(aid, [])
@@ -251,6 +254,21 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @require_auth
     def api_history(agent_id):
         return jsonify(history.get(agent_id, []))
+
+    @app.route("/api/agents/<agent_id>/scan", methods=["GET"])
+    @require_auth
+    def api_scan_get(agent_id):
+        return jsonify(scan_store.get(agent_id, []))
+
+    @app.route("/api/agents/<agent_id>/scan", methods=["POST"])
+    @require_auth
+    def api_scan_save(agent_id):
+        data = request.get_json(silent=True)
+        if not isinstance(data, list):
+            return jsonify({"error": "expected array"}), 400
+        scan_store[agent_id] = data
+        _save_state(data_dir)
+        return jsonify({"ok": True, "count": len(data)})
 
     @app.route("/api/tasks/<task_id>", methods=["GET"])
     @require_auth
@@ -878,8 +896,13 @@ header .info{font-size:11px;color:var(--text2)}
   border-radius:3px;font-size:10px;color:var(--text);
 }
 .pivot-tooltip .tt-port.critical{border-color:rgba(255,100,100,0.4);background:rgba(255,100,100,0.08);color:#ff8888}
+.pivot-tooltip .tt-port.ssl{border-color:rgba(68,221,170,0.4);background:rgba(68,221,170,0.08);color:#44ddaa}
 .pivot-tooltip .tt-banner{
-  font-size:10px;color:var(--text2);padding:2px 0;word-break:break-all;
+  font-size:10px;color:var(--text2);padding:3px 0;word-break:break-all;line-height:1.5;
+}
+.pivot-tooltip .tt-banner.ssl{
+  background:rgba(68,221,170,0.04);border-left:2px solid rgba(68,221,170,0.3);
+  padding:4px 8px;margin:3px 0;border-radius:2px;
 }
 
 /* Scrollbar */
@@ -1627,6 +1650,11 @@ async function showPivotMap(){
   const info = await api("/api/agents/"+selectedAgent);
   const allAgents = await api("/api/agents");
 
+  if(!pivotScanData[selectedAgent]){
+    const stored = await api("/api/agents/"+selectedAgent+"/scan");
+    if(stored && stored.length) pivotScanData[selectedAgent] = stored;
+  }
+
   openPanel("Pivot Map", `
     <div class="pivot-controls">
       <button onclick="runNetScan()">&#128269; Scan Subnet</button>
@@ -2117,13 +2145,14 @@ function showNodeTooltip(node, mx, my){
   } else if(node.type === "host" && node.hostData){
     const d = node.hostData;
     const criticalPorts = new Set([21,23,135,139,445,3389,5900,5985]);
+    const sslPorts = new Set([443,993,995,8443,636,989,990,992,5986,9443]);
     html += '<div class="tt-header"><span class="tt-dot" style="background:'+node.color+';box-shadow:0 0 6px '+node.color+'"></span>';
     html += '<span class="tt-title">'+esc(d.hostname||d.ip)+'</span>';
     html += '<button class="tt-close" onclick="dismissTooltip()">&#10005;</button></div>';
     html += '<div class="tt-body">';
     html += '<div class="tt-row"><span class="tt-lbl">IP</span><span class="tt-val">'+esc(d.ip)+'</span></div>';
     if(d.hostname) html += '<div class="tt-row"><span class="tt-lbl">Hostname</span><span class="tt-val">'+esc(d.hostname)+'</span></div>';
-    html += '<div class="tt-row"><span class="tt-lbl">MAC</span><span class="tt-val">'+esc(d.mac||"?")+'</span></div>';
+    html += '<div class="tt-row"><span class="tt-lbl">MAC</span><span class="tt-val" style="font-family:var(--mono)">'+esc(d.mac||"?")+'</span></div>';
     if(d.vendor) html += '<div class="tt-row"><span class="tt-lbl">Vendor</span><span class="tt-val highlight">'+esc(d.vendor)+'</span></div>';
     if(d.os_guess) html += '<div class="tt-row"><span class="tt-lbl">OS Guess</span><span class="tt-val warn">'+esc(d.os_guess)+'</span></div>';
     if(d.type && d.type !== "?") html += '<div class="tt-row"><span class="tt-lbl">ARP Type</span><span class="tt-val">'+esc(d.type)+'</span></div>';
@@ -2133,19 +2162,54 @@ function showNodeTooltip(node, mx, my){
       (d.port_info||d.ports.map(String)).forEach(p => {
         const portNum = parseInt(p);
         const isCrit = criticalPorts.has(portNum);
-        html += '<span class="tt-port'+(isCrit?" critical":"")+'">'+esc(String(p))+'</span>';
+        const isSsl = sslPorts.has(portNum);
+        let cls = "tt-port";
+        if(isCrit) cls += " critical";
+        else if(isSsl) cls += " ssl";
+        html += '<span class="'+cls+'">'+esc(String(p))+'</span>';
       });
       html += '</div>';
     }
     if(d.banners && Object.keys(d.banners).length){
-      html += '<div class="tt-section">Banners</div>';
+      const sslBanners = [];
+      const otherBanners = [];
       Object.entries(d.banners).forEach(([port, banner]) => {
-        html += '<div class="tt-banner"><strong>:'+esc(port)+'</strong> '+esc(banner)+'</div>';
+        if(sslPorts.has(parseInt(port)) || banner.includes("TLS") || banner.includes("SSL") || banner.includes("CN="))
+          sslBanners.push([port, banner]);
+        else
+          otherBanners.push([port, banner]);
       });
+      if(sslBanners.length){
+        html += '<div class="tt-section" style="color:#44ddaa">&#128274; SSL/TLS Certificates</div>';
+        sslBanners.forEach(([port, banner]) => {
+          html += '<div class="tt-banner ssl"><strong>:'+esc(port)+'</strong> ';
+          const parts = banner.split(" | ");
+          parts.forEach((part, i) => {
+            if(part.startsWith("CN="))
+              html += '<span style="color:#44ddaa">'+esc(part)+'</span>';
+            else if(part.startsWith("Issuer="))
+              html += '<span style="color:var(--text2)">'+esc(part)+'</span>';
+            else if(part.startsWith("Expires="))
+              html += '<span style="color:var(--orange)">'+esc(part)+'</span>';
+            else if(part.startsWith("SAN="))
+              html += '<span style="color:#88aacc">'+esc(part)+'</span>';
+            else
+              html += '<span>'+esc(part)+'</span>';
+            if(i < parts.length-1) html += ' <span style="color:var(--border)">|</span> ';
+          });
+          html += '</div>';
+        });
+      }
+      if(otherBanners.length){
+        html += '<div class="tt-section">Service Banners</div>';
+        otherBanners.forEach(([port, banner]) => {
+          html += '<div class="tt-banner"><strong>:'+esc(port)+'</strong> '+esc(banner)+'</div>';
+        });
+      }
     }
     if(!d.ports || !d.ports.length){
       html += '<div class="tt-section">Info</div>';
-      html += '<div style="font-size:10px;color:var(--text2);padding:2px 0">No open ports detected. Run Scan Subnet for deeper probe.</div>';
+      html += '<div style="font-size:10px;color:var(--text2);padding:2px 0">No open ports detected. Run ARP Table or Scan Subnet.</div>';
     }
     html += '</div>';
   } else {
@@ -2270,6 +2334,7 @@ async function pollNetScanResult(){
     });
     pivotScanData[selectedAgent] = hosts;
     toast("success","Pivot","Found "+hosts.length+" hosts",4000);
+    persistScanData();
   }
   refreshPivotMap();
 }
@@ -2312,9 +2377,17 @@ async function pollArpResult(){
       });
       pivotScanData[selectedAgent] = existing;
       toast("success","Pivot","ARP: "+hosts.length+" devices discovered",4000);
+      persistScanData();
     }
   }
   refreshPivotMap();
+}
+
+async function persistScanData(){
+  if(!selectedAgent || !pivotScanData[selectedAgent]) return;
+  await api("/api/agents/"+selectedAgent+"/scan",{
+    method:"POST", body:JSON.stringify(pivotScanData[selectedAgent])
+  });
 }
 
 async function refreshPivotMap(){

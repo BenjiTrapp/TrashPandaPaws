@@ -15,6 +15,7 @@ import random
 import re
 import shutil
 import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -748,26 +749,68 @@ class Beacon:
                 pass
         return open_ports
 
+    _SSL_PORTS = {443, 993, 995, 8443, 636, 989, 990, 992, 5986, 9443}
+
     @staticmethod
-    def _grab_banner(ip: str, port: int, timeout: float = 1.0) -> str:
+    def _grab_banner(ip: str, port: int, timeout: float = 1.5) -> str:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(timeout)
             s.connect((ip, port))
-            if port == 80:
-                s.sendall(b"HEAD / HTTP/1.0\r\nHost: " + ip.encode() + b"\r\n\r\n")
-            elif port == 443:
+            if port in Beacon._SSL_PORTS or port == 443:
                 s.close()
-                return "HTTPS"
-            else:
+                return Beacon._probe_ssl(ip, port, timeout)
+            if port in (80, 8080, 8888, 9090):
+                s.sendall(b"HEAD / HTTP/1.1\r\nHost: " + ip.encode() + b"\r\nConnection: close\r\n\r\n")
+            elif port == 21:
                 pass
-            s.settimeout(1.5)
-            data = s.recv(256)
+            elif port == 25:
+                pass
+            else:
+                s.sendall(b"\r\n")
+            s.settimeout(2.0)
+            data = s.recv(512)
             s.close()
             line = data.decode("utf-8", errors="replace").split("\n")[0].strip()
-            return line[:120]
+            return line[:160]
         except Exception:
             return ""
+
+    @staticmethod
+    def _probe_ssl(ip: str, port: int, timeout: float = 2.0) -> str:
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((ip, port), timeout=timeout) as sock:
+                with ctx.wrap_socket(sock, server_hostname=ip) as ssock:
+                    cert = ssock.getpeercert(binary_form=False)
+                    der = ssock.getpeercert(binary_form=True)
+                    ver = ssock.version() or "?"
+                    if cert:
+                        subj = dict(x[0] for x in cert.get("subject", ()))
+                        cn = subj.get("commonName", "?")
+                        issuer = dict(x[0] for x in cert.get("issuer", ()))
+                        issuer_cn = issuer.get("commonName", issuer.get("organizationName", "?"))
+                        not_after = cert.get("notAfter", "?")
+                        san_list = []
+                        for typ, val in cert.get("subjectAltName", ()):
+                            if typ == "DNS":
+                                san_list.append(val)
+                        san = ", ".join(san_list[:4])
+                        parts = [ver, f"CN={cn}"]
+                        if issuer_cn != cn:
+                            parts.append(f"Issuer={issuer_cn}")
+                        parts.append(f"Expires={not_after}")
+                        if san:
+                            parts.append(f"SAN=[{san}]")
+                        return " | ".join(parts)
+                    else:
+                        return f"{ver} | self-signed/no-cert"
+        except ssl.SSLError as e:
+            return f"SSL-Error: {str(e)[:80]}"
+        except Exception:
+            return "SSL"
 
     _PORT_NAMES = {
         21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
@@ -781,7 +824,46 @@ class Beacon:
         27017: "MongoDB",
     }
 
+    def _ping_sweep(self):
+        local_ips = self._get_local_ips()
+        if not local_ips:
+            return
+        bases = set()
+        for ip in local_ips:
+            parts = ip.rsplit(".", 1)
+            if len(parts) == 2:
+                bases.add(parts[0])
+
+        def _ping(target):
+            try:
+                if platform.system() == "Windows":
+                    subprocess.run(
+                        ["ping", "-n", "1", "-w", "500", target],
+                        capture_output=True, timeout=3,
+                    )
+                else:
+                    subprocess.run(
+                        ["ping", "-c", "1", "-W", "1", target],
+                        capture_output=True, timeout=3,
+                    )
+            except Exception:
+                pass
+
+        threads = []
+        for base in list(bases)[:3]:
+            for i in range(1, 255):
+                t = threading.Thread(target=_ping, args=(f"{base}.{i}",), daemon=True)
+                threads.append(t)
+                t.start()
+                if len(threads) >= 30:
+                    for tt in threads:
+                        tt.join(timeout=2)
+                    threads = []
+        for tt in threads:
+            tt.join(timeout=2)
+
     def _exec_arptable(self) -> str:
+        self._ping_sweep()
         entries = []
         try:
             if platform.system() == "Windows":
@@ -826,8 +908,10 @@ class Beacon:
         entries = unique
 
         my_ips = set(self._get_local_ips())
-        common_ports = [21,22,23,25,53,80,110,135,139,143,443,445,
-                        548,631,3306,3389,5353,5432,5900,5985,8080,8443]
+        common_ports = [21,22,23,25,53,80,110,111,135,139,143,161,389,
+                        443,445,548,636,631,993,995,1433,1521,
+                        3306,3389,5353,5432,5900,5985,5986,
+                        6379,8080,8443,8888,9090,9200,9443,27017]
         threads = []
         lock = threading.Lock()
 
@@ -843,10 +927,10 @@ class Beacon:
             ent["os_guess"] = self._guess_os(ent["ports"], ent["vendor"])
             ent["self"] = ip in my_ips
             banners = {}
-            for p in ent["ports"][:3]:
+            for p in ent["ports"][:8]:
                 b = self._grab_banner(ip, p)
                 if b:
-                    banners[p] = b
+                    banners[str(p)] = b
             ent["banners"] = banners
             port_info = []
             for p in ent["ports"]:
