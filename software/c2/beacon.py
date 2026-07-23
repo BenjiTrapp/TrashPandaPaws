@@ -794,7 +794,8 @@ class Beacon:
                         ip = parts[0]
                         mac = parts[1].replace("-", ":")
                         typ = parts[2] if len(parts) > 2 else "?"
-                        if ip not in ("255.255.255.255",) and not ip.endswith(".255"):
+                        first_octet = int(ip.split(".")[0])
+                        if ip not in ("255.255.255.255",) and not ip.endswith(".255") and first_octet < 224:
                             entries.append({"ip": ip, "mac": mac, "type": typ})
             else:
                 r = subprocess.run(
@@ -810,10 +811,19 @@ class Beacon:
                     if ip_m:
                         ip = ip_m.group(1)
                         mac = mac_m.group(0) if mac_m else "?"
-                        if ip not in ("255.255.255.255",) and not ip.endswith(".255"):
+                        first_octet = int(ip.split(".")[0])
+                        if ip not in ("255.255.255.255",) and not ip.endswith(".255") and first_octet < 224:
                             entries.append({"ip": ip, "mac": mac, "type": "?"})
         except Exception as e:
             return f"[error] {e}"
+
+        seen_ips = set()
+        unique = []
+        for ent in entries:
+            if ent["ip"] not in seen_ips:
+                seen_ips.add(ent["ip"])
+                unique.append(ent)
+        entries = unique
 
         my_ips = set(self._get_local_ips())
         common_ports = [21,22,23,25,53,80,110,135,139,143,443,445,
