@@ -85,24 +85,91 @@ fi
 PYVER=$($PYTHON --version 2>&1)
 echo -e "${G}  [✓]${N} ${W}Python${N}        ${D}$PYVER${N}"
 
-# Check dependencies
+# ── Virtual environment ──
+VENV_DIR="$SCRIPT_DIR/.venv"
+
+if [[ ! -f "$VENV_DIR/bin/python" ]]; then
+    echo -e "${C}  [*]${N} ${W}Creating venv${N} ${D}$VENV_DIR${N}"
+    $PYTHON -m venv "$VENV_DIR"
+    if [[ $? -ne 0 ]]; then
+        echo -e "${R}  [✗] Failed to create venv${N}"
+        exit 1
+    fi
+fi
+
+PYTHON="$VENV_DIR/bin/python"
+echo -e "${G}  [✓]${N} ${W}Venv${N}          ${D}$VENV_DIR${N}"
+
+# ── Dependencies (pip) ──
+$PYTHON -m pip install --upgrade pip --quiet 2>/dev/null
+
+PIP_PKGS="flask cryptography impacket ldap3 lsassy"
+
 MISSING=""
-for pkg in flask cryptography impacket ldap3 netexec lsassy; do
+for pkg in $PIP_PKGS; do
     if ! $PYTHON -c "import $pkg" 2>/dev/null; then
         MISSING="$MISSING $pkg"
     fi
 done
 
 if [[ -n "$MISSING" ]]; then
-    echo -e "${Y}  [!]${N} ${W}Installing${N}    ${D}$MISSING${N}"
-    $PYTHON -m pip install $MISSING --quiet 2>/dev/null
+    echo -e "${C}  [*]${N} ${W}Installing${N}    ${D}$MISSING${N}"
+    for pkg in $MISSING; do
+        if ! $PYTHON -m pip install "$pkg" --quiet 2>/dev/null; then
+            echo -e "${Y}  [!]${N} ${W}$pkg${N} ${Y}install failed (skipped)${N}"
+        fi
+    done
 fi
 
-echo -e "${G}  [✓]${N} ${W}Flask${N}         ${D}$($PYTHON -c "import importlib.metadata; print(importlib.metadata.version('flask'))")${N}"
-echo -e "${G}  [✓]${N} ${W}Cryptography${N}  ${D}$($PYTHON -c "import importlib.metadata; print(importlib.metadata.version('cryptography'))")${N}"
-echo -e "${G}  [✓]${N} ${W}Impacket${N}      ${D}$($PYTHON -c "import importlib.metadata; print(importlib.metadata.version('impacket'))" 2>/dev/null || echo "not installed")${N}"
-echo -e "${G}  [✓]${N} ${W}NetExec${N}       ${D}$(nxc --version 2>/dev/null || echo "not installed")${N}"
-echo -e "${G}  [✓]${N} ${W}Lsassy${N}        ${D}$($PYTHON -c "import importlib.metadata; print(importlib.metadata.version('lsassy'))" 2>/dev/null || echo "not installed")${N}"
+# ── NetExec (pipx, installed from GitHub) ──
+if ! command -v pipx &>/dev/null; then
+    echo ""
+    echo -ne "${Y}  [?]${N} ${W}pipx is required for NetExec. Install pipx now?${N} ${D}[Y/n]${N} "
+    read -r ANSWER
+    if [[ -z "$ANSWER" || "$ANSWER" =~ ^[yYjJ] ]]; then
+        echo -e "${C}  [*]${N} ${W}Installing${N}    ${D}pipx${N}"
+        $PYTHON -m pip install pipx --quiet 2>/dev/null
+        $PYTHON -m pipx ensurepath 2>/dev/null
+        PIPX_BIN=$($PYTHON -c "import sysconfig; print(sysconfig.get_path('scripts'))" 2>/dev/null)
+        if [[ -n "$PIPX_BIN" ]] && ! command -v pipx &>/dev/null; then
+            export PATH="$PIPX_BIN:$PATH"
+        fi
+        if command -v pipx &>/dev/null; then
+            echo -e "${G}  [✓]${N} ${W}pipx${N}          ${D}installed${N}"
+        else
+            echo -e "${Y}  [!]${N} ${W}pipx${N}          ${Y}install failed${N}"
+        fi
+    fi
+fi
+if command -v pipx &>/dev/null && ! command -v nxc &>/dev/null; then
+    echo -e "${C}  [*]${N} ${W}Installing${N}    ${D}netexec (pipx)${N}"
+    pipx install git+https://github.com/Pennyw0rth/NetExec 2>/dev/null || \
+        echo -e "${Y}  [!]${N} ${W}netexec${N} ${Y}install failed (skipped)${N}"
+fi
+
+# ── Version display ──
+_pkg_ver() {
+    local ver
+    ver=$($PYTHON -c "import importlib.metadata; print(importlib.metadata.version('$1'))" 2>/dev/null)
+    if [[ -z "$ver" ]]; then
+        echo -e "${Y}  [!]${N} ${W}$2${N}${Y}not installed${N}"
+    else
+        echo -e "${G}  [✓]${N} ${W}$2${N}${D}$ver${N}"
+    fi
+}
+
+_pkg_ver flask        "Flask         "
+_pkg_ver cryptography "Cryptography  "
+_pkg_ver impacket     "Impacket      "
+_pkg_ver ldap3        "ldap3         "
+_pkg_ver lsassy       "Lsassy        "
+
+NXC_VER=$(nxc --version 2>/dev/null)
+if [[ -n "$NXC_VER" ]]; then
+    echo -e "${G}  [✓]${N} ${W}NetExec       ${N}${D}$NXC_VER${N}"
+else
+    echo -e "${Y}  [!]${N} ${W}NetExec       ${N}${Y}not installed (requires pipx)${N}"
+fi
 
 # ── Interactive configuration ──
 if [[ -n "$INTERACTIVE" ]] || { [[ -z "$KEY" ]] && [[ -z "$DERIVE_KEY" ]] && [[ -t 0 ]]; }; then
