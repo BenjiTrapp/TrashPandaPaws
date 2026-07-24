@@ -85,17 +85,22 @@ class CiscoLoginHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
 
+    PROTECTED_PATHS = (
+        "/", "/index.html", "/ccmadmin", "/ccmadmin/", "/cuadmin",
+        "/deviceinfo", "/networksetup", "/streamstats",
+    )
+
     def do_GET(self):
-        if self.path == "/" or self.path == "/index.html":
-            self._serve_login()
-        elif self.path in ("/favicon.ico", "/static/favicon.ico"):
+        if self.path in ("/favicon.ico", "/static/favicon.ico"):
             self._serve_static("cisco-favicon.ico", "image/x-icon")
         elif self.path in ("/static/cisco-wallpaper.png", "/cisco-wallpaper.png"):
             self._serve_static("cisco-wallpaper.png", "image/png")
+        elif self.path in self.PROTECTED_PATHS or self.path.startswith("/ccm"):
+            self._serve_login()
         else:
             self._serve_error(
                 404, "Not Found",
-                "The requested page was not found on this device.",
+                "The requested resource does not exist on this server.",
             )
 
     def do_POST(self):
@@ -129,11 +134,7 @@ class CiscoLoginHandler(BaseHTTPRequestHandler):
                 user_agent=user_agent,
             )
 
-        self._serve_error(
-            401,
-            "Authentication Failed",
-            "Invalid credentials. Access to this device requires a valid username and password.",
-        )
+        self._serve_login(error=True)
 
     def _handle_fingerprint(self, body):
         try:
@@ -171,66 +172,95 @@ class CiscoLoginHandler(BaseHTTPRequestHandler):
         except FileNotFoundError:
             self.send_error(404)
 
-    def _serve_login(self):
+    def _serve_login(self, error=False):
+        error_html = ""
+        if error:
+            error_html = (
+                '<div class="error-msg">'
+                'Login failed. Please check your username and password.'
+                '</div>'
+            )
+
         html = """<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
-<title>Cisco IP Phone Administration</title>
+<title>Login Page</title>
 <link rel="shortcut icon" type="image/x-icon" href="/static/favicon.ico">
 <link rel="icon" type="image/x-icon" href="/favicon.ico">
 <style>
-    body {{ margin: 0; padding: 0; font-family: Arial, Helvetica, sans-serif;
-        background: url('/static/cisco-wallpaper.png') no-repeat center center fixed;
-        background-size: cover; background-color: #f0f0f0; }}
-    .login-container {{ position: absolute; top: 50%; left: 40px;
-        transform: translateY(-50%); background: rgba(255,255,255,0.95);
-        padding: 40px; border-radius: 8px;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.3); min-width: 400px; }}
-    .cisco-header {{ text-align: center; margin-bottom: 30px; }}
-    .cisco-logo {{ font-size: 32px; font-weight: bold; color: #049fd9; letter-spacing: 2px; }}
-    .device-info {{ text-align: center; font-size: 12px; color: #666; margin-bottom: 20px; }}
-    .form-group {{ margin-bottom: 20px; }}
-    label {{ display: block; margin-bottom: 5px; color: #333; font-weight: bold; font-size: 14px; }}
-    input[type="text"], input[type="password"] {{ width: 100%; padding: 10px;
-        border: 1px solid #ccc; border-radius: 4px; font-size: 14px; box-sizing: border-box; }}
-    input[type="text"]:focus, input[type="password"]:focus {{ outline: none; border-color: #049fd9; }}
-    .login-btn {{ width: 100%; padding: 12px; background-color: #049fd9; color: white;
-        border: none; border-radius: 4px; font-size: 16px; font-weight: bold;
-        cursor: pointer; transition: background-color 0.3s; }}
-    .login-btn:hover {{ background-color: #037ca8; }}
-    .warning {{ background-color: #fff3cd; border: 1px solid #ffc107; color: #856404;
-        padding: 10px; border-radius: 4px; margin-bottom: 20px; font-size: 12px; }}
-    .footer {{ text-align: center; margin-top: 20px; font-size: 11px; color: #999; }}
+*{{margin:0;padding:0;box-sizing:border-box}}
+html,body{{height:100%;overflow:hidden}}
+body{{font-family:Arial,Helvetica,sans-serif;
+    background:url('/static/cisco-wallpaper.png') no-repeat center center fixed;
+    background-size:cover;background-color:#1a3a5c;color:#fff}}
+.page{{display:flex;flex-direction:column;height:100vh}}
+.main{{flex:1;display:flex;align-items:flex-start;padding:calc(50vh - 180px) 60px 0}}
+.title-block h1{{font-size:20px;font-weight:300;color:#fff;margin-bottom:3px}}
+.title-block .version{{font-size:11px;font-weight:400;color:rgba(255,255,255,0.5)}}
+.login-area{{margin-left:auto;padding:20px}}
+.login-area table{{border-collapse:collapse}}
+.login-area td{{padding:5px 8px;font-size:13px;color:#fff;white-space:nowrap}}
+.login-area td.lbl{{text-align:right;font-weight:700}}
+.login-area input[type="text"],.login-area input[type="password"]{{
+    width:180px;padding:3px 5px;font-size:13px;border:1px solid #999;background:#fff;color:#333}}
+.login-area select{{width:180px;padding:3px 5px;font-size:13px;border:1px solid #999;background:#fff;color:#333}}
+.login-area .btn-row{{padding-top:8px}}
+.login-btn{{padding:3px 16px;font-size:12px;cursor:pointer;
+    background:#e8e8e8;border:1px solid #999;color:#333}}
+.login-btn:hover{{background:#d0d0d0}}
+.remember{{font-size:11px;color:rgba(255,255,255,0.8);padding-top:6px}}
+.remember input{{margin-right:4px;vertical-align:middle}}
+.error-msg{{background:rgba(220,53,69,0.9);color:#fff;padding:8px 12px;
+    font-size:12px;margin-bottom:12px;border-radius:2px;max-width:320px}}
+.footer{{background:rgba(0,0,0,0.4);padding:14px 60px;font-size:11px;color:rgba(255,255,255,0.6);
+    line-height:1.5}}
 </style></head><body>
-<div class="login-container">
-    <div class="cisco-header">
-        <div class="cisco-logo">CISCO</div>
-        <div style="color:#666;font-size:14px;margin-top:5px">Unified Communications</div>
+<div class="page">
+<div class="main">
+    <div class="title-block">
+        <h1>Phone Adapter Configuration Utility</h1>
+        <div class="version">Version 1.1.0 (011)</div>
     </div>
-    <div class="device-info">
-        <strong>Device:</strong> {model}<br>
-        <strong>Firmware:</strong> {firmware}<br>
-        <strong>MAC:</strong> {mac}
+    <div class="login-area">
+        {error_html}
+        <form method="POST" action="/">
+        <table>
+            <tr>
+                <td class="lbl">Username:</td>
+                <td>
+                    <select id="username" name="username">
+                        <option value="Admin" selected>Admin</option>
+                        <option value="User">User</option>
+                    </select>
+                </td>
+            </tr>
+            <tr>
+                <td class="lbl">Password:</td>
+                <td><input type="password" id="password" name="password" required></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td class="btn-row">
+                    <input type="submit" class="login-btn" value="Log In">
+                </td>
+            </tr>
+            <tr>
+                <td></td>
+                <td>
+                    <label class="remember">
+                        <input type="checkbox" name="remember">Remember Username
+                    </label>
+                </td>
+            </tr>
+        </table>
+        </form>
     </div>
-    <div class="warning">
-        &#9888; Restricted to authorized personnel only.
-        Login attempts will be monitored and recorded.
-    </div>
-    <form method="POST" action="/">
-        <div class="form-group">
-            <label for="username">Username:</label>
-            <input type="text" id="username" name="username" required autocomplete="off">
-        </div>
-        <div class="form-group">
-            <label for="password">Password:</label>
-            <input type="password" id="password" name="password" required>
-        </div>
-        <button type="submit" class="login-btn">Login</button>
-    </form>
-    <div class="footer">
-        &copy; 2008-2026 Cisco Systems, Inc. All rights reserved.<br>
-        Web Interface Version 8.5(4) | Build 8.5.4.0-52
-    </div>
+</div>
+<div class="footer">
+    &copy; 2012 Cisco Systems, Inc. All Rights Reserved.<br>
+    Cisco, Cisco Systems, and the Cisco Systems logo are registered trademarks or trademarks of Cisco
+    Systems, Inc. and/or its affiliates in the United States and certain other countries.
+</div>
 </div>
 {fingerprint}
 </body></html>""".format(
@@ -238,6 +268,7 @@ class CiscoLoginHandler(BaseHTTPRequestHandler):
             firmware=self.server.firmware_version,
             mac=self.server.mac_address,
             fingerprint=FINGERPRINT_JS,
+            error_html=error_html,
         )
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
@@ -250,50 +281,43 @@ class CiscoLoginHandler(BaseHTTPRequestHandler):
         html = """<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
-<title>{code} {title} - Cisco IP Phone</title>
+<title>{code} {title}</title>
 <link rel="shortcut icon" type="image/x-icon" href="/static/favicon.ico">
 <style>
-    body {{ margin: 0; padding: 0; font-family: Arial, Helvetica, sans-serif;
-        background: url('/static/cisco-wallpaper.png') no-repeat center center fixed;
-        background-size: cover; background-color: #f0f0f0; }}
-    .error-container {{ position: absolute; top: 50%; left: 40px;
-        transform: translateY(-50%); background: rgba(255,255,255,0.95);
-        padding: 40px; border-radius: 8px;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.3); min-width: 400px; max-width: 500px; }}
-    .cisco-header {{ text-align: center; margin-bottom: 30px; }}
-    .cisco-logo {{ font-size: 32px; font-weight: bold; color: #049fd9; letter-spacing: 2px; }}
-    .error-code {{ text-align: center; font-size: 72px; font-weight: bold; color: #dc3545; margin: 20px 0; }}
-    .error-message {{ background-color: #f8d7da; border: 1px solid #f5c6cb; color: #721c24;
-        padding: 15px; border-radius: 4px; margin-bottom: 20px; text-align: center; }}
-    .error-title {{ font-weight: bold; font-size: 18px; margin-bottom: 10px; }}
-    .error-desc {{ font-size: 14px; color: #666; line-height: 1.5; margin: 15px 0; }}
-    .error-details {{ font-size: 12px; color: #999; margin-top: 15px;
-        padding-top: 15px; border-top: 1px solid #e0e0e0; }}
-    .back-btn {{ width: 100%; padding: 12px; background-color: #049fd9; color: white;
-        border: none; border-radius: 4px; font-size: 16px; font-weight: bold;
-        cursor: pointer; text-decoration: none; display: block; text-align: center; margin-top: 20px; }}
-    .back-btn:hover {{ background-color: #037ca8; }}
-    .footer {{ text-align: center; margin-top: 20px; font-size: 11px; color: #999; }}
+*{{margin:0;padding:0;box-sizing:border-box}}
+html,body{{height:100%}}
+body{{font-family:Arial,Helvetica,sans-serif;
+    background:url('/static/cisco-wallpaper.png') no-repeat center center fixed;
+    background-size:cover;background-color:#1a3a5c;color:#fff}}
+.page{{display:flex;flex-direction:column;min-height:100vh}}
+.main{{flex:1;display:flex;align-items:center;justify-content:center;padding:40px}}
+.error-box{{background:rgba(0,0,0,0.5);padding:40px 50px;border-radius:4px;
+    text-align:center;max-width:480px}}
+.error-code{{font-size:64px;font-weight:700;margin-bottom:10px}}
+.error-title{{font-size:20px;font-weight:600;margin-bottom:12px}}
+.error-desc{{font-size:14px;color:rgba(255,255,255,0.75);line-height:1.5;margin-bottom:20px}}
+.error-meta{{font-size:11px;color:rgba(255,255,255,0.5);margin-top:16px}}
+.back-btn{{display:inline-block;padding:5px 20px;background:#e8e8e8;color:#333;
+    border:1px solid #999;font-size:12px;text-decoration:none;cursor:pointer}}
+.back-btn:hover{{background:#d0d0d0}}
+.footer{{background:rgba(0,0,0,0.4);padding:14px 60px;font-size:11px;color:rgba(255,255,255,0.6);
+    line-height:1.5}}
 </style></head><body>
-<div class="error-container">
-    <div class="cisco-header">
-        <div class="cisco-logo">CISCO</div>
-        <div style="color:#666;font-size:14px;margin-top:5px">Unified Communications</div>
-    </div>
-    <div class="error-code">{code}</div>
-    <div class="error-message">
+<div class="page">
+<div class="main">
+    <div class="error-box">
+        <div class="error-code">{code}</div>
         <div class="error-title">{title}</div>
         <div class="error-desc">{description}</div>
-        <div class="error-details">
-            Timestamp: {timestamp}<br>
-            Server: Cisco-HTTP/1.1
-        </div>
+        <a href="/" class="back-btn">Return to Login</a>
+        <div class="error-meta">Server: Cisco-HTTP/1.1 &bull; {timestamp}</div>
     </div>
-    <a href="/" class="back-btn">&larr; Return to Home</a>
-    <div class="footer">
-        &copy; 2008-2026 Cisco Systems, Inc. All rights reserved.<br>
-        Device: Cisco IP Phone 7960 | Firmware: P0S3-08-12-00
-    </div>
+</div>
+<div class="footer">
+    &copy; 2012 Cisco Systems, Inc. All Rights Reserved.<br>
+    Cisco, Cisco Systems, and the Cisco Systems logo are registered trademarks or trademarks of Cisco
+    Systems, Inc. and/or its affiliates in the United States and certain other countries.
+</div>
 </div>
 {fingerprint}
 </body></html>""".format(
