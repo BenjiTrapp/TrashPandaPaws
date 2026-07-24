@@ -43,7 +43,7 @@ def setup_logging(config: dict):
 def load_config(path: str = None) -> dict:
     candidates = [
         path,
-        "/opt/raccoon/raccoon.yaml",
+        "/opt/raccoon/configs/raccoon.yaml",
         str(Path(__file__).parent.parent / "configs" / "raccoon.yaml"),
     ]
     for p in candidates:
