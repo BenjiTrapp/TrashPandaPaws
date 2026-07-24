@@ -6,17 +6,19 @@ LABEL maintainer="TrashPandaPaws" \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc libffi-dev libssl-dev \
         nmap iputils-ping net-tools \
-        git \
+        git pipx \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
         flask \
         cryptography \
         impacket \
-        netexec \
         lsassy \
         ldap3 \
         requests-ntlm
+
+ENV PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin
+RUN pipx install git+https://github.com/Pennyw0rth/NetExec
 
 # Install Responder
 RUN git clone --depth 1 https://github.com/lgandx/Responder.git /opt/Responder \

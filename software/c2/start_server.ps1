@@ -22,7 +22,7 @@ param(
     [switch]$NoPrompt
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ServerPy = Join-Path $ScriptDir "server.py"
 
@@ -69,40 +69,125 @@ Write-Host "  [+] " -ForegroundColor Green -NoNewline
 Write-Host "Python        " -ForegroundColor White -NoNewline
 Write-Host "$PyVer" -ForegroundColor DarkGray
 
-# Check dependencies
-$Missing = @()
-foreach ($pkg in @("flask", "cryptography", "impacket", "ldap3", "netexec", "lsassy")) {
-    $check = & $Python -c "import $pkg" 2>&1
-    if ($LASTEXITCODE -ne 0) { $Missing += $pkg }
+# -- Virtual environment --
+$VenvDir = Join-Path $ScriptDir ".venv"
+$VenvPython = Join-Path (Join-Path $VenvDir "Scripts") "python.exe"
+
+if (-not (Test-Path $VenvPython)) {
+    Write-Host "  [*] " -ForegroundColor Cyan -NoNewline
+    Write-Host "Creating venv " -ForegroundColor White -NoNewline
+    Write-Host "$VenvDir" -ForegroundColor DarkGray
+    & $Python -m venv $VenvDir
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  [X] " -ForegroundColor Red -NoNewline
+        Write-Host "Failed to create venv" -ForegroundColor White
+        exit 1
+    }
 }
 
-if ($Missing.Count -gt 0) {
-    Write-Host "  [!] " -ForegroundColor Yellow -NoNewline
+$Python = $VenvPython
+Write-Host "  [+] " -ForegroundColor Green -NoNewline
+Write-Host "Venv          " -ForegroundColor White -NoNewline
+Write-Host "$VenvDir" -ForegroundColor DarkGray
+
+# -- Ensure pip is available in venv --
+& $Python -m ensurepip --upgrade 2>$null
+& $Python -m pip install --upgrade pip --quiet 2>$null
+
+# -- Dependencies (pip) --
+$PipPkgs = @("flask", "cryptography", "impacket", "ldap3", "lsassy")
+
+Write-Host "  [*] " -ForegroundColor Cyan -NoNewline
+Write-Host "Checking deps " -ForegroundColor White -NoNewline
+Write-Host ($PipPkgs -join ", ") -ForegroundColor DarkGray
+foreach ($pkg in $PipPkgs) {
+    $out = & $Python -m pip install $pkg --quiet 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  [!] " -ForegroundColor Yellow -NoNewline
+        Write-Host "$pkg install failed (skipped)" -ForegroundColor DarkGray
+    }
+}
+
+# -- NetExec (pipx, installed from GitHub) --
+$HasPipx = $null -ne (Get-Command pipx -ErrorAction SilentlyContinue)
+$HasNxc = $null -ne (Get-Command nxc -ErrorAction SilentlyContinue)
+if (-not $HasPipx) {
+    Write-Host ""
+    Write-Host "  [?] " -ForegroundColor Yellow -NoNewline
+    Write-Host "pipx is required for NetExec. Install pipx now? " -ForegroundColor White -NoNewline
+    Write-Host "[Y/n] " -ForegroundColor DarkGray -NoNewline
+    $answer = Read-Host
+    if ($answer -eq "" -or $answer -match "^[yYjJ]") {
+        Write-Host "  [*] " -ForegroundColor Cyan -NoNewline
+        Write-Host "Installing    " -ForegroundColor White -NoNewline
+        Write-Host "pipx" -ForegroundColor DarkGray
+        & $Python -m pip install pipx --quiet 2>$null
+        & $Python -m pipx ensurepath 2>$null
+        $HasPipx = $null -ne (Get-Command pipx -ErrorAction SilentlyContinue)
+        if (-not $HasPipx) {
+            $pipxBin = & $Python -c "import sysconfig; print(sysconfig.get_path('scripts'))" 2>$null
+            if ($pipxBin -and (Test-Path (Join-Path $pipxBin "pipx.exe"))) {
+                $env:PATH = "$pipxBin;$env:PATH"
+                $HasPipx = $true
+            }
+        }
+        if ($HasPipx) {
+            Write-Host "  [+] " -ForegroundColor Green -NoNewline
+            Write-Host "pipx          " -ForegroundColor White -NoNewline
+            Write-Host "installed" -ForegroundColor DarkGray
+        } else {
+            Write-Host "  [!] " -ForegroundColor Yellow -NoNewline
+            Write-Host "pipx          " -ForegroundColor White -NoNewline
+            Write-Host "install failed" -ForegroundColor Yellow
+        }
+    }
+}
+if ($HasPipx -and -not $HasNxc) {
+    Write-Host "  [*] " -ForegroundColor Cyan -NoNewline
     Write-Host "Installing    " -ForegroundColor White -NoNewline
-    Write-Host ($Missing -join ", ") -ForegroundColor DarkGray
-    & $Python -m pip install @Missing --quiet 2>$null
+    Write-Host "netexec (pipx)" -ForegroundColor DarkGray
+    pipx install git+https://github.com/Pennyw0rth/NetExec 2>$null
+    $pipxBinDir = Join-Path $env:USERPROFILE ".local\bin"
+    if (-not (Get-Command nxc -ErrorAction SilentlyContinue)) {
+        if (Test-Path (Join-Path $pipxBinDir "nxc.exe")) {
+            $env:PATH = "$pipxBinDir;$env:PATH"
+        }
+    }
 }
 
-$FlaskVer = & $Python -c "import importlib.metadata; print(importlib.metadata.version('flask'))" 2>$null
-$CryptoVer = & $Python -c "import importlib.metadata; print(importlib.metadata.version('cryptography'))" 2>$null
-$ImpacketVer = & $Python -c "import importlib.metadata; print(importlib.metadata.version('impacket'))" 2>$null
-$NxcVer = & $Python -c "import importlib.metadata; print(importlib.metadata.version('netexec'))" 2>$null
-$LsassyVer = & $Python -c "import importlib.metadata; print(importlib.metadata.version('lsassy'))" 2>$null
-Write-Host "  [+] " -ForegroundColor Green -NoNewline
-Write-Host "Flask         " -ForegroundColor White -NoNewline
-Write-Host "$FlaskVer" -ForegroundColor DarkGray
-Write-Host "  [+] " -ForegroundColor Green -NoNewline
-Write-Host "Cryptography  " -ForegroundColor White -NoNewline
-Write-Host "$CryptoVer" -ForegroundColor DarkGray
-Write-Host "  [+] " -ForegroundColor Green -NoNewline
-Write-Host "Impacket      " -ForegroundColor White -NoNewline
-Write-Host "$ImpacketVer" -ForegroundColor DarkGray
-Write-Host "  [+] " -ForegroundColor Green -NoNewline
-Write-Host "NetExec       " -ForegroundColor White -NoNewline
-Write-Host "$NxcVer" -ForegroundColor DarkGray
-Write-Host "  [+] " -ForegroundColor Green -NoNewline
-Write-Host "Lsassy        " -ForegroundColor White -NoNewline
-Write-Host "$LsassyVer" -ForegroundColor DarkGray
+# -- Version display --
+$AllDisplay = @(
+    @("Flask",        "flask"),
+    @("Cryptography", "cryptography"),
+    @("Impacket",     "impacket"),
+    @("ldap3",        "ldap3"),
+    @("Lsassy",       "lsassy")
+)
+foreach ($entry in $AllDisplay) {
+    $label = $entry[0].PadRight(14)
+    $ver = & $Python -c "import importlib.metadata; print(importlib.metadata.version('$($entry[1])'))" 2>$null
+    if (-not $ver) {
+        Write-Host "  [!] " -ForegroundColor Yellow -NoNewline
+        Write-Host $label -ForegroundColor White -NoNewline
+        Write-Host "not installed" -ForegroundColor Yellow
+    } else {
+        Write-Host "  [+] " -ForegroundColor Green -NoNewline
+        Write-Host $label -ForegroundColor White -NoNewline
+        Write-Host $ver -ForegroundColor DarkGray
+    }
+}
+$nxcVer = ""
+$nxcCmd = Get-Command nxc -ErrorAction SilentlyContinue
+if ($nxcCmd) { $nxcVer = & nxc --version 2>$null }
+if ($nxcVer) {
+    Write-Host "  [+] " -ForegroundColor Green -NoNewline
+    Write-Host "NetExec       " -ForegroundColor White -NoNewline
+    Write-Host "$nxcVer" -ForegroundColor DarkGray
+} else {
+    Write-Host "  [!] " -ForegroundColor Yellow -NoNewline
+    Write-Host "NetExec       " -ForegroundColor White -NoNewline
+    Write-Host "not installed (requires pipx)" -ForegroundColor Yellow
+}
 
 # -- Interactive configuration --
 $Proto = "http"

