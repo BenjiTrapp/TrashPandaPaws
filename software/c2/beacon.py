@@ -39,7 +39,21 @@ logger = logging.getLogger("raccoon.c2")
 # ── Stdlib AES-256-GCM via OpenSSL ctypes ──
 
 def _load_libcrypto():
-    """Load OpenSSL libcrypto that ships with Python's ssl module."""
+    """Load OpenSSL libcrypto. Returns None if unavailable (macOS Library Validation)."""
+    if platform.system() == "Darwin":
+        brew_paths = [
+            "/opt/homebrew/opt/openssl/lib/libcrypto.dylib",
+            "/opt/homebrew/lib/libcrypto.dylib",
+            "/usr/local/opt/openssl/lib/libcrypto.dylib",
+            "/usr/local/lib/libcrypto.dylib",
+            "/opt/local/lib/libcrypto.dylib",
+        ]
+        for p in brew_paths:
+            if os.path.isfile(p):
+                try:
+                    return ctypes.CDLL(p)
+                except OSError:
+                    continue
     for name in ("libcrypto-3", "libcrypto-3-x64", "libcrypto-1_1",
                  "libcrypto-1_1-x64", "libcrypto"):
         path = ctypes.util.find_library(name)
@@ -70,46 +84,226 @@ def _load_libcrypto():
                     return ctypes.CDLL(os.path.join(search_dir, fn))
                 except OSError:
                     continue
-    raise OSError("Cannot find OpenSSL libcrypto — required for AES-GCM")
+    return None
 
+
+# ── Pure-Python AES-256-GCM (stdlib only, no ctypes) ──
+# Used as fallback when libcrypto is unavailable (macOS Library Validation).
+
+def _xor(a: bytes, b: bytes) -> bytes:
+    return bytes(x ^ y for x, y in zip(a, b))
+
+
+def _ghash_mul(x: bytes, h: bytes) -> bytes:
+    """GF(2^128) multiplication for GHASH."""
+    xi = int.from_bytes(x, "big")
+    hi = int.from_bytes(h, "big")
+    zi = 0
+    R = 0xE1000000000000000000000000000000
+    for i in range(128):
+        if (xi >> (127 - i)) & 1:
+            zi ^= hi
+        carry = hi & 1
+        hi >>= 1
+        if carry:
+            hi ^= R
+    return zi.to_bytes(16, "big")
+
+
+def _ghash(h: bytes, aad: bytes, ct: bytes) -> bytes:
+    """GHASH function per NIST SP 800-38D."""
+    def _pad16(data):
+        r = len(data) % 16
+        return data + b"\x00" * (16 - r) if r else data
+
+    data = _pad16(aad) + _pad16(ct)
+    data += (len(aad) * 8).to_bytes(8, "big") + (len(ct) * 8).to_bytes(8, "big")
+
+    y = b"\x00" * 16
+    for i in range(0, len(data), 16):
+        block = data[i:i + 16]
+        y = _ghash_mul(_xor(y, block), h)
+    return y
+
+
+
+
+# ── Pure-Python AES-256 single-block implementation ──
+
+_AES_SBOX = [
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+]
+
+_AES_RCON = [0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36]
+
+
+def _aes256_expand_key(key: bytes):
+    """AES-256 key expansion → list of 15 round keys (each 16 bytes)."""
+    w = list(struct.unpack(">8I", key))
+    for i in range(8, 60):
+        t = w[i - 1]
+        if i % 8 == 0:
+            t = ((t << 8) | (t >> 24)) & 0xFFFFFFFF
+            t = ((_AES_SBOX[(t >> 24) & 0xFF] << 24) |
+                 (_AES_SBOX[(t >> 16) & 0xFF] << 16) |
+                 (_AES_SBOX[(t >> 8) & 0xFF] << 8) |
+                 _AES_SBOX[t & 0xFF])
+            t ^= _AES_RCON[i // 8 - 1] << 24
+        elif i % 8 == 4:
+            t = ((_AES_SBOX[(t >> 24) & 0xFF] << 24) |
+                 (_AES_SBOX[(t >> 16) & 0xFF] << 16) |
+                 (_AES_SBOX[(t >> 8) & 0xFF] << 8) |
+                 _AES_SBOX[t & 0xFF])
+        w.append(w[i - 8] ^ t)
+    rks = []
+    for r in range(15):
+        rks.append(struct.pack(">4I", *w[r * 4:(r + 1) * 4]))
+    return rks
+
+
+def _aes256_block(key: bytes, block: bytes) -> bytes:
+    """Encrypt a single 16-byte block with AES-256 (column-major state)."""
+    rks = _aes256_expand_key(key)
+
+    def xtime(a):
+        return ((a << 1) ^ 0x1b) & 0xFF if a & 0x80 else (a << 1) & 0xFF
+
+    # State is column-major: state[row][col] = block[col*4 + row]
+    s = bytearray(_xor(block, rks[0]))
+
+    for rnd in range(1, 14):
+        # SubBytes
+        s = bytearray(_AES_SBOX[b] for b in s)
+        # ShiftRows (state[row*4+col] in our flat layout where index = col*4+row)
+        # row 1: shift left 1
+        s[1], s[5], s[9], s[13] = s[5], s[9], s[13], s[1]
+        # row 2: shift left 2
+        s[2], s[6], s[10], s[14] = s[10], s[14], s[2], s[6]
+        # row 3: shift left 3
+        s[3], s[7], s[11], s[15] = s[15], s[3], s[7], s[11]
+        # MixColumns (operate on each column: indices col*4 .. col*4+3)
+        t = bytearray(16)
+        for col in range(4):
+            i = col * 4
+            a0, a1, a2, a3 = s[i], s[i+1], s[i+2], s[i+3]
+            t[i]   = xtime(a0) ^ xtime(a1) ^ a1 ^ a2 ^ a3
+            t[i+1] = a0 ^ xtime(a1) ^ xtime(a2) ^ a2 ^ a3
+            t[i+2] = a0 ^ a1 ^ xtime(a2) ^ xtime(a3) ^ a3
+            t[i+3] = xtime(a0) ^ a0 ^ a1 ^ a2 ^ xtime(a3)
+        s = bytearray(_xor(bytes(t), rks[rnd]))
+
+    # Final round (no MixColumns)
+    s = bytearray(_AES_SBOX[b] for b in s)
+    s[1], s[5], s[9], s[13] = s[5], s[9], s[13], s[1]
+    s[2], s[6], s[10], s[14] = s[10], s[14], s[2], s[6]
+    s[3], s[7], s[11], s[15] = s[15], s[3], s[7], s[11]
+    return bytes(_xor(bytes(s), rks[14]))
+
+
+def _aes_ctr_encrypt(key: bytes, nonce: bytes, data: bytes) -> bytes:
+    """AES-256-CTR encryption (GCM uses CTR internally)."""
+    out = bytearray()
+    # GCM uses a 12-byte nonce + 4-byte big-endian counter starting at 2
+    counter = 2
+    for i in range(0, len(data), 16):
+        cb = nonce + struct.pack(">I", counter)
+        ks_block = _aes256_block(key, cb)
+        chunk = data[i:i + 16]
+        out.extend(_xor(chunk, ks_block[:len(chunk)]))
+        counter += 1
+    return bytes(out)
+
+
+def _pure_aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
+    """Pure-Python AES-256-GCM encrypt. Returns ciphertext + 16-byte tag."""
+    # H = AES(key, 0^128)
+    h = _aes256_block(key, b"\x00" * 16)
+    # Encrypt with CTR (counter starts at 2)
+    ct = _aes_ctr_encrypt(key, nonce, plaintext)
+    # GHASH
+    ghash_val = _ghash(h, b"", ct)
+    # Tag = GHASH XOR AES(key, nonce||0^31||1)
+    j0 = nonce + b"\x00\x00\x00\x01"
+    e_j0 = _aes256_block(key, j0)
+    tag = _xor(ghash_val, e_j0)
+    return ct + tag
+
+
+def _pure_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> bytes:
+    """Pure-Python AES-256-GCM decrypt. Raises ValueError on auth failure."""
+    if len(ciphertext_with_tag) < 16:
+        raise ValueError("Ciphertext too short")
+    ct = ciphertext_with_tag[:-16]
+    tag = ciphertext_with_tag[-16:]
+    # H = AES(key, 0^128)
+    h = _aes256_block(key, b"\x00" * 16)
+    # Verify tag
+    ghash_val = _ghash(h, b"", ct)
+    j0 = nonce + b"\x00\x00\x00\x01"
+    e_j0 = _aes256_block(key, j0)
+    expected_tag = _xor(ghash_val, e_j0)
+    if tag != expected_tag:
+        raise ValueError("GCM authentication failed — wrong key or corrupted data")
+    # Decrypt
+    return _aes_ctr_encrypt(key, nonce, ct)
+
+
+# ── Load libcrypto or fall back to pure-Python ──
 
 _crypto = _load_libcrypto()
+_USE_PURE_PYTHON_AES = _crypto is None
 
-_crypto.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
-_crypto.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
-_crypto.EVP_aes_256_gcm.restype = ctypes.c_void_p
-_crypto.EVP_EncryptInit_ex.argtypes = [
-    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-    ctypes.c_char_p, ctypes.c_char_p,
-]
-_crypto.EVP_EncryptInit_ex.restype = ctypes.c_int
-_crypto.EVP_DecryptInit_ex.argtypes = [
-    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-    ctypes.c_char_p, ctypes.c_char_p,
-]
-_crypto.EVP_DecryptInit_ex.restype = ctypes.c_int
-_crypto.EVP_EncryptUpdate.argtypes = [
-    ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
-    ctypes.c_char_p, ctypes.c_int,
-]
-_crypto.EVP_EncryptUpdate.restype = ctypes.c_int
-_crypto.EVP_DecryptUpdate.argtypes = [
-    ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
-    ctypes.c_char_p, ctypes.c_int,
-]
-_crypto.EVP_DecryptUpdate.restype = ctypes.c_int
-_crypto.EVP_EncryptFinal_ex.argtypes = [
-    ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
-]
-_crypto.EVP_EncryptFinal_ex.restype = ctypes.c_int
-_crypto.EVP_DecryptFinal_ex.argtypes = [
-    ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
-]
-_crypto.EVP_DecryptFinal_ex.restype = ctypes.c_int
-_crypto.EVP_CIPHER_CTX_ctrl.argtypes = [
-    ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p,
-]
-_crypto.EVP_CIPHER_CTX_ctrl.restype = ctypes.c_int
+if not _USE_PURE_PYTHON_AES:
+    _crypto.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+    _crypto.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
+    _crypto.EVP_aes_256_gcm.restype = ctypes.c_void_p
+    _crypto.EVP_EncryptInit_ex.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_char_p, ctypes.c_char_p,
+    ]
+    _crypto.EVP_EncryptInit_ex.restype = ctypes.c_int
+    _crypto.EVP_DecryptInit_ex.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_char_p, ctypes.c_char_p,
+    ]
+    _crypto.EVP_DecryptInit_ex.restype = ctypes.c_int
+    _crypto.EVP_EncryptUpdate.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+        ctypes.c_char_p, ctypes.c_int,
+    ]
+    _crypto.EVP_EncryptUpdate.restype = ctypes.c_int
+    _crypto.EVP_DecryptUpdate.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+        ctypes.c_char_p, ctypes.c_int,
+    ]
+    _crypto.EVP_DecryptUpdate.restype = ctypes.c_int
+    _crypto.EVP_EncryptFinal_ex.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+    ]
+    _crypto.EVP_EncryptFinal_ex.restype = ctypes.c_int
+    _crypto.EVP_DecryptFinal_ex.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+    ]
+    _crypto.EVP_DecryptFinal_ex.restype = ctypes.c_int
+    _crypto.EVP_CIPHER_CTX_ctrl.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p,
+    ]
+    _crypto.EVP_CIPHER_CTX_ctrl.restype = ctypes.c_int
 
 EVP_CTRL_GCM_SET_IVLEN = 0x9
 EVP_CTRL_GCM_GET_TAG = 0x10
@@ -118,6 +312,8 @@ GCM_TAG_LEN = 16
 
 
 def _aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
+    if _USE_PURE_PYTHON_AES:
+        return _pure_aes_gcm_encrypt(key, nonce, plaintext)
     ctx = _crypto.EVP_CIPHER_CTX_new()
     if not ctx:
         raise RuntimeError("EVP_CIPHER_CTX_new failed")
@@ -152,6 +348,8 @@ def _aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
 
 
 def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> bytes:
+    if _USE_PURE_PYTHON_AES:
+        return _pure_aes_gcm_decrypt(key, nonce, ciphertext_with_tag)
     if len(ciphertext_with_tag) < GCM_TAG_LEN:
         raise ValueError("Ciphertext too short")
     ct = ciphertext_with_tag[:-GCM_TAG_LEN]

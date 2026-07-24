@@ -777,7 +777,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             encoded = base64.b64encode(compressed).decode()
             var_data = _rand_name()
             var_mod = _rand_name()
-            return f"import base64 as {var_mod},zlib;exec(zlib.decompress({var_mod}.b64decode('{encoded}')))"
+            return f'import base64 as {var_mod},zlib;exec(zlib.decompress({var_mod}.b64decode("{encoded}")))'
 
         deob_layers = [{"layer": 0, "label": "Original source", "size": len(payload),
                         "preview": payload[:2000]}]
@@ -859,7 +859,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             compressed = zlib.compress(code.encode("utf-8"), 9)
             encoded = base64.b64encode(compressed).decode()
             var_mod = _rand_name()
-            return f"import base64 as {var_mod},zlib;exec(zlib.decompress({var_mod}.b64decode('{encoded}')))"
+            return f'import base64 as {var_mod},zlib;exec(zlib.decompress({var_mod}.b64decode("{encoded}")))'
 
         stage = payload
         for _ in range(layers):

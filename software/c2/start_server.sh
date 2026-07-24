@@ -101,7 +101,7 @@ PYTHON="$VENV_DIR/bin/python"
 echo -e "${G}  [✓]${N} ${W}Venv${N}          ${D}$VENV_DIR${N}"
 
 # ── Dependencies (pip) ──
-$PYTHON -m pip install --upgrade pip --quiet 2>/dev/null
+$PYTHON -m pip install --upgrade pip --quiet 2>/dev/null || true
 
 PIP_PKGS="flask cryptography impacket ldap3 lsassy"
 
@@ -164,7 +164,7 @@ _pkg_ver impacket     "Impacket      "
 _pkg_ver ldap3        "ldap3         "
 _pkg_ver lsassy       "Lsassy        "
 
-NXC_VER=$(nxc --version 2>/dev/null)
+NXC_VER=$(nxc --version 2>/dev/null || true)
 if [[ -n "$NXC_VER" ]]; then
     echo -e "${G}  [✓]${N} ${W}NetExec       ${N}${D}$NXC_VER${N}"
 else

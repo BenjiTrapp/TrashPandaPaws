@@ -18,6 +18,7 @@ hardware/gerber/*.drl
 bin/implant
 bin/*.tmp
 
+.serena
 .env
 *.key
 *.pem
