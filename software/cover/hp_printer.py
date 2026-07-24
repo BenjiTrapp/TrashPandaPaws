@@ -487,114 +487,144 @@ class HPPrinterCover:
         error_html = ""
         if error:
             error_html = (
-                '<div style="background:#fce4e4;border:1px solid #c00;color:#c00;'
-                'padding:10px;border-radius:4px;margin-bottom:20px;font-size:13px;text-align:center">'
-                '&#10060; The password you entered is incorrect. Please try again.</div>'
+                '<div class="error-msg">'
+                'The password you entered is incorrect. Please try again.</div>'
             )
 
         logo_src = f"data:image/png;base64,{self._HP_LOGO_B64}" if self._HP_LOGO_B64 else "/static/hp_logo.png"
 
-        nav_html = ""
-        for tab_path, tab_label in self.EWS_TABS:
-            active = " class=\"active\"" if tab_path == path else ""
-            nav_html += f'<a href="{tab_path}"{active}>{tab_label}</a>\n'
 
         page_name, page_hint = self.EWS_PAGE_HINTS.get(path, ("Printer", "Sign in to access this feature."))
-        title_section = f"{page_name} &mdash; " if path != "/" else ""
 
         body = f"""<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
-<title>{PRINTER_MODEL} - {page_name}</title>
+<title>HP Smart - {page_name}</title>
 <link rel="icon" type="image/x-icon" href="/favicon.ico">
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:'Segoe UI',Arial,Helvetica,sans-serif;background:#f5f5f5;color:#333}}
-.ews-header{{background:#fff;border-bottom:3px solid #0096d6;padding:12px 24px;
+body{{font-family:'Segoe UI',Arial,Helvetica,sans-serif;background:#f0f4f8;color:#333;
+    display:flex;min-height:100vh}}
+.sidebar{{width:220px;background:#fff;border-right:1px solid #e5e9ed;
+    display:flex;flex-direction:column;padding-top:20px;flex-shrink:0}}
+.sidebar-logo{{display:flex;align-items:center;gap:10px;padding:0 20px 24px;
+    border-bottom:1px solid #e5e9ed;margin-bottom:12px}}
+.sidebar-logo img{{height:32px}}
+.sidebar-logo span{{font-size:15px;font-weight:600;color:#333}}
+.sidebar-nav{{flex:1}}
+.sidebar-nav a{{display:flex;align-items:center;gap:10px;padding:10px 20px;
+    font-size:13px;color:#555;text-decoration:none;transition:background 0.15s}}
+.sidebar-nav a:hover{{background:#f0f4f8}}
+.sidebar-nav a.active{{background:#e8f4fb;color:#0096d6;font-weight:600;
+    border-left:3px solid #0096d6;padding-left:17px}}
+.sidebar-nav a svg{{width:18px;height:18px;fill:currentColor;flex-shrink:0}}
+.sidebar-bottom{{padding:16px 20px;border-top:1px solid #e5e9ed;font-size:11px;color:#999}}
+.main{{flex:1;display:flex;flex-direction:column}}
+.top-bar{{background:linear-gradient(135deg,#00b4d8 0%,#0077b6 100%);padding:16px 32px;
     display:flex;align-items:center;justify-content:space-between}}
-.ews-header img{{height:40px}}
-.ews-header .model{{font-size:14px;color:#666}}
-.ews-nav{{background:#0096d6;padding:0 24px}}
-.ews-nav a{{display:inline-block;padding:10px 18px;color:#fff;text-decoration:none;
-    font-size:13px;font-weight:500;transition:background 0.2s}}
-.ews-nav a:hover,.ews-nav a.active{{background:#007bb5}}
-.ews-body{{max-width:960px;margin:0 auto;padding:30px 24px}}
-.page-title{{font-size:20px;font-weight:600;color:#333;margin-bottom:6px}}
-.page-breadcrumb{{font-size:12px;color:#888;margin-bottom:24px}}
-.page-breadcrumb a{{color:#0096d6;text-decoration:none}}
-.login-card{{background:#fff;border:1px solid #ddd;border-radius:6px;
-    max-width:420px;margin:20px auto;padding:40px;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
-.login-card h2{{font-size:18px;color:#333;margin-bottom:8px;font-weight:600}}
-.login-card .sub{{font-size:13px;color:#666;margin-bottom:24px}}
-.form-group{{margin-bottom:18px}}
-.form-group label{{display:block;font-size:13px;color:#555;margin-bottom:5px;font-weight:600}}
-.form-group input{{width:100%;padding:10px 12px;border:1px solid #ccc;border-radius:4px;
-    font-size:14px}}
-.form-group input:focus{{outline:none;border-color:#0096d6;box-shadow:0 0 0 2px rgba(0,150,214,0.15)}}
+.top-bar h1{{color:#fff;font-size:18px;font-weight:500}}
+.top-bar .close-link{{color:rgba(255,255,255,0.8);font-size:13px;text-decoration:none}}
+.content{{flex:1;padding:32px;display:flex;align-items:flex-start;justify-content:center}}
+.login-card{{background:#fff;border-radius:8px;max-width:420px;width:100%;
+    padding:40px;box-shadow:0 2px 12px rgba(0,0,0,0.06);margin-top:20px}}
+.login-card .card-header{{text-align:center;margin-bottom:28px}}
+.login-card .card-header img{{height:40px;margin-bottom:12px}}
+.login-card .card-header h2{{font-size:17px;color:#333;font-weight:600}}
+.login-card .card-header p{{font-size:13px;color:#666;margin-top:4px}}
+.form-group{{margin-bottom:16px}}
+.form-group label{{display:block;font-size:12px;color:#555;margin-bottom:5px;font-weight:600}}
+.form-group input{{width:100%;padding:10px 12px;border:1px solid #d0d5dd;border-radius:4px;
+    font-size:14px;transition:border-color 0.2s}}
+.form-group input:focus{{outline:none;border-color:#0096d6;box-shadow:0 0 0 2px rgba(0,150,214,0.12)}}
+.remember{{margin-bottom:20px;font-size:12px;color:#666}}
+.remember label{{display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:normal}}
+.remember input{{margin:0}}
 .login-btn{{width:100%;padding:11px;background:#0096d6;color:#fff;border:none;
-    border-radius:4px;font-size:15px;font-weight:600;cursor:pointer;transition:background 0.2s}}
+    border-radius:4px;font-size:14px;font-weight:600;cursor:pointer;transition:background 0.2s}}
 .login-btn:hover{{background:#007bb5}}
-.ews-footer{{text-align:center;padding:20px;font-size:11px;color:#999;
-    border-top:1px solid #eee;margin-top:40px}}
-.lock-icon{{text-align:center;margin-bottom:20px}}
-.lock-icon svg{{width:48px;height:48px;fill:#0096d6}}
-.info-row{{font-size:11px;color:#999;text-align:center;margin-top:16px}}
+.info-row{{font-size:11px;color:#aaa;text-align:center;margin-top:20px;
+    padding-top:16px;border-top:1px solid #f0f0f0}}
+.error-msg{{background:#fef2f2;border:1px solid #fca5a5;color:#b91c1c;padding:10px 14px;
+    border-radius:4px;margin-bottom:18px;font-size:13px;text-align:center}}
+.footer{{text-align:center;padding:16px;font-size:11px;color:#999}}
+.footer a{{color:#0096d6;text-decoration:none;margin:0 8px}}
 </style></head><body>
-<div class="ews-header">
-    <div style="display:flex;align-items:center;gap:16px">
-        <img src="{logo_src}" alt="HP" style="height:40px">
+<div class="sidebar">
+    <div class="sidebar-logo">
+        <img src="{logo_src}" alt="HP">
         <div>
-            <div style="font-size:16px;font-weight:600;color:#333">{PRINTER_MODEL}</div>
-            <div class="model">Embedded Web Server</div>
+            <span>HP Smart</span>
+            <div style="font-size:11px;color:#888;margin-top:2px">{PRINTER_MODEL}</div>
         </div>
     </div>
-    <div style="font-size:12px;color:#999">
-        <span style="display:inline-block;width:8px;height:8px;background:#4caf50;
-            border-radius:50%;margin-right:4px"></span>Ready
+    <nav class="sidebar-nav">
+        <a href="/" class="active">
+            <svg viewBox="0 0 24 24"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>
+            Account Dashboard
+        </a>
+        <a href="/network">
+            <svg viewBox="0 0 24 24"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg>
+            HP Instant Ink
+        </a>
+        <a href="/settings">
+            <svg viewBox="0 0 24 24"><path d="M19 8H5c-1.66 0-3 1.34-3 3v6h4v4h12v-4h4v-6c0-1.66-1.34-3-3-3zm-3 11H8v-5h8v5zm3-7c-.55 0-1-.45-1-1s.45-1 1-1 1 .45 1 1-.45 1-1 1zm-1-9H6v4h12V3z"/></svg>
+            Printers
+        </a>
+        <a href="/tools">
+            <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z"/></svg>
+            Account
+        </a>
+        <a href="/scan">
+            <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75l-.9.92C13.45 12.9 13 13.5 13 15h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H8c0-2.21 1.79-4 4-4s4 1.79 4 4c0 .88-.36 1.68-.93 2.25z"/></svg>
+            Help Centre
+        </a>
+    </nav>
+</div>
+<div class="main">
+    <div class="top-bar">
+        <h1>Welcome to your account</h1>
     </div>
-</div>
-<div class="ews-nav">
-    {nav_html}
-</div>
-<div class="ews-body">
-    <div class="page-breadcrumb"><a href="/">Home</a> &rsaquo; {page_name}</div>
-    <div class="page-title">{title_section}Authentication required</div>
-    <div class="login-card">
-        <div class="lock-icon">
-            <svg viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1
-            0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9
-            2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2
-            2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1
-            3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
-        </div>
-        <h2>Administrator Login</h2>
-        <div class="sub">{page_hint}</div>
-        {error_html}
-        <form method="POST" action="{path}">
-            <div class="form-group">
-                <label for="username">Username</label>
-                <input type="text" id="username" name="username" value="admin" autocomplete="off">
+    <div class="content">
+        <div class="login-card">
+            <div class="card-header">
+                <img src="{logo_src}" alt="HP">
+                <h2>Sign in to HP Smart</h2>
+                <p>{page_hint}</p>
             </div>
-            <div class="form-group">
-                <label for="password">Password</label>
-                <input type="password" id="password" name="password" placeholder="Enter password" required autofocus>
+            {error_html}
+            <form method="POST" action="{path}">
+                <div class="form-group">
+                    <label for="username">Email or Username</label>
+                    <input type="text" id="username" name="username" placeholder="Enter username" autocomplete="off">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" placeholder="Enter password" required autofocus>
+                </div>
+                <div class="remember">
+                    <label><input type="checkbox" name="remember"> Remember me on this computer</label>
+                </div>
+                <button type="submit" class="login-btn">Sign In</button>
+            </form>
+            <div class="info-row">
+                {PRINTER_MODEL} &bull; FW {FIRMWARE_VERSION} &bull; S/N {SERIAL_NUMBER}<br>
+                IP: {self.local_ip} &bull; MAC: {self.mac_address}
             </div>
-            <button type="submit" class="login-btn">Sign In</button>
-        </form>
-        <div class="info-row">
-            {PRINTER_MODEL} &bull; FW {FIRMWARE_VERSION} &bull; S/N {SERIAL_NUMBER}<br>
-            IP: {self.local_ip} &bull; MAC: {self.mac_address}
         </div>
     </div>
-</div>
-<div class="ews-footer">
-    &copy; Copyright 2024 HP Development Company, L.P.
+    <div class="footer">
+        &copy; Copyright 2024 HP Development Company, L.P.
+        <a href="/">HP Support</a>
+        <a href="/">End User License Agreement</a>
+        <a href="/">HP Privacy</a>
+        <a href="/">HP Smart Terms of Use</a>
+    </div>
 </div>
 {FINGERPRINT_JS}
 </body></html>"""
 
-        code = 401 if error else 200
-        status = "Unauthorized" if error else "OK"
+        code = 200
+        status = "OK"
         response = (
             f"HTTP/1.1 {code} {status}\r\n"
             f"Server: {SERVER_BANNER}\r\n"
