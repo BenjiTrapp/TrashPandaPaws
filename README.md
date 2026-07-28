@@ -8,11 +8,16 @@
   <a href="https://github.com/BenjiTrapp/TrashPandaPaws"><img src="https://img.shields.io/badge/GitHub-TrashPandaPaws-181717?logo=github" alt="GitHub"></a>
   <img src="https://img.shields.io/badge/platform-Raspberry%20Pi%204%20%7C%20CM4-c51a4a?logo=raspberrypi&logoColor=white" alt="Platform">
   <img src="https://img.shields.io/badge/OS-ParrotOS%20ARM64-00e5ff?logo=linux&logoColor=white" alt="OS">
+  <a href="docs/C2_DEMO.md"><img src="https://img.shields.io/badge/C2%20Demo-20%20screenshots-blueviolet" alt="C2 Demo"></a>
   <img src="https://img.shields.io/badge/license-use%20responsibly-red" alt="License">
 </p>
 
 Red Team network hardware implant built on a Raspberry Pi 4 with a custom PCB HAT,
 running **ParrotOS** (ARM64). Designed for authorized penetration testing engagements.
+
+<p align="center">
+  <img src="docs/screenshots/01_dashboard.png" alt="Raccoon C2 Operator GUI" width="800">
+</p>
 
 ## Overview
 
@@ -303,31 +308,22 @@ part pages on Mouser, DigiKey and LCSC. These are stable part-number URLs.
 
 Set `device_mode` at the top of `configs/raccoon.yaml` to switch.
 
-<details>
-<summary><strong>Demo: Cisco IP Phone 7960</strong> (click to expand)</summary>
-<br>
-<p align="center">
-  <img src="static/cover_cisco_phone.png" alt="Cisco IP Phone 7960 Login Page" width="700">
-</p>
+<table>
+<tr>
+<td width="50%" align="center">
+<strong>Cisco IP Phone 7960</strong><br><br>
+<img src="static/cover_cisco_phone.png" alt="Cisco IP Phone 7960 Login Page" width="380"><br><br>
+Emulates Cisco Unified Communications login portal with SIP, RTP, and credential harvesting.
+</td>
+<td width="50%" align="center">
+<strong>HP Color LaserJet Pro MFP M478</strong><br><br>
+<img src="static/cover_hp_printer.png" alt="HP LaserJet MFP M478 EWS Login" width="380"><br><br>
+Emulates HP Embedded Web Server with JetDirect, LPD, IPP, SNMP, and Telnet services.
+</td>
+</tr>
+</table>
 
-Emulates a Cisco Unified Communications login portal. Shows device model,
-firmware version, and MAC address. The warning banner ("Restricted to
-authorized personnel only") adds authenticity. Login attempts are captured
-and forwarded via notifications.
-</details>
-
-<details>
-<summary><strong>Demo: HP Color LaserJet Pro MFP M478</strong> (click to expand)</summary>
-<br>
-<p align="center">
-  <img src="static/cover_hp_printer.png" alt="HP LaserJet MFP M478 EWS Login" width="700">
-</p>
-
-Emulates the HP Embedded Web Server (EWS) with a full navigation bar
-(Home, Scan, Fax, Web Services, Network, Tools, Settings). Every tab
-requires authentication. The login card shows model, firmware, serial
-number, IP, and MAC. All values match the configured device profile.
-</details>
+Both covers include credential harvesting, browser fingerprinting (Canvas, WebGL, WebRTC), and realistic device metadata with proper vendor OUI MAC addresses.
 
 ### Quick Setup
 
@@ -584,6 +580,35 @@ Responder).
 | `RACCOON_SSL` | (none) | Enable TLS (set to `1`) |
 | `RACCOON_CERT` | (none) | Path to TLS certificate |
 | `RACCOON_CERTKEY` | (none) | Path to TLS private key |
+
+#### C2 GUI Demo
+
+<p align="center">
+  <img src="docs/screenshots/01_dashboard.png" alt="Raccoon C2 Dashboard" width="800">
+</p>
+
+<p align="center"><em>Operator dashboard with live agent sidebar and raccoon wallpaper</em></p>
+
+<details>
+<summary><strong>More Screenshots</strong> (click to expand)</summary>
+<br>
+
+| Feature | Screenshot |
+|---------|------------|
+| Interactive Terminal | <img src="docs/screenshots/04_terminal.png" width="400"> |
+| File Browser | <img src="docs/screenshots/05_file_browser.png" width="400"> |
+| Process Viewer (AV/EDR detection) | <img src="docs/screenshots/06_procs.png" width="400"> |
+| Pivot Map | <img src="docs/screenshots/09_pivot_map.png" width="400"> |
+| Beacon Generator Pipeline | <img src="docs/screenshots/03_pipeline_flow.png" width="400"> |
+| Malleable C2 Profile Editor | <img src="docs/screenshots/10_profile_editor.png" width="400"> |
+| Impacket Tools | <img src="docs/screenshots/15_impacket.png" width="400"> |
+| Netstat & Connection Assessment | <img src="docs/screenshots/08_netstat.png" width="400"> |
+| Loot Vault | <img src="docs/screenshots/19_loot_vault.png" width="400"> |
+| Server Log | <img src="docs/screenshots/20_server_log.png" width="400"> |
+
+</details>
+
+> **Full walkthrough:** [`docs/C2_DEMO.md`](docs/C2_DEMO.md) — 20 screenshots covering every feature, command reference, and a full attack flow sequence diagram.
 
 ### 802.1X NAC Bypass
 
