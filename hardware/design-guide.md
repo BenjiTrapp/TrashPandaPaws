@@ -53,16 +53,17 @@ built-in Ethernet jack. Our HAT connects to this header to extract power.
 
 **SI3402-B Connections:**
 ```
-VC1+ ──→ F1 (500mA PTC) ──→ VDD (pin 1)
-VC1- ──→ VSS (pin 10)
-VC2+ ──→ VDD (pin 1) via D3 (BAT54S)
-VC2- ──→ VSS (pin 10) via D4 (BAT54S)
+VC1+ ──→ F1 (500mA PTC) ──→ VDD_IN (pin 1)
+VC1- ──→ VSS1 (pin 4)
+VC2+ ──→ VDD_IN (pin 1) via D3 (BAT54S)
+VC2- ──→ VSS1 (pin 4) via D4 (BAT54S)
 
-DET    (pin 3) ── R4 (25.5K) ──→ VSS     [Detection signature]
-CLASS  (pin 4) ── R3 (49.9K) ──→ VSS     [Class 0: 0.44-12.95W]
-PWRGD  (pin 7) ──→ TPS54302 EN           [Power good signal]
-GATE   (pin 6) ──→ Q1 Gate (NMOS)        [Inrush current control]
-VDD    (pin 1) ── C3 (100uF) ──→ VSS     [Input bulk cap]
+DET    (pin 2) ── R4 (25.5K) ──→ VSS     [Detection signature]
+RCLASS (pin 3) ── R3 (49.9K) ──→ VSS     [Class 0: 0.44-12.95W]
+PWRGD  (pin 5) ──→ TPS54302 EN           [Power good signal]
+GATE   (pin 9) ──→ Q1 Gate (SI2302CDS)   [Inrush current control]
+VDD_IN (pin 1) ── C3 (100uF) ──→ VSS     [Input bulk cap]
+D2 (SMBJ58A) across VDD_IN/VSS           [TVS overvoltage protection]
 ```
 
 ### 1.2 DC-DC Buck Converter — TPS54302 (U2)
@@ -76,7 +77,7 @@ BST  ── C1 (100nF) to SW
 SW   ── L1 (10uH) ──→ VOUT (5V)
 FB   ── R9/R10 voltage divider from VOUT
       ── R9 (100K) to VOUT
-      ── R10 (22K) to GND
+      ── R10 (19.1K) to GND
       ── FB = VOUT × R10/(R9+R10) = 0.8V reference
 EN   ── PWRGD from SI3402-B
 VOUT ── C11 (22uF) + C12 (22uF) to GND
@@ -86,9 +87,10 @@ GND  ── → Ground plane
 
 **VOUT Calculation:**
 ```
-VOUT = 0.8V × (1 + R9/R10) = 0.8 × (1 + 100K/22K) = 0.8 × 5.545 ≈ 4.44V
-→ Adjust R10 to 19.1K for VOUT = 5.05V
-  VOUT = 0.8 × (1 + 100K/19.1K) = 0.8 × 6.236 = 4.99V ✓
+VOUT = 0.8V × (1 + R9/R10) = 0.8 × (1 + 100K/19.1K) = 0.8 × 6.236 = 4.99V ✓
+
+R9  = 100K (top, from VOUT to FB)
+R10 = 19.1K (bottom, from FB to GND)
 ```
 
 ### 1.3 3.3V LDO — AP2112K-3.3 (U4)
@@ -122,7 +124,7 @@ AVDD33    ── C7 (100nF) to GND   [3.3V Analog]
 DVDD33    ── C8 (100nF) to GND   [3.3V Digital]
 DVDD12    ── Internal LDO output ── C9 (10uF) to GND
 
-XI/XO     ── Y1 (25MHz) ── C13, C14 (10pF load caps)
+XI/XO     ── Y1 (25MHz) ── C13, C14 (10pF load caps each)
 
 SPI_CLK   ──→ U5 pin 6 (CLK)
 SPI_MOSI  ──→ U5 pin 5 (DI)

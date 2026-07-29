@@ -6,7 +6,9 @@ services:
     network_mode: host
     volumes:
       - raccoon-data:/data/raccoon-c2
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
     environment:
+      - DISPLAY=${DISPLAY:-:0}
       - RACCOON_PORT=8443
       - RACCOON_HOST=0.0.0.0
       # - RACCOON_KEY=<base64-aes-256-key>
