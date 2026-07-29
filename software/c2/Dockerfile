@@ -7,6 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc libffi-dev libssl-dev \
         nmap iputils-ping net-tools \
         git pipx \
+        freerdp2-x11 \
+        tigervnc-viewer \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
