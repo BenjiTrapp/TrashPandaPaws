@@ -4,7 +4,7 @@
     {
       "name": "raccoon-c2",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["software/c2/server.py", "--port", "8443"],
+      "runtimeArgs": ["software/c2/server.py", "--port", "8443", "--token", "demo"],
       "port": 8443
     }
   ]

