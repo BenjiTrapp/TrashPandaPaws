@@ -42,22 +42,27 @@ The main view after login. All connected agents are listed in the left sidebar w
 
 ![Dashboard](screenshots/01_dashboard.png)
 
-**Header Bar:**
-- Raccoon C2 logo with server status indicator (green dot = running)
-- Quick-access buttons: Beacon Generator, Loot Vault, Server Log, Notifications, Settings
+### Header Bar
 
-**Agent Sidebar (left):**
-- Agent cards with color-coded status: green (online), yellow (stale), red (offline)
-- Each card shows: agent name, `user@hostname`, architecture, last seen timestamp
-- Auto-refreshes every 3 seconds
+The top bar shows the Raccoon C2 logo with a green server status dot, plus quick-access buttons for Beacon Generator, Loot Vault, Server Log, Notifications, and Settings. Everything is one click away.
 
-**Agent Header (when selected):**
-- Agent name, architecture tag, OS tag
-- `user@host` with PID and uptime
-- Proxy status tag (green if proxy active)
-- C2 Profile tag: purple if Malleable profile active, gray if default
+### Agent Sidebar (left)
 
-**14-button Toolbar:**
+Each agent appears as a card color-coded by status: **green** (online), **yellow** (stale), **red** (offline). Cards display the agent name, `user@hostname`, architecture, and last-seen timestamp. The sidebar auto-refreshes every 3 seconds, so new check-ins appear in real time.
+
+### Agent Header (when selected)
+
+Clicking an agent reveals a detailed header strip:
+
+| Element | What it shows |
+|---------|---------------|
+| **Name + Arch** | Agent name with architecture tag (e.g. `aarch64`) and OS tag |
+| **Identity** | `user@host` with PID and uptime counter |
+| **Proxy Status** | Green tag if the agent is routing through a SOCKS proxy |
+| **C2 Profile** | Purple tag when a Malleable C2 profile is active, gray for default |
+
+### 14-Button Toolbar
+
 | Button | Function |
 |--------|----------|
 | Files | File Browser panel |
@@ -84,20 +89,157 @@ Generate fully configured, multi-layer obfuscated beacon payloads with encryptio
 
 ![Beacon Generator](screenshots/02_beacon_generator.png)
 
-**Configuration Options:**
-- **C2 URL**: Auto-populated callback URL (protocol + host + port)
-- **Encryption Key**: AES-GCM 256-bit (auto-generated or custom, Base64-encoded)
-- **Beacon Interval**: Check-in frequency in seconds
-- **Jitter**: Randomization percentage (0-100%)
-- **Obfuscation Layers**: Slider (1-6 layers of nested zlib + base64 encoding)
-- **Delivery Method**: Inline (copy-paste) or GitHub Gist (auto-delete on first connect)
+### Configuration Options
 
-**Anti-Analysis Features (baked into beacon):**
-- Sandbox detection (VM artifacts, debugger presence)
-- Process name randomization
-- Connection jitter with randomized sleep
+| Option | Description |
+|--------|-------------|
+| **Transport Protocols** | HTTPS, DNS, SMB, QUIC — mix and match with automatic fallback |
+| **Encryption Key** | AES-GCM 256-bit (auto-generated or custom, Base64-encoded) |
+| **Beacon Interval** | Check-in frequency in seconds |
+| **Jitter** | Randomization percentage (0–100%) |
+| **Obfuscation Layers** | Slider from 1 to 6 layers of nested zlib + base64 encoding |
+| **Delivery Method** | Inline (copy-paste) or GitHub Gist (auto-delete on first connect) |
 
-**Pipeline Flow Diagram:**
+### Anti-Analysis Features (baked into every beacon)
+
+Every generated beacon includes built-in evasion that activates before the main loop starts. The beacon checks for sandbox indicators such as VM artifacts and debugger presence, randomizes its own process name, and applies connection jitter with randomized sleep intervals. No operator configuration required — these are always on.
+
+### Transport Protocols
+
+The beacon supports four transport channels that can be enabled independently and combined for resilient C2 communication. Each channel is implemented in pure Python stdlib — no external dependencies.
+
+| Protocol | Port | When to use |
+|----------|------|-------------|
+| **HTTPS** | 443/8443 | Default. Blends into normal web traffic. Supports Malleable C2 profiles for deep traffic shaping. |
+| **DNS** | 53 | Egress-restricted networks. Data exfil over TXT records. Slow but hard to block. |
+| **SMB** | 445 | Internal pivoting. Named-pipe communication between beacons or to an internal C2 relay. |
+| **QUIC** | 4433 | UDP-based, fragmented datagrams. Bypasses proxies and deep packet inspection that only inspect TCP. |
+
+### Protocol-Specific Configuration
+
+| Protocol | Parameters |
+|----------|------------|
+| HTTPS | Callback URL (e.g. `https://c2.example.com:8443/api/v1/beacon`) |
+| DNS | Domain (`c2.example.com`), Resolver IP (`8.8.8.8`) |
+| SMB | Pipe Name (`msrpc_6e2f`), Server IP (parent beacon or C2 relay) |
+| QUIC | Server address + port (`c2.example.com:4433`) |
+
+### Channel Fallback & Prioritization
+
+When multiple protocols are enabled, the beacon tries them in the order they were selected. If the primary channel fails, it falls through to the next available one. This happens on every beacon cycle — a channel that was down can be picked up again on the next iteration.
+
+```mermaid
+flowchart LR
+    BEACON["🦝 Beacon<br/>wakes up"] --> HTTPS{"HTTPS<br/>enabled?"}
+    HTTPS -- yes --> TRY_H["POST to<br/>callback URL"]
+    TRY_H -- "✔ 200 OK" --> EXEC["Process<br/>tasking"]
+    TRY_H -- "✘ timeout" --> DNS
+
+    HTTPS -- no --> DNS{"DNS<br/>enabled?"}
+    DNS -- yes --> TRY_D["TXT query to<br/>c2.example.com"]
+    TRY_D -- "✔ response" --> EXEC
+    TRY_D -- "✘ no answer" --> SMB
+
+    DNS -- no --> SMB{"SMB<br/>enabled?"}
+    SMB -- yes --> TRY_S["Open named pipe<br/>on relay host"]
+    TRY_S -- "✔ data" --> EXEC
+    TRY_S -- "✘ refused" --> QUIC
+
+    SMB -- no --> QUIC{"QUIC<br/>enabled?"}
+    QUIC -- yes --> TRY_Q["UDP datagrams<br/>to C2"]
+    TRY_Q -- "✔ response" --> EXEC
+    TRY_Q -- "✘ no reply" --> FAIL["💤 backoff sleep<br/>+ retry next cycle"]
+
+    QUIC -- no --> FAIL
+
+    style BEACON fill:#c44,stroke:#333,color:#fff
+    style EXEC fill:#4a9,stroke:#333,color:#fff
+    style FAIL fill:#555,stroke:#333,color:#fff
+```
+
+### Example: Mixed-Protocol Scenarios
+
+**Scenario 1 — Internet-facing host (HTTPS + DNS fallback):**
+
+```mermaid
+sequenceDiagram
+    participant B as 🦝 Beacon
+    participant FW as 🔥 Firewall
+    participant C2 as 🎯 Team Server
+
+    B->>FW: HTTPS POST /api/v1/beacon
+    FW->>C2: ✔ allowed (port 443)
+    C2-->>B: tasking (encrypted)
+    Note over B: Normal operation via HTTPS
+
+    B->>FW: HTTPS POST /api/v1/beacon
+    FW--xB: ✘ blocked (proxy down)
+    B->>FW: DNS TXT beacon-id.b.c2.example.com
+    FW->>C2: ✔ DNS allowed (port 53)
+    C2-->>B: tasking via TXT record
+    Note over B: Automatic DNS fallback
+```
+
+**Scenario 2 — Internal pivot (SMB between beacons):**
+
+In this setup, only the border beacon has internet access. Interior beacons communicate via SMB named pipes through the compromised network, forming a chain back to the team server.
+
+```mermaid
+flowchart LR
+    C2["🎯 Team Server<br/>(internet)"] <-->|"HTTPS"| B1["🦝 Beacon 1<br/>DMZ host<br/>(HTTPS + SMB listener)"]
+    B1 <-->|"SMB pipe:<br/>msrpc_6e2f"| B2["🦝 Beacon 2<br/>internal host<br/>(SMB only)"]
+    B2 <-->|"SMB pipe:<br/>msrpc_6e2f"| B3["🦝 Beacon 3<br/>DC / file server<br/>(SMB only)"]
+
+    style C2 fill:#4a9,stroke:#333,color:#fff
+    style B1 fill:#c44,stroke:#333,color:#fff
+    style B2 fill:#c44,stroke:#333,color:#fff
+    style B3 fill:#c44,stroke:#333,color:#fff
+```
+
+**Scenario 3 — Maximum resilience (all four channels):**
+
+Enable all protocols for high-value targets. The beacon cycles through every available channel before sleeping, maximizing the chance of getting tasking through even aggressive network controls.
+
+```mermaid
+flowchart TD
+    B["🦝 Beacon<br/>all 4 protocols enabled"]
+    H["HTTPS<br/>Primary — fast, profiled"]
+    D["DNS<br/>Fallback 1 — slow, stealthy"]
+    S["SMB<br/>Fallback 2 — internal pivot"]
+    Q["QUIC<br/>Fallback 3 — UDP bypass"]
+    OK["✔ Got tasking"]
+    SLEEP["💤 All failed<br/>backoff + retry"]
+
+    B --> H
+    H -->|success| OK
+    H -->|fail| D
+    D -->|success| OK
+    D -->|fail| S
+    S -->|success| OK
+    S -->|fail| Q
+    Q -->|success| OK
+    Q -->|fail| SLEEP
+
+    style B fill:#c44,stroke:#333,color:#fff
+    style H fill:#47a,stroke:#333,color:#fff
+    style D fill:#47a,stroke:#333,color:#fff
+    style S fill:#47a,stroke:#333,color:#fff
+    style Q fill:#47a,stroke:#333,color:#fff
+    style OK fill:#4a9,stroke:#333,color:#fff
+    style SLEEP fill:#555,stroke:#333,color:#fff
+```
+
+### Protocol Implementation Details
+
+**HTTPS** — Standard `urllib` POST with AES-GCM encrypted JSON body. Supports proxy auto-detection (PAC files, environment variables, manual config). When a Malleable C2 Profile is active, the beacon uses profile-defined URIs, headers, and User-Agent strings to mimic legitimate web traffic (e.g. Azure CDN, Slack API).
+
+**DNS** — Raw DNS queries via `socket` (no `dnspython` needed). The agent ID is Base32-encoded into the subdomain (`<id>.b.c2.example.com`). The team server responds with AES-GCM encrypted TXT records. Bandwidth is limited (~200 bytes per query), so DNS is best suited as a keep-alive or fallback channel.
+
+**SMB** — Full SMB2 protocol stack implemented in pure Python (`socket` + `struct`). The beacon negotiates SMB 2.0/2.1, performs anonymous session setup, connects to `IPC$`, and opens a named pipe (default: `msrpc_6e2f`). Data is exchanged via pipe read/write operations. The pipe name is configurable to blend in with legitimate RPC traffic.
+
+**QUIC** — Lightweight UDP-based transport with QUIC-style framing. Payloads are AES-GCM encrypted, fragmented into 1200-byte datagrams with stream IDs for reassembly. Useful in environments where TCP inspection is heavy but UDP is less scrutinized.
+
+### Pipeline Flow Diagram
 
 The generator includes a collapsible visual pipeline showing how profiles integrate:
 
@@ -105,7 +247,7 @@ The generator includes a collapsible visual pipeline showing how profiles integr
 
 ```mermaid
 graph TD
-    BG["🚀 Beacon Generator<br/>URL, key, interval, jitter, obfuscation"]
+    BG["🚀 Beacon Generator<br/>Protocols, key, interval, jitter, obfuscation"]
     PE["🛡 C2 Profile Editor<br/>Syntax highlighting, linter, tutorial"]
     TPL["📄 Template<br/>Azure / CDN preset"]
     BURP["🔍 Burp Import<br/>Paste raw HTTP"]
@@ -129,17 +271,15 @@ graph TD
     style GIST fill:#4a9,stroke:#333,color:#fff
 ```
 
-**Deobfuscation Chain Viewer:**
+### Deobfuscation Chain Viewer
 
-Shows the exact decode pipeline needed to reconstruct the beacon from the obfuscated payload, with platform-specific tabs for Linux, macOS, and Windows.
+Shows the exact decode pipeline needed to reconstruct the beacon from the obfuscated payload, with platform-specific tabs for Linux, macOS, and Windows. Each tab displays the shell one-liner that reverses the encoding layers.
 
-**GitHub Gist Delivery:**
+### GitHub Gist Delivery
 
 ![Gist Delivery](screenshots/02b_beacon_gist.png)
 
-- Creates a private Gist via `gh` CLI
-- One-liner curl command for target deployment
-- Auto-deletes the Gist when the beacon first connects
+The Gist delivery method creates a private GitHub Gist via the `gh` CLI, producing a clean one-liner curl command for target deployment. When the beacon connects for the first time, it automatically deletes the Gist from GitHub, eliminating the payload from the internet.
 
 ![Gist Payload](screenshots/02c_gist_payload.png)
 
@@ -151,17 +291,20 @@ The main terminal area provides a full interactive command interface to the sele
 
 ![Terminal](screenshots/04_terminal.png)
 
-**Terminal Features:**
-- Color-coded output: directories (blue), permissions, IP addresses (cyan), privileged users (red/bold), errors (red), connection states
-- Command history with arrow key navigation (up/down)
-- Tab completion with autocomplete dropdown (commands + path suggestions)
-- Ghost text hints showing command syntax
-- Pending task animations while waiting for results
-- Auto-polling results every 2.5 seconds
+### Terminal Features
 
-**Quick Info Buttons:**
+| Feature | Description |
+|---------|-------------|
+| **Color-coded output** | Directories appear in blue, IP addresses in cyan, privileged users in red/bold, and errors in red |
+| **Command history** | Arrow key navigation (up/down) through previously executed commands |
+| **Tab completion** | Autocomplete dropdown with matching commands and path suggestions |
+| **Ghost text hints** | Translucent syntax hints appear as you type, showing expected arguments |
+| **Task animations** | Spinner animation while waiting for beacon results |
+| **Auto-polling** | Results are fetched every 2.5 seconds until the task completes |
 
-One-click reconnaissance:
+### Quick Info Buttons
+
+One-click reconnaissance commands for immediate situational awareness:
 
 ```
 $ whoami
@@ -182,19 +325,22 @@ Full-featured remote file browser with tree view navigation, file operations, an
 
 ![File Browser](screenshots/05_file_browser.png)
 
-**Layout:**
-- **Tree View** (left): Collapsible directory tree with expand/collapse icons
-- **Directory Listing** (right): Files and folders with metadata columns
+### Layout
 
-**File Details (per entry):**
-- File name with type-based color-coded badges
-- Owner and group
-- Unix permissions string (`-rwxr-xr-x`)
-- Last modified timestamp
-- File size (human-readable)
-- File type detection: `code`, `text`, `image`, `archive`, `binary`, `cert`, `database`
+The panel is split into two regions. The **tree view** on the left shows a collapsible directory hierarchy with expand/collapse icons for quick navigation. The **directory listing** on the right displays files and folders with metadata columns.
 
-**File Operations:**
+### File Details (per entry)
+
+| Column | Content |
+|--------|---------|
+| **Name** | File name with color-coded type badge (`code`, `text`, `image`, `archive`, `binary`, `cert`, `database`) |
+| **Owner / Group** | UNIX owner and group of the file |
+| **Permissions** | Standard UNIX string (e.g. `rwxr-xr-x`) |
+| **Modified** | Last modification timestamp |
+| **Size** | Human-readable file size |
+
+### File Operations
+
 | Action | Description |
 |--------|-------------|
 | Navigate | Click folder to browse into it |
@@ -203,10 +349,9 @@ Full-featured remote file browser with tree view navigation, file operations, an
 | Loot | Flag file for exfiltration |
 | Upload | Drag-and-drop or button upload to current directory |
 
-**Upload:**
-- Click "Upload" button or drag files onto the drop zone
-- Prompted for remote path on the target
-- File transferred as base64-encoded task data
+### Upload
+
+Click the "Upload" button or drag files directly onto the drop zone. The operator is prompted for a remote destination path on the target. The file is transferred as base64-encoded task data within the encrypted C2 channel.
 
 ---
 
@@ -214,38 +359,42 @@ Full-featured remote file browser with tree view navigation, file operations, an
 
 ### Local Process Viewer (`procs` button)
 
-Lists all running processes on the agent with automatic AV/EDR product detection.
+Lists all running processes on the agent with automatic AV/EDR product detection. The beacon runs `ps aux` (Linux/macOS) or `tasklist /v` (Windows) and cross-references every process name against a built-in detection database.
 
 ![Process Viewer](screenshots/06_procs.png)
 
-**Detection Database (30+ products):**
+### Detection Database (30+ products)
 
 | Category | Products Detected |
 |----------|-------------------|
 | **EDR** | CrowdStrike Falcon, SentinelOne, Carbon Black, Cortex XDR, Elastic EDR, Cybereason, Cynet, HarfangLab |
 | **AV** | Windows Defender, Kaspersky, Bitdefender, Sophos, McAfee/Trellix, ESET, Avast, AVG, F-Secure/WithSecure, Symantec SEP, G DATA, Malwarebytes, Panda/WatchGuard, Trend Micro, Acronis |
 | **SIEM/Audit** | Splunk, Sysmon, osquery, Wazuh |
-| **Other** | FortiClient, FortiEDR, Check Point, CylancE, Tanium, Rapid7, Qualys, Ivanti |
+| **Other** | FortiClient, FortiEDR, Check Point, Cylance, Tanium, Rapid7, Qualys, Ivanti |
 
-- Detected products are highlighted with severity badges: **HIGH** (red), **MED** (yellow), **LOW** (green)
-- The beacon's own PID is highlighted for easy identification
-- Results from `ps aux` (Linux/macOS) or `tasklist /v` (Windows) are parsed and cross-referenced
+Detected products are highlighted with severity badges: **HIGH** (red) for EDR solutions that actively block, **MED** (yellow) for products that alert but don't prevent, and **LOW** (green) for monitoring-only tools. The beacon's own PID is also highlighted for easy identification.
 
 ### Remote AV/EDR Enumeration (`AV/EDR` button)
 
-Server-side remote enumeration via Impacket SMB — no beacon interaction needed.
+Server-side remote enumeration via Impacket SMB — no beacon interaction needed. This runs from the C2 server directly against a target host.
 
 ![AV/EDR Enum](screenshots/07_avedr.png)
 
-**Three detection methods:**
-1. **LsarLookupNames** — Unprivileged, queries LSA for known AV service accounts
-2. **Named Pipe Enumeration** — Connects to IPC$ and checks for known AV pipes
-3. **Service Control Manager** — Queries SCM for AV/EDR service names (requires admin)
+### Three Detection Methods
 
-**Input fields:**
-- Target IP
-- Domain, Username, Password (or NTLM hash)
-- Pass-the-Hash toggle
+1. **LsarLookupNames** — Unprivileged technique that queries LSA for known AV service accounts. Works without admin rights and leaves minimal forensic artifacts.
+2. **Named Pipe Enumeration** — Connects to IPC$ and checks for pipes registered by known AV/EDR products. Also unprivileged, but may trigger network-level alerts.
+3. **Service Control Manager** — Queries SCM for AV/EDR service display names and binary paths. Requires local admin or equivalent privileges on the target.
+
+### Input Fields
+
+| Field | Description |
+|-------|-------------|
+| **Target IP** | Host to enumerate |
+| **Domain** | Active Directory domain name |
+| **Username** | Account for authentication |
+| **Password / Hash** | Cleartext password or NTLM hash |
+| **Pass-the-Hash** | Toggle to authenticate with NT hash instead of password |
 
 ---
 
@@ -255,55 +404,65 @@ Detailed network connection analysis with service identification and attack surf
 
 ![Netstat](screenshots/08_netstat.png)
 
-**Summary Stats:**
-- Total connections, listening ports, established connections, unique remote hosts
+### Summary Stats
 
-**Service Identification:**
+The header row shows four counters at a glance: total connections, listening ports, established connections, and unique remote hosts. This gives an immediate read on the target's network footprint.
 
-60+ port-to-service mappings including:
-- Standard services: SSH (22), HTTP (80/443), DNS (53), SMB (445), RDP (3389)
-- Database services: MySQL (3306), PostgreSQL (5432), MSSQL (1433), MongoDB (27017), Redis (6379)
-- Enterprise: LDAP (389/636), Kerberos (88), WinRM (5985/5986)
-- Monitoring: Prometheus (9090), Grafana (3000), Elasticsearch (9200)
+### Service Identification
 
-**Suspicious Port Detection:**
-- Flags uncommon high ports, known backdoor ports, and unusual listeners
-- Highlights connections to unexpected external hosts
+60+ port-to-service mappings are built in, covering:
 
-**Attack Surface Assessment:**
-- Identifies pivot opportunities (internal listeners on high-value ports)
-- Flags potential lateral movement targets
+| Category | Example Ports |
+|----------|---------------|
+| **Standard Services** | SSH (22), HTTP (80/443), DNS (53), SMB (445), RDP (3389) |
+| **Database Services** | MySQL (3306), PostgreSQL (5432), MSSQL (1433), MongoDB (27017), Redis (6379) |
+| **Enterprise** | LDAP (389/636), Kerberos (88), WinRM (5985/5986) |
+| **Monitoring** | Prometheus (9090), Grafana (3000), Elasticsearch (9200) |
+
+### Suspicious Port Detection
+
+The analyzer flags uncommon high ports, known backdoor ports, and unusual listeners. Connections to unexpected external hosts are highlighted, drawing operator attention to potential exfiltration or unauthorized tunnels.
+
+### Attack Surface Assessment
+
+Identified listeners on high-value ports (e.g. RDP, WinRM, SQL) are tagged as pivot opportunities. The panel also flags potential lateral movement targets based on open management ports on neighboring hosts discovered during `netscan`.
 
 ---
 
 ## 7. Pivot Map
 
-Interactive HTML5 Canvas network topology visualization.
+Interactive HTML5 Canvas network topology visualization showing the relationship between C2, beacons, and discovered hosts.
 
 ![Pivot Map](screenshots/09_pivot_map.png)
 
-**Node Types:**
-- **C2 Server** (red): Central node, always visible
-- **Beacon Nodes** (green): Connected agents with hostname labels
-- **Discovered Hosts** (blue): Hosts found via `netscan` or `arptable`
+### Node Types
 
-**Subnet Grouping:**
-- Hosts are grouped into subnet boxes (`10.0.1.0/24`, `192.168.1.0/24`, etc.)
-- Subnet labels with host count
+| Node | Color | Description |
+|------|-------|-------------|
+| **C2 Server** | Red | Central node, always visible at the center |
+| **Beacon Nodes** | Green | Connected agents with hostname labels |
+| **Discovered Hosts** | Blue | Hosts found via `netscan` or `arptable` |
 
-**Interactive Controls:**
-- Click and drag nodes to rearrange
-- Scroll to zoom in/out
-- Hover for tooltips with: IP, ports, banners, OS guess, vendor (from OUI)
-- Animated packet flow along connections (C2 ↔ beacon)
+### Subnet Grouping
 
-**Data Sources:**
-- Agent registration (IP, hostname)
-- `netscan` results (live hosts, open ports, banners)
-- `arptable` results (MAC vendor, neighbor info)
+Hosts are automatically grouped into subnet boxes (`10.0.1.0/24`, `192.168.1.0/24`, etc.) with labels showing the subnet CIDR and host count. This makes large networks scannable at a glance.
 
-**Legend:**
-- Color-coded by node type with connection status indicators
+### Interactive Controls
+
+| Control | Action |
+|---------|--------|
+| **Click + drag** | Rearrange nodes to preferred positions |
+| **Scroll wheel** | Zoom in and out of the topology |
+| **Hover** | Tooltip with IP, open ports, banners, OS guess, MAC vendor (from OUI) |
+| **Animated paths** | Packet flow animation along C2 ↔ beacon connections |
+
+### Data Sources
+
+The map aggregates data from three sources: agent registration (IP, hostname), `netscan` results (live hosts, open ports, banners), and `arptable` results (MAC vendor, neighbor info). New data points appear automatically as agents report back.
+
+### Legend
+
+A color-coded legend in the corner maps node types and connection status indicators, so the operator can read the topology without memorizing the schema.
 
 ---
 
@@ -313,35 +472,41 @@ Full-featured editor for creating and managing Malleable C2 profiles that make b
 
 ![Profile Editor](screenshots/10_profile_editor.png)
 
-**Editor Features:**
-- **Syntax Highlighting**: Keywords (`set`, `http-get`, `http-post`, `client`, `server`, `metadata`), strings, comments
-- **Line Numbers**: Synced scrolling between line numbers and code
-- **Real-Time Linting**: Validates structure, required blocks, field values — returns errors, warnings, info
+### Editor Features
 
-**Top Bar Actions:**
+| Feature | Description |
+|---------|-------------|
+| **Syntax Highlighting** | Keywords (`set`, `http-get`, `http-post`, `client`, `server`, `metadata`), strings, and comments are color-coded |
+| **Line Numbers** | Synced scrolling between line numbers and the code area |
+| **Real-Time Linting** | Validates structure, required blocks, and field values — returns errors, warnings, and info messages |
+
+### Top Bar Actions
+
 | Button | Function |
 |--------|----------|
 | Lint | Validate profile syntax and structure |
 | Save & Apply | Parse profile and activate server-side |
-| Push to Agents | Push active profile to all/selected beacons |
+| Push to Agents | Push active profile to all or selected beacons |
 | Import from Burp | Generate profile from raw HTTP traffic |
 | Library | Open preset profile library |
 | Template | Load annotated starter template |
 | Clear | Reset editor |
 
-**Tutorial Sidebar (6 sections):**
-1. Overview — What Malleable C2 profiles do
-2. Global Options — `sleeptime`, `jitter`, `useragent`, `host_stage`
-3. http-get / http-post — URI sets, client/server blocks
-4. Data Transforms — `base64`, `base64url`, `netbios`, `mask`, `prepend`, `append`
-5. https-certificate — CN, O, C, validity for TLS mimicry
-6. Advanced — `stage`, `process-inject`, `post-ex` blocks
-7. Example profiles with copy-paste
+### Tutorial Sidebar (7 sections)
 
-**Profile Parsing Engine:**
-- Extracts: globals (sleeptime, jitter, useragent), http-get/http-post blocks
-- Per block: URIs, client headers, params, metadata/id/output sub-blocks
-- Each sub-block: transform chain + terminator (header, parameter, print)
+The collapsible sidebar walks operators through profile creation step by step:
+
+1. **Overview** — What Malleable C2 profiles do and why they matter
+2. **Global Options** — `sleeptime`, `jitter`, `useragent`, `host_stage`
+3. **http-get / http-post** — URI sets, client/server blocks, and how data flows
+4. **Data Transforms** — `base64`, `base64url`, `netbios`, `mask`, `prepend`, `append`
+5. **https-certificate** — CN, O, C, validity fields for TLS certificate mimicry
+6. **Advanced** — `stage`, `process-inject`, `post-ex` blocks for fine-grained control
+7. **Example profiles** — Ready-to-use templates with copy-paste support
+
+### Profile Parsing Engine
+
+The server-side parser extracts globals (sleeptime, jitter, useragent), http-get and http-post blocks with their URI sets, client headers, parameters, and metadata/id/output sub-blocks. Each sub-block contains its transform chain and terminator (header, parameter, or print). The parsed profile is then injected into every generated beacon.
 
 ### Example: Slack API Profile
 
@@ -422,15 +587,11 @@ Curated collection of 8 Malleable C2 profiles mimicking legitimate SaaS and CDN 
 | **Outlook/O365** | Office 365 | `Microsoft Office/16.0` | `/api/v2.0/me/messages` | `/api/v2.0/me/sendmail` | SaaS |
 | **Cloudflare Workers** | Edge compute | `Cloudflare-Workers` | `/cdn-cgi/trace` | `/client/v4/zones/` | CDN |
 
-Each profile includes:
-- Realistic HTTP headers matching the mimicked service
-- Proper metadata encoding chains (base64url with service-specific prefixes)
-- Response wrapping that matches the service's JSON schema
-- TLS certificate parameters for SNI mimicry
+Each profile ships with realistic HTTP headers matching the mimicked service, proper metadata encoding chains (base64url with service-specific prefixes like `xoxb-` for Slack), response wrapping that matches the service's JSON schema, and TLS certificate parameters for SNI mimicry.
 
-**Search & Filter:**
-- Real-time search by profile name
-- Category tags: CDN (blue), SaaS (purple), API (green), Web (orange)
+### Search & Filter
+
+The library supports real-time search by profile name and category filter tags: **CDN** (blue), **SaaS** (purple), **API** (green), **Web** (orange).
 
 ---
 
@@ -440,18 +601,20 @@ Generate a Malleable C2 profile directly from captured HTTP traffic in Burp Suit
 
 ![Burp Import](screenshots/12_burp_import.png)
 
-**Workflow:**
+### Workflow
+
 1. Capture a legitimate HTTP request/response in Burp Suite
 2. Copy the raw HTTP request and response
 3. Paste into the import dialog's two text areas
 4. Select where to store beacon metadata, ID, and output:
-   - Header (blend into existing header value)
-   - URI Parameter
-   - Body
+   > **Header** — blend into an existing header value  
+   > **URI Parameter** — append as a query string parameter  
+   > **Body** — embed within the request/response body
 5. Choose encoding: `base64`, `base64url`, `netbios`, `netbiosu`
 6. Click Generate — the profile is created and loaded into the editor
 
-**Use Case:**
+### Use Case
+
 > You observe that the target network allows traffic to `updates.vendor.com`. Capture a legitimate request in Burp, import it, and your beacon traffic becomes indistinguishable from real update checks.
 
 ---
@@ -476,32 +639,19 @@ Per-agent configuration panel for timing, persistence, C2 profile management, an
 | `bashrc` | Linux | Append to `~/.bashrc` |
 | `systemd` | Linux | User-level systemd service |
 
-- **Install**: Select method, click Install
-- **Remove**: Click Remove to clean up persistence artifacts
+Select a method and click **Install** to deploy. Click **Remove** to clean up all persistence artifacts the beacon created.
 
 ### C2 Profile Section
 
-Two information blocks:
+The panel displays two information cards side by side.
 
 **Agent Profile (from beacon telemetry):**
 
-Purple-bordered card showing what the beacon is actively using:
-- User-Agent string
-- Beacon interval and jitter percentage
-- GET URIs (blue tags) the beacon rotates through
-- POST URIs (orange tags) for result delivery
-- GET/POST custom headers (green tags)
-- Metadata encoding chain (e.g., `base64url prepend="xoxb-"`)
-- Beacon ID encoding (e.g., `base64url → parameter channel`)
+A purple-bordered card showing what the beacon is actively using. It displays the User-Agent string, beacon interval and jitter percentage, GET URIs (blue tags) that the beacon rotates through, POST URIs (orange tags) for result delivery, GET/POST custom headers (green tags), the metadata encoding chain (e.g. `base64url prepend="xoxb-"`), and the beacon ID encoding (e.g. `base64url → parameter channel`).
 
 **Last Beacon HTTP Request (from server-side capture):**
 
-Blue-bordered card showing the actual HTTP request received from this beacon:
-- Request path (e.g., `/api/v1/api/users.list`)
-- User-Agent header
-- Timestamp
-- All custom headers
-- Green confirmation: *"Profile is actively applied — beacon is using C2 profile URI ... instead of default paths"*
+A blue-bordered card showing the actual HTTP request received from this beacon. It displays the request path (e.g. `/api/v1/api/users.list`), User-Agent header, timestamp, and all custom headers. A green confirmation message appears when the profile is actively applied — *"Profile is actively applied — beacon is using C2 profile URI ... instead of default paths"*.
 
 ### Dynamic Reconfiguration
 
@@ -509,17 +659,14 @@ Push a new profile to running beacons without redeployment:
 
 1. Select a profile from the library dropdown or open the editor
 2. **Push to Agent** — reconfigure this specific beacon
-3. **Push to All** — fleet-wide reconfiguration (with confirmation)
+3. **Push to All** — fleet-wide reconfiguration (with confirmation dialog)
 4. Beacon receives `reconfig` command on next check-in
 5. Beacon immediately switches: URIs, headers, user-agent, timing
 6. Next telemetry confirms the new profile is active
 
 ### Kill Agent
 
-Red button to terminate the beacon process on the target. Sends a `kill` command that:
-- Removes any installed persistence
-- Cleans up artifacts
-- Terminates the beacon process
+The red "Kill Agent" button sends a `kill` command that terminates the beacon process on the target. Before exiting, the beacon removes any installed persistence mechanisms and cleans up on-disk artifacts.
 
 ---
 
@@ -570,7 +717,7 @@ sequenceDiagram
 
 ## 13. Impacket & NetExec Integration
 
-Server-side tool execution — these tools run on the C2 server, not on the beacon.
+Server-side tool execution — these tools run on the C2 server, not on the beacon. This keeps the agent footprint minimal while giving operators full access to the Impacket and NetExec tool suites.
 
 ### Impacket Tools (16 tools)
 
@@ -600,20 +747,28 @@ Each tool prompts for: target IP, domain, username, password/hash.
 
 ### NetExec (NXC) Scans
 
+![NetExec Scans](screenshots/16_nxc.png)
+
 **Subnet Discovery:**
-- SMB scan — find Windows hosts
-- RDP scan — find RDP-enabled hosts
-- WinRM scan — find WinRM-enabled hosts
-- SSH scan — find SSH servers
-- MSSQL scan — find database servers
+
+| Scan | Finds |
+|------|-------|
+| SMB scan | Windows hosts with SMB open |
+| RDP scan | RDP-enabled hosts |
+| WinRM scan | WinRM-enabled hosts |
+| SSH scan | SSH servers |
+| MSSQL scan | Database servers |
 
 **Per-Host Enumeration:**
-- Shares — list SMB shares with permissions
-- Users — enumerate local users
-- Sessions — list active sessions
-- Password Policy — dump domain password policy
-- Groups — enumerate local/domain groups
-- LDAP Users — enumerate via LDAP
+
+| Module | Description |
+|--------|-------------|
+| Shares | List SMB shares with access permissions |
+| Users | Enumerate local user accounts |
+| Sessions | List active logon sessions |
+| Password Policy | Dump domain password policy |
+| Groups | Enumerate local and domain groups |
+| LDAP Users | Enumerate users via LDAP |
 
 ---
 
@@ -621,18 +776,35 @@ Each tool prompts for: target IP, domain, username, password/hash.
 
 ### Responder (LLMNR/NBT-NS/mDNS Poisoner)
 
-- **Interface**: Network interface to poison on
-- **Mode**: Analyze (passive, observe only) or Poison (active, capture hashes)
-- **Options**: WPAD proxy, Force WPAD auth, Verbose mode
-- Captures NTLMv1/v2 hashes for offline cracking
+![Responder Dialog](screenshots/17_responder.png)
+
+| Setting | Description |
+|---------|-------------|
+| **Interface** | Network interface to poison on |
+| **Mode** | Analyze (passive, observe only) or Poison (active, capture hashes) |
+| **WPAD Proxy** | Serve a malicious WPAD file to redirect HTTP traffic |
+| **Force WPAD Auth** | Force authentication on WPAD requests |
+| **Verbose** | Detailed logging of all poisoned queries |
+
+Responder captures NTLMv1/v2 hashes from poisoned name resolution requests. These hashes can be cracked offline with hashcat or john, or relayed directly using RelayKing.
 
 ### RelayKing (NTLM Relay Audit)
 
-- **Target/DC IP**: Target host and domain controller
-- **Protocols**: SMB, LDAP, LDAPS, HTTP, HTTPS, MSSQL (checkbox selection)
-- **Options**: Audit mode, port scan, NTLMv1 downgrade, generate relay list, coerce all
-- **Threads**: Concurrent connection count
-- Identifies relay opportunities across the network
+![RelayKing Dialog](screenshots/18_relayking.png)
+
+| Setting | Description |
+|---------|-------------|
+| **Target IP** | Host to relay credentials to |
+| **DC IP** | Domain controller for LDAP relay validation |
+| **Protocols** | SMB, LDAP, LDAPS, HTTP, HTTPS, MSSQL (checkbox selection) |
+| **Audit Mode** | Check relay paths without executing attacks |
+| **Port Scan** | Enumerate open relay targets before relaying |
+| **NTLMv1 Downgrade** | Attempt to downgrade authentication for easier cracking |
+| **Generate Relay List** | Automatically build a target list from network scan |
+| **Coerce All** | Trigger authentication from all discovered hosts |
+| **Threads** | Concurrent connection count |
+
+RelayKing identifies relay opportunities across the network, mapping which hosts accept relayed credentials and over which protocols.
 
 ---
 
@@ -640,7 +812,7 @@ Each tool prompts for: target IP, domain, username, password/hash.
 
 Browse, read, and download files from remote SMB shares — **directly from the beacon**, without loading impacket or any other external package. The entire SMB2 protocol stack (negotiate, NTLM auth, tree connect, create, read, query directory) is implemented in pure Python stdlib.
 
-![SMBLoot](screenshots/20_smbloot.png)
+![SMBLoot](screenshots/21_smbloot.png)
 
 ### Why?
 
@@ -721,15 +893,7 @@ python3 smbloot.py 10.0.1.5 admin P@ssw0rd --depth 5 tree SYSVOL
 
 ### GUI Integration
 
-In the Impacket tools panel, a dedicated **"SMBLoot"** section provides one-click access:
-
-- **List Shares** — enumerate all accessible shares
-- **Browse Share (ls)** — directory listing with share/path inputs
-- **Tree (recursive)** — recursive traversal
-- **Read File (cat)** — preview file content in the terminal
-- **Download File (get)** — download and store in Loot Vault
-
-The GUI reuses the target/user/pass fields from the Impacket panel, plus two additional fields for share name and path.
+The Impacket tools panel includes a dedicated **"SMBLoot"** section with one-click access to all five actions: **List Shares**, **Browse Share (ls)**, **Tree (recursive)**, **Read File (cat)**, and **Download File (get)**. The GUI reuses the target/user/pass fields from the Impacket panel, plus two additional fields for share name and path.
 
 ### Technical Details
 
@@ -745,10 +909,12 @@ The GUI reuses the target/user/pass fields from the Impacket panel, plus two add
 
 ### Limitations
 
-- No SMB signing (works against most targets with signing not required)
-- No SMB3 encryption (targets requiring encryption will reject the connection)
-- Maximum file download size: 10MB per file
-- Tree recursion capped at 2000 entries to prevent timeout
+| Constraint | Detail |
+|------------|--------|
+| No SMB signing | Works against most targets with signing not required |
+| No SMB3 encryption | Targets requiring encryption will reject the connection |
+| Max file size | 10MB per download |
+| Tree recursion | Capped at 2000 entries to prevent timeout |
 
 ---
 
@@ -758,16 +924,17 @@ Centralized storage for all exfiltrated files across all agents.
 
 ![Loot Vault](screenshots/19_loot_vault.png)
 
-**Features:**
-- Lists all downloads and loot operations from every agent
-- Files stored in the server's data directory
-- Download button for each file
-- File metadata: agent source, timestamp, size, original path
+### Features
 
-**Exfiltration Methods:**
-- `download <path>` — Download single file via HTTPS
-- `loot <dir>` — Recursively zip and exfiltrate entire directory
-- `exfil <path>` — Exfiltrate via DNS channel (for restricted networks)
+The Loot Vault collects every downloaded and exfiltrated file from all connected agents in one place. Each entry shows the source agent, timestamp, original remote path, and file size. Files are stored in the server's data directory and can be downloaded individually via the download button.
+
+### Exfiltration Methods
+
+| Command | Channel | Description |
+|---------|---------|-------------|
+| `download <path>` | HTTPS | Download a single file through the primary C2 channel |
+| `loot <dir>` | HTTPS | Recursively zip an entire directory and exfiltrate it |
+| `exfil <path>` | DNS | Exfiltrate a file via DNS TXT records (for restricted networks where HTTPS is blocked) |
 
 ---
 
@@ -777,7 +944,7 @@ Centralized storage for all exfiltrated files across all agents.
 
 ![Server Log](screenshots/20_server_log.png)
 
-Filterable event log with category buttons:
+The server log is a filterable event stream accessible from the right-side drawer. It auto-polls every 5 seconds.
 
 | Category | Events |
 |----------|--------|
@@ -790,21 +957,18 @@ Filterable event log with category buttons:
 | **Download** | File downloads completed |
 | **Startup** | Server start events |
 
-Auto-polls every 5 seconds.
-
 ### Notifications
 
-- Bell icon in header with unread count badge
-- Real-time toasts for: agent connect/disconnect/reconnect, task completion, tool results, errors
-- Notification panel dropdown with type, timestamp, message
-- Clear all button
+The bell icon in the header shows an unread count badge. Real-time toast notifications appear for agent connect/disconnect/reconnect, task completion, tool results, and errors. The notification dropdown panel displays each entry with its type, timestamp, and message, plus a "Clear all" button.
 
 ### Server Settings
 
-- **Network**: Listen address, port, SSL status
-- **Security**: Encryption key (reveal/copy), operator token (reveal/copy)
-- **Storage**: Data directory path
-- **Statistics**: Uptime, online/total agents, total tasks dispatched
+| Section | Content |
+|---------|---------|
+| **Network** | Listen address, port, SSL status |
+| **Security** | Encryption key (reveal/copy), operator token (reveal/copy) |
+| **Storage** | Data directory path |
+| **Statistics** | Uptime, online/total agents, total tasks dispatched |
 
 ---
 
@@ -954,5 +1118,5 @@ sequenceDiagram
 | 17 | `17_responder.png` | Responder dialog |
 | 18 | `18_relayking.png` | RelayKing NTLM relay dialog |
 | 19 | `19_loot_vault.png` | Loot Vault with downloaded files |
-| 20 | `20_smbloot.png` | SMBLoot panel with share listing or directory browse |
-| 21 | `21_server_log.png` | Server log drawer with category filters |
+| 20 | `20_server_log.png` | Server log drawer with category filters |
+| 21 | `21_smbloot.png` | SMBLoot panel with share listing or directory browse |

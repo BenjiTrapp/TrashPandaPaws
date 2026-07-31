@@ -8,7 +8,9 @@
   <a href="https://github.com/BenjiTrapp/TrashPandaPaws"><img src="https://img.shields.io/badge/GitHub-TrashPandaPaws-181717?logo=github" alt="GitHub"></a>
   <img src="https://img.shields.io/badge/platform-Raspberry%20Pi%204%20%7C%20CM4-c51a4a?logo=raspberrypi&logoColor=white" alt="Platform">
   <img src="https://img.shields.io/badge/OS-ParrotOS%20ARM64-00e5ff?logo=linux&logoColor=white" alt="OS">
-  <a href="docs/C2_DEMO.md"><img src="https://img.shields.io/badge/C2%20Demo-20%20screenshots-blueviolet" alt="C2 Demo"></a>
+  <a href="docs/C2_DEMO.md"><img src="https://img.shields.io/badge/C2%20Demo-23%20screenshots-blueviolet" alt="C2 Demo"></a>
+  <img src="https://img.shields.io/badge/transport-HTTPS%20%7C%20DNS%20%7C%20SMB%20%7C%20QUIC-blue" alt="Transports">
+  <img src="https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen" alt="No Dependencies">
   <img src="https://img.shields.io/badge/license-use%20responsibly-red" alt="License">
 </p>
 
@@ -25,6 +27,21 @@ The Raccoon Implant is an inline Ethernet tap that bridges two network ports on 
 and captures traffic transparently while providing remote C2 access. The entire device is
 powered via PoE from the upstream switch port. It presents itself as either a Cisco IP Phone
 or an HP network printer to blend into enterprise infrastructure.
+
+### Highlights
+
+| Area | Capability |
+|------|------------|
+| **Hardware** | Custom PoE HAT (SI3402-B + TPS54302), USB-GbE via RTL8153B, 3 build variants (Lite / v1 HAT / v2 CM4) |
+| **Cover Identity** | Cisco IP Phone 7960 (SIP, RTP, HTTP) or HP LaserJet MFP M478 (PJL, LPD, IPP, SNMP, Telnet) |
+| **C2 Transport** | 4 independent channels: HTTPS, DNS, SMB named pipes, QUIC-style UDP — with automatic fallback |
+| **Encryption** | AES-256-GCM on all channels, keys auto-generated or operator-defined |
+| **Beacon** | Pure Python stdlib, zero external dependencies, multi-layer obfuscation (1–6 layers zlib+base64) |
+| **Operator GUI** | Flask-based team server with embedded SPA: terminal, file browser, pivot map, profile editor, 16 Impacket tools |
+| **Malleable C2** | 8 built-in traffic profiles (Slack, Google, Azure CDN, O365, …), Burp Suite import, real-time profile push |
+| **NAC Bypass** | 802.1X EAPOL forwarding with passive discovery and L2/L3 rewriting |
+| **Persistence** | 5 independent autorun layers (systemd, crontab, rc.local, udev, watchdog timer) with PID lock dedup |
+| **SMBLoot** | Pure-Python SMB2 browser for remote share enumeration, file read, and download — no impacket on target |
 
 ## Architecture
 
@@ -130,15 +147,21 @@ graph LR
 | Standalone | Use a USB-C power supply for the Pi and a regular switch uplink |
 
 **Advantages:**
-- No soldering and no custom PCB required. Ready to deploy in 10 minutes.
-- Components are easy to replace individually.
-- The UniFi switch blends in as a normal network device.
-- Well suited for red team training and proof-of-concept demos.
+
+| ✔ | Detail |
+|---|--------|
+| No soldering | No custom PCB required. Ready to deploy in 10 minutes. |
+| Modular | Components are easy to replace individually. |
+| Covert enough | The UniFi switch blends in as a normal network device. |
+| Training ready | Well suited for red team training and proof-of-concept demos. |
 
 **Disadvantages:**
-- Physically larger than v1/v2 because it consists of two separate devices.
-- No integrated PoE for the Pi, so a splitter or USB-C PSU is needed.
-- Less covert than a custom board hidden inside a phone or printer enclosure.
+
+| ✘ | Detail |
+|---|--------|
+| Larger footprint | Two separate devices instead of one integrated board. |
+| No integrated PoE | A splitter or USB-C PSU is needed for the Pi. |
+| Less covert | Not as concealable as a custom board hidden inside a phone or printer enclosure. |
 
 **Quick Start (Lite):**
 
@@ -286,18 +309,19 @@ part pages on Mouser, DigiKey and LCSC. These are stable part-number URLs.
 
 ### Features
 
-- Transparent Ethernet bridge that acts as a zero-config inline tap
-- Selective traffic capture with BPF filters and rotating PCAP output
-- **Two cover identities** selectable via `configs/raccoon.yaml`:
-  - **Cisco IP Phone 7960** emulating SIP, RTP, and an HTTP admin interface
-  - **HP Color LaserJet Pro MFP M478** emulating HTTP (401), JetDirect/PJL (9100), LPD (515), CUPS/IPP (631), SNMP (161), and Telnet (23)
-- **802.1X NAC bypass** using EAPOL forwarding, passive discovery, and ebtables/iptables L2/L3 rewriting
-- **Remote access** via SSH reverse tunnel (autossh) and VNC (headless x11vnc), both independently configurable
-- Credential capture from HTTP Basic Auth and Telnet login attempts
-- C2 beacon over DNS and HTTPS with jittered callbacks
-- Captured data exfiltration via DNS tunneling or HTTPS
-- Watchdog and systemd auto-recovery
-- Full Cisco IOS-style logging
+| Category | Feature |
+|----------|---------|
+| **Network** | Transparent Ethernet bridge acting as a zero-config inline tap |
+| **Capture** | Selective traffic capture with BPF filters and rotating PCAP output |
+| **Cover: Cisco** | Cisco IP Phone 7960 emulating SIP, RTP, and an HTTP admin interface |
+| **Cover: HP** | HP Color LaserJet Pro MFP M478 emulating HTTP (401), JetDirect/PJL (9100), LPD (515), CUPS/IPP (631), SNMP (161), and Telnet (23) |
+| **NAC Bypass** | 802.1X bypass via EAPOL forwarding, passive discovery, and ebtables/iptables L2/L3 rewriting |
+| **Remote Access** | SSH reverse tunnel (autossh) and VNC (headless x11vnc), independently configurable |
+| **Credential Capture** | HTTP Basic Auth and Telnet login attempts |
+| **C2 Beacon** | Multi-channel beacon over HTTPS, DNS, SMB, and QUIC with jittered callbacks |
+| **Exfiltration** | Data exfil via DNS tunneling or HTTPS |
+| **Reliability** | Watchdog and systemd auto-recovery with 5 independent persistence layers |
+| **Logging** | Full Cisco IOS-style logging |
 
 ### Cover Modes
 
@@ -399,12 +423,14 @@ The PID lock file prevents duplicate instances. Whichever layer starts first hol
 
 ### Why ParrotOS?
 
-- Pre-installed security tools (scapy, tcpdump, nmap, aircrack, john, etc.)
-- Hardened Debian base with AppArmor profiles
-- Smaller attack surface than Kali (lighter desktop options)
-- Official ARM64 images for Raspberry Pi 4
-- `macchanger` included for boot-time MAC spoofing
-- Familiar `apt` package management
+| Reason | Detail |
+|--------|--------|
+| Pre-installed tools | scapy, tcpdump, nmap, aircrack, john, hashcat, and more |
+| Hardened base | Debian base with AppArmor profiles |
+| Lighter than Kali | Smaller attack surface with lighter desktop options |
+| ARM64 support | Official images for Raspberry Pi 4 |
+| MAC spoofing | `macchanger` included for boot-time MAC spoofing |
+| Package management | Familiar `apt` ecosystem |
 
 ### C2: Sliver Integration
 
@@ -508,6 +534,74 @@ graph LR
 | Pivot View | Discover and enumerate hosts on adjacent subnets |
 | Server Logs | Global server log viewer with filtering (accessible without active agent) |
 
+#### Transport Protocols
+
+The beacon supports four independent C2 transport channels, all implemented in pure Python stdlib with zero external dependencies. Multiple protocols can be enabled simultaneously; the beacon tries them in order and falls through to the next on failure.
+
+```mermaid
+flowchart LR
+    B["🦝 Beacon"] --> HTTPS["HTTPS<br/>urllib POST<br/>port 443/8443"]
+    HTTPS -->|fail| DNS["DNS<br/>raw socket TXT<br/>port 53"]
+    DNS -->|fail| SMB["SMB<br/>named pipe IPC$<br/>port 445"]
+    SMB -->|fail| QUIC["QUIC-style<br/>UDP datagrams<br/>port 4433"]
+    QUIC -->|fail| SLEEP["💤 backoff"]
+
+    HTTPS -->|success| OK["✔ tasking"]
+    DNS -->|success| OK
+    SMB -->|success| OK
+    QUIC -->|success| OK
+
+    style B fill:#c44,stroke:#333,color:#fff
+    style OK fill:#4a9,stroke:#333,color:#fff
+    style SLEEP fill:#555,stroke:#333,color:#fff
+```
+
+| Protocol | Implementation | Best for |
+|----------|---------------|----------|
+| **HTTPS** | `urllib` POST with AES-GCM body. Supports Malleable C2 profiles and proxy auto-detection (PAC, env vars). | Default. Blends into normal web traffic. |
+| **DNS** | Raw DNS queries via `socket`. Agent ID Base32-encoded into subdomain, tasking via encrypted TXT records. ~200 bytes/query. | Egress-restricted networks. Hard to block. |
+| **SMB** | Full SMB2 stack (`socket` + `struct`). Negotiate → anonymous session → IPC$ tree connect → named pipe I/O. Configurable pipe name. | Internal pivoting between beacons. |
+| **QUIC** | UDP with QUIC-style framing. AES-GCM encrypted, fragmented into 1200-byte datagrams with stream IDs for reassembly. | Bypassing TCP-only DPI and proxies. |
+
+#### Malleable C2 Profiles
+
+The team server includes a full Malleable C2 profile system that reshapes beacon traffic to mimic legitimate web services. Profiles control URIs, headers, User-Agent strings, metadata encoding chains, and TLS certificate parameters.
+
+| Capability | Detail |
+|------------|--------|
+| **8 Built-in Profiles** | Amazon CDN, Slack API, Google APIs, OneDrive Sync, jQuery CDN, GitHub API, Outlook/O365, Cloudflare Workers |
+| **Profile Editor** | Syntax highlighting, real-time linting, and a 7-section tutorial sidebar |
+| **Burp Suite Import** | Generate profiles from captured HTTP traffic — paste raw request/response and choose encoding |
+| **Live Push** | Push a new profile to running beacons without redeployment. Beacon switches URIs, headers, and timing on next check-in. |
+| **Verification** | Server captures every beacon HTTP request and confirms profile is actively applied (no Wireshark needed) |
+
+#### Beacon Generator
+
+The GUI-based beacon generator produces fully configured, multi-layer obfuscated payloads:
+
+| Option | Description |
+|--------|-------------|
+| **Transport Selection** | Enable any combination of HTTPS, DNS, SMB, QUIC with per-protocol configuration |
+| **Encryption** | AES-256-GCM with auto-generated or custom Base64 key |
+| **Obfuscation** | 1–6 layers of nested zlib + base64 encoding with randomized variable names |
+| **Anti-Analysis** | Sandbox detection (VM artifacts, debugger), process name randomization, jittered sleep |
+| **Delivery** | Inline (copy-paste one-liner) or GitHub Gist (private, auto-deletes on first beacon connect) |
+| **Profile Injection** | Active Malleable C2 profile is baked into the payload at generation time |
+
+#### SMBLoot (Pure-Python SMB2 Browser)
+
+Browse, read, and download files from remote SMB shares directly from the beacon, without loading impacket or any other package on the target. The entire SMB2 protocol stack (negotiate, NTLMv2 auth, tree connect, create, read, query directory) is implemented with only `socket`, `struct`, `hashlib`, and `hmac`.
+
+| Action | Command |
+|--------|---------|
+| List shares | `smbloot <host> <user> <pass> shares` |
+| Browse directory | `smbloot <host> <user> <pass> ls <share> [path]` |
+| Read file | `smbloot <host> <user> <pass> cat <share> <path>` |
+| Download file | `smbloot <host> <user> <pass> get <share> <path>` |
+| Recursive tree | `smbloot <host> <user> <pass> tree <share> [path]` |
+
+Pass-the-Hash is supported via LM:NT or bare NT hash format.
+
 **Integrated Offensive Tools:**
 
 | Tool | Purpose | Integration |
@@ -601,14 +695,19 @@ Responder).
 | Pivot Map | <img src="docs/screenshots/09_pivot_map.png" width="400"> |
 | Beacon Generator Pipeline | <img src="docs/screenshots/03_pipeline_flow.png" width="400"> |
 | Malleable C2 Profile Editor | <img src="docs/screenshots/10_profile_editor.png" width="400"> |
+| Profile Library | <img src="docs/screenshots/11_profile_library.png" width="400"> |
+| Beacon Config & Persistence | <img src="docs/screenshots/13_beacon_config.png" width="400"> |
 | Impacket Tools | <img src="docs/screenshots/15_impacket.png" width="400"> |
+| Responder | <img src="docs/screenshots/17_responder.png" width="400"> |
+| RelayKing NTLM Relay | <img src="docs/screenshots/18_relayking.png" width="400"> |
+| SMBLoot | <img src="docs/screenshots/21_smbloot.png" width="400"> |
 | Netstat & Connection Assessment | <img src="docs/screenshots/08_netstat.png" width="400"> |
 | Loot Vault | <img src="docs/screenshots/19_loot_vault.png" width="400"> |
 | Server Log | <img src="docs/screenshots/20_server_log.png" width="400"> |
 
 </details>
 
-> **Full walkthrough:** [`docs/C2_DEMO.md`](docs/C2_DEMO.md) — 20 screenshots covering every feature, command reference, and a full attack flow sequence diagram.
+> **Full walkthrough:** [`docs/C2_DEMO.md`](docs/C2_DEMO.md) — 20 sections covering every feature, command reference, Mermaid diagrams, and a full attack flow sequence diagram.
 
 ### 802.1X NAC Bypass
 
@@ -744,10 +843,7 @@ device_mode: "cisco_phone"    # or "hp_printer"
 | Cisco IP Phone 7960 | `cisco_phone` | VoIP/UC environments, conference rooms | HTTP login page, SIP (INVITE/OPTIONS/REGISTER), RTP echo |
 | HP LaserJet MFP M478 | `hp_printer` | General offices with network printers | HP EWS login, JetDirect/PJL, LPD, IPP/CUPS, SNMP (BER), Telnet |
 
-Both covers include:
-- **Credential harvesting** that captures login attempts and forwards them via notifications
-- **Browser fingerprinting** using JavaScript-based recon covering Canvas, WebGL/GPU, WebRTC local IP, screen resolution, timezone, installed plugins, and hardware concurrency
-- **Realistic device metadata** with MAC addresses from real vendor OUI ranges and proper protocol responses
+Both covers include **credential harvesting** that captures login attempts and forwards them via notifications, **browser fingerprinting** using JavaScript-based recon covering Canvas, WebGL/GPU, WebRTC local IP, screen resolution, timezone, installed plugins, and hardware concurrency, plus **realistic device metadata** with MAC addresses from real vendor OUI ranges and proper protocol responses.
 
 Tune service ports per cover in the same file:
 
@@ -861,6 +957,7 @@ graph LR
             BEACON_SA["beacon_standalone.py"]
             EXFIL_PY["exfil.py"]
             SERVER_PY["server.py<br/>Team Server + GUI"]
+            SMBLOOT_PY["smbloot.py<br/>Pure-Python SMB2"]
             DOCKER["Dockerfile<br/>+ docker-compose.yml"]
         end
         NAC_PY["nac_bypass.py"]
