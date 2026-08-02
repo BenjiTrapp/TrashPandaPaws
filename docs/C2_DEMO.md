@@ -32,7 +32,6 @@
 17. [Server Log & Notifications](#17-server-log--notifications)
 18. [Full Attack Flow](#18-full-attack-flow)
 19. [Command Reference](#19-command-reference)
-20. [Screenshots Checklist](#20-screenshots-checklist)
 
 ---
 
@@ -1088,35 +1087,3 @@ sequenceDiagram
 |---------|-------------|
 | `reconfig` | Push new C2 profile config (triggered via GUI) |
 | `lsjson` | JSON directory listing (used by File Browser) |
-
----
-
-## 20. Screenshots Checklist
-
-> **To complete this demo**, take the following screenshots and save them in `docs/screenshots/`:
-
-| # | File | What to capture |
-|---|------|-----------------|
-| 1 | `01_dashboard.png` | Main dashboard with 1+ online agents, sidebar visible |
-| 2 | `02_beacon_generator.png` | Beacon generator dialog with inline payload |
-| 2b | `02b_beacon_gist.png` | Beacon generator with GitHub Gist delivery |
-| 2c | `02c_gist_payload.png` | Raw Gist payload on GitHub |
-| 3 | `03_pipeline_flow.png` | Expanded pipeline flow diagram |
-| 4 | `04_terminal.png` | Terminal with command output (e.g. `ls` or `shell` result) |
-| 5 | `05_file_browser.png` | File browser with tree view + directory listing |
-| 6 | `06_procs.png` | Process viewer with AV/EDR detection badges |
-| 7 | `07_avedr.png` | Remote AV/EDR enumeration dialog |
-| 8 | `08_netstat.png` | Netstat panel with connection table |
-| 9 | `09_pivot_map.png` | Pivot map with C2 + beacon + discovered hosts |
-| 10 | `10_profile_editor.png` | C2 Profile Editor with Slack profile loaded |
-| 11 | `11_profile_library.png` | Profile library grid with search |
-| 12 | `12_burp_import.png` | Burp Suite import dialog |
-| 13 | `13_beacon_config.png` | Beacon Config panel (persistence + C2 profile) |
-| 14 | `14_profile_verification.png` | "Last Beacon HTTP Request" with green confirmation |
-| 15 | `15_impacket.png` | Impacket tools dropdown menu |
-| 16 | `16_nxc.png` | NetExec scans dropdown menu |
-| 17 | `17_responder.png` | Responder dialog |
-| 18 | `18_relayking.png` | RelayKing NTLM relay dialog |
-| 19 | `19_loot_vault.png` | Loot Vault with downloaded files |
-| 20 | `20_server_log.png` | Server log drawer with category filters |
-| 21 | `21_smbloot.png` | SMBLoot panel with share listing or directory browse |
