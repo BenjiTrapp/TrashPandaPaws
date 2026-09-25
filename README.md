@@ -191,6 +191,19 @@ sudo reboot
 Full BOM: [`hardware/bom.csv`](hardware/bom.csv)
 PCB Design: [`hardware/kicad/`](hardware/kicad/) (Schematic + PCB, KiCad 10)
 
+> [!WARNING]
+> **The v1 HAT hardware is at concept stage and is not manufacturable as-is.**
+> A design audit on 2026-09-24 found that the schematic carries no usable
+> connectivity, the board is unrouted, and the PoE front end is built around a
+> part that cannot supply enough power for a Pi 4 with a USB peripheral. One
+> documented connection would destroy the TPS54302 on power-up. Do not send
+> these files to a fab house. The full findings, corrections applied so far and
+> the open decisions are in
+> [`hardware/OPEN_QUESTIONS.md`](hardware/OPEN_QUESTIONS.md).
+>
+> The **Lite** variant above uses only off-the-shelf parts and is the working
+> build today.
+
 <details>
 <summary><strong>PCB Layout</strong> (click to expand)</summary>
 <br>
@@ -277,7 +290,7 @@ part pages on Mouser, DigiKey and LCSC. These are stable part-number URLs.
 | Part | MPN | Description | Distributor Links |
 |------|-----|-------------|-------------------|
 | PoE Transformer | 750342460 | Flyback 48V:5V | [Mouser](https://www.mouser.com/c/?q=750342460) |
-| RJ45 + Magnetics | HR911105A | 10/100/1000, THT | [LCSC](https://www.lcsc.com/search?q=HR911105A) |
+| RJ45 + Magnetics | HR911105A | ⚠ **10/100 only — not gigabit**, see [`OPEN_QUESTIONS.md`](hardware/OPEN_QUESTIONS.md) item 4 | [LCSC](https://www.lcsc.com/search?q=HR911105A) |
 | GPIO Header | SSW-120-02-G-D | 2x20 2.54mm, THT | [Mouser](https://www.mouser.com/c/?q=SSW-120-02-G-D) · [DigiKey](https://www.digikey.com/en/products/filter?keywords=SSW-120-02-G-D) |
 | USB-A Male | USB 3.0 Type-A Male | SMD, to Pi USB port | [Mouser](https://www.mouser.com/c/?q=USB+3.0+type+A+male+SMD) |
 | Schottky Diode | MBRS340T3G | 40V 3A, SMA | [Mouser](https://www.mouser.com/c/?q=MBRS340T3G) |
