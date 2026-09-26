@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "raccoon")(type "KiCad")(uri "${KIPRJMOD}/raccoon.kicad_sym")(options "")(descr "Raccoon Tap project symbols"))
+)

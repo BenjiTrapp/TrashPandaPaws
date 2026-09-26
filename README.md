@@ -40,6 +40,7 @@ or an HP network printer to blend into enterprise infrastructure.
 | **Operator GUI** | Flask-based team server with embedded SPA: terminal, file browser, pivot map, profile editor, 16 Impacket tools |
 | **Malleable C2** | 8 built-in traffic profiles (Slack, Google, Azure CDN, O365, …), Burp Suite import, real-time profile push |
 | **NAC Bypass** | 802.1X EAPOL forwarding with passive discovery and L2/L3 rewriting |
+| **Egress Proxy** | Auto-discovery (env, registry, PAC/WPAD) plus pure-stdlib NTLMv2 proxy authentication via loopback relay |
 | **Persistence** | 5 independent autorun layers (systemd, crontab, rc.local, udev, watchdog timer) with PID lock dedup |
 | **SMBLoot** | Pure-Python SMB2 browser for remote share enumeration, file read, and download — no impacket on target |
 
@@ -190,6 +191,19 @@ sudo reboot
 Full BOM: [`hardware/bom.csv`](hardware/bom.csv)
 PCB Design: [`hardware/kicad/`](hardware/kicad/) (Schematic + PCB, KiCad 10)
 
+> [!WARNING]
+> **The v1 HAT hardware is at concept stage and is not manufacturable as-is.**
+> A design audit on 2026-09-24 found that the schematic carries no usable
+> connectivity, the board is unrouted, and the PoE front end is built around a
+> part that cannot supply enough power for a Pi 4 with a USB peripheral. One
+> documented connection would destroy the TPS54302 on power-up. Do not send
+> these files to a fab house. The full findings, corrections applied so far and
+> the open decisions are in
+> [`hardware/OPEN_QUESTIONS.md`](hardware/OPEN_QUESTIONS.md).
+>
+> The **Lite** variant above uses only off-the-shelf parts and is the working
+> build today.
+
 <details>
 <summary><strong>PCB Layout</strong> (click to expand)</summary>
 <br>
@@ -276,7 +290,7 @@ part pages on Mouser, DigiKey and LCSC. These are stable part-number URLs.
 | Part | MPN | Description | Distributor Links |
 |------|-----|-------------|-------------------|
 | PoE Transformer | 750342460 | Flyback 48V:5V | [Mouser](https://www.mouser.com/c/?q=750342460) |
-| RJ45 + Magnetics | HR911105A | 10/100/1000, THT | [LCSC](https://www.lcsc.com/search?q=HR911105A) |
+| RJ45 + Magnetics | HR911105A | ⚠ **10/100 only — not gigabit**, see [`OPEN_QUESTIONS.md`](hardware/OPEN_QUESTIONS.md) item 4 | [LCSC](https://www.lcsc.com/search?q=HR911105A) |
 | GPIO Header | SSW-120-02-G-D | 2x20 2.54mm, THT | [Mouser](https://www.mouser.com/c/?q=SSW-120-02-G-D) · [DigiKey](https://www.digikey.com/en/products/filter?keywords=SSW-120-02-G-D) |
 | USB-A Male | USB 3.0 Type-A Male | SMD, to Pi USB port | [Mouser](https://www.mouser.com/c/?q=USB+3.0+type+A+male+SMD) |
 | Schottky Diode | MBRS340T3G | 40V 3A, SMA | [Mouser](https://www.mouser.com/c/?q=MBRS340T3G) |
@@ -587,6 +601,66 @@ The GUI-based beacon generator produces fully configured, multi-layer obfuscated
 | **Anti-Analysis** | Sandbox detection (VM artifacts, debugger), process name randomization, jittered sleep |
 | **Delivery** | Inline (copy-paste one-liner) or GitHub Gist (private, auto-deletes on first beacon connect) |
 | **Profile Injection** | Active Malleable C2 profile is baked into the payload at generation time |
+| **Egress Proxy** | Proxy mode (auto / manual / direct) and optional NTLM credentials baked into the payload |
+
+#### Egress Proxy & NTLM Authentication
+
+Enterprise networks rarely allow direct outbound connections. The beacon discovers
+and uses the host's proxy automatically, and can authenticate against proxies that
+demand NTLM.
+
+| Mode | Behaviour |
+|------|-----------|
+| `auto` | Discover the proxy from environment variables, the Windows registry, GNOME/KDE settings, macOS `scutil`, or PAC/WPAD. Falls back to a direct connection. |
+| `manual` | Always use the configured proxy URL. |
+| `none` | Force a direct connection and ignore all environment proxy settings. |
+
+**NTLM proxy authentication:** `urllib` (and WinINet) cannot perform NTLM proxy
+auth when the account lives in a different AD domain than the proxy. The beacon
+solves this with a loopback CONNECT relay: it listens on `127.0.0.1` on a random
+port, performs the full NTLMv2 handshake against the upstream proxy on a single
+keep-alive connection, then bridges the raw TCP tunnel.
+
+```mermaid
+graph LR
+    B["🦝 Beacon<br/>urllib"] -->|"CONNECT via<br/>127.0.0.1:random"| RELAY["NTLM Relay<br/>(in-process)"]
+    RELAY -->|"1. CONNECT (no auth)"| PX["Corporate Proxy<br/>(NTLM required)"]
+    PX -->|"2. 407 + NTLM offer"| RELAY
+    RELAY -->|"3. Type 1 negotiate"| PX
+    PX -->|"4. 407 + Type 2 challenge"| RELAY
+    RELAY -->|"5. Type 3 authenticate"| PX
+    PX -->|"6. 200 Established"| RELAY
+    RELAY -->|"raw TCP tunnel"| SRV["C2 Team Server"]
+
+    style B fill:#c44,stroke:#333,color:#fff
+    style RELAY fill:#fa0,stroke:#333,color:#000
+    style PX fill:#888,stroke:#333,color:#fff
+    style SRV fill:#47a,stroke:#333,color:#fff
+```
+
+The entire NTLMv2 implementation (including MD4, which `hashlib` does not provide)
+is pure stdlib, consistent with the rest of the beacon. Credentials accept
+`DOMAIN\user`, `user@domain`, or a separate `domain` field. The workstation name
+defaults to the target's real hostname rather than a static string.
+
+```yaml
+c2:
+  proxy:
+    mode: "auto"          # auto | manual | none
+    url: ""               # used when mode is manual
+    ntlm:
+      enabled: true
+      host: ""            # empty = reuse the auto-discovered proxy
+      port: 8080
+      domain: "CORP"      # or inline as "CORP\\alice" in username
+      username: "alice"
+      password: "s3cret"
+      workstation: ""     # empty = target hostname
+```
+
+Configurable via `configs/raccoon.yaml` for the implant, or per-payload in the
+GUI beacon generator. Use the `proxyinfo` beacon command to confirm which proxy
+and identity are in use at runtime.
 
 #### SMBLoot (Pure-Python SMB2 Browser)
 

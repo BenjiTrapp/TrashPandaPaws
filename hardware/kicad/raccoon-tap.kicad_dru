@@ -1,0 +1,17 @@
+(version 1)
+
+# Fine-pitch packages cannot meet netclass clearances between their OWN adjacent
+# pads - that spacing is fixed by the package, not by the layout. U3 is a QFN-40
+# on 0.40mm pitch, so pad-to-pad gaps are around 0.15mm and the exposed pad sits
+# closer still, while the Power netclass asks for 0.30mm.
+#
+# This relaxes clearance only BETWEEN PADS OF THE SAME FOOTPRINT. Clearance from
+# U3's pads to anything else on the board keeps the full netclass value, so no
+# board-level rule is weakened.
+#
+# Note on syntax: "A.Fp_Reference" silently matches nothing in KiCad 10 - it was
+# tried first and left all 78 violations in place. "A.memberOfFootprint()" is the
+# working accessor.
+(rule "intra-footprint pad clearance on fine-pitch parts"
+	(condition "A.memberOfFootprint('U3') && B.memberOfFootprint('U3')")
+	(constraint clearance (min 0.1mm)))
