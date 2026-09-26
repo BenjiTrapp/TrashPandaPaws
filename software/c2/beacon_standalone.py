@@ -125,6 +125,7 @@ def main():
                 "beacon_interval_seconds": c2_cfg.get("beacon_interval_seconds", 300),
                 "jitter_percent": c2_cfg.get("jitter_percent", 20),
                 "encryption_key": c2_cfg.get("encryption_key", ""),
+                "proxy": c2_cfg.get("proxy", {}),
                 "https": fallback_cfg.get("https", {}),
                 "dns": fallback_cfg.get("dns", {}),
             }

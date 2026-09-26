@@ -1,32 +1,18 @@
-Reference,Quantity,Value,Package,Part Number,Description,Supplier,Est. Cost (USD)
-U1,1,SI3402-B,QFN-20,SI3402-B-FS,IEEE 802.3af PoE PD Controller,Mouser,3.50
-U2,1,TPS54302,SOT-23-6,TPS54302DDCR,3A 28V Input Step-Down Converter,Mouser,1.80
-U3,1,RTL8153B-VB-CG,QFN-48,RTL8153B-VB-CG,USB 3.0 to Gigabit Ethernet Controller,LCSC,4.20
-U4,1,AP2112K-3.3,SOT-23-5,AP2112K-3.3TRG1,3.3V LDO Regulator 600mA,Mouser,0.45
-U5,1,25Q16,SOP-8,W25Q16JVSSIQ,16Mbit SPI Flash (RTL8153B firmware),LCSC,0.60
-Y1,1,25MHz,3215,25MHz Crystal,Crystal Oscillator for RTL8153B,LCSC,0.30
-T1,1,750342460,SMD,750342460,PoE Flyback Transformer 48V:5V,Mouser,4.50
-D1,1,MBRS340,SMA,MBRS340T3G,Schottky Diode 40V 3A,Mouser,0.40
-D2,1,TVS 58V,SMA,SMBJ58A,TVS Diode 58V (PoE protection),Mouser,0.35
-D3-D4,2,BAT54S,SOT-23,BAT54S-7-F,Dual Schottky Diode (PoE bridge),Mouser,0.20
-L1,1,10uH,1210,SRN6045TA-100M,Power Inductor 10uH 3A,Mouser,0.80
-L2,1,4.7uH,0805,LQM21FN4R7M,Inductor 4.7uH (RTL8153B),LCSC,0.15
-J1,1,2x20 2.54mm,THT,SSW-120-02-G-D,40-pin GPIO Header (Pi HAT),Mouser,2.50
-J2,1,RJ45+Magnetics,THT,HR911105A,RJ45 w/ Integrated Magnetics 10/100/1000,LCSC,2.80
-J3,1,USB-A Male,SMD,USB-AM-S-X-X-TH,USB 3.0 Type-A Male Connector (to Pi),Mouser,0.90
-C1-C2,2,10uF,0805,CL21A106KOQNNNG,10uF 25V X5R Capacitor,LCSC,0.10
-C3-C4,2,100uF,Electrolytic,UVR1H101MDD1TD,100uF 50V Electrolytic (PoE input),Mouser,0.30
-C5-C10,6,100nF,0402,CL05B104KO5NNNC,100nF Decoupling Capacitor,LCSC,0.02
-C11-C12,2,22uF,0805,CL21A226MQQNNNG,22uF 10V (5V output filter),LCSC,0.08
-C13-C14,2,10pF,0402,CL05C100JB5NNNC,10pF Crystal Load Caps (25MHz Y1),LCSC,0.02
-Q1,1,SI2302CDS,SOT-23,SI2302CDS-T1-GE3,N-MOSFET 20V 2.6A (PoE inrush control),Mouser,0.35
-R1-R2,2,75R,0402,RC0402FR-0775RL,75 Ohm Ethernet Termination,LCSC,0.02
-R3,1,49.9K,0402,RC0402FR-0749K9L,49.9K PoE Classification,LCSC,0.02
-R4,1,25.5K,0402,RC0402FR-0725K5L,25.5K PoE Detection Signature,LCSC,0.02
-R5-R6,2,10K,0402,RC0402FR-0710KL,10K Pull-up Resistors,LCSC,0.02
-R7-R8,2,1K,0402,RC0402FR-071KL,1K LED Current Limiting,LCSC,0.02
-R9,1,100K,0402,RC0402FR-07100KL,100K Feedback Divider,LCSC,0.02
-R10,1,19.1K,0402,RC0402FR-0719K1L,19.1K Feedback Divider (5.05V output),LCSC,0.02
-LED1,1,Green,0402,19-217/GHC-YR1S2/3T,Link Activity LED,LCSC,0.05
-LED2,1,Amber,0402,19-217/Y2C-CQ2R2L/3T,Power LED,LCSC,0.05
-F1,1,500mA PTC,1206,nSMD050-24V,Resettable Fuse (PoE input),Mouser,0.25
+Reference,Quantity,Value,Tolerance,Package,Part Number,Description,Source
+"C1,C3",2,10uF,,0805,,USB VBUS bulk,
+"C2,C7-C18,C21",14,100nF,,0402,,USB VBUS HF decoupling,
+C4,1,22uF,,0805,,U6 buck output (COUT) on +1V0,
+C5,1,1uF,,0603,,U4 LDO input,[AP-DS] AP2112 needs >=1uF on the input
+C6,1,10uF,,0603,,U4 LDO output on +3V3,"[AP-DS] needs >=1uF for loop stability. design-guide.md once said 100nF here, which would risk instability - see OPEN_QUESTIONS.md value table."
+"C19,C20",2,39pF,C0G,0402,,"Y1 load capacitor, CKXTAL1 side",[OLIMEX] 39pF C0G with a 25MHz/20ppm/20pF crystal. TBD until the crystal is picked - size from its actual CL. See Y1 design_notes.
+J2,1,LPJG16402AQNL,,"THT, right-angle, tab-up, 21.25 x 15.95 x 13.45 mm",LPJG16402AQNL,"1000BASE-T RJ45 MagJack with integrated magnetics, integrated Bob Smith termination and bi-colour LEDs. Replaces the HR911105A, which was a 10/100-only part - see OPEN_QUESTIONS.md item 4.","[LPJG] LINK-PP drawing LP11021122 rev A, sheets 1/2 (schematic) and 2/2 (mechanical). Title ""RJ45 Connector With 1000 Base-TX Integrated Magnetic"". UL file E484"
+J3,1,USB3-A-Plug,,SMT horizontal,692112030100,"USB 3.0 Type-A plug to the Pi's blue USB 3.0 port. Supplies board power. Chosen over USB-C: the Pi 4's USB-C port is USB 2.0 OTG only (~320 Mbit/s measured by Olimex with this same PHY), and a USB-C receptacle would need a SuperSpeed mux to handle both plug orientations. See OPEN_QUESTIONS.md.","Standard USB 3.0 Type-A pinout, matched against the KiCad-maintained footprint for Wuerth 692112030100 (pads 1-9 plus SH shield)."
+L2,1,2.2uH,,1210 or similar shielded,,Buck output inductor for the 1.0V rail,"[SY8089] inductor equation, 1 A design point - see U6 design_notes"
+R5,1,10.0K,1%,0402,,"Buck feedback divider, top (LX/output side)",[SY8089] Vout = 0.6 x (1 + R5/R6) -> 1.000 V
+R6,1,15.0K,1%,0402,,"Buck feedback divider, bottom (to GND)",[SY8089] Vout = 0.6 x (1 + R5/R6) -> 1.000 V
+"R7,R8",2,1K,,0402,,"Series resistor, J2 yellow LED",[OLIMEX] use 1K for the same role (~1mA). See J2 design_notes.leds
+R11,1,2.49K,1%,0402,,"RSET current reference for U3, to GND","[OLIMEX] traced: U3.RSET -> R8.1, R8.2 -> GND, R8 = 2.49k 1%. Not stated in [RTL-DS]; verify on first build. See OPEN_QUESTIONS.md 3e."
+U3,1,RTL8153B,,"QFN-40, 5x5mm, exposed pad",RTL8153B-VB-CG,USB 3.0 to Gigabit Ethernet controller,[RTL-DS] - 40 pins + exposed pad = pin 41
+U4,1,AP2112K-3.3,,SOT-23-5,AP2112K-3.3TRG1,3.3V 600mA LDO,[AP-DS]. Required - see OPEN_QUESTIONS.md 3d
+U6,1,SY8089AAAC,,SOT-23-5,SY8089AAAC,1.0V buck converter for the RTL8153B core rails,"[SY8089] Silergy SY8089/SY8089A datasheet + AN_SY8089. 2.7-5.5V in, 2A continuous / 3A peak, 1MHz fixed switching frequency. Vout = 0.6 x (1 + R1/R2), VREF = 0."
+Y1,1,25MHz,,3215,,25MHz crystal for U3 clock reference,[RTL-DS] 'Supports 25MHz Crystal'

