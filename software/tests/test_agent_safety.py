@@ -224,6 +224,16 @@ class TestTierOneSpellings(unittest.TestCase):
         self.assertEqual(
             _classify("ls /tmp; iptables -F").tier, safety.TIER_HARD)
 
+    def test_spellings_found_by_adversarial_review(self):
+        """Gaps the first pass missed; each is a second way to ask."""
+        self._hard(("shell systemctl kexec", "shell kexec -e",
+                    "shell nmcli networking disable",
+                    "shell nmcli radio all disable"))
+        # Zeroing the uplink address strands the beacon as surely as `down`.
+        self._hard(("shell ifconfig eth0 0.0.0.0",))
+        self.assertNotEqual(
+            _classify("shell ifconfig wlan1 0.0.0.0").tier, safety.TIER_HARD)
+
 
 class TestTierTwoClassifiesByEffect(unittest.TestCase):
     """Review Focus 2: Wirkung zählt, nicht der Binärname."""
@@ -318,6 +328,11 @@ class TestTierTwoClassifiesByEffect(unittest.TestCase):
 
     def test_crontab_listing_is_free(self):
         self.assertEqual(self._c("shell crontab -l").tier, safety.TIER_FREE)
+
+    def test_at_scheduler_is_persistence(self):
+        """The pre-schtasks spelling, found by adversarial review."""
+        self._assert_action(("shell at 09:00 /f c:\\x.exe",
+                             "shell at 23:30 /interactive c:\\x.exe"), "persist")
 
     def test_deauth_every_spelling(self):
         self._assert_action(("shell aireplay-ng -0 5 -a aa:bb wlan0mon",
