@@ -53,6 +53,7 @@ Teil 1 ist ein Aufsatz auf Bestehendes. Teile 2 und 3 sind neue Ausführungsflä
 4. Der Agent kann die Operation nicht versehentlich zerstören — Verbindungsverlust und Enttarnung sind die beiden Risiken, gegen die abgesichert wird.
 5. Vier LLM-Anbieter werden unterstützt, inklusive lokaler Modelle beim Operator.
 6. Der Agent nutzt **dieselbe HTTP-API wie der Operator**. Seine Aktionen erscheinen damit automatisch in der bestehenden History, dem bestehenden Server-Log und der bestehenden Loot-Vault.
+7. **Ohne angebundenes LLM funktioniert der C2 unverändert weiter.** Die Agenten-Schicht ist durchgängig optional — kein konfigurierter Anbieter, kein laufender Agent-Dienst und kein API-Key dürfen den Status quo beeinträchtigen. Siehe Abschnitt 19.
 
 ## 3. Nicht-Ziele
 
@@ -73,6 +74,7 @@ Dinge, die dieses Projekt zum Scheitern bringen würden, auch wenn es technisch 
 - **Ein blockierter C2.** Wenn ein LLM-Timeout oder eine Exception in der Agenten-Schicht das Beacon-Handling anhält, ist das Fleet-Management kaputt.
 - **Ein Protokoll, das man nicht lesen kann.** „Der Agent hat irgendwas gemacht" ist für einen Pentest-Bericht wertlos.
 - **Eine Leine, die mit drei Zeilen Python umgehbar ist.** Siehe Abschnitt 10.2 zu `run_script`.
+- **Ein C2, der ein LLM braucht, um zu funktionieren.** Wer den Agenten nicht nutzt, darf von diesem Projekt nichts merken — kein fehlender API-Key, kein kaputtes GUI, kein geänderter Beacon, kein zusätzlicher Pflicht-Dienst.
 
 ## 5. Randbedingungen
 
@@ -102,6 +104,7 @@ Dinge, die dieses Projekt zum Scheitern bringen würden, auch wenn es technisch 
 Da Wire Intel und die Wifi-Kette beide am Capability-Modell in `beacon.py` hängen, gilt:
 
 - Für Engagements mit Agenten-Betrieb ist der **Python-Beacon die Vorgabe** auf der Box.
+- **Die ausgelieferte Vorbelegung ändert sich nicht.** Ohne konfigurierten `agent:`-Block bleibt `sliver.enabled: true` und `main.py` verhält sich exakt wie heute. Die Exklusivität greift nur, wenn ein Agenten-Block vorhanden ist.
 - `configs/raccoon.yaml` bekommt einen Kommentar, dass `sliver.enabled: true` und Agenten-Betrieb sich ausschließen.
 - `software/main.py` protokolliert beim Start eine Warnung, wenn Sliver aktiv ist und ein Agenten-Block konfiguriert wurde.
 - Sliver bleibt vollständig nutzbar — dann ist die Box eben nicht agentengesteuert.
@@ -824,7 +827,59 @@ Neuer `agent:`-Block in `configs/raccoon.yaml`, konsistent mit dem Repo (keine T
 
 ---
 
-## 19. Tests
+## 19. Betrieb ohne LLM und Rückwärtskompatibilität
+
+Harte Anforderung aus Ziel 7: **wer den Agenten nicht nutzt, darf von diesem Projekt nichts merken.** Das betrifft vier Ebenen, und jede bekommt eine eigene Zusicherung.
+
+### 19.1 Drei Abstufungen des Fehlens
+
+| Zustand | Verhalten |
+|---|---|
+| **Agent-Dienst läuft nicht** | C2 startet und arbeitet vollständig. `/api/ai/*` liefert `503` mit `{"error":"agent service unavailable"}`. Keine Exception, kein Stacktrace, keine Verzögerung im Beacon-Handling. |
+| **Agent-Dienst läuft, kein Anbieter konfiguriert** | Dienst startet, Datenbank wird angelegt, `GET /api/ai/status` liefert `{"available": false, "reason": "no provider configured"}`. Kampagnenstart wird mit derselben Begründung abgelehnt, statt in einen Fehler zu laufen. |
+| **Anbieter konfiguriert, aber nicht erreichbar** | Kampagnenstart schlägt mit lesbarer Meldung fehl, Run wird auf `failed` gesetzt, Beacon-Intervall zurückgesetzt. Bereits laufende Kampagnen brechen kontrolliert ab. |
+
+Der Agent-Dienst ist in `docker-compose.yml` ein **eigener Service ohne `depends_on` in Richtung C2** und umgekehrt. Keiner der beiden wartet auf den anderen.
+
+### 19.2 Das GUI bleibt funktionsfähig
+
+Der kritische Pfad: `_OPERATOR_HTML` lädt die neuen Flächen über `<script src="/static/agent.js">`. Daraus folgt:
+
+- **Die Agenten-Oberfläche wird erst aufgebaut, nachdem `GET /api/ai/status` geantwortet hat.** Antwortet er `503` oder `available: false`, wird der „Automated Attack"-Knopf **ausgegraut mit Tooltip-Begründung** gerendert — nicht versteckt, damit der Operator weiß, dass die Funktion existiert und warum sie nicht geht.
+- Jeder `fetch` auf `/api/ai/*` ist in `try/catch`; ein Fehlschlag darf keine laufenden `setInterval`-Schleifen des bestehenden GUI abbrechen.
+- Schlägt das Laden von `agent.js` selbst fehl (Datei fehlt, 404), bleibt das GUI vollständig bedienbar. Der Knopf wird deshalb **aus `agent.js` heraus eingefügt**, nicht statisch ins HTML-Literal geschrieben.
+- Die Status-Abfrage läuft einmal beim Laden und danach nur, wenn der Operator den Knopf drückt — kein Dauer-Polling gegen einen Dienst, der nicht da ist.
+
+### 19.3 Die Server-Änderungen sind einzeln additiv
+
+Jede der sechs Änderungen aus Abschnitt 7.2 muss **für sich** verhaltensneutral sein, wenn kein Agent existiert:
+
+| Änderung | Neutralität |
+|---|---|
+| Proxy-Routen | neue Pfade, berühren keinen bestehenden Endpoint |
+| Task-Lanes | `lane` hat die Vorbelegung `"operator"`; bei ausschließlich Operator-Tasks ist die Auswahlreihenfolge identisch zum heutigen `queue.pop(0)` |
+| Task-Batching | greift nur bei `caps` enthält `"batch"`; Beacons ohne diese Meldung bekommen unverändert ein einzelnes Task-Dict |
+| `tool_runs` | der parameterlose Result-Endpoint liefert weiter den jüngsten Operator-Lauf; das bestehende GUI braucht keine Änderung |
+| argv-Form | additiv; die String-Form bleibt unverändert inklusive `shell=True` |
+| `phase`-Felder | nullable |
+
+### 19.4 Beacon und Box bleiben kompatibel
+
+- **Neuer Beacon gegen alten Server:** die `caps`-Meldung ist ein zusätzliches Feld im `register`-Payload. `_handle_register` ignoriert unbekannte Felder — ein neuer Beacon funktioniert gegen einen nicht aktualisierten Server.
+- **Alter Beacon gegen neuen Server:** keine `caps` gemeldet heißt kein Batching, keine `wire`- und `wifi`-Tools. Der Beacon läuft unverändert.
+- **Neue Kommandos** (`wire …`, `wifi …`) sind zusätzliche Zweige im bestehenden Dispatcher. Ein Beacon ohne sie antwortet wie bisher mit `Unknown command: …` — bereits vorhandenes Verhalten.
+- **Die Box** ohne `agent:`-Block verhält sich identisch zu heute, inklusive Sliver-Vorrang (Abschnitt 5.2).
+- Die Wifi-Pakete im Box-Image sind zusätzliche Pakete; ohne Nutzung ändern sie nichts am Verhalten. Wer das Image nicht neu baut, verliert nur die Wifi-Kette.
+
+### 19.5 Keine neuen Pflicht-Abhängigkeiten im C2
+
+`server.py` darf **nichts** aus `software/agent/` importieren. Die Kopplung läuft ausschließlich über HTTP. Konkret heißt das: `anthropic`, `openai`, `aiohttp` und `croniter` sind Abhängigkeiten des Agent-Images, nicht des C2-Images. Ein C2-Container ohne diese Pakete muss vollständig funktionieren.
+
+Der Proxy in `server.py` nutzt deshalb `urllib` aus der Standardbibliothek oder eine bereits vorhandene Abhängigkeit — keine neue.
+
+---
+
+## 20. Tests
 
 Konvention des Repos: stdlib `unittest`, Dateien unter `software/tests/`, ausführbar per `python -m unittest …`. Ein Mock-Modell mit Antwortwarteschlange ersetzt jeden Netzzugriff zum LLM; keine Live-API-Tests im Standardlauf.
 
@@ -844,10 +899,11 @@ Konvention des Repos: stdlib `unittest`, Dateien unter `software/tests/`, ausfü
 | `wifi` | Adaptererkennung gegen gefälschtes sysfs (alle vier Zustände) · Monitor-Mode-Wiederherstellung auch bei Exception · airodump-CSV-Parser inklusive fehlerhafter Zeilen · `KEY FOUND!`-Parser · `1 handshake`-Parser · **alles oberhalb `wifi:scan` gegen Mocks, als solche markiert** |
 | `server.py` | Lane-Vorrang (Operator vor Agent) · Batching nur bei `caps: ["batch"]`, alte Beacons bekommen ein einzelnes Task-Dict · `tool_runs` isoliert parallele Läufe · alter Result-Endpoint liefert nur Operator-Läufe · Proxy liefert `503` ohne Agent-Dienst |
 | Integration | Kampagne gegen einen echten lokalen Beacon mit Mock-Modell: Run angelegt, Tasks dispatcht, Findings gespeichert, Phase gesetzt, Run abgeschlossen, Intervall zurückgesetzt |
+| **Status quo** | **Eigene Testgruppe, muss ohne jede Agenten-Komponente grün sein:** die bestehende Suite (`test_c2_server.py`, `test_beacon.py`) läuft unverändert durch · C2 startet ohne `AGENT_URL` · `/api/ai/*` liefert `503` statt zu werfen · Task-Auswahl bei ausschließlich Operator-Tasks ist identisch zum heutigen Verhalten · alter Beacon ohne `caps` bekommt ein einzelnes Task-Dict · neuer Beacon mit `caps` registriert sich gegen einen Server ohne Lane-Unterstützung · parameterloser Result-Endpoint liefert den jüngsten Operator-Lauf · `server.py` importiert nichts aus `software/agent/` (per Quelltext-Prüfung) · `main.py` ohne `agent:`-Block verhält sich wie heute |
 
 ---
 
-## 20. Was dem Umsetzenden überlassen bleibt
+## 21. Was dem Umsetzenden überlassen bleibt
 
 - Interne Modulaufteilung und Funktionssignaturen innerhalb der vorgegebenen Paketstruktur.
 - Konkrete JSON-Schemata der Tool-Parameter (Eugenes Schemata sind eine gute Vorlage, keine Vorschrift).
@@ -856,12 +912,12 @@ Konvention des Repos: stdlib `unittest`, Dateien unter `software/tests/`, ausfü
 - Vollständigkeit der Detection-Muster in Abschnitt 10.6.
 - Poll-Intervalle und Timeouts im Detail, solange die Größenordnungen eingehalten werden.
 - Aufteilung der GUI-Dateien unter `static/` und das konkrete DOM.
-- Ob der Proxy in `server.py` mit `urllib` oder einer kleinen Abhängigkeit arbeitet.
+- Ob der Proxy in `server.py` mit `urllib` oder einer bereits vorhandenen Abhängigkeit arbeitet — eine **neue** Abhängigkeit im C2-Image ist ausgeschlossen (Abschnitt 19.5).
 - Wie die Fähigkeitsstufe eines Modells konkret ermittelt wird (Metadaten, Allowlist, Heuristik) — nur die drei Stufen und ihre Auswirkungen sind festgelegt.
 - Reihenfolge der Umsetzung, mit einer Ausnahme: die Agenten-Schicht (Abschnitte 7–14) sollte vor den Teilprojekten Wire Intel und Wifi stehen, weil beide gegen ihre Capability-Mechanik gebaut werden.
 
 ---
 
-## 21. Offene Punkte
+## 22. Offene Punkte
 
-Keine. Die Entscheidungen aus dem Gespräch und aus der Reviewer-Runde sind in den Abschnitten 5.2, 5.3, 8.6, 8.7, 9, 10.4, 10.5, 10.6, 15, 16 und 18 festgehalten.
+Keine. Die Entscheidungen aus dem Gespräch und aus der Reviewer-Runde sind in den Abschnitten 5.2, 5.3, 8.6, 8.7, 9, 10.4, 10.5, 10.6, 15, 16, 18 und 19 festgehalten.
