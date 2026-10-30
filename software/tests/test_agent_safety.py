@@ -474,6 +474,76 @@ class TestReviewFindings(unittest.TestCase):
             self.assertIn("-T2 --max-rate 50", safety.enforce_scan_limits(cmd), cmd)
 
 
+class TestFixRoundRegressions(unittest.TestCase):
+    """Coverage the first fix round lost by narrowing patterns into checks.
+
+    Each of these was tier 1 before that round, free after it, and is pinned
+    here so the same trade cannot happen again: replacing a whole-line regex
+    with a positional check is exactly where a guardrail quietly stops
+    guarding.
+    """
+
+    def _hard(self, cmds, **kw):
+        for cmd in cmds:
+            self.assertEqual(_classify(cmd, **kw).tier, safety.TIER_HARD, cmd)
+
+    def test_a_wipe_reached_through_an_introducer_is_still_a_wipe(self):
+        self._hard(("xargs rm -rf /", "watch rm -rf /", "xargs -n 1 rm -rf /",
+                    "su alice -c rm -rf /", "su - alice -c rm -rf /"))
+
+    def test_wrapper_option_values_do_not_hide_the_program(self):
+        self._hard(("timeout -s TERM 30 rm -rf /", "env -u FOO rm -rf /",
+                    "stdbuf -o L rm -rf /",
+                    "stdbuf -i 0 -o L dd if=/dev/zero of=/dev/sda",
+                    "timeout -s TERM 7200 sleep 7200",
+                    "env -u FOO kill 1234", "nice -n 19 sleep 7200",
+                    "env FOO=bar reconfig"))
+
+    def test_a_valueless_wrapper_flag_does_not_eat_the_program(self):
+        """`env -i` takes no value; skipping a token after it hid the wipe."""
+        self._hard(("env -i rm -rf /",))
+
+    def test_a_signal_name_is_not_a_program(self):
+        got = _classify("timeout -s KILL 600 whoami")
+        self.assertEqual(got.tier, safety.TIER_FREE)
+
+    def test_readers_that_execute_or_write_are_not_trusted(self):
+        self._hard(("find /tmp -exec iptables -F +",))
+        for cmd in ("sed -i s/x/y/ /home/u/.ssh/authorized_keys",
+                    "sed -i s/x/y/ /etc/rc.local",
+                    "awk -f /tmp/x.awk authorized_keys"):
+            self.assertEqual(_classify(cmd).tier, safety.TIER_KNOCK, cmd)
+
+    def test_read_only_partition_tools_stay_free(self):
+        """Refusing recon trains the operator to work around the guardrail."""
+        for cmd in ("fdisk -l", "parted /dev/sda print", "badblocks -s /dev/sda"):
+            self.assertEqual(_classify(cmd).tier, safety.TIER_FREE, cmd)
+
+    def test_destructive_partition_subcommands_are_hard(self):
+        self._hard(("fdisk /dev/sda", "parted /dev/sda mklabel gpt",
+                    "badblocks -w /dev/sda"))
+
+    def test_root_shorthands(self):
+        self._hard(("rm -rf //", "rm -rf /.", "rm -rf ~/*"))
+
+    def test_a_no_op_interface_set_is_not_refused(self):
+        self.assertEqual(
+            _classify("shell nmcli device set eth0 managed yes").tier,
+            safety.TIER_FREE)
+
+    def test_the_interface_verdict_does_not_pre_empt_the_phase_five_refusal(self):
+        got = safety.classify("ifconfig wlan1 down msfconsole",
+                              target_kind="beacon",
+                              is_uplink_iface=lambda n: False,
+                              phase5_enabled=False)
+        self.assertEqual(got.tier, safety.TIER_HARD)
+
+    def test_scan_limits_survive_a_separated_option_value(self):
+        for cmd in ("timeout -s KILL 600 nmap -sV 10.0.1.5",
+                    "nice -n 19 nmap -sV 10.0.1.5"):
+            self.assertIn("-T2 --max-rate 50", safety.enforce_scan_limits(cmd), cmd)
+
+
 class TestNeverRaises(unittest.TestCase):
     def test_hostile_input_returns_a_classification(self):
         for cmd in ("", "   ", "\n\n", "\x00", "sudo", "sudo -u", "shell",

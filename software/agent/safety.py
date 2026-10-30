@@ -84,9 +84,20 @@ _WRAPPERS = ("env", "nohup", "timeout", "exec", "setsid", "stdbuf", "nice",
 # Commands that read rather than act. A verb appearing as their argument is
 # a string, not an instruction: `grep reboot /var/log/syslog` must not be
 # refused, or the agent cannot read its own logs.
+#
+# Deliberately excludes find, sed, awk and xxd. Each of those can execute or
+# write — `find … -exec`, `sed -i`, `xxd -r` — so trusting their arguments as
+# data would suppress the rules for the very lines that act.
 _READERS = ("grep", "egrep", "fgrep", "rgrep", "man", "cat", "less", "more",
-            "tail", "head", "ls", "find", "echo", "awk", "sed", "file",
-            "stat", "wc", "strings", "diff", "nl", "od", "xxd")
+            "tail", "head", "ls", "echo", "file", "stat", "wc", "strings",
+            "nl", "od", "dirname", "basename", "realpath")
+
+# Wrappers that put a real program in argument position, and the shell-ish
+# forms that introduce a nested command.
+_COMMAND_INTRODUCERS = ("xargs", "watch", "su", "nohup", "timeout", "env",
+                        "setsid", "stdbuf", "nice", "ionice", "busybox",
+                        "command", "time", "exec", "sudo", "doas", "runas",
+                        "pkexec", "sh", "bash", "zsh", "dash", "shell")
 
 
 def _normalise(command):
@@ -105,21 +116,59 @@ def _strip_privilege(text):
     return text
 
 
+# Which of each wrapper's own flags take a separately-given value. Guessing
+# this from the token's shape does not work: a heuristic that treats an
+# all-caps word as a value misses `timeout -s term …` once the line has been
+# lowercased, and one that skips any token after any flag eats the real
+# command in `env -i rm -rf /`, where -i takes nothing.
+_WRAPPER_VALUE_FLAGS = {
+    "timeout": ("-s", "--signal", "-k", "--kill-after"),
+    "nice": ("-n", "--adjustment"),
+    "ionice": ("-c", "-n", "--class", "--classdata"),
+    "stdbuf": ("-i", "-o", "-e", "--input", "--output", "--error"),
+    "env": ("-u", "--unset", "-s", "--split-string", "-c", "--chdir"),
+    "xargs": ("-n", "-i", "-p", "-d", "-s", "-l", "--max-args",
+              "--replace", "--max-procs", "--delimiter", "--max-lines"),
+    "watch": ("-n", "--interval"),
+    "time": ("-f", "-o", "--format", "--output"),
+}
+
+
+def _skip_wrapper_arguments(tokens, wrapper=""):
+    """Drop a wrapper's own arguments, including values given separately.
+
+    `timeout -s TERM 30 cmd` has to reduce to `cmd`. The first attempt at
+    this skipped the flag but not its value, which left `term` in program
+    position — hiding the real command and making a signal name look like one.
+    """
+    value_flags = _WRAPPER_VALUE_FLAGS.get(wrapper, ())
+    rest = list(tokens)
+    while rest:
+        token = rest[0]
+        if token.startswith("-"):
+            rest = rest[1:]
+            if rest and token in value_flags:
+                rest = rest[1:]
+            continue
+        if re.match(r"^\d+(?:\.\d+)?[smhd]?$", token) or re.match(r"^\w+=", token):
+            rest = rest[1:]
+            continue
+        break
+    return rest
+
+
 def _strip_wrappers(text):
     """Drop leading wrappers that put the real program in argument position."""
     previous = None
     while previous != text:
         previous = text
         tokens = text.split()
-        if not tokens or _basename(tokens[0]) not in _WRAPPERS:
+        if not tokens:
             break
-        rest = tokens[1:]
-        # `timeout 5 cmd`, `nice -n 10 cmd`, `env FOO=bar cmd`
-        while rest and (rest[0].startswith("-")
-                        or re.match(r"^\d+(?:\.\d+)?[smhd]?$", rest[0])
-                        or re.match(r"^\w+=", rest[0])):
-            rest = rest[1:]
-        text = " ".join(rest).strip()
+        wrapper = _basename(tokens[0]).lower()
+        if wrapper not in _WRAPPERS:
+            break
+        text = " ".join(_skip_wrapper_arguments(tokens[1:], wrapper)).strip()
     return text
 
 
@@ -408,7 +457,8 @@ _IFACE_RULES = [
     re.compile(r"\bip\s+(?:a|addr|address)\s+flush\s+(?:dev\s+)?(?P<if>[\w.:-]+)\b"),
     re.compile(r"\bifconfig\s+(?:-\S+\s+)*(?P<if>[\w.:-]+)\s+(?:down|0\.0\.0\.0)\b"),
     re.compile(r"\bifdown\s+(?:-\S+\s+)*(?P<if>[\w.:-]+)\b"),
-    re.compile(r"\bnmcli\s+dev(?:ice)?\s+(?:disconnect|set)\s+(?P<if>[\w.:-]+)\b"),
+    re.compile(r"\bnmcli\s+dev(?:ice)?\s+disconnect\s+(?P<if>[\w.:-]+)\b"),
+    re.compile(r"\bnmcli\s+dev(?:ice)?\s+set\s+(?P<if>[\w.:-]+)\s+managed\s+no\b"),
 ]
 
 # ── Destructive filesystem operations ──
@@ -428,22 +478,47 @@ _WIPE_PROGRAMS = ("rm", "shred", "unlink", "srm", "wipe")
 
 
 def _is_disk_wipe(effective):
-    program = _program(effective)
-    if program.startswith("mkfs") or program in ("wipefs", "fdisk", "parted",
-                                                  "sgdisk", "badblocks"):
-        return True
-    tokens = effective.split()[1:]
-    if program == "dd":
-        return any(t.startswith(("of=/dev/", "if=/dev/")) for t in tokens)
-    if program not in _WIPE_PROGRAMS:
-        return False
-    for token in tokens:
-        if token.startswith("-"):
+    """True if any command on the line destroys a filesystem or raw device.
+
+    Scans every position, not just the program, because a wipe reached
+    through an introducer — `xargs rm -rf /`, `su alice -c rm -rf /` — is the
+    same wipe. Checking only the program position was a regression the task
+    review caught: it lost coverage the earlier whole-line regex happened to
+    have.
+    """
+    tokens = effective.split()
+    for index, token in enumerate(tokens):
+        name = _basename(token).lower()
+        if name.endswith(".exe"):
+            name = name[:-4]
+        arguments = tokens[index + 1:]
+        if name.startswith("mkfs") or name == "wipefs":
+            return True
+        # Read-only invocations of the partitioning tools are recon the agent
+        # legitimately needs; only their destructive subcommands count.
+        if name == "fdisk" and not any(a in ("-l", "--list") for a in arguments):
+            return True
+        if name == "parted" and any(
+                a in ("mklabel", "mkpart", "rm", "mkfs") for a in arguments):
+            return True
+        if name == "badblocks" and any(a == "-w" for a in arguments):
+            return True
+        if name == "dd":
+            if any(a.startswith(("of=/dev/", "if=/dev/")) for a in arguments):
+                return True
             continue
-        if token in _WIPE_TARGETS or token.rstrip("/") in _WIPE_TARGETS:
-            return True
-        if token.startswith("/dev/"):
-            return True
+        if name not in _WIPE_PROGRAMS:
+            continue
+        for argument in arguments:
+            if argument.startswith("-"):
+                continue
+            if argument in _WIPE_TARGETS or argument.rstrip("/") in _WIPE_TARGETS:
+                return True
+            if argument.startswith("/dev/"):
+                return True
+            # `rm -rf ~/*` and `rm -rf /.` are the same instruction.
+            if re.match(r"^(?:~|/)[./*]*$", argument):
+                return True
     return False
 
 
@@ -558,16 +633,16 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
         if any(pattern.search(text) for text in candidates):
             return RISK_TABLE[key]
 
-    verdict = _classify_iface(candidates, is_uplink_iface)
-    if verdict is not None:
-        return verdict
-
-    # Promotion has to happen before the tier-2 scan, or an earlier tier-2
-    # hit on the same line shadows a verdict that should have been a refusal.
+    # Promotion is checked before the interface verdict as well as before the
+    # tier-2 scan, so that nothing which can merely gate pre-empts a refusal.
     if not phase5_enabled and any(_EXPLOIT_RULE.search(t) for t in candidates):
         return RISK_TABLE["exploit_known_poc"]._replace(
             tier=TIER_HARD,
             reason="the exploitation phase is switched off for this run")
+
+    verdict = _classify_iface(candidates, is_uplink_iface)
+    if verdict is not None:
+        return verdict
 
     for pattern, key in _RULES_KNOCK:
         if not any(pattern.search(text) for text in candidates):
@@ -579,11 +654,17 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
                         "conservatively", *_UNKNOWN_KNOCK)
         return row
 
-    # A rule added at runtime (the suite does this) lands in neither half, so
-    # fall back to a full scan rather than silently ignoring it.
+    # A rule added at runtime lands in neither half, since both are frozen at
+    # import. Scan for those rather than silently ignoring them.
+    known = set(id(p) for p, _ in _RULES_HARD) | set(id(p) for p, _ in _RULES_KNOCK)
     for pattern, key in _RULES:
-        if key in RISK_TABLE or not any(pattern.search(t) for t in candidates):
+        if id(pattern) in known:
             continue
+        if not any(pattern.search(t) for t in candidates):
+            continue
+        row = RISK_TABLE.get(key)
+        if row is not None:
+            return row
         return _row(TIER_KNOCK, key, "unknown",
                     "gated action with no risk-table row; treated "
                     "conservatively", *_UNKNOWN_KNOCK)
@@ -652,18 +733,27 @@ def enforce_scan_limits(command):
 
     tokens = command.split()
     index = None
-    for position, token in enumerate(tokens):
+    position = 0
+    while position < len(tokens):
+        token = tokens[position]
         name = _basename(token).lower()
         if name.endswith(".exe"):
             name = name[:-4]
         if name in _SCANNER_LIMITS:
             index = position
             break
-        # Only wrappers, the beacon verb and flags may precede the scanner.
+        # Only wrappers, the beacon verb and their own arguments may precede
+        # the scanner. A separately-given option value is skipped too, so
+        # `timeout -s KILL 600 nmap …` still gets limited.
         if name in ("shell", "sudo", "doas", "runas", "pkexec") \
-                or name in _WRAPPERS or token.startswith("-") \
-                or re.match(r"^\d+(?:\.\d+)?[smhd]?$", token) \
+                or name in _WRAPPERS:
+            position += 1
+            consumed = _skip_wrapper_arguments(tokens[position:], name)
+            position = len(tokens) - len(consumed)
+            continue
+        if token.startswith("-") or re.match(r"^\d+(?:\.\d+)?[smhd]?$", token) \
                 or re.match(r"^\w+=", token):
+            position += 1
             continue
         return command
     if index is None:
