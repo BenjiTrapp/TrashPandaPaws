@@ -30,3 +30,6 @@ fp-info-cache
 
 # superpowers brainstorming mockups
 .superpowers/
+
+# git worktrees
+.worktrees/
