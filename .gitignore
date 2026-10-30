@@ -33,3 +33,6 @@ fp-info-cache
 
 # git worktrees
 .worktrees/
+
+# openchamber screenshots and scratch
+.openchamber/
