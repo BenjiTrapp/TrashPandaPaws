@@ -259,7 +259,17 @@ class TestApprovals(unittest.TestCase):
         queries.create_approval(conn, r1, "deauth", "{}", "{}")
         self.assertEqual(queries.get_pending_approvals(conn, r2), [])
 
-    def test_decided_by_check_constraint(self):
+    def test_decided_by_accepts_exactly_the_four_deciders(self):
+        conn = _conn()
+        rid = _fresh_run(conn)
+        for decider in ("operator", "ev", "timeout", "hard"):
+            aid = queries.create_approval(conn, rid, "deauth", "{}", "{}")
+            queries.decide_approval(conn, aid, "denied", decider)
+            stored = conn.execute(
+                "SELECT decided_by FROM approvals WHERE id = ?", (aid,)).fetchone()[0]
+            self.assertEqual(stored, decider)
+
+    def test_decided_by_rejects_unknown_decider(self):
         conn = _conn()
         aid = queries.create_approval(conn, _fresh_run(conn), "deauth", "{}", "{}")
         with self.assertRaises(sqlite3.IntegrityError):

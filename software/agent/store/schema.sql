@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     classification_json TEXT NOT NULL,
     ev_json             TEXT NOT NULL,
     decision            TEXT,
-    decided_by          TEXT CHECK(decided_by IN ('operator','ev','timeout')),
+    decided_by          TEXT CHECK(decided_by IN ('operator','ev','timeout','hard')),
     requested_at        TEXT NOT NULL,
     decided_at          TEXT
 );
