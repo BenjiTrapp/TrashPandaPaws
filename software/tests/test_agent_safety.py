@@ -544,6 +544,60 @@ class TestFixRoundRegressions(unittest.TestCase):
             self.assertIn("-T2 --max-rate 50", safety.enforce_scan_limits(cmd), cmd)
 
 
+class TestCommandPositionAndReaders(unittest.TestCase):
+    """Round-3 boundary: a program is a program only in command position.
+
+    The two previous rounds oscillated — checking index 0 only missed wipes
+    behind an introducer, checking every token turned `man fdisk` into a hard
+    refusal. Both directions are pinned here.
+    """
+
+    def _hard(self, cmds):
+        for cmd in cmds:
+            self.assertEqual(_classify(cmd).tier, safety.TIER_HARD, cmd)
+
+    def _free(self, cmds):
+        for cmd in cmds:
+            self.assertEqual(_classify(cmd).tier, safety.TIER_FREE, cmd)
+
+    def test_a_wipe_program_named_as_data_is_not_a_wipe(self):
+        self._free(("man fdisk", "man mkfs", "man mkfs.ext4",
+                    "ls -l /sbin/mkfs.ext4", "grep -i fdisk /var/log/syslog",
+                    "grep mkfs /etc/fstab", "grep rm /dev/null",
+                    "cp /bin/rm /dev/shm/x"))
+
+    def test_but_in_command_position_it_still_is(self):
+        self._hard(("xargs rm -rf /", "watch rm -rf /", "su alice -c rm -rf /",
+                    "sh -c rm -rf /", "find /tmp -exec rm -rf / +"))
+
+    def test_clustered_write_flags(self):
+        """An exact-token test let `badblocks -wsv` through."""
+        self._hard(("badblocks -wsv /dev/sda", "badblocks -vw /dev/sda"))
+        self._free(("badblocks -s /dev/sda",))
+
+    def test_partition_tools_read_only_vs_destructive(self):
+        self._free(("fdisk -l", "fdisk -lu /dev/sda", "parted /dev/sda print"))
+        self._hard(("fdisk /dev/sda", "parted /dev/sda mklabel gpt",
+                    "parted /dev/sda"))
+
+    def test_dd_is_destructive_only_when_writing_a_raw_device(self):
+        self._hard(("dd if=/dev/zero of=/dev/mmcblk0", "dd of=/dev/sda bs=4m"))
+        self._free(("dd if=/dev/urandom of=/tmp/x", "dd if=/dev/sda of=/tmp/img"))
+
+    def test_any_non_reader_writing_a_block_device(self):
+        """Catches the spellings no program-name rule knows."""
+        self._hard(("xxd -r /tmp/hex /dev/sda", "tee /dev/sda"))
+        self._free(("cat /dev/sda", "ls -l /dev/sda"))
+
+    def test_conditional_readers_read_until_asked_to_act(self):
+        self._free(("sed -n /reboot/p /var/log/syslog",
+                    "awk /reboot/ /var/log/syslog", "find /tmp -name reboot"))
+        self._hard(("find /tmp -exec iptables -F +",))
+        for cmd in ("sed -i s/x/y/ /etc/rc.local",
+                    "awk -f /tmp/x.awk authorized_keys"):
+            self.assertEqual(_classify(cmd).tier, safety.TIER_KNOCK, cmd)
+
+
 class TestNeverRaises(unittest.TestCase):
     def test_hostile_input_returns_a_classification(self):
         for cmd in ("", "   ", "\n\n", "\x00", "sudo", "sudo -u", "shell",

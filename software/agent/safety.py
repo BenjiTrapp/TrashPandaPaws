@@ -79,25 +79,49 @@ _PRIVILEGE = re.compile(
 # Wrappers that put a real program in argument position. Without these,
 # `nohup sleep 7200` and `/usr/bin/sleep 7200` escape the first-token check.
 _WRAPPERS = ("env", "nohup", "timeout", "exec", "setsid", "stdbuf", "nice",
-             "ionice", "busybox", "command", "time")
+             "ionice", "busybox", "command", "time", "xargs", "watch")
 
 # Commands that read rather than act. A verb appearing as their argument is
 # a string, not an instruction: `grep reboot /var/log/syslog` must not be
 # refused, or the agent cannot read its own logs.
-#
-# Deliberately excludes find, sed, awk and xxd. Each of those can execute or
-# write — `find … -exec`, `sed -i`, `xxd -r` — so trusting their arguments as
-# data would suppress the rules for the very lines that act.
 _READERS = ("grep", "egrep", "fgrep", "rgrep", "man", "cat", "less", "more",
             "tail", "head", "ls", "echo", "file", "stat", "wc", "strings",
             "nl", "od", "dirname", "basename", "realpath")
 
-# Wrappers that put a real program in argument position, and the shell-ish
-# forms that introduce a nested command.
-_COMMAND_INTRODUCERS = ("xargs", "watch", "su", "nohup", "timeout", "env",
-                        "setsid", "stdbuf", "nice", "ionice", "busybox",
-                        "command", "time", "exec", "sudo", "doas", "runas",
-                        "pkexec", "sh", "bash", "zsh", "dash", "shell")
+# Readers only while they are not asked to act. Deleting them outright, as
+# the first attempt did, turned `sed -n /reboot/p /var/log/syslog` and
+# `find /tmp -name reboot` into hard refusals — trading an under-match for an
+# over-match in the same module.
+_CONDITIONAL_READERS = {
+    "find": ("-exec", "-execdir", "-delete", "-ok", "-fprint", "-fls"),
+    # A script loaded with -f can write: sed has `w`, awk has `print >`.
+    "sed": ("-i", "--in-place", "-s", "-f", "--file"),
+    "awk": ("-i", "inplace", "-f", "--file"),
+    "xxd": ("-r", "--revert"),
+    "perl": ("-i", "-e", "-E"),
+}
+
+# Anything that can put a nested command in argument position.
+_COMMAND_INTRODUCERS = _WRAPPERS + (
+    "su", "sudo", "doas", "runas", "pkexec", "sh", "bash", "zsh", "dash",
+    "shell", "cmd", "powershell", "pwsh")
+
+
+def _is_reader(program, tokens):
+    """True if the program only reads, given how it was invoked."""
+    if program in _READERS:
+        return True
+    acting = _CONDITIONAL_READERS.get(program)
+    if acting is None:
+        return False
+    for token in tokens:
+        for flag in acting:
+            if flag.startswith("--") or not flag.startswith("-"):
+                if token == flag or token.startswith(flag):
+                    return False
+            elif token == flag or re.match(r"^-[a-z]*%s" % flag[1:], token):
+                return False
+    return True
 
 
 def _normalise(command):
@@ -476,37 +500,92 @@ _WIPE_TARGETS = frozenset((
 ))
 _WIPE_PROGRAMS = ("rm", "shred", "unlink", "srm", "wipe")
 
+# A write to a raw block device destroys a filesystem whatever program does
+# it. /dev/null, /dev/zero and /dev/shm are not block devices and stay free.
+_BLOCK_DEVICE = re.compile(
+    r"^/dev/(?:sd[a-z]+\d*|nvme\d+n\d+(?:p\d+)?|mmcblk\d+(?:p\d+)?"
+    r"|hd[a-z]+\d*|vd[a-z]+\d*|loop\d+|md\d+|dm-\d+|xvd[a-z]+\d*)$")
+
+
+def _command_positions(tokens):
+    """Indices where a token is a program rather than an argument.
+
+    The middle ground between the two failures this module has already had:
+    checking only index 0 missed `xargs rm -rf /`, and checking every token
+    turned `man fdisk` and `grep mkfs /etc/fstab` into hard refusals. A
+    program is in command position at the start of the line, or directly
+    after something that introduces a nested command.
+    """
+    positions = set()
+    pending = [0]
+    while pending:
+        index = pending.pop()
+        if index >= len(tokens) or index in positions:
+            continue
+        positions.add(index)
+        name = _basename(tokens[index]).lower()
+        if name.endswith(".exe"):
+            name = name[:-4]
+        if name in _COMMAND_INTRODUCERS:
+            rest = _skip_wrapper_arguments(tokens[index + 1:], name)
+            pending.append(len(tokens) - len(rest))
+    # `-c`, `-exec` and `--` introduce a command wherever they appear.
+    for index, token in enumerate(tokens):
+        if token in ("-c", "-exec", "-execdir", "--", "/c", "/k"):
+            pending.append(index + 1)
+    while pending:
+        index = pending.pop()
+        if index >= len(tokens) or index in positions:
+            continue
+        positions.add(index)
+    return positions
+
 
 def _is_disk_wipe(effective):
-    """True if any command on the line destroys a filesystem or raw device.
-
-    Scans every position, not just the program, because a wipe reached
-    through an introducer — `xargs rm -rf /`, `su alice -c rm -rf /` — is the
-    same wipe. Checking only the program position was a regression the task
-    review caught: it lost coverage the earlier whole-line regex happened to
-    have.
-    """
+    """True if any command on the line destroys a filesystem or raw device."""
     tokens = effective.split()
-    for index, token in enumerate(tokens):
-        name = _basename(token).lower()
+    positions = _command_positions(tokens)
+    for index in sorted(positions):
+        name = _basename(tokens[index]).lower()
         if name.endswith(".exe"):
             name = name[:-4]
         arguments = tokens[index + 1:]
         if name.startswith("mkfs") or name == "wipefs":
             return True
-        # Read-only invocations of the partitioning tools are recon the agent
-        # legitimately needs; only their destructive subcommands count.
-        if name == "fdisk" and not any(a in ("-l", "--list") for a in arguments):
-            return True
-        if name == "parted" and any(
-                a in ("mklabel", "mkpart", "rm", "mkfs") for a in arguments):
-            return True
-        if name == "badblocks" and any(a == "-w" for a in arguments):
-            return True
-        if name == "dd":
-            if any(a.startswith(("of=/dev/", "if=/dev/")) for a in arguments):
+        # Programs with their own destructive/read-only distinction are
+        # decided here and here only — falling through to the generic
+        # block-device rule below would refuse `fdisk -lu /dev/sda`, which
+        # is recon.
+        if name == "fdisk":
+            if not any(re.match(r"^-[a-z]*l", a) for a in arguments):
                 return True
             continue
+        if name == "parted":
+            # Interactive parted on a device can destroy it, so the test is
+            # for a read-only subcommand rather than for a destructive one.
+            if any(_BLOCK_DEVICE.match(a) for a in arguments) and not any(
+                    a in ("print", "p", "unit", "version", "help", "select")
+                    for a in arguments):
+                return True
+            continue
+        if name == "badblocks":
+            if any(re.match(r"^-[a-z]*w", a) for a in arguments):
+                return True
+            continue
+        if name == "dd":
+            # Destructive when it writes to a raw device. Reading one into a
+            # file is imaging, and reading /dev/urandom into a file is noise.
+            for argument in arguments:
+                if argument.startswith("of=") \
+                        and _BLOCK_DEVICE.match(argument[3:]):
+                    return True
+            continue
+        # Any other non-reader naming a raw block device is writing to it.
+        # This is what catches `xxd -r hex /dev/sda` and interactive
+        # `parted /dev/sda`, which no program-name rule recognises.
+        if not _is_reader(name, arguments) \
+                and any(_BLOCK_DEVICE.match(a) for a in arguments):
+            return True
         if name not in _WIPE_PROGRAMS:
             continue
         for argument in arguments:
@@ -626,7 +705,8 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
     # interface, so this check sits after those three. It applies only to a
     # single command: once the line carries a separator, the first token no
     # longer speaks for the rest of it.
-    if program in _READERS and not has_shell_metachars(command):
+    if _is_reader(program, effective[0].split()[1:]) \
+            and not has_shell_metachars(command):
         return _FREE
 
     for pattern, key in _RULES_HARD:
