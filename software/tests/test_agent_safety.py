@@ -379,6 +379,101 @@ class TestTierTwoClassifiesByEffect(unittest.TestCase):
         self.assertEqual(got.points, 0)
 
 
+class TestReviewFindings(unittest.TestCase):
+    """Spellings the task review found reaching the wrong tier.
+
+    Each of these returned TIER_FREE before the fix round. They are pinned
+    here because a guardrail that catches only the spelling its author
+    thought of first provides false assurance.
+    """
+
+    def _hard(self, cmds, **kw):
+        for cmd in cmds:
+            self.assertEqual(_classify(cmd, **kw).tier, safety.TIER_HARD, cmd)
+
+    def test_the_root_wipe_that_actually_works(self):
+        """GNU rm refuses a bare `/`; the trailing-flag form is the real one."""
+        self._hard(("shell rm -rf / --no-preserve-root",
+                    "shell rm -rf /etc /var", "shell rm -rf ~",
+                    "shell rm -fr /home --verbose"))
+
+    def test_raw_device_writes(self):
+        self._hard(("shell shred /dev/sda", "shell dd of=/dev/sda bs=4m",
+                    "shell rm /dev/sda1", "shell parted /dev/sda mklabel gpt"))
+
+    def test_windows_and_target_switch_power_off(self):
+        self._hard(("shell powershell restart-computer -force",
+                    "shell stop-computer -force",
+                    "shell systemctl isolate rescue.target",
+                    "shell systemctl emergency"))
+
+    def test_path_and_wrapper_prefixed_beacon_verbs(self):
+        """A wrapper or absolute path must not hide the verb."""
+        self._hard(("shell /usr/bin/sleep 7200", "shell nohup sleep 7200",
+                    "shell timeout 5 sleep 7200", "shell /bin/kill 1234",
+                    "env reconfig", "shell sudo -u alice sleep 7200",
+                    "shell setsid unpersist auto"))
+
+    def test_modern_ip_and_route_spellings(self):
+        self._hard(("shell ip addr del 10.0.1.5/24 dev eth0",
+                    "shell ip a flush dev eth0", "shell ip l set eth0 down",
+                    "shell route del default", "shell route flush",
+                    "shell nmcli radio wifi off",
+                    "shell nmcli device set eth0 managed no",
+                    "shell ifconfig -a eth0 down"))
+
+    def test_firewall_long_forms_and_restore(self):
+        self._hard(("shell iptables --policy output drop",
+                    "shell iptables-restore /tmp/rules.v4",
+                    "shell ufw --force reset",
+                    "shell nft delete table inet filter"))
+
+    def test_relative_at_scheduler_forms(self):
+        for cmd in ("shell at now + 1 minute /f c:\\x.exe",
+                    "shell at -f /tmp/x now", "shell at midnight /f x.exe"):
+            got = _classify(cmd)
+            self.assertEqual((got.tier, got.action_key),
+                             (safety.TIER_KNOCK, "persist"), cmd)
+
+    def test_phase_five_promotion_is_not_shadowed_by_an_earlier_tier_two_hit(self):
+        """The promoted refusal has to win over any other gated hit on the line."""
+        for cmd in ("responder -I eth0 msfconsole", "crontab -e msfconsole"):
+            self.assertEqual(
+                safety.classify(cmd, target_kind="server",
+                                is_uplink_iface=lambda n: False,
+                                phase5_enabled=False).tier,
+                safety.TIER_HARD, cmd)
+
+    def test_interface_disconnect_is_one_rule_not_two(self):
+        """Hard on the uplink, gated elsewhere — not tier-1 for both."""
+        self.assertEqual(
+            _classify("shell nmcli device disconnect eth0").tier, safety.TIER_HARD)
+        got = _classify("shell nmcli device disconnect wlan1",
+                        is_uplink_iface=lambda n: False)
+        self.assertEqual((got.tier, got.action_key),
+                         (safety.TIER_KNOCK, "iface_change"))
+
+    def test_a_verb_in_a_readers_arguments_is_data(self):
+        for cmd in ("grep reboot /var/log/syslog", "man reboot",
+                    "ls /tmp/reboot", "cat /home/u/.bashrc",
+                    "head -n 5 /var/log/auth.log"):
+            self.assertEqual(_classify(cmd).tier, safety.TIER_FREE, cmd)
+
+    def test_but_a_separator_ends_the_readers_protection(self):
+        self._hard(("ls /tmp; iptables -F", "cat /etc/hosts && reboot"))
+
+    def test_scan_limits_only_fire_in_command_position(self):
+        for cmd in ("man nmap", "grep nmap /etc/services", "cat masscan.conf",
+                    "ls nmap-results"):
+            self.assertEqual(safety.enforce_scan_limits(cmd), cmd, cmd)
+
+    def test_scan_limits_still_fire_behind_wrappers(self):
+        for cmd in ("sudo nmap -sV 10.0.1.5", "shell sudo nmap -T5 10.0.1.5",
+                    "timeout 600 nmap -sV 10.0.1.5",
+                    "shell env nmap -sV 10.0.1.5"):
+            self.assertIn("-T2 --max-rate 50", safety.enforce_scan_limits(cmd), cmd)
+
+
 class TestNeverRaises(unittest.TestCase):
     def test_hostile_input_returns_a_classification(self):
         for cmd in ("", "   ", "\n\n", "\x00", "sudo", "sudo -u", "shell",

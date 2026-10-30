@@ -58,17 +58,35 @@ def has_shell_metachars(command):
 
 # ── Normalisation ──
 #
-# One normalised form, produced once, that every pattern in _RULES is written
-# against. Quotes and backslashes are removed because they carry no meaning
-# for classification but are the cheapest way to hide a verb: re''boot,
-# "reboot" and r\eboot all have to reach the same verdict. Removing
-# backslashes also flattens Windows paths, so patterns matching those are
-# written against the flattened form (comsvcs.dll, ntds.dit, currentversionrun).
+# Two normalised forms, produced once per command by _forms, and every
+# pattern is matched against both. One deletes backslashes, which defeats
+# escape tricks (r\eboot → reboot); the other turns them into slashes, which
+# keeps Windows paths tokenised so that \bshutdown still has a word boundary
+# in ...\System32\shutdown.exe. Deleting backslashes and keeping those paths
+# tokenised are mutually exclusive on a single string, which is why there
+# are two.
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f\u200b-\u200f\u202a-\u202e]")
 _QUOTES = re.compile(r"[\"'\\]")
 _WHITESPACE = re.compile(r"\s+")
-_PRIVILEGE = re.compile(r"^(?:sudo|doas|runas|pkexec)\b(?:\s+-[^\s]+)*\s*")
+
+# `sudo -u alice cmd` and `doas -n cmd` both have to reduce to `cmd`, so the
+# flag list has to know which flags take a value.
+_PRIVILEGE = re.compile(
+    r"^(?:sudo|doas|runas|pkexec|su)\b"
+    r"(?:\s+(?:-u|-U|--user|-g|--group)\s+\S+|\s+-[^\s]+)*\s*")
+
+# Wrappers that put a real program in argument position. Without these,
+# `nohup sleep 7200` and `/usr/bin/sleep 7200` escape the first-token check.
+_WRAPPERS = ("env", "nohup", "timeout", "exec", "setsid", "stdbuf", "nice",
+             "ionice", "busybox", "command", "time")
+
+# Commands that read rather than act. A verb appearing as their argument is
+# a string, not an instruction: `grep reboot /var/log/syslog` must not be
+# refused, or the agent cannot read its own logs.
+_READERS = ("grep", "egrep", "fgrep", "rgrep", "man", "cat", "less", "more",
+            "tail", "head", "ls", "find", "echo", "awk", "sed", "file",
+            "stat", "wc", "strings", "diff", "nl", "od", "xxd")
 
 
 def _normalise(command):
@@ -84,21 +102,45 @@ def _strip_privilege(text):
     while previous != text:
         previous = text
         text = _PRIVILEGE.sub("", text, count=1).strip()
-        # `sudo -u root cmd` leaves a bare user token behind
-        if previous.startswith(("sudo ", "doas ", "runas ")) and text.startswith("root "):
-            text = text[5:].strip()
+    return text
+
+
+def _strip_wrappers(text):
+    """Drop leading wrappers that put the real program in argument position."""
+    previous = None
+    while previous != text:
+        previous = text
+        tokens = text.split()
+        if not tokens or _basename(tokens[0]) not in _WRAPPERS:
+            break
+        rest = tokens[1:]
+        # `timeout 5 cmd`, `nice -n 10 cmd`, `env FOO=bar cmd`
+        while rest and (rest[0].startswith("-")
+                        or re.match(r"^\d+(?:\.\d+)?[smhd]?$", rest[0])
+                        or re.match(r"^\w+=", rest[0])):
+            rest = rest[1:]
+        text = " ".join(rest).strip()
     return text
 
 
 def _effective(text):
-    """The command with privilege wrappers and the beacon `shell` verb removed."""
+    """The command with wrappers, privilege prefixes and `shell` removed."""
     text = _strip_privilege(text)
     if text.startswith("shell "):
         text = _strip_privilege(text[6:].strip())
-    # `sh -c reboot` and friends wrap the real verb
     text = re.sub(r"^(?:sh|bash|zsh|dash|cmd(?:\.exe)?|powershell(?:\.exe)?)\b"
                   r"(?:\s+-\w+)*\s+", "", text).strip()
+    text = _strip_privilege(_strip_wrappers(text))
     return text
+
+
+def _program(text):
+    """Basename of the effective command's program, lowercased."""
+    tokens = text.split()
+    if not tokens:
+        return ""
+    name = _basename(tokens[0]).lower()
+    return name[:-4] if name.endswith(".exe") else name
 
 
 def _basename(token):
@@ -236,21 +278,18 @@ _RULES = [
                 r"|\bshutdown(?:\.exe)?\b"
                 r"|\bhalt\b(?!\.\w)"
                 r"|\bkexec\b"
+                r"|\b(?:restart|stop)-computer\b"
                 r"|\b(?:tel)?init\s+[0-6]\b"
-                r"|\bsystemctl\b[^/]*\b(?:poweroff|reboot|halt|kexec)\b"), "power_off"),
-
-    (re.compile(r"\bmkfs(?:\.\w+)?\b"
-                r"|\bwipefs\b"
-                r"|\bdd\b.*\bif=/dev/"
-                r"|\brm\b(?:\s+-{1,2}[\w-]+)*\s+/"
-                r"(?:\*|(?:etc|usr|var|bin|sbin|boot|lib|lib64|home|root)/?)?\s*$"),
-     "disk_wipe"),
+                r"|\bsystemctl\b[^/]*\b(?:poweroff|reboot|halt|kexec|emergency)\b"
+                r"|\bsystemctl\b.*\bisolate\s+(?:rescue|emergency)"), "power_off"),
 
     (re.compile(r"\b(?:ip6?tables|ebtables|arptables)\b"
-                r"(?=.*(?:\s-[fxz]\b|--flush|--delete-chain"
+                r"(?=.*(?:\s-[fxz]\b|--flush|--delete-chain|--policy"
+                r"|--insert|--append|--delete\b"
                 r"|\s-p\s+\w+\s+(?:drop|reject)|\s-[aidr]\b))"
-                r"|\bnft\b.*\bflush\b"
-                r"|\bufw\b\s+(?:enable|disable|reset|default)\b"
+                r"|\bip6?tables-restore\b"
+                r"|\bnft\b.*\b(?:flush|delete)\b"
+                r"|\bufw\b[^|]*?\s(?:enable|disable|reset|default)\b"
                 r"|\bfirewall-cmd\b.*(?:--reload|--add|--remove|--panic)"),
      "firewall_change"),
 
@@ -261,11 +300,12 @@ _RULES = [
                 r"|/etc/init\.d/network\w*\b.*\b(?:stop|restart)\b"
                 r"|\bnetplan\s+apply\b"
                 r"|\bnmcli\b.*\b(?:networking\s+(?:off|disable)"
-                r"|radio\s+(?:all\s+)?(?:off|disable)"
+                r"|radio\s+(?:\w+\s+)?(?:off|disable)"
                 r"|r\s+all\s+(?:off|disable)|con(?:nection)?\s+down"
-                r"|dev(?:ice)?\s+disconnect)\b"
-                r"|\bip\b[^/]*\broute\s+(?:flush|del|delete)\b"
-                r"|\bip\b[^/]*\baddr\s+flush\b"
+                r"|managed\s+no)\b"
+                r"|\bip\b[^/]*\b(?:r|route)\s+(?:flush|del|delete)\b"
+                r"|\bip\b[^/]*\b(?:a|addr|address)\s+(?:flush|del|delete)\b"
+                r"|\broute\b\s+(?:del|delete|flush)\b"
                 r"|\bdhclient\b\s+-r\b"), "network_service"),
 
     (re.compile(r"\bairmon-ng\b.*\bcheck\s+kill\b"), "airmon_check_kill"),
@@ -304,7 +344,9 @@ _RULES = [
                 r"|\bcrontab\b(?!\s+-l\b)"
                 r"|\bsystemctl\b.*\benable\b"
                 r"|\bschtasks\b.*/create\b"
-                r"|\bat\s+\d{1,2}:\d{2}\b"
+                r"|\bat\b\s+(?:now\b|-|\d{1,2}:\d{2}\b|\d{1,2}(?:am|pm)\b"
+                r"|midnight\b|noon\b|teatime\b)"
+                r"|\bsystemd-run\b.*--on-"
                 r"|\breg\s+add\b.*currentversion/?run"
                 r"|\bsc\s+create\b"
                 r"|\b(?:useradd|adduser)\b"
@@ -357,19 +399,66 @@ _IFACE_RULES = [
     re.compile(r"\biw\s+(?P<if>\S+)\s+set\s+monitor\b"),
     re.compile(r"\biwconfig\s+(?P<if>\S+)\s+mode\s+monitor\b"),
     re.compile(r"\bairmon-ng\s+(?:start|stop)\s+(?P<if>\S+)"),
-    re.compile(r"\bip\s+link\s+set\s+(?:dev\s+)?(?P<if>[\w.:-]+)\s+(?:down|nomaster)\b"),
-    re.compile(r"\bip\s+link\s+set\s+down\s+dev\s+(?P<if>[\w.:-]+)\b"),
-    re.compile(r"\bip\s+link\s+(?:delete|del)\s+(?P<if>[\w.:-]+)\b"),
-    re.compile(r"\bifconfig\s+(?P<if>[\w.:-]+)\s+(?:down|0\.0\.0\.0)\b"),
-    re.compile(r"\bifdown\s+(?P<if>[\w.:-]+)\b"),
-    re.compile(r"\bnmcli\s+dev(?:ice)?\s+disconnect\s+(?P<if>[\w.:-]+)\b"),
+    re.compile(r"\bip\s+(?:l|link)\s+set\s+(?:(?:-\S+|dev)\s+)*"
+               r"(?P<if>[\w.:-]+)\s+(?:down|nomaster)\b"),
+    re.compile(r"\bip\s+(?:l|link)\s+set\s+down\s+dev\s+(?P<if>[\w.:-]+)\b"),
+    re.compile(r"\bip\s+(?:l|link)\s+(?:delete|del)\s+(?P<if>[\w.:-]+)\b"),
+    re.compile(r"\bip\s+(?:a|addr|address)\s+(?:del|delete)\s+\S+\s+dev\s+"
+               r"(?P<if>[\w.:-]+)\b"),
+    re.compile(r"\bip\s+(?:a|addr|address)\s+flush\s+(?:dev\s+)?(?P<if>[\w.:-]+)\b"),
+    re.compile(r"\bifconfig\s+(?:-\S+\s+)*(?P<if>[\w.:-]+)\s+(?:down|0\.0\.0\.0)\b"),
+    re.compile(r"\bifdown\s+(?:-\S+\s+)*(?P<if>[\w.:-]+)\b"),
+    re.compile(r"\bnmcli\s+dev(?:ice)?\s+(?:disconnect|set)\s+(?P<if>[\w.:-]+)\b"),
 ]
+
+# ── Destructive filesystem operations ──
+#
+# Checked by walking the arguments rather than by regex. "Any argument is a
+# root-level path" is not a thing a regex expresses well, and the first
+# attempt here proved it: anchoring the pattern at end-of-string meant that
+# `rm -rf /` was refused while `rm -rf / --no-preserve-root` — the spelling
+# that actually works, because GNU rm declines the first — went through free.
+
+_WIPE_TARGETS = frozenset((
+    "/", "/*", "~", "~/", "/etc", "/usr", "/var", "/bin", "/sbin", "/boot",
+    "/lib", "/lib64", "/home", "/root", "/srv", "/dev", "/proc", "/sys",
+    "c:", "c:/", "c:/windows",
+))
+_WIPE_PROGRAMS = ("rm", "shred", "unlink", "srm", "wipe")
+
+
+def _is_disk_wipe(effective):
+    program = _program(effective)
+    if program.startswith("mkfs") or program in ("wipefs", "fdisk", "parted",
+                                                  "sgdisk", "badblocks"):
+        return True
+    tokens = effective.split()[1:]
+    if program == "dd":
+        return any(t.startswith(("of=/dev/", "if=/dev/")) for t in tokens)
+    if program not in _WIPE_PROGRAMS:
+        return False
+    for token in tokens:
+        if token.startswith("-"):
+            continue
+        if token in _WIPE_TARGETS or token.rstrip("/") in _WIPE_TARGETS:
+            return True
+        if token.startswith("/dev/"):
+            return True
+    return False
+
 
 _MALFORMED = _row(TIER_HARD, "malformed", "input",
                   "command is not a string and cannot be classified")
 
 _BEACON_HARD_VERBS = ("kill", "unpersist", "reconfig")
 _SLEEP_LIMIT_SECONDS = 3600
+
+# The two halves of _RULES are consulted at different points in classify, so
+# that the tier-1-before-tier-2 ordering is structural rather than a property
+# of where an entry happens to sit in one long list.
+_RULES_HARD = [(p, k) for p, k in _RULES if RISK_TABLE[k].tier == TIER_HARD]
+_RULES_KNOCK = [(p, k) for p, k in _RULES if RISK_TABLE[k].tier == TIER_KNOCK]
+_EXPLOIT_RULE = next(p for p, k in _RULES if k == "exploit_known_poc")
 
 
 # ── Classification ──
@@ -430,6 +519,10 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
     target_kind is "beacon", "dropbox" or "server". Anything else is treated
     as the drop-box, which is the strictest reading — an unrecognised target
     must not quietly lose the lifeline protections.
+
+    The order of the checks below is the ordering guarantee: everything that
+    can refuse outright is consulted before anything that can merely gate,
+    so a line carrying both reaches the refusal.
     """
     if not isinstance(command, str):
         return _MALFORMED
@@ -438,21 +531,45 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
     effective = tuple(_effective(form) for form in forms)
     candidates = forms + effective
 
-    first_token = effective[0].split(" ", 1)[0] if effective[0] else ""
+    program = _program(effective[0])
+    first_token = program
+
     if first_token in _BEACON_HARD_VERBS:
         return RISK_TABLE["beacon_control"]
     if first_token == "sleep":
         return _classify_sleep(effective[0])
 
+    if any(_is_disk_wipe(text) for text in effective):
+        return RISK_TABLE["disk_wipe"]
+
     if target_kind not in ("beacon", "server"):
         if any(_LIFELINE.search(text) for text in candidates):
             return RISK_TABLE["dropbox_lifeline"]
+
+    # A verb in a reader's argument list is a string, not an instruction.
+    # Readers cannot wipe, cannot touch a lifeline and cannot change an
+    # interface, so this check sits after those three. It applies only to a
+    # single command: once the line carries a separator, the first token no
+    # longer speaks for the rest of it.
+    if program in _READERS and not has_shell_metachars(command):
+        return _FREE
+
+    for pattern, key in _RULES_HARD:
+        if any(pattern.search(text) for text in candidates):
+            return RISK_TABLE[key]
 
     verdict = _classify_iface(candidates, is_uplink_iface)
     if verdict is not None:
         return verdict
 
-    for pattern, key in _RULES:
+    # Promotion has to happen before the tier-2 scan, or an earlier tier-2
+    # hit on the same line shadows a verdict that should have been a refusal.
+    if not phase5_enabled and any(_EXPLOIT_RULE.search(t) for t in candidates):
+        return RISK_TABLE["exploit_known_poc"]._replace(
+            tier=TIER_HARD,
+            reason="the exploitation phase is switched off for this run")
+
+    for pattern, key in _RULES_KNOCK:
         if not any(pattern.search(text) for text in candidates):
             continue
         row = RISK_TABLE.get(key)
@@ -460,11 +577,16 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
             return _row(TIER_KNOCK, key, "unknown",
                         "gated action with no risk-table row; treated "
                         "conservatively", *_UNKNOWN_KNOCK)
-        if key == "exploit_known_poc" and not phase5_enabled:
-            return row._replace(
-                tier=TIER_HARD,
-                reason="the exploitation phase is switched off for this run")
         return row
+
+    # A rule added at runtime (the suite does this) lands in neither half, so
+    # fall back to a full scan rather than silently ignoring it.
+    for pattern, key in _RULES:
+        if key in RISK_TABLE or not any(pattern.search(t) for t in candidates):
+            continue
+        return _row(TIER_KNOCK, key, "unknown",
+                    "gated action with no risk-table row; treated "
+                    "conservatively", *_UNKNOWN_KNOCK)
 
     return _FREE
 
@@ -519,16 +641,31 @@ def _scanner_of(token):
 
 
 def enforce_scan_limits(command):
-    """Rewrite a scanning command to gentle timing. Idempotent."""
+    """Rewrite a scanning command to gentle timing. Idempotent.
+
+    Only fires when the scanner is in command position — possibly behind
+    privilege or wrapper prefixes — so that `man nmap` and
+    `grep nmap /etc/services` are left alone.
+    """
     if not isinstance(command, str):
         return command
 
     tokens = command.split()
     index = None
     for position, token in enumerate(tokens):
-        if _scanner_of(token):
+        name = _basename(token).lower()
+        if name.endswith(".exe"):
+            name = name[:-4]
+        if name in _SCANNER_LIMITS:
             index = position
             break
+        # Only wrappers, the beacon verb and flags may precede the scanner.
+        if name in ("shell", "sudo", "doas", "runas", "pkexec") \
+                or name in _WRAPPERS or token.startswith("-") \
+                or re.match(r"^\d+(?:\.\d+)?[smhd]?$", token) \
+                or re.match(r"^\w+=", token):
+            continue
+        return command
     if index is None:
         return command
 
