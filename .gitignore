@@ -27,3 +27,12 @@ bin/*.tmp
 *.kicad_prl
 *-backups/
 fp-info-cache
+
+# superpowers brainstorming mockups
+.superpowers/
+
+# git worktrees
+.worktrees/
+
+# openchamber screenshots and scratch
+.openchamber/
