@@ -672,10 +672,13 @@ Upstream-Tag `v2` (Commit `2fd9aa0`). Der Pfad `vendor/` ist nicht gitignored.
 Die Config `.opencode/opencode.json` registriert die Skills aus
 `./vendor/kicad-happy/skills`.
 
-Aufruf mit Python 3.12, nicht mit dem System-Python:
+Aufruf mit Python 3.12, nicht mit dem System-Python. `KH` ist der Interpreter
+für kicad-happy; `KIPY` ist der Interpreter aus dem KiCad-Bundle, der die
+`pcbnew`-Bindings enthält (für `gen_pcb.py` und `route_pcb.py`):
 
 ```
 KH=/opt/homebrew/bin/python3.12
+KIPY=/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/3.9/bin/python3
 $KH vendor/kicad-happy/skills/kicad/scripts/analyze_schematic.py \
     hardware/kicad/raccoon-tap.kicad_sch --output /tmp/t1.json
 ```
