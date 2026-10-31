@@ -664,6 +664,42 @@ For contrast, the same measurement on the old `raccoon-hat.kicad_sch`:
 shorts and a floating pin that I had introduced by swapping the anode and
 cathode of the jack's LEDs.
 
+### kicad-happy — Schaltungsanalyse und Skripte
+
+Die Analyse-Skripte stammen aus `aklofas/kicad-happy`, vendored unter
+`vendor/kicad-happy/` (Subtree, `--squash`, kein Submodul). Gepinnt auf den
+Upstream-Tag `v2` (Commit `2fd9aa0`). Der Pfad `vendor/` ist nicht gitignored.
+Die Config `.opencode/opencode.json` registriert die Skills aus
+`./vendor/kicad-happy/skills`.
+
+Aufruf mit Python 3.12, nicht mit dem System-Python:
+
+```
+KH=/opt/homebrew/bin/python3.12
+$KH vendor/kicad-happy/skills/kicad/scripts/analyze_schematic.py \
+    hardware/kicad/raccoon-tap.kicad_sch --output /tmp/t1.json
+```
+
+Das System-`python3` ist 3.9.6 und liegt unter dem Mindestmaß von 3.10 des
+Toolkits. Es bricht schon beim Import ab, weil moderne Typ-Syntax wie
+`str | None` zur Laufzeit ausgewertet wird:
+
+```
+python3 vendor/kicad-happy/skills/kicad/scripts/analyze_schematic.py \
+    hardware/kicad/raccoon-tap.kicad_sch --output /tmp/t1_sys.json
+TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'
+```
+
+Upgrade auf einen neueren Upstream-Stand:
+
+```
+git subtree pull --prefix vendor/kicad-happy \
+    https://github.com/aklofas/kicad-happy.git <tag> --squash
+```
+
+Danach `.opencode/opencode.json` und die Versionsangabe in diesem Abschnitt
+prüfen.
+
 ## ERC — now run with the real tool
 
 KiCad 10.0.6 was installed on 2026-09-25, so `kicad-cli` is available and the
