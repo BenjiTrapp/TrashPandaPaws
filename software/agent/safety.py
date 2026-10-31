@@ -89,16 +89,20 @@ _READERS = ("grep", "egrep", "fgrep", "rgrep", "man", "cat", "less", "more",
             "nl", "od", "dirname", "basename", "realpath")
 
 # Readers only while they are not asked to act. Deleting them outright, as
-# the first attempt did, turned `sed -n /reboot/p /var/log/syslog` and
-# `find /tmp -name reboot` into hard refusals — trading an under-match for an
-# over-match in the same module.
+# an earlier attempt did, turned `sed -n /reboot/p /var/log/syslog` and
+# `find /tmp -name reboot` into hard refusals.
+#
+# Stored as regexes rather than flag names because a flag-cluster match on
+# its own is not precise enough: lowercasing turns awk's `-F:` field
+# separator into `-f:`, which a prefix match reads as awk's script flag and
+# escalates a log grep to a refusal. A flag whose value is attached must not
+# match, so those entries are anchored with $.
 _CONDITIONAL_READERS = {
-    "find": ("-exec", "-execdir", "-delete", "-ok", "-fprint", "-fls"),
-    # A script loaded with -f can write: sed has `w`, awk has `print >`.
-    "sed": ("-i", "--in-place", "-s", "-f", "--file"),
-    "awk": ("-i", "inplace", "-f", "--file"),
-    "xxd": ("-r", "--revert"),
-    "perl": ("-i", "-e", "-E"),
+    "find": (r"^-exec(?:dir)?$", r"^-delete$", r"^-ok$", r"^-fprint", r"^-fls"),
+    "sed": (r"^-[a-z]*i", r"^--in-place", r"^-[a-z]*f$", r"^--file$"),
+    "awk": (r"^-[a-z]*f$", r"^--file$", r"^-i$", r"^inplace"),
+    "xxd": (r"^-[a-z]*r$", r"^--revert$"),
+    "perl": (r"^-[a-z]*i", r"^-[a-z]*e$"),
 }
 
 # Anything that can put a nested command in argument position.
@@ -115,11 +119,8 @@ def _is_reader(program, tokens):
     if acting is None:
         return False
     for token in tokens:
-        for flag in acting:
-            if flag.startswith("--") or not flag.startswith("-"):
-                if token == flag or token.startswith(flag):
-                    return False
-            elif token == flag or re.match(r"^-[a-z]*%s" % flag[1:], token):
+        for pattern in acting:
+            if re.match(pattern, token):
                 return False
     return True
 
@@ -501,23 +502,53 @@ _WIPE_TARGETS = frozenset((
 _WIPE_PROGRAMS = ("rm", "shred", "unlink", "srm", "wipe")
 
 # A write to a raw block device destroys a filesystem whatever program does
-# it. /dev/null, /dev/zero and /dev/shm are not block devices and stay free.
-_BLOCK_DEVICE = re.compile(
-    r"^/dev/(?:sd[a-z]+\d*|nvme\d+n\d+(?:p\d+)?|mmcblk\d+(?:p\d+)?"
-    r"|hd[a-z]+\d*|vd[a-z]+\d*|loop\d+|md\d+|dm-\d+|xvd[a-z]+\d*)$")
+# it — but "any non-reader naming a device is writing to it" is false, and
+# saying so refused mount, lsblk, smartctl, blkid, sha256sum and fsck at a
+# tier with no operator override. The premise is gone; an explicit writer
+# list replaces it.
+_DEVICE_WRITERS = ("tee", "xxd", "shred", "wipe", "srm", "pv", "cpio")
+
+# Pseudo-devices that are not storage. Everything else under /dev/ is
+# treated as a device, which is the safe direction: /dev/mapper/* and
+# /dev/disk/by-id/* are the usual way to address a disk on an LVM host and
+# an allowlist of sd*/nvme* names misses both entirely.
+_SAFE_PSEUDO_DEVICES = frozenset((
+    "null", "zero", "random", "urandom", "full", "tty", "stdin", "stdout",
+    "stderr", "console", "ptmx", "fd",
+))
+
+
+def _is_storage_device(path):
+    if not path.startswith("/dev/"):
+        return False
+    rest = path[5:]
+    head = rest.split("/", 1)[0]
+    return head.rstrip("0123456789") not in _SAFE_PSEUDO_DEVICES \
+        and head not in _SAFE_PSEUDO_DEVICES
 
 
 def _command_positions(tokens):
     """Indices where a token is a program rather than an argument.
 
-    The middle ground between the two failures this module has already had:
-    checking only index 0 missed `xargs rm -rf /`, and checking every token
-    turned `man fdisk` and `grep mkfs /etc/fstab` into hard refusals. A
-    program is in command position at the start of the line, or directly
-    after something that introduces a nested command.
+    Three attempts converged here. Index 0 only missed `xargs rm -rf /`;
+    every token turned `man fdisk` into a hard refusal; and seeding only from
+    index 0 missed `ls ; rm -rf /`, because a separator introduces a command
+    just as surely as `-c` does. One worklist, and introducers are re-checked
+    at every position it pops — the earlier two-loop split meant a nested
+    introducer like `su alice -c xargs rm -rf /` was never expanded.
     """
-    positions = set()
+    separators = (";", "&&", "||", "|", "&", ";;", "|&")
+    introducing_flags = ("-c", "-exec", "-execdir", "--", "/c", "/k")
+
     pending = [0]
+    for index, token in enumerate(tokens):
+        if token in separators or token in introducing_flags:
+            pending.append(index + 1)
+        # `ls;rm -rf /` has no standalone separator token.
+        elif token.endswith(";") and len(token) > 1:
+            pending.append(index + 1)
+
+    positions = set()
     while pending:
         index = pending.pop()
         if index >= len(tokens) or index in positions:
@@ -529,21 +560,14 @@ def _command_positions(tokens):
         if name in _COMMAND_INTRODUCERS:
             rest = _skip_wrapper_arguments(tokens[index + 1:], name)
             pending.append(len(tokens) - len(rest))
-    # `-c`, `-exec` and `--` introduce a command wherever they appear.
-    for index, token in enumerate(tokens):
-        if token in ("-c", "-exec", "-execdir", "--", "/c", "/k"):
-            pending.append(index + 1)
-    while pending:
-        index = pending.pop()
-        if index >= len(tokens) or index in positions:
-            continue
-        positions.add(index)
     return positions
 
 
 def _is_disk_wipe(effective):
     """True if any command on the line destroys a filesystem or raw device."""
-    tokens = effective.split()
+    # Separators are made standalone first, so that `ls;rm -rf /` is seen as
+    # two commands rather than one token named `ls;rm`.
+    tokens = re.sub(r"([;|&])", r" \1 ", effective).split()
     positions = _command_positions(tokens)
     for index in sorted(positions):
         name = _basename(tokens[index]).lower()
@@ -557,13 +581,13 @@ def _is_disk_wipe(effective):
         # block-device rule below would refuse `fdisk -lu /dev/sda`, which
         # is recon.
         if name == "fdisk":
-            if not any(re.match(r"^-[a-z]*l", a) for a in arguments):
+            if not any(re.match(r"^(?:-[a-z]*l|--list)", a) for a in arguments):
                 return True
             continue
         if name == "parted":
             # Interactive parted on a device can destroy it, so the test is
             # for a read-only subcommand rather than for a destructive one.
-            if any(_BLOCK_DEVICE.match(a) for a in arguments) and not any(
+            if any(_is_storage_device(a) for a in arguments) and not any(
                     a in ("print", "p", "unit", "version", "help", "select")
                     for a in arguments):
                 return True
@@ -573,18 +597,18 @@ def _is_disk_wipe(effective):
                 return True
             continue
         if name == "dd":
-            # Destructive when it writes to a raw device. Reading one into a
-            # file is imaging, and reading /dev/urandom into a file is noise.
+            # Destructive when it writes to storage. Reading a device into a
+            # file is imaging; writing /dev/null or /dev/zero is nothing.
             for argument in arguments:
                 if argument.startswith("of=") \
-                        and _BLOCK_DEVICE.match(argument[3:]):
+                        and _is_storage_device(argument[3:]):
                     return True
             continue
-        # Any other non-reader naming a raw block device is writing to it.
-        # This is what catches `xxd -r hex /dev/sda` and interactive
-        # `parted /dev/sda`, which no program-name rule recognises.
-        if not _is_reader(name, arguments) \
-                and any(_BLOCK_DEVICE.match(a) for a in arguments):
+        # Programs that write raw bytes where they are pointed. `cp`, `mount`,
+        # `lsblk` and the inspection tools are deliberately absent: naming a
+        # device is not writing to it.
+        if name in _DEVICE_WRITERS \
+                and any(_is_storage_device(a) for a in arguments):
             return True
         if name not in _WIPE_PROGRAMS:
             continue

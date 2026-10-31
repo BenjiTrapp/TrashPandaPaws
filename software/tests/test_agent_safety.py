@@ -598,6 +598,72 @@ class TestCommandPositionAndReaders(unittest.TestCase):
             self.assertEqual(_classify(cmd).tier, safety.TIER_KNOCK, cmd)
 
 
+class TestRoundFourFindings(unittest.TestCase):
+    """The fourth re-review's findings. One was Critical.
+
+    `_command_positions` is the right concept but its first implementation
+    seeded only index 0, so a wipe after a shell separator was free — and the
+    every-token scan it replaced had caught those. The block-device rule's
+    premise ("any non-reader naming a device is writing to it") was simply
+    false and refused mount, lsblk, smartctl and fsck at a tier with no
+    operator override.
+    """
+
+    def _hard(self, cmds):
+        for cmd in cmds:
+            self.assertEqual(_classify(cmd).tier, safety.TIER_HARD, cmd)
+
+    def _free(self, cmds):
+        for cmd in cmds:
+            self.assertEqual(_classify(cmd).tier, safety.TIER_FREE, cmd)
+
+    def test_a_separator_introduces_a_command(self):
+        self._hard(("ls ; rm -rf /", "ls;rm -rf /", "ls && rm -rf /",
+                    "ls&&rm -rf /", "echo hi | rm -rf /", "echo a|rm -rf /",
+                    "find . | xargs rm -rf /"))
+
+    def test_a_nested_introducer_is_expanded(self):
+        """One worklist; the two-loop split never recursed past -c."""
+        for code in ("su alice -c xargs rm -rf /",
+                     "nohup su alice -c xargs rm -rf /",
+                     "find . -execdir xargs rm -rf / +"):
+            self.assertIsNotNone(safety.validate_script(code, "bash"), code)
+
+    def test_naming_a_device_is_not_writing_to_it(self):
+        self._free(("mount /dev/sda1 /mnt", "lsblk /dev/sda",
+                    "smartctl -a /dev/sda", "blkid /dev/sda",
+                    "sha256sum /dev/sda", "cp /dev/sda /tmp/img",
+                    "cryptsetup luksdump /dev/sda", "sgdisk -p /dev/sda",
+                    "fsck /dev/sda1"))
+
+    def test_but_a_writer_pointed_at_storage_is(self):
+        self._hard(("tee /dev/sda", "xxd -r /tmp/hex /dev/sda",
+                    "tee /dev/mapper/vg-root"))
+
+    def test_storage_is_recognised_by_what_it_is_not(self):
+        """An sd*/nvme* allowlist misses every LVM and by-id path."""
+        self._hard(("dd if=/dev/zero of=/dev/mapper/vg-root",
+                    "dd if=/dev/zero of=/dev/disk/by-id/ata-x",
+                    "dd if=/dev/zero of=/dev/sr0",
+                    "dd if=/dev/zero of=/dev/nbd0"))
+        self._free(("dd if=/dev/zero of=/dev/null",
+                    "dd if=/dev/urandom of=/tmp/x",
+                    "dd if=/dev/sda of=/tmp/img"))
+
+    def test_a_field_separator_is_not_a_script_flag(self):
+        """Lowercasing turns awk's -F into -f; a prefix match then misfired."""
+        self._free(("awk -F: /reboot/ /var/log/syslog",
+                    "awk -F: /reboot/ /etc/passwd",
+                    "sed -s /reboot/p /var/log/syslog"))
+        for cmd in ("awk -f /tmp/x.awk authorized_keys",
+                    "sed -i s/x/y/ /etc/rc.local",
+                    "sed -i.bak s/x/y/ /etc/rc.local"):
+            self.assertEqual(_classify(cmd).tier, safety.TIER_KNOCK, cmd)
+
+    def test_long_form_list_flags(self):
+        self._free(("fdisk --list /dev/sda", "grep -- -la /dev/sda"))
+
+
 class TestNeverRaises(unittest.TestCase):
     def test_hostile_input_returns_a_classification(self):
         for cmd in ("", "   ", "\n\n", "\x00", "sudo", "sudo -u", "shell",
