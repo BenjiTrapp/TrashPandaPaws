@@ -57,7 +57,7 @@ kicad-cli pcb drc --severity-all --output $R/drc.rpt hardware/kicad/raccoon-tap.
 | Unconnected items | 134 | `drc.rpt`; expected, board is unrouted |
 | DRC errors | 0 | `drc.rpt` violation list holds no error-severity entries |
 | DRC warnings | 43 | 41 `via_dangling`, 2 `silk_over_copper` (J2 shield pads) |
-| ERC errors | 0 | `erc.rpt` (0 warnings) |
+| ERC errors | 0 | `erc.rpt` (0 warnings); **with four checks ignored**, see caveats |
 | EMC risk score | 76.0 / 100 | 0 = worst, 100 = best; 29 findings (2 error, 22 warning, 5 info); see caveat |
 | Highest junction temperature | 69.8 °C | U4 (AP2112K-3.3 LDO), 25 °C ambient; see caveat |
 | Schematic analyzer findings | 27 | 2 error, 3 warning, 22 info |
@@ -91,6 +91,21 @@ violations, which is why "DRC errors" is 0 and "unconnected items" is 134.
   RTL8153B, which dissipates the most, was not modelled at all. The U4 figure
   rests on an assumed 105 mA load (the schematic power budget uses 10 mA) and
   the default Tj,max of 125 °C. Treat it as a placeholder, not a thermal sign-off.
+- **ERC 0 means "0 with four checks disabled".** `erc.rpt` ends with an
+  `** Ignored checks:` block naming: *Global label only appears once in the
+  schematic*, *Four connection points are joined together*, *SPICE model issue*,
+  and *Assigned footprint doesn't match footprint filters*. These are not set
+  in the project: `hardware/kicad/raccoon-tap.kicad_pro` has no `erc` section at
+  all (its `rule_severities` entries belong to DRC), so they are KiCad 10's
+  built-in default severities. Confirmed by running `kicad-cli sch erc` on a
+  copy of the schematic with no project file, which ignores the same four. To
+  see what they would say, a scratch copy of the project was given an `erc`
+  section setting those four to `error`; `kicad-cli` then reported "Ignored
+  checks: None" and still 0 violations, so on today's schematic the ignored
+  checks hide nothing. That result is for this schematic only; it is not
+  recorded in a committed file. The footprint-filter check is silent here
+  for a further reason: no symbol in `raccoon.kicad_sym` or the schematic
+  defines `ki_fp_filters`, so there is nothing for it to compare.
 - **Datasheet-backed checks did not run.** `capability_mode.json` shows
   `datasheet_extraction: unavailable`, datasheet coverage 0 %, and no schematic
   finding is `datasheet_backed`. The component lifecycle audit was not run
@@ -121,7 +136,15 @@ touches it.
 | 9 | Y1: no crystal selected, placeholder footprint, C19/C20 `TBD` | **partial** | `SS-001` and `missing_mpn` list Y1 among the 33 parts without an MPN. Nothing about the placeholder footprint. The load-cap check takes the 39 pF values at face value: `DO-DET-y1` "Crystal load cap Y1 = 22.5pF", `in_typical_range: true`. The `TBD` status lives in `netlist.yaml`, which the toolkit does not read, so the tool signs off a placeholder. |
 | 10 | LED polarity assumption (`led_polarity`) | **missed** | No finding mentions the LED nets (`ETH_LED0/1`, `LED_G_A`, `LED_Y_A`) beyond listing them as unrouted (`RT-001`) and unprotected (`EP-AUD-j2`). |
 | 11 | BOM: 10 of 19 lines have no part number | **found** (number differs) | `SS-001:c1` (error): "Sourcing blocker: BOM has <50% MPN coverage (0/17 unique parts). Board is not pre-fab ready." `DS-001` (error), `bom_lock.status: fail`. The tool sees **0** MPNs where the project knows 9 of 19 lines have one, because the MPNs live in `netlist.yaml`/`bom.csv`, not in the schematic's symbol fields. The direction is right; the magnitude is wrong. |
-| 12 | U3 footprint `QFN-40-1EP_5x5mm_P0.4mm_EP3.6x3.6mm` resolves in the installed library | **missed** | The analyzer reads the copy embedded in the board file; it does not look the footprint up in a library. Separately (not a toolkit result): the file exists at `…/KiCad.app/Contents/SharedSupport/footprints/Package_DFN_QFN.pretty/QFN-40-1EP_5x5mm_P0.4mm_EP3.6x3.6mm.kicad_mod`, and `kicad-cli pcb drc` reports "Found 0 Footprint errors". The analyzer's `TV-001` (U3 thermal vias 9/9) shows it parsed the embedded footprint correctly. |
+| 12 | U3 footprint `QFN-40-1EP_5x5mm_P0.4mm_EP3.6x3.6mm` resolves in the installed library | **missed** | The analyzer reads the copy embedded in the board file; it does not look the footprint up in a library. Separately (not a toolkit result): the file exists at `…/KiCad.app/Contents/SharedSupport/footprints/Package_DFN_QFN.pretty/QFN-40-1EP_5x5mm_P0.4mm_EP3.6x3.6mm.kicad_mod`, and `kicad-cli pcb drc` reports "Found 0 Footprint errors". ERC's silence on
+the filter check (*Assigned footprint doesn't match footprint filters* is one of
+the four ignored checks, see caveats) says nothing about this item: that check
+compares a footprint against a symbol's `ki_fp_filters` (none are defined here),
+not against the library. The check that does test resolution is
+`footprint_link_issues`, which is not ignored: the real ERC run raised nothing
+for U3's `Package_DFN_QFN:QFN-40-1EP_5x5mm_P0.4mm_EP3.6x3.6mm`, and in the
+no-project probe it fired only for J2's unconfigured `raccoon` library, never
+for U3, so the check was live and U3's link resolved. The analyzer's `TV-001` (U3 thermal vias 9/9) shows it parsed the embedded footprint correctly. |
 
 **Score: 2 found outright (3, 11), 3 partial (6, 8, 9), 7 missed (1, 2, 4, 5, 7, 10, 12).**
 
