@@ -1,0 +1,42 @@
+---
+description: KiCad electronics design analysis skills — schematic review, PCB layout, EMC pre-compliance, SPICE, BOM, manufacturing
+globs: ["**/*.kicad_sch", "**/*.kicad_pcb", "**/*.sch", "skills/**"]
+alwaysApply: false
+---
+
+# kicad-happy
+
+This repo is a suite of AI-powered electronics design skills for KiCad 5-10.
+
+## Skills
+
+Each skill lives under `skills/<name>/SKILL.md` — read the SKILL.md for full usage. Key skills:
+
+- **kicad** — Schematic/PCB/Gerber analysis. Run `python3 skills/kicad/scripts/analyze_schematic.py <file>.kicad_sch` for structured analysis.
+- **emc** — EMC pre-compliance (42 rules). Consumes schematic + PCB analyzer JSON.
+- **spice** — SPICE simulation with auto-generated testbenches.
+- **bom** — BOM management with multi-supplier pricing.
+- **digikey/mouser/lcsc/element14** — Component sourcing APIs.
+- **jlcpcb/pcbway** — Manufacturing prep and DFM validation.
+
+## Analysis workflow
+
+1. Run schematic analyzer: `python3 skills/kicad/scripts/analyze_schematic.py <file>.kicad_sch --output sch.json`
+2. Run PCB analyzer: `python3 skills/kicad/scripts/analyze_pcb.py <file>.kicad_pcb --full --output pcb.json`
+3. Run EMC analysis: `python3 skills/emc/scripts/analyze_emc.py --schematic sch.json --pcb pcb.json`
+4. Run thermal analysis: `python3 skills/kicad/scripts/analyze_thermal.py --schematic sch.json --pcb pcb.json`
+
+All scripts are zero-dependency Python 3.8+ (stdlib only).
+
+## Code structure
+
+- `skills/kicad/scripts/analyze_schematic.py` — Main schematic parser and orchestrator
+- `skills/kicad/scripts/signal_detectors.py` — Core signal path detectors (regulators, filters, opamps)
+- `skills/kicad/scripts/domain_detectors.py` — Domain-specific detectors (USB, Ethernet, BMS, audio, sensors)
+- `skills/kicad/scripts/analyze_pcb.py` — PCB layout analyzer
+- `skills/emc/scripts/emc_rules.py` — EMC rule implementations
+- `skills/kicad/scripts/kicad_types.py` — `AnalysisContext` dataclass shared by all detectors
+
+## Testing
+
+Test harness at `~/Projects/kicad-happy-testharness/` validates against 1,036 real KiCad projects. Run `python3 run/run_schematic.py --jobs 16` and `python3 regression/run_checks.py --type schematic`.

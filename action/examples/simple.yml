@@ -1,0 +1,84 @@
+# KiCad Design Review workflow
+# For repos with trusted contributors only (no fork PRs)
+#
+# Two-tier review:
+#   1. Deterministic analysis (always runs, free, no API key needed)
+#   2. AI-powered review (optional, requires ANTHROPIC_API_KEY)
+#
+# Add this file to your KiCad project repo at:
+#   .github/workflows/kicad-review.yml
+
+name: KiCad Design Review
+on:
+  push:
+    paths: ['**/*.kicad_sch', '**/*.kicad_pcb']
+  pull_request:
+    paths: ['**/*.kicad_sch', '**/*.kicad_pcb']
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: sudo apt-get install -y ngspice poppler-utils
+
+      # --- Tier 1: Deterministic analysis (free, no LLM) ---
+      - uses: aklofas/kicad-happy@v1
+        id: analysis
+        with:
+          # Optional: distributor API keys for datasheet download
+          # LCSC is always tried (no auth needed).
+          digikey-client-id: ${{ secrets.DIGIKEY_CLIENT_ID }}
+          digikey-client-secret: ${{ secrets.DIGIKEY_CLIENT_SECRET }}
+          # mouser-api-key: ${{ secrets.MOUSER_SEARCH_API_KEY }}
+          # element14-api-key: ${{ secrets.ELEMENT14_API_KEY }}
+
+      # Post deterministic results as PR comment (only on pull requests)
+      - uses: thollander/actions-comment-pull-request@v3
+        if: always() && github.event_name == 'pull_request'
+        with:
+          file-path: ${{ steps.analysis.outputs.report-path }}
+          comment-tag: kicad-happy-review
+          mode: upsert
+
+      # On push events, the report is available in the step summary
+      # (visible on the Actions run page) and as a workflow artifact
+
+      # --- Tier 2: AI-powered review (optional, needs ANTHROPIC_API_KEY) ---
+      # Claude reads the analysis output + datasheets and writes a full
+      # natural-language design review with datasheet cross-referencing,
+      # pin-by-pin verification, and engineering recommendations.
+      - uses: anthropics/claude-code-action@v1
+        if: github.event_name == 'pull_request' && env.ANTHROPIC_API_KEY != ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: |
+            The kicad-happy deterministic analysis has already been run.
+            Read the JSON report at ${{ steps.analysis.outputs.schematic-json }}
+            and the markdown report at ${{ steps.analysis.outputs.report-path }}.
+
+            Do NOT re-run the analysis scripts or re-analyze the schematic from scratch.
+            Instead, review the findings in the reports and:
+            1. Verify the top 3-5 most critical IC pinouts against datasheets
+            2. Check any WARNING or CRITICAL findings for accuracy
+            3. Note anything the deterministic analysis may have missed
+
+            Post a concise summary (under 2000 chars) as a PR comment using
+            the GitHub API. Focus on actionable findings only.
+          claude_args: '--model claude-sonnet-4-6 --max-turns 50'
+
+      # Optional: fail the check if critical issues found
+      # - name: Fail on critical
+      #   if: steps.analysis.outputs.has-critical == 'true'
+      #   run: |
+      #     echo "::error::Critical design issues found"
+      #     exit 1

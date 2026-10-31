@@ -1,0 +1,18 @@
+{
+  "name": "kicad-happy",
+  "owner": {
+    "name": "aklofas"
+  },
+  "metadata": {
+    "description": "AI-powered KiCad design review — schematic analysis, PCB layout review, EMC pre-compliance, SPICE simulation, datasheet extraction, BOM sourcing across DigiKey/Mouser/LCSC/element14, and fab prep for JLCPCB/PCBWay."
+  },
+  "plugins": [
+    {
+      "name": "kicad-happy",
+      "source": "./",
+      "description": "KiCad electronics design review. Parse schematics and PCB layouts, run EMC pre-compliance and SPICE simulation, extract structured specs from datasheet PDFs, source components from major distributors, and prep boards for fabrication. Catches real design bugs before you order.",
+      "version": "2.3.2",
+      "author": { "name": "aklofas" }
+    }
+  ]
+}

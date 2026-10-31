@@ -1,0 +1,42 @@
+# Fork-safe comment posting workflow (companion to fork-safe.yml)
+# This workflow runs with write permissions after the analysis workflow completes.
+#
+# Add this file to your KiCad project repo at:
+#   .github/workflows/kicad-comment.yml
+
+name: Post Review Comment
+on:
+  workflow_run:
+    workflows: ['KiCad Analysis']
+    types: [completed]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  comment:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: kicad-review
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: kicad-review-meta
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: pr-number
+        shell: bash
+        run: echo "number=$(cat pr-number.txt)" >> "$GITHUB_OUTPUT"
+
+      - uses: thollander/actions-comment-pull-request@v3
+        with:
+          file-path: report.md
+          comment-tag: kicad-happy-review
+          mode: upsert
+          pr-number: ${{ steps.pr-number.outputs.number }}
