@@ -19,6 +19,7 @@ Usage:
         refuse(cls.reason)
 """
 
+import bisect
 import math
 import re
 from collections import namedtuple
@@ -99,10 +100,12 @@ _READERS = ("grep", "egrep", "fgrep", "rgrep", "man", "cat", "less", "more",
 # match, so those entries are anchored with $.
 _CONDITIONAL_READERS = {
     "find": (r"^-exec(?:dir)?$", r"^-delete$", r"^-ok$", r"^-fprint", r"^-fls"),
-    "sed": (r"^-[a-z]*i", r"^--in-place", r"^-[a-z]*f$", r"^--file$"),
-    "awk": (r"^-[a-z]*f$", r"^--file$", r"^-i$", r"^inplace"),
-    "xxd": (r"^-[a-z]*r$", r"^--revert$"),
-    "perl": (r"^-[a-z]*i", r"^-[a-z]*e$"),
+    # `-f` may carry its value attached, so the anchor admits a path start
+    # but not `-F:`, which is awk's field separator after lowercasing.
+    "sed": (r"^-[a-z]*i", r"^--in-place", r"^-[a-z]*f(?:$|[/.~])",
+            r"^--file", r"^-[a-z]*e(?:$|\s)"),
+    "awk": (r"^-[a-z]*f(?:$|[/.~])", r"^--file", r"^-i$", r"^inplace"),
+    "xxd": (r"^-[a-z]*r(?:$|[/.~])", r"^--revert"),
 }
 
 # Anything that can put a nested command in argument position.
@@ -159,6 +162,24 @@ _WRAPPER_VALUE_FLAGS = {
 }
 
 
+def _wrapper_argument_count(tokens, start, wrapper):
+    """How many of a wrapper's own arguments follow, counted without slicing."""
+    value_flags = _WRAPPER_VALUE_FLAGS.get(wrapper, ())
+    index = start
+    while index < len(tokens):
+        token = tokens[index]
+        if token.startswith("-"):
+            index += 1
+            if index < len(tokens) and token in value_flags:
+                index += 1
+            continue
+        if re.match(r"^\d+(?:\.\d+)?[smhd]?$", token) or re.match(r"^\w+=", token):
+            index += 1
+            continue
+        break
+    return index - start
+
+
 def _skip_wrapper_arguments(tokens, wrapper=""):
     """Drop a wrapper's own arguments, including values given separately.
 
@@ -166,35 +187,24 @@ def _skip_wrapper_arguments(tokens, wrapper=""):
     this skipped the flag but not its value, which left `term` in program
     position — hiding the real command and making a signal name look like one.
     """
-    value_flags = _WRAPPER_VALUE_FLAGS.get(wrapper, ())
-    rest = list(tokens)
-    while rest:
-        token = rest[0]
-        if token.startswith("-"):
-            rest = rest[1:]
-            if rest and token in value_flags:
-                rest = rest[1:]
-            continue
-        if re.match(r"^\d+(?:\.\d+)?[smhd]?$", token) or re.match(r"^\w+=", token):
-            rest = rest[1:]
-            continue
-        break
-    return rest
+    return list(tokens[_wrapper_argument_count(tokens, 0, wrapper):])
 
 
 def _strip_wrappers(text):
-    """Drop leading wrappers that put the real program in argument position."""
-    previous = None
-    while previous != text:
-        previous = text
-        tokens = text.split()
-        if not tokens:
-            break
-        wrapper = _basename(tokens[0]).lower()
+    """Drop leading wrappers that put the real program in argument position.
+
+    Works on one token list with an advancing index. Re-joining the string at
+    every wrapper made this quadratic: 20k chained introducers took 21
+    seconds, which would stall a campaign on one malformed command.
+    """
+    tokens = text.split()
+    index = 0
+    while index < len(tokens):
+        wrapper = _basename(tokens[index]).lower()
         if wrapper not in _WRAPPERS:
             break
-        text = " ".join(_skip_wrapper_arguments(tokens[1:], wrapper)).strip()
-    return text
+        index += 1 + _wrapper_argument_count(tokens, index + 1, wrapper)
+    return " ".join(tokens[index:])
 
 
 def _effective(text):
@@ -501,30 +511,81 @@ _WIPE_TARGETS = frozenset((
 ))
 _WIPE_PROGRAMS = ("rm", "shred", "unlink", "srm", "wipe")
 
-# A write to a raw block device destroys a filesystem whatever program does
-# it — but "any non-reader naming a device is writing to it" is false, and
-# saying so refused mount, lsblk, smartctl, blkid, sha256sum and fsck at a
-# tier with no operator override. The premise is gone; an explicit writer
-# list replaces it.
-_DEVICE_WRITERS = ("tee", "xxd", "shred", "wipe", "srm", "pv", "cpio")
+# The destructive direction is decided by a broad predicate, and read-only
+# work is exempted by name. Five rounds of this module oscillated between a
+# broad premise that over-matched (mount, lsblk, smartctl refused at a tier
+# with no override) and a narrow program list that under-matched (cryptsetup
+# luksFormat, blkdiscard, sgdisk -Z, mke2fs, nvme format all free). Neither
+# direction works alone, so both are here: anything not a reader and not a
+# listed inspector that names storage is writing to it.
+_DEVICE_INSPECTORS = {
+    # program: flags or subcommands that keep it read-only. An empty tuple
+    # means the program never writes a device.
+    "mount": (),
+    "umount": (),
+    "lsblk": (),
+    "blkid": (),
+    "findmnt": (),
+    "df": (),
+    "du": (),
+    "lsof": (),
+    "fuser": (),
+    "udevadm": (),
+    "partx": (),
+    "fsck": (),
+    "e2fsck": (),
+    "tune2fs": ("-l",),
+    "dumpe2fs": (),
+    "smartctl": (),
+    "hdparm": ("-i", "-I", "--identify"),
+    "nvme": ("list", "id-ctrl", "id-ns", "smart-log", "show-regs"),
+    "cryptsetup": ("luksdump", "status", "isluks", "benchmark"),
+    "sgdisk": ("-p", "--print", "-i", "--info"),
+    "mdadm": ("--detail", "--examine", "-D", "-E", "--query", "-Q"),
+    "pvs": (), "vgs": (), "lvs": (),
+    "pvdisplay": (), "vgdisplay": (), "lvdisplay": (),
+    "sha1sum": (), "sha256sum": (), "sha512sum": (), "md5sum": (),
+    "cmp": (), "hexdump": (),
+}
 
-# Pseudo-devices that are not storage. Everything else under /dev/ is
-# treated as a device, which is the safe direction: /dev/mapper/* and
-# /dev/disk/by-id/* are the usual way to address a disk on an LVM host and
-# an allowlist of sd*/nvme* names misses both entirely.
-_SAFE_PSEUDO_DEVICES = frozenset((
-    "null", "zero", "random", "urandom", "full", "tty", "stdin", "stdout",
-    "stderr", "console", "ptmx", "fd",
-))
+# Programs whose last argument is the destination. `cp /dev/sda /tmp/img` is
+# imaging; `cp /tmp/img /dev/sda` overwrites the disk.
+_DESTINATION_LAST = ("cp", "install", "rsync", "mv", "dcfldd")
 
 
 def _is_storage_device(path):
     if not path.startswith("/dev/"):
         return False
-    rest = path[5:]
-    head = rest.split("/", 1)[0]
-    return head.rstrip("0123456789") not in _SAFE_PSEUDO_DEVICES \
-        and head not in _SAFE_PSEUDO_DEVICES
+    head = path[5:].split("/", 1)[0]
+    return head not in _SAFE_PSEUDO_DEVICES \
+        and head.rstrip("0123456789") not in _SAFE_PSEUDO_DEVICES
+
+# Pseudo-paths under /dev/ that are not storage. tmpfs at /dev/shm is the
+# framework's own staging area and must stay writable.
+_SAFE_PSEUDO_DEVICES = frozenset((
+    "null", "zero", "random", "urandom", "full", "tty", "stdin", "stdout",
+    "stderr", "console", "ptmx", "fd", "shm", "pts", "net", "input", "snd",
+    "char", "bus", "cpu", "mem", "kmsg", "log", "dri", "hugepages", "mqueue",
+))
+
+
+def _is_device_inspector(program, arguments):
+    """True if the program is only reading the device it was pointed at."""
+    if program not in _DEVICE_INSPECTORS:
+        return False
+    read_only_flags = _DEVICE_INSPECTORS[program]
+    if not read_only_flags:
+        return True
+    return any(a.lower() in read_only_flags for a in arguments)
+
+
+def _writes_storage(program, arguments):
+    """True if this invocation points a write at storage."""
+    targets = arguments
+    if program in _DESTINATION_LAST:
+        # Only the destination counts; naming a device as the source is a read.
+        targets = [a for a in arguments[-1:] if not a.startswith("-")]
+    return any(_is_storage_device(a) for a in targets)
 
 
 def _command_positions(tokens):
@@ -538,28 +599,47 @@ def _command_positions(tokens):
     introducer like `su alice -c xargs rm -rf /` was never expanded.
     """
     separators = (";", "&&", "||", "|", "&", ";;", "|&")
-    introducing_flags = ("-c", "-exec", "-execdir", "--", "/c", "/k")
+    # `-c` only introduces a command after a shell-like program. Seeding it
+    # unconditionally made `grep -c "rm -rf /" log` and `sort -c rm -rf /`
+    # plant a command position inside argument text.
+    shell_like = ("sh", "bash", "zsh", "dash", "ksh", "su", "cmd", "powershell",
+                  "pwsh", "ssh", "doas", "sudo", "runuser")
 
     pending = [0]
     for index, token in enumerate(tokens):
-        if token in separators or token in introducing_flags:
+        if token in separators:
             pending.append(index + 1)
-        # `ls;rm -rf /` has no standalone separator token.
         elif token.endswith(";") and len(token) > 1:
             pending.append(index + 1)
+        elif token in ("-exec", "-execdir", "--", "/c", "/k"):
+            pending.append(index + 1)
+        elif token == "-c" and index > 0:
+            # Only a shell-like program's -c introduces a command. Seeding it
+            # unconditionally made `grep -c "rm -rf /" log` plant a command
+            # position inside argument text. The lookback scans the whole
+            # prefix because `su alice -c …` puts a username in between.
+            if any(_basename(t).lower() in shell_like for t in tokens[:index]):
+                pending.append(index + 1)
 
     positions = set()
     while pending:
         index = pending.pop()
         if index >= len(tokens) or index in positions:
             continue
+        # A flag is never a program. `grep -- -la /dev/sda` used to plant
+        # `-la` as one and refuse the line.
+        if tokens[index].startswith("-"):
+            continue
         positions.add(index)
         name = _basename(tokens[index]).lower()
         if name.endswith(".exe"):
             name = name[:-4]
         if name in _COMMAND_INTRODUCERS:
-            rest = _skip_wrapper_arguments(tokens[index + 1:], name)
-            pending.append(len(tokens) - len(rest))
+            # Index arithmetic rather than slicing: slicing the tail at every
+            # introducer made this quadratic, and 20k chained introducers
+            # took seconds.
+            pending.append(index + 1 + _wrapper_argument_count(
+                tokens, index + 1, name))
     return positions
 
 
@@ -568,13 +648,28 @@ def _is_disk_wipe(effective):
     # Separators are made standalone first, so that `ls;rm -rf /` is seen as
     # two commands rather than one token named `ls;rm`.
     tokens = re.sub(r"([;|&])", r" \1 ", effective).split()
-    positions = _command_positions(tokens)
-    for index in sorted(positions):
+    positions = sorted(_command_positions(tokens))
+    if not positions:
+        return False
+
+    # A command's arguments end at the next command or separator. Giving
+    # every position the whole remaining tail was both wrong — `rm -rf /tmp;
+    # ls /dev/sda` had `rm` seeing `/dev/sda` — and quadratic.
+    boundaries = set(positions)
+    for index, token in enumerate(tokens):
+        if token in (";", "&&", "||", "|", "&", ";;", "|&"):
+            boundaries.add(index)
+    ordered_boundaries = sorted(boundaries)
+
+    for index in positions:
+        cut = bisect.bisect_right(ordered_boundaries, index)
+        end = ordered_boundaries[cut] if cut < len(ordered_boundaries) else len(tokens)
         name = _basename(tokens[index]).lower()
         if name.endswith(".exe"):
             name = name[:-4]
-        arguments = tokens[index + 1:]
-        if name.startswith("mkfs") or name == "wipefs":
+        arguments = tokens[index + 1:end]
+        if name.startswith("mkfs") or name in ("wipefs", "mke2fs", "mkdosfs",
+                                               "mkswap", "mkntfs", "blkdiscard"):
             return True
         # Programs with their own destructive/read-only distinction are
         # decided here and here only — falling through to the generic
@@ -604,11 +699,15 @@ def _is_disk_wipe(effective):
                         and _is_storage_device(argument[3:]):
                     return True
             continue
-        # Programs that write raw bytes where they are pointed. `cp`, `mount`,
-        # `lsblk` and the inspection tools are deliberately absent: naming a
-        # device is not writing to it.
-        if name in _DEVICE_WRITERS \
-                and any(_is_storage_device(a) for a in arguments):
+        # Broad predicate plus explicit exemptions: anything that is neither
+        # a reader nor a listed device inspector, pointing a write at
+        # storage, is destroying it. This is what catches cryptsetup
+        # luksFormat, sgdisk -Z, mdadm --zero-superblock, pvcreate,
+        # nvme format, hdparm --security-erase and `cp image /dev/sdX`,
+        # none of which any program-name list enumerated.
+        if not _is_reader(name, arguments) \
+                and not _is_device_inspector(name, arguments) \
+                and _writes_storage(name, arguments):
             return True
         if name not in _WIPE_PROGRAMS:
             continue
@@ -717,7 +816,10 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
     if first_token == "sleep":
         return _classify_sleep(effective[0])
 
-    if any(_is_disk_wipe(text) for text in effective):
+    # Checked against both the raw and the effective form: the raw form still
+    # carries the privilege prefix, and `su alice -c rm -rf /` needs `su` to
+    # be visible for the -c lookback to fire.
+    if any(_is_disk_wipe(text) for text in candidates):
         return RISK_TABLE["disk_wipe"]
 
     if target_kind not in ("beacon", "server"):
@@ -748,6 +850,21 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
     if verdict is not None:
         return verdict
 
+    # Rules appended at runtime land in neither frozen half. Their tier-1
+    # entries are consulted here, before the frozen tier-2 scan, so the
+    # ordering guarantee holds for them too — deferred three rounds, closed
+    # now because "only the suite does this" is a reason to keep it cheap,
+    # not a reason to leave the ordering wrong.
+    frozen = set(id(p) for p, _ in _RULES_HARD) | set(id(p) for p, _ in _RULES_KNOCK)
+    runtime = [(p, k) for p, k in _RULES if id(p) not in frozen]
+
+    for pattern, key in runtime:
+        row = RISK_TABLE.get(key)
+        if row is None or row.tier != TIER_HARD:
+            continue
+        if any(pattern.search(text) for text in candidates):
+            return row
+
     for pattern, key in _RULES_KNOCK:
         if not any(pattern.search(text) for text in candidates):
             continue
@@ -758,13 +875,8 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
                         "conservatively", *_UNKNOWN_KNOCK)
         return row
 
-    # A rule added at runtime lands in neither half, since both are frozen at
-    # import. Scan for those rather than silently ignoring them.
-    known = set(id(p) for p, _ in _RULES_HARD) | set(id(p) for p, _ in _RULES_KNOCK)
-    for pattern, key in _RULES:
-        if id(pattern) in known:
-            continue
-        if not any(pattern.search(t) for t in candidates):
+    for pattern, key in runtime:
+        if not any(pattern.search(text) for text in candidates):
             continue
         row = RISK_TABLE.get(key)
         if row is not None:

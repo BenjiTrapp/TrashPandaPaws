@@ -664,6 +664,93 @@ class TestRoundFourFindings(unittest.TestCase):
         self._free(("fdisk --list /dev/sda", "grep -- -la /dev/sda"))
 
 
+class TestRoundFiveFindings(unittest.TestCase):
+    """The fifth re-review's findings, and the end of the oscillation.
+
+    Rounds 1–4 traded between a broad predicate that over-matched and a
+    narrow program list that under-matched. Round 5 uses both: anything that
+    is neither a reader nor a listed device inspector, pointing a write at
+    storage, is destroying it. These tests pin both directions, because
+    getting one right at the other's expense is what happened four times.
+    """
+
+    def _hard(self, cmds):
+        for cmd in cmds:
+            self.assertEqual(_classify(cmd).tier, safety.TIER_HARD, cmd)
+
+    def _free(self, cmds):
+        for cmd in cmds:
+            self.assertEqual(_classify(cmd).tier, safety.TIER_FREE, cmd)
+
+    def test_the_device_destruction_family_a_program_list_cannot_enumerate(self):
+        self._hard(("cryptsetup luksformat /dev/sda", "cryptsetup erase /dev/sda",
+                    "blkdiscard /dev/sda", "sgdisk -z /dev/sda",
+                    "sgdisk --zap-all /dev/sda", "sfdisk /dev/sda",
+                    "cfdisk /dev/sda", "mdadm --zero-superblock /dev/sda1",
+                    "pvcreate /dev/sda", "lvremove /dev/vg/root",
+                    "mke2fs /dev/sda1", "mkdosfs /dev/sda1", "mkswap /dev/sda2",
+                    "nvme format /dev/nvme0", "debugfs -w /dev/sda",
+                    "hdparm --security-erase p /dev/sda"))
+
+    def test_read_only_device_inspection_stays_free(self):
+        self._free(("mount /dev/sda1 /mnt", "umount /dev/sda1", "lsblk /dev/sda",
+                    "blkid /dev/sda", "findmnt /dev/sda1", "fsck /dev/sda1",
+                    "smartctl -a /dev/sda", "sha256sum /dev/sda",
+                    "cryptsetup luksdump /dev/sda", "sgdisk -p /dev/sda",
+                    "mdadm --detail /dev/md0", "hdparm -i /dev/sda",
+                    "nvme list", "tune2fs -l /dev/sda1", "dumpe2fs /dev/sda1"))
+
+    def test_direction_matters_for_copy_like_programs(self):
+        """`cp image /dev/sdX` overwrites the disk; the reverse is imaging."""
+        self._hard(("cp /tmp/img /dev/sda", "install /tmp/img /dev/sda"))
+        self._free(("cp /dev/sda /tmp/img",))
+
+    def test_tmpfs_and_pseudo_paths_are_not_storage(self):
+        """/dev/shm is the framework's own staging area."""
+        self._free(("tee /dev/shm/payload", "xxd -r hex.txt /dev/shm/payload",
+                    "pv /dev/shm/data", "tee /dev/pts/0", "tee /dev/net/tun",
+                    "tee /dev/null", "tee /dev/fd/1"))
+
+    def test_arguments_end_at_the_next_command(self):
+        """Giving each position the whole tail was wrong as well as slow."""
+        self._free(("rm -rf /tmp ; ls /dev/sda",))
+        self._hard(("rm -rf / ; ls /tmp", "ls /dev/sda ; tee /dev/sda"))
+
+    def test_a_flag_is_never_a_program(self):
+        self._free(("grep -- -la /dev/sda", "grep -c rm -rf / /var/log/auth.log",
+                    "sort -c rm -rf /"))
+
+    def test_but_a_shells_dash_c_still_introduces_one(self):
+        self._hard(("su alice -c rm -rf /", "sh -c rm -rf /",
+                    "su alice -c xargs rm -rf /"))
+
+    def test_acting_flags_with_attached_values(self):
+        for cmd in ("sed -f/tmp/x.sed /etc/rc.local",
+                    "awk -f/tmp/x.awk authorized_keys",
+                    "sed -nf/tmp/x.sed /etc/rc.local"):
+            self.assertEqual(_classify(cmd).tier, safety.TIER_KNOCK, cmd)
+        self._free(("awk -F: /reboot/ /var/log/syslog",))
+
+    def test_an_interpreter_is_not_a_reader(self):
+        self._hard(("perl script.pl /dev/sda",))
+
+    def test_classification_is_linear_in_token_count(self):
+        """20k chained introducers took 21 seconds before this round."""
+        import time
+        start = time.time()
+        _classify("xargs " * 20000 + "rm -rf /")
+        self.assertLess(time.time() - start, 2.0)
+
+    def test_a_runtime_tier_one_rule_outranks_a_frozen_tier_two_hit(self):
+        added = (safety.re.compile(r"\bfrobnicate\b"), "power_off")
+        safety._RULES.append(added)
+        try:
+            got = _classify("frobnicate crontab -e")
+        finally:
+            safety._RULES.remove(added)
+        self.assertEqual((got.tier, got.action_key), (safety.TIER_HARD, "power_off"))
+
+
 class TestNeverRaises(unittest.TestCase):
     def test_hostile_input_returns_a_classification(self):
         for cmd in ("", "   ", "\n\n", "\x00", "sudo", "sudo -u", "shell",
