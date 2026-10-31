@@ -1,0 +1,199 @@
+{
+  "analyzer_type": "thermal",
+  "schema_version": "1.4.0",
+  "inputs": {
+    "source_files": [
+      "hardware/review/2026-10-31-baseline/schematic.json",
+      "hardware/review/2026-10-31-baseline/pcb.json"
+    ],
+    "source_hashes": {
+      "hardware/review/2026-10-31-baseline/schematic.json": "8e8080930b265ba044fcbe7decfe2a1423ab7e57140cb8b1c90737df4b746732",
+      "hardware/review/2026-10-31-baseline/pcb.json": "68eff04f110719c7734f654ce02ab54a20bd4a1e2fcba523b691cf5266fe8a11"
+    },
+    "run_id": "20261031T145210Z-71d30a",
+    "config_hash": null,
+    "upstream_artifacts": {
+      "schematic": {
+        "path": "hardware/review/2026-10-31-baseline/schematic.json",
+        "sha256": "8e8080930b265ba044fcbe7decfe2a1423ab7e57140cb8b1c90737df4b746732",
+        "schema_version": "1.4.0",
+        "run_id": "20261031T145210Z-71d30a"
+      },
+      "pcb": {
+        "path": "hardware/review/2026-10-31-baseline/pcb.json",
+        "sha256": "68eff04f110719c7734f654ce02ab54a20bd4a1e2fcba523b691cf5266fe8a11",
+        "schema_version": "1.4.0",
+        "run_id": "20261031T145210Z-71d30a"
+      }
+    }
+  },
+  "compat": {
+    "minimum_consumer_version": "1.4.0",
+    "deprecated_fields": [],
+    "experimental_fields": []
+  },
+  "summary": {
+    "total_findings": 1,
+    "components_assessed": 1,
+    "components_skipped": 1,
+    "active": 1,
+    "suppressed": 0,
+    "by_severity": {
+      "error": 0,
+      "warning": 0,
+      "info": 1
+    },
+    "thermal_score": 100,
+    "total_board_dissipation_w": 0.179,
+    "hottest_component": {
+      "ref": "U4",
+      "tj_estimated_c": 69.8
+    },
+    "components_analyzed": 1,
+    "components_above_85c": 0,
+    "components_above_tjmax": 0,
+    "ambient_c": 25.0
+  },
+  "findings": [
+    {
+      "category": "thermal_safety",
+      "severity": "info",
+      "rule_id": "TS-005",
+      "confidence": "heuristic",
+      "title": "U4 (AP2112K-3.3) Tj 70\u00b0C, margin 55\u00b0C",
+      "description": "ldo dissipates 0.179W in SOT-23 \u2014 within safe thermal limits.",
+      "components": [
+        "U4"
+      ],
+      "recommendation": "",
+      "detector": "analyze_thermal",
+      "summary": "U4 (AP2112K-3.3) Tj 70\u00b0C, margin 55\u00b0C",
+      "nets": [],
+      "pins": [],
+      "evidence_source": "heuristic_rule",
+      "report_context": {
+        "section": "Thermal Safety",
+        "impact": "Component reliability",
+        "standard_ref": ""
+      },
+      "suppressed": false,
+      "suppression_reason": "",
+      "stages": [
+        "layout"
+      ],
+      "finding_id": "thermal:TS-005:u4"
+    }
+  ],
+  "assessments": [
+    {
+      "ref": "U4",
+      "value": "AP2112K-3.3",
+      "component_type": "ldo",
+      "pdiss_w": 0.179,
+      "pdiss_source": "(5.0V - 3.3V) \u00d7 0.105A",
+      "pdiss_confidence": "heuristic",
+      "package": "SOT-23",
+      "rtheta_ja_raw": 250.0,
+      "rtheta_ja_source": "package_table",
+      "pcb_correction": 1.0,
+      "pcb_correction_notes": [],
+      "rtheta_ja_effective": 250.0,
+      "ambient_c": 25.0,
+      "tj_estimated_c": 69.8,
+      "tj_max_c": 125.0,
+      "tj_max_source": "default_125",
+      "margin_c": 55.2,
+      "position": {
+        "x": 110.0,
+        "y": 111.0
+      },
+      "detector": "analyze_thermal",
+      "rule_id": "TH-DET",
+      "category": "thermal",
+      "severity": "info",
+      "confidence": "heuristic",
+      "evidence_source": "heuristic_rule",
+      "summary": "Thermal: U4 Tj=69.8C (margin 55.2C)",
+      "description": "Component U4 in SOT-23 package: Tj=69.8C, margin 55.2C to Tj_max (125.0C).",
+      "components": [
+        "U4"
+      ],
+      "nets": [],
+      "pins": [],
+      "recommendation": "",
+      "report_context": {
+        "section": "Thermal",
+        "impact": "",
+        "standard_ref": ""
+      }
+    }
+  ],
+  "elapsed_s": 0.001,
+  "missing_info": {
+    "default_rtheta_ja": [],
+    "default_tj_max": [
+      "U4"
+    ]
+  },
+  "skipped_components": [
+    {
+      "ref": "U6",
+      "value": "SY8089AAAC",
+      "reason": "below_min_pdiss"
+    }
+  ],
+  "trust_summary": {
+    "total_findings": 1,
+    "trust_level": "low",
+    "by_confidence": {
+      "deterministic": 0,
+      "heuristic": 1,
+      "datasheet_backed": 0
+    },
+    "by_evidence_source": {
+      "datasheet": 0,
+      "topology": 0,
+      "heuristic_rule": 1,
+      "symbol_footprint": 0,
+      "bom": 0,
+      "geometry": 0,
+      "api_lookup": 0
+    },
+    "provenance_coverage_pct": 0.0
+  },
+  "audience_summary": {
+    "designer": {
+      "total_findings": 1,
+      "by_severity": {
+        "error": 0,
+        "warning": 0,
+        "info": 1
+      },
+      "by_category": {
+        "thermal_safety": 1
+      },
+      "top_issues": []
+    },
+    "reviewer": {
+      "total_findings": 0,
+      "by_category": {},
+      "top_issues": []
+    },
+    "manager": {
+      "risk_level": "none",
+      "blocker_count": 0,
+      "warning_count": 0,
+      "stage_readiness": {
+        "schematic": "pass",
+        "layout": "pass",
+        "pre_fab": "pass",
+        "bring_up": "pass"
+      },
+      "one_liner": "No errors or warnings \u2014 all stages ready."
+    }
+  },
+  "capability_mode_ref": {
+    "source": "analysis/capability_mode.json",
+    "run_id": "20261031T145210Z-71d30a"
+  }
+}
