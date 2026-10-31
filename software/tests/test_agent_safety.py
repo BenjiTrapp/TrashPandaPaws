@@ -751,6 +751,84 @@ class TestRoundFiveFindings(unittest.TestCase):
         self.assertEqual((got.tier, got.action_key), (safety.TIER_HARD, "power_off"))
 
 
+class TestAdjudicationAndFinalCriticals(unittest.TestCase):
+    """The two Criticals of the last re-review, and the adjudication.
+
+    Five rounds enumerated read-only tools so that a broad write predicate
+    would not refuse ordinary recon, and the list was never complete —
+    sg_inq, dmsetup, mountpoint, e2label were all missing, each one an
+    unoverridable refusal at tier 1. The adjudication: an unrecognised
+    program writing storage earns a knock, not a refusal. An incomplete list
+    then costs one approval click instead of blocking the agent.
+    """
+
+    def _hard(self, cmds):
+        for cmd in cmds:
+            self.assertEqual(_classify(cmd).tier, safety.TIER_HARD, cmd)
+
+    def _knock(self, cmds):
+        for cmd in cmds:
+            self.assertEqual(_classify(cmd).tier, safety.TIER_KNOCK, cmd)
+
+    def _free(self, cmds):
+        for cmd in cmds:
+            self.assertEqual(_classify(cmd).tier, safety.TIER_FREE, cmd)
+
+    def test_double_dash_marks_options_not_a_command(self):
+        """Treating `--` as a command bounded the real one's arguments."""
+        self._hard(("rm -rf -- /", "shred -- /dev/sda", "tee -- /dev/sda",
+                    "tee -a -- /dev/sda", "xxd -r hex.txt -- /dev/sda"))
+        self._free(("grep -- -la /dev/sda",))
+
+    def test_a_trailing_token_cannot_hide_a_destination(self):
+        self._hard(("cp /tmp/img /dev/sda -v", "cp -a /tmp/img /dev/sda --verbose",
+                    "cp /tmp/img /dev/sda >/dev/null",
+                    "cp /tmp/img /dev/sda 2>/dev/null",
+                    "mv /tmp/img /dev/sda >/dev/null",
+                    "install /tmp/img /dev/sda >/dev/null",
+                    "dcfldd if=/tmp/img of=/dev/sda"))
+        self._free(("cp /dev/sda /tmp/img",))
+
+    def test_an_exemption_requires_the_whole_invocation_to_be_read_only(self):
+        """A harmless flag beside a destructive one used to exempt both."""
+        self._hard(("hdparm -i --security-erase p /dev/sda",
+                    "sgdisk -p -z /dev/sda", "sgdisk -p --zap-all /dev/sda",
+                    "nvme id-ctrl /dev/nvme0 format"))
+        self._free(("hdparm -i /dev/sda", "sgdisk -p /dev/sda",
+                    "tune2fs -l /dev/sda1", "nvme list",
+                    "cryptsetup luksdump /dev/sda", "mdadm --detail /dev/md0"))
+
+    def test_recon_the_inspector_list_does_not_know_is_not_refused(self):
+        self._free(("sg_inq /dev/sda", "mountpoint /dev/sda1",
+                    "e2label /dev/sda1", "dmsetup info /dev/mapper/vg-root",
+                    "bcache-super-show /dev/sda",
+                    "fsfreeze --unfreeze /dev/sda1"))
+
+    def test_an_unrecognised_program_writing_storage_asks(self):
+        for cmd in ("someunknowntool /dev/sda", "pv /dev/sda",
+                    "wipefs -n /dev/sda", "tune2fs -l /dev/sda1 -u random"):
+            got = _classify(cmd)
+            self.assertEqual(got.tier, safety.TIER_KNOCK, cmd)
+
+    def test_recognised_destroyers_are_still_refused(self):
+        self._hard(("cryptsetup luksformat /dev/sda", "blkdiscard /dev/sda",
+                    "mke2fs /dev/sda1", "nvme format /dev/nvme0",
+                    "mkfs.ext4 /dev/sda1",
+                    "dd if=/dev/zero of=/dev/mapper/vg-root",
+                    "rm -rf /", "tee /dev/sda"))
+
+    def test_dry_runs_and_non_device_targets_are_not_refused(self):
+        self._free(("blkdiscard -l", "mkswap /tmp/swapfile",
+                    "mkfs.ext4 /tmp/img"))
+
+    def test_the_dash_c_lookback_is_linear(self):
+        """A prefix scan per `-c` token took 11 seconds at 8k of them."""
+        import time
+        start = time.time()
+        _classify("gcc -c " * 20000)
+        self.assertLess(time.time() - start, 2.0)
+
+
 class TestNeverRaises(unittest.TestCase):
     def test_hostile_input_returns_a_classification(self):
         for cmd in ("", "   ", "\n\n", "\x00", "sudo", "sudo -u", "shell",

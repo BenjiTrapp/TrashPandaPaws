@@ -294,6 +294,17 @@ RISK_TABLE = {
     "disk_wipe": _row(
         TIER_HARD, "disk_wipe", "destructive",
         "destroys the filesystem of the host"),
+    # The adjudication that ends five rounds of enumeration: a program this
+    # module does not recognise, pointing a write at storage, is a question
+    # for the operator rather than a refusal. An allowlist of read-only tools
+    # can never be complete — sg_inq, dmsetup, mountpoint, e2label were all
+    # missing — and at tier 1 every omission is an unoverridable refusal of
+    # ordinary recon. At tier 2 an omission costs one approval click, so the
+    # list's incompleteness stops being a correctness problem.
+    "device_write_unknown": _row(
+        TIER_KNOCK, "device_write_unknown", "destructive",
+        "an unrecognised program is pointing a write at storage",
+        points=0, p_success=0.8, p_detect=0.3),
     "airmon_check_kill": _row(
         TIER_HARD, "airmon_check_kill", "lifecycle",
         "airmon-ng check kill stops NetworkManager and severs C2"),
@@ -519,38 +530,61 @@ _WIPE_PROGRAMS = ("rm", "shred", "unlink", "srm", "wipe")
 # direction works alone, so both are here: anything not a reader and not a
 # listed inspector that names storage is writing to it.
 _DEVICE_INSPECTORS = {
-    # program: flags or subcommands that keep it read-only. An empty tuple
-    # means the program never writes a device.
-    "mount": (),
-    "umount": (),
-    "lsblk": (),
-    "blkid": (),
-    "findmnt": (),
-    "df": (),
-    "du": (),
-    "lsof": (),
-    "fuser": (),
-    "udevadm": (),
-    "partx": (),
-    "fsck": (),
-    "e2fsck": (),
-    "tune2fs": ("-l",),
-    "dumpe2fs": (),
-    "smartctl": (),
-    "hdparm": ("-i", "-I", "--identify"),
-    "nvme": ("list", "id-ctrl", "id-ns", "smart-log", "show-regs"),
-    "cryptsetup": ("luksdump", "status", "isluks", "benchmark"),
-    "sgdisk": ("-p", "--print", "-i", "--info"),
-    "mdadm": ("--detail", "--examine", "-D", "-E", "--query", "-Q"),
+    # program: markers that make this invocation destructive. An empty tuple
+    # means the program never writes a device, so it is always exempt.
+    #
+    # Expressed as destructive markers rather than read-only ones, because
+    # the read-only form was any-flag: `hdparm -I --security-erase /dev/sda`
+    # matched the read flag and exempted the whole line. A destructive marker
+    # cannot be defeated by adding a harmless flag next to it.
+    "mount": (), "umount": (), "lsblk": (), "blkid": (), "findmnt": (),
+    "df": (), "du": (), "lsof": (), "fuser": (), "udevadm": (), "partx": (),
+    "dumpe2fs": (), "smartctl": (), "mountpoint": (), "sg_inq": (),
     "pvs": (), "vgs": (), "lvs": (),
     "pvdisplay": (), "vgdisplay": (), "lvdisplay": (),
     "sha1sum": (), "sha256sum": (), "sha512sum": (), "md5sum": (),
-    "cmp": (), "hexdump": (),
+    "cmp": (), "hexdump": (), "bcache-super-show": (),
+    "fsck": ("-y", "--yes", "-a", "-p"),
+    "e2fsck": ("-y", "--yes", "-a", "-p", "-f"),
+    "tune2fs": ("-l1", "-u", "-c", "-i", "-m", "-r", "-o", "-e", "-j", "-o"),
+    "hdparm": ("--security-erase", "--security-erase-enhanced",
+               "--trim-sector-ranges", "--make-bad-sector", "--write-sector",
+               "--dco-restore", "--security-set-pass"),
+    "nvme": ("format", "sanitize", "write", "write-zeroes", "delete-ns",
+             "create-ns"),
+    "cryptsetup": ("luksformat", "reencrypt", "erase", "lukserase",
+                   "luksaddkey", "luksremovekey", "lukskillslot",
+                   "luksconvertkey", "luksheaderrestore"),
+    "sgdisk": ("-z", "--zap-all", "-o", "--clear", "-n", "--new", "-d",
+               "--delete", "-t", "--typecode", "-g", "--mbrtogpt"),
+    "mdadm": ("--zero-superblock", "--create", "-c", "--add", "--fail",
+              "--remove", "--grow"),
+    "dmsetup": ("create", "remove", "load", "reload", "wipe_table", "clear"),
+    "e2label": ("--",),
+    "fsfreeze": (),
 }
+
+# tune2fs's read-only flag is -l; every other flag it has changes something.
+# Listing the destructive ones individually is error-prone for that binary,
+# so it is special-cased below rather than by marker.
+_TUNE2FS_READ_ONLY = ("-l", "--list")
 
 # Programs whose last argument is the destination. `cp /dev/sda /tmp/img` is
 # imaging; `cp /tmp/img /dev/sda` overwrites the disk.
-_DESTINATION_LAST = ("cp", "install", "rsync", "mv", "dcfldd")
+# dcfldd is deliberately absent: it spells its destination `of=`, like
+# dd, so the generic `=`-aware branch handles it.
+_DESTINATION_LAST = ("cp", "install", "rsync", "mv")
+
+# Programs whose write to storage is unambiguously destruction. Anything
+# outside this set that writes storage earns a knock instead — see the
+# device_write_unknown row.
+_KNOWN_DESTROYERS = (
+    "tee", "xxd", "shred", "wipe", "srm", "cpio", "cat", "cp",
+    "install", "rsync", "mv", "dcfldd", "cryptsetup", "sgdisk", "sfdisk",
+    "cfdisk", "gdisk", "mdadm", "pvcreate", "vgcreate", "lvcreate",
+    "lvremove", "vgremove", "pvremove", "nvme", "hdparm", "debugfs",
+    "blkdiscard", "fdisk", "parted", "dd", "perl", "python", "python3",
+)
 
 
 def _is_storage_device(path):
@@ -570,22 +604,42 @@ _SAFE_PSEUDO_DEVICES = frozenset((
 
 
 def _is_device_inspector(program, arguments):
-    """True if the program is only reading the device it was pointed at."""
+    """True if this invocation of a dual-purpose tool is only reading."""
     if program not in _DEVICE_INSPECTORS:
         return False
-    read_only_flags = _DEVICE_INSPECTORS[program]
-    if not read_only_flags:
-        return True
-    return any(a.lower() in read_only_flags for a in arguments)
+    if program == "tune2fs":
+        flags = [a for a in arguments if a.startswith("-")]
+        return bool(flags) and all(a in _TUNE2FS_READ_ONLY for a in flags)
+    destructive = _DEVICE_INSPECTORS[program]
+    lowered = [a.lower() for a in arguments]
+    # Exempt unless a destructive marker is present anywhere. The reverse —
+    # exempt if a read-only marker is present — let `hdparm -I
+    # --security-erase` through on the strength of the harmless flag.
+    return not any(marker in lowered or any(a.startswith(marker) for a in lowered)
+                   for marker in destructive)
+
+
+def _operands(arguments):
+    """Bare operands: not flags, not redirects, not KEY=value."""
+    return [a for a in arguments
+            if not a.startswith(("-", ">", "<", "&", "|", "2>"))
+            and "=" not in a.split("/", 1)[0]]
 
 
 def _writes_storage(program, arguments):
     """True if this invocation points a write at storage."""
-    targets = arguments
     if program in _DESTINATION_LAST:
-        # Only the destination counts; naming a device as the source is a read.
-        targets = [a for a in arguments[-1:] if not a.startswith("-")]
-    return any(_is_storage_device(a) for a in targets)
+        # Every operand after the first is a destination. Taking only the
+        # final bare token meant any trailing flag or redirect hid it:
+        # `cp /tmp/img /dev/sda -v` and `… >/dev/null` were both free.
+        return any(_is_storage_device(a) for a in _operands(arguments)[1:])
+    for argument in arguments:
+        if _is_storage_device(argument):
+            return True
+        # `of=/dev/sda`, as dd and dcfldd spell it.
+        if "=" in argument and _is_storage_device(argument.split("=", 1)[1]):
+            return True
+    return False
 
 
 def _command_positions(tokens):
@@ -605,20 +659,31 @@ def _command_positions(tokens):
     shell_like = ("sh", "bash", "zsh", "dash", "ksh", "su", "cmd", "powershell",
                   "pwsh", "ssh", "doas", "sudo", "runuser")
 
+    # One prefix pass: whether a shell-like program has been seen before
+    # each index. Scanning the prefix per `-c` token was quadratic — 8k of
+    # them took 11 seconds.
+    shell_before = [False] * (len(tokens) + 1)
+    for index, token in enumerate(tokens):
+        shell_before[index + 1] = (
+            shell_before[index] or _basename(token).lower() in shell_like)
+
     pending = [0]
     for index, token in enumerate(tokens):
         if token in separators:
             pending.append(index + 1)
         elif token.endswith(";") and len(token) > 1:
             pending.append(index + 1)
-        elif token in ("-exec", "-execdir", "--", "/c", "/k"):
+        elif token in ("-exec", "-execdir", "/c", "/k"):
+            # `--` is deliberately absent: it marks the end of options, not
+            # the start of a command. Treating it as one bounded the real
+            # command's arguments and let `rm -rf -- /` through free.
             pending.append(index + 1)
         elif token == "-c" and index > 0:
             # Only a shell-like program's -c introduces a command. Seeding it
             # unconditionally made `grep -c "rm -rf /" log` plant a command
             # position inside argument text. The lookback scans the whole
             # prefix because `su alice -c …` puts a username in between.
-            if any(_basename(t).lower() in shell_like for t in tokens[:index]):
+            if shell_before[index]:
                 pending.append(index + 1)
 
     positions = set()
@@ -643,24 +708,25 @@ def _command_positions(tokens):
     return positions
 
 
-def _is_disk_wipe(effective):
-    """True if any command on the line destroys a filesystem or raw device."""
-    # Separators are made standalone first, so that `ls;rm -rf /` is seen as
-    # two commands rather than one token named `ls;rm`.
+def _disk_verdict(effective):
+    """Which disk-related key this line earns, or None.
+
+    Returns "disk_wipe" for a recognised destructive operation and
+    "device_write_unknown" for an unrecognised program pointing a write at
+    storage — see the RISK_TABLE comment for why those are different tiers.
+    """
     tokens = re.sub(r"([;|&])", r" \1 ", effective).split()
     positions = sorted(_command_positions(tokens))
     if not positions:
-        return False
+        return None
 
-    # A command's arguments end at the next command or separator. Giving
-    # every position the whole remaining tail was both wrong — `rm -rf /tmp;
-    # ls /dev/sda` had `rm` seeing `/dev/sda` — and quadratic.
     boundaries = set(positions)
     for index, token in enumerate(tokens):
         if token in (";", "&&", "||", "|", "&", ";;", "|&"):
             boundaries.add(index)
     ordered_boundaries = sorted(boundaries)
 
+    unknown_write = False
     for index in positions:
         cut = bisect.bisect_right(ordered_boundaries, index)
         end = ordered_boundaries[cut] if cut < len(ordered_boundaries) else len(tokens)
@@ -668,16 +734,19 @@ def _is_disk_wipe(effective):
         if name.endswith(".exe"):
             name = name[:-4]
         arguments = tokens[index + 1:end]
-        if name.startswith("mkfs") or name in ("wipefs", "mke2fs", "mkdosfs",
-                                               "mkswap", "mkntfs", "blkdiscard"):
-            return True
+        if (name.startswith("mkfs") or name in ("wipefs", "mke2fs", "mkdosfs",
+                                                "mkswap", "mkntfs", "blkdiscard")) \
+                and any(_is_storage_device(a) for a in arguments) \
+                and not any(a in ("-n", "--no-act", "-l", "--list")
+                            for a in arguments):
+            return "disk_wipe"
         # Programs with their own destructive/read-only distinction are
         # decided here and here only — falling through to the generic
         # block-device rule below would refuse `fdisk -lu /dev/sda`, which
         # is recon.
         if name == "fdisk":
             if not any(re.match(r"^(?:-[a-z]*l|--list)", a) for a in arguments):
-                return True
+                return "disk_wipe"
             continue
         if name == "parted":
             # Interactive parted on a device can destroy it, so the test is
@@ -685,11 +754,11 @@ def _is_disk_wipe(effective):
             if any(_is_storage_device(a) for a in arguments) and not any(
                     a in ("print", "p", "unit", "version", "help", "select")
                     for a in arguments):
-                return True
+                return "disk_wipe"
             continue
         if name == "badblocks":
             if any(re.match(r"^-[a-z]*w", a) for a in arguments):
-                return True
+                return "disk_wipe"
             continue
         if name == "dd":
             # Destructive when it writes to storage. Reading a device into a
@@ -697,31 +766,32 @@ def _is_disk_wipe(effective):
             for argument in arguments:
                 if argument.startswith("of=") \
                         and _is_storage_device(argument[3:]):
-                    return True
+                    return "disk_wipe"
             continue
         # Broad predicate plus explicit exemptions: anything that is neither
         # a reader nor a listed device inspector, pointing a write at
-        # storage, is destroying it. This is what catches cryptsetup
-        # luksFormat, sgdisk -Z, mdadm --zero-superblock, pvcreate,
-        # nvme format, hdparm --security-erase and `cp image /dev/sdX`,
-        # none of which any program-name list enumerated.
+        # storage, is touching a disk. A recognised destroyer is refused; an
+        # unrecognised program only earns a knock, so that an incomplete
+        # inspector list costs an approval rather than a hard refusal.
         if not _is_reader(name, arguments) \
                 and not _is_device_inspector(name, arguments) \
                 and _writes_storage(name, arguments):
-            return True
+            if name in _KNOWN_DESTROYERS:
+                return "disk_wipe"
+            unknown_write = True
         if name not in _WIPE_PROGRAMS:
             continue
         for argument in arguments:
             if argument.startswith("-"):
                 continue
             if argument in _WIPE_TARGETS or argument.rstrip("/") in _WIPE_TARGETS:
-                return True
+                return "disk_wipe"
             if argument.startswith("/dev/"):
-                return True
+                return "disk_wipe"
             # `rm -rf ~/*` and `rm -rf /.` are the same instruction.
             if re.match(r"^(?:~|/)[./*]*$", argument):
-                return True
-    return False
+                return "disk_wipe"
+    return "device_write_unknown" if unknown_write else None
 
 
 _MALFORMED = _row(TIER_HARD, "malformed", "input",
@@ -818,8 +888,13 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
 
     # Checked against both the raw and the effective form: the raw form still
     # carries the privilege prefix, and `su alice -c rm -rf /` needs `su` to
-    # be visible for the -c lookback to fire.
-    if any(_is_disk_wipe(text) for text in candidates):
+    # be visible for the -c lookback to fire. A refusal outranks a knock.
+    disk_keys = set()
+    for text in candidates:
+        key = _disk_verdict(text)
+        if key:
+            disk_keys.add(key)
+    if "disk_wipe" in disk_keys:
         return RISK_TABLE["disk_wipe"]
 
     if target_kind not in ("beacon", "server"):
@@ -864,6 +939,9 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
             continue
         if any(pattern.search(text) for text in candidates):
             return row
+
+    if "device_write_unknown" in disk_keys:
+        return RISK_TABLE["device_write_unknown"]
 
     for pattern, key in _RULES_KNOCK:
         if not any(pattern.search(text) for text in candidates):
