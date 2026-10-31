@@ -1,0 +1,86 @@
+name: 'KiCad Design Review'
+description: 'Automated KiCad design review — schematic, PCB, SPICE, derating, protocol checks. Posts PR comments.'
+author: 'aklofas'
+branding:
+  icon: 'cpu'
+  color: 'blue'
+
+inputs:
+  schematic:
+    description: 'Path to .kicad_sch file (auto-detected if omitted)'
+    required: false
+  pcb:
+    description: 'Path to .kicad_pcb file (auto-detected if omitted)'
+    required: false
+  severity:
+    description: 'Minimum severity to report: all, warning, critical'
+    required: false
+    default: 'all'
+  derating-profile:
+    description: 'Voltage derating profile: commercial, military, automotive'
+    required: false
+    default: 'commercial'
+  spice:
+    description: 'Run SPICE simulation if ngspice is available'
+    required: false
+    default: 'true'
+  datasheets-dir:
+    description: 'Path to datasheets directory (auto-detected next to schematic if omitted)'
+    required: false
+  digikey-client-id:
+    description: 'DigiKey API client ID — downloads missing datasheets if provided'
+    required: false
+  digikey-client-secret:
+    description: 'DigiKey API client secret'
+    required: false
+  mouser-api-key:
+    description: 'Mouser Search API key — downloads missing datasheets if provided'
+    required: false
+  element14-api-key:
+    description: 'element14/Newark/Farnell API key — downloads missing datasheets if provided'
+    required: false
+  diff-base:
+    description: 'Compare against base branch and show only changes (PR events only)'
+    required: false
+    default: 'false'
+
+outputs:
+  schematic-json:
+    description: 'Path to schematic analysis JSON output'
+    value: ${{ steps.analyze.outputs.schematic-json }}
+  pcb-json:
+    description: 'Path to PCB analysis JSON output'
+    value: ${{ steps.analyze.outputs.pcb-json }}
+  report-path:
+    description: 'Path to markdown report file'
+    value: ${{ steps.analyze.outputs.report-path }}
+  findings-count:
+    description: 'Total findings (warnings + critical)'
+    value: ${{ steps.analyze.outputs.findings-count }}
+  has-critical:
+    description: 'Whether any critical findings exist (true/false)'
+    value: ${{ steps.analyze.outputs.has-critical }}
+
+runs:
+  using: 'composite'
+  steps:
+    - uses: actions/setup-python@v7
+      with:
+        python-version: '3.10'
+    - id: analyze
+      shell: bash
+      run: bash ${{ github.action_path }}/action/entrypoint.sh
+      env:
+        INPUT_SCHEMATIC: ${{ inputs.schematic }}
+        INPUT_PCB: ${{ inputs.pcb }}
+        INPUT_SEVERITY: ${{ inputs.severity }}
+        INPUT_DERATING_PROFILE: ${{ inputs.derating-profile }}
+        INPUT_SPICE: ${{ inputs.spice }}
+        INPUT_DATASHEETS_DIR: ${{ inputs.datasheets-dir }}
+        INPUT_DIFF_BASE: ${{ inputs.diff-base }}
+        DIGIKEY_CLIENT_ID: ${{ inputs.digikey-client-id }}
+        DIGIKEY_CLIENT_SECRET: ${{ inputs.digikey-client-secret }}
+        MOUSER_SEARCH_API_KEY: ${{ inputs.mouser-api-key }}
+        ELEMENT14_API_KEY: ${{ inputs.element14-api-key }}
+        GITHUB_TOKEN: ${{ github.token }}
+        ACTION_PATH: ${{ github.action_path }}

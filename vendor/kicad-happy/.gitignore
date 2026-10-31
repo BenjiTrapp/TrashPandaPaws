@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+CLAUDE.md
+/TODO-*
+/LOG-*
+.claude/
+.codex/
+.venv/
+test-output/
+docs/
+
+# Preserved removed-skill source (kidoc removed in v1.4)
+old/

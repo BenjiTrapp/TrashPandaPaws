@@ -1,0 +1,48 @@
+# Fork-safe KiCad Design Review workflow
+# Uses two workflows to safely handle PRs from forks.
+# Fork PRs get read-only GITHUB_TOKEN, so the analysis runs in workflow 1
+# and the comment is posted in workflow 2 (with write permissions).
+#
+# Add BOTH files to your KiCad project repo at:
+#   .github/workflows/kicad-analyze.yml    (this file)
+#   .github/workflows/kicad-comment.yml    (see fork-safe-comment.yml)
+
+name: KiCad Analysis
+on:
+  pull_request:
+    paths: ['**/*.kicad_sch', '**/*.kicad_pcb']
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - run: sudo apt-get install -y ngspice poppler-utils
+
+      # --- Tier 1: Deterministic analysis ---
+      - uses: aklofas/kicad-happy@v1
+        id: analysis
+        with:
+          digikey-client-id: ${{ secrets.DIGIKEY_CLIENT_ID }}
+          digikey-client-secret: ${{ secrets.DIGIKEY_CLIENT_SECRET }}
+
+      # Save results as artifact for the comment workflow
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kicad-review
+          path: ${{ steps.analysis.outputs.report-path }}
+          retention-days: 1
+
+      - shell: bash
+        if: always()
+        run: echo "${{ github.event.pull_request.number }}" > /tmp/pr-number.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kicad-review-meta
+          path: /tmp/pr-number.txt
+          retention-days: 1
