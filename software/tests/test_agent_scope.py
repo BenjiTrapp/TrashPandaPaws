@@ -368,6 +368,62 @@ class TestFailClosed(unittest.TestCase):
             self.assertIsNotNone(_scope().check(cmd, _none))
 
 
+class TestExemptionBoundaries(unittest.TestCase):
+    """The glob refusal has two deliberate exemptions: a bracketed IPv6
+    literal, and a URL's path and query. An exemption inside a fail-closed
+    extractor is where a later change quietly opens a hole, so each edge is
+    pinned here in both directions: what must stay refused as unreadable
+    ("cannot verify") and what must stay readable."""
+
+    UNREADABLE = "cannot verify"
+
+    def _assert_unreadable(self, cmd):
+        reason = _scope().check(cmd, _none)
+        self.assertIsNotNone(reason, cmd)
+        self.assertTrue(reason.startswith(self.UNREADABLE), (cmd, reason))
+
+    def test_brackets_that_are_not_an_ipv6_literal_are_unreadable(self):
+        for cmd in ("nmap [*]", "nmap [1-5]", "nmap []", "nmap [fd00::1",
+                    "nmap [[fd00::1]]", "nmap a[fd00::1]", "nmap [fd00::1]x",
+                    "nmap [fd00::1]*", "nmap [fd00::1]:*", "nmap [fd00::1],dc*",
+                    "nmap [fd00::g]", "nmap [1:5]x", "nmap http://[*]/",
+                    "nmap http://[fd00::*]/"):
+            self._assert_unreadable(cmd)
+
+    def test_valid_ipv6_literal_is_read_and_judged_by_scope(self):
+        wide = scope.Scope(allow=["fd00::/64"], deny=[])
+        self.assertIsNone(wide.check("nmap -6 [fd00::1]", _none))
+        # Read as an address, so refused for being out of scope, not unreadable.
+        for cmd in ("nmap -6 [fd00::1]", "nmap -6 [::]"):
+            reason = _scope().check(cmd, _none)
+            self.assertIsNotNone(reason, cmd)
+            self.assertFalse(reason.startswith(self.UNREADABLE), reason)
+            self.assertIn("not entirely inside the authorised ranges", reason)
+        self.assertIn("'::'", _scope().check("nmap -6 [::]", _none))
+        self.assertEqual(scope.extract_targets("nmap -6 [::]"), (["::"], []))
+
+    def test_glob_in_url_host_userinfo_port_query_or_fragment_is_unreadable(self):
+        for cmd in ("curl http://a*@10.0.1.5/", "curl http://10.0.1.5:8*/",
+                    "curl http://10.0.1.5?*", "curl http://10.0.1.5#*",
+                    "curl x://dc*.corp.local/", "curl http://dc0[1-5].corp.local/",
+                    "curl http:///dc*"):
+            self._assert_unreadable(cmd)
+
+    def test_glob_in_url_path_or_query_after_the_host_is_still_readable(self):
+        for cmd in ("curl http://10.0.1.5/?a=*", "curl http://10.0.1.5/x[1]",
+                    "curl http://10.0.1.5/#*", "curl 'http://10.0.1.5/a?b=c&d[]=*'"):
+            self.assertIsNone(_scope().check(cmd, _none), cmd)
+            self.assertEqual(scope.extract_targets(cmd)[0], ["10.0.1.5"], cmd)
+
+    def test_unquoted_ampersand_ends_the_url_so_the_rest_is_judged_alone(self):
+        self._assert_unreadable("curl http://10.0.1.5/a?b=c&d[]=*")
+
+    def test_readable_url_path_does_not_launder_an_out_of_scope_host(self):
+        reason = _scope().check("curl http://172.16.0.5/?a=*", _none)
+        self.assertIn("172.16.0.5", reason)
+        self.assertFalse(reason.startswith(self.UNREADABLE), reason)
+
+
 class TestScopeConstruction(unittest.TestCase):
     def test_malformed_allow_entry_raises(self):
         with self.assertRaises(ValueError):
