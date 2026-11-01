@@ -9,6 +9,14 @@ the netlist removes that whole class of mismatch by construction.
 Identical parts are grouped into ranges (C7-C10 style) the way the previous BOM
 did, so the diff stays readable.
 
+DNP is explicit. A component with `populate: false` is never grouped with a
+part that is fitted, and its row says so in four places that an assembler
+cannot all miss: Populate = DNP, Quantity = 0, the "Part Number" cell is EMPTY
+(a buyer working down that column cannot order it), and the part to use if it
+is ever fitted is named in "Part If Fitted". DNP rows come last. Parts with
+`bom: false` (test pads, cut-open solder jumpers) are not parts and are left
+out. Rules in tools/fitting.py.
+
 Usage:
     python3 gen_bom.py [--out bom.csv] [netlist.yaml]
 """
@@ -22,12 +30,16 @@ from pathlib import Path
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fitting  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 DEFAULT_NETLIST = HERE.parent / "netlist.yaml"
 DEFAULT_OUT = HERE.parent / "bom.csv"
 
-FIELDS = ["Reference", "Quantity", "Value", "Tolerance", "Package",
-          "Part Number", "Description", "Source"]
+FIELDS = ["Reference", "Quantity", "Populate", "Value", "Tolerance", "Package",
+          "Manufacturer", "Part Number", "Part If Fitted", "Description",
+          "Source"]
 
 
 def ref_key(ref):
@@ -67,6 +79,58 @@ def first_line(text):
     return " ".join(str(text).split())
 
 
+def build_rows(netlist):
+    """BOM rows for `netlist`: fitted rows by reference, then the DNP rows."""
+    components = netlist["components"]
+
+    # Group by everything that makes two parts interchangeable. `populate` is
+    # part of the key so a DNP part can never be folded into a fitted row.
+    groups = defaultdict(list)
+    for ref, comp in components.items():
+        if not fitting.in_bom(ref, comp):
+            continue
+        key = (fitting.is_populated(ref, comp),
+               str(comp.get("value", "")),
+               str(comp.get("tolerance", "")),
+               str(comp.get("package", "")),
+               str(comp.get("manufacturer", "")),
+               str(comp.get("mpn", "")))
+        groups[key].append(ref)
+
+    rows = []
+    for (populated, value, tolerance, package, manufacturer, mpn), refs in groups.items():
+        refs.sort(key=ref_key)
+        sample = components[refs[0]]
+        # One description if they agree. If not, list the distinct ones (at
+        # most three, then "and N more") so the cell never describes only the
+        # first reference of a group.
+        distinct = []
+        for ref in refs:
+            text = first_line(components[ref].get("description"))
+            if text not in distinct:
+                distinct.append(text)
+        description = " | ".join(distinct[:3])
+        if len(distinct) > 3:
+            description += f" | and {len(distinct) - 3} more"
+        rows.append({
+            "Reference": collapse(refs),
+            "Quantity": len(refs) if populated else 0,
+            "Populate": "yes" if populated else "DNP",
+            "Value": value,
+            "Tolerance": tolerance,
+            "Package": package,
+            "Manufacturer": manufacturer,
+            "Part Number": mpn if populated else "",
+            "Part If Fitted": "" if populated else mpn,
+            "Description": description,
+            "Source": first_line(sample.get("source"))[:160],
+        })
+
+    rows.sort(key=lambda r: (r["Populate"] != "yes",
+                             ref_key(r["Reference"].split(",")[0].split("-")[0])))
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -77,37 +141,11 @@ def main():
     with open(args.netlist) as handle:
         netlist = yaml.safe_load(handle)
 
-    components = netlist["components"]
-
-    # Group by everything that makes two parts interchangeable.
-    groups = defaultdict(list)
-    for ref, comp in components.items():
-        key = (str(comp.get("value", "")),
-               str(comp.get("tolerance", "")),
-               str(comp.get("package", "")),
-               str(comp.get("mpn", "")))
-        groups[key].append(ref)
-
-    rows = []
-    for (value, tolerance, package, mpn), refs in groups.items():
-        refs.sort(key=ref_key)
-        sample = components[refs[0]]
-        # Prefer a shared description; if they differ, say so generically.
-        descriptions = {first_line(components[r].get("description")) for r in refs}
-        description = (descriptions.pop() if len(descriptions) == 1
-                       else first_line(sample.get("description")))
-        rows.append({
-            "Reference": collapse(refs),
-            "Quantity": len(refs),
-            "Value": value,
-            "Tolerance": tolerance,
-            "Package": package,
-            "Part Number": mpn,
-            "Description": description,
-            "Source": first_line(sample.get("source"))[:160],
-        })
-
-    rows.sort(key=lambda r: ref_key(r["Reference"].split(",")[0].split("-")[0]))
+    try:
+        rows = build_rows(netlist)
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
     out = Path(args.out)
     with open(out, "w", newline="") as handle:
@@ -115,9 +153,12 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
+    fitted = sum(r["Quantity"] for r in rows)
+    dnp = [r["Reference"] for r in rows if r["Populate"] == "DNP"]
     print(f"Generated {out}")
     print(f"  line items   {len(rows)}")
-    print(f"  components   {sum(r['Quantity'] for r in rows)}")
+    print(f"  to be fitted {fitted}")
+    print(f"  DNP          {', '.join(dnp) if dnp else 'none'}")
     return 0
 
 

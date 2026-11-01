@@ -15,7 +15,7 @@ is self-contained and does not depend on installed KiCad libraries.
 Run tests/check_netlist.py first - this script trusts the netlist.
 
 Usage:
-    python3 gen_schematic.py [--out path] [netlist.yaml]
+    python3 gen_schematic.py [--out path] [--symlib path] [netlist.yaml]
 """
 
 import argparse
@@ -24,6 +24,9 @@ import sys
 from pathlib import Path
 
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fitting  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_NETLIST = HERE.parent / "netlist.yaml"
@@ -37,6 +40,10 @@ PIN_SPACING = 2.54
 STUB = 2.54
 SHEET_W, SHEET_H = 420.0, 297.0   # A3
 MARGIN = 20.0
+
+
+def yn(flag):
+    return "yes" if flag else "no"
 
 
 def uuid_for(*parts):
@@ -64,6 +71,8 @@ class Symbol:
         self.comp = comp
         self.value = str(comp.get("value", ref))
         self.footprint = comp.get("footprint", "")
+        self.populated = fitting.is_populated(ref, comp)
+        self.in_bom = fitting.in_bom(ref, comp)
         pins = comp.get("pins") or {}
         self.pins = {str(n): (p or {}) for n, p in pins.items()}
         self.bare = f"RACCOON_{ref}"
@@ -106,7 +115,7 @@ class Symbol:
     def render(self):
         out = [f'\t\t(symbol "{self.name}"',
                '\t\t\t(pin_names (offset 0.508))',
-               '\t\t\t(exclude_from_sim no) (in_bom yes) (on_board yes)',
+               f'\t\t\t(exclude_from_sim no) (in_bom {yn(self.in_bom)}) (on_board yes)',
                f'\t\t\t(property "Reference" "{self.ref}" (at 0 {self.half_h + 2.54} 0)',
                '\t\t\t\t(effects (font (size 1.27 1.27))))',
                f'\t\t\t(property "Value" "{self.value}" (at 0 {-self.half_h - 2.54} 0)',
@@ -179,7 +188,7 @@ def place(symbols, order):
     return positions
 
 
-def build(netlist, out_path):
+def build(netlist, out_path, symlib_path=DEFAULT_SYMLIB):
     components = netlist["components"]
     nets = netlist["nets"]
     no_connect = netlist.get("no_connect") or {}
@@ -252,7 +261,8 @@ def build(netlist, out_path):
         ox, oy = positions[ref]
         instances += [
             f'\t(symbol (lib_id "{LIB}:RACCOON_{ref}") (at {ox} {oy} 0) (unit 1)',
-            '\t\t(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no)',
+            f'\t\t(exclude_from_sim no) (in_bom {yn(sym.in_bom)}) (on_board yes) '
+            f'(dnp {yn(not sym.populated)})',
             f'\t\t(uuid "{uuid_for("inst", ref)}")',
             f'\t\t(property "Reference" "{ref}" (at {ox} {oy - sym.half_h - 2.54} 0)',
             '\t\t\t(effects (font (size 1.27 1.27))))',
@@ -260,7 +270,15 @@ def build(netlist, out_path):
             f'(at {ox} {oy + sym.half_h + 2.54} 0)',
             '\t\t\t(effects (font (size 1.27 1.27))))',
             f'\t\t(property "Footprint" "{sym.footprint}" (at {ox} {oy} 0)',
-            '\t\t\t(effects (font (size 1.27 1.27)) hide))',
+            '\t\t\t(effects (font (size 1.27 1.27)) hide))']
+        # The manufacturer part number travels with the symbol, so a BOM
+        # exported from KiCad itself (not only gen_bom.py) carries it.
+        for key, field in (("MPN", "mpn"), ("Manufacturer", "manufacturer")):
+            if sym.comp.get(field):
+                instances += [
+                    f'\t\t(property "{key}" "{sym.comp[field]}" (at {ox} {oy} 0)',
+                    '\t\t\t(effects (font (size 1.27 1.27)) hide))']
+        instances += [
             f'\t\t(instances (project "raccoon-tap" '
             f'(path "/{uuid_for("sheet", meta.get("revision"))}" '
             f'(reference "{ref}") (unit 1))))',
@@ -333,7 +351,7 @@ def build(netlist, out_path):
         block = POWER_SYMBOL.format(safe=safe_name(rail), net=rail, lib=LIB)
         lib.append(block.replace(f'"{LIB}:', '"', 1))
     lib += [')', '']
-    symlib_path = DEFAULT_SYMLIB
+    symlib_path = Path(symlib_path)
     symlib_path.write_text("\n".join(lib), encoding="utf-8")
 
     return {"symbols": len(order), "rails": len(rails), "symlib": symlib_path.name,
@@ -346,12 +364,13 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("netlist", nargs="?", default=str(DEFAULT_NETLIST))
     parser.add_argument("--out", default=str(DEFAULT_OUT))
+    parser.add_argument("--symlib", default=str(DEFAULT_SYMLIB))
     args = parser.parse_args()
 
     with open(args.netlist) as handle:
         netlist = yaml.safe_load(handle)
 
-    stats = build(netlist, Path(args.out))
+    stats = build(netlist, Path(args.out), Path(args.symlib))
     print(f"Generated {args.out}")
     for key, value in stats.items():
         print(f"  {key:<12} {value}")

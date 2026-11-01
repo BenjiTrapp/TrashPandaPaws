@@ -337,10 +337,14 @@ def check_against_netlist(sch, bom_rows, netlist, report):
                  f"schematic has all {len(source)} netlist refs",
                  f"missing: {sorted(set(source) - set(sch_refs))} "
                  f"extra: {sorted(set(sch_refs) - set(source))}")
-    report.check(set(bom_refs) == set(source),
-                 f"BOM has all {len(source)} netlist refs",
-                 f"missing: {sorted(set(source) - set(bom_refs))} "
-                 f"extra: {sorted(set(bom_refs) - set(source))}")
+    # `bom: false` marks a board feature that is not a part (test pad, cut-open
+    # solder jumper): on the schematic and the PCB, deliberately not in the BOM.
+    in_bom = {ref for ref, comp in source.items()
+              if comp.get("bom", True) is not False}
+    report.check(set(bom_refs) == in_bom,
+                 f"BOM has all {len(in_bom)} netlist refs that are parts",
+                 f"missing: {sorted(in_bom - set(bom_refs))} "
+                 f"extra: {sorted(set(bom_refs) - in_bom)}")
 
     sch_bad, bom_bad = [], []
     for ref, comp in sorted(source.items()):

@@ -232,6 +232,43 @@ class LegacyFormatStillUnderstood(unittest.TestCase):
         self.assertIn("no name-only net references remain", labels(report))
 
 
+class BomExpectationHonoursTheBomFlag(unittest.TestCase):
+    """`bom: false` parts (test pads, solder jumpers) are on the schematic and
+    the PCB but not in the BOM; every other part must be in the BOM."""
+
+    @classmethod
+    def setUpClass(cls):
+        import csv
+        cls.netlist = load_netlist()
+        cls.sch = ck.parse_sexp(ck.SCH.read_text(encoding="utf-8"))
+        with open(ck.BOM, newline="") as handle:
+            cls.rows = list(csv.DictReader(handle))
+
+    def run_check(self, rows):
+        report = ck.Report()
+        with contextlib.redirect_stdout(io.StringIO()):
+            ck.check_against_netlist(self.sch, rows, self.netlist, report)
+        return report
+
+    def test_the_generated_files_pass(self):
+        self.assertEqual(self.run_check(self.rows).failures, [])
+
+    def test_some_parts_really_are_flagged_out_of_the_bom(self):
+        flagged = {r for r, c in self.netlist["components"].items()
+                   if c.get("bom", True) is False}
+        self.assertTrue({"TP1", "JP1", "JP2"} <= flagged)
+
+    def test_a_flagged_part_found_in_the_bom_fails(self):
+        rows = self.rows + [{"Reference": "TP1", "Value": "TP_GND"}]
+        self.assertTrue(any("BOM has all" in label
+                            for label in labels(self.run_check(rows))))
+
+    def test_a_real_part_missing_from_the_bom_fails(self):
+        rows = [r for r in self.rows if r["Reference"] != "U7"]
+        self.assertTrue(any("BOM has all" in label
+                            for label in labels(self.run_check(rows))))
+
+
 class MainEntryPoint(unittest.TestCase):
     def test_script_exits_zero_and_checks_the_tap_board(self):
         proc = subprocess.run(
