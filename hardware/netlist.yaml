@@ -24,13 +24,24 @@
 #             function is variant-independent; each is annotated below.
 #   [LPJG]    LINK-PP LPJG16402AQNL drawing LP11021122 rev A, sheets 1/2 and
 #             2/2, read from the rendered drawing. UL file E484635.
+#   [VERDICT] hardware/review/u3-pinout-verdict.md - the Task 3 gate result: every
+#             U3 pin number and the roles of pins 20 and 22, taken from [RTL-DS].
+#             Section numbers below ("Table 6", "6.15") are [RTL-DS] unless stated.
+#   [ABM8]    Abracon ABM8 ceramic SMD crystal datasheet, revised 2020-07-29,
+#             hardware/datasheets/ABM8_abracon_rev2020-07-29.pdf (md5 57e1ee1bde6f9bb895f0c55dde98b00b)
+#   [WE-692]  Wuerth Elektronik 692112030100 datasheet (WR-COM USB 3.0 SMT Plug,
+#             order code 692112030100, rev BBO 002.000, 2022-04-28), pin
+#             assignment table. Read from https://www.we-online.com/components/
+#             products/datasheet/692112030100.pdf as returned by a web search
+#             tool; the PDF itself was refused to scripted download (HTTP 403),
+#             so no copy is committed and no hash can be given.
 #   [TBD]     not determinable from available documents - see OPEN_QUESTIONS.md
 
 meta:
   board: Raccoon Tap
-  revision: "2.0-draft"
+  revision: "2.1-draft"
   architecture: "Option A - USB-powered GbE tap, PoE via Pi PoE+ HAT"
-  date: "2026-09-25"
+  date: "2026-11-01"
   routed: false
   erc_clean: false
 
@@ -86,7 +97,12 @@ rails:
     source: "U6 SY8089AAAC external buck (ENSWREG tied low, internal SWR disabled)"
     range: "0.95 - 1.05 V"
     note: >
-      [RTL-DS] table 21: DVDD10, AVDD10, U3VDD10, U2VDD10, DVDD10_UPS.
+      [RTL-DS] table 21 gives the 0.95-1.05 V window for DVDD10, AVDD10,
+      U3VDD10, U2VDD10 (and DVDD10_UPS, which is NOT fed from this rail: it is
+      an LDO output, see U3 design_notes.ldo_outputs). Connection rule for this
+      rail: [RTL-DS] 6.14 - REGOUT's 1.0 V output "must be connected only to
+      DVDD10, AVDD10, U3VDD10, and U2VDD10"; this rail takes REGOUT's place, so
+      the same four pin groups, and only those, hang on it.
       Decision 2026-09-25: external buck rather than the chip's internal
       switching regulator, on a 4-layer board. Rationale in OPEN_QUESTIONS.md
       item 3f - [RTL-614] warns the internal SWR "requires a well-designed PCB
@@ -108,7 +124,11 @@ components:
     package: QFN-40, 5x5mm, exposed pad
     footprint: "Package_DFN_QFN:QFN-40-1EP_5x5mm_P0.4mm_EP3.6x3.6mm"
     description: USB 3.0 to Gigabit Ethernet controller
-    source: "[RTL-DS] - 40 pins + exposed pad = pin 41"
+    source: >
+      [RTL-DS] - 40 pins + exposed pad = pin 41. All 41 pin numbers confirmed
+      against [RTL-DS] tables 1-10 and figure 1 in three copies of the PDF,
+      see [VERDICT] sec. 3; re-run with
+      `python3 hardware/datasheets/crosscheck_u3_pinout.py`.
     pins:
       1:  {name: MDIP0,      type: bidirectional}
       2:  {name: MDIN0,      type: bidirectional}
@@ -129,9 +149,9 @@ components:
       17: {name: U2DM,       type: bidirectional}
       18: {name: U2DP,       type: bidirectional}
       19: {name: U2VDD10,    type: power_in}
-      20: {name: AVDD33,     type: power_in}
+      20: {name: AVDD33,     type: power_out, note: "LDO 3.3V OUTPUT, not a supply input: [RTL-DS] table 6 'AVDD33 P 20 Linear Regulator (LDO) 3.3V Output... designed for RTL8153B-VB internal use only'. Own output cap, NOT on +3V3. See design_notes.ldo_outputs."}
       21: {name: VDD5,       type: power_in}
-      22: {name: DVDD10_UPS, type: power_in}
+      22: {name: DVDD10_UPS, type: power_out, note: "LDO 1.0V OUTPUT, not a supply input: [RTL-DS] table 6 'DVDD10_UPS P 22 Linear Regulator (LDO) 1.0V Output', 6.15 notes 1 and 2. Own output cap, NOT on +1V0. See design_notes.ldo_outputs."}
       23: {name: DVDD33,     type: power_in}
       24: {name: LED2,       type: output,   shared: "EEDO/LED2/SPISDO/LANWAKEB/GPIO"}
       25: {name: ENSWREG,    type: input,    shared: "EEDI/SPISDI/ENSWREG"}
@@ -168,9 +188,73 @@ components:
         this variant's AVDD10/DVDD10/U3VDD10/U2VDD10. Decision open - see
         OPEN_QUESTIONS.md item 3f.
       lowv_rail_fanout: >
-        Whichever source is used, the 1.0V rail must reach AVDD10 (3, 8, 37),
-        DVDD10 (34), U3VDD10 (14), U2VDD10 (19) and DVDD10_UPS (22).
-        [OLIMEX] place 9 decoupling caps on this rail alone.
+        CORRECTED 2026-11-01 (an earlier revision also listed DVDD10_UPS (22);
+        that was wrong, see ldo_outputs). Whichever source is used, the 1.0V
+        rail reaches AVDD10 (3, 8, 37), DVDD10 (34), U3VDD10 (14) and
+        U2VDD10 (19), and nothing else. Source: [RTL-DS] 6.14 "REGOUT ... must
+        be connected only to DVDD10, AVDD10, U3VDD10, and U2VDD10 (do not
+        provide this power source to other devices)"; table 8 for the pin
+        numbers (AVDD10 3/8/37, DVDD10 34, U3VDD10 14, U2VDD10 19). The earlier
+        text traced to [OLIMEX], which is the RTL8153VC-CG, a different part.
+        The rail has C12-C16 (five 100nF) plus C4 (22uF) at the buck; the
+        Olimex count of 9 caps is for their variant and is not copied.
+      ldo_outputs: >
+        DECIDED 2026-11-01. Two pins of U3 are outputs of its embedded linear
+        regulators, not supply inputs, and neither is connected to a supply
+        rail of this board.
+        (1) DVDD10_UPS (22): [RTL-DS] table 6 "Linear Regulator (LDO) 1.0V
+        Output. Note: The embedded LDO is designed for RTL8153B-VB internal use
+        only. Do not provide this power source to other devices."; 6.15 note 1
+        (same), note 2 "The digital LDO output pin (DVDD10_UPS) should be
+        separated from the other 1.0V SWR output pin (REGOUT)"; 6.14 lists the
+        pins REGOUT may feed and 22 is not among them; 6.15 asks for "only an
+        output capacitor between its output and analog ground for phase
+        compensation", placed "as close as possible to the power pins". This
+        design drives the +1V0 rail from U6 instead of REGOUT, and that rail
+        takes REGOUT's place, so pin 22 is likewise kept off it. Pin 22 now has
+        its own net (DVDD10_UPS) with C17 to GND as the output capacitor.
+        C17 VALUE: the datasheet gives no capacitance. 100nF is kept because
+        [OLIMEX] Rev E fit exactly 100nF/X5R/0402 (C22) on DVDD10_UPS, on its
+        own net, off the 1.0V rail, with REGOUT left open as here. That is a
+        different die and package (VC, QFN-48), so it is a precedent for the
+        function, not a datasheet value. NEEDS CONFIRMATION ON FIRST BUILD:
+        probe pin 22 for ~1.0V with a quiet waveform. The footprint is 0402, so
+        a 1uF X5R drop-in is possible if it rings; no respin.
+        (2) AVDD33 (20): [RTL-DS] table 6 "AVDD33 P 20 Linear Regulator (LDO)
+        3.3V Output" with the identical internal-use-only note; 6.15 note 1
+        covers "the embedded LDO". Table 8 lists pin 20 inside the AVDD33
+        supply group (11, 20, 39, 40) and table 21 lists "DVDD33, AVDD33" by
+        name, not by pin. DECISION: treat pin 20 as an LDO output, not on
+        +3V3. REASONS: (a) table 6 is the only row that describes pin 20 on its
+        own, and it says output; tables 8 and 21 only group it by name. (b) The
+        same document has the identical pattern for pin 22 - table 8 calls it a
+        "Digital 1.0V Uninterruptible Power Supply" and table 21 lists
+        DVDD10_UPS as a supply voltage - yet 6.15 note 2 settles pin 22 as an
+        output. So tables 8 and 21 demonstrably do not distinguish an LDO
+        output from an input, and are not evidence against table 6. (c) Neither
+        reading is directly contradicted by a rule, so the evidence leans, it
+        does not prove: unlike pin 22 there is no 6.14/6.15 sentence naming pin
+        20 and saying what it may touch. (d) Failure asymmetry, chosen to fail
+        loudly and harmlessly: with pin 20 isolated, if it really were an
+        input the chip fails to come up on first power, which is visible and
+        fixed in two minutes by fitting R12 (0R, DNP, to +3V3). With pin 20 on
+        +3V3, if it is an output, two regulators fight on the analog 3.3V rail
+        and the fault may stay silent (heat, noise) in the field.
+        [OLIMEX] COUNTER-EVIDENCE, stated so it is not lost: on Olimex Rev E
+        (VC variant) the AVDD33 pin sitting next to VDD5 (their pin 25, the
+        analogue of our 20 by position, not by datasheet) is tied to the common
+        external 3.3V. Their datasheet was not available to check whether that
+        pin is an LDO output there, so this does not settle the question.
+        A web-search snippet of a paywalled reference-schematic overview ("Place
+        C10 close to VDD33 pin 20 (reserved)") hints at a cap of its own on pin
+        20. It was seen only as a snippet and is not relied on.
+        PIN 20 CAP: C8, 2.2uF X5R 10V 0402. The datasheet gives no value; an
+        LDO output capacitor "for phase compensation" is typically 1-10uF
+        ceramic, 2.2uF is the middle, and DC bias at 3.3V leaves roughly 1uF
+        effective in 0402, still inside that range. NEEDS CONFIRMATION ON FIRST
+        BUILD. FIRST-BUILD TEST THAT SETTLES IT: with R12 not fitted, measure
+        pin 20 against GND at power-up. About 3.3V means it is an LDO output
+        and R12 must stay empty. 0V means it is an input after all: fit R12.
       decoupling_reference: >
         [OLIMEX] total 18x 100nF 0402 plus 2x 2.2uF 0603 across all rails.
         The repo currently has far fewer. Count and placement to be settled
@@ -192,24 +276,63 @@ components:
 
   Y1:
     value: 25MHz
-    package: "3215"
+    mpn: ABM8-25.000MHZ-D2Y-T
+    manufacturer: Abracon
+    package: "3225"
     footprint: "Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm"
-    description: 25MHz crystal for U3 clock reference
-    source: "[RTL-DS] 'Supports 25MHz Crystal'"
+    description: "25MHz crystal for U3 clock reference, CL 18pF, +/-30ppm over temperature"
+    source: >
+      [RTL-DS] 7.4 table 23 and 'Supports 25MHz Crystal'. Part chosen against
+      table 23, checked item by item against [ABM8]:
+        Fref 25 MHz fundamental, AT-cut ...... ABM8 fundamental 8-54 MHz       OK
+        Stability +/-30 ppm, 0..70 C ......... option code Y = +/-30 ppm, and
+                                               code D = -40..+85 C, a superset OK
+        Tolerance +/-50 ppm at 25 C .......... code 2 = +/-20 ppm              OK
+        CL 16-20 pF .......................... standard CL 18.0 pF             OK
+        ESR max 70 ohm; 50 ohm at C0 = 3 pF
+        (table 23 note 3) .................... ABM8 table 1: 50 ohm max for
+                                               20.000-29.999 MHz fundamental,
+                                               C0 3.0 pF                       OK, at the limit
+      Not met on paper: table 23 gives "DL Drive Level ... max 0.3 mW" and
+      [ABM8] rates 100 uW max. Whether table 23 means the crystal must tolerate
+      0.3 mW or that U3 drives no more than 0.3 mW is not stated; every 3225
+      25 MHz part found is rated 100 uW. OPEN, NEEDS CONFIRMATION ON FIRST BUILD:
+      measure the drive level (or at least check the oscillation amplitude at
+      CKXTAL2) against the crystal's 100 uW rating.
+      Variant-code decode (D2Y) is read from the ordering-option table of
+      [ABM8]; distributor listings disagree on whether the D2Y tolerance is
+      +/-20 or +/-50 ppm. Either satisfies table 23, but confirm on the order
+      confirmation that the stability is +/-30 ppm.
+      Footprint: pads 1 and 3 are the crystal terminals, pads 2 and 4 are GND
+      ([ABM8] outline, top view). [ABM8] land pattern is a 2.3 x 1.75 mm pitch;
+      the KiCad 3225-4Pin footprint is 2.2 x 1.6 mm - 0.1 mm off, within what
+      the 1.3 x 1.05 mm pads absorb. An earlier revision of this file said
+      package "3215", which is a 3.2 x 1.5 mm part; corrected.
     design_notes:
       load_caps: >
-        The load capacitors depend on the crystal's CL spec, which the repo
-        never states. [OLIMEX] traced: CKXTAL1 -> C7 + X1.3, CKXTAL2 -> C8 +
-        X1.1, with a 25MHz/20ppm/20pF crystal and C7/C8 = 39pF C0G 50V.
-        The repo currently specifies 10pF, which would only suit a much lower
-        CL. Pick the crystal first, then size the caps from its CL.
+        CALCULATED 2026-11-01, replaces the 39pF placeholder.
+        Series combination of the two caps plus stray capacitance must equal the
+        crystal's CL: CL = C19*C20/(C19+C20) + Cstray; with C19 = C20 = C that
+        is CL = C/2 + Cstray, so C = 2*(CL - Cstray).
+        CL = 18 pF ([ABM8] standard). Cstray = 4 pF assumed (two 0402 pads, a
+        short trace, U3's CKXTAL pins and the crystal's own pad capacitance;
+        3-5 pF is the usual range, this is an assumption, not a measured value).
+        C = 2*(18 - 4) = 28 pF -> nearest E24 value 27 pF.
+        27 pF is also exactly what [RTL-DS] 7.4 table 23 notes 3 and 4 give:
+        "the latest reference schematic recommends two external capacitors of
+        27pF ... To match this use the load capacitance specified by the crystal
+        manufacturer of 16~20pF." With 27 pF: CL = 13.5 + 4 = 17.5 pF; across
+        Cstray 3-5 pF, CL = 16.5-18.5 pF, inside the 16-20 pF window of table 23.
+        The earlier placeholder, 39 pF from [OLIMEX], would give CL = 19.5 + 4 =
+        23.5 pF here: outside the 16-20 pF window, so the crystal would run low
+        in frequency.
+        Use C0G (NP0) 50V 0402, 5% or better, for stability.
     pins:
       # SMD3225/4 standard numbering: 1 and 3 are the crystal terminals,
       # 2 and 4 are the case ground pads. An earlier revision had 1/2 as the
       # two terminals, which would have grounded one electrode and left the
       # other floating. Caught when pcbnew reported pads 3 and 4 with no net.
-      # Confirm against the chosen crystal's datasheet - the part is not yet
-      # selected (see design_notes.load_caps).
+      # Confirmed against [ABM8] outline drawing, top view: GND on pads 2 and 4.
       1: {name: XIN,   type: passive}
       2: {name: CASE1, type: passive, note: "case ground"}
       3: {name: XOUT,  type: passive}
@@ -238,11 +361,13 @@ components:
       2: {name: D_N,       type: passive}
       3: {name: D_P,       type: passive}
       4: {name: GND,       type: passive}
-      5: {name: SSRX_N,    type: passive, note: "host-side name; we drive this"}
-      6: {name: SSRX_P,    type: passive, note: "host-side name; we drive this"}
+      # Names and numbers verified against [WE-692] "Pin Assignment": 5 StdA_SSRX-,
+      # 6 StdA_SSRX+, 7 GND_DRAIN, 8 StdA_SSTX-, 9 StdA_SSTX+. See design_notes.usb3_crossover.
+      5: {name: SSRX_N,    type: passive, note: "[WE-692] StdA_SSRX-; host-side name, host receives, we drive this"}
+      6: {name: SSRX_P,    type: passive, note: "[WE-692] StdA_SSRX+; host-side name, host receives, we drive this"}
       7: {name: GND_DRAIN, type: passive}
-      8: {name: SSTX_N,    type: passive, note: "host-side name; we receive this"}
-      9: {name: SSTX_P,    type: passive, note: "host-side name; we receive this"}
+      8: {name: SSTX_N,    type: passive, note: "[WE-692] StdA_SSTX-; host-side name, host transmits, we receive this"}
+      9: {name: SSTX_P,    type: passive, note: "[WE-692] StdA_SSTX+; host-side name, host transmits, we receive this"}
       SH: {name: SHIELD,  type: passive, note: "shield tabs, footprint pad name SH"}
 
   U6:
@@ -282,6 +407,14 @@ components:
         The 1.0 V rail current is not specified in [RTL-DS]; 1 A is a
         conservative design point for a GbE PHY core and should be confirmed by
         measurement on the first build.
+      feed_forward: >
+        A DNP pad, C24, is provided across R5 (output to FB) for a feed-forward
+        capacitor. No value is given because none is sourced: this file records
+        no [SY8089] figure for it and the SY8089 datasheet is not in
+        hardware/datasheets to check, and a number picked now would be a guess
+        that looks like a spec. It costs one empty 0402 pad and allows trimming
+        transient response or output ripple on the first build with a scope
+        rather than a respin. Leave empty until a measurement says otherwise.
       layout: >
         Datasheet: keep CIN, L, R1 and R2 close to the IC, and keep the trace
         from the divider to FB short and away from the switch node.
@@ -398,10 +531,15 @@ components:
     description: "+3V3 decoupling at U3 AVDD33 (11)"
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C8:
-    value: 100nF
+    value: 2.2uF
+    tolerance: "X5R, 10V"
     package: "0402"
     footprint: "Capacitor_SMD:C_0402_1005Metric"
-    description: "+3V3 decoupling at U3 AVDD33 (20)"
+    description: "Output capacitor of U3's embedded 3.3V LDO at AVDD33 (20); NOT on +3V3"
+    source: >
+      [RTL-DS] 6.15: "only an output capacitor between its output and analog
+      ground for phase compensation". No value given; 2.2uF chosen, NEEDS
+      CONFIRMATION ON FIRST BUILD. Reasoning in U3 design_notes.ldo_outputs.
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C9:
     value: 100nF
@@ -455,7 +593,12 @@ components:
     value: 100nF
     package: "0402"
     footprint: "Capacitor_SMD:C_0402_1005Metric"
-    description: "+1V0 decoupling at U3 DVDD10_UPS (22)"
+    description: "Output capacitor of U3's embedded 1.0V LDO at DVDD10_UPS (22); NOT on +1V0"
+    source: >
+      [RTL-DS] 6.15: "only an output capacitor between its output and analog
+      ground for phase compensation"; no value given. 100nF as fitted by
+      [OLIMEX] Rev E C22 on its DVDD10_UPS (variant VC). NEEDS CONFIRMATION ON
+      FIRST BUILD, 1uF X5R is the drop-in if needed. See U3 design_notes.ldo_outputs.
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C18:
     value: 100nF
@@ -466,22 +609,23 @@ components:
 
   # --- Crystal load caps ---
   C19:
-    value: 39pF
+    value: 27pF
     tolerance: "C0G"
     package: "0402"
     footprint: "Capacitor_SMD:C_0402_1005Metric"
     description: "Y1 load capacitor, CKXTAL1 side"
     source: >
-      [OLIMEX] 39pF C0G with a 25MHz/20ppm/20pF crystal. TBD until the crystal
-      is picked - size from its actual CL. See Y1 design_notes.
+      Computed from Y1 = ABM8-25.000MHZ-D2Y-T, CL 18 pF [ABM8]:
+      C = 2*(CL - Cstray) = 2*(18 - 4) = 28 pF -> 27 pF. Matches the 27 pF of
+      [RTL-DS] 7.4 table 23 note 4. Calculation in Y1 design_notes.load_caps.
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C20:
-    value: 39pF
+    value: 27pF
     tolerance: "C0G"
     package: "0402"
     footprint: "Capacitor_SMD:C_0402_1005Metric"
     description: "Y1 load capacitor, CKXTAL2 side"
-    source: "[OLIMEX] - see C19"
+    source: "Same as C19 - see C19 and Y1 design_notes.load_caps"
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
 
   # --- MagJack PHY-side centre tap ---
@@ -491,6 +635,70 @@ components:
     footprint: "Capacitor_SMD:C_0402_1005Metric"
     description: "Bypass for J2 PHY-side centre taps (pins 5, 6) to GND"
     source: "[LPJG] sheet 1/2 - pins 5/6 are the PHY-side centre-tap common"
+    pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
+
+  # --- Added 2026-11-01 (Task 5). Generators do not yet understand DNP: the
+  # --- value text carries it so it reaches the BOM. Parts are unplaced in
+  # --- gen_pcb.py PLACEMENT until the placement task.
+  C22:
+    value: 100nF
+    tolerance: "X7R/X5R, 10V"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
+    description: "USB 3.0 SuperSpeed TX AC-coupling, U3SSTXP (13) to J3 pin 6"
+    source: >
+      USB 3.0 requires the transmitter to be AC coupled with 75-200 nF in
+      series, placed at the transmitter. [RTL-DS] is silent on it. [OLIMEX]
+      Rev E fit 100nF/X5R/0402 in series in each of U3TX_P and U3TX_N (C1, C2).
+      NOT in the earlier netlist; found while verifying usb3_crossover. Place
+      close to U3, symmetric with C23, same size and orientation.
+    pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
+  C23:
+    value: 100nF
+    tolerance: "X7R/X5R, 10V"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
+    description: "USB 3.0 SuperSpeed TX AC-coupling, U3SSTXN (12) to J3 pin 5"
+    source: "Same as C22"
+    pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
+
+  R12:
+    value: "0R DNP"
+    populate: false
+    package: "0402"
+    footprint: "Resistor_SMD:R_0402_1005Metric"
+    description: "DNP link between U3 pin 20 (AVDD33 LDO output) and +3V3; fit only if pin 20 proves to be a supply input"
+    source: >
+      Contingency for the pin 20 decision, see U3 design_notes.ldo_outputs.
+      Leave EMPTY unless the first-build measurement shows pin 20 at 0 V.
+    pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
+
+  C24:
+    value: DNP
+    populate: false
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
+    description: "DNP feed-forward capacitor across the buck feedback divider top resistor R5"
+    source: >
+      Pad only, no value. See U6 design_notes.feed_forward. Wired across R5:
+      one side on +1V0 (output), the other on FB.
+    pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
+
+  C25:
+    value: 1nF
+    tolerance: "X7R, 2kV, 10%"
+    package: "1206"
+    footprint: "Capacitor_SMD:C_1206_3216Metric"
+    description: "J2 SHIELD to GND, high-frequency return"
+    source: "[OLIMEX] Rev E C9, 1nF/2000V/10%/X7R/1206 from the jack shield to GND. See design_notes.shield_tie."
+    pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
+  R13:
+    value: 1M
+    tolerance: "5%"
+    package: "1206"
+    footprint: "Resistor_SMD:R_1206_3216Metric"
+    description: "J2 SHIELD to GND, DC bleed in parallel with C25; the pad also takes a 0R for a direct tie"
+    source: "design_notes.shield_tie (the 1M bleed is the usual companion of the 1nF; not in [OLIMEX])"
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
 
   J2:
@@ -596,6 +804,8 @@ nets:
     - C19.2
     - C20.2
     - C21.2
+    - C25.2
+    - R13.2
     - Y1.2           # crystal case ground
     - Y1.4
 
@@ -616,7 +826,6 @@ nets:
   "+3V3":
     - U4.5           # LDO out
     - U3.11          # AVDD33
-    - U3.20          # AVDD33
     - U3.39          # AVDD33
     - U3.40          # AVDD33
     - U3.23          # DVDD33
@@ -624,9 +833,9 @@ nets:
     - U3.26          # VDDREG33
     - R7.1           # LED series, yellow
     - R8.1           # LED series, green
+    - R12.1          # DNP link to AVDD33_LDO, see U3 design_notes.ldo_outputs
     - C6.1
     - C7.1
-    - C8.1
     - C9.1
     - C10.1
     - C11.1
@@ -640,14 +849,13 @@ nets:
     - U3.34          # DVDD10
     - U3.14          # U3VDD10
     - U3.19          # U2VDD10
-    - U3.22          # DVDD10_UPS
     - C4.1
+    - C24.1          # DNP feed-forward, see U6 design_notes.feed_forward
     - C12.1
     - C13.1
     - C14.1
     - C15.1
     - C16.1
-    - C17.1
 
   # --- Buck ---
   SW_1V0:            # switch node - keep small, F.Cu only
@@ -657,6 +865,17 @@ nets:
     - U6.3           # FB
     - R5.2
     - R6.1
+    - C24.2          # DNP feed-forward
+
+  # --- U3's embedded-LDO outputs: own nets, own caps, no supply rail ---
+  # See components.U3.design_notes.ldo_outputs. [RTL-DS] table 6, 6.15.
+  AVDD33_LDO:        # pin 20, 3.3V LDO output
+    - U3.20
+    - C8.1
+    - R12.2          # DNP link to +3V3, contingency only
+  DVDD10_UPS:        # pin 22, 1.0V LDO output
+    - U3.22
+    - C17.1
 
   RSET:
     - U3.38
@@ -683,9 +902,15 @@ nets:
   # --- USB 3.0 SuperSpeed, see design_notes.usb3_crossover ---
   USB3_TX_P:
     - U3.13          # U3SSTXP - device transmits
+    - C22.1          # AC-coupling cap, at the transmitter
+  USB3_TX_P_CONN:
+    - C22.2
     - J3.6           # plug pin named SSRX+ (host receives)
   USB3_TX_N:
     - U3.12          # U3SSTXN
+    - C23.1
+  USB3_TX_N_CONN:
+    - C23.2
     - J3.5           # plug pin named SSRX-
   USB3_RX_P:
     - U3.16          # U3SSRXP - device receives
@@ -710,11 +935,14 @@ nets:
     - C21.1
 
   # --- LEDs in the jack ---
-  # Assumes the PHY LED pins SINK current: +3V3 -> R -> anode, cathode -> PHY.
-  # See design_notes.led_polarity - must be confirmed against [RTL-DS] 6.2.
+  # Wired as +3V3 -> R -> anode, cathode -> PHY pin, i.e. the pin SINKS. The pin
+  # is push-pull and its active level is programmable, so this works when U3 is
+  # set LowActive. See design_notes.led_polarity.
   SHIELD:            # RJ45 cable-side shield - see design_notes.shield_tie
     - J2.SH1
     - J2.SH2
+    - C25.1          # 1nF/2kV to GND
+    - R13.1          # 1M bleed to GND
 
   LED_Y_A:           # yellow anode node
     - R7.2
@@ -739,13 +967,22 @@ no_connect:
       output is unused. Decision 3f.
   U3.24:
     reason: >
-      LED2 - the jack's bi-colour LED needs anti-parallel drive to show orange,
-      which needs the LED pin polarity from [RTL-DS] 6.2 confirmed first.
-      Green plus yellow are enough for link/activity. TODO.
+      LED2 - not used. Green plus yellow are enough for link/activity. The
+      polarity question that once blocked orange is answered (design_notes.
+      led_polarity: push-pull, programmable level), so orange via anti-parallel
+      drive of the bi-colour LED is possible - [OLIMEX] Rev E does it between
+      LED0 and LED1 - but it needs two pins on opposite levels and is a choice
+      left for later, not an open datasheet question. Pin 24 is "LED Mode
+      (default)" in [RTL-DS] table 11, and an output (table 7), so leaving it
+      open is correct.
   U3.31:
     reason: >
-      EECS - no external EEPROM; the part's embedded OTP replaces it. Confirm
-      against [RTL-DS] 6.4 whether EECS may float or wants a defined level. TODO.
+      EECS - no external EEPROM; the part has embedded eFUSE which the
+      datasheet says it loads first ([RTL-DS] table 3 note 1, 6.4). EECS is an
+      output (table 3, type O) and table 11 gives pin 31 no function outside
+      EEPROM mode. The datasheet does not say in so many words that it may
+      float; an unused output pin normally may, and [OLIMEX] Rev E ships with
+      its EEPROM (U2) unpopulated, leaving this net unterminated.
   U4.4:
     reason: "AP2112K pin 4 is NC by datasheet."
 
@@ -754,30 +991,84 @@ no_connect:
 # ---------------------------------------------------------------------------
 design_notes:
   shield_tie: >
-    J2's shield tabs are on their own SHIELD net rather than tied straight to
-    GND, because the tie strategy is a deliberate EMI decision, not a default.
-    The jack already bridges its internal Bob Smith node to SHIELD through
-    1000pF/2kV. Options for the board: a direct single-point tie to GND, or the
-    common 1nF + 1M parallel combination. Decide before layout release; leaving
-    the shield genuinely floating would make it an antenna.
+    DECIDED 2026-11-01: 1nF/2kV (C25) in parallel with 1M (R13) from SHIELD to
+    GND, not a direct tie. A direct tie was the alternative.
+    Why: the SHIELD net is the cable-side shield, which at the far end of the
+    Ethernet cable is normally bonded to the switch's chassis, while this
+    board's GND is the Pi's USB-powered 5V return, which sits behind the PoE+
+    HAT's isolated converter (OPEN_QUESTIONS.md item 0; that isolation is as
+    stated there and has not been re-verified here). A direct tie would
+    give a DC path from the cable shield into that GND, bypassing the isolation
+    the HAT provides, and a ground loop through the Pi's own Ethernet cable.
+    The 1nF/2kV cap still returns high-frequency common-mode energy and holds
+    off the 1500Vrms of the jack's own hipot rating; the 1M bleed stops the
+    shield from floating at some arbitrary DC level, which would make it an
+    antenna. The jack's internal 1000pF/2kV from its Bob Smith node to SHIELD
+    is unchanged by this. Precedent: [OLIMEX] Rev E ties the jack shield to
+    GND through a single 1nF/2kV/X7R/1206 (C9); the 1M is added here.
+    R13 is a 1206 pad so that fitting a 0R instead gives the direct tie, if EMC
+    testing prefers it, without a respin. 1206 rather than 0402 for the higher
+    working-voltage rating; how it behaves in a 1.5kV hipot test is not verified.
     J3's USB shield is tied to GND, which is the normal device-side convention.
   usb3_crossover: >
-    IMPORTANT and error-prone. J3 is an A-*plug* that mates with the host's
-    A-receptacle, and USB 3.0 pin names on that interface are given from the
-    HOST's point of view. So the plug pin labelled SSTX is the host's
-    transmitter and must feed our receiver, and the pin labelled SSRX is the
-    host's receiver and must be fed by our transmitter:
-      U3 SSTX (12/13, outputs) -> J3 pins 5/6  (labelled SSRX-/SSRX+)
-      U3 SSRX (15/16, inputs)  <- J3 pins 8/9  (labelled SSTX-/SSTX+)
-    Net names here follow the DEVICE's direction (USB3_TX_* = we transmit).
-    Verify against the connector's own datasheet before layout release - a swap
-    here costs a board spin.
+    VERIFIED 2026-11-01 against the connector's own datasheet, [WE-692]. Its
+    "Pin Assignment" table for 692112030100 (Gender: Plug, Type A) reads:
+    5 StdA_SSRX-, 6 StdA_SSRX+, 7 GND_DRAIN, 8 StdA_SSTX-, 9 StdA_SSTX+. The
+    names are the Standard-A, i.e. host, point of view: J3 is an A-*plug* that
+    mates with the host's A-receptacle, so the plug pin labelled SSTX is the
+    host's transmitter and must feed our receiver, and the pin labelled SSRX is
+    the host's receiver and must be fed by our transmitter. U3 side from
+    [RTL-DS] table 10: U3SSTXP/N = 13/12 outputs, U3SSRXP/N = 16/15 inputs.
+      U3 SSTX 13 (P) -> C22 -> J3 pin 6 (StdA_SSRX+)    P to P, N to N
+      U3 SSTX 12 (N) -> C23 -> J3 pin 5 (StdA_SSRX-)
+      U3 SSRX 16 (P) <- J3 pin 9 (StdA_SSTX+)
+      U3 SSRX 15 (N) <- J3 pin 8 (StdA_SSTX-)
+    This is what nets USB3_TX_* / USB3_RX_* wire. Net names follow the
+    DEVICE's direction (USB3_TX_* = we transmit). Result: the crossover is
+    correct as drawn; no change to pin assignment was needed.
+    LIMIT OF THE EVIDENCE: [WE-692] gives the names and numbers. That the
+    names are host-side is the USB 3.0 Standard-A convention and is consistent
+    with Wuerth's datasheet for its 692122030100 receptacle, which lists the
+    same names on the same pin numbers (seen in the same search results, not
+    otherwise kept); it is not stated in [WE-692] in those words.
+    ADDED WITH THIS CHECK: the netlist had no AC-coupling capacitors in the
+    SuperSpeed transmit path. USB 3.0 requires 75-200 nF in series at the
+    transmitter; [RTL-DS] does not mention it; [OLIMEX] Rev E has 100nF in each
+    TX line. C22 (P) and C23 (N), 100nF 0402, are added at the transmitter.
+    The receive pair needs none on our side (the host's TX is already coupled).
+    The ESD parts planned for these pairs must go on the connector side of
+    C22/C23, or between them and J3, not between U3 and the caps.
   led_polarity: >
-    Wired on the assumption that the RTL8153B LED pins sink current
-    (anode -> series R -> +3V3, cathode -> LED pin), which is the usual Realtek
-    arrangement. [RTL-DS] 6.2 "Customizable LED Configuration" must be read to
-    confirm before release. If the pins source instead, swap the resistors to
-    the cathode side.
+    CHECKED 2026-11-01 against [RTL-DS]. The premise "the pins sink" turned
+    out to be the wrong question: the datasheet does not make the pins sink or
+    source, it makes the level programmable.
+    * Table 26 (DC characteristics): Voh >= 0.9*VDD33 at Ioh = -4 mA and Vol <=
+      0.1*VDD33 at Iol = 4 mA. These are push-pull outputs rated to source
+      and to sink 4 mA.
+    * 6.2 tables 12 and 15 (LED Feature Control-1): bits 14:12 of OCP register
+      DD90h are the active level of LED2, LED1 and LED0 respectively, 0 =
+      "LowActive", 1 = "HighActive"; bit 15 picks Option 1 or 2 of table 17.
+      The level is therefore a register field, not a pin property.
+    * 6.2 table 16: with no link and no activity the pin is "Floating"; table 7
+      note 1: the output level depends on link state and the high/low-active
+      setting; with the LAN disabled the pin is 0 V.
+    What the datasheet does NOT give: the power-on default of those bits. So
+    which polarity the part comes up in is NOT settled by the datasheet.
+    Decision: keep the wiring (anode -> R -> +3V3, cathode -> LED pin). It works
+    when the pin is LowActive (pin driven low = LED lit; pin floating = LED
+    off). [OLIMEX] Rev E wires its yellow LED as a sink too: anode to +3.3V,
+    cathode through R1 1K to the LED2 pin (resistor on the cathode side, which
+    is electrically the same as the anode-side resistor used here). If U3 powers up HighActive the
+    LED stays dark (the pin drives high into a cathode, reverse bias; no
+    current, no damage) and the fix is the register bit, not the board,
+    so the resistor-to-cathode-side swap is NOT needed. Current: 1k with VF
+    1.8-2.6 V gives about 0.7-1.5 mA, well under the 4 mA the pin is rated for.
+    NEEDS CONFIRMATION ON FIRST BUILD: link a cable and see whether the LEDs
+    light for link; if inverted or dark, clear DD90h bits 14:12 (0 =
+    LowActive).
+    Other facts from the datasheet for the record: pins 24/30/32 default to LED
+    mode (table 11), the LEDs may blink at power-on or during EEPROM/SPI access
+    (5.11), and "LED OFF Mode" (all select bits 0) makes the pins float.
   mdi_pair_mapping: >
     J2 PHY-side pins carry to cable pins as: TD1 -> J1/J2, TD2 -> J3/J6,
     TD3 -> J4/J5, TD4 -> J7/J8 ([LPJG] sheet 1/2). That is the standard
