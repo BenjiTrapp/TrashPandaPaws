@@ -110,7 +110,10 @@ class TestExtraction(unittest.TestCase):
             found, unknown = scope.extract_targets(cmd)
             self.assertIsInstance(found, list)
             self.assertIsInstance(unknown, list)
-            self.assertIsNotNone(_scope().check(cmd, _none) if unknown else "x")
+            result = _scope().check(cmd, _none)
+            self.assertIsInstance(result, (str, type(None)))
+            if unknown:
+                self.assertIsInstance(result, str)
 
 
 class TestUnresolvable(unittest.TestCase):
@@ -169,6 +172,45 @@ class TestUnresolvable(unittest.TestCase):
         for cmd in ("nmap 172,10.0.0.1", "nmap 10.1,9.0.5", "nmap 10.0.1,2.5",
                     "nmap 10.0.1.5,80"):
             self.assertTrue(self._unknown(cmd), cmd)
+
+    def test_path_arguments_are_unresolvable(self):
+        for cmd in ("nxc smb /tmp/hosts", "nxc smb ./hosts", "nxc smb ../hosts",
+                    "nxc smb ~/hosts", "nxc smb ~hosts", "nxc smb /tmp/hosts,/tmp/x",
+                    "nxc smb 10.0.1.5,/tmp/x", "nmap --excludefile /tmp/x",
+                    "nmap --excludefile=/tmp/x", "nmap 10.0.1.5 /dev/stdin",
+                    "nmap -oA /tmp/out 10.0.1.5", "masscan -c conf/hosts"):
+            self.assertTrue(self._unknown(cmd), cmd)
+
+    def test_path_refusal_names_the_path(self):
+        reason = _scope().check("nxc smb /tmp/hosts", _none)
+        self.assertIn("/tmp/hosts", reason)
+        self.assertIn("individually", reason)
+
+    def test_paths_that_are_not_arguments_still_pass(self):
+        for cmd in ("/usr/bin/nmap 10.0.1.5", "./run.sh 10.0.1.5", "~/bin/scan 10.0.1.5",
+                    "nmap 10.0.1.5 > /tmp/out", "nmap 10.0.1.5 2>/tmp/err",
+                    "nmap 10.0.1.0/24", "curl http://10.0.1.5/a/b",
+                    "curl http://10.0.1.5/robots.txt"):
+            self.assertIsNone(_scope().check(cmd, _none), cmd)
+
+    def test_glob_characters_are_unresolvable(self):
+        for cmd in ("nmap dc0[1-5].corp.local", "nmap dc*.corp.local",
+                    "nmap dc0?.corp.local", "nmap *.corp.local", "nmap 10.0.1.*",
+                    "nmap 10.0.1.[5-9]", "nmap dc0[1:5].corp.local",
+                    "nmap 10.0.1.5,dc[1].corp.local", "tool --rhosts=dc*.corp.local",
+                    "nmap [fd00::g]", "nmap [fd00::1", "nmap fd00::1]",
+                    "curl http://dc0[1-5].corp.local/"):
+            self.assertTrue(self._unknown(cmd), cmd)
+
+    def test_glob_refusal_names_the_pattern(self):
+        self.assertIn("dc0[1-5].corp.local",
+                      _scope().check("nmap dc0[1-5].corp.local", _none))
+
+    def test_legitimate_bracket_and_query_uses_still_pass(self):
+        s = scope.Scope(allow=ALLOW + ["fd00::/64"], deny=DENY)
+        for cmd in ("nmap -6 [fd00::1]", "nmap 10.0.1.5,[fd00::2]", "ssh root@[fd00::1]",
+                    "curl http://[fd00::1]:80/", "curl 'http://10.0.1.5/x?a=b*&c[]=1'"):
+            self.assertIsNone(s.check(cmd, _none), cmd)
 
     def test_check_names_the_unresolvable_argument(self):
         reason = _scope().check("nmap -iL ziele.txt 10.0.1.5", _none)

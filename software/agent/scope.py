@@ -50,10 +50,15 @@ _TARGET_FLAGS = ("--target-file", "--targets", "--target-list", "--input-file",
 _TARGET_FLAG_PREFIXES = ("-iL", "-iR")  # -iR: nmap picks random targets
 _FILE_SUFFIXES = (".txt", ".lst", ".list")
 _DYNAMIC_CHARS = frozenset("$`{}\\%")  # expansion, escapes, URL-encoding
+_GLOB_CHARS = frozenset("*?[]")
+# The one legitimate use of brackets: an IPv6 literal, [fd00::1], at the start
+# of a word or after @ / , = and before the end or : / ,
+_BRACKETED_V6 = re.compile(r"(?:^|(?<=[@/,=]))\[([0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)\](?=$|[:/,])")
 _PUNCT = frozenset("();<>|&")
 _ALWAYS_HOSTS = ("localhost",)
 
-_NET, _UNKNOWN, _HOST, _BARE, _IGNORE = "net", "unknown", "host", "bare", "ignore"
+_NET, _UNKNOWN, _HOST, _BARE, _PATH, _IGNORE = (
+    "net", "unknown", "host", "bare", "path", "ignore")
 
 _HINT = ("name each target individually as an IP address, CIDR block or "
          "range, without files, variables or shorthand")
@@ -113,7 +118,11 @@ def _classify(piece: str, loose: bool, dotted: bool) -> str:
     if _HOSTNAME.fullmatch(piece):
         if "." in piece or piece.lower() in _ALWAYS_HOSTS:
             return _HOST
+        # A single-label word with no finding is not refused here (nmap dc01):
+        # `-u admin` looks identical. Deferred to the router's strict mode.
         return _BARE
+    if "/" in piece or piece.startswith(("~", ".")):
+        return _PATH
     return _IGNORE
 
 
@@ -132,6 +141,26 @@ def _tokenise(command: str, depth: int = 0) -> List[str]:
         else:
             words.extend(_tokenise(word, depth + 1))
     return words
+
+
+def _is_dynamic(word: str) -> bool:
+    """True if the shell or the tool would expand the word to something else."""
+    if _DYNAMIC_CHARS & set(word):
+        return True
+    head = word
+    if "://" in word:  # a URL's path and query may legitimately hold ? * [ ]
+        scheme, _, rest = word.partition("://")
+        head = scheme + "://" + rest.split("/", 1)[0]
+    head = _BRACKETED_V6.sub(_drop_valid_v6, head)
+    return bool(_GLOB_CHARS & set(head))
+
+
+def _drop_valid_v6(match) -> str:
+    try:
+        ipaddress.IPv6Address(match.group(1))
+    except ValueError:
+        return match.group(0)
+    return ""
 
 
 def _scan_value(value: str, found, unknown, bare) -> None:
@@ -153,7 +182,7 @@ def _scan_value(value: str, found, unknown, bare) -> None:
         if not piece:
             continue
         kind = _classify(piece, len(pieces) == 1, "." in value)
-        if kind == _UNKNOWN:
+        if kind in (_UNKNOWN, _PATH):
             unknown.append(piece)
         elif kind in (_NET, _HOST):
             found.append(piece)
@@ -183,7 +212,7 @@ def _scan(command) -> Tuple[List[str], List[str], List[str]]:
             skip_next = False
             continue
         is_program, at_start = at_start, False
-        if not word.isascii() or _DYNAMIC_CHARS & set(word):
+        if not word.isascii() or _is_dynamic(word):
             unknown.append(word)
         elif word == "-":
             unknown.append(word)
