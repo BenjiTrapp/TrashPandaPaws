@@ -29,12 +29,22 @@
 #             Section numbers below ("Table 6", "6.15") are [RTL-DS] unless stated.
 #   [ABM8]    Abracon ABM8 ceramic SMD crystal datasheet, revised 2020-07-29,
 #             hardware/datasheets/ABM8_abracon_rev2020-07-29.pdf (md5 57e1ee1bde6f9bb895f0c55dde98b00b)
+#   [USB3]    Universal Serial Bus 3.0 Specification, Revision 1.0 (USB-IF,
+#             12 Nov 2008), section 5.3.1.2, Table 5-2 "USB 3.0 Standard-A
+#             Connector Pin Assignments", with its note "Tx and Rx are defined
+#             from the host perspective". Obtainable from usb.org. Read here from
+#             a third-party mirror copy (md5 e819db9ff88967934f85d210666c7519,
+#             not committed: it is the USB-IF's document).
 #   [WE-692]  Wuerth Elektronik 692112030100 datasheet (WR-COM USB 3.0 SMT Plug,
 #             order code 692112030100, rev BBO 002.000, 2022-04-28), pin
-#             assignment table. Read from https://www.we-online.com/components/
-#             products/datasheet/692112030100.pdf as returned by a web search
-#             tool; the PDF itself was refused to scripted download (HTTP 403),
-#             so no copy is committed and no hash can be given.
+#             assignment table. OPEN ITEM: no copy of this PDF is committed. It
+#             was read only as search-extracted text of
+#             https://www.we-online.com/components/products/datasheet/692112030100.pdf
+#             because we-online.com refuses scripted download (HTTP 403). A
+#             person must download it by hand, commit it under
+#             hardware/datasheets/ and record its md5 here (carried into the
+#             ordering instructions, Task 11). Until then [WE-692] is
+#             corroboration only; [USB3] is the primary citation.
 #   [TBD]     not determinable from available documents - see OPEN_QUESTIONS.md
 
 meta:
@@ -149,7 +159,7 @@ components:
       17: {name: U2DM,       type: bidirectional}
       18: {name: U2DP,       type: bidirectional}
       19: {name: U2VDD10,    type: power_in}
-      20: {name: AVDD33,     type: power_out, note: "LDO 3.3V OUTPUT, not a supply input: [RTL-DS] table 6 'AVDD33 P 20 Linear Regulator (LDO) 3.3V Output... designed for RTL8153B-VB internal use only'. Own output cap, NOT on +3V3. See design_notes.ldo_outputs."}
+      20: {name: AVDD33,     type: power_out, note: "Treated as an LDO 3.3V OUTPUT, kept off +3V3: [RTL-DS] table 6 'AVDD33 P 20 Linear Regulator (LDO) 3.3V Output... internal use only'; table 8 lists it with the AVDD33 supplies, so the datasheet does not settle it. Own output cap; R12 DNP can join it to +3V3. See design_notes.ldo_outputs."}
       21: {name: VDD5,       type: power_in}
       22: {name: DVDD10_UPS, type: power_out, note: "LDO 1.0V OUTPUT, not a supply input: [RTL-DS] table 6 'DVDD10_UPS P 22 Linear Regulator (LDO) 1.0V Output', 6.15 notes 1 and 2. Own output cap, NOT on +1V0. See design_notes.ldo_outputs."}
       23: {name: DVDD33,     type: power_in}
@@ -221,40 +231,94 @@ components:
         probe pin 22 for ~1.0V with a quiet waveform. The footprint is 0402, so
         a 1uF X5R drop-in is possible if it rings; no respin.
         (2) AVDD33 (20): [RTL-DS] table 6 "AVDD33 P 20 Linear Regulator (LDO)
-        3.3V Output" with the identical internal-use-only note; 6.15 note 1
-        covers "the embedded LDO". Table 8 lists pin 20 inside the AVDD33
-        supply group (11, 20, 39, 40) and table 21 lists "DVDD33, AVDD33" by
-        name, not by pin. DECISION: treat pin 20 as an LDO output, not on
-        +3V3. REASONS: (a) table 6 is the only row that describes pin 20 on its
-        own, and it says output; tables 8 and 21 only group it by name. (b) The
-        same document has the identical pattern for pin 22 - table 8 calls it a
-        "Digital 1.0V Uninterruptible Power Supply" and table 21 lists
-        DVDD10_UPS as a supply voltage - yet 6.15 note 2 settles pin 22 as an
-        output. So tables 8 and 21 demonstrably do not distinguish an LDO
-        output from an input, and are not evidence against table 6. (c) Neither
-        reading is directly contradicted by a rule, so the evidence leans, it
-        does not prove: unlike pin 22 there is no 6.14/6.15 sentence naming pin
-        20 and saying what it may touch. (d) Failure asymmetry, chosen to fail
-        loudly and harmlessly: with pin 20 isolated, if it really were an
-        input the chip fails to come up on first power, which is visible and
-        fixed in two minutes by fitting R12 (0R, DNP, to +3V3). With pin 20 on
-        +3V3, if it is an output, two regulators fight on the analog 3.3V rail
-        and the fault may stay silent (heat, noise) in the field.
-        [OLIMEX] COUNTER-EVIDENCE, stated so it is not lost: on Olimex Rev E
-        (VC variant) the AVDD33 pin sitting next to VDD5 (their pin 25, the
-        analogue of our 20 by position, not by datasheet) is tied to the common
-        external 3.3V. Their datasheet was not available to check whether that
-        pin is an LDO output there, so this does not settle the question.
-        A web-search snippet of a paywalled reference-schematic overview ("Place
-        C10 close to VDD33 pin 20 (reserved)") hints at a cap of its own on pin
-        20. It was seen only as a snippet and is not relied on.
+        3.3V Output" with the same internal-use-only note as REGOUT and pin 22;
+        6.15 note 1 covers "the embedded LDO". Table 8 lists pin 20 inside the
+        AVDD33 supply group (11, 20, 39, 40) and table 21 lists "DVDD33, AVDD33"
+        by name, not by pin.
+        THE DATASHEET DOES NOT SETTLE PIN 20. Three readings fit it:
+          H1  LDO output for internal use only, to carry its own cap and nothing
+              else (the reading this board is wired for).
+          H2  LDO output whose job is to supply the chip's OWN AVDD33 group
+              (11, 39, 40). The phrase "internal use only. Do not provide this
+              power source to other devices" is attached to REGOUT in table 6
+              too, and 6.14 REQUIRES REGOUT to be wired to the chip's own
+              DVDD10/AVDD10/U3VDD10/U2VDD10. In this datasheet the phrase
+              therefore means "no other chips", not "do not wire it to this
+              chip's own supply pins". Table 8's grouping of pin 20 with
+              11/39/40 fits this reading well. It is also how Olimex Rev E
+              wires the matching pin (below).
+          H3  A plain 3.3V supply input like its group neighbours (table 8
+              read literally).
+        Argument for table 6 over table 8: table 6 is the only row describing
+        pin 20 on its own; and the same document calls pin 22 a "Digital 1.0V
+        Uninterruptible Power Supply" in table 8 and lists DVDD10_UPS as a supply
+        in table 21, yet 6.15 note 2 settles pin 22 as an output. So tables 8
+        and 21 do not distinguish an LDO output from an input, and are not
+        evidence against table 6. That argument favours H1 or H2 over H3. It
+        does NOT choose between H1 and H2: the "internal use only" phrase cannot
+        be read as "isolate this pin", because REGOUT carries it and is meant to
+        be wired to the chip. Unlike pin 22 there is no 6.14/6.15 sentence
+        naming pin 20 and saying what it may touch.
+        DECISION (unchanged action): pin 20 is kept off +3V3, on its own net
+        AVDD33_LDO with C8 to GND, and R12 (0R, DNP) can join it to +3V3. Why
+        this stands under all three readings: under H1 it is exactly right; under
+        H2 the chip's own LDO still supplies whatever sits behind pad 20 and
+        11/39/40 are fed from +3V3, which is the arrangement Olimex use for
+        everything but the one pin, and fitting R12 gives their wiring exactly;
+        under H3 the first power-up shows it and R12 is the fix.
+        THE RISK, STATED AS IT IS (replaces an earlier version that overstated
+        it): paralleling an LDO output with a 3.3V rail is NOT destructive on
+        its face. An LDO's pass device cannot sink current, so a stiff parallel
+        rail at or above its set point simply turns it off, and a rail below it
+        just takes a share. What it costs is unspecified behaviour: the LDO
+        loses its defined load, possible reverse leakage through the pass
+        device into VDDREG5/VDD5 if +3V3 outlasts +5V at power-down, and noise
+        coupling between the two. Leaving pin 20 isolated costs, under H3 or
+        under an H2 where the pad has no on-die link to 11/39/40, a part of the
+        analogue domain that may be underpowered. So the thing to weigh when
+        deciding about R12 is "unspecified-but-probably-benign parallel
+        sources" against "possibly-underpowered domain", not "destroyed versus
+        fine". Neither choice was shown to be safe by the datasheet; the
+        isolation is chosen because it follows table 6 and the pin 22 precedent
+        and is reversible with one 0402.
+        [OLIMEX] Rev E (VC variant): the AVDD33 pin sitting next to VDD5 (their
+        pin 25, the analogue of our 20 by position, not by datasheet) is tied to
+        the common external 3.3V. Their datasheet was not available to check
+        whether that pin is an LDO output there. This is the evidence for H2 and
+        H3 and is not outweighed here. A web-search snippet of a paywalled
+        reference-schematic overview ("Place C10 close to VDD33 pin 20
+        (reserved)") hints at a cap of its own on pin 20; seen only as a
+        snippet, not relied on.
         PIN 20 CAP: C8, 2.2uF X5R 10V 0402. The datasheet gives no value; an
         LDO output capacitor "for phase compensation" is typically 1-10uF
         ceramic, 2.2uF is the middle, and DC bias at 3.3V leaves roughly 1uF
         effective in 0402, still inside that range. NEEDS CONFIRMATION ON FIRST
-        BUILD. FIRST-BUILD TEST THAT SETTLES IT: with R12 not fitted, measure
-        pin 20 against GND at power-up. About 3.3V means it is an LDO output
-        and R12 must stay empty. 0V means it is an input after all: fit R12.
+        BUILD.
+        FIRST-BUILD PROCEDURE FOR PIN 20 (thresholds are engineering judgement,
+        anchored on table 21's 3.14V minimum for AVDD33, not datasheet values).
+        A bare voltage reading does NOT tell the cases apart: with R12 open, a
+        pin bonded on-die to the AVDD33 group and an LDO output both read about
+        3.3V. So use all of these, in this order, with R12 open:
+          1. Board unpowered. Measure resistance (or diode-mode drop) from pin
+             20 (C8.1) to +3V3 (e.g. C7.1). Low ohms (< ~10 ohm): pin 20 is the
+             same on-die node as 11/39/40, R12 is redundant and stays empty,
+             stop. Otherwise it is a separate node: continue.
+          2. Powered, no cable. V(pin 20) against GND:
+               >= 3.14V and quiet (< 50 mV p-p): an LDO is driving it.
+               < 3.14V but > 0.5V (typically 2.5-3V is a reviewer's estimate, not a
+                 measurement, for a domain held up through ESD diodes): neither clean output nor
+                 supply; treat as H3, go to step 3 and expect to fit R12.
+               < 0.5V: not driven by anything; H3, fit R12.
+          3. Functional check with R12 open: the Pi must enumerate it at
+             SuperSpeed (lsusb -t shows 5000M, not 480M) and the Ethernet link
+             must reach 1000 Mb/s and hold a 5 minute iperf3 at line rate with
+             no errors. Pass: leave R12 empty. Fail or falls back to USB 2.0:
+             fit R12, repeat; a pass now means pin 20 needed 3.3V from outside.
+          4. Supply-current comparison, using the +3V3 series bridge: record the
+             +3V3 rail current at 1000 Mb/s with R12 open and then fitted
+             (table 26 Icc33 typ 70 mA). A shift of more than ~10 mA means the
+             pin 20 domain is a real load that moves between sources. Record it;
+             it corroborates steps 2 and 3 but is not decisive alone.
       decoupling_reference: >
         [OLIMEX] total 18x 100nF 0402 plus 2x 2.2uF 0603 across all rails.
         The repo currently has far fewer. Count and placement to be settled
@@ -295,10 +359,17 @@ components:
                                                C0 3.0 pF                       OK, at the limit
       Not met on paper: table 23 gives "DL Drive Level ... max 0.3 mW" and
       [ABM8] rates 100 uW max. Whether table 23 means the crystal must tolerate
-      0.3 mW or that U3 drives no more than 0.3 mW is not stated; every 3225
-      25 MHz part found is rated 100 uW. OPEN, NEEDS CONFIRMATION ON FIRST BUILD:
-      measure the drive level (or at least check the oscillation amplitude at
-      CKXTAL2) against the crystal's 100 uW rating.
+      0.3 mW or that U3 drives no more than 0.3 mW is not stated, so up to 3x
+      overdrive cannot be excluded from the documents. OPEN. (An earlier version
+      of this note said every 3225 25 MHz part is rated 100 uW; that is wrong:
+      Epson's current TSX-3225 datasheet, X1E0000210427, rates 200 uW max, for
+      24.576 MHz at CL 12 pF. I did not find an orderable 25 MHz part in that
+      family or another with CL inside 16-20 pF, +/-30 ppm and a >=200 uW rating
+      whose datasheet could be checked, so ABM8 stays.)
+      HARDWARE HOOK: R14, a 0402 0R series resistor between CKXTAL2 and the
+      crystal, so the drive can be reduced on the bench without a respin. See
+      design_notes.drive_level for the measurement and the trim rule. A crystal
+      rated 200 uW or more is the second remedy if trimming is not enough.
       Variant-code decode (D2Y) is read from the ordering-option table of
       [ABM8]; distributor listings disagree on whether the D2Y tolerance is
       +/-20 or +/-50 ppm. Either satisfies table 23, but confirm on the order
@@ -327,6 +398,29 @@ components:
         23.5 pF here: outside the 16-20 pF window, so the crystal would run low
         in frequency.
         Use C0G (NP0) 50V 0402, 5% or better, for stability.
+        R14 sits between U3 pin 36 (CKXTAL2, the output, [RTL-DS] table 5) and
+        the crystal node, ahead of C20, so with R14 = 0R the load is unchanged
+        (a 0402 pad adds a fraction of a pF, inside the Cstray assumption).
+      drive_level: >
+        OPEN ITEM, see Y1.source. The crystal is rated 100 uW ([ABM8]); the
+        chip's side is only "DL Drive Level max 0.3 mW" ([RTL-DS] table 23).
+        MEASURE, do not guess. Drive level is P = I_rms^2 * ESR, where I_rms is
+        the current through the crystal; the amplitude at the pin is not the
+        drive level, but it gives the current:
+          I_rms = 2 * pi * f * V_rms * (C0 + CL)   (standard crystal-drive
+          formula, applied here with f = 25 MHz, C0 = 3 pF, CL_total about 21 pF
+          including stray; not from the datasheets)
+        Measure V p-p at CKXTAL1 (crystal side) with a probe of 1 pF or less
+        (a normal 10:1 probe adds 10-15 pF and detunes it), V_rms = Vpp/(2*sqrt 2)
+        for a sine. Worst case ESR 50 ohm ([ABM8] table 1). Worked numbers:
+        100 uW at 50 ohm is I = 1.41 mA, V_rms = 0.43 V, so about 1.2 V p-p;
+        0.3 mW would be about 2.1 V p-p. A current probe round the crystal lead
+        gives I directly and avoids the formula if one is available.
+        RULE: Vpp at CKXTAL1 <= ~1.2 V with R14 = 0R: leave as is. Above it,
+        fit a larger R14 until it is under; the value is found on the bench,
+        none is sourced here. If the amplitude then drops so far that start-up
+        becomes unreliable (check cold start 20 times), replace the crystal with
+        one rated 200 uW or more instead.
     pins:
       # SMD3225/4 standard numbering: 1 and 3 are the crystal terminals,
       # 2 and 4 are the case ground pads. An earlier revision had 1/2 as the
@@ -361,13 +455,14 @@ components:
       2: {name: D_N,       type: passive}
       3: {name: D_P,       type: passive}
       4: {name: GND,       type: passive}
-      # Names and numbers verified against [WE-692] "Pin Assignment": 5 StdA_SSRX-,
-      # 6 StdA_SSRX+, 7 GND_DRAIN, 8 StdA_SSTX-, 9 StdA_SSTX+. See design_notes.usb3_crossover.
-      5: {name: SSRX_N,    type: passive, note: "[WE-692] StdA_SSRX-; host-side name, host receives, we drive this"}
-      6: {name: SSRX_P,    type: passive, note: "[WE-692] StdA_SSRX+; host-side name, host receives, we drive this"}
+      # Names and numbers per [USB3] Table 5-2: 5 StdA_SSRX-, 6 StdA_SSRX+,
+      # 7 GND_DRAIN, 8 StdA_SSTX-, 9 StdA_SSTX+. [WE-692] (pending a committed
+      # copy) lists the same. See design_notes.usb3_crossover.
+      5: {name: SSRX_N,    type: passive, note: "[USB3] Table 5-2 StdA_SSRX-; host-side name, host receives, we drive this"}
+      6: {name: SSRX_P,    type: passive, note: "[USB3] Table 5-2 StdA_SSRX+; host-side name, host receives, we drive this"}
       7: {name: GND_DRAIN, type: passive}
-      8: {name: SSTX_N,    type: passive, note: "[WE-692] StdA_SSTX-; host-side name, host transmits, we receive this"}
-      9: {name: SSTX_P,    type: passive, note: "[WE-692] StdA_SSTX+; host-side name, host transmits, we receive this"}
+      8: {name: SSTX_N,    type: passive, note: "[USB3] Table 5-2 StdA_SSTX-; host-side name, host transmits, we receive this"}
+      9: {name: SSTX_P,    type: passive, note: "[USB3] Table 5-2 StdA_SSTX+; host-side name, host transmits, we receive this"}
       SH: {name: SHIELD,  type: passive, note: "shield tabs, footprint pad name SH"}
 
   U6:
@@ -662,6 +757,14 @@ components:
     source: "Same as C22"
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
 
+  R14:
+    value: 0R
+    package: "0402"
+    footprint: "Resistor_SMD:R_0402_1005Metric"
+    description: "Series drive-level resistor, CKXTAL2 to Y1; 0R now, raise on the bench if Y1 is overdriven"
+    source: "Y1 design_notes.drive_level. Populated with 0R, NOT DNP: the crystal node must be connected."
+    pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
+
   R12:
     value: "0R DNP"
     populate: false
@@ -670,7 +773,8 @@ components:
     description: "DNP link between U3 pin 20 (AVDD33 LDO output) and +3V3; fit only if pin 20 proves to be a supply input"
     source: >
       Contingency for the pin 20 decision, see U3 design_notes.ldo_outputs.
-      Leave EMPTY unless the first-build measurement shows pin 20 at 0 V.
+      Leave EMPTY unless step 2 or 3 of the first-build procedure for pin 20
+      there says to fit it.
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
 
   C24:
@@ -887,7 +991,10 @@ nets:
     - Y1.1
     - C19.1
   XTAL2:
-    - U3.36          # CKXTAL2
+    - U3.36          # CKXTAL2 (output)
+    - R14.1          # series drive-level resistor, 0R, see Y1 design_notes.drive_level
+  XTAL2_Y1:
+    - R14.2
     - Y1.3
     - C20.1
 
@@ -1011,14 +1118,16 @@ design_notes:
     working-voltage rating; how it behaves in a 1.5kV hipot test is not verified.
     J3's USB shield is tied to GND, which is the normal device-side convention.
   usb3_crossover: >
-    VERIFIED 2026-11-01 against the connector's own datasheet, [WE-692]. Its
-    "Pin Assignment" table for 692112030100 (Gender: Plug, Type A) reads:
-    5 StdA_SSRX-, 6 StdA_SSRX+, 7 GND_DRAIN, 8 StdA_SSTX-, 9 StdA_SSTX+. The
-    names are the Standard-A, i.e. host, point of view: J3 is an A-*plug* that
-    mates with the host's A-receptacle, so the plug pin labelled SSTX is the
-    host's transmitter and must feed our receiver, and the pin labelled SSRX is
-    the host's receiver and must be fed by our transmitter. U3 side from
-    [RTL-DS] table 10: U3SSTXP/N = 13/12 outputs, U3SSRXP/N = 16/15 inputs.
+    VERIFIED AGAINST THE USB 3.0 SPECIFICATION 2026-11-01; THE WUERTH SHEET IS
+    STILL PENDING a committed copy (see [WE-692] in the header).
+    Primary citation, [USB3] section 5.3.1.2 Table 5-2, "USB 3.0 Standard-A
+    Connector Pin Assignments": 5 StdA_SSRX-, 6 StdA_SSRX+, 7 GND_DRAIN,
+    8 StdA_SSTX-, 9 StdA_SSTX+, with the table's own note "Tx and Rx are defined
+    from the host perspective". J3 is an A-*plug* that mates with the host's
+    A-receptacle, so the plug pin labelled SSTX is the host's transmitter and
+    must feed our receiver, and the pin labelled SSRX is the host's receiver and
+    must be fed by our transmitter. U3 side from [RTL-DS] table 10:
+    U3SSTXP/N = 13/12 outputs, U3SSRXP/N = 16/15 inputs.
       U3 SSTX 13 (P) -> C22 -> J3 pin 6 (StdA_SSRX+)    P to P, N to N
       U3 SSTX 12 (N) -> C23 -> J3 pin 5 (StdA_SSRX-)
       U3 SSRX 16 (P) <- J3 pin 9 (StdA_SSTX+)
@@ -1026,11 +1135,12 @@ design_notes:
     This is what nets USB3_TX_* / USB3_RX_* wire. Net names follow the
     DEVICE's direction (USB3_TX_* = we transmit). Result: the crossover is
     correct as drawn; no change to pin assignment was needed.
-    LIMIT OF THE EVIDENCE: [WE-692] gives the names and numbers. That the
-    names are host-side is the USB 3.0 Standard-A convention and is consistent
-    with Wuerth's datasheet for its 692122030100 receptacle, which lists the
-    same names on the same pin numbers (seen in the same search results, not
-    otherwise kept); it is not stated in [WE-692] in those words.
+    WHAT IS NOT YET CHECKED: that Wuerth's 692112030100 follows Table 5-2 pin
+    for pin. The text of its datasheet as returned by a web search says it does
+    (5 StdA_SSRX-, 6 StdA_SSRX+, 7 GND_DRAIN, 8 StdA_SSTX-, 9 StdA_SSTX+, Gender:
+    Plug, Type A), and a plug has to, to mate; but that is search-extracted text
+    with no hash. OPEN ITEM for a person: download the PDF, commit it, record
+    the md5. Tracked into the Task 11 ordering instructions.
     ADDED WITH THIS CHECK: the netlist had no AC-coupling capacitors in the
     SuperSpeed transmit path. USB 3.0 requires 75-200 nF in series at the
     transmitter; [RTL-DS] does not mention it; [OLIMEX] Rev E has 100nF in each

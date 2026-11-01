@@ -49,6 +49,11 @@ def run_connectivity(text, netlist=None):
     return report
 
 
+def zone_count(text):
+    """Zones in the (possibly mutated) board text, as the checker will see them."""
+    return len(ck.children(ck.parse_sexp(text), "zone"))
+
+
 def labels(report):
     return [label for label, _ in report.failures]
 
@@ -120,13 +125,15 @@ class KiCad10NetEncodingRejectsDefects(unittest.TestCase):
         text = self.text.replace('(zone\n\t\t(net "GND")', "(zone", 1)
         self.assertNotEqual(text, self.text)
         report = run_nets(text, self.netlist)
-        self.assertIn("all 3 zone(s) carry a netlist net name", labels(report))
+        self.assertIn(f"all {zone_count(text)} zone(s) carry a netlist net name",
+                      labels(report))
 
     def test_zone_on_unknown_net_fails(self):
         text = self.text.replace('(zone\n\t\t(net "GND")',
                                  '(zone\n\t\t(net "BOGUS")', 1)
         report = run_nets(text, self.netlist)
-        self.assertIn("all 3 zone(s) carry a netlist net name", labels(report))
+        self.assertIn(f"all {zone_count(text)} zone(s) carry a netlist net name",
+                      labels(report))
         self.assertIn("BOGUS", details(report))
 
     def test_via_on_unknown_net_fails(self):
@@ -194,7 +201,8 @@ class ConnectivityRejectsDefects(unittest.TestCase):
         text = self.text.replace('(property "Reference" "C21"',
                                  '(property "Reference" "C99"', 1)
         report = run_connectivity(text)
-        self.assertIn("PCB has exactly the 33 netlist components",
+        count = len(self.netlist["components"])
+        self.assertIn(f"PCB has exactly the {count} netlist components",
                       labels(report))
 
     def test_netlist_is_the_authority_not_the_pcb(self):

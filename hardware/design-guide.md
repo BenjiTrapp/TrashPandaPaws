@@ -261,8 +261,12 @@ use only. Do not provide this power source to other devices"; §6.15 asks for
 list both pins among the supplies by *name*. Pin 22 is settled: §6.14 names the
 pins the 1.0 V output may feed (DVDD10, AVDD10, U3VDD10, U2VDD10) and 22 is not
 one; §6.15 note 2 says it "should be separated" from the 1.0 V rail. Pin 20 is
-decided on the weight of Table 6, not on a rule that names it. Neither pin goes
-on a supply rail; each has its own output capacitor. An earlier revision of this
+**not settled by the datasheet**: Table 6 says output, Table 8 groups it with the
+supplies, and the "internal use only" phrase is also attached to REGOUT, which
+§6.14 requires wired to the chip's own pins, so it cannot be read as "isolate
+this pin". It is kept off 3.3 V behind its own capacitor with a DNP link (R12) to
+3.3 V, and a first-build procedure decides. Neither pin goes on a supply rail;
+each has its own output capacitor. An earlier revision of this
 guide and of `netlist.yaml` put pin 22 on the 1.0 V rail and pin 20 on 3.3 V;
 that was wrong. Reasoning, the capacitor values and the first-build check are in
 `netlist.yaml` → `components.U3.design_notes.ldo_outputs`; pin numbers are
@@ -318,7 +322,8 @@ AVDD33 (20)    ── C8 (2.2uF) to GND                 [LDO output, not a suppl
 DVDD10_UPS (22) ── C17 (100nF) to GND               [LDO output, not a supply]
 (There is no DVDD12 pin on the -VB; earlier revisions of this guide named one.)
 
-XI/XO     ── Y1 (25MHz, CL 18pF) ── C19, C20 (27pF C0G load caps each)
+XI/XO     ── Y1 (25MHz, CL 18pF) ── C19, C20 (27pF C0G load caps each);
+             R14 (0R drive-level trim) in series on the XO side
 
 SPI_CLK   ──→ U5 pin 6 (CLK)
 SPI_MOSI  ──→ U5 pin 5 (DI)
