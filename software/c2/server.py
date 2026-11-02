@@ -2968,6 +2968,7 @@ header .info{font-size:11px;color:var(--text2)}
 .bflow-or-line{flex:1;height:1px;background:rgba(255,255,255,0.08)}
 .bflow-or-badge{font-size:8px;color:var(--text2);padding:1px 8px;border:1px solid rgba(255,255,255,0.08);border-radius:8px;text-transform:uppercase;letter-spacing:0.04em}
 </style>
+<link rel="stylesheet" href="/static/agent.css">
 </head>
 <body>
 <div id="app">
@@ -7482,6 +7483,7 @@ setInterval(checkTaskResults, 2500);
 refreshAgents();
 toast("info","Server Online","Listening for beacon connections<br>Beacon traffic accepted on any POST path",6000);
 </script>
+<script src="/static/agent.js" defer></script>
 </body>
 </html>
 """
