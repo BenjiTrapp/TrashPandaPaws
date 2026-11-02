@@ -55,8 +55,11 @@ def add_track(board, net, x0, y0, x1, y1, width):
 # in its preferences, hence the alternatives)
 CASES = [
     ("USB2 D+/D- at the pair gap 0.17", "USB2_D_P", "USB2_D_N", 0.20, 0.17, None),
-    ("USB3 TX after the AC caps (_CONN nets) at 0.17", "USB3_TX_P_CONN",
-     "USB3_TX_N_CONN", 0.20, 0.17, None),
+    ("USB3 TX after the AC caps (USB3_TX_CONN_P/N) at 0.17", "USB3_TX_CONN_P",
+     "USB3_TX_CONN_N", 0.20, 0.17, None),
+    ("control: the old names USB3_TX_P_CONN/N_CONN at 0.17 are not a pair",
+     "USB3_TX_P_CONN", "USB3_TX_N_CONN", 0.20, 0.17,
+     r'(Netzklasse|[Nn]et ?class)\s+"USB3"'),
     ("MDI0 pair at 0.21", "MDI0_P", "MDI0_N", 0.18, 0.21, None),
     ("USB3 RX pair at 0.15, below the pair gap", "USB3_RX_P", "USB3_RX_N",
      0.20, 0.15, r'"intra-pair clearance USB3"'),
@@ -67,13 +70,76 @@ CASES = [
 ]
 
 
+def drc(tmp, board):
+    """Save `board` into a scratch project and return kicad-cli's clearance
+    violations."""
+    shutil.rmtree(tmp / "b", ignore_errors=True)
+    (tmp / "b").mkdir()
+    pcbnew.SaveBoard(str(tmp / "b" / "raccoon-tap.kicad_pcb"), board)
+    shutil.copy(KICAD / "raccoon-tap.kicad_pro", tmp / "b")
+    shutil.copy(KICAD / "raccoon-tap.kicad_dru", tmp / "b")
+    subprocess.run(
+        [KICAD_CLI, "pcb", "drc", "--severity-all", "--format", "json",
+         "--output", str(tmp / "b" / "drc.json"),
+         str(tmp / "b" / "raccoon-tap.kicad_pcb")],
+        check=True, capture_output=True)
+    violations = json.loads((tmp / "b" / "drc.json").read_text())["violations"]
+    return [v for v in violations if v["type"] == "clearance"]
+
+
+def load(tmp):
+    shutil.rmtree(tmp / "a", ignore_errors=True)
+    (tmp / "a").mkdir()
+    shutil.copy(KICAD / "raccoon-tap.kicad_pcb", tmp / "a")
+    return pcbnew.LoadBoard(str(tmp / "a" / "raccoon-tap.kicad_pcb"))
+
+
+# Two adjacent U3 pads of different pairs, and the direction a trace leaves
+# them in: pads 16 / 17 (USB3_RX_P, USB2_D_N, bottom side, trace 0.20) and
+# pads 5 / 6 (MDI1_N, MDI2_P, left side, trace 0.18).
+ESCAPES = [("16", "USB3_RX_P", (0, 1), 0.20), ("17", "USB2_D_N", (0, 1), 0.20),
+           ("5", "MDI1_N", (-1, 0), 0.18), ("6", "MDI2_P", (-1, 0), 0.18)]
+NECK_WIDTH, NECK_LENGTH = 0.15, 1.0
+
+
+def lay_escapes(board, how, neck_length=NECK_LENGTH):
+    """Lay the four escape traces. `how`: 'centre' (full width from the pad
+    centre), 'outer' (full width from the outer end of the pad) or 'neck'
+    (NECK_WIDTH for NECK_LENGTH from the pad centre, then full width)."""
+    u3 = board.FindFootprintByReference("U3")
+    pads = {p.GetNumber(): p for p in u3.Pads()}
+    for number, net, (dx, dy), width in ESCAPES:
+        pad = pads[number]
+        x, y = pcbnew.ToMM(pad.GetPosition().x), pcbnew.ToMM(pad.GetPosition().y)
+        size = pad.GetSize()
+        half = max(pcbnew.ToMM(size.x), pcbnew.ToMM(size.y)) / 2
+        if how == "centre":
+            add_track(board, net, x, y, x + dx * 2.5, y + dy * 2.5, width)
+        elif how == "outer":
+            add_track(board, net, x + dx * half, y + dy * half,
+                      x + dx * 2.5, y + dy * 2.5, width)
+        else:
+            add_track(board, net, x, y, x + dx * neck_length,
+                      y + dy * neck_length, NECK_WIDTH)
+            add_track(board, net, x + dx * neck_length, y + dy * neck_length,
+                      x + dx * 2.5, y + dy * 2.5, width)
+
+
+def escape_violations(clearance):
+    """Clearance violations that involve one of the escape traces."""
+    nets = {net for _, net, _, _ in ESCAPES}
+    found = []
+    for v in clearance:
+        text = " ".join(i["description"] for i in v["items"])
+        if any(f"[{n}]" in text for n in nets) and "Pad" in text:
+            found.append(v["description"])
+    return found
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        (tmp / "a").mkdir()
-        (tmp / "b").mkdir()
-        shutil.copy(KICAD / "raccoon-tap.kicad_pcb", tmp / "a")
-        board = pcbnew.LoadBoard(str(tmp / "a" / "raccoon-tap.kicad_pcb"))
+        board = load(tmp)
         rows = []
         y = 125.0
         for name, net_a, net_b, width, gap, expected in CASES:
@@ -82,25 +148,13 @@ def main():
                       width)
             rows.append((name, net_a, net_b, expected, y))
             y += 3.0
-        # stubs straight out of U3 pads 16 (USB3_RX_P) and 17 (USB2_D_N)
-        u3 = board.FindFootprintByReference("U3")
-        pads = {p.GetNumber(): p.GetPosition() for p in u3.Pads()}
-        for number, net in (("16", "USB3_RX_P"), ("17", "USB2_D_N")):
-            pos = pads[number]
-            add_track(board, net, pcbnew.ToMM(pos.x), pcbnew.ToMM(pos.y),
-                      pcbnew.ToMM(pos.x), pcbnew.ToMM(pos.y) + 2.5, 0.20)
-        pcbnew.SaveBoard(str(tmp / "b" / "raccoon-tap.kicad_pcb"), board)
-        shutil.copy(KICAD / "raccoon-tap.kicad_pro", tmp / "b")
-        shutil.copy(KICAD / "raccoon-tap.kicad_dru", tmp / "b")
-        subprocess.run(
-            [KICAD_CLI, "pcb", "drc", "--severity-all", "--format", "json",
-             "--output", str(tmp / "b" / "drc.json"),
-             str(tmp / "b" / "raccoon-tap.kicad_pcb")],
-            check=True, capture_output=True)
-        violations = json.loads((tmp / "b" / "drc.json").read_text())[
-            "violations"]
-
-    clearance = [v for v in violations if v["type"] == "clearance"]
+        clearance = drc(tmp, board)
+        escapes = {}
+        for how, length in (("centre", None), ("outer", None),
+                            ("neck", NECK_LENGTH), ("neck short", 0.5)):
+            board = load(tmp)
+            lay_escapes(board, how.split()[0], length or NECK_LENGTH)
+            escapes[how] = escape_violations(drc(tmp, board))
 
     def found(net_a, net_b, y0, y1):
         for v in clearance:
@@ -121,19 +175,31 @@ def main():
         print(f"{'ok  ' if good else 'FAIL'} {name}: "
               f"{'no clearance violation' if got is None else got}")
 
-    stub = None
-    for v in clearance:
-        text = " ".join(i["description"] for i in v["items"])
-        if "Pad 17" in text and "[USB3_RX_P]" in text:
-            stub = re.search(r"(?:tatsächlich|actual)\s+([0-9.]+) mm", v["description"])
-    print("note  trace on U3 pad 16 against the neighbouring pad 17: "
-          + (f"{stub.group(1)} mm, flagged against the class clearance"
-             if stub else "no violation"))
+    def worst(descriptions):
+        values = [float(m.group(1)) for d in descriptions
+                  for m in [re.search(r"(?:tatsächlich|actual)\s+([0-9.]+) mm", d)]
+                  if m]
+        return min(values) if values else None
+
+    for how, label in (("centre", "full width from the pad centre"),
+                       ("outer", "full width from the outer end of the pad")):
+        w = worst(escapes[how])
+        print(f"note  {label}: " + (
+            f"{len(escapes[how])} trace-to-pad violations, closest "
+            f"{w:.4f} mm against the class clearance" if escapes[how]
+            else "no trace-to-pad violation"))
+    good = not escapes["neck"]
+    ok &= good
+    print(f"{'ok  ' if good else 'FAIL'} necked to {NECK_WIDTH} mm for "
+          f"{NECK_LENGTH} mm from the pad centre, then full width: "
+          f"{len(escapes['neck'])} trace-to-pad violations")
     pad_pad = [v for v in clearance
                if all(i["description"].startswith("Pad") for i in v["items"])
                and "intra-pair" in v["description"]]
     good = not pad_pad
     ok &= good
+    w = escapes["neck short"]
+    print(f"note  the same neck cut to 0.5 mm: {len(w)} trace-to-pad violations")
     print(f"{'ok  ' if good else 'FAIL'} pad-to-pad spacing of coupled pairs "
           f"on U3 is not touched by the pair rule: {len(pad_pad)} violations")
     return 0 if ok else 1

@@ -23,18 +23,13 @@
 # hardware/fab/stackup-note.md.
 #
 # A.isCoupledDiffPair() is true only for the two nets of one pair that KiCad
-# recognises by name (..._P with ..._N), so a trace of the pair against any
+# recognises by name (..._P with ..._N, the suffix last: the SuperSpeed TX pair
+# after the AC-coupling capacitors is therefore USB3_TX_CONN_P / _CONN_N, not
+# USB3_TX_P_CONN, which KiCad does not pair), so a trace of the pair against any
 # other net, or another pair, still gets the class clearance. Two pads are left
 # out: the spacing of the pads of one footprint is the package's, and the rule
 # above for U3 already covers it. MDI needs no rule: its pair gap (0.21mm) is
 # above the class clearance.
 (rule "intra-pair clearance USB3"
 	(condition "A.NetClass == 'USB3' && B.NetClass == 'USB3' && A.isCoupledDiffPair() && (A.Type != 'Pad' || B.Type != 'Pad')")
-	(constraint clearance (min 0.17mm)))
-
-# The SuperSpeed TX pair carries on after the AC-coupling capacitors as
-# USB3_TX_P_CONN / USB3_TX_N_CONN. The suffix hides the pair from KiCad's name
-# matching, so the same gap is scoped to those two nets by name, both orders.
-(rule "intra-pair clearance USB3 after AC coupling"
-	(condition "(A.NetName == 'USB3_TX_P_CONN' && B.NetName == 'USB3_TX_N_CONN') || (A.NetName == 'USB3_TX_N_CONN' && B.NetName == 'USB3_TX_P_CONN')")
 	(constraint clearance (min 0.17mm)))

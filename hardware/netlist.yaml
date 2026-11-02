@@ -1285,9 +1285,9 @@ components:
       SP3012-04HTG, which Littelfuse and DigiKey list as obsolete. Lifecycle
       and stock: [SOURCING].
     pins:
-      1: {name: IO_A1, type: passive, note: "USB3_TX_P_CONN. Row 1/2/3: TX pair on pins 1 and 3, GND between them"}
+      1: {name: IO_A1, type: passive, note: "USB3_TX_CONN_P. Row 1/2/3: TX pair on pins 1 and 3, GND between them"}
       2: {name: GND,   type: passive}
-      3: {name: IO_A2, type: passive, note: "USB3_TX_N_CONN"}
+      3: {name: IO_A2, type: passive, note: "USB3_TX_CONN_N"}
       4: {name: IO_B2, type: passive, note: "USB3_RX_N. Row 6/5/4: RX pair on pins 6 and 4"}
       5: {name: NC,    type: passive, note: "[SP3019] page 1: on the package drawing, absent from the block diagram; '2022 revision: PIN 5 is NC'"}
       6: {name: IO_B1, type: passive, note: "USB3_RX_P"}
@@ -1633,14 +1633,14 @@ nets:
   USB3_TX_P:
     - U3.13          # U3SSTXP - device transmits
     - C22.1          # AC-coupling cap, at the transmitter
-  USB3_TX_P_CONN:
+  USB3_TX_CONN_P:
     - C22.2
     - J3.6           # plug pin named SSRX+ (host receives)
     - U8.1           # ESD array, connector side of the AC cap
   USB3_TX_N:
     - U3.12          # U3SSTXN
     - C23.1
-  USB3_TX_N_CONN:
+  USB3_TX_CONN_N:
     - C23.2
     - J3.5           # plug pin named SSRX-
     - U8.3           # ESD array, connector side of the AC cap

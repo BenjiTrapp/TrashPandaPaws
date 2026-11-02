@@ -358,6 +358,13 @@ GEOMETRY_FORMULA_TOLERANCE = 0.03
 # follow the in-pair gap down; the in-pair gap gets its own rule in
 # raccoon-tap.kicad_dru instead.
 PAIR_CLEARANCE_MIN = 0.2
+# A 0.20 mm trace leaving a U3 pad runs 0.175 mm from the neighbouring pad of
+# another pair (0.25 mm pads, 0.4 mm pitch), under the class clearance. Decided
+# in review: neck the trace at the pad, no clearance exception. The limits are
+# the most the note may allow task 9: a neck no wider than this and no longer
+# than this, measured from the pad.
+NECK_MAX_WIDTH_MM = 0.15
+NECK_MAX_LENGTH_MM = 1.0
 
 NOTE_REQUIRED_HEADINGS = (
     "## Stackup",
@@ -365,6 +372,7 @@ NOTE_REQUIRED_HEADINGS = (
     "## Result per impedance target",
     "## Tolerance",
     "## Minimum trace width and spacing",
+    "## Constraints for task 9",
     "## Fit on 58 x 36 mm",
     "## Open items",
 )
@@ -425,6 +433,36 @@ def load_dru(path=DRU):
     return path.read_text(encoding="utf-8") if path.exists() else None
 
 
+def unpaired_diff_pair_nets(netlist, pro_json):
+    """Nets of the USB3 and MDI net classes that KiCad's differential-pair
+    router and A.isCoupledDiffPair() would not pair, one message each.
+
+    KiCad pairs two nets on a trailing _P / _N (or +/-) with the same stem in
+    front of it. A net of those classes that carries a _P or _N token but does
+    not end in it (USB3_TX_P_CONN), or whose partner is missing, is not a pair
+    to KiCad, and the pair-gap rule in the .kicad_dru would not apply to it.
+    Nets without a _P / _N token (MDI_CT, the centre tap) are not pair nets."""
+    import fnmatch
+    patterns = [(e["pattern"], e["netclass"])
+                for e in pro_json.get("net_settings", {}).get(
+                    "netclass_patterns", [])
+                if e.get("netclass") in GEOMETRY_CLASSES]
+    nets = [n for n in netlist["nets"]
+            if any(fnmatch.fnmatchcase(n, pat) for pat, _ in patterns)]
+    problems = []
+    for net in sorted(nets):
+        if not re.search(r"_[PN](_|$)", net):
+            continue
+        if not re.search(r"_[PN]$", net):
+            problems.append(f"{net}: _P / _N is not the last part of the "
+                            f"name, KiCad will not treat it as a pair")
+            continue
+        partner = net[:-1] + ("N" if net.endswith("P") else "P")
+        if partner not in netlist["nets"]:
+            problems.append(f"{net}: no partner net {partner}")
+    return problems
+
+
 _LOAD = object()
 
 
@@ -452,6 +490,8 @@ def check_no_placeholder_geometry(pro_json, stackup_note, dru_text=_LOAD,
         governs pair-to-pair spacing, and, where the pair gap is below the
         class clearance, a rule in the .kicad_dru that scopes the smaller
         clearance to the two traces of one coupled pair of that class;
+      * requires the neck limits for the U3 pads (`task9` in the block) to be
+        present and no looser than NECK_MAX_WIDTH_MM / NECK_MAX_LENGTH_MM;
       * requires every non-zero differential-pair preset of the interactive
         router to be one of the documented geometries.
     """
@@ -472,6 +512,22 @@ def check_no_placeholder_geometry(pro_json, stackup_note, dru_text=_LOAD,
         classes = documented["classes"]
     except (yaml.YAMLError, KeyError, TypeError, ValueError) as error:
         return problems + [f"netclass-geometry block is unreadable: {error!r}"]
+    try:
+        neck = documented["task9"]
+        neck_width = float(neck["neck_max_width_mm"])
+        neck_length = float(neck["neck_max_length_mm"])
+    except (KeyError, TypeError, ValueError) as error:
+        problems.append(f"netclass-geometry block has no readable `task9` "
+                        f"neck limits: {error!r}")
+    else:
+        if not 0 < neck_width <= NECK_MAX_WIDTH_MM:
+            problems.append(f"task9 neck_max_width_mm is {neck_width:g}, "
+                            f"it must be above 0 and at most "
+                            f"{NECK_MAX_WIDTH_MM:g}")
+        if not 0 < neck_length <= NECK_MAX_LENGTH_MM:
+            problems.append(f"task9 neck_max_length_mm is {neck_length:g}, "
+                            f"it must be above 0 and at most "
+                            f"{NECK_MAX_LENGTH_MM:g}")
     if not math.isclose(mask_offset, PCBWAY_MASK_OFFSET_OHM, abs_tol=1e-9):
         problems.append(
             f"mask_offset_ohm is {mask_offset:g} in the note, PCBWay's "
@@ -535,7 +591,8 @@ def check_no_placeholder_geometry(pro_json, stackup_note, dru_text=_LOAD,
                 condition, minimum = rule
                 for needle in (f"A.NetClass == '{name}'",
                                f"B.NetClass == '{name}'",
-                               "A.isCoupledDiffPair()"):
+                               "A.isCoupledDiffPair()",
+                               "A.Type != 'Pad' || B.Type != 'Pad'"):
                     if needle not in condition:
                         problems.append(
                             f"{name}: rule 'intra-pair clearance {name}' is "
@@ -698,6 +755,45 @@ class DiffPairGeometryCheckCanFail(unittest.TestCase):
     def test_netlist_targets_are_read_as_documented(self):
         self.assertEqual(netlist_impedance_targets(load_netlist()),
                          {"USB3": 90.0, "MDI": 100.0})
+
+    def test_every_diff_pair_net_is_a_pair_to_kicad(self):
+        # AH: USB3_TX_P_CONN was not; USB3_TX_CONN_P is
+        self.assertEqual(unpaired_diff_pair_nets(load_netlist(), load_pro()),
+                         [])
+
+    def test_a_net_with_the_suffix_in_the_wrong_place_is_reported(self):
+        netlist = copy.deepcopy(load_netlist())
+        nets = netlist["nets"]
+        nets["USB3_TX_P_CONN"] = nets.pop("USB3_TX_CONN_P")
+        nets["USB3_TX_N_CONN"] = nets.pop("USB3_TX_CONN_N")
+        problems = unpaired_diff_pair_nets(netlist, load_pro())
+        self.assertEqual(len(problems), 2, problems)
+        self.assertTrue(all("USB3_TX_" in p and "not treat it as a pair" in p
+                            for p in problems), problems)
+
+    def test_a_pair_net_without_its_partner_is_reported(self):
+        netlist = copy.deepcopy(load_netlist())
+        del netlist["nets"]["MDI3_N"]
+        problems = unpaired_diff_pair_nets(netlist, load_pro())
+        self.assertEqual(problems, ["MDI3_P: no partner net MDI3_N"])
+
+    def test_the_neck_limits_must_be_recorded_and_not_grow(self):
+        note = load_stackup_note()
+        for old, new in [("neck_max_length_mm: 1.0", "neck_max_length_mm: 2.0"),
+                         ("neck_max_width_mm: 0.15", "neck_max_width_mm: 0.2"),
+                         ("neck_max_length_mm: 1.0", "neck_max_length_mm: 0")]:
+            problems = self.check(note=note.replace(old, new))
+            self.assertEqual(len(problems), 1, (new, problems))
+            self.assertIn("task9", problems[0])
+        problems = self.check(note=note.replace("task9:", "other:"))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("task9", problems[0])
+
+    def test_the_rule_must_exclude_pad_against_pad(self):
+        dru = load_dru().replace(" && (A.Type != 'Pad' || B.Type != 'Pad')", "")
+        problems = self.check(dru=dru)
+        self.assertTrue(any("not scoped" in p and "Pad" in p
+                            for p in problems), problems)
 
     def test_a_class_clearance_below_the_floor_is_reported(self):
         # clearance also sets pair-to-pair spacing; it must not follow the pair

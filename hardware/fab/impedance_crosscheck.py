@@ -122,6 +122,22 @@ def main():
             print(f"  {label:46s} {pw:7.1f} {pw - PCBWAY_MASK_OFFSET_OHM:9.1f}"
                   f" {bare:7.1f} {mask:10.1f}{flag}")
 
+    print("\ncombined corners: as-built with one and with two mask passes "
+          "(PCBWay: the reduction doubles with two passes)")
+    for name, w, s, target in GEOMETRIES:
+        print(f"\n{name}: width {w}, gap {s}, window "
+              f"{0.9 * target:g}..{1.1 * target:g}")
+        print(f"  {'case':46s} {'1 pass':>7s} {'2 passes':>9s}")
+        for label, h, er in CASES:
+            pw = pcbway_edge_coupled_zd(1, h, w, s, er)
+            cells = []
+            for passes in (1, 2):
+                value = pw - passes * PCBWAY_MASK_OFFSET_OHM
+                inside = 0.9 * target <= value <= 1.1 * target
+                cells.append(f"{value:7.1f}{'' if inside else ' *'}")
+            print(f"  {label:46s} {cells[0]:>7s} {cells[1]:>9s}")
+    print("\n* outside the window")
+
 
 if __name__ == "__main__":
     main()

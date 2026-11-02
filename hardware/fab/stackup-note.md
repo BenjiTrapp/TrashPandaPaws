@@ -162,40 +162,44 @@ file's existing U3 rule:
 
 * `intra-pair clearance USB3`: min 0.17 mm, for two items of class `USB3` where
   `A.isCoupledDiffPair()` holds (KiCad's own test for the two nets of one pair,
-  made by name: `..._P` with `..._N`), and not for two pads;
-* `intra-pair clearance USB3 after AC coupling`: the same 0.17 mm, scoped by
-  name to `USB3_TX_P_CONN` / `USB3_TX_N_CONN`, the SuperSpeed TX pair after
-  C22 and C23. The `_CONN` suffix hides that pair from KiCad's name matching,
-  and it is a question for task 9 whether the interactive router will then
-  treat the two nets as a pair at all;
+  made by name: `..._P` with `..._N`, the suffix last), and not for two pads.
+  It is the only pair rule. It covers the SuperSpeed TX pair after the
+  AC-coupling capacitors as well, because that pair is named
+  **`USB3_TX_CONN_P` / `USB3_TX_CONN_N`**: they were `USB3_TX_P_CONN` /
+  `USB3_TX_N_CONN` until the review, which KiCad does not pair (the suffix
+  was not last), so neither the differential-pair router nor
+  `isCoupledDiffPair()` would have seen them. The nets were renamed in
+  `netlist.yaml`, the schematic regenerated, and the by-name rule that had
+  been written for the old names deleted after the scratch run below showed
+  the one rule covering the new names (and, as a control, not the old ones);
 * no rule for `MDI`: its pair gap, 0.21 mm, is above the 0.2 mm class
   clearance.
 
 `python hardware/tests/check_fab_release.py` checks that the rule exists, is
-scoped to the class and a coupled pair, and has the pair gap as its minimum. A
-scratch-board run shows what KiCad does with it
+scoped to the class, to a coupled pair and to anything but two pads, and has
+the pair gap as its minimum; and that every net of the two classes carrying a
+`_P` / `_N` token ends in it and has its partner, so a name KiCad cannot pair
+cannot come back. A scratch-board run shows what KiCad does with it
 (`$KIPY hardware/fab/scratch_drc_check.py`; it copies the project to a
 temporary directory and never writes the repository's board):
 
 ```
 ok   USB2 D+/D- at the pair gap 0.17: no clearance violation
-ok   USB3 TX after the AC caps (_CONN nets) at 0.17: no clearance violation
+ok   USB3 TX after the AC caps (USB3_TX_CONN_P/N) at 0.17: no clearance violation
+ok   control: the old names USB3_TX_P_CONN/N_CONN at 0.17 are not a pair: Freiraum-Verstoß (Netzklasse "USB3" Freiraum 0.2000 mm; tatsächlich 0.1700 mm)
 ok   MDI0 pair at 0.21: no clearance violation
 ok   USB3 RX pair at 0.15, below the pair gap: Freiraum-Verstoß (Regel "intra-pair clearance USB3" Freiraum 0.1700 mm; tatsächlich 0.1500 mm)
 ok   two different USB pairs at 0.17: Freiraum-Verstoß (Netzklasse "USB3" Freiraum 0.2000 mm; tatsächlich 0.1700 mm)
 ok   two different MDI pairs at 0.17: Freiraum-Verstoß (Netzklasse "MDI" Freiraum 0.2000 mm; tatsächlich 0.1700 mm)
-note  trace on U3 pad 16 against the neighbouring pad 17: 0.1750 mm, flagged against the class clearance
+note  full width from the pad centre: 4 trace-to-pad violations, closest 0.1750 mm against the class clearance
+note  full width from the outer end of the pad: 4 trace-to-pad violations, closest 0.1807 mm against the class clearance
+ok   necked to 0.15 mm for 1.0 mm from the pad centre, then full width: 0 trace-to-pad violations
+note  the same neck cut to 0.5 mm: 0 trace-to-pad violations
 ok   pad-to-pad spacing of coupled pairs on U3 is not touched by the pair rule: 0 violations
 ```
 
-**Constraint for task 9: pair-to-pair spacing.** Outside the pad escape of U3,
-keep at least 2 to 3 `h` between any two different pairs, that is 0.37 to
-0.56 mm edge to edge with `h` = 0.1855 mm, and the same from a pair to other
-signal copper. This is a general layout rule of thumb; it is **not** taken
-from PCBWay or from a document in this repository, and nothing enforces it:
-the class clearance of 0.2 mm (1.1 `h`) is only the floor. Task 9 should
-treat it as a design constraint and confirm it, or relax it with a reason,
-when it routes.
+The 2 to 3 `h` spacing between pairs that the class clearance of 0.2 mm
+(1.1 `h`) only floors is a constraint for task 9, see "Constraints for task 9".
 
 ### Machine-readable block
 
@@ -205,7 +209,8 @@ The block below is read by `hardware/tests/check_fab_release.py`
 `.kicad_dru`, recomputes the as-built impedance from `inputs`, and fails when a
 net class differs, when the as-built value is more than 3 % from the target,
 when `mask_offset_ohm` is not PCBWay's 8 ohm, when the class clearance is below
-0.2 mm, or when the note is missing.
+0.2 mm, when the neck limits for task 9 are missing or looser than 0.15 mm and
+1.0 mm, or when the note is missing.
 
 <!-- netclass-geometry -->
 ```yaml
@@ -219,6 +224,11 @@ inputs:
 classes:
   USB3: {target_ohm: 90.0, width_mm: 0.20, gap_mm: 0.17, clearance_mm: 0.2}
   MDI: {target_ohm: 100.0, width_mm: 0.18, gap_mm: 0.21, clearance_mm: 0.2}
+task9:
+  # U3 pads: neck no wider and no longer than this, measured from the pad (see
+  # "Constraints for task 9"); the check fails if these limits are loosened
+  neck_max_width_mm: 0.15
+  neck_max_length_mm: 1.0
 ```
 
 ## How far the result moves
@@ -267,8 +277,8 @@ Reading it:
   the solver is an assumption.
 * **What the as-built column rests on is the 8 ohm.** It is PCBWay's "typically,
   one pass" figure. Two passes would double it (the page says so) and the
-  nominal values would fall to about 81.7 and 91.2 ohm, at the lower edge of
-  the window. That is why the number of passes is the first thing to ask PCBWay.
+  nominal values would fall to 81.7 and 91.2 ohm, at the lower edge of the
+  window; the combined corners below leave it.
 * Prepreg thickness matters more than anything else the layout controls.
   PCBWay: "the resin will fill the gaps left by the etched traces, resulting
   in reduced resin thickness between the layers." (excerpt `[4]`). `In1.Cu` is
@@ -276,6 +286,46 @@ Reading it:
   that the pressed thickness could sit nearer the 0.196 mm nominal than the
   0.1855 mm listed for 70 % residual copper; this is an inference, not
   PCBWay's statement. It would move the result up by about 2 ohm.
+
+**Combined corners.** The table changes one factor at a time. The same script
+also prints the as-built value for one and for two mask passes (PCBWay: "The
+reduction value doubles when printing two passes compared to one pass.",
+excerpt `[4]`, so 16 ohm), against the prepreg and stackup cases:
+
+```
+combined corners: as-built with one and with two mask passes (PCBWay: the reduction doubles with two passes)
+
+USB3 / USB2, target 90 ohm: width 0.2, gap 0.17, window 81..99
+  case                                            1 pass  2 passes
+  nominal: h 0.1855, Er 4.74                        89.7      81.7
+  h 0.196 (prepreg as pressed from the sheet)       91.5      83.5
+  h -10 % (0.1670)                                  85.9    77.9 *
+  h +10 % (0.2041)                                  92.9      84.9
+  stackup 3, 30 % residual copper: h 0.1715         86.9    78.9 *
+  Er 4.5                                            91.6      83.6
+  Er 4.2                                            94.3      86.3
+
+MDI, target 100 ohm: width 0.18, gap 0.21, window 90..110
+  case                                            1 pass  2 passes
+  nominal: h 0.1855, Er 4.74                        99.2      91.2
+  h 0.196 (prepreg as pressed from the sheet)      101.2      93.2
+  h -10 % (0.1670)                                  95.3    87.3 *
+  h +10 % (0.2041)                                 102.6      94.6
+  stackup 3, 30 % residual copper: h 0.1715         96.3    88.3 *
+  Er 4.5                                           101.4      93.4
+  Er 4.2                                           104.3      96.3
+
+* outside the window
+```
+
+With one mask pass every case is inside ±10 %. **With two passes, the
+combined corners of a thin prepreg (h -10 %, or the 30 %-residual stackup)
+with the mask fall outside the window for both classes: 77.9 and 78.9 ohm for
+USB3, 87.3 and 88.3 ohm for MDI.** Nominal at two passes (81.7 and 91.2 ohm) is
+inside by 0.7 and 1.2 ohm only. This geometry therefore holds only if PCBWay
+prints one pass or compensates for the second, which is why the number of passes
+is the first question in Open item 1, and why an answer of two passes would
+mean recomputing the geometry, not accepting it.
 
 Neither column is "the" answer. What PCBWay will actually build is decided by
 their engineering calculation with their mask (Open item 1).
@@ -314,12 +364,54 @@ these file values is not stated, so the margin is the margin on the design
 file only. Whether the impedance service applies a stricter figure is Open
 item 3.
 
+## Constraints for task 9
+
+Task 9 routes to the geometry above. These constraints come with it; none is
+optional.
+
+1. **Neck at the U3 pads: at most 0.15 mm wide, for at most 1.0 mm measured
+   from the pad, then widen to the controlled width. No clearance exception.**
+   Decided in review. The reason: 0.25 mm pads on a 0.4 mm pitch leave a
+   0.20 mm trace 0.175 mm from the neighbouring pad (0.185 mm for 0.18 mm),
+   against the 0.2 mm class clearance, and a bounded sub-millimetre
+   discontinuity costs less than lowering the clearance between different
+   pairs. It applies to every `USB3` and `MDI` trace that leaves a U3 pad.
+   The limits are in the machine-readable block (`task9`) and
+   `check_fab_release.py` fails if they are loosened.
+   * **Leaving from the outer end of the pad is the preferred first choice**
+     where the geometry allows it. It was measured on the scratch board
+     (`scratch_drc_check.py`): at full width it brings the closest distance
+     from 0.1750 to 0.1807 mm only, still under 0.2 mm, so with these widths
+     it does not replace the neck; it shortens the neck that is needed.
+   * Measured, the same scratch pads are clean (0 trace-to-pad violations)
+     with a 0.15 mm neck of 1.0 mm and with one of 0.5 mm, each stepping to full
+     width. 1.0 mm is the cap, not a target: use the shortest neck that clears.
+   * What it costs, from the same formula as everywhere else in this note:
+     two 0.15 mm traces at the 0.25 mm gap the pad pitch leaves give 119.9 ohm
+     bare, 111.9 ohm as built, against 90 ohm (USB3) and 100 ohm (MDI), over at
+     most 1.0 mm. The effect of that step at 5 Gbit/s is not modelled; a
+     0.15 mm trace is 5.9 mil, above the 5 mil of PCBWay's table row 15.
+2. **Route every pair with the differential-pair router.** All seven pairs are
+   named so that KiCad pairs them (`USB2_D_P/N`, `USB3_RX_P/N`, `USB3_TX_P/N`,
+   `USB3_TX_CONN_P/N`, `MDI0..3_P/N`); the TX pair after C22 and C23 was
+   renamed for it. The pair gap inside a USB3 pair comes from the `.kicad_dru`
+   rule; MDI is routed at its 0.21 mm gap, above the class clearance.
+3. **Spacing between pairs: at least 2 to 3 `h`**, that is 0.37 to 0.56 mm edge
+   to edge with `h` = 0.1855 mm, outside the pad escape of U3, and the same
+   from a pair to other signal copper. This is a general layout rule of
+   thumb; it is **not** taken from PCBWay or from a document in this
+   repository, and nothing enforces it: the class clearance of 0.2 mm (1.1
+   `h`) is only the floor. Task 9 should treat it as a design constraint and
+   confirm it, or relax it with a reason.
+4. **U8, C22, C23:** see the last item of the next section. Neither the fit
+   there nor the discontinuities are settled.
+
 ## Fit on 58 x 36 mm
 
 **Result: the geometry is frozen for impedance. Fit is shown for the straight
-lanes and for the U3 pad pitch; it is not established at U8, C22 and C23, and
-U3 needs a DRC decision. The board stays 58 x 36 mm for now; nothing here asks
-for it to grow.** Basis, all arithmetic on the geometry above and on pads that
+lanes and, with the neck, for the U3 pad pitch; it is not established at U8,
+C22 and C23. The board stays 58 x 36 mm for now; nothing here asks for it to
+grow.** Basis, all arithmetic on the geometry above and on pads that
 exist, plus the scratch-board DRC run above; nothing is routed yet.
 
 1. **The geometry is not wider than the placeholders it replaces.** Pair
@@ -335,17 +427,14 @@ exist, plus the scratch-board DRC run above; nothing is routed yet.
      0.22 mm (MDI), at the 0.2 mm class clearance and 0.02 mm over it. The
      first version of this note had 0.17 mm for USB3.
    * **Trace to the neighbouring pad is closer: 0.175 mm for a 0.20 mm trace
-     (0.185 mm for 0.18 mm), and KiCad flags it.** The scratch-board run above
-     lays a 0.20 mm trace straight out of pad 16 (`USB3_RX_P`) and pad 17
-     (`USB2_D_N`); DRC reports each against the other's pad at 0.1750 mm
-     against the class clearance of 0.2. It follows from 0.25 mm pads on a 0.4
-     mm pitch and holds for the old placeholders as well (same widths); it
-     does not come from the new gaps, and the existing U3 rule in the
-     `.kicad_dru` covers pad against pad only. It needs a decision before
-     task 9: start each trace at the outer end of its pad, add a
-     U3-scoped track-to-pad exception to the `.kicad_dru`, or neck down at
-     the pads. This task does not add it; the choice lowers a clearance and
-     is for the controller.
+     (0.185 mm for 0.18 mm), and KiCad flags it** against the 0.2 mm class
+     clearance. It follows from 0.25 mm pads on a 0.4 mm pitch, holds for the
+     old placeholders as well (same widths), and is not covered by the
+     existing U3 rule, which handles pad against pad only. The scratch-board
+     run above shows it (4 violations, closest 0.1750 mm), shows that leaving
+     from the pad's outer end does not remove it (0.1807 mm), and shows that a
+     neck removes it. It is settled by the neck in "Constraints for task 9",
+     not by a clearance exception.
    * Pair to pair on the MDI side (pins 1/2, 4/5, 6/7, 9/10; pad centres
      -1.6, -0.4, +0.4, +1.6 mm): the nearest pairs (4/5 and 6/7) are 0.8 mm
      apart centre to centre, outlines 0.57 mm, edge gap 0.23 mm. The 2 to 3
@@ -400,7 +489,8 @@ before anything is ordered; none has been asked yet.
 1. **Confirm the geometry with PCBWay engineering, with solder mask.** Ask
    them to calculate 90 ohm and 100 ohm differential for this stackup (entry 1,
    70 % residual copper, 0.1855 mm prepreg) with their solder mask on, and
-   say how many mask passes they print. The net classes are centred on the
+   say how many mask passes they print (two passes with a thin prepreg
+   leave the window, see the combined corners). The net classes are centred on the
    calculator's value minus PCBWay's "typically, one pass" 8 ohm; if their
    figure differs, change `mask_offset_ohm` in the block above and
    `PCBWAY_MASK_OFFSET_OHM` in `check_fab_release.py` together and
@@ -432,12 +522,13 @@ before anything is ordered; none has been asked yet.
 7. **Not modelled:** surface finish ("The surface finish is neglected.", excerpt
    `[1]`), etch trapezoid (the finite-element check uses rectangular copper),
    the pads of U8, C22 and C23, vias, and loss at 2.5 GHz.
-8. **U3 track-to-pad clearance (0.175 mm against 0.2 mm)**: a decision for the
-   controller before task 9, see the fit section.
-9. **Pair naming.** `USB3_TX_P_CONN` / `USB3_TX_N_CONN` are not recognised as
-   a pair by KiCad's name matching. The `.kicad_dru` covers the clearance by
-   name; whether the interactive router will route them as a coupled pair is
-   open for task 9 (renaming the nets would be a change to `netlist.yaml`).
+8. **Settled in review, recorded here so it is not reopened:** the U3
+   track-to-pad clearance (0.175 mm against 0.2 mm) is handled by the neck in
+   "Constraints for task 9", not by a clearance exception.
+9. **Settled in review:** the AC-coupled TX nets are named
+   `USB3_TX_CONN_P` / `USB3_TX_CONN_N` so that KiCad recognises them as a
+   pair. `netlist.yaml` and the regenerated schematic carry the new names;
+   task 8 regenerates the board from the netlist.
 10. **The 2 to 3 `h` pair-to-pair spacing** is a rule of thumb without a
     source in this repository; it is a constraint for task 9, not a verified
     requirement.
