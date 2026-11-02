@@ -1557,19 +1557,18 @@ class Beacon:
         return self._lowest_metric_iface(candidates)
 
     def _uplink_from_route_print(self) -> Optional[str]:
-        # route print names the interface by its address, not by name.
-        r = subprocess.run(["route", "print", "-4"], capture_output=True,
-                           text=True, timeout=5)
-        candidates = []
-        for line in r.stdout.splitlines():
-            cols = line.split()
-            if len(cols) < 5 or cols[0] != "0.0.0.0" or cols[1] != "0.0.0.0":
-                continue
-            try:
-                candidates.append((int(cols[4]), cols[3]))
-            except ValueError:
-                continue
-        return self._lowest_metric_iface(candidates)
+        # Windows reports the interface by address, not by name, and the
+        # router compares this value against interface *names*. An address
+        # would therefore never match, so the safety layer would believe the
+        # uplink is known and allow a monitor-mode switch on it — the exact
+        # failure "no uplink known" exists to prevent, since that case
+        # refuses every switch instead.
+        #
+        # So: nothing is reported here. Correlating the address back to a
+        # name needs a second command, on a platform where the monitor-mode
+        # path does not exist at all, so the conservative answer costs
+        # nothing and the permissive one costs the channel.
+        return None
 
     # ── System info ──
 

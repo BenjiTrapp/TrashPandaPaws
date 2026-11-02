@@ -388,26 +388,20 @@ class TestUplinkDetection(_Hermetic):
         with _fake_route_table(text):
             self.assertIsNone(self._beacon()._detect_uplink_iface())
 
-    def test_windows_reads_route_print(self):
-        out = (
-            "IPv4 Route Table\n"
-            "Network Destination        Netmask          Gateway       "
-            "Interface  Metric\n"
-            "          0.0.0.0          0.0.0.0      192.168.1.1    "
-            "192.168.1.50     25\n"
-            "          0.0.0.0          0.0.0.0       10.0.0.1       "
-            "10.0.0.7    281\n"
-            "        127.0.0.0        255.0.0.0         On-link         "
-            "127.0.0.1    331\n"
-        )
+    def test_windows_reports_no_uplink(self):
+        # `route print` names the interface by address, and the router
+        # compares against interface *names*, so an address can never match:
+        # the safety layer would believe the uplink is known and allow a
+        # monitor-mode switch on it. Reporting nothing instead makes every
+        # interface count as the uplink, which refuses all switches. On
+        # Windows there is no monitor-mode path anyway, so the conservative
+        # answer costs nothing.
         b = self._beacon()
-        result = MagicMock(stdout=out, returncode=0)
         with patch.object(beacon_mod.platform, "system",
                           return_value="Windows"), \
-                patch.object(beacon_mod.subprocess, "run",
-                             return_value=result) as run:
-            self.assertEqual(b._detect_uplink_iface(), "192.168.1.50")
-        self.assertEqual(run.call_args[0][0][0], "route")
+                patch.object(beacon_mod.subprocess, "run") as run:
+            self.assertIsNone(b._detect_uplink_iface())
+        run.assert_not_called()
 
     def test_windows_without_a_default_route_yields_none(self):
         b = self._beacon()
