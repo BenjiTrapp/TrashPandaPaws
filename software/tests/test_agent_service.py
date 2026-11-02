@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, make_mocked_request
 
-from software.agent import config, orchestrator, service
+from software.agent import config, orchestrator, safety, service
 from software.agent.llm import mock
 from software.agent.llm.provider import ProviderError
 from software.agent.store import db, queries
@@ -202,6 +202,11 @@ class TestStatusWithoutProvider(_ServiceCase):
         resp = await self.post("/campaign", _form(scope_allow=[]))
         self.assertEqual(resp.status, 503)
 
+    async def test_the_tier_one_list_is_there_without_a_provider(self):
+        # The form is greyed out then, but it still reads the list.
+        body = await (await self.get("/status")).json()
+        self.assertTrue(body["tier1_actions"])
+
     async def test_database_is_still_initialised(self):
         body = await (await self.get("/status")).json()
         self.assertTrue(body["db_ready"])
@@ -228,6 +233,18 @@ class TestStatusWithProvider(_ServiceCase):
         # What the form needs to say why phase 5 is locked.
         body = await (await self.get("/status")).json()
         self.assertEqual(body["max_phase"], 4)
+
+    async def test_status_lists_the_tier_one_actions_from_the_risk_table(self):
+        # The form shows what the agent can never do. A copy of that list in
+        # JavaScript would drift from the classifier; this one is derived.
+        body = await (await self.get("/status")).json()
+        listed = {a["key"]: a["reason"] for a in body["tier1_actions"]}
+        expected = {key: row.reason for key, row in safety.RISK_TABLE.items()
+                    if row.tier == safety.TIER_HARD}
+        self.assertEqual(listed, expected)
+        self.assertIn("beacon_control", listed)
+        self.assertNotIn("lsass_dump", listed)  # tier 2: gated, not blocked
+        self.assertTrue(all(listed.values()), "every entry carries its reason")
 
     async def test_db_ready_is_false_when_the_store_is_unusable(self):
         self.rig.conn.close()

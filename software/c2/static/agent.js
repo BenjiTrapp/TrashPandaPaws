@@ -261,7 +261,11 @@ function renderButton(b){
 async function agentOnButton(){
   await agentLoadStatus();
   if(A.lost) resumePolling();
-  agentOpenPanel();
+  // A campaign already being followed: show its state. Otherwise the form,
+  // when the service can actually take one. With no service the status
+  // panel is all there is to show, and it names the reason.
+  if(A.rid != null || A.avail !== "ok"){ agentOpenPanel(); return; }
+  await agentOpenFullAutoForm();
 }
 
 // ── Status panel (inside the existing side panel) ──
@@ -886,6 +890,533 @@ function onStop(){
   return control("stop");
 }
 
+// ── The full-auto configuration form ──
+//
+// Eight sections from spec §17.2 in its order, with OpSec after them: it
+// arrived later and is the one the operator must not be able to miss.
+//
+// The tables below mirror config.py. They are not a convenience copy —
+// test_c2_agent_gui compares them numerically against RISK_PROFILES and
+// OPSEC_PROFILES, so a number changed in Python and not here fails the
+// suite rather than producing a form that shows one thing and submits
+// another.
+
+const FORM_SECTIONS = ["Target beacons", "Scope", "Phases", "Risk profile",
+                       "Approvals", "Budget", "Model", "Schedule", "OpSec"];
+
+const DEFAULT_PHASES_ON = {
+  1: true, 2: true, 3: true, 4: true,
+  5: false,                 // exploitation: switched on deliberately, never by default
+  6: false, 7: false, 8: false,   // wifi: also need a monitor-capable adapter
+};
+
+const PHASE_NAMES = {
+  1: "Discovery", 2: "Enumeration", 3: "Credential access",
+  4: "Lateral movement", 5: "Exploitation",
+  6: "Wifi recon", 7: "Wifi capture", 8: "Wifi cracking",
+};
+
+const WIFI_PHASES = [6, 7, 8];
+
+const RISK_PRESETS = {
+  passive: {ev_threshold: 20.0, p_detect_prior: 0.25, detection_budget: 2, risk_coefficient: 50.0},
+  normal: {ev_threshold: 0.0, p_detect_prior: 0.15, detection_budget: 3, risk_coefficient: 33.0},
+  aggressive: {ev_threshold: -5.0, p_detect_prior: 0.1, detection_budget: 4, risk_coefficient: 25.0},
+};
+
+const RISK_FIELDS = ["ev_threshold", "p_detect_prior", "detection_budget",
+                     "risk_coefficient"];
+
+const RISK_LABELS = {
+  ev_threshold: "EV threshold",
+  p_detect_prior: "P(detect) start",
+  detection_budget: "Detection budget",
+  risk_coefficient: "Risk coefficient R",
+};
+
+const UNATTENDED = ["decide", "skip", "pause"];
+
+const UNATTENDED_HELP = {
+  decide: "the expected-value arbiter answers, and every decision is logged",
+  skip: "a gated action is refused and recorded, nothing is evaluated",
+  pause: "the campaign suspends and waits for you",
+};
+
+const OPSEC_EFFECTS = {
+  quiet: {online_lookups: false, limit_scan_rate: true},
+  normal: {online_lookups: true, limit_scan_rate: true},
+  yolo: {online_lookups: true, limit_scan_rate: false},
+};
+
+// What yolo does, and more importantly what it does not. The name invites
+// the reading "safety off", and ten tests in test_agent_config.py exist to
+// refuse it; saying so here is cheaper than letting someone find out.
+const YOLO_NOTE = "yolo lifts the scan rate limits and nothing else. " +
+  "tier-1 actions stay blocked and the approval gate stays in place in " +
+  "every profile.";
+
+// Used only if /status predates the field. Short on purpose: a long guess
+// would read as authoritative.
+const HARD_BLOCK_FALLBACK = ["kill", "unpersist", "reconfig"];
+
+// A preset is operator preference, so it is a whitelist rather than the
+// whole form: no credential can reach localStorage, and the beacon
+// selection is left out because a fleet changes between engagements.
+const PRESET_FIELDS = ["scope_allow", "scope_deny", "phases", "risk_profile",
+                       "ev_threshold", "p_detect_prior", "detection_budget",
+                       "risk_coefficient", "unattended_behavior",
+                       "max_runtime_seconds", "max_tokens_total",
+                       "campaign_interval", "restore_interval",
+                       "opsec_profile", "online_lookups", "limit_scan_rate"];
+
+const PRESET_KEY = "raccoon.agent.presets";
+
+// Shape only. The server re-checks with the real parser and that is the
+// authority; this is convenience, so a typo shows up before the round trip.
+const CIDR_V4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/;
+
+const BUDGET_FIELDS = [
+  {key: "max_runtime_seconds", label: "Runtime (s)", def: 7200, min: 1},
+  {key: "max_tokens_total", label: "Token budget", def: 500000, min: 1000},
+  {key: "campaign_interval", label: "Beacon interval while running (s)", def: 15, min: 1},
+  {key: "restore_interval", label: "Beacon interval afterwards (s)", def: 300, min: 1},
+];
+
+// Form state, deliberately not read back out of the DOM: the stream's detail
+// view opens in the same side panel and would take the inputs with it.
+const F = {
+  beacons: [],          // the fleet, from /beacons
+  chosen: {},           // beacon id -> selected
+  allow: [],            // scope tags
+  deny: [],
+  phases: {},
+  risk: "normal",
+  nums: {},
+  dirty: {},            // one flag per number: a typed value survives a preset
+  unattended: "decide",
+  budget: {},
+  opsec: "normal",
+  schedule: "",
+  scheduleNote: "",
+  error: "",
+};
+
+function cidrLooksValid(text){
+  const m = CIDR_V4.exec(String(text || "").trim());
+  if(!m) return false;
+  for(let i = 1; i <= 4; i++) if(Number(m[i]) > 255) return false;
+  return Number(m[5]) <= 32;
+}
+
+function resetForm(){
+  F.chosen = {};
+  F.allow = [];
+  F.deny = [];
+  F.phases = Object.assign({}, DEFAULT_PHASES_ON);
+  F.risk = "normal";
+  F.nums = Object.assign({}, RISK_PRESETS.normal);
+  F.dirty = {};
+  F.unattended = "decide";
+  F.budget = {};
+  BUDGET_FIELDS.forEach(function(b){ F.budget[b.key] = b.def; });
+  F.opsec = "normal";
+  F.schedule = "";
+  F.scheduleNote = "";
+  F.error = "";
+}
+
+function applyRiskPreset(name){
+  F.risk = name;
+  const preset = RISK_PRESETS[name] || RISK_PRESETS.normal;
+  RISK_FIELDS.forEach(function(field){
+    // Only while untouched: someone who typed a threshold and then browsed
+    // the presets should not silently lose it.
+    if(!F.dirty[field]) F.nums[field] = preset[field];
+  });
+}
+
+function monitorCapableChosen(){
+  return F.beacons.some(function(b){
+    return F.chosen[b.id] && (b.caps || []).indexOf("wifi:monitor") >= 0;
+  });
+}
+
+function phaseLock(phase){
+  const tier = (A.status && A.status.tier) || "unknown";
+  if(phase === 5 && tier !== "full"){
+    return "exploitation needs the full capability tier; this model (" +
+           ((A.status && A.status.model) || "?") + ") is rated \"" + tier +
+           "\", so the capability tier locks it";
+  }
+  if(WIFI_PHASES.indexOf(phase) >= 0 && !monitorCapableChosen()){
+    return "no monitor-capable adapter on the selected beacons";
+  }
+  return "";
+}
+
+function hardBlocks(){
+  // Each entry is {key, reason}: the key alone means nothing to someone
+  // reading a form, and the reason is already written for the operator.
+  const fromStatus = A.status && A.status.tier1_actions;
+  if(Array.isArray(fromStatus) && fromStatus.length){
+    return {items: fromStatus.map(function(a){
+              return typeof a === "string" ? {key: a, reason: ""} : a;
+            }), confirmed: true};
+  }
+  return {items: HARD_BLOCK_FALLBACK.map(function(k){
+            return {key: k, reason: ""};
+          }), confirmed: false};
+}
+
+function agentCollectForm(){
+  const chosen = F.beacons.filter(function(b){ return F.chosen[b.id]; })
+                          .map(function(b){ return b.id; });
+  const phases = Object.keys(F.phases)
+    .filter(function(p){ return F.phases[p] && !phaseLock(Number(p)); })
+    .map(Number).sort(function(a, b){ return a - b; });
+  const out = {
+    beacons: chosen,
+    scope_allow: F.allow.slice(),
+    scope_deny: F.deny.slice(),
+    phases: phases,
+    risk_profile: F.risk,
+    unattended_behavior: F.unattended,
+    opsec_profile: F.opsec,
+    // Without this the service treats the run as supervised and the
+    // unattended behaviour chosen above would never apply.
+    mode: "auto",
+  };
+  RISK_FIELDS.forEach(function(f){ out[f] = Number(F.nums[f]); });
+  BUDGET_FIELDS.forEach(function(b){ out[b.key] = Number(F.budget[b.key]); });
+  return out;
+}
+
+function formProblem(){
+  const form = agentCollectForm();
+  if(!form.beacons.length) return "select at least one target beacon";
+  if(!form.scope_allow.length)
+    return "the authorised scope is empty, and an empty scope authorises nothing";
+  const bad = F.allow.concat(F.deny).filter(function(t){ return !cidrLooksValid(t); });
+  if(bad.length) return "not a CIDR block: " + bad.join(", ");
+  if(!form.phases.length) return "select at least one phase";
+  return "";
+}
+
+function unleashSummary(){
+  const form = agentCollectForm();
+  return "Start an unattended campaign against " + form.beacons.length +
+         " beacon(s): " + form.beacons.join(", ") +
+         "\n\nscope: " + form.scope_allow.join(", ") +
+         (form.scope_deny.length ? "\nexcluded: " + form.scope_deny.join(", ") : "") +
+         "\nphases: " + form.phases.join(", ") +
+         "\nrisk: " + form.risk_profile + " · opsec: " + form.opsec_profile +
+         "\n\nProceed?";
+}
+
+function readPresets(){
+  try { return JSON.parse(localStorage.getItem(PRESET_KEY) || "{}") || {}; }
+  catch(e){ return {}; }
+}
+
+function agentSavePreset(name){
+  if(!name) return false;
+  const form = agentCollectForm();
+  const kept = {};
+  PRESET_FIELDS.forEach(function(f){ if(f in form) kept[f] = form[f]; });
+  const all = readPresets();
+  all[name] = kept;
+  try { localStorage.setItem(PRESET_KEY, JSON.stringify(all)); }
+  catch(e){ return false; }
+  notify("success", "Preset saved", escHtml(name), 3000);
+  return true;
+}
+
+function agentLoadPreset(name){
+  const kept = readPresets()[name];
+  if(!kept) return false;
+  if(Array.isArray(kept.scope_allow)) F.allow = kept.scope_allow.slice();
+  if(Array.isArray(kept.scope_deny)) F.deny = kept.scope_deny.slice();
+  if(Array.isArray(kept.phases)){
+    Object.keys(F.phases).forEach(function(p){ F.phases[p] = false; });
+    kept.phases.forEach(function(p){ F.phases[p] = true; });
+  }
+  if(kept.risk_profile) applyRiskPreset(kept.risk_profile);
+  RISK_FIELDS.forEach(function(f){
+    if(typeof kept[f] === "number"){ F.nums[f] = kept[f]; F.dirty[f] = true; }
+  });
+  BUDGET_FIELDS.forEach(function(b){
+    if(typeof kept[b.key] === "number") F.budget[b.key] = kept[b.key];
+  });
+  if(kept.unattended_behavior) F.unattended = kept.unattended_behavior;
+  if(kept.opsec_profile) F.opsec = kept.opsec_profile;
+  renderForm();
+  return true;
+}
+
+async function agentOpenFullAutoForm(){
+  resetForm();
+  if(!openInPanel("Automated Attack", function(root){
+        root.appendChild(h("div", {class: "ai-form", id: "ai-form"},
+                           h("div", {class: "ai-sec", text: "Loading the fleet..."})));
+      })) return;
+  const r = await aiCall("beacons");
+  if(!r.ok){
+    F.error = reasonOf(r);
+    F.beacons = [];
+  } else {
+    F.beacons = (r.data && r.data.beacons) || [];
+    const here = currentAgent();
+    if(here && F.beacons.some(function(b){ return b.id === here; })) F.chosen[here] = true;
+  }
+  renderForm();
+}
+
+function section(title, body, note){
+  return h("div", {class: "ai-sec"},
+           h("h4", {text: title}),
+           note ? h("p", {class: "ai-note", text: note}) : null,
+           body);
+}
+
+function renderForm(){
+  const root = document.getElementById("ai-form");
+  if(!root) return;
+  root.innerHTML = "";
+  const S = {};
+  FORM_SECTIONS.forEach(function(name){ S[name] = null; });
+
+  // ── Target beacons ──
+  let body;
+  if(F.error){
+    body = h("p", {class: "ai-bad", text: F.error});
+  } else if(!F.beacons.length){
+    body = h("p", {class: "ai-note", text: "no beacons are checked in"});
+  } else {
+    body = h("div", {class: "ai-list"}, F.beacons.map(function(b){
+      return h("label", {class: "ai-row"},
+        h("input", {type: "checkbox", checked: !!F.chosen[b.id],
+                    onchange: function(e){
+                      F.chosen[b.id] = e.target.checked;
+                      renderForm();   // the wifi gate depends on the selection
+                    }}),
+        h("span", {class: "ai-row-id", text: b.id}),
+        h("span", {class: "ai-row-meta",
+                   text: (b.hostname || "?") + " · " + (b.os || "?") +
+                         " · " + (b.status || "?")}),
+        h("span", {class: "ai-caps", text: (b.caps || []).join(" ")}));
+    }));
+  }
+  S["Target beacons"] = section("Target beacons", body);
+
+  // ── Scope ──
+  S["Scope"] = section("Scope",
+    h("div", {}, tagEditor("allow", "Allowed ranges"),
+                 tagEditor("deny", "Excluded ranges")),
+    "Checked here for shape only, as a convenience; the server validates " +
+    "with the real parser and that is the authority.");
+
+  // ── Phases ──
+  S["Phases"] = section("Phases",
+    h("div", {class: "ai-phases"}, Object.keys(DEFAULT_PHASES_ON).map(function(key){
+      const phase = Number(key);
+      const lock = phaseLock(phase);
+      const box = h("input", {type: "checkbox", disabled: !!lock,
+                              checked: !!F.phases[phase] && !lock,
+                              onchange: function(e){
+                                F.phases[phase] = e.target.checked;
+                                renderForm();
+                              }});
+      const row = h("label", {class: "ai-phase" + (lock ? " locked" : "")},
+                    box, h("span", {text: phase + " " + PHASE_NAMES[phase]}));
+      if(lock) row.setAttribute("title", lock);
+      return row;
+    })));
+
+  // ── Risk profile ──
+  S["Risk profile"] = section("Risk profile",
+    h("div", {},
+      h("div", {class: "ai-choice"}, Object.keys(RISK_PRESETS).map(function(name){
+        return h("label", {class: "ai-opt"},
+          h("input", {type: "radio", name: "ai-risk", checked: F.risk === name,
+                      onchange: function(){ applyRiskPreset(name); renderForm(); }}),
+          h("span", {text: name}));
+      })),
+      h("div", {class: "ai-nums"}, RISK_FIELDS.map(function(field){
+        return h("label", {class: "ai-num" + (F.dirty[field] ? " touched" : "")},
+          h("span", {text: RISK_LABELS[field]}),
+          h("input", {type: "number", step: "any", value: String(F.nums[field]),
+                      oninput: function(e){
+                        F.dirty[field] = true;
+                        F.nums[field] = e.target.value;
+                      }}));
+      }))),
+    "Choosing a profile fills these in. A value you type is kept when you " +
+    "switch profiles.");
+
+  // ── Approvals ──
+  const blocks = hardBlocks();
+  S["Approvals"] = section("Approvals",
+    h("div", {},
+      h("div", {class: "ai-choice"}, UNATTENDED.map(function(b){
+        return h("label", {class: "ai-opt", title: UNATTENDED_HELP[b]},
+          h("input", {type: "radio", name: "ai-unattended",
+                      checked: F.unattended === b,
+                      onchange: function(){ F.unattended = b; renderForm(); }}),
+          h("span", {text: b}));
+      })),
+      h("p", {class: "ai-note", text: UNATTENDED_HELP[F.unattended]}),
+      h("div", {class: "ai-hard"},
+        h("strong", {text: "Never permitted, not configurable:"}),
+        h("ul", {class: "ai-hard-list"}, blocks.items.map(function(a){
+          return h("li", {title: a.reason || ""},
+            h("code", {text: a.key}),
+            a.reason ? h("span", {class: "ai-note", text: " — " + a.reason}) : null);
+        })),
+        h("p", {class: "ai-note",
+                text: "These are irreversible — they would cost the drop-box " +
+                      "or the channel it is reached on." +
+                      (blocks.confirmed ? ""
+                       : " This list could not be confirmed with the agent " +
+                         "service, so it may be incomplete.")}))));
+
+  // ── Budget ──
+  S["Budget"] = section("Budget",
+    h("div", {class: "ai-nums"}, BUDGET_FIELDS.map(function(b){
+      return h("label", {class: "ai-num"},
+        h("span", {text: b.label}),
+        h("input", {type: "number", min: String(b.min),
+                    value: String(F.budget[b.key]),
+                    oninput: function(e){ F.budget[b.key] = e.target.value; }}));
+    })));
+
+  // ── Model ──
+  const st = A.status || {};
+  S["Model"] = section("Model",
+    kv([["provider", st.provider || "?"], ["model", st.model || "?"],
+        ["capability tier", st.tier || "?"],
+        ["highest phase this tier allows", st.max_phase == null ? "?" : st.max_phase]]));
+
+  // ── Schedule ──
+  S["Schedule"] = section("Schedule",
+    h("div", {},
+      h("label", {class: "ai-num"},
+        h("span", {text: "cron (leave empty to run once, now)"}),
+        h("input", {type: "text", placeholder: "0 2 * * *", value: F.schedule,
+                    oninput: function(e){ F.schedule = e.target.value; }})),
+      F.scheduleNote ? h("p", {class: "ai-bad", text: F.scheduleNote}) : null),
+    "A schedule is stored and started later; the form is not kept open.");
+
+  // ── OpSec ──
+  const warnings = (st.opsec_warnings && st.opsec_warnings[F.opsec]) || [];
+  S["OpSec"] = section("OpSec",
+    h("div", {},
+      h("div", {class: "ai-choice"}, Object.keys(OPSEC_EFFECTS).map(function(name){
+        const eff = OPSEC_EFFECTS[name];
+        return h("label", {class: "ai-opt",
+                           title: "third-party lookups: " +
+                                  (eff.online_lookups ? "on" : "off") +
+                                  " · scan rate: " +
+                                  (eff.limit_scan_rate ? "limited" : "unlimited")},
+          h("input", {type: "radio", name: "ai-opsec", checked: F.opsec === name,
+                      onchange: function(){ F.opsec = name; renderForm(); }}),
+          h("span", {text: name}));
+      })),
+      h("p", {class: "ai-note", text: YOLO_NOTE}),
+      warnings.length
+        ? h("div", {class: "ai-warn"}, warnings.map(function(w){
+            return h("p", {text: w});
+          }))
+        : null));
+
+  FORM_SECTIONS.forEach(function(name){ if(S[name]) root.appendChild(S[name]); });
+  root.appendChild(presetBar());
+  root.appendChild(submitBar());
+}
+
+function tagEditor(which, label){
+  const list = which === "allow" ? F.allow : F.deny;
+  const input = h("input", {type: "text", placeholder: "10.0.1.0/24",
+                            onkeydown: function(e){
+                              if(e.key !== "Enter") return;
+                              e.preventDefault();
+                              const v = e.target.value.trim();
+                              if(v && list.indexOf(v) < 0) list.push(v);
+                              e.target.value = "";
+                              renderForm();
+                            }});
+  return h("div", {class: "ai-tags"},
+    h("span", {class: "ai-tags-label", text: label}),
+    list.map(function(tag){
+      return h("span", {class: "ai-tag" + (cidrLooksValid(tag) ? "" : " bad"),
+                        title: cidrLooksValid(tag) ? "" : "not a CIDR block"},
+        tag,
+        h("button", {type: "button", text: "x",
+                     onclick: function(){
+                       list.splice(list.indexOf(tag), 1);
+                       renderForm();
+                     }}));
+    }),
+    input);
+}
+
+function presetBar(){
+  const names = Object.keys(readPresets());
+  const pick = h("select", {},
+    h("option", {value: "", text: names.length ? "load a preset..." : "no presets"}),
+    names.map(function(n){ return h("option", {value: n, text: n}); }));
+  pick.addEventListener("change", guard(function(e){
+    if(e.target.value) agentLoadPreset(e.target.value);
+  }));
+  return h("div", {class: "ai-presets"}, pick,
+    h("button", {type: "button", text: "Save as preset",
+                 onclick: function(){
+                   const name = window.prompt("Preset name");
+                   if(name) agentSavePreset(name.trim());
+                   renderForm();
+                 }}));
+}
+
+function submitBar(){
+  const problem = formProblem();
+  const btn = h("button", {class: "ai-unleash", type: "button",
+                           disabled: !!problem,
+                           text: "\u26A1 Unleash",
+                           onclick: guard(submitForm)});
+  if(problem) btn.setAttribute("title", problem);
+  return h("div", {class: "ai-submit"},
+    problem ? h("p", {class: "ai-bad", text: problem}) : null, btn);
+}
+
+async function submitForm(){
+  if(formProblem()) return;
+  if(!window.confirm(unleashSummary())) return;
+  const form = agentCollectForm();
+  if(F.schedule.trim()){
+    const r = await aiCall("schedules", {
+      method: "POST",
+      body: JSON.stringify({schedule: F.schedule.trim(),
+                            prompt: "scheduled campaign",
+                            config: form})});
+    if(!r.ok){
+      F.scheduleNote = reasonOf(r);
+      renderForm();
+      return;
+    }
+    notify("success", "Schedule stored", escHtml(F.schedule.trim()), 5000);
+    renderForm();
+    return;
+  }
+  const r = await aiCall("campaign", {method: "POST", body: JSON.stringify(form)});
+  if(!r.ok){
+    F.error = reasonOf(r);
+    renderForm();
+    return;
+  }
+  const rid = r.data && r.data.run_id;
+  notify("success", "Campaign started", "run " + escHtml(String(rid)), 5000);
+  if(rid != null) startWatching(rid);
+}
+
 // ── Public surface (Task 16 builds on these) ──
 
 function agentInit(){
@@ -901,6 +1432,10 @@ window.agentOpenPanel = guard(agentOpenPanel);
 window.agentRenderDrawer = guard(agentRenderDrawer);
 window.agentRenderStream = guard(agentRenderStream);
 window.agentAnswerApproval = guard(agentAnswerApproval);
+window.agentOpenFullAutoForm = guard(agentOpenFullAutoForm);
+window.agentCollectForm = agentCollectForm;
+window.agentSavePreset = guard(agentSavePreset);
+window.agentLoadPreset = guard(agentLoadPreset);
 
 // A deferred script runs after parsing, so "loading" only holds if someone
 // loads it differently; handle both rather than depend on it.

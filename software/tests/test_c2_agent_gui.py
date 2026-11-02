@@ -19,6 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from software.agent import config
 from software.c2.server import ServerCrypto, create_app
 from software.tests.test_c2_server import (
     TEST_TOKEN,
@@ -140,6 +141,230 @@ class TestGuiDegradation(ServerTestBase):
     def test_agent_js_does_not_touch_the_operator_token_in_a_url(self):
         js = AGENT_JS.read_text()
         self.assertNotRegex(js, r"[?&]token=")
+
+
+def _js_table(js, name):
+    """A `const NAME = { key: {field: value, ...}, ... };` literal as a dict.
+
+    Only for the flat tables the form keeps in step with config.py, so a
+    number changed there and not here is a failing test, not a form that
+    shows one thing and submits another.
+    """
+    m = re.search(r"const %s\s*=\s*\{(.*?)\n\};" % name, js, re.S)
+    assert m, "no table named %s in agent.js" % name
+    table = {}
+    for key, body in re.findall(r"(\w+):\s*\{([^}]*)\}", m.group(1)):
+        row = {}
+        for field, raw in re.findall(r"(\w+):\s*(-?[\w.]+)", body):
+            row[field] = (raw == "true") if raw in ("true", "false") else float(raw)
+        table[key] = row
+    return table
+
+
+def _js_list(js, name):
+    m = re.search(r"const %s\s*=\s*\[(.*?)\];" % name, js, re.S)
+    assert m, "no list named %s in agent.js" % name
+    return re.findall(r"\"([^\"]*)\"", m.group(1))
+
+
+class TestFullAutoForm(unittest.TestCase):
+    """What Python can see of the configuration form; the rest is by hand."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = AGENT_JS.read_text()
+
+    def test_form_has_all_nine_sections_in_order(self):
+        # Eight from the spec, in its order, and OpSec after them: it was
+        # added later and is the one the operator must not be able to miss.
+        self.assertEqual(_js_list(self.js, "FORM_SECTIONS"),
+                         ["Target beacons", "Scope", "Phases", "Risk profile",
+                          "Approvals", "Budget", "Model", "Schedule", "OpSec"])
+
+    def test_the_form_is_in_english(self):
+        for german in ("Ziel-Beacons", "Phasen", "Risikoprofil", "Anklopfen",
+                       "Zeitplan", "Modell", "Entfesseln"):
+            self.assertNotIn(german, self.js)
+
+    def test_the_submit_button_is_unleash(self):
+        self.assertRegex(self.js, r"(?:\\u26A1|\u26A1) ?Unleash")
+
+    # ── Phases ──
+
+    def test_phase_five_default_is_off_and_one_to_four_are_on(self):
+        on = _js_table_flags(self.js, "DEFAULT_PHASES_ON")
+        self.assertEqual({p for p, v in on.items() if v}, {1, 2, 3, 4})
+        self.assertIs(on[5], False)
+
+    def test_all_eight_phases_are_offered(self):
+        self.assertEqual(set(_js_table_flags(self.js, "DEFAULT_PHASES_ON")),
+                         set(range(1, 9)))
+
+    def test_wifi_phases_are_gated_on_the_monitor_capability(self):
+        self.assertIn("wifi:monitor", self.js)
+        self.assertRegex(self.js, r"WIFI_PHASES\s*=\s*\[6,\s*7,\s*8\]")
+        self.assertRegex(self.js, r"no monitor-capable adapter")
+
+    def test_phase_five_is_locked_unless_the_tier_is_full(self):
+        self.assertRegex(self.js, r"tier\s*!==\s*\"full\"")
+
+    def test_a_locked_phase_says_why_in_a_title(self):
+        # The model and the tier are named, not just a greyed box.
+        self.assertRegex(self.js, r"capability tier")
+        self.assertRegex(self.js, r"setAttribute\(\"title\"|\btitle:")
+
+    # ── Scope ──
+
+    def test_empty_scope_is_refused_client_side(self):
+        self.assertRegex(self.js.lower(), r"scope[^\n]*(is empty|required)")
+
+    def test_cidr_shape_is_checked_and_the_server_is_named_the_authority(self):
+        self.assertIn("CIDR_V4", self.js)
+        self.assertRegex(self.js.lower(), r"convenience[^\n]*server|server[^\n]*authority")
+
+    # ── Risk profile: four numbers ──
+
+    def test_the_three_risk_presets_match_the_config(self):
+        table = _js_table(self.js, "RISK_PRESETS")
+        self.assertEqual(set(table), set(config.RISK_PROFILES))
+        for name, fields in config.RISK_PROFILES.items():
+            self.assertEqual(table[name], {k: float(v) for k, v in fields.items()},
+                             "%s drifted from config.RISK_PROFILES" % name)
+
+    def test_the_profile_drives_four_numbers_including_the_risk_coefficient(self):
+        fields = _js_list(self.js, "RISK_FIELDS")
+        self.assertEqual(set(fields), set(config.RISK_PROFILES["normal"]))
+        self.assertIn("risk_coefficient", fields)
+        self.assertEqual(len(fields), 4)
+
+    def test_a_touched_field_is_not_overwritten_by_a_profile(self):
+        # One flag per field: the first field's edit must not pin the others.
+        self.assertRegex(self.js, r"F\.dirty\[\s*\w+\s*\]\s*=\s*true")
+        self.assertRegex(self.js, r"if\s*\(\s*!\s*F\.dirty\[")
+
+    # ── Approvals ──
+
+    def test_three_unattended_behaviours_are_offered(self):
+        for b in ("decide", "skip", "pause"):
+            self.assertIn('"%s"' % b, self.js)
+
+    def test_the_form_starts_the_campaign_in_auto_mode(self):
+        # Without it the service treats the run as supervised and the
+        # unattended behaviour chosen above would have no effect.
+        self.assertRegex(self.js, r"mode:\s*\"auto\"")
+
+    # ── Budget ──
+
+    def test_budget_defaults_match_the_spec(self):
+        self.assertIn("7200", self.js)
+        self.assertIn("500000", self.js)
+        self.assertRegex(self.js, r"campaign_interval[^\n]*15")
+
+    # ── OpSec ──
+
+    def test_opsec_profiles_are_the_configured_ones(self):
+        table = _js_table(self.js, "OPSEC_EFFECTS")
+        self.assertEqual(set(table), set(config.OPSEC_PROFILES))
+        for name, fields in config.OPSEC_PROFILES.items():
+            self.assertEqual(table[name], fields,
+                             "%s drifted from config.OPSEC_PROFILES" % name)
+
+    def test_opsec_warning_is_read_from_status_for_the_chosen_profile(self):
+        self.assertIn("opsec_warnings", self.js)
+        self.assertRegex(self.js, r"opsec_warnings\[\s*\w+(?:\.\w+)*\s*\]")
+
+    def test_yolo_is_explained_as_lifting_the_scan_rate_limit_only(self):
+        text = self.js.lower()
+        self.assertIn("tier-1", text)
+        self.assertIn("approval gate", text)
+        self.assertRegex(text, r"scan rate")
+        self.assertRegex(text, r"nothing else")
+
+    def test_opsec_profile_is_submitted(self):
+        self.assertRegex(self.js, r"opsec_profile\s*:")
+
+    # ── Hard blocks ──
+
+    def test_hard_block_list_comes_from_status(self):
+        self.assertIn("tier1_actions", self.js)
+
+    def test_the_fallback_is_short_and_says_it_is_unconfirmed(self):
+        fallback = _js_list(self.js, "HARD_BLOCK_FALLBACK")
+        self.assertEqual(fallback, ["kill", "unpersist", "reconfig"])
+        self.assertIn("could not be confirmed", self.js)
+
+    def test_the_list_is_described_as_not_configurable_and_irreversible(self):
+        text = self.js.lower()
+        self.assertIn("not configurable", text)
+        self.assertIn("irreversible", text)
+
+    # ── Presets ──
+
+    def test_presets_live_in_local_storage(self):
+        self.assertIn("localStorage", self.js)
+        for fn in ("agentSavePreset", "agentLoadPreset", "agentCollectForm",
+                   "agentOpenFullAutoForm"):
+            self.assertIn("function " + fn, self.js)
+
+    def test_no_credential_reaches_local_storage(self):
+        # Nothing on a line that touches localStorage may name the operator
+        # token, the Authorization header or a key.
+        for line in self.js.splitlines():
+            if "localStorage" in line:
+                for word in ("TOKEN", "Authorization", "Bearer", "api_key",
+                             "agent_token", "H,", "headers"):
+                    self.assertNotIn(word, line)
+
+    def test_a_preset_is_a_whitelist_not_the_whole_form(self):
+        fields = _js_list(self.js, "PRESET_FIELDS")
+        for secret in ("token", "api_key", "key", "authorization", "headers"):
+            self.assertNotIn(secret, [f.lower() for f in fields])
+        # Not the beacon selection: a fleet changes between engagements.
+        self.assertNotIn("beacons", fields)
+        self.assertIn("scope_allow", fields)
+        self.assertIn("opsec_profile", fields)
+
+    # ── Submit ──
+
+    def test_the_confirmation_names_beacons_and_scope(self):
+        m = re.search(r"function unleashSummary.*?\n\}", self.js, re.S)
+        self.assertTrue(m, "no unleashSummary()")
+        body = m.group(0)
+        self.assertIn("beacon", body)
+        self.assertIn("scope", body.lower())
+        self.assertRegex(self.js, r"confirm\(\s*unleashSummary")
+
+    def test_a_bad_cron_is_shown_not_swallowed(self):
+        self.assertIn("schedules", self.js)
+        self.assertRegex(self.js, r"aiCall\(\s*\"schedules\"")
+        self.assertRegex(self.js, r"reasonOf\(")
+
+    def test_the_form_only_reaches_the_service_through_aicall(self):
+        self.assertRegex(self.js, r"aiCall\(\s*\"campaign\"")
+        self.assertRegex(self.js, r"aiCall\(\s*\"beacons\"")
+
+    def test_form_state_survives_the_panel_being_replaced(self):
+        # The stream's detail view opens in the same side panel, which would
+        # take the form with it; the state is kept apart from the DOM.
+        self.assertRegex(self.js, r"const F\s*=\s*\{")
+
+
+def _js_table_flags(js, name):
+    m = re.search(r"const %s\s*=\s*\{(.*?)\};" % name, js, re.S)
+    assert m, "no table named %s in agent.js" % name
+    return {int(k): v == "true" for k, v in re.findall(r"(\d):\s*(true|false)", m.group(1))}
+
+
+class TestFormStyles(unittest.TestCase):
+    def test_form_classes_are_styled(self):
+        css = AGENT_CSS.read_text()
+        for cls in (".ai-form", ".ai-sec", ".ai-tag", ".ai-tag.bad", ".ai-phase",
+                    ".ai-unleash"):
+            self.assertIn(cls, css)
+
+    def test_the_form_does_not_redefine_the_palette(self):
+        css = AGENT_CSS.read_text()
+        self.assertNotRegex(css, r"--(?:red|green|yellow|orange)\s*:")
 
 
 class TestAccentColours(unittest.TestCase):

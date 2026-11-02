@@ -141,3 +141,71 @@
 .ai-detail .ai-note{color:var(--text2);font-style:italic}
 .ai-detail dl{display:grid;grid-template-columns:auto 1fr;gap:3px 10px}
 .ai-detail dt{color:var(--text2)}
+
+/* ── The full-auto configuration form ──
+   Inherits the palette from the main GUI's :root; nothing is redefined here,
+   so a colour changed there follows through. */
+
+.ai-form{display:flex;flex-direction:column;gap:14px;font-size:12px}
+.ai-sec{border:1px solid var(--border);border-radius:6px;padding:10px 12px;
+        background:var(--surface2)}
+.ai-sec h4{margin:0 0 6px;font-size:11px;text-transform:uppercase;
+           letter-spacing:0.06em;color:var(--orange)}
+.ai-note{margin:4px 0 0;color:var(--text2);font-size:11px;line-height:1.45}
+.ai-bad{margin:4px 0 0;color:var(--red);font-size:11px}
+
+.ai-list{display:flex;flex-direction:column;gap:4px}
+.ai-row{display:flex;align-items:center;gap:8px;padding:3px 0}
+.ai-row-id{font-family:var(--mono);color:var(--text)}
+.ai-row-meta{color:var(--text2);font-size:11px}
+.ai-caps{margin-left:auto;font-family:var(--mono);font-size:10px;
+         color:var(--op, #33ccff)}
+
+.ai-tags{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:4px 0}
+.ai-tags-label{color:var(--text2);font-size:11px;min-width:120px}
+.ai-tags input[type="text"]{flex:1;min-width:140px;background:var(--bg);
+  color:var(--text);border:1px solid var(--border);border-radius:4px;
+  padding:4px 7px;font-family:var(--mono);font-size:11px}
+.ai-tag{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;
+  border:1px solid var(--border);border-radius:10px;font-family:var(--mono);
+  font-size:11px;color:var(--text)}
+.ai-tag button{background:none;border:0;color:var(--text2);cursor:pointer;
+  padding:0;font-size:11px;line-height:1}
+.ai-tag.bad{border-color:var(--red);color:var(--red)}
+.ai-tag.bad button{color:var(--red)}
+
+.ai-phases{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px}
+.ai-phase{display:flex;align-items:center;gap:7px;padding:3px 0}
+.ai-phase.locked{opacity:0.45;cursor:not-allowed}
+
+.ai-choice{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:6px}
+.ai-opt{display:flex;align-items:center;gap:5px}
+.ai-nums{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.ai-num{display:flex;flex-direction:column;gap:3px}
+.ai-num span{color:var(--text2);font-size:11px}
+.ai-num input{background:var(--bg);color:var(--text);border:1px solid var(--border);
+  border-radius:4px;padding:4px 7px;font-family:var(--mono);font-size:11px}
+.ai-num.touched input{border-color:var(--orange)}
+
+.ai-hard{margin-top:8px;padding:8px 10px;border:1px solid var(--red-dim);
+  border-radius:5px;background:rgba(255,26,26,0.06)}
+.ai-hard strong{color:var(--red)}
+.ai-warn{margin-top:8px;padding:8px 10px;border:1px solid var(--yellow);
+  border-radius:5px;background:rgba(255,204,0,0.07)}
+.ai-warn p{margin:0 0 4px;color:var(--yellow);font-size:11px;line-height:1.45}
+.ai-warn p:last-child{margin-bottom:0}
+
+.ai-presets{display:flex;gap:8px;align-items:center}
+.ai-presets select,.ai-presets button{background:var(--surface);color:var(--text);
+  border:1px solid var(--border);border-radius:4px;padding:4px 9px;font-size:11px;
+  cursor:pointer}
+
+.ai-submit{display:flex;flex-direction:column;gap:6px}
+.ai-unleash{align-self:flex-start;padding:7px 16px;border-radius:5px;
+  border:1px solid var(--orange);background:rgba(255,102,0,0.12);
+  color:var(--orange);font-size:12px;font-weight:600;cursor:pointer}
+.ai-unleash:disabled{opacity:0.45;cursor:not-allowed;border-color:var(--border);
+  color:var(--text2);background:rgba(255,255,255,0.03)}
+.ai-hard-list{margin:5px 0 0;padding-left:18px;list-style:disc}
+.ai-hard-list li{margin:2px 0;line-height:1.4}
+.ai-hard-list code{font-family:var(--mono);color:var(--red)}

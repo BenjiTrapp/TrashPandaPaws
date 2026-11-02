@@ -45,7 +45,7 @@ from typing import Any, Dict, List, Optional
 
 from aiohttp import web
 
-from software.agent import c2client, config, scheduler
+from software.agent import c2client, config, safety, scheduler
 from software.agent.llm import provider
 from software.agent.orchestrator import Campaign, restore_orphans
 from software.agent.store import queries
@@ -222,6 +222,19 @@ class _Service:
             "max_phase": provider.TIER_LIMITS.get(tier, {}).get("max_phase"),
             "db_ready": self._db_ready(),
             "opsec_warnings": self._opsec_by_profile(),
+            # The never-permitted actions, generated rather than typed. A
+            # static copy in the form would drift from the classifier, and
+            # then the form would be telling the operator something false
+            # about what the agent can do — the same reason the model's
+            # preamble is generated from this table too.
+            #
+            # With the reason, not just the key: "beacon_control" means
+            # nothing to someone reading a form, and the reason is already
+            # written for the operator.
+            "tier1_actions": [
+                {"key": key, "reason": row.reason}
+                for key, row in sorted(safety.RISK_TABLE.items())
+                if row.tier == safety.TIER_HARD],
             "campaigns": self._campaigns()})
 
     def _db_ready(self) -> bool:
