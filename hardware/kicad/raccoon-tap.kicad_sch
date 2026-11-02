@@ -223,7 +223,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "USBLC6-2SC6" (at 0 -7.62 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Package_TO_SOT_SMD:SOT-23-6" (at 0 0 0)
+			(property "Footprint" "raccoon:SOT-23-6_USBLC6-2" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_U9_0_1"
 				(rectangle (start -12.7 -5.08) (end 12.7 5.08)
@@ -2369,7 +2369,7 @@
 			(effects (font (size 1.27 1.27))))
 		(property "Value" "USBLC6-2SC6" (at 144.78 52.07 0)
 			(effects (font (size 1.27 1.27))))
-		(property "Footprint" "Package_TO_SOT_SMD:SOT-23-6" (at 144.78 44.45 0)
+		(property "Footprint" "raccoon:SOT-23-6_USBLC6-2" (at 144.78 44.45 0)
 			(effects (font (size 1.27 1.27)) hide))
 		(property "MPN" "USBLC6-2SC6" (at 144.78 44.45 0)
 			(effects (font (size 1.27 1.27)) hide))

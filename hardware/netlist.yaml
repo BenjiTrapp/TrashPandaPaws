@@ -1286,7 +1286,7 @@ components:
       and stock: [SOURCING].
       FOOTPRINT (task 8): raccoon:SOT-23-6_SP3019_LittelfuseLand, the land
       pattern of [SP3019] page 5 ('Recommended soldering pad layout': pads 0.60
-      x 0.85 mm, 0.95 mm pitch, 3.33 mm overall) in place of KiCad's SOT-23-6
+      x 0.85 mm, 0.95 mm pitch, 3.33 mm overall, a span the drawing prints as '0.33' and that is read as 3.33) in place of KiCad's SOT-23-6
       (pads 1.325 mm long), because the 0.95 mm channel between the pad rows of
       the latter is too narrow for two lines of different pairs and the
       Littelfuse pattern leaves 1.63 mm. Pad numbering checked against that
@@ -1305,7 +1305,7 @@ components:
     mpn: USBLC6-2SC6
     manufacturer: STMicroelectronics
     package: "SOT-23-6L, 2.9 x 2.8 mm, leaded"
-    footprint: "Package_TO_SOT_SMD:SOT-23-6"
+    footprint: "raccoon:SOT-23-6_USBLC6-2"
     description: "2-line USB 2.0 ESD array with VBUS clamp, at the USB connector"
     source: >
       [USBLC6] DS4260 rev 7: 2 data lines protected, VBUS clamp, 3.5 pF max
@@ -2068,7 +2068,7 @@ design_notes:
     mode (table 11), the LEDs may blink at power-on or during EEPROM/SPI access
     (5.11), and "LED OFF Mode" (all select bits 0) makes the pins float.
   mdi_pair_mapping: >
-    J2 PHY-side pins carry to cable pins as: TD1 -> J1/J2, TD2 -> J3/J6,
+    J2 PHY-side pins carry to cable pins as: TD1 -> J1/J2, TD2 -> J3/J6, TD3 -> J4/J5, TD4 -> J7/J8 ([LPJG] sheet 1/2). That is the standard 1000BASE-T assignment. CORRECTED in task 8 (ruling AJ, revised; an earlier version of this note said exact pair-to-pair assignment was not critical): [RTL-DS] Table 4 section 5.4 makes MDI0 the 10/100 transmit pair (BI_DA) and MDI1 the 10/100 receive pair (BI_DB). Auto-negotiation and every 10/100 frame run on those two pairs only, and the crossover correction exchanges only A with B and C with D. Pair assignment IS critical across that boundary: MDI0/MDI1 must stay on cable pairs A/B and MDI2/MDI3 on C/D, or there is no link at all. Legal freedoms: exchange MDI0 with MDI1, exchange MDI2 with MDI3, turn the polarity of any pair. Keep each pair routed as a pair. Where the layout uses a freedom (see hardware/review/2026-10-31-placement/README.md), the nets in this file are changed first.
     TD3 -> J4/J5, TD4 -> J7/J8 ([LPJG] sheet 1/2). That is the standard
     1000BASE-T assignment. AutoMDX in both the PHY and the jack means pair
     order and polarity are corrected automatically, so exact pair-to-pair

@@ -48,17 +48,16 @@ DEFAULT_OUT = HARDWARE / "kicad" / "raccoon-tap.kicad_pcb"
 KICAD_FP = Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport/footprints")
 PROJECT_FP = HARDWARE / "kicad" / "raccoon.pretty"
 
-# Board outline. The 12 mm beyond the RJ45 jack's front face is the strain-relief
-# tail: the cable boot lies on it and is tied down through the two slots, and
-# the two M2.5 holes sit at its corners (spec 5.2 / 11.9). Before task 8 the
-# board was 58 mm long and ended at the jack.
-BOARD_W, BOARD_H = 70.0, 36.0
+# Board outline. 58 x 36 mm, as before task 8: growth was released for the
+# impedance geometry (spec 11.8), and nothing in the placement needed it. The
+# jack's front face is 0.35 mm inside the edge.
+BOARD_W, BOARD_H = 58.0, 36.0
 ORIGIN_X, ORIGIN_Y = 100.0, 80.0
 
 # Anchors the placement is written against: mm from the board's top-left
 # corner, x to the right, y down.
 UX, UY = 24.0, 23.0           # U3 centre
-JX, JY = 47.55, 18.0          # J2 origin; the jack's front face is at x = 57.9, the courtyard at 58.2
+JX, JY = 47.3, 18.0           # J2 origin; the jack's front face is at x = 57.65, its courtyard at 57.94
 
 # Placement follows the signal flow: USB plug on the left edge, PHY in the
 # middle, MagJack on the right edge, power along the bottom and top left.
@@ -77,10 +76,22 @@ JX, JY = 47.55, 18.0          # J2 origin; the jack's front face is at x = 57.9,
 # order. U3's pins 1-10 and J2's pins 1-10 both run counter-clockwise round
 # their package, so two parts that face each other present the pairs in
 # reversed order (MDI3..0 against MDI0..3), for every rotation of both parts.
-# Drawn as straight ratsnest lines the eight signal pins cross 28 times on one
-# layer. The corridor between U3 and J2 is therefore kept clear on both signal
-# layers; hardware/review/2026-10-31-placement/README.md has the measurement
-# and the routing plan.
+# Drawn as straight ratsnest lines the eight signal pins cross 27 times.
+# Which pairs may be exchanged is limited (ruling AJ, revised): MDI0 and MDI1
+# are the 10/100 pair, so only MDI0<->MDI1, MDI2<->MDI3 and P/N polarity are
+# free; the two groups cannot trade places.
+#
+# THE PLANAR ROUTE THE PLACEMENT LEAVES ROOM FOR (ruling AM). J2's pins are
+# through-hole, so a track can reach them from either face. The southern pairs
+# (MDI0 and MDI1) go east past U3, under J2's pin 10 (strip y 24.7 to 27.5, x 31
+# to 40), through the 2.7 mm gap between pin 9 and the shield pad SH1, up the
+# 4 mm channel between the pin columns and the T-posts (x 41.7 to 45.7), and
+# into the pins from the east: the outermost lane to the northernmost pins.
+# F.Cu is kept free of parts along all of it, and C25 and R13 stay below
+# y 29. MDI2 and MDI3 come from the west and cross each other unless the nets of
+# J2's pins 7 to 10 are changed in the legal ways (ruling AJ, revised); the
+# README and scratch_route_check.py in the placement review directory
+# show two variants that route without a via.
 PLACEMENT = {
     # --- connectors --------------------------------------------------------
     # J3 rotated 180 so the shell overhangs the LEFT edge while the pads stay
@@ -89,7 +100,7 @@ PLACEMENT = {
     # pads land at origin+10.85, so the origin sits off-board.
     "J3":  (-5.85, 18.0, 180),
     # J2 turned so the jack's opening faces the right-hand board edge: signal
-    # pins on the left (x 38.7 and 41.2), LEDs at the front.
+    # pins on the left (x 38.4 and 40.9), LEDs at the front.
     "J2":  (JX, JY, 90),
     # --- PHY and what belongs to it ---------------------------------------
     "U3":  (UX, UY, 180),        # RTL8153B
@@ -102,8 +113,8 @@ PLACEMENT = {
     "R14": (26.9, 28.1, 0),
     "R11": (30.2, 28.2, 0),      # RSET
     # --- USB side ----------------------------------------------------------
-    "U9":  (9.6, 18.0, 0),       # USB 2.0 ESD, flow-through: D+ in at pin 1, out at pin 6, D- in at 3, out at 4
-    "U8":  (18.6, 17.1, 270),    # SuperSpeed ESD, TX row north, 1.63 mm channel between the rows
+    "U9":  (9.6, 18.0, 0),       # USB 2.0 ESD. Pins 1/6 are one node and 3/4 another (DS4260): D+ in at 1, out at 6; D- in at 3, then north through the 0.95 mm channel between the pad columns (0.375 mm to each side), which puts it north of D+ with no via; pin 4 joined by a stub
+    "U8":  (15.6, 17.1, 270),    # SuperSpeed ESD, 10.6 mm from the J3 pads (was 13.6); TX row north, 1.63 mm channel between the rows
     "C22": (24.95, 16.8, 90),    # TX AC coupling, P
     "C23": (26.0, 16.8, 90),     # TX AC coupling, N
     # --- decoupling ring round U3 -----------------------------------------
@@ -123,14 +134,14 @@ PLACEMENT = {
     "C9":  (27.65, 26.75, 0),    # pins 39, 40
     "C12": (29.6, 26.75, 0),     # AVDD10 pin 3 on the east edge
     # --- J2 side ------------------------------------------------------------
-    "C21": (43.5, 17.4, 180),    # centre-tap bypass, on B.Cu under the jack, pad 1 1.3 mm from pin 5
-    "C25": (41.8, 28.6, 0),      # shield to GND, by the jack's shield post
-    "R13": (46.5, 28.6, 0),
-    "R7":  (51.5, 28.0, 0),      # LED series resistors, by the LED pins
-    "R8":  (50.0, 8.3, 0),
+    "C21": (34.4, 18.0, 180),    # centre-tap bypass, top side, in the 5 mm gap west of pin 6 (the MDI0/1 pairs come in from the east, MDI2/3 at y 19.9 and below); the jack's courtyard keeps it 3.3 mm from the pin
+    "C25": (41.6, 29.9, 0),      # shield to GND, by the jack's shield post
+    "R13": (46.3, 29.9, 0),
+    "R7":  (51.3, 28.0, 0),      # LED series resistors, by the LED pins
+    "R8":  (49.8, 8.3, 0),
     # --- mounting ----------------------------------------------------------
-    "H1":  (66.5, 3.5, 0),
-    "H2":  (66.5, 32.5, 0),
+    "H1":  (54.5, 3.5, 0),
+    "H2":  (54.5, 32.5, 0),
     # --- input protection and load switch ---------------------------------
     "C1":  (8.3, 27.0, 180),
     "C2":  (8.3, 28.6, 180),
@@ -164,25 +175,27 @@ PLACEMENT = {
     # --- assembly fiducials (three, for PCBWay's pick-and-place) ------------
     "FID1": (2.5, 2.5, 0),
     "FID2": (2.5, 33.5, 0),
-    "FID3": (68.0, 18.0, 0),
+    "FID3": (47.0, 33.5, 0),
     # --- U3 pin 20 contingency ---------------------------------------------
     "R12": (15.6, 23.6, 90),     # DNP link U3.20 <-> +3V3
 }
 
-# Parts that sit on the bottom copper layer. C21 goes there because the jack's
-# centre-tap pins (5 and 6) sit in the middle of the pin field, between the
-# MDI pairs; the pins are through-hole, so a capacitor under the board reaches
-# them without crossing a pair.
-BOTTOM = {"C21"}
+# Parts that sit on the bottom copper layer: none (a bottom-side part would mean
+# double-sided assembly or hand soldering, and the bottom side has no fiducials).
+BOTTOM = set()
 
 # M2.5 holes (spec 5.2): copper-free ring for the screw head and washer, round
 # the plated pad of the hole. Tracks, vias and parts stay out; the GND pour may
 # come in.
 HOLE_KEEPOUT_R = (3.02, 3.9)
 
-# RJ45 cable-tie slots, centres in mm. A tie goes down one slot, under the
-# board and up the other, round the cable boot lying on the tail between them.
-TIE_SLOTS = [(64.4, 13.5), (64.4, 22.5)]
+# No cable-tie slots. They were drawn in the first round at 4.5 to 7.9 mm beyond
+# the jack's front face, where the plug body, not the boot, still is, and
+# nothing here shows that a tie would clear the latch of a tab-up jack. Without
+# the J2 and plug drawings that cannot be shown, so the board ends at the jack
+# and the strain relief is the two screws, which sit either side of the jack,
+# 3.2 mm behind its front face.
+TIE_SLOTS = []
 TIE_SLOT_L, TIE_SLOT_W = 3.4, 1.6
 
 # Copper patch on F.Cu under the 3.3 V regulator: GND, joined to U4 pin 2
@@ -197,9 +210,9 @@ ISLANDS = [
     ("+5V_SW", [(12.4, 1.0), (18.8, 1.0), (18.8, 34.6), (12.4, 34.6)]),
     ("+5V_SW", [(29.6, 1.0), (36.4, 1.0), (36.4, 12.4), (29.6, 12.4)]),
     ("+1V0", [(19.4, 1.0), (29.0, 1.0), (29.0, 21.4), (19.4, 21.4)]),
-    ("+3V3", [(19.4, 21.8), (29.4, 21.8), (29.4, 12.8), (58.0, 12.8),
-              (58.0, 34.6), (19.4, 34.6)]),
-    ("+3V3", [(44.0, 1.0), (58.0, 1.0), (58.0, 12.4), (44.0, 12.4)]),
+    ("+3V3", [(19.4, 21.8), (29.4, 21.8), (29.4, 12.8), (57.2, 12.8),
+              (57.2, 34.6), (19.4, 34.6)]),
+    ("+3V3", [(44.0, 1.0), (57.2, 1.0), (57.2, 12.4), (44.0, 12.4)]),
 ]
 
 

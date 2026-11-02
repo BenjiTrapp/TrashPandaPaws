@@ -1,35 +1,45 @@
 #!/usr/bin/env python3
-"""Can the SuperSpeed lanes and the MDI escapes be laid out on the placed
-board, at the geometry of hardware/fab/stackup-note.md?
+"""Clearance evidence for the placement: can the SuperSpeed lanes, the USB 2.0
+pair and the MDI pairs be laid out on the placed board at the geometry of
+hardware/fab/stackup-note.md, and does the new U3 rule do what it says?
 
-Task 7 left the fit at U8, C22 and C23 open and handed it to task 8. This
-script is the evidence for the answer. It copies the project (board,
-.kicad_pro, .kicad_dru) to a temporary directory, lays the traces below on
-the copy with pcbnew, runs kicad-cli's DRC there and prints what KiCad
-reports. The repository's board is never written.
+WHAT THIS SHOWS AND WHAT IT DOES NOT. It copies the project (board,
+.kicad_pro, .kicad_dru) to a temporary directory, lays the traces below on the
+copy with pcbnew, runs kicad-cli's DRC and prints what KiCad reports. The
+repository's board is never written. A clean run means the copper clears its
+neighbours at the rules in force. It says nothing about impedance, crosstalk or
+return paths: the SuperSpeed pairs are open (1.5 to 2 mm apart) for about 5 mm
+round U8, and TX_P and RX_N run 0.8 mm apart, centre to centre, through its
+channel. The traces are a feasibility demonstration, not the routing; task 9
+routes.
 
     KIPY=/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/3.9/bin/python3
-    $KIPY hardware/review/2026-10-31-placement/scratch_route_check.py
+    $KIPY hardware/review/2026-10-31-placement/scratch_route_check.py [neck_mm]
 
-The traces are a feasibility demonstration, not the routing: task 9 routes.
-They are laid exactly as the stackup note prescribes: USB3 pairs 0.20 mm wide
-with a 0.17 mm pair gap, MDI 0.18 mm, a 0.15 mm neck for the first 1.0 mm from
-the centre of every U3 pad (0.6 mm here, the shortest that clears the
-neighbouring pad; the cap is 1.0 mm), the TX pair opened to 1.05 mm at the AC-coupling
-capacitors, each U8 line passing through the 1.63 mm channel between U8's pad
-rows or round the outside of a row.
+Geometry: USB3 and USB 2.0 0.20 mm wide at a 0.375 mm pitch (gap 0.175), MDI
+0.18 mm at 0.39 mm, a 0.15 mm neck for the first `neck_mm` (default 0.6, the
+note allows 1.0) from the centre of every U3 pad.
 
-Exit status 0 when nothing but the known structural item is reported (below).
-
-KNOWN STRUCTURAL ITEM, reported separately and not a failure of the placement:
-the "Power" net class asks for 0.30 mm clearance, and a track leaving a U3 pad
-sits 0.20 mm from the neighbouring pad when that pad is a supply (U3 pins 11,
-14 and 19 on the USB side, 3 and 8 on the MDI side), because the pads are on a
-0.40 mm pitch. Necking the track to 0.10 mm would still leave 0.225 mm. The
-existing U3 rule in raccoon-tap.kicad_dru only relaxes pad-to-pad spacing.
+Runs, each on a fresh copy:
+  base     SuperSpeed + USB 2.0 + the MDI0 / MDI1 pairs round the south end of
+           J2's pin field (ruling AM), with the netlist as it is.
+  X        base + the MDI2 / MDI3 pairs from the west, with the J2 pin nets of
+           MDI2 and MDI3 exchanged and their polarity turned (ruling AJ,
+           revised: both legal). Zero vias.
+  Y        the MDI0, MDI1 and MDI2 pairs round the south end, MDI3 from the
+           west with its polarity turned on J2. Zero vias.
+The exchanged nets are applied to the scratch copy only; netlist.yaml and the
+board are unchanged.
+  rule     the escapes of every U3 signal pad, with and without the
+           "track to U3 pad on fine-pitch parts" rule, and three controls that
+           must still be reported.
+Exit status 0 when every run and control behaves as stated.
 """
 
+import itertools
 import json
+import math
+import re
 import shutil
 import subprocess
 import sys
@@ -41,7 +51,11 @@ import pcbnew
 KICAD = Path(__file__).resolve().parents[2] / "kicad"
 KICAD_CLI = "/opt/homebrew/bin/kicad-cli"
 ORIGIN = (100.0, 80.0)          # gen_pcb.py ORIGIN_X, ORIGIN_Y
-NECK_LEN = float(sys.argv[1]) if len(sys.argv) > 1 else 0.6   # mm from the pad centre; the note allows 1.0, a pad ends 0.41 from its centre
+NECK_LEN = float(sys.argv[1]) if len(sys.argv) > 1 else 0.6
+RULE_NAME = "track to U3 pad on fine-pitch parts"
+
+W, NECK, PITCH = 0.20, 0.15, 0.375      # USB3 / USB 2.0
+MW, MPITCH = 0.18, 0.39                 # MDI
 
 
 def mm(value):
@@ -53,10 +67,12 @@ def vec(x, y):
 
 
 class Scratch:
-    def __init__(self, tmp):
-        self.tmp = tmp
-        shutil.copy(KICAD / "raccoon-tap.kicad_pcb", tmp)
-        self.board = pcbnew.LoadBoard(str(tmp / "raccoon-tap.kicad_pcb"))
+    def __init__(self, tmp, drop_rule=False, board=None):
+        self.tmp = Path(tmp)
+        self.drop_rule = drop_rule
+        shutil.copy(board or KICAD / "raccoon-tap.kicad_pcb",
+                    self.tmp / "raccoon-tap.kicad_pcb")
+        self.board = pcbnew.LoadBoard(str(self.tmp / "raccoon-tap.kicad_pcb"))
         self.pad = {}
         for fp in self.board.GetFootprints():
             for pad in fp.Pads():
@@ -66,6 +82,12 @@ class Scratch:
 
     def P(self, ref, number):
         return self.pad[(ref, number)]
+
+    def set_net(self, ref, number, net):
+        fp = self.board.FindFootprintByReference(ref)
+        for pad in fp.Pads():
+            if pad.GetNumber() == number:
+                pad.SetNet(self.board.FindNet(net))
 
     def trace(self, net, points, width, layer=pcbnew.F_Cu):
         item = self.board.FindNet(net)
@@ -80,37 +102,41 @@ class Scratch:
             self.board.Add(track)
 
     def via(self, net, x, y, diameter=0.6, drill=0.3):
-        item = self.board.FindNet(net)
-        assert item is not None, net
         via = pcbnew.PCB_VIA(self.board)
         via.SetPosition(vec(x, y))
         via.SetWidth(mm(diameter))
         via.SetDrill(mm(drill))
         via.SetViaType(pcbnew.VIATYPE_THROUGH)
         via.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
-        via.SetNet(item)
+        via.SetNet(self.board.FindNet(net))
         self.board.Add(via)
 
-    def leave(self, net, pad, direction, then, width, neck=0.15, neck_len=NECK_LEN):
-        """A track leaving a U3 pad: `neck` wide for `neck_len` from the pad
-        centre, then `width` along `then` (list of points)."""
+    def leave(self, net, pad, direction, then, width, neck=NECK, length=None):
+        """A track leaving a U3 pad: `neck` wide for `length` from the pad
+        centre, then `width` along `then`."""
+        length = NECK_LEN if length is None else length
         x, y = pad
-        dx, dy = direction
-        end = (x + dx * neck_len, y + dy * neck_len)
+        end = (x + direction[0] * length, y + direction[1] * length)
         self.trace(net, [pad, end], neck)
         self.trace(net, [end] + then, width)
 
     def drc(self):
         pcbnew.SaveBoard(str(self.tmp / "raccoon-tap.kicad_pcb"), self.board)
-        for name in ("raccoon-tap.kicad_pro", "raccoon-tap.kicad_dru"):
-            shutil.copy(KICAD / name, self.tmp)
+        shutil.copy(KICAD / "raccoon-tap.kicad_pro", self.tmp)
+        rules = (KICAD / "raccoon-tap.kicad_dru").read_text()
+        if self.drop_rule:
+            rules = re.sub(r'\(rule "%s".*?\n\t\(constraint[^\n]*\)\)\n' % RULE_NAME,
+                           "", rules, flags=re.S)
+            assert RULE_NAME not in rules
+        (self.tmp / "raccoon-tap.kicad_dru").write_text(rules)
         out = self.tmp / "drc.json"
         subprocess.run([KICAD_CLI, "pcb", "drc", "--severity-all", "--format",
                         "json", "--output", str(out),
                         str(self.tmp / "raccoon-tap.kicad_pcb")],
                        check=True, capture_output=True)
-        found = json.loads(out.read_text())["violations"]
-        return [v for v in found if v["severity"] == "error"]
+        data = json.loads(out.read_text())
+        self.unconnected = data["unconnected_items"]
+        return [v for v in data["violations"] if v["severity"] == "error"]
 
 
 def describe(violation):
@@ -120,138 +146,298 @@ def describe(violation):
             + f" at ({where['x'] - ORIGIN[0]:.2f}, {where['y'] - ORIGIN[1]:.2f})")
 
 
-def is_u3_supply_pad(violation):
-    """A "Power" class clearance against a pad of U3: the structural item."""
-    names = [i["description"] for i in violation["items"]]
-    return ("Power" in violation["description"]
-            and any(" von U3 " in n or " of U3 " in n for n in names))
+def left_offset(points, d):
+    """The polyline offset by d to the left of its direction of travel (north,
+    when travelling east), with mitred corners."""
+    def unit(a, b):
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        length = math.hypot(dx, dy)
+        return dx / length, dy / length
+    out = []
+    for i, p in enumerate(points):
+        if i == 0:
+            u = unit(points[0], points[1])
+            out.append((p[0] + u[1] * d, p[1] - u[0] * d))
+        elif i == len(points) - 1:
+            u = unit(points[-2], points[-1])
+            out.append((p[0] + u[1] * d, p[1] - u[0] * d))
+        else:
+            u1, u2 = unit(points[i - 1], p), unit(p, points[i + 1])
+            n1, n2 = (u1[1], -u1[0]), (u2[1], -u2[0])
+            mx, my = n1[0] + n2[0], n1[1] + n2[1]
+            length = math.hypot(mx, my)
+            mx, my = mx / length, my / length
+            k = d / (mx * n1[0] + my * n1[1])
+            out.append((p[0] + mx * k, p[1] + my * k))
+    return out
 
 
-def lay_superspeed(s):
-    """TX: U3 -> C22/C23 -> U8 -> J3. RX: J3 -> U8 -> U3. Every pair is coupled
-    (pitch 0.375, gap 0.175; on a 45-degree run the two lines are offset by
-    0.375 x sqrt 2 along y, which is why the RX pair's P line turns 0.155 mm
-    after its N line) wherever the geometry lets it be, and opens only where a
-    pad or a channel makes it."""
-    W, NECK, PITCH = 0.20, 0.15, 0.375
-    h = PITCH / 2
-    P = s.P
-    pad = {n: P("U8", n) for n in "123456"}
-    y_c = (pad["2"][1] + pad["5"][1]) / 2        # centre of the channel
-    j5, j6, j8, j9 = P("J3", "5"), P("J3", "6"), P("J3", "8"), P("J3", "9")
-    p13, p12, p15, p16 = (P("U3", n) for n in ("13", "12", "15", "16"))
-    c22_1, c22_2 = P("C22", "1"), P("C22", "2")
-    c23_1, c23_2 = P("C23", "1"), P("C23", "2")
+# ---- the order of the MDI pairs ---------------------------------------------
 
-    # --- TX, U3 side: necks, then the pair opens to 1.05 mm at the caps ------
-    s.leave("USB3_TX_P", p13, (0, -1), [c22_1], W)
-    s.leave("USB3_TX_N", p12, (0, -1), [(c23_1[0], c23_1[1] + 0.5), c23_1], W)
-
-    # --- TX, after the caps: closes to a pair, runs west, opens at U8 ------
-    # N stays above U8's TX row (0.62 mm stub down to pad 3); P goes into the
-    # channel (y_c - 0.4) and out of it again east of the row.
-    yn, yp = 15.2, 15.2 + PITCH                  # the pair east of U8
-    y_ch = y_c - 0.40
-    s.trace("USB3_TX_CONN_N", [c23_2, (c23_2[0], yn), (22.0, yn),
-                               (21.4, 14.8125), (8.3125, 14.8125),
-                               (7.5, j5[1]), (j5[0] + 0.9, j5[1])], W)
-    s.trace("USB3_TX_CONN_N", [(pad["3"][0], 14.8125), pad["3"]], W)
-    s.trace("USB3_TX_CONN_P", [c22_2, (c22_2[0], yp), (22.0, yp),
-                               (20.9, y_ch), (16.5125, y_ch),
-                               (15.0, 15.1875), (7.8125, 15.1875),
-                               (7.0, j6[1]), (j6[0] + 0.9, j6[1])], W)
-    s.trace("USB3_TX_CONN_P", [(pad["1"][0], y_ch), pad["1"]], W)
-
-    # --- RX: J3 -> coupled -> rises -> opens round U8's RX row -> U3 --------
-    y_rn, y_rp = y_c + 0.40, 19.07
-    s.trace("USB3_RX_N", [(j8[0] + 0.9, j8[1]), (7.5, j8[1]),
-                          (8.3125, 20.8125), (13.0, 20.8125), (16.3125, y_rn),
-                          (21.3, y_rn), (22.2, 18.23),
-                          (p15[0], 18.23), (p15[0], p15[1] - NECK_LEN)], W)
-    s.trace("USB3_RX_N", [(p15[0], p15[1] - NECK_LEN), p15], NECK)
-    s.trace("USB3_RX_N", [(pad["4"][0], y_rn), pad["4"]], W)
-    s.trace("USB3_RX_P", [(j9[0] + 0.9, j9[1]), (7.0, j9[1]),
-                          (7.8125, 21.1875), (13.155, 21.1875), (15.2725, y_rp),
-                          (21.5, y_rp), (22.4, 18.6),
-                          (p16[0], 18.6), (p16[0], p16[1] - NECK_LEN)], W)
-    s.trace("USB3_RX_P", [(p16[0], p16[1] - NECK_LEN), p16], NECK)
-    s.trace("USB3_RX_P", [(pad["6"][0], y_rp), pad["6"]], W)
-
-    # --- D+/D-: the vias that take the pair to the bottom layer, west of the
-    # RX rise and clear of U9's pads. Task 9 routes the pair; this only shows
-    # the vias fit beside the lanes above.
-    u9_6, u9_4 = P("U9", "6"), P("U9", "4")
-    s.via("USB2_D_P", 12.2, u9_6[1])
-    s.via("USB2_D_N", 12.2, u9_4[1])
-    s.trace("USB2_D_P", [u9_6, (12.2, u9_6[1])], W)
-    s.trace("USB2_D_N", [u9_4, (12.2, u9_4[1])], W)
-    return {"U8 channel centre y": y_c, "TX_P line": y_ch, "RX_N line": y_rn}
-
-
-def lay_mdi(s):
-    """Each MDI pad leaves with the neck and runs straight east to x = 29.5,
-    where task 9's fan-out begins; checks the escape and the room the pairs
-    have between U3 and the capacitors at the corners."""
-    for pin, net in (("10", "MDI3_N"), ("9", "MDI3_P"), ("7", "MDI2_N"),
-                     ("6", "MDI2_P"), ("5", "MDI1_N"), ("4", "MDI1_P"),
-                     ("2", "MDI0_N"), ("1", "MDI0_P")):
-        pad = s.P("U3", pin)
-        s.leave(net, pad, (1, 0), [(29.5, pad[1])], 0.18)
+def crossing(a, b, c, d):
+    def o(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+    return o(a, b, c) * o(a, b, d) < 0 and o(c, d, a) * o(c, d, b) < 0
 
 
 def mdi_order(s):
-    """Why the MDI pairs arrive at J2 in reversed order: straight lines from
-    U3's eight MDI signal pads to the same-numbered J2 pins, as placed and with
-    J2 mirrored onto the bottom side (front still facing the board edge)."""
-    import itertools
+    """Straight lines from U3's eight MDI signal pads to J2 pins: as netlist.yaml
+    has it, as placed; with J2 mirrored to the bottom side; and the best any
+    legal re-assignment can do on one layer (ruling AJ, revised: MDI0 with MDI1
+    and MDI2 with MDI3 may exchange, and P/N polarity may turn, nothing else)."""
+    u3 = {n: s.P("U3", n) for n in map(str, (1, 2, 4, 5, 6, 7, 9, 10))}
+    j2 = s.board.FindFootprintByReference("J2")
 
-    def crossing(a, b, c, d):
-        o = lambda p, q, r: (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
-        return o(a, b, c) * o(a, b, d) < 0 and o(c, d, a) * o(c, d, b) < 0
-
-    def count(j2):
-        pads = {p.GetNumber(): (pcbnew.ToMM(p.GetPosition().x) - ORIGIN[0],
+    def pins():
+        return {p.GetNumber(): (pcbnew.ToMM(p.GetPosition().x) - ORIGIN[0],
                                 pcbnew.ToMM(p.GetPosition().y) - ORIGIN[1])
                 for p in j2.Pads()}
-        u3 = {n: s.P("U3", n) for n in map(str, (1, 2, 4, 5, 6, 7, 9, 10))}
-        lines = {n: (u3[n], pads[n]) for n in u3}
-        pins = sum(crossing(*lines[a], *lines[b]) for a, b in itertools.combinations(lines, 2))
-        pairs = [("1", "2"), ("4", "5"), ("6", "7"), ("9", "10")]
-        pair_pairs = sum(any(crossing(*lines[x], *lines[y]) for x in pa for y in pb)
-                         for pa, pb in itertools.combinations(pairs, 2))
-        return pins, pair_pairs
 
-    j2 = s.board.FindFootprintByReference("J2")
-    placed = count(j2)
+    def count(pairs_map, pin_pos):
+        lines = [(u3[a], pin_pos[b]) for a, b in pairs_map]
+        return sum(crossing(*x, *y) for x, y in itertools.combinations(lines, 2))
+
+    natural = [(str(n), str(n)) for n in (1, 2, 4, 5, 6, 7, 9, 10)]
+    pin_pos = pins()
+    placed = count(natural, pin_pos)
+    # legal maps: U3 pair -> J2 cable pair, pairs given as (P pin, N pin)
+    u3_pairs = {0: ("1", "2"), 1: ("4", "5"), 2: ("6", "7"), 3: ("9", "10")}
+    j2_pairs = {"A": ("1", "2"), "B": ("3", "4"), "C": ("7", "8"), "D": ("9", "10")}
+    best = None
+    for ab, cd in itertools.product(itertools.permutations("AB"),
+                                    itertools.permutations("CD")):
+        target = dict(zip((0, 1), ab)); target.update(dict(zip((2, 3), cd)))
+        for flips in itertools.product((0, 1), repeat=4):
+            m = []
+            for k in range(4):
+                ju = j2_pairs[target[k]]
+                if flips[k]:
+                    ju = ju[::-1]
+                m += [(u3_pairs[k][0], ju[0]), (u3_pairs[k][1], ju[1])]
+            c = count(m, pin_pos)
+            best = c if best is None else min(best, c)
     j2.Flip(j2.GetPosition(), pcbnew.FLIP_DIRECTION_LEFT_RIGHT)
     j2.SetOrientationDegrees(270)
-    mirrored = count(j2)
-    return placed, mirrored
+    mirrored = count(natural, pins())
+    return placed, best, mirrored
+
+
+# ---- SuperSpeed and USB 2.0 -------------------------------------------------
+
+def lay_usb(s):
+    """TX: U3 -> C22/C23 -> U8 -> J3. RX: J3 -> U8 -> U3. D+/D-: J3 -> U9, the
+    D- line through the channel between U9's pad columns (DS4260: pins 3 and 4
+    are one node), to the bottom layer and back up at U3. A 45-degree run of a
+    pair puts its two lines 0.375 x sqrt 2 apart along y, which is why the RX
+    pair's P line turns 0.155 mm after its N line."""
+    P = s.P
+    pad = {n: P("U8", n) for n in "123456"}
+    y_c = (pad["2"][1] + pad["5"][1]) / 2        # centre of the channel
+    y_ch, y_rn, y_rp = y_c - 0.40, y_c + 0.40, 19.07
+    j2, j3, j5, j6, j8, j9 = (P("J3", n) for n in ("2", "3", "5", "6", "8", "9"))
+    p12, p13, p15, p16, p17, p18 = (P("U3", n) for n in ("12", "13", "15", "16", "17", "18"))
+    c22_1, c22_2, c23_1, c23_2 = P("C22", "1"), P("C22", "2"), P("C23", "1"), P("C23", "2")
+    x3, x1 = pad["3"][0], pad["1"][0]
+    up = (0, -1)
+
+    # TX: necks, then the pair opens to 1.05 mm at the caps
+    s.leave("USB3_TX_P", p13, up, [c22_1], W)
+    s.leave("USB3_TX_N", p12, up, [(c23_1[0], c23_1[1] + 0.5), c23_1], W)
+    yn, yp = 15.2, 15.2 + PITCH
+    s.trace("USB3_TX_CONN_N", [c23_2, (c23_2[0], yn), (22.0, yn), (21.4, 14.8125),
+                               (8.3125, 14.8125), (7.5, j5[1]), (j5[0] + 0.9, j5[1])], W)
+    s.trace("USB3_TX_CONN_N", [(x3, 14.8125), pad["3"]], W)
+    s.trace("USB3_TX_CONN_P", [c22_2, (c22_2[0], yp), (22.0, yp), (20.9, y_ch),
+                               (x3 - 0.7375, y_ch), (x3 - 2.25, 15.1875),
+                               (7.8125, 15.1875), (7.0, j6[1]), (j6[0] + 0.9, j6[1])], W)
+    s.trace("USB3_TX_CONN_P", [(x1, y_ch), pad["1"]], W)
+    # RX
+    s.trace("USB3_RX_N", [(j8[0] + 0.9, j8[1]), (7.5, j8[1]), (8.3125, 20.8125),
+                          (x3 - 3.3125, 20.8125), (x3, y_rn), (21.0, y_rn),
+                          (21.575, 18.075), (p15[0], 18.075), (p15[0], p15[1] - NECK_LEN)], W)
+    s.trace("USB3_RX_N", [(p15[0], p15[1] - NECK_LEN), p15], NECK)
+    s.trace("USB3_RX_N", [(x3, y_rn), (x3, pad["4"][1])], W)
+    s.trace("USB3_RX_P", [(j9[0] + 0.9, j9[1]), (7.0, j9[1]), (7.8125, 21.1875),
+                          (x3 - 1.495, 21.1875), (x3 + 0.6225, y_rp), (19.6, y_rp),
+                          (20.22, 18.45), (p16[0], 18.45), (p16[0], p16[1] - NECK_LEN)], W)
+    s.trace("USB3_RX_P", [(p16[0], p16[1] - NECK_LEN), p16], NECK)
+    s.trace("USB3_RX_P", [(x1, y_rp), pad["6"]], W)
+    # USB 2.0 at J3 and U9: D+ in at pin 1 and out at 6; D- in at 3, through
+    # the channel between the columns, north of D+, out at the top; pin 4 joined
+    u1, u2, u3, u4, u5, u6 = (P("U9", n) for n in "123456")
+    s.trace("USB2_D_P", [(j3[0] + 0.9, j3[1]), (6.5, u1[1]), u1], W)
+    s.trace("USB2_D_N", [(j2[0] + 0.9, j2[1]), (6.5, u3[1]), u3, (9.6, u3[1]),
+                         (9.6, 16.2), (12.2, 16.2)], W)
+    s.trace("USB2_D_N", [(9.6, u3[1]), u4], W)
+    s.trace("USB2_D_P", [u6, (12.2, 17.1)], W)
+    s.trace("GND", [(P("J3", "7")[0] + 0.9, P("J3", "7")[1]), u2], 0.3)
+    s.via("+5V", 11.9, 18.0)
+    s.trace("+5V", [u5, (11.9, 18.0)], 0.3)
+    s.via("USB2_D_N", 12.2, 16.2)
+    s.via("USB2_D_P", 12.2, 17.1)
+    # the D pair under the RX lanes, on the bottom layer, up again at U3
+    s.trace("USB2_D_P", [p18, (p18[0], p18[1] - NECK_LEN)], NECK)
+    s.trace("USB2_D_P", [(p18[0], p18[1] - NECK_LEN), (p18[0], 19.75), (21.5, 19.75)], W)
+    s.trace("USB2_D_N", [p17, (p17[0], p17[1] - NECK_LEN)], NECK)
+    s.trace("USB2_D_N", [(p17[0], p17[1] - NECK_LEN), (p17[0], 19.1), (22.4, 19.1)], W)
+    s.via("USB2_D_P", 21.5, 19.75)
+    s.via("USB2_D_N", 22.4, 19.1)
+    s.trace("USB2_D_N", [(22.4, 19.1), (15.1, 19.1), (12.2, 16.2)], W, pcbnew.B_Cu)
+    s.trace("USB2_D_P", [(21.5, 19.75), (14.85, 19.75), (12.2, 17.1)], W, pcbnew.B_Cu)
+    return {"U8 channel centre y": round(y_c, 2), "TX_P line": round(y_ch, 2),
+            "RX_N line": round(y_rn, 2)}
+
+
+# ---- MDI --------------------------------------------------------------------
+
+def wrap(s, nets, pads, centre, lane_x, pin_n, pin_p):
+    """One MDI pair round the south end of J2's pin field and up the channel
+    east of the pin columns. `centre` is the pair's centre line up to the foot
+    of the lane at x = lane_x; N (the west line) leaves the lane at the row of
+    pin_n (a west-column pin, reached from the east through the gap between two
+    east-column pins), P at the row of pin_p (an east-column pin)."""
+    net_n, net_p = nets
+    pad_n, pad_p = pads
+    top = min(pin_n[1], pin_p[1])
+    line = centre + [(lane_x, top)]
+    left = left_offset(line, MPITCH / 2)
+    right = left_offset(line, -MPITCH / 2)
+    cut = lambda poly, y: poly[:-1] + [(poly[-1][0], y)]
+    for net, pad in ((net_n, pad_n), (net_p, pad_p)):
+        s.trace(net, [pad, (pad[0] + NECK_LEN, pad[1])], NECK)
+    s.trace(net_n, [(pad_n[0] + NECK_LEN, pad_n[1])] + cut(left, pin_n[1]) + [pin_n], MW)
+    s.trace(net_p, [(pad_p[0] + NECK_LEN, pad_p[1])] + cut(right, pin_p[1]) + [pin_p], MW)
+
+
+def lay_mdi(s, variant):
+    u = {n: s.P("U3", n) for n in ("1", "2", "4", "5", "6", "7", "9", "10")}
+    j = {str(n): s.P("J2", str(n)) for n in range(1, 11)}
+    x0 = u["5"][0] + NECK_LEN
+    if variant == "Y":
+        # MDI3 polarity turned on J2
+        s.set_net("J2", "9", "MDI3_N")
+        s.set_net("J2", "10", "MDI3_P")
+        wrap(s, ("MDI2_N", "MDI2_P"), (u["7"], u["6"]),
+             [(x0, 22.6), (31.3, 22.6), (33.65, 24.95), (40.35, 24.95), (42.4, 22.9)],
+             42.4, j["8"], j["7"])
+        wrap(s, ("MDI1_N", "MDI1_P"), (u["5"], u["4"]),
+             [(x0, 23.4), (30.95, 23.4), (33.7, 26.15), (40.25, 26.15), (43.7, 22.7)],
+             43.7, j["4"], j["3"])
+        wrap(s, ("MDI0_N", "MDI0_P"), (u["2"], u["1"]),
+             [(x0, 24.6), (31.0, 24.6), (33.75, 27.35), (40.15, 27.35), (45.0, 22.5)],
+             45.0, j["2"], j["1"])
+        x0d = u["10"][0] + NECK_LEN
+        s.trace("MDI3_N", [u["10"], (x0d, 21.2)], NECK)
+        s.trace("MDI3_P", [u["9"], (x0d, 21.6)], NECK)
+        s.trace("MDI3_N", [(x0d, 21.2), (36.0, 21.2), (37.0, 22.2), (37.245, 22.445), j["9"]], MW)
+        s.trace("MDI3_P", [(x0d, 21.6), (34.0, 21.6), (36.115, 23.715), j["10"]], MW)
+        return
+    wrap(s, ("MDI1_N", "MDI1_P"), (u["5"], u["4"]),
+         [(x0, 23.4), (33.0, 23.4), (34.6, 25.0), (40.2, 25.0), (42.7, 22.5)],
+         42.7, j["4"], j["3"])
+    wrap(s, ("MDI0_N", "MDI0_P"), (u["2"], u["1"]),
+         [(x0, 24.6), (31.0, 24.6), (32.6, 26.2), (41.3, 26.2), (44.0, 23.5)],
+         44.0, j["2"], j["1"])
+    if variant == "X":
+        # MDI2 and MDI3 exchanged on J2, both turned: pin 7 MDI3_N, 8 MDI3_P,
+        # 9 MDI2_N, 10 MDI2_P
+        for pin, net in (("7", "MDI3_N"), ("8", "MDI3_P"), ("9", "MDI2_N"), ("10", "MDI2_P")):
+            s.set_net("J2", pin, net)
+        x0d = u["10"][0] + NECK_LEN
+        for net, pin in (("MDI3_N", "10"), ("MDI3_P", "9"), ("MDI2_N", "7"), ("MDI2_P", "6")):
+            s.trace(net, [u[pin], (x0d, u[pin][1])], NECK)
+        s.trace("MDI3_N", [(x0d, 21.2), (35.5, 21.2), (36.8, 19.905), j["7"]], MW)
+        s.trace("MDI3_P", [(x0d, 21.6), (36.6, 21.6), (37.0, 21.175), j["8"]], MW)
+        s.trace("MDI2_N", [(x0d, 22.4), (36.5, 22.4), (36.6, 22.445), j["9"]], MW)
+        s.trace("MDI2_P", [(x0d, 22.8), (34.0, 22.8), (34.915, 23.715), j["10"]], MW)
+
+
+def lay_escapes(s):
+    """Every U3 signal pad leaves with the neck and runs on (3 mm for MDI, 2 mm
+    for the USB pairs, which have C22 and C23 beyond): the case the rule is for."""
+    for pin, net in (("10", "MDI3_N"), ("9", "MDI3_P"), ("7", "MDI2_N"), ("6", "MDI2_P"),
+                     ("5", "MDI1_N"), ("4", "MDI1_P"), ("2", "MDI0_N"), ("1", "MDI0_P")):
+        pad = s.P("U3", pin)
+        s.leave(net, pad, (1, 0), [(pad[0] + 3.0, pad[1])], MW)
+    for pin, net in (("12", "USB3_TX_N"), ("13", "USB3_TX_P"), ("15", "USB3_RX_N"),
+                     ("16", "USB3_RX_P"), ("17", "USB2_D_N"), ("18", "USB2_D_P")):
+        pad = s.P("U3", pin)
+        s.leave(net, pad, (0, -1), [(pad[0], pad[1] - 2.0)], W)
+
+
+def run(label, work, drop_rule=False, board=None):
+    with tempfile.TemporaryDirectory() as tmp:
+        s = Scratch(tmp, drop_rule, board)
+        info = work(s)
+        errors = s.drc()
+        return errors, s.unconnected, info
 
 
 def main():
     status = 0
     with tempfile.TemporaryDirectory() as tmp:
-        s = Scratch(Path(tmp))
-        placed, mirrored = mdi_order(s)
-        print(f"MDI order, straight lines U3 pad -> J2 pin: as placed {placed[0]} of 28 "
-              f"pin pairs and {placed[1]} of 6 pair pairs cross; J2 mirrored to the "
-              f"bottom side {mirrored[0]} and {mirrored[1]}")
-        s = Scratch(Path(tmp))
-        info = lay_superspeed(s)
-        lay_mdi(s)
-        errors = s.drc()
-        structural = [v for v in errors if is_u3_supply_pad(v)]
-        other = [v for v in errors if v not in structural]
-        print("U8 channel:", {k: round(v, 2) for k, v in info.items()})
-        print(f"{len(other)} violation(s) other than the known structural item")
-        for v in other:
+        placed, legal, mirrored = mdi_order(Scratch(tmp))
+    print(f"MDI order, straight lines U3 pad -> J2 pin (28 pin pairs): as placed {placed}; "
+          f"best legal re-assignment on one layer {legal}; J2 mirrored to the bottom {mirrored}")
+
+    def usb_and(variant):
+        def work(s):
+            info = lay_usb(s)
+            lay_mdi(s, variant)
+            return info
+        return work
+
+    for variant, text in (("", "base: SuperSpeed + USB 2.0 + MDI0/MDI1 round the south end"),
+                          ("X", "X: base + MDI2/MDI3 exchanged and turned on J2, from the west"),
+                          ("Y", "Y: MDI0, MDI1, MDI2 round the south end, MDI3 turned")):
+        errors, unconnected, info = run(variant, usb_and(variant))
+        if variant == "Y":
+            pass
+        left = sorted({i["description"].split("[")[1].split("]")[0]
+                       for u in unconnected for i in u["items"] if "[" in i["description"]
+                       and i["description"].split("[")[1].split("]")[0].startswith(("USB", "MDI"))
+                       and variant != ""})
+        print(f"{text}: {len(errors)} violation(s)"
+              + (f"; nets still unconnected: {left}" if left else ""))
+        for v in errors:
             print("  ", describe(v))
-        print(f"{len(structural)} track-to-supply-pad violation(s) at U3 "
-              "(known structural item, see the module docstring)")
-        for v in structural:
-            print("  ", describe(v))
-        status = 1 if other else 0
+        status |= 1 if errors else 0
+
+    for drop in (True, False):
+        errors, _, _ = run("rule", lay_escapes, drop_rule=drop)
+        print(f"escapes of the 14 U3 signal pads, rule {'absent' if drop else 'present'}: "
+              f"{len(errors)} violation(s)")
+        if drop and not errors:
+            status = 1
+        if not drop and errors:
+            status = 1
+            for v in errors:
+                print("  ", describe(v))
+
+    # controls: the rule must not let anything nearer than 0.2 mm, and must not
+    # reach past U3's pads or tracks
+    def control_track(s):
+        # 0.19 mm above pad 14 (+1V0, x = 24.6): a USB3_RX_P track at y = 20.15 - 0.19 - 0.1
+        s.trace("USB3_RX_P", [(24.0, 19.86), (25.2, 19.86)], 0.2)
+
+    def control_other_footprint(s):
+        # 0.25 mm from pad 1 of C12 (+1V0), which is not U3: the class rule still holds
+        pad = s.P("C12", "1")
+        s.trace("MDI0_P", [(pad[0] - 1.0, pad[1] - 0.31 - 0.25 - 0.09),
+                           (pad[0] + 1.0, pad[1] - 0.31 - 0.25 - 0.09)], MW)
+
+    def control_via(s):
+        # a via 0.25 mm from the end of U3 pad 3 (+1V0): vias are outside the rule
+        pad = s.P("U3", "3")
+        s.via("MDI0_P", pad[0] + 0.41 + 0.25 + 0.3, pad[1])
+
+    for name, work in (("track 0.19 mm from a U3 pad", control_track),
+                       ("track 0.25 mm from a pad of another footprint", control_other_footprint),
+                       ("via 0.25 mm from a U3 pad", control_via)):
+        errors, _, _ = run(name, work)
+        ok = bool(errors)
+        print(f"control, {name}: {'reported, as it must be' if ok else 'NOT reported'}")
+        status |= 0 if ok else 1
     return status
 
 

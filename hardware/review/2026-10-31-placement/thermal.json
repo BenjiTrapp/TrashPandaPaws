@@ -7,21 +7,21 @@
       "hardware/review/2026-10-31-placement/pcb.json"
     ],
     "source_hashes": {
-      "hardware/review/2026-10-31-placement/schematic.json": "b817f1691b42cdfaf6c2612d5e56c685029f9da86f61e252ea9ef58eb8524a07",
-      "hardware/review/2026-10-31-placement/pcb.json": "cad7d5f0730f834518c05d68c0b9254d44ac396f1ba13e10f24e7f21880bcc95"
+      "hardware/review/2026-10-31-placement/schematic.json": "00a316472140b1c3a7975c56fdce6b5fdb9991b421eb0013f3e59ed0a6d58100",
+      "hardware/review/2026-10-31-placement/pcb.json": "d36319a67c369276eb16ac8f560d0aca8afa8dc33ddc772ddbe2cf1d7a89254a"
     },
     "run_id": "20261102T092822Z-d400a9",
     "config_hash": null,
     "upstream_artifacts": {
       "schematic": {
         "path": "hardware/review/2026-10-31-placement/schematic.json",
-        "sha256": "b817f1691b42cdfaf6c2612d5e56c685029f9da86f61e252ea9ef58eb8524a07",
+        "sha256": "00a316472140b1c3a7975c56fdce6b5fdb9991b421eb0013f3e59ed0a6d58100",
         "schema_version": "1.4.0",
         "run_id": "20261102T092822Z-d400a9"
       },
       "pcb": {
         "path": "hardware/review/2026-10-31-placement/pcb.json",
-        "sha256": "cad7d5f0730f834518c05d68c0b9254d44ac396f1ba13e10f24e7f21880bcc95",
+        "sha256": "d36319a67c369276eb16ac8f560d0aca8afa8dc33ddc772ddbe2cf1d7a89254a",
         "schema_version": "1.4.0",
         "run_id": "20261102T092822Z-d400a9"
       }

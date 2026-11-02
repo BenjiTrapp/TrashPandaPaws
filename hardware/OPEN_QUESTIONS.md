@@ -763,11 +763,11 @@ shield pads are named `SH`, so J3's shield pin was renamed to match.
 ## PCB — generated and DRC-checked, not routed
 
 > **Task 8 update (2026-11-02).** The board described below has been
-> re-placed: 70 x 36 mm, 58 footprints, U3 turned to 180 degrees, mounting
-> holes and cable-tie slots, In2 split into islands. The figures in the rest of
+> re-placed: still 58 x 36 mm, 58 footprints, U3 turned to 180 degrees, two
+> mounting holes, In2 split into islands. The figures in the rest of
 > this section are from the earlier board. Current numbers, findings and the
 > hand-off to routing (including the MDI pair-order reversal that rotation does
-> not fix, and the 0.30 mm Power clearance against U3's 0.40 mm pitch) are in
+> not fix, and the U3 track-clearance rule) are in
 > `review/2026-10-31-placement/README.md`.
 
 `tools/gen_pcb.py` builds `kicad/raccoon-tap.kicad_pcb` through KiCad's own

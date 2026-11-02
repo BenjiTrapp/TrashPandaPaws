@@ -2608,7 +2608,7 @@
     },
     {
       "value": "USBLC6-2SC6",
-      "footprint": "Package_TO_SOT_SMD:SOT-23-6",
+      "footprint": "raccoon:SOT-23-6_USBLC6-2",
       "mpn": "USBLC6-2SC6",
       "manufacturer": "STMicroelectronics",
       "digikey": "",
@@ -2971,7 +2971,7 @@
       "value": "USBLC6-2SC6",
       "lib_id": "raccoon:RACCOON_U9",
       "lib_name": "",
-      "footprint": "Package_TO_SOT_SMD:SOT-23-6",
+      "footprint": "raccoon:SOT-23-6_USBLC6-2",
       "datasheet": "",
       "description": "",
       "mpn": "USBLC6-2SC6",
@@ -25493,7 +25493,7 @@
       "resistor": 5,
       "capacitor": 8
     },
-    "total_unique_footprints": 19,
+    "total_unique_footprints": 20,
     "single_use_passive_values": 12,
     "consolidation_suggestions": [
       {
@@ -25817,7 +25817,7 @@
       "hardware/kicad/raccoon-tap.kicad_sch"
     ],
     "source_hashes": {
-      "hardware/kicad/raccoon-tap.kicad_sch": "eebaf3eb44ff574347a29752f2b9e553a1b2223f95145ed4103180eeb6530297"
+      "hardware/kicad/raccoon-tap.kicad_sch": "d1bfd3ce4d9a49d1bad106be4983fa513651d9c52070a235f994bc6900d93151"
     },
     "run_id": "20261102T092822Z-d400a9",
     "config_hash": null,
