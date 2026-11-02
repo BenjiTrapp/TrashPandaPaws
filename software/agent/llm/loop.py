@@ -77,6 +77,22 @@ _TEXT_BLOCK = re.compile(
     r"^[ \t]*TOOL_CALL[ \t\r]*\n(.*?)^[ \t]*END[ \t\r]*$",
     re.DOTALL | re.MULTILINE)
 
+# Tried only when the anchored pattern finds nothing. The text protocol is
+# there for models too weak for native tool calling, and those are exactly
+# the ones that put both markers on one line or forget END — so refusing the
+# shape outright means the fallback fails for its own audience. This match is
+# lazy, which reintroduces the END-inside-an-argument problem the anchored
+# pattern avoids; in that case the JSON arrives cut short and comes back as a
+# readable parse error, which the model can act on. Silently returning the
+# attempt as a final answer is the outcome worth avoiding.
+_TEXT_BLOCK_LOOSE = re.compile(r"TOOL_CALL[ \t\r\n]*(.*?)[ \t\r\n]*END",
+                               re.DOTALL)
+
+# A reply that mentions the marker but parses to nothing is a format mistake,
+# not an answer. Nudging costs a turn; treating it as the final answer hands
+# the caller a raw TOOL_CALL string as if it were a result.
+_TEXT_MENTION = re.compile(r"TOOL_CALL")
+
 _TEXT_PROTOCOL = """\
 
 You can call tools. To call one, write a block in your reply, with each \
@@ -105,9 +121,19 @@ def _text_system(system: str, tools: List[Tool]) -> str:
 
 def _parse_text_calls(text: str, turn: int) -> List[ToolCall]:
     calls = []  # type: List[ToolCall]
-    for i, m in enumerate(_TEXT_BLOCK.finditer(text)):
-        call_id = "text_%d_%d" % (turn, i)
-        calls.append(_read_block(call_id, m.group(1)))
+    for pattern in (_TEXT_BLOCK, _TEXT_BLOCK_LOOSE):
+        for i, m in enumerate(pattern.finditer(text)):
+            call_id = "text_%d_%d" % (turn, i)
+            calls.append(_read_block(call_id, m.group(1)))
+        if calls:
+            return calls
+    if _TEXT_MENTION.search(text):
+        return [ToolCall(
+            "text_%d_0" % turn, "", {},
+            "a TOOL_CALL block was started but could not be read: write "
+            "TOOL_CALL alone on its own line, then one JSON object, then END "
+            "alone on its own line. If you meant this as your final answer, "
+            "write it again without the word TOOL_CALL.")]
     return calls
 
 

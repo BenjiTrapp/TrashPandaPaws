@@ -610,20 +610,82 @@ class TestTextProtocolFallback(IsolatedAsyncioTestCase):
         self.assertEqual(await loop.run(c, system="s", prompt="p", tools=[],
                                         max_turns=8), "nur prosa")
 
-    async def test_marker_on_a_single_line_is_not_a_block(self):
-        # Only a line of its own opens or closes a block, which is what lets
-        # "END" appear inside an argument; the instructions say so.
+    async def test_end_inside_an_argument_does_not_close_the_block(self):
+        # This is the property the line-anchored pattern exists for, and it
+        # holds because that pattern is tried first. The earlier version of
+        # this test asserted a consequence instead — that a single-line block
+        # is not a block at all — which is a different claim and is no longer
+        # true; see test_a_single_line_block_is_still_honoured.
         entered = []
 
         async def echo(value="d"):
             entered.append(value)
             return {}
-        text = 'TOOL_CALL {"name": "echo", "arguments": {}} END'
-        c = mock.MockClient([mock.text(text)], supports_tools=False)
+        c = mock.MockClient(
+            [mock.text('TOOL_CALL\n{"name": "echo", "arguments": '
+                       '{"value": "END"}}\nEND'),
+             mock.text("fertig")], supports_tools=False)
         out = await loop.run(c, system="s", prompt="p",
-                             tools=[_tool("echo", echo, {})], max_turns=4)
-        self.assertEqual(out, text)
-        self.assertEqual(entered, [])
+                             tools=[_tool("echo", echo, {"value": "string"})],
+                             max_turns=4)
+        self.assertEqual(out, "fertig")
+        self.assertEqual(entered, ["END"])
+
+    async def test_a_single_line_block_is_still_honoured(self):
+        # The fallback exists for models too weak for native tool calling,
+        # and those are the ones that put both markers on one line. Refusing
+        # the shape made the fallback fail for its own audience.
+        entered = []
+
+        async def echo(value="d"):
+            entered.append(value)
+            return {}
+        c = mock.MockClient(
+            [mock.text('TOOL_CALL {"name": "echo", '
+                       '"arguments": {"value": "hi"}} END'),
+             mock.text("fertig")], supports_tools=False)
+        out = await loop.run(c, system="s", prompt="p",
+                             tools=[_tool("echo", echo, {"value": "string"})],
+                             max_turns=4)
+        self.assertEqual(out, "fertig")
+        self.assertEqual(entered, ["hi"])
+
+    async def test_an_unclosed_block_is_corrected_not_returned_as_an_answer(self):
+        # Returning the raw attempt would hand the caller a TOOL_CALL string
+        # as if it were a result. The nudge costs one turn and the model can
+        # act on it.
+        captured = {}
+
+        async def echo(value="d"):
+            return {}
+        c = _capturing_mock(captured, [
+            mock.text('TOOL_CALL\n{"name": "echo", "arguments": {"value": "hi"}}'),
+            mock.text("fertig")], supports_tools=False)
+        out = await loop.run(c, system="s", prompt="p",
+                             tools=[_tool("echo", echo, {"value": "string"})],
+                             max_turns=4)
+        self.assertEqual(out, "fertig")
+        # A client with no tool support has no "tool" role, so the loop sends
+        # results back as a user message; that is where the nudge lands.
+        self.assertIn("own line", captured["user_messages"][-1])
+
+    async def test_prose_that_merely_mentions_the_marker_is_corrected(self):
+        # The cost of this one: a reply that talks about TOOL_CALL without
+        # using it spends a turn being corrected. Accepted, because the
+        # alternative is returning a half-written call as the final answer.
+        async def echo(value="d"):
+            return {}
+        c = mock.MockClient([mock.text("I will use TOOL_CALL in a moment"),
+                             mock.text("fertig")], supports_tools=False)
+        out = await loop.run(c, system="s", prompt="p",
+                             tools=[_tool("echo", echo, {"value": "string"})],
+                             max_turns=4)
+        self.assertEqual(out, "fertig")
+
+    async def test_plain_prose_is_still_a_final_answer(self):
+        c = mock.MockClient([mock.text("nur prosa")], supports_tools=False)
+        self.assertEqual(await loop.run(c, system="s", prompt="p", tools=[],
+                                        max_turns=4), "nur prosa")
 
 
 # ── Observability ──
