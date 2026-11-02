@@ -291,14 +291,32 @@ class TestCheckOrder(IsolatedAsyncioTestCase):
         await r.run_command("kill", beacon_id="raccoon-fox")
         self.assertEqual(_approvals(r), 0)
 
-    async def test_the_gate_is_asked_before_the_path_is_chosen(self):
-        # The gate needs the risk numbers, so it runs on the classification
-        # and not on a routable command: a tier-2 command with no usable
-        # path has already asked.
-        r, c2 = _router()
-        res = await r.run_command("lsassy -u a -p b 10.0.1.5")
+    async def test_an_impossible_route_is_refused_without_asking(self):
+        # This asserted the opposite: that a tier-2 command with no usable
+        # path had already asked, on the grounds that the gate runs on the
+        # classification rather than on a routable command. The first half of
+        # that is true and unchanged — the classification is what the gate
+        # prices — but it does not follow that a question worth nothing
+        # should be put to the operator. An approval spent on something that
+        # cannot run is what teaches people to click through.
+        #
+        # All three impossible routes are knowable without asking anyone.
+        for kwargs in ({},
+                       {"beacon_id": "nope"},
+                       {"beacon_id": "raccoon-fox", "server_side": True}):
+            r, c2 = _router()
+            res = await r.run_command("lsassy -u a -p b 10.0.1.5", **kwargs)
+            self.assertFalse(res.success, kwargs)
+            self.assertEqual(_approvals(r), 0, kwargs)
+            self.assertTrue(c2.nothing_ran(), kwargs)
+
+    async def test_the_gate_still_prices_the_action_not_the_route(self):
+        # A viable route still goes to the gate, and the refusal names it.
+        r, c2 = _router(gate_allows=False)
+        res = await r.run_command("lsassy -u a -p b 10.0.1.5", server_side=True)
         self.assertFalse(res.success)
         self.assertEqual(_approvals(r), 1)
+        self.assertIn("gate", res.blocked_reason.lower())
         self.assertTrue(c2.nothing_ran())
 
 

@@ -144,6 +144,23 @@ def _reaches_the_network(command: str, server_side: bool) -> bool:
     return first in _NETWORK_VERBS
 
 
+def _route_problem(beacon_id, server_side, beacon_ids) -> Optional[str]:
+    """Why this request can never run, or None if the route is viable.
+
+    Separate from the path selection below so the gate can consult it first:
+    everything here is knowable without asking anyone.
+    """
+    if server_side and beacon_id is not None:
+        return "give either beacon_id or server_side, not both"
+    if server_side:
+        return None
+    if beacon_id is None:
+        return "name a beacon_id, or set server_side"
+    if beacon_id not in beacon_ids:
+        return "unknown beacon '%s'" % str(beacon_id)[:_CLIP]
+    return None
+
+
 def _scope_view(command: str) -> Optional[str]:
     """The command as scope should read it, or None if it will not tokenise."""
     try:
@@ -361,18 +378,19 @@ class Router:
         if classification.tier == safety.TIER_HARD:
             return blocked(classification.reason or "irreversible action")
         if classification.tier == safety.TIER_KNOCK:
-            # Before the gate, not after: in supervised mode a request that
-            # names a beacon this job does not have would put a question in
-            # front of the operator, take their answer, and then be refused
-            # anyway. A decision spent on something that cannot run teaches
-            # people to click through. Only a *named* id is checked here; a
-            # request that names none still asks first (the gate prices the
-            # action, not the route — see test_the_gate_is_asked_before_the_
-            # path_is_chosen). Checked again below, because beacon_ids is
-            # live and an approval can wait minutes for an answer.
-            if (beacon_id is not None and not server_side
-                    and beacon_id not in self._beacon_ids):
-                return blocked("unknown beacon '%s'" % str(beacon_id)[:_CLIP])
+            # Before the gate, not after: in supervised mode a request whose
+            # route is already impossible would put a question in front of
+            # the operator, take their answer, and then be refused anyway. A
+            # decision spent on something that cannot run teaches people to
+            # click through.
+            #
+            # Three ways the route is impossible, all knowable now: both
+            # targets given, neither given, or a named beacon this job does
+            # not have. The named-beacon case is checked again below, because
+            # beacon_ids is live and an approval can wait minutes.
+            route = _route_problem(beacon_id, server_side, self._beacon_ids)
+            if route:
+                return blocked(route)
             decision = await self.gate.request(
                 classification, p_success_override=p_success_override)
             if not decision.allowed:
@@ -385,8 +403,9 @@ class Router:
         limited = (safety.enforce_scan_limits(command)
                    if self._limit_scan_rate else command)
 
-        if server_side and beacon_id is not None:
-            return blocked("give either beacon_id or server_side, not both")
+        route = _route_problem(beacon_id, server_side, self._beacon_ids)
+        if route:
+            return blocked(route)
         if server_side:
             try:
                 argv = shlex.split(limited)
@@ -395,8 +414,4 @@ class Router:
             if not argv:
                 return blocked("the command is empty")
             return _Plan("server", limited, argv, view)
-        if beacon_id is None:
-            return blocked("name a beacon_id, or set server_side")
-        if beacon_id not in self._beacon_ids:
-            return blocked("unknown beacon '%s'" % str(beacon_id)[:_CLIP])
         return _Plan("beacon", limited, None, view)
