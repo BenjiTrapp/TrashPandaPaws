@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Cross-check of the diff-pair geometry in stackup-note.md.
 
-Two independent numbers per geometry:
+Three numbers per geometry:
 
   pcbway   the formula PCBWay's own Edge Coupled Microstrip calculator runs
            (hardware/fab/pcbway-source-excerpts.txt [1]); the same function
-           check_fab_release.py uses to guard the net classes.
+           check_fab_release.py uses to guard the net classes. Bare copper.
+  as-built pcbway minus PCBWAY_MASK_OFFSET_OHM, PCBWay's own figure for what
+           one pass of solder mask does to a differential pair
+           (excerpt [4]). This is the column the net classes are centred on.
   fd2d     a 2-D finite-element Laplace solve of the cross-section (bilinear
            elements, rectangular copper, ground plane below, grounded box
            around), odd-mode impedance doubled. Written for this check and
@@ -14,7 +17,8 @@ Two independent numbers per geometry:
            2 mm apart, copper 5 um): 68.7 ohm against 70.4 ohm, a 2 %
            difference that is not explained further here.
 
-The solder-mask case is an upper bound: mask is modelled as Er 3.5 filling
+The fd2d+mask column is an estimate, kept as a second opinion on the
+as-built column, and it is an upper bound: mask is modelled as Er 3.5 filling
 everything from the laminate up to 15 um above the copper. PCBWay publishes
 neither the mask thickness nor its Er on the pages used; 3.5 is an assumption.
 
@@ -32,7 +36,8 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as sla
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
-from check_fab_release import pcbway_edge_coupled_zd  # noqa: E402
+from check_fab_release import (  # noqa: E402
+    PCBWAY_MASK_OFFSET_OHM, pcbway_edge_coupled_zd)
 
 C0 = 299792458.0
 EPS0 = 8.8541878128e-12
@@ -86,8 +91,8 @@ def fd2d_zdiff(w, s, h, t, er, mask_over_cu=None, mask_er=3.5, d=5e-6):
     return 2.0 / (C0 * math.sqrt(c_diel * c_air))
 
 
-GEOMETRIES = (("USB3 / USB2, target 90 ohm", 0.23, 0.16),
-              ("MDI, target 100 ohm", 0.20, 0.18))
+GEOMETRIES = (("USB3 / USB2, target 90 ohm", 0.20, 0.17, 90.0),
+              ("MDI, target 100 ohm", 0.18, 0.21, 100.0))
 CASES = (
     ("nominal: h 0.1855, Er 4.74", 0.1855, 4.74),
     ("h 0.196 (prepreg as pressed from the sheet)", 0.196, 4.74),
@@ -100,16 +105,22 @@ CASES = (
 
 
 def main():
-    print("units: mm and ohm; copper 35 um (1 oz) throughout")
-    for name, w, s in GEOMETRIES:
-        print(f"\n{name}: width {w}, gap {s}")
-        print(f"  {'case':46s} {'pcbway':>7s} {'fd2d':>7s} {'fd2d+mask':>10s}")
+    print("units: mm and ohm; copper 35 um (1 oz) throughout; as-built = "
+          f"pcbway - {PCBWAY_MASK_OFFSET_OHM:g}; window = target +/-10 %")
+    for name, w, s, target in GEOMETRIES:
+        print(f"\n{name}: width {w}, gap {s}, window "
+              f"{0.9 * target:g}..{1.1 * target:g}")
+        print(f"  {'case':46s} {'pcbway':>7s} {'as-built':>9s} {'fd2d':>7s}"
+              f" {'fd2d+mask':>10s}")
         for label, h, er in CASES:
             bare = fd2d_zdiff(w * 1e-3, s * 1e-3, h * 1e-3, 35e-6, er)
             mask = fd2d_zdiff(w * 1e-3, s * 1e-3, h * 1e-3, 35e-6, er,
                               mask_over_cu=15e-6)
-            print(f"  {label:46s} {pcbway_edge_coupled_zd(1, h, w, s, er):7.1f}"
-                  f" {bare:7.1f} {mask:10.1f}")
+            pw = pcbway_edge_coupled_zd(1, h, w, s, er)
+            flag = "" if 0.9 * target <= pw - PCBWAY_MASK_OFFSET_OHM \
+                <= 1.1 * target else "  <- outside"
+            print(f"  {label:46s} {pw:7.1f} {pw - PCBWAY_MASK_OFFSET_OHM:9.1f}"
+                  f" {bare:7.1f} {mask:10.1f}{flag}")
 
 
 if __name__ == "__main__":

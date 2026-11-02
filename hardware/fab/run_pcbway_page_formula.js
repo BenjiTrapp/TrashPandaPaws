@@ -48,7 +48,7 @@ const zd = new Function(stubs + pageCode + run + "return zd;")();
 const args = process.argv.slice(2).map(Number);
 const cases = args.length
   ? [args]
-  : [[1, 0.1855, 0.23, 0.16, 4.74], [1, 0.1855, 0.20, 0.18, 4.74]];
+  : [[1, 0.1855, 0.20, 0.17, 4.74], [1, 0.1855, 0.18, 0.21, 4.74]];
 for (let i = 0; i < cases.length; i += 1) {
   const c = cases[i];
   console.log(`t=${c[0]} oz  h=${c[1]} mm  w=${c[2]} mm  s=${c[3]} mm  ` +
