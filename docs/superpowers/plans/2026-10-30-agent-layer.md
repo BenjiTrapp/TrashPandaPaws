@@ -466,7 +466,7 @@ git commit -m "feat(agent): add safety classification, scan limits and risk tabl
 - Produces:
   - `Scope` — Klasse, `Scope(allow: List[str], deny: List[str])`
   - `scope.extract_targets(command: str) -> Tuple[List[str], List[str]]` — `(erkannte_ziele, nicht_auflösbare_argumente)`
-  - `Scope.check(command: str, resolve_host: Callable[[str], Optional[str]]) -> Optional[str]` — Ablehnungsgrund oder `None`
+  - `Scope.check(command: str, resolve_host: Callable[[str], Union[None, str, Sequence[str]]]) -> Optional[str]` — Ablehnungsgrund oder `None`. **Korrigiert 2026-11-02:** der Resolver darf mehrere Adressen liefern, weil jeder Dual-Stack-Name auf A *und* AAAA auflöst; `Optional[str]` machte Hostnamen als Ziel unbenutzbar, `nmap localhost` eingeschlossen. Jede gelieferte Adresse muss im Scope liegen — eine außerhalb lehnt den ganzen Namen ab, also bleibt es fail-closed.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -560,7 +560,7 @@ Expected: FAIL mit `ModuleNotFoundError`
 
 Der Kern ist die Extraktion. Vorgehen: Befehlszeile an Leerzeichen trennen, jedes Argument zusätzlich an Kommas trennen, umgebende eckige Klammern entfernen. Für jedes Token in dieser Reihenfolge prüfen: `ipaddress.ip_address`, `ipaddress.ip_network(strict=False)`, die zwei Bereichsformen per Regex, dann Hostname-Muster `^[a-zA-Z0-9._-]+$` mit mindestens einem Punkt oder einem Treffer in `findings`. Tokens, die mit `-` beginnen, sind Flags und werden übersprungen — **mit einer Ausnahme:** `-iL`, `--target-file`, `--targets` und `-` machen die Prüfung sofort unauflösbar, ebenso ein Argument, das auf `.txt`, `.lst` oder `.list` endet.
 
-`check` löst Hostnamen über `resolve_host` auf, wandelt alle erkannten Ziele in `ip_network`-Objekte (Bereiche über `ipaddress.summarize_address_range`), und verlangt für jedes: in mindestens einem Allow-Netz **enthalten** (`subnet_of`) und in keinem Deny-Netz überlappend. Nicht auflösbare Argumente führen immer zur Ablehnung mit dem Hinweis, Ziele einzeln zu benennen.
+`check` löst Hostnamen über `resolve_host` auf — eine Adresse oder mehrere, und jede davon muss die Prüfung bestehen —, wandelt alle erkannten Ziele in `ip_network`-Objekte (Bereiche über `ipaddress.summarize_address_range`), und verlangt für jedes: in mindestens einem Allow-Netz **enthalten** (`subnet_of`) und in keinem Deny-Netz überlappend. Nicht auflösbare Argumente führen immer zur Ablehnung mit dem Hinweis, Ziele einzeln zu benennen.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 

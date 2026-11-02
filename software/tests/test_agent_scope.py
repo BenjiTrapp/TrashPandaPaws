@@ -342,7 +342,13 @@ class TestFailClosed(unittest.TestCase):
         self.assertEqual(seen, ["fs02.corp.local"])
 
     def test_resolver_returning_garbage_is_refused(self):
-        for bad in ("not-an-ip", "10.0.1.0/24", "", 5, ["10.0.1.5"], "10.0.1.5 10.0.9.5"):
+        # ["10.0.1.5"] used to be in this list. It is no longer garbage: a
+        # resolver may return several addresses, because any dual-stack name
+        # resolves to both an A and an AAAA record. See
+        # TestMultiAddressHostnames for the contract that replaced it.
+        for bad in ("not-an-ip", "10.0.1.0/24", "", 5, "10.0.1.5 10.0.9.5",
+                    [], [5], ["10.0.1.5", "not-an-ip"], [["10.0.1.5"]],
+                    {"10.0.1.5": 1}, object()):
             self.assertIsNotNone(
                 _scope().check("nmap fs02.corp.local", lambda h, b=bad: b), repr(bad))
 
@@ -585,6 +591,67 @@ class TestFlagArity(unittest.TestCase):
             self.assertIn("cannot verify", _scope().check(cmd, _none) or "", cmd)
 
 
+class TestMultiAddressHostnames(unittest.TestCase):
+    """A resolver may return several addresses, and every one must be in scope.
+
+    Refusing a list made hostname targets unusable: any dual-stack name
+    resolves to both an A and an AAAA record, so `nmap localhost` and
+    `nmap dc01.corp.local` were both refused with "not a single address" even
+    when every address was authorised. Accepting a list is not a loosening —
+    one address outside still refuses the whole name, because the tool may
+    pick that one.
+    """
+
+    def test_a_dual_stack_name_inside_the_scope_passes(self):
+        sc = scope.Scope(allow=["127.0.0.0/8", "::1/128"], deny=[])
+        self.assertIsNone(
+            sc.check("nmap localhost", lambda h: ["127.0.0.1", "::1"]))
+
+    def test_a_single_string_still_works(self):
+        sc = scope.Scope(allow=["127.0.0.0/8"], deny=[])
+        self.assertIsNone(sc.check("nmap localhost", lambda h: "127.0.0.1"))
+
+    def test_a_tuple_works(self):
+        sc = scope.Scope(allow=["127.0.0.0/8", "::1/128"], deny=[])
+        self.assertIsNone(
+            sc.check("nmap localhost", lambda h: ("127.0.0.1", "::1")))
+
+    def test_one_address_outside_refuses_the_whole_name(self):
+        reason = _scope().check(
+            "nmap dc01.corp.local", lambda h: ["10.0.1.5", "10.9.9.9"])
+        self.assertIsNotNone(reason)
+        self.assertIn("10.9.9.9", reason)
+
+    def test_one_denied_address_refuses_the_whole_name(self):
+        reason = _scope().check(
+            "nmap dc01.corp.local", lambda h: ["10.0.1.5", "10.0.9.5"])
+        self.assertIsNotNone(reason)
+        self.assertIn("denied", reason)
+
+    def test_every_address_inside_passes(self):
+        self.assertIsNone(_scope().check(
+            "nmap dc01.corp.local", lambda h: ["10.0.1.5", "10.0.2.7"]))
+
+    def test_an_empty_result_is_not_a_pass(self):
+        # "I looked and found nothing" is the same position as no finding at
+        # all, which must not read as authorisation.
+        reason = _scope().check("nmap dc01.corp.local", lambda h: [])
+        self.assertIsNotNone(reason)
+        self.assertIn("no finding", reason)
+
+    def test_a_mixed_list_with_one_unreadable_entry_is_refused(self):
+        reason = _scope().check(
+            "nmap dc01.corp.local", lambda h: ["10.0.1.5", "nonsense"])
+        self.assertIsNotNone(reason)
+        self.assertIn("nonsense", reason)
+
+    def test_the_reason_names_every_address_it_judged(self):
+        reason = _scope().check(
+            "nmap dc01.corp.local", lambda h: ["10.0.1.5", "172.16.0.1"])
+        for addr in ("10.0.1.5", "172.16.0.1"):
+            self.assertIn(addr, reason)
+
+
 class TestReasonsAreBounded(unittest.TestCase):
     """No path echoes attacker-shaped text without a ceiling."""
 
@@ -595,9 +662,17 @@ class TestReasonsAreBounded(unittest.TestCase):
         self.assertIn("no finding", reason)
         self.assertLess(len(reason), 400)
 
-    def test_multi_address_resolution_is_clipped(self):
+    def test_unreadable_resolution_is_clipped(self):
         reason = _scope().check("nmap dc01.corp", lambda host: "10.0.1.5 " * 1000)
-        self.assertIn("not a single address", reason)
+        self.assertIn("not an address", reason)
+        self.assertLess(len(reason), 400)
+
+    def test_a_long_list_of_real_addresses_is_clipped(self):
+        # All inside the scope, so the verdict is a pass; the point is that a
+        # resolver returning hundreds of addresses cannot blow up a reason.
+        many = ["10.0.9.%d" % i for i in range(1, 200)]   # denied range
+        reason = _scope().check("nmap dc01.corp", lambda host: many)
+        self.assertIsNotNone(reason)
         self.assertLess(len(reason), 400)
 
     def test_verdict_label_is_clipped(self):

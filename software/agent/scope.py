@@ -412,17 +412,47 @@ class Scope:
         return None
 
     def _check_host(self, name: str, addr) -> Optional[str]:
+        """Check one hostname against the scope.
+
+        `addr` is whatever the caller's resolver returned: `None`, a single
+        address, or several. Several is the normal case — any dual-stack name
+        resolves to both an A and an AAAA record — so refusing a list would
+        make hostname targets unusable, `localhost` included. Every address
+        has to be inside the authorised ranges and outside the denied ones,
+        which keeps this fail-closed: one address outside refuses the whole
+        name, because the tool may well pick that one.
+        """
         if addr is None:
             return ("hostname '%s' has no finding tying it to an address; "
                     "use its IP address" % _clip(name))
-        try:
-            if not isinstance(addr, str):
-                raise ValueError(addr)
-            ip = ipaddress.ip_address(addr)
-        except ValueError:
-            return "hostname '%s' resolves to %s, which is not a single address" % (
+        # An explicit list of container types rather than "is it iterable":
+        # a dict is iterable and yields its keys, so a resolver that returned
+        # a mapping would be judged on whatever happened to be in key
+        # position. A set is allowed because deduplicating is a reasonable
+        # thing for a resolver to do.
+        if isinstance(addr, str):
+            addrs = [addr]
+        elif isinstance(addr, (list, tuple, set, frozenset)):
+            addrs = sorted(addr, key=repr)
+        else:
+            return "hostname '%s' resolved to %s, which is not an address" % (
                 _clip(name), _clip(repr(addr)))
-        return self._verdict("%s (%s)" % (name, addr), [_as_network(ip)])
+        if not addrs:
+            # An empty result is "I looked and found nothing", which is the
+            # same position as no finding at all, not a pass.
+            return ("hostname '%s' has no finding tying it to an address; "
+                    "use its IP address" % _clip(name))
+        nets = []
+        for one in addrs:
+            try:
+                if not isinstance(one, str):
+                    raise ValueError(one)
+                nets.append(_as_network(ipaddress.ip_address(one)))
+            except ValueError:
+                return ("hostname '%s' resolved to %s, which is not an "
+                        "address" % (_clip(name), _clip(repr(one))))
+        shown = addrs[0] if len(addrs) == 1 else ", ".join(str(a) for a in addrs)
+        return self._verdict("%s (%s)" % (name, _clip(shown)), nets)
 
     def _verdict(self, label: str, nets) -> Optional[str]:
         for net in nets:
