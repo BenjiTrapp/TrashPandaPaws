@@ -189,15 +189,30 @@ def interpolate_rise_us(table, ct_pf):
             return y0 + (y1 - y0) * (ct_pf - x0) / (x1 - x0)
 
 
-def gated_rail_inrush_ma(netlist, gated_rail):
-    """Current in mA that charges everything behind the load switch of
-    `gated_rail` while its output ramps, with CT taken CT_MARGIN low.
+def gated_rail_inrush_profile(netlist, gated_rail, tss_scale=1.0, uvlo_v=None):
+    """Model the current drawn through a load switch while its output ramps.
 
-    The capacitance on the gated rail counts in full; the capacitance on each
-    rail fed from it through a regulator counts as the charge that has to pass
-    the switch to fill it (C x V_rail x charge_in_per_charge_out), expressed as
-    an equivalent capacitance at the gated rail's voltage. Raises ValueError if
-    the switch has no readable CT capacitor on its CT pin.
+    Returns {"peak_ma", "average_ma", "slew_v_per_s", ...}. It is a MODEL of
+    the capacitive charging only, in phases, with the CT capacitor taken
+    CT_MARGIN low:
+
+      * the gated rail's own capacitance charges at the full slew for the
+        whole ramp;
+      * a linear regulator (model: ldo) passes its output charge straight
+        through: while its input is within `dropout_assumed_v` of the output
+        voltage the output tracks the input, so the capacitance behind it
+        charges at the same slew, in the first part of the ramp;
+      * a buck (model: buck) starts when the input crosses its UVLO and then
+        brings its output up linearly in its soft-start time; the input
+        current is the output charging current times Vout/(Vin x efficiency),
+        evaluated at every instant, not at a fixed ratio.
+
+    NOT in it: the start-up load of U3 itself, the 10-90 % table's missing
+    first and last tenth, hot-plug ringing. `tss_scale` and `uvlo_v` replace
+    the buck's soft-start time factor and UVLO for sensitivity runs, because
+    the committed SY8089 note gives TSS as a typical value only and the UVLO
+    as a maximum only. Raises ValueError if the switch has no readable CT
+    capacitor on its CT pin or a downstream model is unknown.
     """
     rails = netlist["rails"]
     spec = rails[gated_rail]
@@ -224,18 +239,64 @@ def gated_rail_inrush_ma(netlist, gated_rail):
     ct_pf = parse_capacitance_uf(components[ct_ref]["value"]) * 1e6
 
     v_gated = float(spec["nominal_v"])
-    equivalent_uf = sum_bulk_capacitance(netlist, gated_rail)
-    for rail_name, down in spec["downstream_rails"].items():
-        v_out = float(rails[rail_name]["nominal_v"])
-        charged_uf = sum(sum_bulk_capacitance(netlist, n) for n in down["nets"])
-        equivalent_uf += (charged_uf * v_out
-                          * float(down["charge_in_per_charge_out"]) / v_gated)
-
     rise_us = interpolate_rise_us(soft["rise_time_us_10_90_at_5v"],
                                   ct_pf * (1.0 - CT_MARGIN))
-    volts_per_second = soft["swing_fraction"] * v_gated / (rise_us * 1e-6)
-    return equivalent_uf * 1e-6 * volts_per_second * 1e3
+    slew = soft["swing_fraction"] * v_gated / (rise_us * 1e-6)   # V/s
+    ramp_s = v_gated / slew
 
+    own_f = sum_bulk_capacitance(netlist, gated_rail) * 1e-6
+    phases = []
+    for rail_name, down in spec["downstream_rails"].items():
+        v_out = float(rails[rail_name]["nominal_v"])
+        c_f = sum(sum_bulk_capacitance(netlist, n) for n in down["nets"]) * 1e-6
+        via = components[down["via"]]
+        if down["model"] == "ldo":
+            phases.append(("ldo", c_f, v_out,
+                           float(via["tracking"]["dropout_assumed_v"])))
+        elif down["model"] == "buck":
+            ss = via["soft_start"]
+            phases.append(("buck", c_f, v_out,
+                           float(ss["tss_ms"]) * 1e-3 * tss_scale,
+                           float(ss["uvlo_v"]) if uvlo_v is None else uvlo_v,
+                           float(ss["efficiency_assumed"])))
+        else:
+            raise ValueError(f"{rail_name}: unknown model {down['model']!r}")
+
+    step = 1e-6
+    end = ramp_s
+    for ph in phases:
+        if ph[0] == "buck":
+            end = max(end, ph[4] / slew + ph[3])
+    peak = total = 0.0
+    t_peak = 0.0
+    n = int(end / step) + 1
+    for i in range(n):
+        t = i * step
+        v_in = min(v_gated, slew * t)
+        current = own_f * slew if t < ramp_s else 0.0
+        for ph in phases:
+            if ph[0] == "ldo":
+                _, c_f, v_out, dropout = ph
+                if t < ramp_s and v_in - dropout < v_out:
+                    current += c_f * slew
+            else:
+                _, c_f, v_out, tss, uvlo, eff = ph
+                t0 = uvlo / slew
+                if t >= t0 and (t - t0) < tss:
+                    v_o = v_out * (t - t0) / tss
+                    current += c_f * (v_out / tss) * v_o / (v_in * eff)
+        if current > peak:
+            peak, t_peak = current, t
+        if t < ramp_s:
+            total += current * step
+    return {"peak_ma": peak * 1e3, "average_ma": total / ramp_s * 1e3,
+            "slew_v_per_s": slew, "ramp_ms": ramp_s * 1e3,
+            "t_peak_ms": t_peak * 1e3}
+
+
+def gated_rail_inrush_ma(netlist, gated_rail):
+    """Modelled peak charging current in mA; see gated_rail_inrush_profile."""
+    return gated_rail_inrush_profile(netlist, gated_rail)["peak_ma"]
 
 
 class FabReleaseChecks(unittest.TestCase):
@@ -335,6 +396,13 @@ def schematic_instances(text):
             if not ref.startswith("PWR_")}
 
 
+def instance_block(text, ref):
+    """The text of one component instance in a generated .kicad_sch."""
+    start = text.index(f'(symbol (lib_id "raccoon:RACCOON_{ref}") (at')
+    end = text.index("\n\t)\n", start)
+    return text[start:end]
+
+
 def generate(netlist, directory):
     """Run the real generators on `netlist`; return (bom_rows, schematic_text)."""
     directory = Path(directory)
@@ -361,14 +429,63 @@ class SoftStartCannotBeFaked(unittest.TestCase):
         return load_netlist()
 
     def test_inrush_behind_the_load_switch_is_under_the_limit(self):
+        # A necessary condition, not a sufficient one: it bounds the capacitive
+        # charging in the model, not U3's own start-up load.
         ma = gated_rail_inrush_ma(self.netlist(), "+5V_SW")
         self.assertLessEqual(ma, INRUSH_MAX_MA,
                              f"{ma:.0f} mA into +5V_SW, limit {INRUSH_MAX_MA:.0f} mA")
 
-    def test_the_number_is_the_one_in_the_design_note(self):
-        # design_notes.vbus_inrush quotes 42 mA for the CT 20 % low case
-        ma = gated_rail_inrush_ma(self.netlist(), "+5V_SW")
-        self.assertAlmostEqual(ma, 42.3, delta=1.5)
+    def test_the_numbers_are_the_ones_in_the_design_note(self):
+        # design_notes.vbus_inrush quotes a modelled peak of about 50 mA and a
+        # ramp average of about 42 mA, CT taken 20 % low
+        profile = gated_rail_inrush_profile(self.netlist(), "+5V_SW")
+        self.assertAlmostEqual(profile["peak_ma"], 50.2, delta=1.5)
+        self.assertAlmostEqual(profile["average_ma"], 42.3, delta=1.5)
+
+    def test_the_peak_is_above_the_ramp_average(self):
+        profile = gated_rail_inrush_profile(self.netlist(), "+5V_SW")
+        self.assertGreater(profile["peak_ma"], profile["average_ma"])
+
+    def test_the_buck_phase_is_really_in_the_model(self):
+        # without U6's soft-start contribution the peak would be the pure
+        # LDO-window figure; the buck adds to it
+        netlist = self.netlist()
+        with_buck = gated_rail_inrush_profile(netlist, "+5V_SW")["peak_ma"]
+        netlist["components"]["C4"]["value"] = "1nF"
+        for ref in ("C12", "C13", "C14", "C15", "C16"):
+            netlist["components"][ref]["value"] = "1nF"
+        without = gated_rail_inrush_profile(netlist, "+5V_SW")["peak_ma"]
+        self.assertGreater(with_buck, without + 1.0)
+
+    def test_the_ldo_charges_at_full_slew_during_its_tracking_window(self):
+        # (C on +5V_SW + C behind U4) x slew is the floor of the peak
+        netlist = self.netlist()
+        profile = gated_rail_inrush_profile(netlist, "+5V_SW")
+        c_uf = (sum_bulk_capacitance(netlist, "+5V_SW")
+                + sum_bulk_capacitance(netlist, "+3V3_REG")
+                + sum_bulk_capacitance(netlist, "+3V3"))
+        self.assertGreaterEqual(profile["peak_ma"],
+                                c_uf * 1e-6 * profile["slew_v_per_s"] * 1e3 - 0.1)
+
+    def test_the_peak_is_not_bounded_by_the_committed_evidence(self):
+        # SY8089 gives TSS as a typical value only and the UVLO as a maximum
+        # only. A faster soft start or an earlier start raises the peak; the
+        # model must respond to both, which is why the note does not claim
+        # a margin.
+        netlist = self.netlist()
+        typical = gated_rail_inrush_profile(netlist, "+5V_SW")["peak_ma"]
+        fast = gated_rail_inrush_profile(netlist, "+5V_SW", tss_scale=0.25,
+                                         uvlo_v=2.0)["peak_ma"]
+        early = gated_rail_inrush_profile(netlist, "+5V_SW", tss_scale=0.25,
+                                          uvlo_v=0.5)["peak_ma"]
+        self.assertGreater(fast, typical)
+        self.assertGreater(early, INRUSH_MAX_MA)
+
+    def test_an_unknown_downstream_model_raises(self):
+        netlist = self.netlist()
+        netlist["rails"]["+5V_SW"]["downstream_rails"]["+3V3"]["model"] = "magic"
+        with self.assertRaises(ValueError):
+            gated_rail_inrush_ma(netlist, "+5V_SW")
 
     def test_switch_output_is_the_gated_rail_and_its_input_is_raw_vbus(self):
         netlist = self.netlist()
@@ -465,6 +582,23 @@ class DnpIsExplicitEndToEnd(unittest.TestCase):
         marked = {ref for ref, (_, dnp) in instances.items() if dnp == "yes"}
         self.assertEqual(marked, self.dnp_refs())
 
+    def test_a_dnp_part_carries_no_orderable_mpn_in_the_schematic(self):
+        # a BOM exported from KiCad itself must not list R12 with a part number
+        for ref in self.dnp_refs():
+            block = instance_block(self.sch, ref)
+            self.assertNotIn('(property "MPN"', block, ref)
+            self.assertIn('(property "MPN_If_Fitted"', block, ref)
+
+    def test_a_dnp_part_is_out_of_a_kicad_exported_bom(self):
+        instances = schematic_instances(self.sch)
+        for ref in self.dnp_refs():
+            self.assertEqual(instances[ref], ("no", "yes"), ref)
+
+    def test_a_fitted_part_keeps_its_mpn(self):
+        block = instance_block(self.sch, "R14")
+        self.assertIn('(property "MPN" "', block)
+        self.assertNotIn("MPN_If_Fitted", block)
+
     def test_no_dnp_part_sits_in_a_row_that_is_to_be_fitted(self):
         for row in self.bom:
             refs = set(expand(row["Reference"]))
@@ -519,6 +653,26 @@ class DnpIsExplicitEndToEnd(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
 
+class CommittedDatasheetsMatchTheirHashes(unittest.TestCase):
+    """Every datasheet the netlist header cites by path and md5 must be on disk
+    with that md5: a cited source that cannot be checked is not a source."""
+
+    def test_header_paths_exist_and_hashes_match(self):
+        import hashlib
+        header = NETLIST.read_text(encoding="utf-8")
+        header = header[:header.index("\nmeta:")]
+        cited = re.findall(r"(hardware/datasheets/[\w.\-]+\.pdf)[\s#]*\(?md5\s+([0-9a-f]{32})", header)
+        self.assertGreaterEqual(len(cited), 8)
+        names = {path for path, _ in cited}
+        for path, md5 in cited:
+            file = HARDWARE.parent / path
+            self.assertTrue(file.exists(), path)
+            self.assertEqual(hashlib.md5(file.read_bytes()).hexdigest(), md5, path)
+        for needed in ("SP3019", "SY8089", "TI_SLVAF82B", "TI_SLYT118",
+                       "TPS22810", "USBLC6", "AP2112"):
+            self.assertTrue(any(needed in n for n in names), needed)
+
+
 class GeneratedFilesAreCurrent(unittest.TestCase):
     """bom.csv and the schematic are generated, never edited by hand. A
     committed copy that differs from a fresh run is stale or hand-edited."""
@@ -539,7 +693,7 @@ class GeneratedFilesAreCurrent(unittest.TestCase):
         netlist = load_netlist()
         text = SCHEMATIC.read_text(encoding="utf-8")
         for ref, comp in netlist["components"].items():
-            if comp.get("mpn"):
+            if comp.get("mpn") and comp.get("populate", True):
                 self.assertIn(f'(property "MPN" "{comp["mpn"]}"', text, ref)
 
     def test_schematic_is_what_the_generator_writes(self):

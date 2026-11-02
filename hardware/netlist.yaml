@@ -54,24 +54,48 @@
 #   [AP2112]  Diodes Inc AP2112 datasheet DS39724 rev 2-2,
 #             hardware/datasheets/AP2112_diodes_DS39724_rev2-2.pdf
 #             (md5 108c38271beb03462b5c4b6c8f6536d5)
-#   [SP3019]  Littelfuse SP3019 series datasheet, revised 08/16/22. OPEN ITEM
-#             of low weight: not committed. littelfuse.com and mouser.com both
-#             refuse scripted download, so it was read as search-extracted text
-#             of https://www.littelfuse.com/assetdocs/littelfuse-tvs-diode-array-sp3019-datasheet
-#             (assetguid e916472b-caac-48e9-84a7-ccbd6c544a5d). A person should
-#             download it, commit it under hardware/datasheets/ and record the
-#             md5 here. The 0.3 pF figure is the typical value with no maximum
-#             published; the pin map is the same SOT23-6L drawing as the
-#             obsolete SP3012-04HTG (pins 1,3,4,6 I/O, 2 GND, 5 NC).
-#   [TI-ESD]  Texas Instruments SLVAF82B rev B, "ESD and Surge Protection for
-#             USB Interfaces", section 4.2: SuperSpeed lines "less than 0.5 pF",
-#             D+/D- "less than 4 pF", IEC 61000-4-2 8 kV contact / 15 kV air.
+#   [SP3019]  Littelfuse SP3019 series datasheet, revision 01/25/18,
+#             hardware/datasheets/SP3019_littelfuse_rev2018-01-25.pdf
+#             (md5 54393f118f8c7b7301cd09a710708d61), obtained from
+#             catalogue2.pss-electrocomponents.com/catalogue/463/SP3019-04HTG.pdf
+#             after littelfuse.com and mouser.com refused scripted download. Its
+#             cover reads "Low Capacitance ESD Protection - SP3019" and
+#             "SP3012 Series": a family sheet in which the SOT23-6L drawing and
+#             block diagram are the SP3012-04HTG ones. Page 1 holds the pinout
+#             (top view, 1 2 3 along the bottom, 6 5 4 along the top) and the
+#             functional block diagram (I/O = pins 1, 3, 4, 6, GND = pin 2; pin
+#             5 is drawn on the package and absent from the diagram). A later
+#             revision (08/16/22, read only as search-extracted text of the
+#             littelfuse.com asset) adds the sentence "Note: PIN 5 is NC"; the
+#             two agree. Page 2: 0.3 pF typ I/O-to-GND at 3 GHz, 0.18 pF
+#             I/O-to-I/O, no maximum published. Datasheet revision 01/25/18 is
+#             older than the product page; the electrical figures were
+#             compared with the 2022 text and match.
+#   [TI-ESD]  Texas Instruments SLVAF82B rev B (Jan 2024), "ESD and Surge
+#             Protection for USB Interfaces",
+#             hardware/datasheets/TI_SLVAF82B_ESD-USB_rev-B_2024-01.pdf
+#             (md5 f4b872aa5ecade54a2725a96892d6fcb). Section 4.2: SuperSpeed
+#             lines "less than 0.5pF"; D+/D- "less than 4pF"; IEC 61000-4-2
+#             8 kV contact / 15 kV air.
 #   [SLYT118] Texas Instruments SLYT118, "Powering electronics from the USB
-#             port", table 1: maximum input capacitor 10 uF, maximum inrush
-#             50 uC, low-power current 100 mA. SECONDARY source for the USB 2.0
-#             section 7.2.4.1 wording ("if more bypass capacitance is required
-#             ... some form of VBUS surge current limiting"); the USB-IF text
-#             itself was not read here.
+#             port" (2005),
+#             hardware/datasheets/TI_SLYT118_Powering-from-USB_2005.pdf
+#             (md5 c1c8541851b79dc95dbd220f56ced0ca). Table 1: maximum input
+#             capacitor 10 uF, maximum inrush 50 uC, low-power current 100 mA.
+#             SECONDARY source for the USB 2.0 section 7.2.4.1 wording ("if
+#             more bypass capacitance is required ... some form of VBUS surge
+#             current limiting"); the USB-IF text itself was not read here.
+#   [SY8089]  Silergy Application Note AN_SY8089/A rev 0.9A (2013-01-06),
+#             hardware/datasheets/SY8089_silergy_AN_rev0.9A_via-lcsc.pdf
+#             (md5 7c45f31bd305a2bc06e60e6a38ffcc56), downloaded from LCSC
+#             (C78988). The footer reads "Silergy Corp. Confidential - Prepared
+#             for Customer Use Only"; LCSC and Olimex both publish it openly.
+#             Page 4, electrical characteristics: soft-start time TSS 1.2 ms in
+#             the Typ column only; input UVLO threshold VUVLO 2.5 V in the Max
+#             column only (hysteresis 0.2 V typ); VIN 2.7-5.5 V; PFET current
+#             limit 3.5 A min. No minimum soft-start time and no minimum UVLO
+#             is published: the inrush model uses the typical TSS and the
+#             maximum UVLO, which is why it cannot bound the peak.
 #   [SOURCING] hardware/review/part-sourcing.md - manufacturer, part number,
 #             package, lifecycle and stock for every BOM row, checked
 #             2026-11-01. U3 separately in hardware/review/u3-sourcing.md.
@@ -143,24 +167,22 @@ rails:
       The board's 5 V supply for U3 (VDD5, VDDREG5), U4 and U6. Slew-limited
       by C26 on U7's CT pin. The bulk capacitance (C3 10 uF, C5 1 uF, C18
       100 nF) sits here, not on raw VBUS. `gated_by` and `downstream_rails`
-      below are read by check_fab_release.py to compute the attach-time
-      inrush current; they are data, not decoration. `charge_in_per_charge_out`
-      is the charge drawn from +5V_SW per unit charge delivered to the
-      downstream rail: 1.0 for the LDO U4 (a linear regulator passes the
-      output charge through 1:1), 0.25 for the buck U6 (ideal Vout/Vin =
-      1.0/5.0 = 0.2, divided by an ASSUMED 80 % efficiency; not a datasheet
-      figure).
+      below are read by check_fab_release.py, which models the attach-time
+      charging current in phases: U4 as a linear regulator whose output
+      tracks its input, U6 as a buck with its own soft-start. They are data,
+      not decoration. The model parameters sit on U4 (`tracking`) and U6
+      (`soft_start`).
     gated_by:
       switch: U7
       ct_cap: C26
     downstream_rails:
       "+3V3":
         via: U4
-        charge_in_per_charge_out: 1.0
+        model: ldo
         nets: ["+3V3_REG", "+3V3"]
       "+1V0":
         via: U6
-        charge_in_per_charge_out: 0.25
+        model: buck
         nets: ["+1V0_REG", "+1V0"]
   "+3V3":
     source: "U4 AP2112K-3.3 output, through the cut-open link JP1"
@@ -300,7 +322,7 @@ components:
         own net, off the 1.0V rail, with REGOUT left open as here. That is a
         different die and package (VC, QFN-48), so it is a precedent for the
         function, not a datasheet value. NEEDS CONFIRMATION ON FIRST BUILD:
-        probe pin 22 for ~1.0V with a quiet waveform. The footprint is 0603, so
+        probe pin 22 for ~1.0V with a quiet waveform. The footprint is 0402, so
         a 1uF X5R drop-in is possible if it rings; no respin.
         (2) AVDD33 (20): [RTL-DS] table 6 "AVDD33 P 20 Linear Regulator (LDO)
         3.3V Output" with the same internal-use-only note as REGOUT and pin 22;
@@ -361,7 +383,7 @@ components:
         reference-schematic overview ("Place C10 close to VDD33 pin 20
         (reserved)") hints at a cap of its own on pin 20; seen only as a
         snippet, not relied on.
-        PIN 20 CAP: C8, 2.2uF X5R 16V 0603 (10V 0402 until task 6). The datasheet gives no value; an
+        PIN 20 CAP: C8, 2.2uF X5R 16V 0603 (a deliberate, recorded deviation from spec 5.1, see C8 and design_notes.bom_and_dnp; it was 10V 0402 before task 6). The datasheet gives no value; an
         LDO output capacitor "for phase compensation" is typically 1-10uF
         ceramic, 2.2uF is the middle, and DC bias at 3.3V takes part of it away (less in 0603 at 16 V than
         in the 10 V 0402 it replaced; the effective value was not looked up),
@@ -405,6 +427,18 @@ components:
     footprint: "Package_TO_SOT_SMD:SOT-23-5"
     description: "3.3V 600mA LDO from +5V_SW; its output (+3V3_REG) reaches +3V3 through JP1"
     source: "[AP-DS]. Required - see OPEN_QUESTIONS.md 3d. Thermal and current check in design_notes.rail_currents."
+    tracking:
+      dropout_assumed_v: 0.25
+      source: >
+        Inrush model, check_fab_release.py. A linear regulator's output follows
+        its input until the input is within the dropout voltage of the set
+        point, so the capacitance behind U4 charges at the input's slew rate
+        while VIN is below 3.3 V + dropout. [AP2112] gives VDROP 250 mV typ at
+        600 mA for the 3.3 V part (125 mV at 300 mA, 5 mV at 10 mA); 0.25 V is
+        taken, which lengthens the window and so overlaps the buck's start
+        more: the pessimistic side. [AP2112] also quotes a 50 mA short-circuit
+        current at VOUT = 0 and a 20 us start-up time; the charging current
+        here (about 23 mA into 10.4 uF) stays below that 50 mA.
     pins:
       1: {name: VIN,  type: power_in}
       2: {name: GND,  type: power_in}
@@ -440,7 +474,19 @@ components:
       24.576 MHz at CL 12 pF. I did not find an orderable 25 MHz part in that
       family or another with CL inside 16-20 pF, +/-30 ppm and a >=200 uW rating
       whose datasheet could be checked, so ABM8 stays.)
-      HARDWARE HOOK: R14, a 0603 0R series resistor between CKXTAL2 and the
+      HAND-SOLDERABILITY (ruling AC, task 6 review): the ABM8 has four pads
+      under the body and is not comfortable to solder with an iron. The part
+      stays: it was checked point by point against Table 23 and that work is
+      not discarded. Two-sided mitigation: (1) task 11 adds Y1 to PCBWay's
+      partial assembly together with U3, so the crystal is machine-placed on
+      the first boards (part-sourcing.md and u3-sourcing.md carry the
+      consequences: two parts to place, Y1 sourced from Abracon via
+      DigiKey/Mouser or consigned); (2) task 8 draws Y1 with an extended-pad
+      footprint, pads lengthened beyond the body, so a hand rework of a
+      crystal that is not in the right place is possible at all. A 3225
+      crystal with side-visible terminations would be the other way out; it is
+      not chosen here.
+      HARDWARE HOOK: R14, a 0402 0R series resistor between CKXTAL2 and the
       crystal, so the drive can be reduced on the bench without a respin. See
       design_notes.drive_level for the measurement and the trim rule. A crystal
       rated 200 uW or more is the second remedy if trimming is not enough.
@@ -459,7 +505,7 @@ components:
         Series combination of the two caps plus stray capacitance must equal the
         crystal's CL: CL = C19*C20/(C19+C20) + Cstray; with C19 = C20 = C that
         is CL = C/2 + Cstray, so C = 2*(CL - Cstray).
-        CL = 18 pF ([ABM8] standard). Cstray = 4 pF assumed (two 0603 pads, a
+        CL = 18 pF ([ABM8] standard). Cstray = 4 pF assumed (two 0402 pads, a
         short trace, U3's CKXTAL pins and the crystal's own pad capacitance;
         3-5 pF is the usual range, this is an assumption, not a measured value).
         C = 2*(18 - 4) = 28 pF -> nearest E24 value 27 pF.
@@ -471,10 +517,10 @@ components:
         The earlier placeholder, 39 pF from [OLIMEX], would give CL = 19.5 + 4 =
         23.5 pF here: outside the 16-20 pF window, so the crystal would run low
         in frequency.
-        Use C0G (NP0) 50V 0603, 5% or better, for stability.
+        Use C0G (NP0) 50V 0402, 5% or better, for stability.
         R14 sits between U3 pin 36 (CKXTAL2, the output, [RTL-DS] table 5) and
         the crystal node, ahead of C20, so with R14 = 0R the load is unchanged
-        (a 0603 pad adds a fraction of a pF, inside the Cstray assumption).
+        (a 0402 pad adds a fraction of a pF, inside the Cstray assumption).
       drive_level: >
         OPEN ITEM, see Y1.source. The crystal is rated 100 uW ([ABM8]); the
         chip's side is only "DL Drive Level max 0.3 mW" ([RTL-DS] table 23).
@@ -551,6 +597,19 @@ components:
       2A continuous / 3A peak, 1MHz fixed switching frequency.
       Vout = 0.6 x (1 + R1/R2), VREF = 0.588 / 0.600 / 0.612 V.
       Same part Olimex use for this role in their OSHW USB-GIGABIT.
+    soft_start:
+      tss_ms: 1.2
+      uvlo_v: 2.5
+      efficiency_assumed: 0.8
+      source: >
+        Inrush model, check_fab_release.py. [SY8089] page 4, electrical
+        characteristics: soft-start time TSS = 1.2 ms (Typ column ONLY; no
+        minimum), input UVLO threshold = 2.5 V (Max column ONLY; no minimum or
+        typical, hysteresis 0.2 V typ). The model starts U6 at the UVLO maximum
+        and ramps its output in the typical TSS; a shorter TSS or an earlier
+        start would draw more, and the note publishes neither bound. The
+        efficiency of 0.8 is an ASSUMPTION, not a datasheet value (it sets the
+        input current for a given output charging current).
     pins:
       1: {name: LX,  type: output,    note: "switch node -> L2"}
       2: {name: GND, type: power_in}
@@ -626,12 +685,15 @@ components:
     tolerance: "1%"
     package: "0603"
     footprint: "Resistor_SMD:R_0603_1608Metric"
-    manufacturer: Yageo
-    mpn: RC0603FR-0715KL
+    manufacturer: Vishay
+    mpn: CRCW060315K0FKEA
     description: "Buck feedback divider, bottom (to GND)"
     source: >
       [SY8089] Vout = 0.6 x (1 + R5/R6) -> 1.000 V. Package 0402 -> 0603 for
-      hand soldering. Part: Yageo RC0603FR-0715KL. Part and lifecycle:
+      hand soldering. Part: Vishay Dale CRCW060315K0FKEA, 15 kOhm 1 % 0603.
+      CHANGED from Yageo RC0603FR-0715KL in the task 6 fix round: DigiKey
+      quotes the Yageo part with a 24-week lead time (not stocked), the Vishay
+      part has 209,000 to 253,000 in stock there. Part and lifecycle:
       [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
 
@@ -730,13 +792,16 @@ components:
     tolerance: "X5R, 6.3V, 20%"
     package: "0805"
     footprint: "Capacitor_SMD:C_0805_2012Metric"
-    manufacturer: Samsung Electro-Mechanics
-    mpn: CL21A226MQQNNNE
+    manufacturer: Yageo
+    mpn: CC0805MKX5R5BB226
     description: "U6 buck output (COUT), regulator side of JP2"
     source: >
       On +1V0_REG, i.e. at the buck output ahead of the measurement link JP2.
-      At 1 V the DC-bias loss is small, so 6.3 V is enough. Part: Samsung
-      CL21A226MQQNNNE, X5R 6.3V 20%. Part and lifecycle: [SOURCING].
+      At 1 V the DC-bias loss is small, so 6.3 V is enough. Part: Yageo
+      CC0805MKX5R5BB226, X5R 6.3V 20%. CHANGED from Samsung CL21A226MQQNNNE in
+      the task 6 fix round: one DigiKey page showed it with no stock (Newark,
+      Farnell and an LCSC reseller still had it); the Yageo part is in stock
+      at DigiKey. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C5:
     value: 1uF
@@ -756,30 +821,37 @@ components:
     tolerance: "X5R, 10V, 10%"
     package: "0603"
     footprint: "Capacitor_SMD:C_0603_1608Metric"
-    manufacturer: Samsung Electro-Mechanics
-    mpn: CL10A106KP8NNNC
+    manufacturer: Yageo
+    mpn: CC0603KRX5R6BB106
     description: "U4 LDO output, regulator side of JP1 (+3V3_REG)"
     source: >
       [AP-DS] needs >=1uF for loop stability. design-guide.md once said 100nF
       here, which would risk instability - see OPEN_QUESTIONS.md value table.
       Sits on +3V3_REG, ahead of the measurement link JP1, so U4 keeps its
-      output capacitor while JP1 is cut open. Part: Samsung CL10A106KP8NNNC,
-      X5R 10V 10%. Part and lifecycle: [SOURCING].
+      output capacitor while JP1 is cut open. Part: Yageo CC0603KRX5R6BB106,
+      X5R 10V 10%. CHANGED from Samsung CL10A106KP8NNNC in the task 6 fix
+      round: DigiKey quotes that part with a 61-week lead time (no stock),
+      which blocks a 5-board build; the Yageo part is in stock (see part-
+      sourcing.md). Murata GRM188R61A106KE69D was also rejected: one vendor
+      lists it as removed from Murata's database. Part and lifecycle:
+      [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
 
   # --- Decoupling, one per supply pin group ---
   C7:
     value: 100nF
     tolerance: "X7R, 50V, 10%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603KRX7R9BB104
+    mpn: CC0402KRX7R9BB104
     description: "+3V3 decoupling at U3 AVDD33 (11)"
     source: >
-      Package raised 0402 -> 0603 in task 6 so it can be soldered by hand with
-      an iron. Part: Yageo CC0603KRX7R9BB104, X7R 50V 10%. Part and lifecycle:
-      [SOURCING].
+      Package stays 0402: spec 5.1 exempts the decoupling capacitors directly
+      at U3 and the crystal load capacitors from the 0402 -> 0603 raise,
+      because they stay small and close for signal integrity (task 6 first
+      raised them by mistake; restored). Part: Yageo CC0402KRX7R9BB104, X7R
+      50V 10%. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C8:
     value: 2.2uF
@@ -793,175 +865,205 @@ components:
       [RTL-DS] 6.15: 'only an output capacitor between its output and analog
       ground for phase compensation'. No value given; 2.2uF chosen, NEEDS
       CONFIRMATION ON FIRST BUILD. Reasoning in U3 design_notes.ldo_outputs.
-      Now 0603 (was 0402) for hand soldering; the larger case also keeps more
-      capacitance under the 3.3 V bias. Part: Samsung CL10A225KO8NNNC, X5R 16V
-      10%. Part and lifecycle: [SOURCING].
+      DELIBERATE DEVIATION FROM SPEC 5.1, recorded by the spec owner: C8 is
+      decoupling at U3 and 5.1 would keep it 0402, but a 2.2 uF ceramic in
+      0402 at 3.3 V bias loses a large fraction of its nominal value to DC
+      bias, and this capacitor's job is LDO phase compensation, where actual
+      capacitance outweighs ESL. So it is 0603 and 16 V (less bias loss). Do
+      not 'fix' it back to 0402. Part: Samsung CL10A225KO8NNNC, X5R 16V 10%.
+      Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C9:
     value: 100nF
     tolerance: "X7R, 50V, 10%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603KRX7R9BB104
+    mpn: CC0402KRX7R9BB104
     description: "+3V3 decoupling at U3 AVDD33 (39, 40)"
     source: >
-      Package raised 0402 -> 0603 in task 6 so it can be soldered by hand with
-      an iron. Part: Yageo CC0603KRX7R9BB104, X7R 50V 10%. Part and lifecycle:
-      [SOURCING].
+      Package stays 0402: spec 5.1 exempts the decoupling capacitors directly
+      at U3 and the crystal load capacitors from the 0402 -> 0603 raise,
+      because they stay small and close for signal integrity (task 6 first
+      raised them by mistake; restored). Part: Yageo CC0402KRX7R9BB104, X7R
+      50V 10%. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C10:
     value: 100nF
     tolerance: "X7R, 50V, 10%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603KRX7R9BB104
+    mpn: CC0402KRX7R9BB104
     description: "+3V3 decoupling at U3 DVDD33 (23)"
     source: >
-      Package raised 0402 -> 0603 in task 6 so it can be soldered by hand with
-      an iron. Part: Yageo CC0603KRX7R9BB104, X7R 50V 10%. Part and lifecycle:
-      [SOURCING].
+      Package stays 0402: spec 5.1 exempts the decoupling capacitors directly
+      at U3 and the crystal load capacitors from the 0402 -> 0603 raise,
+      because they stay small and close for signal integrity (task 6 first
+      raised them by mistake; restored). Part: Yageo CC0402KRX7R9BB104, X7R
+      50V 10%. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C11:
     value: 100nF
     tolerance: "X7R, 50V, 10%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603KRX7R9BB104
+    mpn: CC0402KRX7R9BB104
     description: "+3V3 decoupling at U3 DVDD33 (33) and VDDREG33 (26)"
     source: >
-      Package raised 0402 -> 0603 in task 6 so it can be soldered by hand with
-      an iron. Part: Yageo CC0603KRX7R9BB104, X7R 50V 10%. Part and lifecycle:
-      [SOURCING].
+      Package stays 0402: spec 5.1 exempts the decoupling capacitors directly
+      at U3 and the crystal load capacitors from the 0402 -> 0603 raise,
+      because they stay small and close for signal integrity (task 6 first
+      raised them by mistake; restored). Part: Yageo CC0402KRX7R9BB104, X7R
+      50V 10%. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C12:
     value: 100nF
     tolerance: "X7R, 50V, 10%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603KRX7R9BB104
+    mpn: CC0402KRX7R9BB104
     description: "+1V0 decoupling at U3 AVDD10 (3)"
     source: >
-      Package raised 0402 -> 0603 in task 6 so it can be soldered by hand with
-      an iron. Part: Yageo CC0603KRX7R9BB104, X7R 50V 10%. Part and lifecycle:
-      [SOURCING].
+      Package stays 0402: spec 5.1 exempts the decoupling capacitors directly
+      at U3 and the crystal load capacitors from the 0402 -> 0603 raise,
+      because they stay small and close for signal integrity (task 6 first
+      raised them by mistake; restored). Part: Yageo CC0402KRX7R9BB104, X7R
+      50V 10%. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C13:
     value: 100nF
     tolerance: "X7R, 50V, 10%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603KRX7R9BB104
+    mpn: CC0402KRX7R9BB104
     description: "+1V0 decoupling at U3 AVDD10 (8)"
     source: >
-      Package raised 0402 -> 0603 in task 6 so it can be soldered by hand with
-      an iron. Part: Yageo CC0603KRX7R9BB104, X7R 50V 10%. Part and lifecycle:
-      [SOURCING].
+      Package stays 0402: spec 5.1 exempts the decoupling capacitors directly
+      at U3 and the crystal load capacitors from the 0402 -> 0603 raise,
+      because they stay small and close for signal integrity (task 6 first
+      raised them by mistake; restored). Part: Yageo CC0402KRX7R9BB104, X7R
+      50V 10%. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C14:
     value: 100nF
     tolerance: "X7R, 50V, 10%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603KRX7R9BB104
+    mpn: CC0402KRX7R9BB104
     description: "+1V0 decoupling at U3 AVDD10 (37)"
     source: >
-      Package raised 0402 -> 0603 in task 6 so it can be soldered by hand with
-      an iron. Part: Yageo CC0603KRX7R9BB104, X7R 50V 10%. Part and lifecycle:
-      [SOURCING].
+      Package stays 0402: spec 5.1 exempts the decoupling capacitors directly
+      at U3 and the crystal load capacitors from the 0402 -> 0603 raise,
+      because they stay small and close for signal integrity (task 6 first
+      raised them by mistake; restored). Part: Yageo CC0402KRX7R9BB104, X7R
+      50V 10%. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C15:
     value: 100nF
     tolerance: "X7R, 50V, 10%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603KRX7R9BB104
+    mpn: CC0402KRX7R9BB104
     description: "+1V0 decoupling at U3 DVDD10 (34)"
     source: >
-      Package raised 0402 -> 0603 in task 6 so it can be soldered by hand with
-      an iron. Part: Yageo CC0603KRX7R9BB104, X7R 50V 10%. Part and lifecycle:
-      [SOURCING].
+      Package stays 0402: spec 5.1 exempts the decoupling capacitors directly
+      at U3 and the crystal load capacitors from the 0402 -> 0603 raise,
+      because they stay small and close for signal integrity (task 6 first
+      raised them by mistake; restored). Part: Yageo CC0402KRX7R9BB104, X7R
+      50V 10%. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C16:
     value: 100nF
     tolerance: "X7R, 50V, 10%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603KRX7R9BB104
+    mpn: CC0402KRX7R9BB104
     description: "+1V0 decoupling at U3 U3VDD10 (14) and U2VDD10 (19)"
     source: >
-      Package raised 0402 -> 0603 in task 6 so it can be soldered by hand with
-      an iron. Part: Yageo CC0603KRX7R9BB104, X7R 50V 10%. Part and lifecycle:
-      [SOURCING].
+      Package stays 0402: spec 5.1 exempts the decoupling capacitors directly
+      at U3 and the crystal load capacitors from the 0402 -> 0603 raise,
+      because they stay small and close for signal integrity (task 6 first
+      raised them by mistake; restored). Part: Yageo CC0402KRX7R9BB104, X7R
+      50V 10%. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C17:
     value: 100nF
     tolerance: "X7R, 50V, 10%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603KRX7R9BB104
+    mpn: CC0402KRX7R9BB104
     description: "Output capacitor of U3's embedded 1.0V LDO at DVDD10_UPS (22); NOT on +1V0"
     source: >
       [RTL-DS] 6.15: 'only an output capacitor between its output and analog
-      ground for phase compensation'; no value given. 100nF as fitted by
-      [OLIMEX] Rev E C22 on its DVDD10_UPS (variant VC). NEEDS CONFIRMATION ON
-      FIRST BUILD, 1uF X5R is the drop-in if needed (same 0603 footprint). See
-      U3 design_notes.ldo_outputs. Package raised 0402 -> 0603 in task 6 so it
-      can be soldered by hand with an iron. Part: Yageo CC0603KRX7R9BB104, X7R
-      50V 10%. Part and lifecycle: [SOURCING].
+      ground for phase compensation', 'as close as possible to the power
+      pins'; no value given. 100nF as fitted by [OLIMEX] Rev E C22 on its
+      DVDD10_UPS (variant VC). NEEDS CONFIRMATION ON FIRST BUILD, 1uF X5R is
+      the drop-in if needed (same 0402 footprint, which takes a 1uF X5R 6.3V+
+      part). See U3 design_notes.ldo_outputs. Package stays 0402: spec 5.1
+      exempts the decoupling capacitors directly at U3 and the crystal load
+      capacitors from the 0402 -> 0603 raise, because they stay small and
+      close for signal integrity (task 6 first raised them by mistake;
+      restored). Part: Yageo CC0402KRX7R9BB104, X7R 50V 10%. Part and
+      lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C18:
     value: 100nF
     tolerance: "X7R, 50V, 10%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603KRX7R9BB104
+    mpn: CC0402KRX7R9BB104
     description: "+5V_SW decoupling at U3 VDD5 (21) and VDDREG5 (27)"
     source: >
-      Package raised 0402 -> 0603 in task 6 so it can be soldered by hand with
-      an iron. Part: Yageo CC0603KRX7R9BB104, X7R 50V 10%. Part and lifecycle:
-      [SOURCING].
+      Package stays 0402: spec 5.1 exempts the decoupling capacitors directly
+      at U3 and the crystal load capacitors from the 0402 -> 0603 raise,
+      because they stay small and close for signal integrity (task 6 first
+      raised them by mistake; restored). Part: Yageo CC0402KRX7R9BB104, X7R
+      50V 10%. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
 
   # --- Crystal load caps ---
   C19:
     value: 27pF
     tolerance: "C0G, 50V, 5%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603JRNPO9BN270
+    mpn: CC0402JRNPO9BN270
     description: "Y1 load capacitor, CKXTAL1 side"
     source: >
       Computed from Y1 = ABM8-25.000MHZ-D2Y-T, CL 18 pF [ABM8]: C = 2*(CL -
       Cstray) = 2*(18 - 4) = 28 pF -> 27 pF. Matches the 27 pF of [RTL-DS] 7.4
-      table 23 note 4. Calculation in Y1 design_notes.load_caps. Now 0603 (was
-      0402): the 0.6 mm longer pad is inside the 4 pF stray-capacitance
-      assumption of that calculation, and C0G is available in 0603. Part:
-      Yageo CC0603JRNPO9BN270, C0G 50V 5%. Part and lifecycle: [SOURCING].
+      table 23 note 4. Calculation in Y1 design_notes.load_caps. Package stays
+      0402: spec 5.1 exempts the decoupling capacitors directly at U3 and the
+      crystal load capacitors from the 0402 -> 0603 raise, because they stay
+      small and close for signal integrity (task 6 first raised them by
+      mistake; restored). Part: Yageo CC0402JRNPO9BN270, C0G 50V 5%. Part and
+      lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C20:
     value: 27pF
     tolerance: "C0G, 50V, 5%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603JRNPO9BN270
+    mpn: CC0402JRNPO9BN270
     description: "Y1 load capacitor, CKXTAL2 side"
     source: >
-      Same as C19 - see C19 and Y1 design_notes.load_caps. Now 0603 (was
-      0402): the 0.6 mm longer pad is inside the 4 pF stray-capacitance
-      assumption of that calculation, and C0G is available in 0603. Part:
-      Yageo CC0603JRNPO9BN270, C0G 50V 5%. Part and lifecycle: [SOURCING].
+      Same as C19 - see C19 and Y1 design_notes.load_caps. Package stays 0402:
+      spec 5.1 exempts the decoupling capacitors directly at U3 and the
+      crystal load capacitors from the 0402 -> 0603 raise, because they stay
+      small and close for signal integrity (task 6 first raised them by
+      mistake; restored). Part: Yageo CC0402JRNPO9BN270, C0G 50V 5%. Part and
+      lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
 
   # --- MagJack PHY-side centre tap ---
@@ -986,46 +1088,53 @@ components:
   C22:
     value: 100nF
     tolerance: "X7R, 50V, 10%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603KRX7R9BB104
+    mpn: CC0402KRX7R9BB104
     description: "USB 3.0 SuperSpeed TX AC-coupling, U3SSTXP (13) to J3 pin 6"
     source: >
       USB 3.0 requires the transmitter to be AC coupled with 75-200 nF in
       series, placed at the transmitter. [RTL-DS] is silent on it. [OLIMEX]
       Rev E fit 100nF/X5R/0402 in series in each of U3TX_P and U3TX_N (C1,
       C2). NOT in the earlier netlist; found while verifying usb3_crossover.
-      Place close to U3, symmetric with C23, same size and orientation. Task
-      6: 0402 -> 0603; 100 nF +/-10 % X7R stays inside the 75-200 nF window. A
-      0603 body adds about 0.6 mm to the pair, which task 8/9 must keep
-      identical on both legs. Part: Yageo CC0603KRX7R9BB104, X7R 50V 10%. Part
-      and lifecycle: [SOURCING].
+      Place close to U3, symmetric with C23, same size and orientation. 100 nF
+      +/-10 % X7R stays inside the 75-200 nF window. Package: a 0603 pad is a
+      larger impedance discontinuity on a 90 ohm pair than a 0402 pad, it sits
+      beside the ESD array U8, and the two legs must stay symmetric, so 0402
+      is kept (first raised to 0603 in task 6, restored after review). Part:
+      Yageo CC0402KRX7R9BB104, X7R 50V 10%. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
   C23:
     value: 100nF
     tolerance: "X7R, 50V, 10%"
-    package: "0603"
-    footprint: "Capacitor_SMD:C_0603_1608Metric"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
-    mpn: CC0603KRX7R9BB104
+    mpn: CC0402KRX7R9BB104
     description: "USB 3.0 SuperSpeed TX AC-coupling, U3SSTXN (12) to J3 pin 5"
     source: >
-      Same as C22. Part: Yageo CC0603KRX7R9BB104, X7R 50V 10%. Part and
-      lifecycle: [SOURCING].
+      Same as C22, including the package reasoning: a 0603 pad is a larger
+      impedance discontinuity on a 90 ohm pair than a 0402 pad, it sits beside
+      the ESD array U8, and the two legs must stay symmetric, so 0402 is kept
+      (first raised to 0603 in task 6, restored after review). Part: Yageo
+      CC0402KRX7R9BB104, X7R 50V 10%. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
 
   R14:
     value: 0R
-    package: "0603"
-    footprint: "Resistor_SMD:R_0603_1608Metric"
+    package: "0402"
+    footprint: "Resistor_SMD:R_0402_1005Metric"
     manufacturer: Yageo
-    mpn: RC0603JR-070RL
+    mpn: RC0402JR-070RL
     description: "Series drive-level resistor, CKXTAL2 to Y1; 0R now, raise on the bench if Y1 is overdriven"
     source: >
       Y1 design_notes.drive_level. Populated with 0R, NOT DNP: the crystal
-      node must be connected. Package 0402 -> 0603 for hand soldering. Part:
-      Yageo RC0603JR-070RL. Part and lifecycle: [SOURCING].
+      node must be connected. Package stays 0402 (controller decision, task 6
+      review): spec 5.1 does not exempt it, but its pad adds to Cstray on the
+      crystal node (Y1 design_notes.load_caps) and the drive-level question
+      there is already tight. Part: Yageo RC0402JR-070RL. Part and lifecycle:
+      [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
 
   R12:
@@ -1102,10 +1211,10 @@ components:
       CT 10 nF gives 864 us, CT 27 nF gives 2245 us. The formula in 9.3.4 (SR
       = 46.62/CT) does not describe 5 V and is NOT used; the table, stored in
       U7.soft_start, is. 27 nF is the largest table entry: 10 nF would leave
-      only a 12 % margin to the 100 mA target (design_notes.vbus_inrush). The
+      put the modelled peak at 126 mA, over the 100 mA target (design_notes.vbus_inrush). The
       inrush calculation and the guard in check_fab_release.py both depend on
       this value; a +/-10 % X7R part that loses a further 10 % to DC bias (CT
-      sees up to 2.5 V, 9.3.4) is covered by the 20 % margin there. Part:
+      sees up to 2.5 V, 9.3.4) is covered by the 20 % CT allowance in the model. Part:
       Yageo CC0603KRX7R9BB273, X7R 50V 10%. Part and lifecycle: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
 
@@ -1159,12 +1268,20 @@ components:
     footprint: "Package_TO_SOT_SMD:SOT-23-6"
     description: "4-channel 0.3 pF ESD array for the SuperSpeed pairs, at the USB connector"
     source: >
-      [SP3019] (search-extracted text, see header): 4 channels, 0.3 pF typ
-      I/O-to-GND at 3 GHz (no maximum published), 0.18 pF I/O-to-I/O, 5 V
-      stand-off, +/-10 kV contact / +/-15 kV air IEC 61000-4-2, SOT23-6L
-      leaded and hand-solderable. Selection criterion and reasons in
-      design_notes.esd_protection: capacitance per line at most 0.5 pF ([TI-
-      ESD] 4.2, 'less than 0.5pF' for 5 Gbit/s). This replaces the
+      [SP3019] (committed, md5 54393f11...; see the header): 4 channels, 0.3
+      pF typ I/O-to-GND at 3 GHz (page 2 electrical characteristics; no
+      maximum published), 0.18 pF I/O-to-I/O, 5 V stand-off, +/-10 kV contact
+      / +/-15 kV air IEC 61000-4-2, SOT23-6L leaded and hand-solderable. PIN
+      MAP from page 1: the pinout drawing (top view, pins 1 2 3 along the
+      bottom, 6 5 4 along the top, pin 1 dot at the bottom left) and the
+      functional block diagram, which attaches the four I/O to PIN 1, PIN 3,
+      PIN 4, PIN 6 and the ground rail to GND (PIN 2). Pin 5 is on the package
+      drawing and not in the diagram, i.e. not connected; the 08/16/22
+      revision says so in words ("Note: PIN 5 is NC", search-extracted text).
+      The cover calls it an SP3012-family sheet because the SOT23-6L drawing
+      is shared with the obsolete SP3012-04HTG. Selection criterion and
+      reasons in design_notes.esd_protection: capacitance per line at most 0.5
+      pF ([TI-ESD] 4.2, 'less than 0.5pF' for 5 Gbit/s). Replaces the
       SP3012-04HTG, which Littelfuse and DigiKey list as obsolete. Lifecycle
       and stock: [SOURCING].
     pins:
@@ -1172,7 +1289,7 @@ components:
       2: {name: GND,   type: passive}
       3: {name: IO_A2, type: passive, note: "USB3_TX_N_CONN"}
       4: {name: IO_B2, type: passive, note: "USB3_RX_N. Row 6/5/4: RX pair on pins 6 and 4"}
-      5: {name: NC,    type: passive, note: "[SP3019] 'PIN 5 is NC'"}
+      5: {name: NC,    type: passive, note: "[SP3019] page 1: on the package drawing, absent from the block diagram; '2022 revision: PIN 5 is NC'"}
       6: {name: IO_B1, type: passive, note: "USB3_RX_P"}
 
   U9:
@@ -1608,78 +1725,96 @@ no_connect:
       service, so there is no switch-off to discharge. [TPS22810] 6: 'disabling
       QOD by leaving pin floating'.
   U8.5:
-    reason: "SP3019-04HTG pin 5 is NC by datasheet ([SP3019])."
+    reason: "SP3019-04HTG pin 5 is not connected inside the part ([SP3019] page 1 block diagram; the 2022 revision states it)."
 
 # ---------------------------------------------------------------------------
 # Cross-cutting design notes
 # ---------------------------------------------------------------------------
 design_notes:
   vbus_inrush: >
-    DECIDED 2026-11-01 (task 6). PROBLEM: the +5V net carried 21.2 uF (C1 10 +
-    C2 0.1 + C3 10 + C5 1 + C18 0.1) directly on the connector. [SLYT118]
-    table 1: the USB limit is 10 uF at the connector with at most 50 uC of
-    inrush; USB 2.0 7.2.4.1 (as quoted via [SLYT118] and
+    DECIDED 2026-11-01 (task 6), REWORKED after review. PROBLEM: the +5V net
+    carried 21.2 uF (C1 10 + C2 0.1 + C3 10 + C5 1 + C18 0.1) directly on the
+    connector. [SLYT118] table 1: the USB limit is 10 uF at the connector with
+    at most 50 uC of inrush; USB 2.0 7.2.4.1 (as quoted via [SLYT118] and
     electrongen.blogspot.com; the USB-IF text itself was not read here): a
     device that needs more bypass capacitance 'must incorporate some form of
     VBUS surge current limiting'. 21.2 uF is twice the limit with nothing
-    limiting the current; the symptom is a browned-out port or a tripped VL805
-    current limit on the Pi 4.
+    limiting the current.
 
     FIX, two parts. (a) Less capacitance on raw VBUS: C1 10 uF -> 1 uF, now
     the load switch's input capacitor. Raw VBUS holds C1 1 uF + C2 0.1 uF =
-    1.1 uF, i.e. 5.8 uC at 5.25 V against the 50 uC limit; the existing 10 uF
-    test in check_fab_release.py reads that net and passes on it. (b) The bulk
-    (C3 10 uF buck input, C5 1 uF LDO input, C18 100 nF) moved behind U7, a
-    TPS22810 load switch whose rise time is set by C26. That is NOT just a
-    renamed net: check_fab_release.py also computes the inrush into everything
-    behind U7 (rails.+5V_SW.gated_by / downstream_rails) and fails if
-    capacitance is added there or C26 is removed.
+    1.1 uF, i.e. 5.8 uC at 5.25 V against the 50 uC limit; the 10 uF test in
+    check_fab_release.py reads that net and passes on it. (b) The bulk (C3 10
+    uF buck input, C5 1 uF LDO input, C18 100 nF) moved behind U7, a TPS22810
+    load switch whose rise time is set by C26. That is NOT just a renamed net:
+    check_fab_release.py also models the charging current into everything
+    behind U7 and fails if capacitance is added there or C26 is removed. EN of
+    U7 is tied to VIN, which [TPS22810] 9.3.3 endorses; VBUS settles in
+    microseconds against an output ramp of about two milliseconds.
 
-    CALCULATION (inputs all read from this file; the test repeats it):
+    MODEL (a model of the capacitive charging, in phases; check_fab_release.py
+    repeats it, parameters are read from this file). Switch: CT = 27 nF, taken
+    20 % low (21.6 nF) for X7R tolerance and bias: rise time 1806 us for 4 V
+    by linear interpolation of the [TPS22810] table 2 entries for 10 nF (864
+    us) and 27 nF (2245 us) at VIN = 5 V; slew 2215 V/s, 0 to 5 V in 2.26 ms.
+    The slope is taken as constant over the whole ramp although the table
+    covers only 10-90 %.
 
-      capacitance on +5V_SW ..... C3 10 + C5 1 + C18 0.1 = 11.1 uF
-      behind U4 (+3V3) ......... C6 10 + C7, C9, C10, C11 0.4 = 10.4 uF at 3.3 V, 1:1 -> 34.3 uC
-      behind U6 (+1V0) ......... C4 22 + C12..C16 0.5 = 22.5 uF at 1.0 V x 0.25 -> 5.6 uC
-      equivalent at 5 V ........ 11.1 + 34.3/5 + 5.6/5 = 19.1 uF  (95 uC in all)
-      rise time ................ CT = 27 nF: 2245 us for 4 V (10-90 %) at VIN = 5 V
-                                 [TPS22810] table 2; CT taken 20 % low = 21.6 nF: 1806 us
-                                 by linear interpolation between 10 nF and 27 nF
-      dV/dt .................... 4 V / 1806 us = 2215 V/s  (1782 V/s with the nominal CT)
-      inrush ................... 19.1 uF x 2215 V/s = 42 mA   (34 mA nominal)
+      phase 1, whole ramp .... +5V_SW itself: C3 10 + C5 1 + C18 0.1 = 11.1 uF x 2215 V/s = 24.6 mA
+      phase 2, VIN < 3.55 V .. U4 is an LDO and its output tracks its input until dropout, so the
+                               10.4 uF behind it (C6 10 + C7, C9, C10, C11 0.4) charges at the FULL
+                               slew: 23.0 mA more, together 47.6 mA, for the first 1.6 ms
+      phase 3, VIN > 2.5 V .... U6 starts at its UVLO ([SY8089] page 4, 2.5 V max) and brings its
+                               22.5 uF (C4 22 + C12..C16 0.5) to 1.0 V in TSS = 1.2 ms (typ): 18.8 mA
+                               out, input current = I_out x Vout/(Vin x 0.8), about 2.5 mA at VIN = 3.5 V,
+                               under 5 mA throughout
+      modelled peak ........... 50 mA at t = 1.6 ms (phases 1+2 plus the first of phase 3)
+      ramp average ............ 42 mA (this is the number the first version of this note called
+                               'inrush'; it is a LOWER BOUND on the peak, not the peak)
 
-    TARGET: below 100 mA. Why that number: the USB attach test counts only
-    current above 100 mA as an inrush event (quoted at
-    electrongen.blogspot.com, from the USB test procedure; not read at USB-IF)
-    and 100 mA is the low-power unit load ([SLYT118] table 1). Under it there
-    is no inrush region at all. Margin 2.4x at the 20 % low CT. The 10-90 %
-    figure leaves out the first and last tenth of the ramp, and the datasheet
-    states its table is valid only when VIN is already steady before EN is
-    asserted, which does not hold with EN tied to VIN; that is why the target
-    keeps a margin of more than 2 and why the first build must look at the
-    ramp.
+    THIS DOES NOT BOUND THE PEAK. Stated plainly, because the first version of
+    this note claimed a margin that the evidence did not carry. (1) The SY8089
+    note gives TSS as a TYPICAL value and the UVLO as a MAXIMUM only: nothing
+    says the soft start is not four times faster or the converter starting at
+    2.0 V or lower. Run through the same model: TSS/4 with a 2.0 V UVLO gives 83 mA; TSS/4 with the buck starting at 0.5 V gives 128 mA. (2) The model
+    leaves out U3's own start-up load. U3 is powered through U4 from about 1.6
+    ms on, and [RTL-DS] table 26 gives its operating current (Icc33 70 mA typ,
+    Icc10 170 mA typ, heavy traffic) but nothing for power-up. Any of that
+    adds to the charging current, and the USB attach test counts total current
+    above 100 mA. (3) The 10-90 % table leaves out the first and last tenth of
+    the ramp. So: 50 mA is the modelled capacitive peak under typical
+    datasheet values; 42 mA is a ramp-average lower bound; the true peak is
+    unbounded from committed evidence and could plausibly be higher. The guard
+    in check_fab_release.py asserts the modelled peak stays under 100 mA,
+    which is a NECESSARY condition only. There is no margin figure in this
+    note, and none should be quoted from it.
 
-    NOT COVERED, stated rather than hidden. (1) The steady current the board
-    draws before the host has configured it: USB allows a SuperSpeed device
-    150 mA until configured (one USB 3.0 unit load, from memory of the
-    specification, not checked against its text here), [RTL-DS] table 26 gives only the heavy-traffic
-    average (Isys5 about 119 mA typ, see rail_currents) and nothing for
-    attach. NOT ASSESSED: measure with a USB power meter on the first build.
-    (2) Hot-plug overshoot. Ceramic capacitors on an inductive cable ring up
-    to roughly twice the supply on a hot plug. A TPS22918 (6 V absolute
-    maximum) was rejected for that reason; U7 is rated 20 V absolute maximum
-    and 18 V operating, and U9 clamps raw VBUS from 6 V up. U6 (5.5 V maximum)
-    and U4 (6.5 V) sit behind U7 and see the slewed rail. The overshoot was
-    not measured; TP2 is there to look at it. (3) Reverse conduction:
+    WHY 100 mA: the USB attach test counts only current above 100 mA as an
+    inrush event (quoted at electrongen.blogspot.com from the USB test
+    procedure; not read at USB-IF) and 100 mA is the low-power unit load
+    ([SLYT118] table 1).
+
+    ALSO NOT COVERED. (a) The steady current the board draws before the host
+    has configured it: USB allows a SuperSpeed device 150 mA until configured
+    (one USB 3.0 unit load, from memory of the specification, not checked
+    against its text here); nothing in the committed documents gives the
+    attach current. NOT ASSESSED. (b) Hot-plug overshoot: ceramic capacitors
+    on an inductive cable ring up to roughly twice the supply on a hot plug. A
+    TPS22918 (6 V absolute maximum) was rejected for that reason; U7 is rated
+    20 V absolute maximum and 18 V operating, and U9 clamps raw VBUS from 6 V
+    up. Not measured; TP2 is there to look at it. (c) Reverse conduction:
     [TPS22810] 10.4 recommends CIN greater than CL because of the body diode,
     here CL (11.1 uF) is ten times CIN (1.1 uF). On unplug +5V_SW runs down
     through the body diode into raw VBUS and the loads; nothing reaches the
     host, it has disconnected. If the host drops VBUS while still connected,
     +5V_SW can feed it for a few milliseconds. Accepted.
 
-    FIRST BUILD: scope TP2 (raw VBUS) and TP3 (+5V_SW) together on plug-in,
-    with a current probe or a 0.1 ohm resistor in the USB cable. Expect TP3 to
-    ramp over roughly two milliseconds with the current peak under 100 mA, and
-    TP2 never above 6 V.
+    FIRST BUILD (this is where the peak gets its bound): scope TP2 (raw VBUS)
+    and TP3 (+5V_SW) together on plug-in, with a current probe or a 0.1 ohm
+    resistor in the USB cable. Expect TP3 to ramp over roughly two
+    milliseconds. Record the peak current; if it is over 100 mA the cures are
+    a larger C26 (outside the datasheet table, so characterise it), a delayed
+    enable for U6, or a smaller C4/C6.
   esd_protection: >
     ADDED 2026-11-01 (task 6). The board is plugged into somebody else's host;
     D+/D- and the SuperSpeed pairs had no protection at all. Chosen: U9
@@ -1709,7 +1844,7 @@ design_notes:
     DigiKey, while aggregator sites still list stock as 'active'. SP3019 is
     the Littelfuse replacement and is better on capacitance.
 
-    LAYOUT (for tasks 8 and 9). U9 is flow-through: D+ enters pad 1 and leaves
+    U8 PIN MAP, PROVENANCE: [SP3019] (committed) page 1, pinout drawing and functional block diagram: I/O on pins 1, 3, 4, 6, GND on pin 2, pin 5 not connected; pin 1 is the dotted corner at the bottom left of the top view, the same numbering as KiCad's SOT-23-6 footprint (pads 1-3 along one side, 4-6 back along the other). Task 8 must still check the placed footprint's pad 1 against that drawing. LAYOUT (for tasks 8 and 9). U9 is flow-through: D+ enters pad 1 and leaves
     pad 6, D- enters 3 and leaves 4. U8 is NOT flow-through, each line has one
     pin: take each line through its pad (trace in and out of the same pad, no
     side stub), TX pair on pins 1 and 3 with GND (pin 2) between, RX pair on
@@ -1764,8 +1899,7 @@ design_notes:
     schematic marks it (dnp yes); bom.csv lists it with Populate = DNP,
     Quantity = 0, an EMPTY Part Number cell (a buyer working down that column
     cannot order it) and the part to use if it is ever fitted in 'Part If
-    Fitted'; DNP rows come last. A value text that says DNP without `populate:
-    false` is refused by both generators. `bom: false` = a board feature that
+    Fitted'; DNP rows come last. A value text that says DNP without `populate: false` is refused by both generators. The schematic symbol of a DNP part is also (in_bom no) and carries its part number only as `MPN_If_Fitted`, never `MPN`, so a BOM exported from KiCad itself cannot list R12 with an orderable number either. `bom: false` = a board feature that
     is not a part (TP1..TP7, JP1, JP2): on the schematic and the PCB, left out
     of the BOM.
 
@@ -1775,12 +1909,27 @@ design_notes:
     from-BOM onto the footprints of R12, C24 and the TP/JP parts, or a CPL
     exported from the PCB lists R12 as a part to place.
 
-    PACKAGES: every 0402 passive became 0603 (the operator solders by hand),
-    except where a larger case was already used. Parts not 0603 on purpose:
-    C3, C4 0805 (a 10 uF/22 uF 0603 loses too much capacitance to DC bias),
-    C25, R13 1206 (2 kV rating, direct-tie option), L2 3225. Every row has a
-    manufacturer part number; the lifecycle check over all rows is in
-    hardware/review/part-sourcing.md.
+    PACKAGES (spec 5.1: everything except U3 must be hand-solderable; passives
+    go 0402 -> 0603 where the layout allows, EXCEPT the crystal load
+    capacitors and the decoupling at U3, which stay small and close for signal
+    integrity). Task 6 first raised every 0402 and was corrected after review.
+    0402 stays: C7, C9-C16, C18 (U3 decoupling), C17 (U3 DVDD10_UPS LDO output
+    capacitor, 'as close as possible to the power pins', [RTL-DS] 6.15), C19,
+    C20 (crystal load), C22, C23 (SuperSpeed AC coupling: a 0603 pad on a 90
+    ohm pair is a larger discontinuity, it sits beside U8, and the pair must
+    stay symmetric) and R14 (its pad adds to Cstray on the crystal node and
+    the drive-level question there is already tight; a controller call, 5.1
+    does not exempt it). 0603: C1, C2, C5, C6, C21, C24, C26, R5-R8, R11, R12
+    (R12 and C24 are the parts the operator may have to fit by hand on the
+    first build, which is why they are not 0402), C8. C8 IS A DELIBERATE
+    DEVIATION FROM 5.1, recorded by the spec owner: C8 is decoupling at U3 and
+    5.1 would keep it 0402, but a 2.2 uF ceramic in 0402 at 3.3 V bias loses a
+    large fraction of its nominal value to DC bias and its job is LDO phase
+    compensation, where actual capacitance outweighs ESL. Do not revert it to
+    0402. Larger on purpose: C3, C4 0805 (a 10 uF/22 uF 0603 loses too much
+    capacitance to DC bias), C25, R13 1206 (2 kV rating, direct-tie option),
+    L2 3225. Every row has a manufacturer part number; the lifecycle check
+    over all rows is in hardware/review/part-sourcing.md.
   shield_tie: >
     DECIDED 2026-11-01: 1nF/2kV (C25) in parallel with 1M (R13) from SHIELD to
     GND, not a direct tie. A direct tie was the alternative.
@@ -1828,7 +1977,7 @@ design_notes:
     ADDED WITH THIS CHECK: the netlist had no AC-coupling capacitors in the
     SuperSpeed transmit path. USB 3.0 requires 75-200 nF in series at the
     transmitter; [RTL-DS] does not mention it; [OLIMEX] Rev E has 100nF in each
-    TX line. C22 (P) and C23 (N), 100nF (0402 when added in task 5, 0603 since task 6), are added at the transmitter.
+    TX line. C22 (P) and C23 (N), 100nF 0402, are added at the transmitter.
     The receive pair needs none on our side (the host's TX is already coupled).
     The ESD parts planned for these pairs must go on the connector side of
     C22/C23, or between them and J3, not between U3 and the caps.

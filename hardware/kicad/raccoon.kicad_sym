@@ -270,7 +270,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "100nF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C10_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -288,7 +288,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "100nF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C11_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -306,7 +306,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "100nF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C12_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -324,7 +324,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "100nF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C13_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -342,7 +342,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "100nF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C14_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -360,7 +360,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "100nF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C15_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -378,7 +378,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "100nF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C16_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -396,7 +396,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "100nF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C17_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -414,7 +414,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "100nF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C18_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -432,7 +432,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "27pF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C19_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -468,7 +468,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "27pF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C20_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -504,7 +504,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "100nF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C22_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -522,7 +522,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "100nF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C23_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -535,7 +535,7 @@
 		)
 		(symbol "RACCOON_C24"
 			(pin_names (offset 0.508))
-			(exclude_from_sim no) (in_bom yes) (on_board yes)
+			(exclude_from_sim no) (in_bom no) (on_board yes)
 			(property "Reference" "C24" (at 0 3.81 0)
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "DNP" (at 0 -3.81 0)
@@ -666,7 +666,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "100nF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C7_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -702,7 +702,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "100nF" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Capacitor_SMD:C_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Capacitor_SMD:C_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_C9_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
@@ -787,7 +787,7 @@
 		)
 		(symbol "RACCOON_R12"
 			(pin_names (offset 0.508))
-			(exclude_from_sim no) (in_bom yes) (on_board yes)
+			(exclude_from_sim no) (in_bom no) (on_board yes)
 			(property "Reference" "R12" (at 0 3.81 0)
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "0R DNP" (at 0 -3.81 0)
@@ -828,7 +828,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "0R" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Resistor_SMD:R_0603_1608Metric" (at 0 0 0)
+			(property "Footprint" "Resistor_SMD:R_0402_1005Metric" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_R14_0_1"
 				(rectangle (start -2.54 -1.27) (end 2.54 1.27)

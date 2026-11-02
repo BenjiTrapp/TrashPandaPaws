@@ -72,7 +72,9 @@ class Symbol:
         self.value = str(comp.get("value", ref))
         self.footprint = comp.get("footprint", "")
         self.populated = fitting.is_populated(ref, comp)
-        self.in_bom = fitting.in_bom(ref, comp)
+        # A DNP part is out of a KiCad-exported BOM too: gen_bom.py is the one
+        # place that lists it, as DNP with quantity 0 and no orderable number.
+        self.in_bom = fitting.in_bom(ref, comp) and self.populated
         pins = comp.get("pins") or {}
         self.pins = {str(n): (p or {}) for n, p in pins.items()}
         self.bare = f"RACCOON_{ref}"
@@ -273,7 +275,11 @@ def build(netlist, out_path, symlib_path=DEFAULT_SYMLIB):
             '\t\t\t(effects (font (size 1.27 1.27)) hide))']
         # The manufacturer part number travels with the symbol, so a BOM
         # exported from KiCad itself (not only gen_bom.py) carries it.
-        for key, field in (("MPN", "mpn"), ("Manufacturer", "manufacturer")):
+        # A DNP part gets MPN_If_Fitted, never MPN: an exported BOM or a
+        # tool reading MPN must not see an orderable number on a part that is
+        # not to be fitted.
+        mpn_key = "MPN" if sym.populated else "MPN_If_Fitted"
+        for key, field in ((mpn_key, "mpn"), ("Manufacturer", "manufacturer")):
             if sym.comp.get(field):
                 instances += [
                     f'\t\t(property "{key}" "{sym.comp[field]}" (at {ox} {oy} 0)',
