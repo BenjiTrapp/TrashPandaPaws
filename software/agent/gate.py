@@ -35,9 +35,11 @@ from software.agent.store import queries
 class GateDecision(NamedTuple):
     allowed: bool
     reason: str
-    # "hard", "free", "ev", "operator", "timeout" or "skip". "free" and
-    # "skip" are not in approvals.decided_by's CHECK list, and neither writes
-    # a row; "hard" is in the list but is never written either.
+    # "hard", "free", "ev", "operator", "timeout" or "skip". "free" is the
+    # only one that writes no row — a tier-3 action has nothing to ask and
+    # would flood the table. "hard" and "skip" write a row that is already
+    # decided: audited, yet unanswerable, because pending() filters on
+    # decision IS NULL and answer() finds no future for it.
     decided_by: str
     ev: Optional[float]
     # The verdict between allowed and refused: allowed, but only because the
@@ -64,6 +66,20 @@ _REFUSED = "refused"
 _DETECTION_POINTS = -100
 _DETECTION_STEP = 0.15
 _DETECTION_CAP = 0.95
+
+# A detection costs 100 points, raises p_detect for every later decision and
+# can end the run by spending the budget, so which signal fired belongs in the
+# record. The name arrives from scanned tool output, so it is normalised and
+# capped before it is written: untrusted text must not be able to put an
+# unbounded or deceptive value into the audit trail.
+_SOURCE_MAX = 40
+
+
+def _audit_source(source) -> str:
+    if not isinstance(source, str):
+        return "unnamed"
+    cleaned = re.sub(r"[^a-z0-9]+", "_", source.lower()).strip("_")
+    return cleaned[:_SOURCE_MAX] or "unnamed"
 
 
 # ── Output scanning ──
@@ -172,7 +188,8 @@ class Gate:
 
     def note_detection(self, source):
         """Record a detection. True if the detection budget is now spent."""
-        queries.log_score(self._conn, self._run_id, "detection",
+        queries.log_score(self._conn, self._run_id,
+                          "detection:" + _audit_source(source),
                           _DETECTION_POINTS, "high", True)
         return self.detection_count >= self.detection_budget
 
@@ -236,9 +253,7 @@ class Gate:
             if self.unattended_behavior == "pause":
                 raise GatePauseRequested(classification.action_key)
             if self.unattended_behavior == "skip":
-                return GateDecision(
-                    False, "no operator is present and this run skips gated "
-                    "actions", "skip", None)
+                return self._skip(classification)
 
         numbers = self._evaluate(classification, p_success_override)
         approval_id = queries.create_approval(
@@ -250,8 +265,33 @@ class Gate:
             return self._decide_by_ev(approval_id, numbers)
         return await self._ask_operator(approval_id, numbers)
 
+    def _skip(self, classification):
+        """Refuse without evaluating, but on the record.
+
+        The rule for this layer is that the agent may act unleashed and
+        everything is logged, so a skip cannot be a refusal with no trace.
+        No EV is computed — the point of "skip" is that nothing decides in
+        the operator's absence — so the row carries why instead of numbers.
+        """
+        approval_id = queries.create_approval(
+            self._conn, self._run_id, classification.action_key,
+            json.dumps(classification._asdict(), default=str),
+            json.dumps({"skipped": True,
+                        "reason": "unattended_behavior is skip"}))
+        queries.decide_approval(self._conn, approval_id, _REFUSED, "skip")
+        return GateDecision(
+            False, "no operator is present and this run skips gated actions",
+            "skip", None)
+
     def _evaluate(self, classification, p_success_override):
-        p_detect = self.effective_p_detect(classification.p_detect)
+        # A missing p_detect is substituted, not floored. safety._row defaults
+        # p_detect to 0.0, so a risk-table row that omits it would otherwise
+        # yield ev = points * p_success - 0 — a risk-free expected value for
+        # an action that is supposed to knock. Flooring a low-but-real value
+        # instead would silently overrule the table.
+        substituted = not classification.p_detect
+        p_detect = self.effective_p_detect(
+            self.p_detect_prior if substituted else classification.p_detect)
         p_success = classification.p_success
         if p_success_override is not None:
             p_success = safety.clamp_llm_adjustment(
@@ -268,6 +308,7 @@ class Gate:
             "p_success_effective": p_success,
             "p_detect_prior": classification.p_detect,
             "p_detect_effective": p_detect,
+            "p_detect_substituted": substituted,
             "detections": self.detection_count,
             "override_decisive": (ev > self.ev_threshold
                                   and not ev_prior > self.ev_threshold),
@@ -290,6 +331,10 @@ class Gate:
                       "(p_detect %.2f after %d detection(s))"
                       % (ev, self.ev_threshold, numbers["p_detect_effective"],
                          numbers["detections"]))
+        if numbers["p_detect_substituted"]:
+            reason += ("; the risk table named no p_detect for this action, "
+                       "so the configured prior %.2f was used"
+                       % self.p_detect_prior)
         return GateDecision(allowed, reason, "ev", ev, decisive)
 
     async def _ask_operator(self, approval_id, numbers):

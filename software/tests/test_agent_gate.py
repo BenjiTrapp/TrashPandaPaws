@@ -135,6 +135,56 @@ class TestTierRouting(unittest.IsolatedAsyncioTestCase):
 
 # ── EV arbiter ──
 
+class TestMissingDetectionProbability(unittest.IsolatedAsyncioTestCase):
+    """`p_detect_prior` substitutes for a missing p_detect; it is not a floor.
+
+    `safety._row` defaults `p_detect` to 0.0, so a risk-table row that omits
+    it would yield `ev = points * p_success - 100 * 0` — a risk-free expected
+    value for an action that is meant to knock. Substituting is the narrow
+    fix; flooring would silently overrule a low-but-deliberate table value.
+    """
+
+    async def test_a_missing_p_detect_is_not_risk_free(self):
+        conn, rid = _fresh_run()
+        d = await _gate(conn, rid, p_detect_prior=0.15).request(
+            _cls(points=200, p_success=0.9, p_detect=0.0))
+        self.assertAlmostEqual(d.ev, 200 * 0.9 - 100 * 0.15)
+
+    async def test_a_low_but_real_p_detect_is_left_alone(self):
+        conn, rid = _fresh_run()
+        d = await _gate(conn, rid, p_detect_prior=0.15).request(
+            _cls(points=200, p_success=0.9, p_detect=0.01))
+        self.assertAlmostEqual(d.ev, 200 * 0.9 - 100 * 0.01)
+
+    async def test_the_substitution_is_stated_in_the_reason(self):
+        conn, rid = _fresh_run()
+        substituted = await _gate(conn, rid, p_detect_prior=0.15).request(
+            _cls(points=200, p_success=0.9, p_detect=0.0))
+        self.assertIn("no p_detect", substituted.reason)
+        present = await _gate(conn, rid, p_detect_prior=0.15).request(
+            _cls(points=200, p_success=0.9, p_detect=0.01))
+        self.assertNotIn("no p_detect", present.reason)
+
+    async def test_the_substitution_is_recorded(self):
+        conn, rid = _fresh_run()
+        await _gate(conn, rid).request(_cls(p_detect=0.0))
+        self.assertTrue(json.loads(_rows(conn)[0]["ev_json"])
+                        ["p_detect_substituted"])
+
+    async def test_the_configured_prior_is_what_gets_used(self):
+        conn, rid = _fresh_run()
+        d = await _gate(conn, rid, p_detect_prior=0.40).request(
+            _cls(points=200, p_success=0.9, p_detect=0.0))
+        self.assertAlmostEqual(d.ev, 200 * 0.9 - 100 * 0.40)
+
+    async def test_detection_tracking_still_applies_to_a_substituted_value(self):
+        conn, rid = _fresh_run()
+        g = _gate(conn, rid, p_detect_prior=0.15, detection_budget=99)
+        g.note_detection("reset")
+        d = await g.request(_cls(points=200, p_success=0.9, p_detect=0.0))
+        self.assertAlmostEqual(d.ev, 200 * 0.9 - 100 * 0.30)
+
+
 class TestEvArbiter(unittest.IsolatedAsyncioTestCase):
     async def test_positive_ev_proceeds(self):
         conn, rid = _fresh_run()
@@ -343,10 +393,39 @@ class TestDetectionTracking(unittest.TestCase):
         conn, rid = _fresh_run()
         _gate(conn, rid).note_detection("reset")
         event = queries.get_score_context(conn, rid)["recent_events"][0]
-        self.assertEqual(event["action"], "detection")
+        self.assertEqual(event["action"], "detection:reset")
         self.assertEqual(event["points"], -100)
         self.assertEqual(event["risk_level"], "high")
         self.assertTrue(event["detected"])
+
+    def test_the_signal_that_fired_is_recoverable_from_the_record(self):
+        # A detection costs 100 points, raises p_detect for every later
+        # decision and can end the run. Which signal fired has to survive
+        # into the audit trail or the operator cannot review the decision.
+        conn, rid = _fresh_run()
+        g = _gate(conn, rid, detection_budget=99)
+        for source in ("reset", "policy_block", "no_route"):
+            g.note_detection(source)
+        actions = [e["action"]
+                   for e in queries.get_score_context(conn, rid)["recent_events"]]
+        for source in ("reset", "policy_block", "no_route"):
+            self.assertIn("detection:" + source, actions)
+
+    def test_an_untrusted_source_name_cannot_poison_the_record(self):
+        # The name arrives from scanned tool output, so it is attacker-shaped.
+        conn, rid = _fresh_run()
+        g = _gate(conn, rid, detection_budget=99)
+        for source in ("A" * 500, "drop'; DELETE FROM approvals; --",
+                       "with spaces\nand\tcontrol", "", "   ", None, 7, b"x"):
+            g.note_detection(source)
+        for event in queries.get_score_context(conn, rid)["recent_events"]:
+            action = event["action"]
+            self.assertTrue(action.startswith("detection:"), action)
+            self.assertLessEqual(len(action), len("detection:") + 40, action)
+            self.assertRegex(action, r"^detection:[a-z0-9_]+$")
+        # The injection attempt did not run.
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM score_events").fetchone()[0], 8)
 
 
 class TestDetectionScanner(unittest.TestCase):
@@ -666,12 +745,31 @@ class TestUnattendedBehaviour(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(d.decided_by, "skip")
         self.assertTrue(d.reason)
 
-    async def test_skip_leaves_no_answerable_row(self):
+    async def test_skip_is_audited_but_not_answerable(self):
+        # The property this pins is unchanged — a skip must not be
+        # answerable — but it is now reached by writing an already-decided
+        # row rather than by writing none, because a refusal with no trace
+        # breaks the rule that everything the agent does is logged.
         conn, rid = _fresh_run()
         g = _gate(conn, rid, unattended_behavior="skip")
         await g.request(_cls(points=200, p_success=0.9, p_detect=0.1))
-        self.assertEqual(_rows(conn), [])
-        self.assertFalse(g.answer(1, True))
+        rows = _rows(conn)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["decision"], "refused")
+        self.assertEqual(rows[0]["decided_by"], "skip")
+        self.assertEqual(rows[0]["action"], "lsass_dump")
+        # Decided on arrival, so it is invisible to the operator queue and
+        # cannot be flipped open again.
+        self.assertEqual(g.pending(), [])
+        self.assertFalse(g.answer(rows[0]["id"], True))
+
+    async def test_a_skipped_row_records_why_rather_than_numbers(self):
+        conn, rid = _fresh_run()
+        g = _gate(conn, rid, unattended_behavior="skip")
+        await g.request(_cls())
+        stored = json.loads(_rows(conn)[0]["ev_json"])
+        self.assertTrue(stored["skipped"])
+        self.assertNotIn("ev", stored)
 
     async def test_pause_raises_for_the_lifecycle(self):
         conn, rid = _fresh_run()
