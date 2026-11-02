@@ -41,6 +41,7 @@ import re
 import shlex
 from typing import List, NamedTuple, Optional, Union
 
+from software.agent.control import ControlSignal
 from software.agent import safety
 from software.agent.executor import ActionResult, blocked
 from software.agent.executor.beacon import run_on_beacon
@@ -53,8 +54,12 @@ from software.agent.store import queries
 __all__ = ["ActionResult", "Router", "RouterAborted"]
 
 
-class RouterAborted(Exception):
-    """The detection budget is spent; the campaign is over."""
+class RouterAborted(ControlSignal):
+    """The detection budget is spent; the campaign is over.
+
+    A ControlSignal so the tool-calling loop re-raises it instead of handing
+    the model an error string to work around — see software/agent/control.py.
+    """
 
 
 # ── What scope is shown ──
@@ -192,7 +197,7 @@ _CLIP = 80
 class Router:
     def __init__(self, c2, gate, scope, *, conn, run_id, beacon_ids,
                  caps_by_beacon, uplink_by_beacon, phase5_enabled,
-                 truncate_chars):
+                 truncate_chars, limit_scan_rate=True):
         self._c2 = c2
         self.gate = gate
         self._scope = scope
@@ -204,6 +209,10 @@ class Router:
         self._caps = caps_by_beacon
         self._uplinks = uplink_by_beacon
         self._phase5_enabled = phase5_enabled
+        # The yolo OpSec profile turns this off: scans run at the tool's own
+        # defaults, which is loud on the target network. It changes nothing
+        # about the tier-1 blocks or the gate, and a test pins that.
+        self._limit_scan_rate = limit_scan_rate
         self._truncate_chars = truncate_chars
 
     # ── Target ──
@@ -248,19 +257,25 @@ class Router:
     def _resolve_host(self, name: str) -> Optional[List[str]]:
         """Every address findings tie to `name`, or None if there are none.
 
-        Reads the findings table and nothing else. A name the agent has not
-        seen tied to an address is not a target it may act on, which is the
-        fail-closed reading of scope. And a lookup would send the name to
+        Reads this run's findings and nothing else. A name the agent has
+        not seen tied to an address is not a target it may act on, which is
+        the fail-closed reading of scope. And a lookup would send the name to
         whichever resolver this host uses; during an engagement that may be
         the client's, and a name the model invented would go with it. That is
         both noisy and an exposure.
+
+        Scoped to the run, not to the whole table: a finding from a different
+        engagement resolving a name for this one is a read across clients.
+        The cost is that a scheduled follow-up campaign rediscovers names it
+        already knew, which is a scan, not a leak.
 
         All addresses come back, not one picked: scope requires every one of
         them to be in range, because the tool may well choose the one that
         is not.
         """
         found = set()
-        for finding in queries.get_findings_by_host(self._conn, name):
+        for finding in queries.get_findings_by_host(
+                self._conn, name, run_id=self._run_id):
             found.update(_addresses_in(finding.get("data")))
         return sorted(found) or None
 
@@ -280,7 +295,8 @@ class Router:
             except ValueError:
                 addresses = self._resolve_host(target) or []
             for address in addresses:
-                if queries.get_findings_by_host(self._conn, address):
+                if queries.get_findings_by_host(
+                        self._conn, address, run_id=self._run_id):
                     return True
         return False
 
@@ -353,7 +369,8 @@ class Router:
             return blocked("unrecognised tier %r; refusing"
                            % (classification.tier,))
 
-        limited = safety.enforce_scan_limits(command)
+        limited = (safety.enforce_scan_limits(command)
+                   if self._limit_scan_rate else command)
 
         if server_side and beacon_id is not None:
             return blocked("give either beacon_id or server_side, not both")

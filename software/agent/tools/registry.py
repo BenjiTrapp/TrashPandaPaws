@@ -47,28 +47,30 @@ def _level(tier):
                          % (tier, ", ".join(TIER_LIMITS))) from None
 
 
-def _select(role, caps, tier) -> List[Entry]:
+def _select(role, caps, tier, online=True) -> List[Entry]:
     level = _level(tier)
     have = set(caps or ())
     return [e for e in _CATALOGUE
             if role in e.roles
             and all(c in have for c in e.requires_caps)
-            and level in e.levels]
+            and level in e.levels
+            and (online or not e.requires_online)]
 
 
-def specs(role, caps, tier) -> List[ToolSpec]:
+def specs(role, caps, tier, online=True) -> List[ToolSpec]:
     """The declarations a role would be offered, without building anything.
 
     For the preambles, which describe the tools and have no connection or
     router to build them with.
     """
-    return [e.spec for e in _select(role, caps, tier)]
+    return [e.spec for e in _select(role, caps, tier, online)]
 
 
-def executor_tools(router, conn, run_id, *, caps, tier, scope_key) -> List[Tool]:
+def executor_tools(router, conn, run_id, *, caps, tier, scope_key,
+                   online=True) -> List[Tool]:
     ctx = Context(conn=conn, run_id=run_id, scope_key=scope_key, router=router)
     return [Tool(e.spec, e.build(ctx))
-            for e in _select("executor", caps, tier)]
+            for e in _select("executor", caps, tier, online)]
 
 
 def orchestrator_tools(conn, run_id, *, dispatch_single, dispatch_parallel,

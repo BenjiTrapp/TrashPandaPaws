@@ -425,6 +425,57 @@ def load(argv=None, yaml_path=None, env=None) -> AgentConfig:
 # below -7.5 bought nothing except an unwatched write to storage. -5 keeps the
 # profile looser than normal and that action refused. The property is pinned
 # by TestZeroValueActionsStayRefused, which walks every profile.
+# ── OpSec profiles ──
+#
+# A different axis from the risk profile, and the distinction matters. The
+# risk profile prices being noticed *on the target network*. This prices what
+# leaves the operator's own host to a third party, and what the target hears
+# in terms of raw scan volume.
+#
+# What the agent sends outward, measured:
+#   · the CVE lookup  → osv.dev and nvd.nist.gov learn a service and version
+#                       found on a client host, timed with the engagement
+#   · the LLM provider → sees the whole conversation: hostnames, versions,
+#                       recovered credentials, topology
+#   · the C2          → the operator's own infrastructure, not a third party
+#
+# So "quiet" is honest only about the first. The provider is the larger
+# exposure by far and cannot be switched off — no model, no agent — which is
+# what `opsec_warnings` says out loud. A genuinely quiet run is quiet plus
+# `provider: local`, which the provider matrix already supports.
+#
+# `yolo` lifts the scan rate limits. It does **not** touch the tier-1 blocks
+# or the approval gate, and TestOpsecProfilesAreNotSafetySwitches pins that:
+# the name invites exactly that reading, so the suite refuses it.
+OPSEC_PROFILES = {
+    "quiet":  {"online_lookups": False, "limit_scan_rate": True},
+    "normal": {"online_lookups": True,  "limit_scan_rate": True},
+    "yolo":   {"online_lookups": True,  "limit_scan_rate": False},
+}
+
+
+def opsec_warnings(agent, campaign) -> List[str]:
+    """What a chosen profile does not deliver, in the operator's words.
+
+    A profile named "quiet" that leaves every finding flowing to a hosted
+    model would be a promise the configuration does not keep.
+    """
+    out = []
+    profile = getattr(campaign, "opsec_profile", "normal")
+    if profile == "quiet" and getattr(agent, "provider", None) != "local":
+        out.append(
+            "opsec_profile is quiet, but the model provider is %r: every "
+            "finding, hostname and recovered credential still goes to it. "
+            "Set provider to local for a run that leaves nothing."
+            % (getattr(agent, "provider", None),))
+    if not OPSEC_PROFILES.get(profile, {}).get("limit_scan_rate", True):
+        out.append(
+            "opsec_profile is %s: scan rate limits are not applied, so scans "
+            "are as loud as the tool's defaults. Tier-1 blocks and the "
+            "approval gate are unaffected." % profile)
+    return out
+
+
 RISK_PROFILES = {
     "passive":    {"ev_threshold":  20.0, "p_detect_prior": 0.25,
                    "detection_budget": 2, "risk_coefficient": 50.0},
@@ -462,6 +513,9 @@ class CampaignConfig:
     campaign_interval: int
     restore_interval: int
     mode: str
+    opsec_profile: str = "normal"
+    online_lookups: bool = True
+    limit_scan_rate: bool = True
 
     @classmethod
     def from_form(cls, payload: dict, *, tier: str) -> "CampaignConfig":
@@ -483,6 +537,8 @@ class CampaignConfig:
 
         profile = pick("risk_profile", _enum(*RISK_PROFILES), "normal")
         base = RISK_PROFILES[profile]
+        opsec = pick("opsec_profile", _enum(*OPSEC_PROFILES), "normal")
+        opsec_base = OPSEC_PROFILES[opsec]
 
         beacons = _string_list(payload, "beacons")
         allow = _string_list(payload, "scope_allow")
@@ -513,6 +569,11 @@ class CampaignConfig:
             risk_coefficient=pick("risk_coefficient",
                                   _bounded(_to_float, 0, low_open=True),
                                   base["risk_coefficient"]),
+            opsec_profile=opsec,
+            online_lookups=pick("online_lookups", _to_bool,
+                                opsec_base["online_lookups"]),
+            limit_scan_rate=pick("limit_scan_rate", _to_bool,
+                                 opsec_base["limit_scan_rate"]),
             unattended_behavior=pick("unattended_behavior",
                                      _enum(*_UNATTENDED), "decide"),
             max_runtime_seconds=pick("max_runtime_seconds",

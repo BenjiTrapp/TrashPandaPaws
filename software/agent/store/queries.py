@@ -133,9 +133,20 @@ def log_finding(conn, run_id, host, finding_type, data, source) -> int:
     return cur.lastrowid
 
 
-def get_findings_by_host(conn, host) -> List[Dict[str, Any]]:
+def get_findings_by_host(conn, host, run_id=None) -> List[Dict[str, Any]]:
+    """Findings for one host, optionally only from one run.
+
+    `run_id` exists because the router resolves hostnames from findings: a
+    name is a legitimate target only if this run observed it tied to an
+    address. Unfiltered, a finding from a different engagement could resolve
+    a name for this one, which is a read across clients.
+    """
+    if run_id is None:
+        return _dicts(conn.execute(
+            "SELECT * FROM findings WHERE host = ? ORDER BY id", (host,)))
     return _dicts(conn.execute(
-        "SELECT * FROM findings WHERE host = ? ORDER BY id", (host,)))
+        "SELECT * FROM findings WHERE host = ? AND run_id = ? ORDER BY id",
+        (host, run_id)))
 
 
 # ── Scoring ──

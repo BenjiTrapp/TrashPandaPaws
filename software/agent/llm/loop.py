@@ -30,6 +30,7 @@ import re
 import time
 from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Tuple
 
+from software.agent.control import ControlSignal
 from software.agent.llm.provider import (Completion, LlmClient, ProviderError,
                                          ToolCall, ToolSpec)
 from software.agent.store import queries
@@ -190,6 +191,12 @@ async def _invoke(by_name: Dict[str, Tool], call: ToolCall) -> Any:
 
 
 def _render(outcome: Any, limit: int) -> str:
+    if isinstance(outcome, ControlSignal):
+        # Not a tool result. The detection budget and an operator pause end
+        # or suspend the run; rendered as an error string, the model read
+        # them as one more failed step and carried on. See
+        # software/agent/control.py.
+        raise outcome
     if isinstance(outcome, BaseException):
         outcome = {"error": "%s: %s" % (type(outcome).__name__, outcome)}
     try:

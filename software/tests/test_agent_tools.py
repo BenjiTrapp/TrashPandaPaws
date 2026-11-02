@@ -1048,3 +1048,35 @@ class TestNoNetworkAtImport(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQuietProfileDropsTheOnlineTool(unittest.TestCase):
+    """The quiet OpSec profile removes the tool, rather than refusing it.
+
+    A tool the model never sees costs no turn and cannot be attempted; the
+    preamble describes the tools it was offered, so dropping it keeps the
+    two consistent. The local exploit check stays, because it touches
+    nothing.
+    """
+
+    def _names(self, online):
+        return [s.name for s in
+                registry.specs("executor", ["batch"], "full", online)]
+
+    def test_lookup_cve_is_absent_when_offline(self):
+        self.assertNotIn("lookup_cve", self._names(False))
+        self.assertIn("lookup_cve", self._names(True))
+
+    def test_the_local_exploit_check_survives(self):
+        self.assertIn("check_exploit", self._names(False))
+
+    def test_nothing_else_is_lost(self):
+        online, offline = set(self._names(True)), set(self._names(False))
+        self.assertEqual(online - offline, {"lookup_cve"})
+
+    def test_the_built_tool_list_honours_it_too(self):
+        built = [t.spec.name for t in registry.executor_tools(
+            _router_stub(), _conn(), 1, caps=["batch"], tier="full",
+            scope_key="scope:10.0.1.0/24", online=False)]
+        self.assertNotIn("lookup_cve", built)
+        self.assertIn("check_exploit", built)

@@ -459,5 +459,5 @@ def entries():
                      "version": {"type": "string",
                                  "description": "the version, such as 8.2"}},
                  "required": ["service", "version"]}),
-            ("executor",), CORE, _lookup_cve),
+            ("executor",), CORE, _lookup_cve, requires_online=True),
     ]

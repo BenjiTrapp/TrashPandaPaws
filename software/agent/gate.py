@@ -27,6 +27,7 @@ import re
 from typing import Dict, List, NamedTuple, Optional
 
 from software.agent import safety
+from software.agent.control import ControlSignal
 from software.agent.store import queries
 
 # ── Verdicts ──
@@ -50,8 +51,12 @@ class GateDecision(NamedTuple):
     override_decisive: bool = False
 
 
-class GatePauseRequested(Exception):
-    """Raised for a tier-2 action when unattended_behavior is "pause"."""
+class GatePauseRequested(ControlSignal):
+    """Raised for a tier-2 action when unattended_behavior is "pause".
+
+    A ControlSignal so the tool-calling loop re-raises it: a pause is an
+    instruction, not a failed step — see software/agent/control.py.
+    """
 
 
 _MODES = ("supervised", "auto")

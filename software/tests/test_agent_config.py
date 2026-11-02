@@ -820,3 +820,118 @@ class TestShippedYaml(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOpsecProfilesAreNotSafetySwitches(unittest.TestCase):
+    """A profile named "yolo" must not be readable as "safety off".
+
+    That is exactly what the name invites, so the property is pinned rather
+    than trusted. An OpSec profile governs what leaves the operator's host
+    and how loud a scan is. It does not touch the tier-1 blocks, which are
+    the irreversible actions, and it does not touch the approval gate.
+    """
+
+    FORM = {"beacons": ["a"], "scope_allow": ["10.0.1.0/24"]}
+
+    def _campaign(self, profile):
+        return config.CampaignConfig.from_form(
+            dict(self.FORM, opsec_profile=profile), tier="full")
+
+    def test_every_profile_is_covered(self):
+        self.assertEqual(set(config.OPSEC_PROFILES),
+                         {"quiet", "normal", "yolo"})
+
+    def test_no_profile_changes_which_actions_are_tier_one(self):
+        from software.agent import safety
+        hard = {k for k, r in safety.RISK_TABLE.items()
+                if r.tier == safety.TIER_HARD}
+        self.assertTrue(hard, "no tier-1 rows to check")
+        for profile in config.OPSEC_PROFILES:
+            campaign = self._campaign(profile)
+            # The profile carries two switches and neither is about tiers.
+            self.assertEqual(
+                set(config.OPSEC_PROFILES[profile]),
+                {"online_lookups", "limit_scan_rate"},
+                "%s gained a switch; check it is not a safety one" % profile)
+            self.assertFalse(
+                hasattr(campaign, "phase5_enabled")
+                and profile == "yolo" and campaign.phases == {1, 2, 3, 4, 5},
+                "yolo must not enable phase 5 by itself")
+
+    def test_no_profile_enables_a_phase_on_its_own(self):
+        for profile in config.OPSEC_PROFILES:
+            self.assertEqual(self._campaign(profile).phases, {1, 2, 3, 4},
+                             profile)
+
+    def test_no_profile_changes_the_approval_behaviour(self):
+        for profile in config.OPSEC_PROFILES:
+            self.assertEqual(self._campaign(profile).unattended_behavior,
+                             "decide", profile)
+
+    def test_no_profile_changes_the_risk_numbers(self):
+        normal = config.RISK_PROFILES["normal"]
+        for profile in config.OPSEC_PROFILES:
+            campaign = self._campaign(profile)
+            self.assertEqual(campaign.ev_threshold, normal["ev_threshold"],
+                             profile)
+            self.assertEqual(campaign.detection_budget,
+                             normal["detection_budget"], profile)
+            self.assertEqual(campaign.risk_coefficient,
+                             normal["risk_coefficient"], profile)
+
+    def test_only_yolo_lifts_the_scan_rate_limit(self):
+        self.assertTrue(self._campaign("quiet").limit_scan_rate)
+        self.assertTrue(self._campaign("normal").limit_scan_rate)
+        self.assertFalse(self._campaign("yolo").limit_scan_rate)
+
+    def test_only_quiet_stops_third_party_lookups(self):
+        self.assertFalse(self._campaign("quiet").online_lookups)
+        self.assertTrue(self._campaign("normal").online_lookups)
+        self.assertTrue(self._campaign("yolo").online_lookups)
+
+    def test_a_typo_is_refused_and_lists_the_profiles(self):
+        with self.assertRaises(config.ConfigError) as caught:
+            config.CampaignConfig.from_form(
+                dict(self.FORM, opsec_profile="quite"), tier="full")
+        for name in config.OPSEC_PROFILES:
+            self.assertIn(name, str(caught.exception))
+
+    def test_a_single_switch_can_be_overridden(self):
+        campaign = config.CampaignConfig.from_form(
+            dict(self.FORM, opsec_profile="yolo", limit_scan_rate=True),
+            tier="full")
+        self.assertTrue(campaign.limit_scan_rate)
+        self.assertTrue(campaign.online_lookups)
+
+
+class TestOpsecWarningsSayWhatIsNotDelivered(unittest.TestCase):
+    """"Quiet" with a hosted model is a promise the configuration cannot keep."""
+
+    FORM = {"beacons": ["a"], "scope_allow": ["10.0.1.0/24"]}
+
+    class _Agent:
+        def __init__(self, provider):
+            self.provider = provider
+
+    def _warnings(self, provider, profile):
+        campaign = config.CampaignConfig.from_form(
+            dict(self.FORM, opsec_profile=profile), tier="full")
+        return config.opsec_warnings(self._Agent(provider), campaign)
+
+    def test_quiet_with_a_hosted_model_warns_about_the_provider(self):
+        warnings = self._warnings("anthropic", "quiet")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("provider", warnings[0])
+        self.assertIn("local", warnings[0])
+
+    def test_quiet_with_a_local_model_is_silent(self):
+        self.assertEqual(self._warnings("local", "quiet"), [])
+
+    def test_yolo_warns_about_the_scan_rate_and_says_what_is_untouched(self):
+        warnings = self._warnings("local", "yolo")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("rate", warnings[0].lower())
+        self.assertIn("gate", warnings[0].lower())
+
+    def test_normal_with_a_hosted_model_is_silent(self):
+        self.assertEqual(self._warnings("anthropic", "normal"), [])

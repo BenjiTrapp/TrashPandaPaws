@@ -45,6 +45,11 @@ class Entry(NamedTuple):
     # Capabilities a beacon must advertise, every one of them. A tool whose
     # capability is missing is not offered, rather than refused when called.
     requires_caps: Tuple[str, ...] = ()
+    # True for a tool that reaches a third party from the operator's host.
+    # The quiet OpSec profile drops it from the catalogue rather than letting
+    # it be called and refused: a tool the model never sees costs no turn,
+    # and the preamble describes what is offered, so it stays consistent.
+    requires_online: bool = False
 
 
 # Shared by the modules that declare entries.

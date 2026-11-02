@@ -16,6 +16,9 @@ from unittest import IsolatedAsyncioTestCase
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from software.agent.control import ControlSignal
+from software.agent.executor import router
+from software.agent import gate
 from software.agent.llm import loop, mock, openai_client, provider
 from software.agent.llm.provider import Completion, ToolCall, ToolSpec
 from software.agent.store import db, queries
@@ -796,3 +799,70 @@ class TestObservability(IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestControlSignalsEscapeTheLoop(IsolatedAsyncioTestCase):
+    """Two things must not become a tool result the model reads and ignores.
+
+    The detection budget is an abort condition, not a statistic (spec
+    §10.6), and an operator pause is an instruction. Both were raised by a
+    tool and swallowed by the loop's catch-all, so the run carried on after
+    the budget was measured as spent. They are a ControlSignal now, and the
+    loop re-raises anything deriving from it.
+    """
+
+    def _tool(self, fn):
+        return loop.Tool(
+            spec=provider.ToolSpec(
+                name="act", description="d",
+                parameters={"type": "object", "properties": {}}),
+            fn=fn)
+
+    async def _run(self, fn):
+        client = mock.MockClient(
+            [mock.calls(("act", {})), mock.text("carried on")])
+        return await loop.run(client, system="s", prompt="p",
+                              tools=[self._tool(fn)], max_turns=4)
+
+    async def test_a_control_signal_propagates(self):
+        class Stop(ControlSignal):
+            pass
+
+        async def abort():
+            raise Stop("budget spent")
+        with self.assertRaises(Stop):
+            await self._run(abort)
+
+    async def test_the_routers_abort_propagates(self):
+        async def abort():
+            raise router.RouterAborted("budget spent")
+        with self.assertRaises(router.RouterAborted):
+            await self._run(abort)
+
+    async def test_the_gates_pause_propagates(self):
+        async def pause():
+            raise gate.GatePauseRequested("lsass_dump")
+        with self.assertRaises(gate.GatePauseRequested):
+            await self._run(pause)
+
+    async def test_an_ordinary_failure_is_still_a_tool_result(self):
+        async def boom():
+            raise RuntimeError("just a bad step")
+        self.assertEqual(await self._run(boom), "carried on")
+
+    async def test_one_control_signal_among_several_calls_still_escapes(self):
+        async def ok():
+            return {"ok": True}
+
+        async def abort():
+            raise router.RouterAborted("budget spent")
+        tools = [
+            loop.Tool(spec=provider.ToolSpec(
+                name="fine", description="d",
+                parameters={"type": "object", "properties": {}}), fn=ok),
+            self._tool(abort)]
+        client = mock.MockClient(
+            [mock.calls(("fine", {}), ("act", {})), mock.text("carried on")])
+        with self.assertRaises(router.RouterAborted):
+            await loop.run(client, system="s", prompt="p", tools=tools,
+                           max_turns=4)
