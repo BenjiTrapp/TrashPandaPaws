@@ -27,6 +27,10 @@ Runs, each on a fresh copy:
            MDI2_N, MDI2_P (ruling AQ, variant X: the two pairs exchanged and
            turned, inside cable pairs C/D), so nothing crosses and there are no
            vias in the MDI pairs.
+  return   the USB 2.0 pair's stretch on B.Cu (ruling AR, revised): counts the
+           In2 island boundaries under it, samples the B.Cu GND pour beside it
+           across the crossing and checks the GND vias that flank the crossing
+           are on that pour; two controls (no flank vias; pour cut) must fail.
   rule     the escapes of every U3 signal pad, with and without the
            "track to U3 pad on fine-pitch parts" rule, and three controls that
            must still be reported.
@@ -56,6 +60,14 @@ RULE_NAME = "track to U3 pad on fine-pitch parts"
 
 W, NECK, PITCH = 0.20, 0.15, 0.375      # USB3 / USB 2.0
 MW, MPITCH = 0.18, 0.39                 # MDI
+
+
+# The USB 2.0 pair on B.Cu between its vias at U9 (x 12.2) and at U3, west to
+# east, centre lines. D_N is the north track of the pair.
+USB2_BCU = {"USB2_D_N": [(12.2, 16.2), (15.1, 19.1), (22.4, 19.1)],
+            "USB2_D_P": [(12.2, 17.1), (14.85, 19.75), (21.5, 19.75)]}
+# The x range of the crossing of the In2 island gap between +5V_SW and +1V0
+CROSSING_X = (18.8, 19.4)
 
 
 def mm(value):
@@ -307,8 +319,8 @@ def lay_usb(s):
     s.trace("USB2_D_N", [(p17[0], p17[1] - NECK_LEN), (p17[0], 19.1), (22.4, 19.1)], W)
     s.via("USB2_D_P", 21.5, 19.75)
     s.via("USB2_D_N", 22.4, 19.1)
-    s.trace("USB2_D_N", [(22.4, 19.1), (15.1, 19.1), (12.2, 16.2)], W, pcbnew.B_Cu)
-    s.trace("USB2_D_P", [(21.5, 19.75), (14.85, 19.75), (12.2, 17.1)], W, pcbnew.B_Cu)
+    for net, path in USB2_BCU.items():
+        s.trace(net, path, W, pcbnew.B_Cu)
     return {"U8 channel centre y": round(y_c, 2), "TX_P line": round(y_ch, 2),
             "RX_N line": round(y_rn, 2)}
 
@@ -369,6 +381,118 @@ def lay_escapes(s):
         s.leave(net, pad, (0, -1), [(pad[0], pad[1] - 2.0)], W)
 
 
+def usb2_return(s):
+    """What lies under and beside the USB 2.0 pair's stretch on B.Cu (ruling AR,
+    revised: one In2 island boundary is acceptable if the crossing is flanked
+    by GND vias and the B.Cu GND pour runs beside the pair across it, tied to
+    In1). Fills the zones of the scratch copy, then samples:
+      * the In2 island under the centre line of the pair, every 0.05 mm, and
+        counts the island-to-island boundaries it passes;
+      * B.Cu GND pour 0.6 mm from the centre line of the outer track on each
+        side (0.3 mm clearance, 0.1 mm half-track, 0.2 mm into the pour),
+        along the whole stretch and in the crossing window;
+      * the GND vias within 2.5 mm of the crossing, and whether each one is
+        part of the pour polygon that runs beside the pair.
+    Returns (problems, text lines)."""
+    b = s.board
+    pcbnew.ZONE_FILLER(b).Fill(b.Zones())
+    gnd = b.FindNet("GND")
+    pour = next(z for z in b.Zones() if z.GetLayer() == pcbnew.B_Cu
+                and not z.GetIsRuleArea() and z.GetNetCode() == gnd.GetNetCode())
+    islands = [z for z in b.Zones() if z.GetLayer() == pcbnew.In2_Cu]
+    polys = pour.GetFilledPolysList(pcbnew.B_Cu)
+
+    def island_at(x, y):
+        for z in islands:
+            if z.Outline().Contains(vec(x, y)):
+                return z.GetNetname() + "@" + str(round(pcbnew.ToMM(z.GetBoundingBox().GetLeft()) - ORIGIN[0], 1))
+        return "gap"
+
+    def polygon_at(x, y):
+        for i in range(polys.OutlineCount()):
+            if polys.Outline(i).PointInside(vec(x, y)):
+                return i
+        return None
+
+    lines, problems = [], []
+    path = USB2_BCU["USB2_D_N"]
+    # island labels along the north track from x 12.4 (first copper clear of the via) to 21.5
+    seq, x = [], 12.4
+    while x <= 21.5:
+        y = next(path[i][1] + (path[i + 1][1] - path[i][1]) *
+                 (x - path[i][0]) / (path[i + 1][0] - path[i][0])
+                 for i in range(len(path) - 1) if path[i][0] <= x <= path[i + 1][0]
+                 and path[i + 1][0] != path[i][0])
+        label = island_at(x, y)
+        if not seq or seq[-1][0] != label:
+            seq.append((label, round(x, 2)))
+        x += 0.05
+    names = [label for label, _ in seq]
+    boundaries = sum(1 for a, c in zip(names, names[1:])
+                     if a != "gap" and c != "gap" and a != c) + \
+        sum(1 for a, c, d in zip(names, names[1:], names[2:])
+            if a != "gap" and c == "gap" and d != "gap" and a != d)
+    lines.append("In2 under the pair, west to east: "
+                 + " -> ".join(f"{label} from x {at}" for label, at in seq))
+    lines.append(f"island boundaries crossed between x 12.4 and x 21.5: {boundaries}")
+    if boundaries != 1:
+        problems.append(f"the stretch crosses {boundaries} In2 island boundaries, the ruling covers one")
+
+    # GND pour beside the pair
+    sides = ((USB2_BCU["USB2_D_N"], 0.6), (USB2_BCU["USB2_D_P"], -0.6))
+    total = covered = win_total = win_covered = 0
+    polygons, missing = set(), []
+    for pts, d in sides:
+        off = left_offset(pts, d)
+        for (a, c) in zip(off, off[1:]):
+            n = max(1, int(math.hypot(c[0] - a[0], c[1] - a[1]) / 0.1))
+            for k in range(n + 1):
+                x = a[0] + (c[0] - a[0]) * k / n
+                y = a[1] + (c[1] - a[1]) * k / n
+                if x < 12.9 or x > 21.0:
+                    continue        # inside 0.7 mm of a signal via: the vias' own pads are there
+                total += 1
+                inside = polygon_at(x, y)
+                covered += inside is not None
+                if inside is None:
+                    missing.append((round(x, 2), round(y, 2)))
+                else:
+                    polygons.add(inside)
+                if CROSSING_X[0] - 0.5 <= x <= CROSSING_X[1] + 0.5:
+                    win_total += 1
+                    win_covered += inside is not None
+    lines.append(f"B.Cu GND pour beside the pair, 0.6 mm from the outer track of each side, "
+                 f"x 12.9 to 21.0: {covered} of {total} samples inside the pour; "
+                 f"crossing window x {CROSSING_X[0] - 0.5:.1f} to {CROSSING_X[1] + 0.5:.1f}: "
+                 f"{win_covered} of {win_total}")
+    if missing:
+        lines.append(f"  not covered at: {missing[:8]}{' ...' if len(missing) > 8 else ''}")
+    if win_covered != win_total or not win_total:
+        problems.append("the B.Cu GND pour does not run beside the pair across the crossing")
+    lines.append(f"  the pour beside the pair is {len(polygons)} filled polygon(s)")
+
+    # the flank vias: are they in that polygon?
+    tied = []
+    for via in b.GetTracks():
+        if via.Type() != pcbnew.PCB_VIA_T or via.GetNetCode() != gnd.GetNetCode():
+            continue
+        vx = pcbnew.ToMM(via.GetPosition().x) - ORIGIN[0]
+        vy = pcbnew.ToMM(via.GetPosition().y) - ORIGIN[1]
+        if not (CROSSING_X[0] - 2.5 <= vx <= CROSSING_X[1] + 2.5 and 17.0 <= vy <= 21.0):
+            continue
+        ring = {polygon_at(vx + 0.55 * math.cos(t * math.pi / 4),
+                           vy + 0.55 * math.sin(t * math.pi / 4)) for t in range(8)}
+        ring.discard(None)
+        tied.append((round(vx, 2), round(vy, 2), bool(ring & polygons)))
+    lines.append("GND vias within 2.5 mm of the crossing (x, y, on the pour beside the pair): "
+                 + ", ".join(map(str, tied)))
+    north = [t for t in tied if t[1] < 19.1 and t[2]]
+    south = [t for t in tied if t[1] > 19.75 and t[2]]
+    if not (north and south):
+        problems.append("the crossing is not flanked by a tied GND via on each side of the pair")
+    return problems, lines
+
+
 def run(label, work, drop_rule=False, board=None):
     with tempfile.TemporaryDirectory() as tmp:
         s = Scratch(tmp, drop_rule, board)
@@ -406,6 +530,39 @@ def main():
     for v in errors:
         print("  ", describe(v))
     status |= 1 if errors or left else 0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        s = Scratch(tmp)
+        lay_usb(s)
+        problems, lines = usb2_return(s)
+    print("USB 2.0 stretch on B.Cu, return path:")
+    for line in lines:
+        print("  ", line)
+    for problem in problems:
+        print("   PROBLEM:", problem)
+    status |= 1 if problems else 0
+
+    # controls for the return-path check: it must report a crossing without its
+    # flank vias, and a pour that something cuts
+    def no_flank_vias(s):
+        for via in list(s.board.GetTracks()):
+            if via.Type() == pcbnew.PCB_VIA_T and via.GetNetname() == "GND":
+                vx = pcbnew.ToMM(via.GetPosition().x) - ORIGIN[0]
+                if 17.0 <= vx <= 19.5 and 17.5 <= pcbnew.ToMM(via.GetPosition().y) - ORIGIN[1] <= 21.0:
+                    s.board.Remove(via)
+
+    def cut_pour(s):
+        s.trace("USB3_RX_P", [(19.1, 16.5), (19.1, 18.7)], 0.2, pcbnew.B_Cu)
+
+    for name, work in (("crossing without its flank vias", no_flank_vias),
+                       ("pour cut beside the pair at the crossing", cut_pour)):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = Scratch(tmp)
+            lay_usb(s)
+            work(s)
+            problems, _ = usb2_return(s)
+        print(f"control, {name}: {'reported, as it must be' if problems else 'NOT reported'}")
+        status |= 0 if problems else 1
 
     for drop in (True, False):
         errors, _, _ = run("rule", lay_escapes, drop_rule=drop)

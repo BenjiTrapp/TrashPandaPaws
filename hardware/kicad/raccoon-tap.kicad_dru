@@ -21,10 +21,14 @@
 # The Power class asks 0.30mm of anything on a supply or GND item, so a signal
 # track next to a supply pad, or a supply escape next to a signal pad, fails by
 # the package's geometry whatever the layout does. Under this rule the
-# distance of any track to any pad of U3 is 0.2mm: the signal class's own
-# clearance, so no track is allowed nearer than a signal track already was
-# (rulings AG and AI stand). It names U3 and tracks only. Vias, zones and every
-# other footprint, U8 and U9 included, keep the class clearance.
+# class clearance (0.3mm Power, 0.2mm signal) no longer applies between a track
+# and a pad of U3: the track-to-pad distance is held at 0.2mm, the signal
+# class's own clearance, so no track is allowed nearer to a U3 pad than a signal
+# track already was (rulings AG and AI stand). Another rule can still allow
+# less: a coupled USB3 pair's track against its partner's pad (the 0.17mm rule
+# below) is lower, which is moot at U3's 0.4mm pitch. The rule names U3 and
+# tracks only. Vias, zones and every other footprint, U8 and U9 included, keep
+# the class clearance.
 (rule "track to U3 pad on fine-pitch parts"
 	(condition "A.Type == 'Track' && B.Type == 'Pad' && B.memberOfFootprint('U3')")
 	(constraint clearance (min 0.2mm)))

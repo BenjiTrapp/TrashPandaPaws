@@ -8,7 +8,7 @@
     ],
     "source_hashes": {
       "hardware/review/2026-10-31-placement/schematic.json": "132ea7845a0d30bb8c45ea007e51828d1156ef39a57cf0f314ee490e184ae55d",
-      "hardware/review/2026-10-31-placement/pcb.json": "9f27a169daf8fa06818b3a1778c897d229738740a6bce71d582470a33d200575"
+      "hardware/review/2026-10-31-placement/pcb.json": "d6580e5716996972d1712fbda0eb8a14a42bdf04f12ca89c50fc3d5afcbc906f"
     },
     "run_id": "20261102T092822Z-d400a9",
     "config_hash": null,
@@ -21,7 +21,7 @@
       },
       "pcb": {
         "path": "hardware/review/2026-10-31-placement/pcb.json",
-        "sha256": "9f27a169daf8fa06818b3a1778c897d229738740a6bce71d582470a33d200575",
+        "sha256": "d6580e5716996972d1712fbda0eb8a14a42bdf04f12ca89c50fc3d5afcbc906f",
         "schema_version": "1.4.0",
         "run_id": "20261102T092822Z-d400a9"
       }
@@ -32,7 +32,7 @@
     "deprecated_fields": [],
     "experimental_fields": []
   },
-  "elapsed_s": 0.006,
+  "elapsed_s": 0.007,
   "summary": {
     "total_findings": 0,
     "by_severity": {
@@ -104,7 +104,7 @@
       "check": "VS-002",
       "ran": true,
       "reason_skipped": null,
-      "items_examined": 36,
+      "items_examined": 40,
       "findings": 0
     },
     {

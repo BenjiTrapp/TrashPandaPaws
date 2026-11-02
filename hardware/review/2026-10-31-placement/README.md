@@ -1,4 +1,4 @@
-# raccoon-tap — placement baseline (task 8, round 3, 2026-11-02)
+# raccoon-tap — placement baseline (task 8, round 4, 2026-11-02)
 
 The board after `tools/gen_pcb.py` was last run on it: U3 turned, every part
 from tasks 5 to 7 placed, mounting added, the power plane split. Task 9 routes
@@ -6,15 +6,15 @@ this board and freezes the geometry; nothing here is routed. Later review runs
 compare against this directory. `../2026-10-31-baseline/` describes a board that
 no longer exists (33 footprints, U3 at 0 degrees, none of tasks 5 to 7).
 
-This replaces the earlier baselines of this task. What rounds 2 and 3 changed is
-in "Rounds 2 and 3" at the end.
+This replaces the earlier baselines of this task. What rounds 2 to 4 changed is
+in "Rounds 2 to 4" at the end.
 
 Measured design state (SHA-256 of the analysed files):
 
 | File | SHA-256 |
 |---|---|
 | `hardware/kicad/raccoon-tap.kicad_sch` | `344164db00edf4910d6972afe34defc89f81067478801e28a34b6adfbe9f0720` |
-| `hardware/kicad/raccoon-tap.kicad_pcb` | `e069ec37855ef34e7bc33985ca5f9187cf6d910df11b600575233fe471f77c0f` |
+| `hardware/kicad/raccoon-tap.kicad_pcb` | `68531c0d82a3e956531cb74e167c92715945c1cace7687b0b152edf5dc2cd3da` |
 
 ![top side](placement-top.png)
 
@@ -27,15 +27,15 @@ The bottom side carries no parts, so there is no bottom picture.
 | Footprints | 33 | 58 (all placed, none parked) | `pcb.json` |
 | Board | 58 x 36 mm | **58 x 36 mm** | |
 | DRC errors | 0 | **0** | `drc.rpt` |
-| DRC warnings | 43 | 46 (36 `via_dangling`, 7 `silk_over_copper`, 3 `silk_overlap`) | `drc.rpt` |
-| Unconnected items | 134 | 164 | `drc.rpt`; nothing is routed |
+| DRC warnings | 43 | 50 (40 `via_dangling`, 7 `silk_over_copper`, 3 `silk_overlap`) | `drc.rpt` |
+| Unconnected items | 134 | 168 | `drc.rpt`; nothing is routed |
 | DRC errors, zones refilled | not measured | **0** (23 warnings: those 10 silk plus 13 `isolated_copper`, the In2 islands have no vias yet; 129 unconnected) | `kicad-cli pcb drc --refill-zones` |
 | ERC | 0 / 0 | 0 / 0 | `erc.rpt` |
 | `check_kicad.py` | 23 failures on the stale PCB | passes | |
 | U3 decoupling distance (cap to nearest U3 pad centre) | 3.56 to 7.63 mm | 1.33 to 3.57 mm | `pcb.json` |
 | Buck switching loop (U6, L2, C3) | 7.9 mm2 | 7.9 mm2 | `pcb.json` |
 | Hottest part | U4, 69.8 C | U4, 67.5 C | `thermal.json` |
-| EMC score | 76.0 | 50.5, see below | `emc.json` |
+| EMC score | 76.0 | 56.5, see below | `emc.json` |
 | Zones | 3 | 17: 9 copper (In1 and bottom GND, six In2 islands, the U4 patch), 8 keepout rule areas (four per mounting hole) | `pcb.json` |
 
 DRC progression (every change measured, per the `OPEN_QUESTIONS.md` 263-to-269
@@ -48,10 +48,11 @@ lesson):
 | round 1, final | 0 | 47 | 170 |
 | round 2: 58 mm board, holes at 54.5, slots dropped, C21 on top | 0 | 46 | 166 |
 | round 2, final: C25/R13 and U8 moved, U9 declared as a flow-through, the new U3 rule | 0 | 46 | 164 |
-| round 3: J2 pins 7 to 10 re-netted (ruling AQ), board and schematic regenerated | **0** | **46** | **164** |
+| round 3: J2 pins 7 to 10 re-netted (ruling AQ), board and schematic regenerated | 0 | 46 | 164 |
+| round 4: four GND vias for the USB 2.0 stretch (ruling AR, revised) | **0** | **50** | **168** |
 
-EMC score: 50.5 from 76.0 because the new parts are unrouted and read as ICs
-by the analyzer, not because placement got worse. Four errors: `DC-001` on U8
+EMC score: 56.5 from 76.0 because the new parts are unrouted and read as ICs
+by the analyzer, not because placement got worse. Three errors (the round-4 vias took `DC-003` from 21 findings to 16; nothing else moved): `DC-001` on U8
 and on U9 (it reads the two passive ESD arrays as ICs wanting a decoupling cap,
 and takes C22 for U8's; the known false positive of ruling Z), `ES-002` (no GND
 via by U9: there are no vias yet), `IO-001` (no filter at J2; the magnetics are
@@ -59,6 +60,58 @@ the filter, as in the baseline). Moving U8 3 mm nearer J3 made the U8 `DC-001`
 worse (C22 is now 9.4 mm away) and removed `ES-001` on U9.
 `PM-002` also flags J2 (courtyard 0.06 mm inside the edge, which is what a jack
 at the edge is) and J3 (the plug overhangs 15.8 mm), both intended.
+
+## The USB 2.0 pair on B.Cu (ruling AR, revised)
+
+The pair has to leave F.Cu to get under the SuperSpeed lanes (see U9 above): it
+goes down at U9 (vias at x 12.2) and comes up at U3 (x 21.5 and 22.4), and runs
+on B.Cu between, 0.20 mm wide at a 0.375 mm pitch. B.Cu's neighbour is In2 (the
+power layer), so the pair has a power plane, not In1, for a reference there.
+
+**Island boundaries crossed: one.** Under the north track, west to east
+(`scratch_route_check.py` samples the zone outlines every 0.05 mm): the pair
+starts at the vias in the 11.8 to 12.4 gap beside the +5V_SW island, runs over
+**+5V_SW** (x 12.4 to 18.8), crosses the **0.6 mm gap** (x 18.8 to 19.4) and ends
+over **+1V0** (from x 19.4). The one boundary is +5V_SW to +1V0. The 0.2 mm
+over the gap at the start is an end of the stretch (the via is there), not a
+crossing. Both tracks cover the same x range, and +5V_SW (y 1 to 34.6) and +1V0
+(y 1 to 21.4) hold the whole y range of the pair (16.2 to 19.75).
+
+**What was placed** (`USB2_RETURN_VIAS` in `gen_pcb.py`, GND, 0.6 / 0.3 mm):
+
+| Via | Where | Why there |
+|---|---|---|
+| crossing, north | (19.1, 18.3) | on the gap, between RX_N (y 17.5) and RX_P (y 19.07) on F.Cu |
+| crossing, south | (17.6, 20.6) | 1.5 mm west of the gap: C8 sits at x 18.1 to 21.0, y 19.9 to 20.8 on F.Cu |
+| U9 end | (12.1, 18.95) | nearest free place to the signal vias (12.2, 16.2) / (12.2, 17.1): 2.3 mm |
+| U3 end | (22.0, 17.3) | nearest free place to (21.5, 19.75) / (22.4, 19.1): 2.1 mm |
+
+Each was placed by searching for the nearest spot that keeps 0.3 mm (the Power
+class) from every copper item of the scratch routes, F.Cu and B.Cu, with at
+least 0.05 mm to spare. The south flank cannot sit on the gap; it sits 1.5 mm to
+the west, which at 480 Mbit/s (edges of order 1 ns, about 150 mm of wave) is a
+small fraction of a wavelength. The crossing is still flanked, north and south
+of the pair, within 1.5 mm of the gap.
+
+**The B.Cu pour provides the coplanar return, shown rather than assumed.**
+`scratch_route_check.py` lays the pair on a copy of the board, fills the zones
+and samples the B.Cu GND pour 0.6 mm from the centre line of the outer track on
+each side (0.2 mm into the pour past its 0.3 mm clearance), all along the stretch
+from x 12.9 to 21.0: **180 of 180 samples are in the pour, 32 of 32 in the
+crossing window (x 18.3 to 19.9)**, and the pour beside the pair is a single
+filled polygon, which contains both crossing vias. The pour is tied to In1 by
+those vias and by the perimeter stitching. Controls: with the two crossing
+vias removed, and with a track cutting the pour at x 19.1, the check reports.
+
+What it does not show: impedance. The stackup is symmetric (0.1855 mm of
+prepreg on both outer layers), so the 0.20 / 0.17 mm geometry of
+`stackup-note.md` gives its 89.7 ohm over a solid In2 as it does over In1. Here
+the plane under the pair is a power island, split by a 0.6 mm gap (no plane at
+all under the pair for 0.6 mm), and the pour sits 0.3 mm from each track, so the
+pair is coplanar with ground on both sides. Both move the figure (the gap up,
+the pour down); neither was calculated. Task 9 should keep that in mind and,
+if it matters, widen the pour clearance beside the pair or accept the loading.
+Not SuperSpeed, not MDI: the ruling covers USB 2.0 only.
 
 ## U3 turned to 180 degrees
 
@@ -298,7 +351,8 @@ restriction added to either side, minimum 0.1, 0.15 or 0.3.
    gap between J2 pin 9 and SH1, the channel x 41.7 to 45.7 up to y 12, the
    corridor between U3 and J2, the USB lane band (x 6.5 to 26.2, y 13.4 to 19.6
    and the RX approach at y 20 to 22), the crystal channel (x 23.3 to 24.7,
-   y 25.7 to 29.6), U9's channel.
+   y 25.7 to 29.6), U9's channel, and the four USB 2.0 return vias (0.3 mm to
+   anything that is not GND).
 3. **The necks** are at most 0.15 mm wide for at most 1.0 mm from the pad
    centre; 0.6 mm clears every clearance the 0.2 mm class asks for in the
    scratch run. The rule "track to U3 pad on fine-pitch parts" (0.2 mm,
@@ -308,9 +362,16 @@ restriction added to either side, minimum 0.1, 0.15 or 0.3.
    channel free of everything else; a GND trace from U9 pin 2 to J3's pad 7 along
    y = 18; VBUS via east of pin 5; U9 has jumper pad groups, so D+ needs no
    copper between pins 1 and 6.
-5. **USB 2.0:** four vias, the pair on the bottom layer from x 12.2 to x 21.5.
-   That layer's reference is In2 (power): short, 480 Mbit/s, but it is a pair over
-   a power plane too; judge it.
+5. **USB 2.0:** four signal vias, the pair on the bottom layer from x 12.2 to
+   x 21.5, crossing ONE In2 island boundary (+5V_SW to +1V0, the gap at
+   x 18.8 to 19.4; ruling AR, revised). The four GND vias at (19.1, 18.3),
+   (17.6, 20.6), (12.1, 18.95) and (22.0, 17.3) are on the board and stay; route
+   the pair on B.Cu so that it crosses the gap between the two crossing vias,
+   keep the B.Cu pour beside it (do not draw anything on B.Cu across the pour
+   north or south of the pair at x 17 to 21), and do not add a second boundary
+   (the pair must stay over +5V_SW and +1V0 only; do not move the vias off
+   x 12.2 or the U3 vias east of x 22.4 without redoing the count). Judge the
+   coplanar loading of the pour (see the section above).
 6. **U8 is a tee** with short stubs; TX_P and RX_N sit 0.8 mm apart in its
    channel; about 5 mm of each pair is open. These are to be judged, not just
    cleared.
@@ -319,12 +380,13 @@ restriction added to either side, minimum 0.1, 0.15 or 0.3.
 8. **First build:** 1000 Mb/s link with a straight and a crossover cable (the
    C/D exchange).
 
-## Rounds 2 and 3 (what changed from the first baseline)
+## Rounds 2 to 4 (what changed from the first baseline)
 
 | Finding | Done |
 |---|---|
 | R2 F-1 MDI order (AJ withdrawn, AM adopted) | README corrected; the A/B route round the south end shown with the scratch run; the wrong "pair assignment is not critical" sentence in `netlist.yaml` corrected |
 | R3 ruling AQ, variant X | `netlist.yaml` nets of MDI2/MDI3 re-netted on J2 pins 7 to 10; schematic, BOM and PCB regenerated; before/after table and the C/D proof above; `mdi_group_problems` and its tests in `check_fab_release.py` |
+| R4 ruling AR, revised | four GND vias for the USB 2.0 stretch (`USB2_RETURN_VIAS`), one island boundary counted, the pour beside the pair sampled; the stale `mdi_pair_mapping` fragment, FID3's "strain-relief tail", the cable-tie leftovers in `gen_pcb.py` and the overclaim in the U3 rule's comment corrected |
 | R2 F-2 Power clearance at U3 | the rule, verified on 14 escapes plus three controls; R3: tested in `check_fab_release.py` |
 | R2 F-3 board back to 58 mm | outline 58 x 36, holes at (54.5, 3.5) and (54.5, 32.5), slots and the strain-relief claim dropped |
 | R2 F-4 C21 to the top side | (34.4, 18.0), 3.3 mm from pin 6 |
@@ -340,7 +402,7 @@ restriction added to either side, minimum 0.1, 0.15 or 0.3.
 | `erc.rpt` | `kicad-cli sch erc --severity-all` |
 | `schematic.json`, `pcb.json`, `cross.json`, `emc.json`, `thermal.json`, `capability_mode.json` | kicad-happy, the commands of the baseline README |
 | `scratch_route_check.py` | the clearance run described above |
-| `placement-top.png`, `placement-bottom.png` | the board |
+| `placement-top.png` | the board, top side (the bottom carries no parts) |
 
 Reproducing, from the repository root:
 

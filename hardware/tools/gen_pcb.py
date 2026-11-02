@@ -10,7 +10,7 @@ What this does:
   * marks DNP parts DNP and keeps DNP parts and bare board features out of the
     position files (tools/fitting.py reads the same flags as the BOM and the
     schematic do)
-  * board outline, two M2.5 mounting holes with a keepout, RJ45 cable-tie slots
+  * board outline, two M2.5 mounting holes with a keepout
   * GND planes on In1 and B.Cu, the power plane on In2 split into islands, and
     a GND copper patch under the 3.3 V regulator
   * thermal via array under U3's exposed pad, tented from the back
@@ -191,14 +191,29 @@ BOTTOM = set()
 # come in.
 HOLE_KEEPOUT_R = (3.02, 3.9)
 
-# No cable-tie slots. They were drawn in the first round at 4.5 to 7.9 mm beyond
-# the jack's front face, where the plug body, not the boot, still is, and
-# nothing here shows that a tie would clear the latch of a tab-up jack. Without
-# the J2 and plug drawings that cannot be shown, so the board ends at the jack
-# and the strain relief is the two screws, which sit either side of the jack,
-# 3.2 mm behind its front face.
-TIE_SLOTS = []
-TIE_SLOT_L, TIE_SLOT_W = 3.4, 1.6
+# No cable-tie slots: the first round drew them 4.5 to 7.9 mm beyond the jack's
+# front face, where the plug body still is, and nothing here shows that a tie
+# would clear the latch of a tab-up jack. The board ends at the jack and the
+# strain relief is the two screws, either side of the jack, 3.2 mm behind its
+# front face (unproven without the J2 and plug drawings).
+
+# GND vias for the USB 2.0 pair (ruling AR, revised). The pair leaves F.Cu at
+# U9 (x 12.2), runs on B.Cu to U3 (x 21.5 and 22.4) and so crosses ONE boundary
+# between In2 islands: the 0.6 mm gap at x 18.8 to 19.4 between +5V_SW and +1V0
+# (it starts over the 11.8 to 12.4 gap beside the +5V_SW island, where its vias
+# are, which is an end of the stretch and not a crossing). Return current has
+# to get across that gap in the B.Cu GND pour beside the pair, so the pour is
+# tied to In1 by a via on each side of the crossing, and at each end. The
+# crossing's north via sits on the gap (x 19.1); the south one cannot, because
+# C8 occupies the F.Cu south of it, so it is as near as the F.Cu copper lets it
+# (1.5 mm west). The two end vias are the nearest places that keep 0.3 mm from
+# the F.Cu routes of hardware/review/2026-10-31-placement/scratch_route_check.py.
+USB2_RETURN_VIAS = [
+    (19.1, 18.3),     # crossing, north of the pair (between RX_N and RX_P on F.Cu)
+    (17.6, 20.6),     # crossing, south of the pair (west of C8)
+    (12.1, 18.95),    # U9 end, south of the signal vias
+    (22.0, 17.3),     # U3 end, north of the signal vias
+]
 
 # Copper patch on F.Cu under the 3.3 V regulator: GND, joined to U4 pin 2
 # (the lead frame's main thermal path) without thermal relief.
@@ -247,21 +262,12 @@ def load_footprint(ref, fpid, report):
 
 
 def add_outline(board):
-    """Board outline on Edge.Cuts, plus the cable-tie slots."""
+    """Board outline on Edge.Cuts."""
     corners = [(0, 0), (BOARD_W, 0), (BOARD_W, BOARD_H), (0, BOARD_H)]
     for index in range(4):
         x1, y1 = corners[index]
         x2, y2 = corners[(index + 1) % 4]
         add_edge_line(board, x1, y1, x2, y2)
-    half = TIE_SLOT_W / 2
-    reach = TIE_SLOT_L / 2 - half
-    for cx, cy in TIE_SLOTS:
-        add_edge_line(board, cx - reach, cy - half, cx + reach, cy - half)
-        add_edge_line(board, cx - reach, cy + half, cx + reach, cy + half)
-        add_edge_arc(board, (cx + reach, cy - half), (cx + reach + half, cy),
-                     (cx + reach, cy + half))
-        add_edge_arc(board, (cx - reach, cy + half), (cx - reach - half, cy),
-                     (cx - reach, cy - half))
 
 
 def add_edge_line(board, x1, y1, x2, y2):
@@ -542,7 +548,7 @@ def build(netlist, out_path):
         report.append("U3 not on the board, no thermal vias placed")
 
     # GND stitching round the perimeter, skipping any spot that is too close to
-    # a pad, a slot or a hole.
+    # a pad or a hole.
     def free(x, y):
         for fp in board.GetFootprints():
             for pad in fp.Pads():
@@ -553,14 +559,17 @@ def build(netlist, out_path):
                 reach = max(sx, sy) + 0.9
                 if abs(x - px) < reach and abs(y - py) < reach:
                     return False
-        for sx_, sy_ in TIE_SLOTS:
-            if abs(x - sx_) < TIE_SLOT_L / 2 + 1.0 and abs(y - sy_) < 1.8:
-                return False
         for ref in ("H1", "H2"):
             if ref in PLACEMENT and math.hypot(x - PLACEMENT[ref][0],
                                                y - PLACEMENT[ref][1]) < HOLE_KEEPOUT_R[1] + 0.5:
                 return False
         return True
+
+    # GND vias for the USB 2.0 pair's stretch on B.Cu (ruling AR, revised).
+    # Their places are fixed by the F.Cu copper they have to stay clear of; see
+    # USB2_RETURN_VIAS.
+    for x, y in USB2_RETURN_VIAS:
+        add_via(board, x, y, gnd)
 
     stitches = []
     for i in range(1, int(BOARD_W / 5)):
