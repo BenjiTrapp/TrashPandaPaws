@@ -1756,15 +1756,17 @@ class MdiPairsStayInTheirCableGroup(unittest.TestCase):
 
 
 def run_gen_pcb_on_routed_board(extra_args=(), routed=True):
-    """Run tools/gen_pcb.py against a copy of the committed board, given one
-    track segment if `routed`. The guard has to act before pcbnew is imported,
+    """Run tools/gen_pcb.py against a copy of the committed board, stripped of
+    its tracks and then given one track segment if `routed`. The guard has to act before pcbnew is imported,
     so this runs under the interpreter of the test suite, which has no pcbnew:
     without the guard the script gets as far as the import and fails there.
     Returns the CompletedProcess plus whether the target file was left as it
     was."""
     with tempfile.TemporaryDirectory() as tmp:
         target = Path(tmp) / "raccoon-tap.kicad_pcb"
-        text = PCB.read_text()
+        # the board without its tracks first, so the test does not depend on
+        # whether the committed board is routed
+        text = re.sub(r"\n\t\((?:segment|arc)\n.*?\n\t\)", "", PCB.read_text(), flags=re.S)
         if routed:
             net = re.search(r'\(net\s+"([^"]+)"\)', text).group(1)
             segment = ('\t(segment\n\t\t(start 120 100)\n\t\t(end 121 100)\n'

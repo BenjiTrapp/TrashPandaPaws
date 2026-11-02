@@ -16,9 +16,10 @@ What this does:
   * thermal via array under U3's exposed pad, tented from the back
   * GND stitching vias around the board
 
-It places; it does not route. Routing is done by tools/route_pcb.py, as
-targeted geometry written on purpose and checked with kicad-cli's DRC and
-kicad-happy's EMC analysis (decision: docs/superpowers/specs/
+It places; it does not route. Routing is done by tools/route_pcb.py: the
+pairs, the buck loop and U3's escapes as geometry written on purpose, the rest
+connection by connection with tools/route_grid.py, all of it checked with
+kicad-cli's DRC and kicad-happy's analyses (decision: docs/superpowers/specs/
 2026-10-30-raccoon-tap-fab-release-design.md, section 6.3).
 
 FROZEN ONCE ROUTED. This script builds the board from nothing (NewBoard), so
@@ -36,7 +37,7 @@ route anything. The seven differential pairs need KiCad's interactive
 differential-pair router with a human deciding geometry and length matching.
 An autorouted result would be an unverifiable artefact - see
 OPEN_QUESTIONS.md." The FreeRouting half of that objection still stands and
-no autorouter is used; the "unverifiable" half no longer holds, because the
+FreeRouting is not used; the "unverifiable" half no longer holds, because the
 routed result is checked (DRC, kicad-happy skew, reference-plane and
 decoupling checks) rather than trusted.
 
@@ -136,24 +137,28 @@ PLACEMENT = {
     # --- USB side ----------------------------------------------------------
     "U9":  (9.6, 18.0, 0),       # USB 2.0 ESD. Pins 1/6 are one node and 3/4 another (DS4260): D+ in at 1, out at 6; D- in at 3, then north through the 0.95 mm channel between the pad columns (0.375 mm to each side), which puts it north of D+ with no via; pin 4 joined by a stub
     "U8":  (15.6, 17.1, 270),    # SuperSpeed ESD, 10.6 mm from the J3 pads (was 13.6); TX row north, 1.63 mm channel between the rows
-    "C22": (24.95, 16.8, 90),    # TX AC coupling, P
-    "C23": (26.0, 16.8, 90),     # TX AC coupling, N
-    # --- decoupling ring round U3 -----------------------------------------
-    # West edge (pins 21-30, supply pins): one column of 0402s, pad 1 towards U3.
-    "C8":  (19.3, 20.35, 180),   # 2.2 uF 0603 on pin 20 (AVDD33 LDO output)
-    "C17": (19.75, 21.75, 180),  # pin 22
-    "C10": (19.75, 22.8, 180),   # pin 23
-    "C18": (19.75, 23.85, 180),  # pins 21, 27
-    "C11": (19.75, 24.9, 180),   # pins 26, 33
-    "C16": (17.6, 21.75, 180),   # pins 14, 19; second column, there is no room beside them
-    # North-east corner (pin 11, and the AVDD10 pin 8 on the east edge)
-    "C7":  (27.7, 19.2, 90),
-    "C13": (28.8, 19.2, 90),
-    # South edge (pins 33-40), either side of the crystal channel
-    "C15": (22.3, 26.75, 180),   # pin 34
-    "C14": (25.65, 26.75, 0),    # pin 37
-    "C9":  (27.65, 26.75, 0),    # pins 39, 40
-    "C12": (29.6, 26.75, 0),     # AVDD10 pin 3 on the east edge
+    # 1.2 mm further north than task 8 put them (ruling AV): U3 pin 14 (+1V0)
+    # leaves up the channel between the RX_N and TX_P escapes, and C22 closed
+    # its end.
+    "C22": (24.95, 15.6, 90),    # TX AC coupling, P
+    "C23": (26.0, 15.6, 90),     # TX AC coupling, N
+    # --- decoupling ring round U3 (re-placed under rulings AV / AY) ----------
+    # Task 8's ring (a column of 0402s 0.64 mm from the west pads, a row 0.59 mm
+    # under the south pads) walled in pins 23 / 26 / 27 / 32 / 33 / 38 with
+    # pads of foreign supplies. Each cap now sits where its pin's escape ends,
+    # with room for its own via; tools/route_pcb.py records the distances.
+    "C16": (23.42, 16.75, 180),  # pin 14 (+1V0), at the end of its escape north up the RX_N / TX_P channel
+    "C7":  (27.0, 19.0, 0),      # pin 11 (+3V3), north-east of the TX_N run
+    "C13": (29.9, 21.35, 0),     # pin 8 (+1V0), in the pocket between MDI3 and MDI2
+    "C12": (29.6, 24.4, 0),      # pin 3 (+1V0), in the pocket between MDI1 and MDI0
+    "C8":  (19.2, 20.4, 180),    # pin 20 (AVDD33 LDO output, 2.2 uF 0603), west of pin 19's via
+    "C17": (17.3, 22.43, 270),   # pin 22 (DVDD10), on its line west; pad 1 north
+    "C10": (19.25, 22.65, 180),  # pins 23 / 26 (+3V3), west of their via
+    "C18": (18.9, 24.2, 270),    # pin 27 (+5V_SW), on its line west to the +5V_SW island; pad 1 north
+    "C15": (22.45, 27.95, 180),  # pin 34 (+1V0), under its via
+    "C14": (32.6, 28.0, 0),      # pin 37 (+1V0): R11 and R14 leave no room by the pin; on the B.Cu +1V0 link
+    "C11": (19.2, 25.95, 180),   # pins 26 / 33 (+3V3), on the +3V3 plane south-west of U3
+    "C9":  (19.2, 27.0, 180),    # pins 39 / 40 (+3V3), the same
     # --- J2 side ------------------------------------------------------------
     "C21": (34.4, 18.0, 180),    # centre-tap bypass, top side, in the 5 mm gap west of pin 6 (the MDI0/1 pairs come in from the east, MDI2/3 at y 19.9 and below); the jack's courtyard keeps it 3.3 mm from the pin
     "C25": (41.6, 29.9, 0),      # shield to GND, by the jack's shield post
@@ -231,8 +236,10 @@ USB2_RETURN_VIAS = [
     (19.1, 18.3),     # crossing, north of the pair (between RX_N and RX_P on F.Cu)
     (17.6, 20.6),     # crossing, south of the pair (west of C8)
     (12.1, 18.95),    # U9 end, south of the signal vias
-    (22.0, 17.3),     # U3 end, north of the signal vias
 ]
+# The U3-end GND via of task 8, (22.0, 17.3), is gone: ruling AZ released it
+# with the USB 2.0 signal vias at U3, and tools/route_pcb.py places the vias
+# of that end with the routing.
 
 # Rule area round U3's escape (ruling AU), named for the DRC rule "track to
 # track at the U3 escape" in raccoon-tap.kicad_dru: two escapes from

@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""Why task 9 stopped at the supplies: U3's supply and GND pins cannot leave
-their pads within the rules in force. Evidence, reproducible.
+"""Why task 9 stopped twice at the supplies (rounds 1 and 2): U3's supply and
+GND pins could not leave their pads within the rules then in force, and then
+not past task 8's decoupling ring. Evidence, reproducible.
+
+HISTORICAL. This probe belongs to the unrouted placement of commit a974bf4,
+before ruling AY re-placed the ring; the committed board is now routed and
+re-placed, and the probe refuses to run on it. To reproduce the evidence:
+
+    git worktree add /tmp/a974bf4 a974bf4
+    $KIPY /tmp/a974bf4/hardware/review/2026-11-02-routing/u3_supply_escape_probe.py [--round2]
 
 Every run copies the committed board and project to a temporary directory,
 lays copper there with pcbnew and prints what kicad-cli's DRC reports. The
@@ -193,6 +201,10 @@ def round2():
 
 
 def main():
+    if "(segment" in (KICAD / "raccoon-tap.kicad_pcb").read_text():
+        print("this probe is for the unrouted placement of commit a974bf4 (see the docstring)",
+              file=sys.stderr)
+        return 2
     if "--round2" in sys.argv:
         return 0 if round2() else 1
     # Round 1, re-run against the rules as they now stand: ruling AU's rule is
