@@ -41,6 +41,25 @@ def run_nets(text, netlist=None):
     return report
 
 
+def run_fitting(text, netlist=None):
+    report = ck.Report()
+    with contextlib.redirect_stdout(io.StringIO()):
+        ck.check_pcb_fitting(ck.parse_sexp(text), netlist or load_netlist(), report)
+    return report
+
+
+def set_footprint_attrs(text, ref, attrs):
+    """Replace the (attr ...) line of one footprint in the tap board text."""
+    at = text.index(f'(property "Reference" "{ref}"')
+    start = text.rfind("\n\t(footprint ", 0, at)
+    nxt = text.find("\n\t(footprint ", at)
+    end = nxt if nxt != -1 else len(text)
+    block = text[start:end]
+    new = re.sub(r"\(attr[^)]*\)", f"(attr {attrs})" if attrs else "", block, count=1)
+    assert new != block, f"{ref}: attr edit changed nothing"
+    return text[:start] + new + text[end:]
+
+
 def run_connectivity(text, netlist=None):
     report = ck.Report()
     with contextlib.redirect_stdout(io.StringIO()):
@@ -50,8 +69,10 @@ def run_connectivity(text, netlist=None):
 
 
 def zone_count(text):
-    """Zones in the (possibly mutated) board text, as the checker will see them."""
-    return len(ck.children(ck.parse_sexp(text), "zone"))
+    """Copper zones in the (possibly mutated) board text, as the checker will
+    see them: rule areas (keepouts) carry no net and are not counted."""
+    return len([z for z in ck.children(ck.parse_sexp(text), "zone")
+                if not ck.children(z, "keepout")])
 
 
 def labels(report):
@@ -99,6 +120,33 @@ class TapBoardAccepted(unittest.TestCase):
     def test_tap_board_connectivity_matches_netlist(self):
         report = run_connectivity(self.text)
         self.assertEqual(report.failures, [])
+
+
+class FittingFlagsRejectDefects(unittest.TestCase):
+    """Ruling X: a CPL exported from the PCB must not list R12 or C24."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = TAP_PCB.read_text(encoding="utf-8")
+
+    def test_real_board_passes(self):
+        self.assertEqual(run_fitting(self.text).failures, [])
+
+    def test_dnp_part_without_dnp_fails(self):
+        text = set_footprint_attrs(self.text, "R12",
+                                   "smd exclude_from_pos_files exclude_from_bom")
+        self.assertIn("footprint DNP / position-file flags match the netlist",
+                      labels(run_fitting(text)))
+
+    def test_dnp_part_still_in_position_file_fails(self):
+        text = set_footprint_attrs(self.text, "C24", "smd exclude_from_bom dnp")
+        self.assertIn("footprint DNP / position-file flags match the netlist",
+                      labels(run_fitting(text)))
+
+    def test_machine_placed_part_excluded_from_position_file_fails(self):
+        text = set_footprint_attrs(self.text, "Y1", "smd exclude_from_pos_files")
+        self.assertIn("footprint DNP / position-file flags match the netlist",
+                      labels(run_fitting(text)))
 
 
 class KiCad10NetEncodingRejectsDefects(unittest.TestCase):

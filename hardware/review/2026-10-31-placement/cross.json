@@ -1,0 +1,141 @@
+{
+  "analyzer_type": "cross_analysis",
+  "schema_version": "1.4.0",
+  "inputs": {
+    "source_files": [
+      "hardware/review/2026-10-31-placement/schematic.json",
+      "hardware/review/2026-10-31-placement/pcb.json"
+    ],
+    "source_hashes": {
+      "hardware/review/2026-10-31-placement/schematic.json": "b817f1691b42cdfaf6c2612d5e56c685029f9da86f61e252ea9ef58eb8524a07",
+      "hardware/review/2026-10-31-placement/pcb.json": "cad7d5f0730f834518c05d68c0b9254d44ac396f1ba13e10f24e7f21880bcc95"
+    },
+    "run_id": "20261102T092822Z-d400a9",
+    "config_hash": null,
+    "upstream_artifacts": {
+      "schematic": {
+        "path": "hardware/review/2026-10-31-placement/schematic.json",
+        "sha256": "b817f1691b42cdfaf6c2612d5e56c685029f9da86f61e252ea9ef58eb8524a07",
+        "schema_version": "1.4.0",
+        "run_id": "20261102T092822Z-d400a9"
+      },
+      "pcb": {
+        "path": "hardware/review/2026-10-31-placement/pcb.json",
+        "sha256": "cad7d5f0730f834518c05d68c0b9254d44ac396f1ba13e10f24e7f21880bcc95",
+        "schema_version": "1.4.0",
+        "run_id": "20261102T092822Z-d400a9"
+      }
+    }
+  },
+  "compat": {
+    "minimum_consumer_version": "1.4.0",
+    "deprecated_fields": [],
+    "experimental_fields": []
+  },
+  "elapsed_s": 0.007,
+  "summary": {
+    "total_findings": 0,
+    "by_severity": {
+      "error": 0,
+      "warning": 0,
+      "info": 0
+    }
+  },
+  "findings": [],
+  "assessments": [],
+  "checks_run": [
+    {
+      "check": "CC-001",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 2,
+      "findings": 0
+    },
+    {
+      "check": "EG-001",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 2,
+      "findings": 0
+    },
+    {
+      "check": "DA-001",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 0,
+      "findings": 0
+    },
+    {
+      "check": "XV-001..003",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 58,
+      "findings": 0
+    },
+    {
+      "check": "NR-001",
+      "ran": false,
+      "reason_skipped": "no PCB track segments present",
+      "items_examined": 0,
+      "findings": 0
+    },
+    {
+      "check": "RP-002",
+      "ran": false,
+      "reason_skipped": "no PCB track segments present",
+      "items_examined": 0,
+      "findings": 0
+    },
+    {
+      "check": "TW-001",
+      "ran": false,
+      "reason_skipped": "no PCB track segments present",
+      "items_examined": 0,
+      "findings": 0
+    },
+    {
+      "check": "PS-002",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 38,
+      "findings": 0
+    },
+    {
+      "check": "VS-002",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 40,
+      "findings": 0
+    },
+    {
+      "check": "DP-005",
+      "ran": false,
+      "reason_skipped": "no PCB track segments present",
+      "items_examined": 0,
+      "findings": 0
+    }
+  ],
+  "trust_summary": {
+    "total_findings": 0,
+    "trust_level": "high",
+    "by_confidence": {
+      "deterministic": 0,
+      "heuristic": 0,
+      "datasheet_backed": 0
+    },
+    "by_evidence_source": {
+      "datasheet": 0,
+      "topology": 0,
+      "heuristic_rule": 0,
+      "symbol_footprint": 0,
+      "bom": 0,
+      "geometry": 0,
+      "api_lookup": 0
+    },
+    "provenance_coverage_pct": null
+  },
+  "capability_mode_ref": {
+    "source": "analysis/capability_mode.json",
+    "run_id": "20261102T092822Z-d400a9"
+  }
+}

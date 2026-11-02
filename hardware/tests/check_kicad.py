@@ -14,6 +14,10 @@ that made the files unusable in the first place, so they cannot creep back in:
     that net name must be exactly the netlist's endpoints. netlist.yaml is
     the authority; the PCB is what is being checked. This replaces the
     guarantee that used to come from regenerating the PCB from the netlist.
+  * PCB fitting flags: a DNP part (populate: false) is marked DNP and left out
+    of position files and BOM on its footprint; a bare board feature
+    (bom: false) is left out of both; a part that is fitted is neither (U3 and
+    Y1 are machine-placed from the position file).
   * Reference designators must agree between schematic, PCB and BOM.
   * Component values must agree between the schematic and the BOM.
   * Balanced parentheses in both KiCad files.
@@ -204,7 +208,8 @@ def check_pcb_nets_named(pcb_text, pcb, netlist, report):
     report.check(not unknown, "every referenced net name is in netlist.yaml",
                  f"unknown names: {sorted(unknown)}")
 
-    zones = children(pcb, "zone")
+    # A rule area (keepout) has no net by design: it is a region, not copper.
+    zones = [z for z in children(pcb, "zone") if not children(z, "keepout")]
     bad_zones = []
     for zone in zones:
         net = children(zone, "net")
@@ -291,6 +296,50 @@ def check_pcb_connectivity(pcb, netlist, report):
                     if p and (r, p) not in accounted)
     report.check(not orphan, "every numbered PCB pad is in the netlist",
                  f"in neither nets nor no_connect: {orphan}")
+
+
+def check_pcb_fitting(pcb, netlist, report):
+    """The footprint flags must say what netlist.yaml says about fitting.
+
+    A CPL exported from the PCB lists every footprint not flagged out of the
+    position files. R12 exists so that it is NOT fitted (fitting it reverses
+    the pin 20 decision), so its footprint must carry DNP and the exclusion;
+    U3 and Y1 are placed by the assembler from the same file, so they must not
+    carry it. netlist.yaml is the authority.
+    """
+    print("PCB fitting flags vs netlist.yaml")
+
+    flags = {}
+    for fp in children(pcb, "footprint"):
+        found = set()
+        for attr in children(fp, "attr"):
+            found.update(a for a in attr[1:] if isinstance(a, str))
+        flags[prop(fp, "Reference")] = found
+
+    wrong = []
+    for ref, comp in netlist["components"].items():
+        if ref not in flags:
+            continue                     # a missing part is the other check's job
+        have = flags[ref]
+        dnp = comp.get("populate", True) is False
+        feature = comp.get("bom", True) is False
+        if dnp:
+            need = {"dnp", "exclude_from_pos_files", "exclude_from_bom"}
+        elif feature:
+            need = {"exclude_from_pos_files", "exclude_from_bom"}
+        else:
+            need = set()
+        missing = need - have
+        if missing:
+            wrong.append(f"{ref}: lacks {sorted(missing)}")
+        if not dnp and not feature:
+            extra = have & {"dnp", "exclude_from_bom"}
+            if "smd" in have:
+                extra |= have & {"exclude_from_pos_files"}
+            if extra:
+                wrong.append(f"{ref}: is fitted but carries {sorted(extra)}")
+    report.check(not wrong, "footprint DNP / position-file flags match the netlist",
+                 "; ".join(wrong))
 
 
 def expand_bom_refs(field):
@@ -407,6 +456,7 @@ def main():
     pcb = parse_sexp(pcb_text)
     check_pcb_nets(pcb_text, pcb, report, netlist)
     check_pcb_connectivity(pcb, netlist, report)
+    check_pcb_fitting(pcb, netlist, report)
 
     print()
     if report.failures:

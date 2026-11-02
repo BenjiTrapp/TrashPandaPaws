@@ -188,7 +188,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "SP3019-04HTG" (at 0 -7.62 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Package_TO_SOT_SMD:SOT-23-6" (at 0 0 0)
+			(property "Footprint" "raccoon:SOT-23-6_SP3019_LittelfuseLand" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_U8_0_1"
 				(rectangle (start -12.7 -5.08) (end 12.7 5.08)
@@ -232,7 +232,7 @@
 				(effects (font (size 1.27 1.27))))
 			(property "Value" "25MHz" (at 0 -6.35 0)
 				(effects (font (size 1.27 1.27))))
-			(property "Footprint" "Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm" (at 0 0 0)
+			(property "Footprint" "Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm_HandSoldering" (at 0 0 0)
 				(effects (font (size 1.27 1.27)) hide))
 			(symbol "RACCOON_Y1_0_1"
 				(rectangle (start -12.7 -3.81) (end 12.7 3.81)
@@ -711,6 +711,88 @@
 			(symbol "RACCOON_C9_1_1"
 				(pin passive line (at -5.08 0.0 0) (length 2.54) (name "A" (effects (font (size 1.016 1.016)))) (number "1" (effects (font (size 1.016 1.016)))))
 				(pin passive line (at 5.08 0.0 180) (length 2.54) (name "B" (effects (font (size 1.016 1.016)))) (number "2" (effects (font (size 1.016 1.016)))))
+			)
+		)
+		(symbol "RACCOON_FID1"
+			(pin_names (offset 0.508))
+			(exclude_from_sim no) (in_bom no) (on_board yes)
+			(property "Reference" "FID1" (at 0 3.81 0)
+				(effects (font (size 1.27 1.27))))
+			(property "Value" "FIDUCIAL_1" (at 0 -3.81 0)
+				(effects (font (size 1.27 1.27))))
+			(property "Footprint" "Fiducial:Fiducial_1mm_Mask2mm" (at 0 0 0)
+				(effects (font (size 1.27 1.27)) hide))
+			(symbol "RACCOON_FID1_0_1"
+				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
+					(stroke (width 0.254) (type default)) (fill (type background)))
+			)
+			(symbol "RACCOON_FID1_1_1"
+			)
+		)
+		(symbol "RACCOON_FID2"
+			(pin_names (offset 0.508))
+			(exclude_from_sim no) (in_bom no) (on_board yes)
+			(property "Reference" "FID2" (at 0 3.81 0)
+				(effects (font (size 1.27 1.27))))
+			(property "Value" "FIDUCIAL_2" (at 0 -3.81 0)
+				(effects (font (size 1.27 1.27))))
+			(property "Footprint" "Fiducial:Fiducial_1mm_Mask2mm" (at 0 0 0)
+				(effects (font (size 1.27 1.27)) hide))
+			(symbol "RACCOON_FID2_0_1"
+				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
+					(stroke (width 0.254) (type default)) (fill (type background)))
+			)
+			(symbol "RACCOON_FID2_1_1"
+			)
+		)
+		(symbol "RACCOON_FID3"
+			(pin_names (offset 0.508))
+			(exclude_from_sim no) (in_bom no) (on_board yes)
+			(property "Reference" "FID3" (at 0 3.81 0)
+				(effects (font (size 1.27 1.27))))
+			(property "Value" "FIDUCIAL_3" (at 0 -3.81 0)
+				(effects (font (size 1.27 1.27))))
+			(property "Footprint" "Fiducial:Fiducial_1mm_Mask2mm" (at 0 0 0)
+				(effects (font (size 1.27 1.27)) hide))
+			(symbol "RACCOON_FID3_0_1"
+				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
+					(stroke (width 0.254) (type default)) (fill (type background)))
+			)
+			(symbol "RACCOON_FID3_1_1"
+			)
+		)
+		(symbol "RACCOON_H1"
+			(pin_names (offset 0.508))
+			(exclude_from_sim no) (in_bom no) (on_board yes)
+			(property "Reference" "H1" (at 0 3.81 0)
+				(effects (font (size 1.27 1.27))))
+			(property "Value" "M2.5_HOLE_1" (at 0 -3.81 0)
+				(effects (font (size 1.27 1.27))))
+			(property "Footprint" "MountingHole:MountingHole_2.7mm_M2.5_Pad" (at 0 0 0)
+				(effects (font (size 1.27 1.27)) hide))
+			(symbol "RACCOON_H1_0_1"
+				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
+					(stroke (width 0.254) (type default)) (fill (type background)))
+			)
+			(symbol "RACCOON_H1_1_1"
+				(pin passive line (at -5.08 0.0 0) (length 2.54) (name "GND" (effects (font (size 1.016 1.016)))) (number "1" (effects (font (size 1.016 1.016)))))
+			)
+		)
+		(symbol "RACCOON_H2"
+			(pin_names (offset 0.508))
+			(exclude_from_sim no) (in_bom no) (on_board yes)
+			(property "Reference" "H2" (at 0 3.81 0)
+				(effects (font (size 1.27 1.27))))
+			(property "Value" "M2.5_HOLE_2" (at 0 -3.81 0)
+				(effects (font (size 1.27 1.27))))
+			(property "Footprint" "MountingHole:MountingHole_2.7mm_M2.5_Pad" (at 0 0 0)
+				(effects (font (size 1.27 1.27)) hide))
+			(symbol "RACCOON_H2_0_1"
+				(rectangle (start -2.54 -1.27) (end 2.54 1.27)
+					(stroke (width 0.254) (type default)) (fill (type background)))
+			)
+			(symbol "RACCOON_H2_1_1"
+				(pin passive line (at -5.08 0.0 0) (length 2.54) (name "GND" (effects (font (size 1.016 1.016)))) (number "1" (effects (font (size 1.016 1.016)))))
 			)
 		)
 		(symbol "RACCOON_JP1"

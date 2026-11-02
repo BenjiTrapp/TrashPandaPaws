@@ -451,7 +451,7 @@ components:
     mpn: ABM8-25.000MHZ-D2Y-T
     manufacturer: Abracon
     package: "3225"
-    footprint: "Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm"
+    footprint: "Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm_HandSoldering"
     description: "25MHz crystal for U3 clock reference, CL 18pF, +/-30ppm over temperature"
     source: >
       [RTL-DS] 7.4 table 23 and 'Supports 25MHz Crystal'. Part chosen against
@@ -1265,7 +1265,7 @@ components:
     mpn: SP3019-04HTG
     manufacturer: Littelfuse
     package: "SOT-23-6L, 2.9 x 2.8 mm, leaded"
-    footprint: "Package_TO_SOT_SMD:SOT-23-6"
+    footprint: "raccoon:SOT-23-6_SP3019_LittelfuseLand"
     description: "4-channel 0.3 pF ESD array for the SuperSpeed pairs, at the USB connector"
     source: >
       [SP3019] (committed, md5 54393f11...; see the header): 4 channels, 0.3
@@ -1284,6 +1284,14 @@ components:
       pF ([TI-ESD] 4.2, 'less than 0.5pF' for 5 Gbit/s). Replaces the
       SP3012-04HTG, which Littelfuse and DigiKey list as obsolete. Lifecycle
       and stock: [SOURCING].
+      FOOTPRINT (task 8): raccoon:SOT-23-6_SP3019_LittelfuseLand, the land
+      pattern of [SP3019] page 5 ('Recommended soldering pad layout': pads 0.60
+      x 0.85 mm, 0.95 mm pitch, 3.33 mm overall) in place of KiCad's SOT-23-6
+      (pads 1.325 mm long), because the 0.95 mm channel between the pad rows of
+      the latter is too narrow for two lines of different pairs and the
+      Littelfuse pattern leaves 1.63 mm. Pad numbering checked against that
+      page's package drawing: pin 1 is the dotted corner and the numbering runs
+      counter-clockwise, as in KiCad's footprint.
     pins:
       1: {name: IO_A1, type: passive, note: "USB3_TX_CONN_P. Row 1/2/3: TX pair on pins 1 and 3, GND between them"}
       2: {name: GND,   type: passive}
@@ -1395,6 +1403,51 @@ components:
     source: "Task 6, design_notes.measurement_points. KiCad's net-tie jumper footprint (net_tie_pad_groups '1, 2'), so the copper bridge between two different nets is not a DRC short. Nothing to buy: left out of the BOM (bom: false)."
     pins: {1: {name: A, type: passive, note: "regulator side"}, 2: {name: B, type: passive, note: "load side"}}
 
+  H1:
+    value: M2.5_HOLE_1
+    bom: false
+    package: "plated M2.5 mounting hole, 2.7 mm drill, 5.4 mm pad, tied to GND"
+    footprint: "MountingHole:MountingHole_2.7mm_M2.5_Pad"
+    description: "M2.5 mounting hole, corner furthest from the USB plug, north"
+    source: "Task 8, spec 5.2 / 11.9. A hole, not a part: left out of the BOM (bom: false). Plated and tied to GND so a metal standoff or washer gives a chassis ground; the keepout around it is drawn by gen_pcb.py."
+    pins: {1: {name: GND, type: passive}}
+
+  H2:
+    value: M2.5_HOLE_2
+    bom: false
+    package: "plated M2.5 mounting hole, 2.7 mm drill, 5.4 mm pad, tied to GND"
+    footprint: "MountingHole:MountingHole_2.7mm_M2.5_Pad"
+    description: "M2.5 mounting hole, corner furthest from the USB plug, south"
+    source: "Task 8, spec 5.2 / 11.9. A hole, not a part: left out of the BOM (bom: false). Plated and tied to GND so a metal standoff or washer gives a chassis ground; the keepout around it is drawn by gen_pcb.py."
+    pins: {1: {name: GND, type: passive}}
+
+  FID1:
+    value: FIDUCIAL_1
+    bom: false
+    package: "SMD fiducial, 1 mm copper dot, 2 mm mask opening"
+    footprint: "Fiducial:Fiducial_1mm_Mask2mm"
+    description: "Assembly fiducial 1 of 3 (top left)"
+    source: "Task 8. kicad-happy FD-001 (the board had none) and PCBWay's pick-and-place need three; U3 and Y1 are machine-placed (spec 5.1, ruling Y/AC). A copper dot, not a part: left out of the BOM (bom: false)."
+    pins: {}
+
+  FID2:
+    value: FIDUCIAL_2
+    bom: false
+    package: "SMD fiducial, 1 mm copper dot, 2 mm mask opening"
+    footprint: "Fiducial:Fiducial_1mm_Mask2mm"
+    description: "Assembly fiducial 2 of 3 (bottom left)"
+    source: "Task 8. kicad-happy FD-001 (the board had none) and PCBWay's pick-and-place need three; U3 and Y1 are machine-placed (spec 5.1, ruling Y/AC). A copper dot, not a part: left out of the BOM (bom: false)."
+    pins: {}
+
+  FID3:
+    value: FIDUCIAL_3
+    bom: false
+    package: "SMD fiducial, 1 mm copper dot, 2 mm mask opening"
+    footprint: "Fiducial:Fiducial_1mm_Mask2mm"
+    description: "Assembly fiducial 3 of 3 (right, on the strain-relief tail)"
+    source: "Task 8. kicad-happy FD-001 (the board had none) and PCBWay's pick-and-place need three; U3 and Y1 are machine-placed (spec 5.1, ruling Y/AC). A copper dot, not a part: left out of the BOM (bom: false)."
+    pins: {}
+
   J2:
     value: LPJG16402AQNL
     mpn: LPJG16402AQNL
@@ -1505,6 +1558,8 @@ nets:
     - U9.2           # USB 2.0 ESD array
     - C26.2
     - TP1.1
+    - H1.1           # mounting holes, plated, chassis ground
+    - H2.1
     - Y1.2           # crystal case ground
     - Y1.4
 
