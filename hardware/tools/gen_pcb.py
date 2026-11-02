@@ -234,6 +234,15 @@ USB2_RETURN_VIAS = [
     (22.0, 17.3),     # U3 end, north of the signal vias
 ]
 
+# Rule area round U3's escape (ruling AU), named for the DRC rule "track to
+# track at the U3 escape" in raccoon-tap.kicad_dru: two escapes from
+# neighbouring U3 pads are about 0.25 mm apart at the 0.40 mm pitch, which the
+# Power class's 0.30 mm cannot allow. The square reaches 3.45 mm from U3's
+# centre: the pads' outer ends are at 2.85 mm and a neck may run to 1.0 mm
+# from a pad centre (3.44 mm). It restricts nothing by itself (no keepout).
+U3_ESCAPE_AREA = "U3_escape"
+U3_ESCAPE_HALF = 3.45
+
 # Copper patch on F.Cu under the 3.3 V regulator: GND, joined to U4 pin 2
 # (the lead frame's main thermal path) without thermal relief.
 U4_PATCH = [(13.0, 29.6), (21.2, 29.6), (21.2, 35.3), (13.0, 35.3)]
@@ -360,6 +369,26 @@ def add_hole_keepout(board, cx, cy):
             outline.Append(mm(ORIGIN_X + cx + r_in * math.cos(angle)),
                            mm(ORIGIN_Y + cy + r_in * math.sin(angle)))
         board.Add(zone)
+
+
+def add_named_area(board, name, cx, cy, half):
+    """Square rule area on F.Cu with no keepout of its own, for a DRC rule
+    that scopes itself with insideArea()."""
+    zone = pcbnew.ZONE(board)
+    zone.SetIsRuleArea(True)
+    zone.SetLayer(pcbnew.F_Cu)
+    zone.SetDoNotAllowTracks(False)
+    zone.SetDoNotAllowVias(False)
+    zone.SetDoNotAllowFootprints(False)
+    zone.SetDoNotAllowPads(False)
+    zone.SetDoNotAllowZoneFills(False)
+    zone.SetZoneName(name)
+    outline = zone.Outline()
+    outline.NewOutline()
+    for dx, dy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+        outline.Append(mm(ORIGIN_X + cx + dx * half), mm(ORIGIN_Y + cy + dy * half))
+    board.Add(zone)
+    return zone
 
 
 def add_via(board, x, y, net, diameter=0.6, drill=0.3, tent_back=False):
@@ -563,6 +592,7 @@ def build(netlist, out_path):
             for iy in range(3):
                 add_via(board, cx + (ix - 1) * 1.1, cy + (iy - 1) * 1.1,
                         gnd, 0.6, 0.3, tent_back=True)
+        add_named_area(board, U3_ESCAPE_AREA, cx, cy, U3_ESCAPE_HALF)
     else:
         report.append("U3 not on the board, no thermal vias placed")
 

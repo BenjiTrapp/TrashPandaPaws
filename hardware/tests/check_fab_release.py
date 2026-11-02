@@ -521,6 +521,94 @@ def u3_track_rule_problems(dru_text=_LOAD):
     return problems
 
 
+U3_ESCAPE_RULE = "track to track at the U3 escape"
+U3_ESCAPE_AREA = "U3_escape"
+# Tracks against tracks only, both inside the area round U3's escape, any net
+# on either side (ruling AU).
+U3_ESCAPE_RULE_CONDITION = ("A.Type == 'Track' && B.Type == 'Track' && "
+                            "A.insideArea('U3_escape') && B.insideArea('U3_escape')")
+U3_ESCAPE_RULE_MIN_MM = PAIR_CLEARANCE_MIN
+# The area takes in U3's pads (outer ends 2.85 mm from the centre) and the
+# 1.0 mm necks (3.44 mm); gen_pcb.py U3_ESCAPE_HALF. Wider would let the 0.2 mm
+# reach tracks that have left U3.
+U3_ESCAPE_HALF_MAX_MM = 3.45
+
+
+def _rule_area(pcb_text, name):
+    """(layers, keepout block or '', [(x, y), ...]) of the zone named `name`,
+    or None."""
+    for block in re.findall(r"\n\t\(zone\n.*?\n\t\)", pcb_text, re.S):
+        if f'(name "{name}")' not in block:
+            continue
+        layers = re.search(r"\(layers? ([^)]*)\)", block).group(1)
+        keepout = re.search(r"\(keepout(.*?)\n\t\t\)", block, re.S)
+        pts = [(float(x), float(y)) for x, y in
+               re.findall(r"\(xy ([-0-9.]+) ([-0-9.]+)\)", block.split("(polygon", 1)[1])]
+        return layers, keepout.group(1) if keepout else "", pts
+    return None
+
+
+def _footprint_at(pcb_text, ref):
+    for block in re.split(r"\n\t\(footprint ", pcb_text)[1:]:
+        if re.search(r'\(property "Reference" "%s"' % re.escape(ref), block):
+            x, y = re.search(r"\n\t\t\(at ([-0-9.]+) ([-0-9.]+)", block).groups()
+            return float(x), float(y)
+    return None
+
+
+def u3_escape_rule_problems(dru_text=_LOAD, pcb_text=_LOAD):
+    """One message per reason the rule of ruling AU, or the area it is scoped
+    to, is not what task 9 wrote: the rule must exist with exactly
+    U3_ESCAPE_RULE_CONDITION and U3_ESCAPE_RULE_MIN_MM; the area must exist on
+    the board as a rule area on F.Cu that forbids nothing, and reach no
+    further than U3_ESCAPE_HALF_MAX_MM from U3's centre."""
+    if dru_text is _LOAD:
+        dru_text = load_dru()
+    if pcb_text is _LOAD:
+        pcb_text = PCB.read_text(encoding="utf-8")
+    rules = {name: (" ".join(condition.split()), float(minimum))
+             for name, condition, minimum in _DRU_RULE.findall(dru_text or "")}
+    problems = []
+    if U3_ESCAPE_RULE not in rules:
+        problems.append(f"raccoon-tap.kicad_dru has no rule {U3_ESCAPE_RULE!r}: "
+                        f"a supply escape cannot leave U3 beside another escape "
+                        f"at the Power class's 0.3 mm")
+    else:
+        condition, minimum = rules[U3_ESCAPE_RULE]
+        if condition != U3_ESCAPE_RULE_CONDITION:
+            problems.append(f"rule {U3_ESCAPE_RULE!r} has condition {condition!r}, "
+                            f"it must be {U3_ESCAPE_RULE_CONDITION!r}: tracks "
+                            f"against tracks, both in the area, any net")
+        if not math.isclose(minimum, U3_ESCAPE_RULE_MIN_MM, abs_tol=1e-9):
+            problems.append(f"rule {U3_ESCAPE_RULE!r} says min {minimum:g}, it must "
+                            f"be {U3_ESCAPE_RULE_MIN_MM:g} (the signal class "
+                            f"clearance)")
+    area = _rule_area(pcb_text or "", U3_ESCAPE_AREA)
+    if area is None:
+        problems.append(f"the board has no zone named {U3_ESCAPE_AREA!r}: the rule "
+                        f"{U3_ESCAPE_RULE!r} would match nothing")
+        return problems
+    layers, keepout, pts = area
+    if not keepout:
+        problems.append(f"zone {U3_ESCAPE_AREA!r} is not a rule area")
+    elif "not_allowed" in keepout:
+        problems.append(f"rule area {U3_ESCAPE_AREA!r} forbids something; it is "
+                        f"there to name a region, not to keep anything out")
+    if layers.split() != ['"F.Cu"']:
+        problems.append(f"rule area {U3_ESCAPE_AREA!r} is on {layers}, it must be "
+                        f"on F.Cu only (U3's escape)")
+    centre = _footprint_at(pcb_text, "U3")
+    if centre is None or not pts:
+        problems.append("U3 or the area's outline cannot be read")
+    else:
+        reach = max(max(abs(x - centre[0]), abs(y - centre[1])) for x, y in pts)
+        if reach > U3_ESCAPE_HALF_MAX_MM + 1e-6:
+            problems.append(f"rule area {U3_ESCAPE_AREA!r} reaches {reach:.2f} mm "
+                            f"from U3's centre, at most {U3_ESCAPE_HALF_MAX_MM} "
+                            f"(pads and 1.0 mm necks)")
+    return problems
+
+
 # RJ45 pins of the four cable pairs of 1000BASE-T (IEEE 802.3 clause 40) and the
 # group each MDI pair of the RTL8153B belongs to ([RTL-DS] Table 4: MDI0 BI_DA,
 # MDI1 BI_DB, MDI2 BI_DC, MDI3 BI_DD). A and B carry 10/100 and auto-negotiation.
@@ -1534,6 +1622,70 @@ class U3TrackRuleCannotBeLoosened(unittest.TestCase):
             problems = self.mutate("(min 0.2mm)", f"(min {new})")
             self.assertEqual(len(problems), 1, (new, problems))
             self.assertIn("must be 0.2", problems[0])
+
+
+class U3EscapeRuleCannotBeLoosened(unittest.TestCase):
+    """Ruling AU: the track-to-track rule at U3's escape and its rule area."""
+
+    def test_the_committed_rule_and_area_pass(self):
+        self.assertEqual(u3_escape_rule_problems(), [])
+
+    def mutate(self, old, new):
+        dru = load_dru()
+        start = dru.index(f'(rule "{U3_ESCAPE_RULE}"')
+        head, rule = dru[:start], dru[start:]
+        self.assertIn(old, rule)
+        return u3_escape_rule_problems(head + rule.replace(old, new, 1))
+
+    def test_a_missing_rule_is_reported(self):
+        problems = u3_escape_rule_problems(load_dru().replace(U3_ESCAPE_RULE, "renamed"))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("has no rule", problems[0])
+
+    def test_a_widened_scope_is_reported(self):
+        for old, new in [(" && B.insideArea('U3_escape')", ""),
+                         ("A.insideArea('U3_escape') && ", ""),
+                         ("A.Type == 'Track' && B.Type == 'Track' && ", ""),
+                         ("B.Type == 'Track'", "B.Type != 'Zone'"),
+                         ("A.Type == 'Track'", "A.Type == 'Track' || A.Type == 'Via'"),
+                         ("B.insideArea('U3_escape')", "B.insideArea('U3_escape') || B.NetClass == 'MDI'"),
+                         ("A.insideArea('U3_escape')", "A.intersectsCourtyard('J2')")]:
+            problems = self.mutate(old, new)
+            self.assertTrue(any("condition" in p for p in problems), (new, problems))
+
+    def test_a_wrong_minimum_is_reported(self):
+        for new in ("0.1mm", "0.15mm", "0.25mm", "0.3mm"):
+            problems = self.mutate("(min 0.2mm)", f"(min {new})")
+            self.assertEqual(len(problems), 1, (new, problems))
+            self.assertIn("must be 0.2", problems[0])
+
+    def test_a_missing_area_is_reported(self):
+        pcb = PCB.read_text(encoding="utf-8").replace('(name "U3_escape")', '(name "other")')
+        problems = u3_escape_rule_problems(pcb_text=pcb)
+        self.assertTrue(any("no zone named" in p for p in problems), problems)
+
+    def test_a_widened_area_is_reported(self):
+        pcb = PCB.read_text(encoding="utf-8")
+        cx, cy = _footprint_at(pcb, "U3")
+        layers, keepout, pts = _rule_area(pcb, U3_ESCAPE_AREA)
+        x0, y0 = pts[0]
+        grown = pcb.replace(f"(xy {x0:g} {y0:g})", f"(xy {x0 - 2:g} {y0 - 2:g})", 1)
+        self.assertNotEqual(grown, pcb)
+        problems = u3_escape_rule_problems(pcb_text=grown)
+        self.assertTrue(any("reaches" in p for p in problems), problems)
+
+    def test_an_area_that_keeps_things_out_or_sits_on_other_layers_is_reported(self):
+        pcb = PCB.read_text(encoding="utf-8")
+        start = pcb.index('(name "U3_escape")')
+        block_start = pcb.rindex("\n\t(zone\n", 0, start)
+        block_end = pcb.index("\n\t)", start)
+        block = pcb[block_start:block_end]
+        for old, new, word in [("(tracks allowed)", "(tracks not_allowed)", "forbids"),
+                               ('(layer "F.Cu")', '(layers "F.Cu" "B.Cu")', "F.Cu only")]:
+            self.assertIn(old, block)
+            problems = u3_escape_rule_problems(
+                pcb_text=pcb[:block_start] + block.replace(old, new) + pcb[block_end:])
+            self.assertTrue(any(word in p for p in problems), (new, problems))
 
 
 class MdiPairsStayInTheirCableGroup(unittest.TestCase):
