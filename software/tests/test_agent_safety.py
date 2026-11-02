@@ -354,13 +354,15 @@ class TestTierTwoClassifiesByEffect(unittest.TestCase):
                             "exploit_known_poc")
 
     def test_remote_execution_tools_share_the_lateral_rule(self):
+        # They share the action *class*, not the action key: see
+        # TestLateralKeysAreNotShared for why the key had to be split out.
         self._assert_action((
             "impacket-psexec corp/a:b@10.0.1.5", "impacket-wmiexec corp/a:b@10.0.1.5",
             "impacket-smbexec corp/a:b@10.0.1.5", "impacket-atexec corp/a:b@10.0.1.5",
             "impacket-dcomexec corp/a:b@10.0.1.5", "psexec.py corp/a:b@10.0.1.5",
             "wmiexec.py corp/a:b@10.0.1.5", "smbexec.py corp/a:b@10.0.1.5",
             "atexec.py corp/a:b@10.0.1.5", "dcomexec.py corp/a:b@10.0.1.5",
-            "evil-winrm -i 10.0.1.5 -u a -p b"), "ntlm_relay")
+            "evil-winrm -i 10.0.1.5 -u a -p b"), "remote_exec")
         self.assertEqual(self._c("evil-winrm -i 10.0.1.5").action_class, "lateral")
 
     def test_exe_suffixed_persistence_spellings(self):
@@ -1090,6 +1092,122 @@ class TestScriptValidation(unittest.TestCase):
             self.assertIsNotNone(safety.validate_script("whoami; id", language), language)
             self.assertIsNotNone(safety.validate_script("reboot", language), language)
             self.assertIsNone(safety.validate_script("whoami", language), language)
+
+
+class TestPythonScriptsCannotReachTierOneEffects(unittest.TestCase):
+    """Skipping command classification for python must not restore the bypass.
+
+    The shell path hard-blocks filesystem destruction, raw block-device access
+    and killing a process. None of those three needs a shell, so a language
+    branch that only screens for shell escapes would let the same effects
+    through by rewriting the destroyer in python — which is the bypass
+    `validate_script` exists to close, in a narrower spelling.
+    """
+
+    def test_filesystem_destruction_is_refused_without_a_shell(self):
+        for line, construct in (
+                ("shutil.rmtree('/')", "shutil.rmtree"),
+                ("os.remove('/etc/shadow')", "os.remove"),
+                ("os.unlink('/etc/shadow')", "os.unlink"),
+                ("os.rmdir('/var')", "os.rmdir"),
+                ("os.removedirs('/var/log')", "os.removedirs"),
+                ("os.truncate('/etc/passwd', 0)", "os.truncate"),
+                ("Path('/etc/shadow').unlink()", ".unlink(")):
+            msg = safety.validate_script("x = 1\n" + line, "python")
+            self.assertIsNotNone(msg, line)
+            self.assertIn("line 2", msg, line)
+            self.assertIn(construct, msg, line)
+
+    def test_raw_block_devices_are_refused_in_either_direction(self):
+        for device in ("/dev/sda", "/dev/nvme0n1", "/dev/hdb", "/dev/mmcblk0",
+                       "/dev/disk0", "/dev/rdisk0"):
+            for line in ("open('%s', 'wb').write(b'x')" % device,
+                         "data = open('%s', 'rb').read()" % device):
+                msg = safety.validate_script(line, "python")
+                self.assertIsNotNone(msg, line)
+                self.assertIn("destroys or kills", msg, line)
+
+    def test_killing_a_process_is_refused(self):
+        for line in ("os.kill(pid, 9)", "os.killpg(group, 9)"):
+            self.assertIsNotNone(safety.validate_script(line, "python"), line)
+
+    def test_arbitrary_code_reach_counts_as_a_shell_escape(self):
+        for line, construct in (("import ctypes", "ctypes"),
+                                ("ctypes.CDLL('libc.so.6').system(b'id')", "ctypes"),
+                                ("import importlib", "importlib"),
+                                ("importlib.import_module('os')", "importlib"),
+                                ("os.spawnv(os.P_WAIT, '/bin/sh', [])", "os.spawn")):
+            msg = safety.validate_script(line, "python")
+            self.assertIsNotNone(msg, line)
+            self.assertIn(construct, msg, line)
+
+    def test_benign_stdlib_use_still_passes(self):
+        for line in ("path = os.path.join('a', 'b')",
+                     "v = ast.literal_eval('[1, 2]')",
+                     "seed = open('/dev/urandom', 'rb').read(4)",
+                     "sink = open('/dev/null', 'w')",
+                     "s = socket.socket()",
+                     "cwd = os.getcwd()",
+                     "entries = os.listdir('/etc')",
+                     "shutil.copy('a', 'b')",
+                     "unlinked = 1",
+                     "pos.systematic = 1"):
+            self.assertIsNone(safety.validate_script(line, "python"), line)
+
+    def test_a_destructive_python_line_is_reported_with_its_number(self):
+        code = "import shutil\nx = 1\nshutil.rmtree('/')\nos.remove('/etc/x')\n"
+        msg = safety.validate_script(code, "python")
+        self.assertIn("line 3", msg)
+        self.assertNotIn("line 4", msg)
+
+
+class TestLateralKeysAreNotShared(unittest.TestCase):
+    """The gate keys approvals and detection history on `action_key`.
+
+    Two different actions behind one key means an approval granted for the
+    first silently authorises the second, so a shared key is an
+    authorisation-widening bug rather than a labelling one.
+    """
+
+    def test_remote_execution_has_its_own_key(self):
+        for command in ("shell psexec.py corp/admin@10.0.1.5",
+                        "shell wmiexec.py corp/admin@10.0.1.5",
+                        "shell smbexec.py corp/admin@10.0.1.5",
+                        "shell atexec.py corp/admin@10.0.1.5",
+                        "shell dcomexec.py corp/admin@10.0.1.5",
+                        "shell impacket-psexec corp/admin@10.0.1.5",
+                        "shell evil-winrm -i 10.0.1.5 -u admin"):
+            verdict = _classify(command)
+            self.assertEqual(verdict.tier, safety.TIER_KNOCK, command)
+            self.assertEqual(verdict.action_key, "remote_exec", command)
+            self.assertEqual(verdict.action_class, "lateral", command)
+
+    def test_coercion_keeps_the_relay_key(self):
+        for command in ("shell ntlmrelayx.py -tf targets.txt",
+                        "shell petitpotam.py 10.0.1.5 10.0.1.6",
+                        "shell dfscoerce.py -u a 10.0.1.5"):
+            verdict = _classify(command)
+            self.assertEqual(verdict.action_key, "ntlm_relay", command)
+
+    def test_the_two_reasons_describe_different_actions(self):
+        relay = _classify("shell ntlmrelayx.py -tf targets.txt").reason
+        remote = _classify("shell psexec.py corp/admin@10.0.1.5").reason
+        self.assertNotEqual(relay, remote)
+        self.assertIn("relay", relay)
+        self.assertIn("another host", remote)
+
+    def test_remote_service_creation_is_persistence_with_or_without_a_host(self):
+        for command in (r"shell sc \\dc01 create svc binPath= C:\evil.exe",
+                        "shell sc create svc binPath= evil.exe",
+                        "shell sc.exe create svc binPath= evil.exe"):
+            verdict = _classify(command)
+            self.assertEqual(verdict.tier, safety.TIER_KNOCK, command)
+            self.assertEqual(verdict.action_key, "persist", command)
+
+    def test_service_queries_stay_free(self):
+        for command in ("shell sc query svc", "shell sc qc svc",
+                        r"shell sc \\dc01 query svc"):
+            self.assertEqual(_classify(command).tier, safety.TIER_FREE, command)
 
 
 class TestClamp(unittest.TestCase):

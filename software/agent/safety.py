@@ -331,6 +331,14 @@ RISK_TABLE = {
         TIER_KNOCK, "ntlm_relay", "lateral",
         "relay and authentication coercion against third-party hosts",
         points=75, p_success=0.4, p_detect=0.5, phase=5),
+    # Kept apart from ntlm_relay although both are lateral: the gate keys
+    # approvals and detection history on action_key, so sharing one key would
+    # let an approval granted for a coercion attempt silently authorise
+    # command execution on another host. The odds differ too.
+    "remote_exec": _row(
+        TIER_KNOCK, "remote_exec", "lateral",
+        "executes commands on another host with credentials already held",
+        points=75, p_success=0.8, p_detect=0.6, phase=5),
     "log_clear": _row(
         TIER_KNOCK, "log_clear", "anti_forensics",
         "clearing logs is itself a high-signal detection event",
@@ -426,10 +434,11 @@ _RULES = [
     (re.compile(r"\bntlmrelayx(?:\.py)?\b|impacket-ntlmrelayx"
                 r"|\bkrbrelayx(?:\.py)?\b|\bsmbrelayx(?:\.py)?\b"
                 r"|\bprinterbug(?:\.py)?\b|\bdfscoerce(?:\.py)?\b"
-                r"|\bcoercer\b|\bpetitpotam(?:\.py)?\b|-m\s+coerce"
-                r"|\b(?:impacket-)?(?:psexec|wmiexec|smbexec|atexec|dcomexec)"
+                r"|\bcoercer\b|\bpetitpotam(?:\.py)?\b|-m\s+coerce"), "ntlm_relay"),
+
+    (re.compile(r"\b(?:impacket-)?(?:psexec|wmiexec|smbexec|atexec|dcomexec)"
                 r"(?:\.py)?\b"
-                r"|\bevil-winrm\b"), "ntlm_relay"),
+                r"|\bevil-winrm\b"), "remote_exec"),
 
     (re.compile(r"\bwevtutil(?:\.exe)?\b.*\b(?:cl|clear-log)\b"
                 r"|\bclear-eventlog\b"
@@ -453,7 +462,7 @@ _RULES = [
                 r"|midnight\b|noon\b|teatime\b)"
                 r"|\bsystemd-run\b.*--on-"
                 r"|\breg(?:\.exe)?\s+add\b.*currentversion/?run"
-                r"|\bsc(?:\.exe)?\s+create\b"
+                r"|\bsc(?:\.exe)?\s+(?:\S+\s+)?create\b"
                 r"|\b(?:useradd|adduser)\b"
                 r"|\bnet\s+user\b.*\s/add\b"
                 r"|\bnet\s+localgroup\b.*\s/add\b"
@@ -1093,11 +1102,26 @@ def enforce_scan_limits(command):
 # sandbox: an aliased import gets past it.
 _PYTHON_SHELL_ESCAPES = re.compile(
     r"subprocess"
-    r"|\bos\s*\.\s*(?:system|popen|exec)"
+    r"|\bos\s*\.\s*(?:system|popen|exec|spawn)"
     r"|\b(?:eval|exec)\s*\("
     r"|__import__"
+    r"|\bimportlib\b"
+    r"|\bctypes\b"
     r"|\bpty\s*\.\s*spawn"
     r"|\bcommands\s*\.\s*getoutput")
+
+
+# Skipping command classification for python would hand back the bypass this
+# function exists to close: the tier-1 effects do not need a shell, and
+# `shutil.rmtree("/")` destroys a host exactly as `rm -rf /` does. These are
+# the stdlib spellings of the effects the shell path hard-blocks — filesystem
+# destruction, raw block-device access and killing a process — named so a
+# caller can read the refusal and rewrite the script.
+_PYTHON_DESTRUCTIVE = re.compile(
+    r"\bshutil\s*\.\s*(?:rmtree|disk_usage)"
+    r"|\bos\s*\.\s*(?:removedirs|remove|unlink|rmdir|truncate|kill(?:pg)?)"
+    r"|\.\s*unlink\s*\("
+    r"|/dev/(?:sd[a-z]|nvme\d|hd[a-z]|mmcblk\d|r?disk\d)")
 
 
 def validate_script(code, language):
@@ -1109,9 +1133,11 @@ def validate_script(code, language):
     implementation this project is modelled on let scripts bypass the safety
     layer entirely — which made the whole leash removable in three lines.
 
-    A python script is screened for shell-escape constructs instead of being
-    classified as shell commands. Any other language, recognised or not, takes
-    the strict shell path.
+    A python script is screened for shell-escape and destructive constructs
+    instead of being classified as shell commands — punctuation there is
+    syntax, so the metacharacter screen cannot apply, but the tier-1 effects
+    are reachable without a shell and are refused by name. Any other language,
+    recognised or not, takes the strict shell path.
     """
     if not isinstance(code, str):
         return "script is not a string"
@@ -1127,6 +1153,11 @@ def validate_script(code, language):
             if escape:
                 return "line %d: shell escape '%s' is not permitted in a python " \
                        "script" % (number, re.sub(r"\s+", "", escape.group(0)))
+            destructive = _PYTHON_DESTRUCTIVE.search(line)
+            if destructive:
+                return "line %d: '%s' destroys or kills without a shell, which " \
+                       "is blocked in any language" % (
+                           number, re.sub(r"\s+", "", destructive.group(0)))
             continue
         if has_shell_metachars(line):
             return "line %d: shell metacharacters are not permitted" % number
