@@ -315,10 +315,18 @@ RISK_TABLE = {
         "airmon-ng check kill stops NetworkManager and severs C2"),
 
     # ── Tier 2: OpSec- or resilience-relevant, gated ──
+    #
+    # `points` is the value of the outcome the action *unlocks*, taken from
+    # the scoring table — not a score tag for the action itself. The EV is
+    # `points * p_success - R * p_detect`, so the benefit term has to be an
+    # expected value. Immediate outcome only: every follow-up action gets its
+    # own EV, and counting the chain here would inflate whatever comes first.
+    # A pure enabler carries the value of what it makes reachable.
+    # See docs/superpowers/specs/2026-11-02-ev-calibration-amendment.md.
     "iface_change": _row(
         TIER_KNOCK, "iface_change", "lifecycle",
         "changes the mode or state of a network interface",
-        points=0, p_success=0.9, p_detect=0.2),
+        points=30, p_success=0.9, p_detect=0.2),
     "lsass_dump": _row(
         TIER_KNOCK, "lsass_dump", "credential_access",
         "credential material extraction — the single loudest EDR trigger",
@@ -350,7 +358,7 @@ RISK_TABLE = {
     "persist": _row(
         TIER_KNOCK, "persist", "persistence",
         "installing persistence leaves an artifact that outlives the test",
-        points=25, p_success=0.9, p_detect=0.25, phase=4),
+        points=75, p_success=0.9, p_detect=0.25, phase=4),
     "deauth": _row(
         TIER_KNOCK, "deauth", "wifi",
         "deauthentication is disruptive and attributable",
@@ -358,7 +366,7 @@ RISK_TABLE = {
     "exploit_known_poc": _row(
         TIER_KNOCK, "exploit_known_poc", "exploitation",
         "exploitation against a confirmed service version",
-        points=25, p_success=0.6, p_detect=0.3, phase=5),
+        points=200, p_success=0.6, p_detect=0.3, phase=5),
 }
 
 

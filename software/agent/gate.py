@@ -74,6 +74,14 @@ _DETECTION_CAP = 0.95
 # unbounded or deceptive value into the audit trail.
 _SOURCE_MAX = 40
 
+# The EV's risk coefficient, deliberately not the score penalty's 100. That
+# −100 is what a detection costs in the CTF ledger; this prices what being
+# noticed once costs the *run*, which is not total loss — the default
+# detection budget is 3, so one detection spends about a third of the
+# tolerance. Hence ≈ 100/3. Settable rather than derived from the budget,
+# so changing the budget cannot silently shift how aggressive the agent is.
+_DEFAULT_RISK_COEFFICIENT = 33.0
+
 
 def _audit_source(source) -> str:
     if not isinstance(source, str):
@@ -146,7 +154,8 @@ def scan_for_detection(output, *, host_was_responsive):
 
 class Gate:
     def __init__(self, conn, run_id, *, mode, ev_threshold, p_detect_prior,
-                 detection_budget, unattended_behavior, approval_timeout):
+                 detection_budget, unattended_behavior, approval_timeout,
+                 risk_coefficient=_DEFAULT_RISK_COEFFICIENT):
         # An unknown mode would otherwise fall through to one of the two
         # branches in request(), and which one would be an accident.
         if mode not in _MODES:
@@ -162,6 +171,7 @@ class Gate:
         self.detection_budget = detection_budget
         self.unattended_behavior = unattended_behavior
         self.approval_timeout = approval_timeout
+        self.risk_coefficient = risk_coefficient
         # approval_id -> the future its request() is waiting on. Presence
         # here is what makes an approval answerable: tier-1 and tier-3 never
         # get an entry, and a decided one has been removed.
@@ -296,13 +306,14 @@ class Gate:
         if p_success_override is not None:
             p_success = safety.clamp_llm_adjustment(
                 classification.p_success, p_success_override)
-        ev = classification.points * p_success - 100 * p_detect
+        ev = classification.points * p_success - self.risk_coefficient * p_detect
         ev_prior = classification.points * classification.p_success \
-            - 100 * p_detect
+            - self.risk_coefficient * p_detect
         return {
             "ev": ev,
             "ev_prior": ev_prior,
             "threshold": self.ev_threshold,
+            "risk_coefficient": self.risk_coefficient,
             "points": classification.points,
             "p_success_prior": classification.p_success,
             "p_success_effective": p_success,

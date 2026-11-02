@@ -34,8 +34,15 @@ def _cls(tier=safety.TIER_KNOCK, points=50, p_success=0.5, p_detect=0.7,
         reason="LSASS access")
 
 
+# The EV's risk coefficient. Named rather than inlined so these tests
+# assert the property — ev = points * p_success - R * p_detect — instead
+# of a constant that moved once already.
+_R = gate._DEFAULT_RISK_COEFFICIENT
+
+
 def _gate(conn, rid, **kw):
     kw.setdefault("mode", "auto")
+    kw.setdefault("risk_coefficient", _R)
     kw.setdefault("ev_threshold", 0.0)
     kw.setdefault("p_detect_prior", 0.15)
     kw.setdefault("detection_budget", 3)
@@ -135,11 +142,75 @@ class TestTierRouting(unittest.IsolatedAsyncioTestCase):
 
 # ── EV arbiter ──
 
+class TestTheLeashTightensInOrder(unittest.IsolatedAsyncioTestCase):
+    """The order in which actions fall away as detections accumulate.
+
+    Spec §10.6 promises that a detection "pushes most tier-2 actions below
+    the threshold" — which only means anything if they start above it, and
+    only reads as a leash if the loudest action is the first to go. Before
+    the EV calibration amendment every tier-2 action was refused from the
+    outset, so Full Automated was behaviourally identical to skip and this
+    promise was vacuous. These tests pin the shape, not the exact numbers.
+    """
+
+    async def _verdicts(self, detections):
+        conn, rid = _fresh_run()
+        g = _gate(conn, rid, detection_budget=99)
+        for _ in range(detections):
+            g.note_detection("reset")
+        out = {}
+        for key, row in safety.RISK_TABLE.items():
+            if row.tier != safety.TIER_KNOCK:
+                continue
+            out[key] = (await g.request(row)).allowed
+        return out
+
+    async def test_full_auto_can_act_at_all(self):
+        allowed = [k for k, v in (await self._verdicts(0)).items() if v]
+        self.assertTrue(allowed, "no tier-2 action is reachable in auto mode")
+
+    async def test_the_quiet_valuable_actions_are_reachable(self):
+        verdicts = await self._verdicts(0)
+        for key in ("persist", "remote_exec", "iface_change", "ntlm_relay",
+                    "responder", "deauth", "lsass_dump"):
+            self.assertTrue(verdicts[key], key)
+
+    async def test_actions_that_score_nothing_and_are_loud_stay_refused(self):
+        # No detection count makes these worth doing unattended: they unlock
+        # nothing scored. The operator can still approve them by hand.
+        for detections in (0, 1, 2):
+            verdicts = await self._verdicts(detections)
+            for key in ("log_clear", "shadow_copy_delete",
+                        "device_write_unknown"):
+                self.assertFalse(verdicts[key], "%s at %d" % (key, detections))
+
+    async def test_the_loudest_action_is_the_first_to_fall_away(self):
+        # lsass_dump carries the highest p_detect of the actions that are
+        # reachable at all, so it must drop out before the quieter ones.
+        after_one = await self._verdicts(1)
+        self.assertFalse(after_one["lsass_dump"])
+        for key in ("persist", "remote_exec", "iface_change", "ntlm_relay",
+                    "responder"):
+            self.assertTrue(after_one[key], key)
+
+    async def test_the_leash_only_ever_tightens(self):
+        counts = [await self._verdicts(n) for n in range(4)]
+        for key in counts[0]:
+            reachable = [c[key] for c in counts]
+            # Once refused, never allowed again at a higher detection count.
+            first_refusal = next(
+                (i for i, ok in enumerate(reachable) if not ok), None)
+            if first_refusal is not None:
+                self.assertFalse(any(reachable[first_refusal:]),
+                                 "%s becomes allowed again: %s"
+                                 % (key, reachable))
+
+
 class TestMissingDetectionProbability(unittest.IsolatedAsyncioTestCase):
     """`p_detect_prior` substitutes for a missing p_detect; it is not a floor.
 
     `safety._row` defaults `p_detect` to 0.0, so a risk-table row that omits
-    it would yield `ev = points * p_success - 100 * 0` — a risk-free expected
+    it would yield `ev = points * p_success - R * 0` — a risk-free expected
     value for an action that is meant to knock. Substituting is the narrow
     fix; flooring would silently overrule a low-but-deliberate table value.
     """
@@ -148,13 +219,13 @@ class TestMissingDetectionProbability(unittest.IsolatedAsyncioTestCase):
         conn, rid = _fresh_run()
         d = await _gate(conn, rid, p_detect_prior=0.15).request(
             _cls(points=200, p_success=0.9, p_detect=0.0))
-        self.assertAlmostEqual(d.ev, 200 * 0.9 - 100 * 0.15)
+        self.assertAlmostEqual(d.ev, 200 * 0.9 - _R * 0.15)
 
     async def test_a_low_but_real_p_detect_is_left_alone(self):
         conn, rid = _fresh_run()
         d = await _gate(conn, rid, p_detect_prior=0.15).request(
             _cls(points=200, p_success=0.9, p_detect=0.01))
-        self.assertAlmostEqual(d.ev, 200 * 0.9 - 100 * 0.01)
+        self.assertAlmostEqual(d.ev, 200 * 0.9 - _R * 0.01)
 
     async def test_the_substitution_is_stated_in_the_reason(self):
         conn, rid = _fresh_run()
@@ -175,14 +246,14 @@ class TestMissingDetectionProbability(unittest.IsolatedAsyncioTestCase):
         conn, rid = _fresh_run()
         d = await _gate(conn, rid, p_detect_prior=0.40).request(
             _cls(points=200, p_success=0.9, p_detect=0.0))
-        self.assertAlmostEqual(d.ev, 200 * 0.9 - 100 * 0.40)
+        self.assertAlmostEqual(d.ev, 200 * 0.9 - _R * 0.40)
 
     async def test_detection_tracking_still_applies_to_a_substituted_value(self):
         conn, rid = _fresh_run()
         g = _gate(conn, rid, p_detect_prior=0.15, detection_budget=99)
         g.note_detection("reset")
         d = await g.request(_cls(points=200, p_success=0.9, p_detect=0.0))
-        self.assertAlmostEqual(d.ev, 200 * 0.9 - 100 * 0.30)
+        self.assertAlmostEqual(d.ev, 200 * 0.9 - _R * 0.30)
 
 
 class TestEvArbiter(unittest.IsolatedAsyncioTestCase):
@@ -192,19 +263,19 @@ class TestEvArbiter(unittest.IsolatedAsyncioTestCase):
             _cls(points=200, p_success=0.6, p_detect=0.3))
         self.assertTrue(d.allowed)
         self.assertEqual(d.decided_by, "ev")
-        self.assertAlmostEqual(d.ev, 200 * 0.6 - 100 * 0.3)
+        self.assertAlmostEqual(d.ev, 200 * 0.6 - _R * 0.3)
 
     async def test_negative_ev_is_refused(self):
         conn, rid = _fresh_run()
         d = await _gate(conn, rid).request(
-            _cls(points=50, p_success=0.5, p_detect=0.7))
+            _cls(points=10, p_success=0.5, p_detect=0.7))
         self.assertFalse(d.allowed)
         self.assertEqual(d.decided_by, "ev")
-        self.assertAlmostEqual(d.ev, 50 * 0.5 - 100 * 0.7)
+        self.assertAlmostEqual(d.ev, 10 * 0.5 - _R * 0.7)
 
     async def test_threshold_is_respected(self):
         conn, rid = _fresh_run()
-        c = _cls(points=100, p_success=0.5, p_detect=0.4)   # EV = 10
+        c = _cls(points=50, p_success=0.5, p_detect=0.5)    # EV = 25 - R/2
         self.assertTrue(
             (await _gate(conn, rid, ev_threshold=5.0).request(c)).allowed)
         self.assertFalse(
@@ -213,20 +284,20 @@ class TestEvArbiter(unittest.IsolatedAsyncioTestCase):
     async def test_ev_exactly_at_threshold_is_refused(self):
         # The spec says EV > threshold, so equality does not pass.
         conn, rid = _fresh_run()
-        c = _cls(points=100, p_success=0.5, p_detect=0.5)   # EV = 0
+        c = _cls(points=_R, p_success=0.5, p_detect=0.5)    # EV = 0 exactly
         self.assertFalse((await _gate(conn, rid).request(c)).allowed)
 
     async def test_llm_p_success_override_is_clamped(self):
         conn, rid = _fresh_run()
         d = await _gate(conn, rid).request(
             _cls(points=50, p_success=0.5, p_detect=0.1), p_success_override=0.99)
-        self.assertAlmostEqual(d.ev, 50 * 0.7 - 100 * 0.1)
+        self.assertAlmostEqual(d.ev, 50 * 0.7 - _R * 0.1)
 
     async def test_llm_override_can_only_lower_as_far_as_the_clamp(self):
         conn, rid = _fresh_run()
         d = await _gate(conn, rid).request(
             _cls(points=50, p_success=0.5, p_detect=0.1), p_success_override=0.0)
-        self.assertAlmostEqual(d.ev, 50 * 0.3 - 100 * 0.1)
+        self.assertAlmostEqual(d.ev, 50 * 0.3 - _R * 0.1)
 
     async def test_non_numeric_override_falls_back_to_the_prior(self):
         conn, rid = _fresh_run()
@@ -234,20 +305,20 @@ class TestEvArbiter(unittest.IsolatedAsyncioTestCase):
             d = await _gate(conn, rid).request(
                 _cls(points=50, p_success=0.5, p_detect=0.1),
                 p_success_override=bad)
-            self.assertAlmostEqual(d.ev, 50 * 0.5 - 100 * 0.1, msg=repr(bad))
+            self.assertAlmostEqual(d.ev, 50 * 0.5 - _R * 0.1, msg=repr(bad))
 
     async def test_ev_uses_the_tracked_detection_probability(self):
         conn, rid = _fresh_run()
         g = _gate(conn, rid)
-        c = _cls(points=100, p_success=0.5, p_detect=0.3)
+        c = _cls(points=30, p_success=0.5, p_detect=0.3)
         before = await g.request(c)
-        self.assertAlmostEqual(before.ev, 100 * 0.5 - 100 * 0.30)
+        self.assertAlmostEqual(before.ev, 30 * 0.5 - _R * 0.30)
         self.assertTrue(before.allowed)
         g.note_detection("reset")
         g.note_detection("reset")
         after = await g.request(c)
         # 0.30 + 2 * 0.15 = 0.60, not the classification's 0.30.
-        self.assertAlmostEqual(after.ev, 100 * 0.5 - 100 * 0.60)
+        self.assertAlmostEqual(after.ev, 30 * 0.5 - _R * 0.60)
         self.assertFalse(after.allowed)
 
     async def test_detections_reported_outside_note_detection_also_count(self):
@@ -257,7 +328,7 @@ class TestEvArbiter(unittest.IsolatedAsyncioTestCase):
         queries.log_score(conn, rid, "detection", -100, "high", True)
         d = await _gate(conn, rid).request(
             _cls(points=100, p_success=0.5, p_detect=0.3))
-        self.assertAlmostEqual(d.ev, 100 * 0.5 - 100 * 0.45)
+        self.assertAlmostEqual(d.ev, 100 * 0.5 - _R * 0.45)
 
     async def test_a_rebuilt_gate_remembers_the_runs_detections(self):
         conn, rid = _fresh_run()
@@ -284,7 +355,7 @@ class TestEvArbiter(unittest.IsolatedAsyncioTestCase):
         await _gate(conn, rid).request(
             _cls(points=200, p_success=0.6, p_detect=0.3))
         await _gate(conn, rid).request(
-            _cls(points=50, p_success=0.5, p_detect=0.7))
+            _cls(points=10, p_success=0.5, p_detect=0.7))
         self.assertEqual([r["decision"] for r in _rows(conn)],
                          ["approved", "refused"])
 
@@ -296,7 +367,7 @@ class TestEvArbiter(unittest.IsolatedAsyncioTestCase):
                         p_success_override=0.6)
         row = _rows(conn)[0]
         ev = json.loads(row["ev_json"])
-        self.assertAlmostEqual(ev["ev"], 100 * 0.6 - 100 * 0.45)
+        self.assertAlmostEqual(ev["ev"], 100 * 0.6 - _R * 0.45)
         self.assertAlmostEqual(ev["p_detect_effective"], 0.45)
         self.assertAlmostEqual(ev["p_success_effective"], 0.6)
         self.assertAlmostEqual(ev["p_success_prior"], 0.5)
@@ -309,18 +380,20 @@ class TestOverrideIsLoud(unittest.IsolatedAsyncioTestCase):
 
     async def test_override_that_flips_a_refusal_is_flagged(self):
         conn, rid = _fresh_run()
-        c = _cls(points=50, p_success=0.5, p_detect=0.3)   # prior EV = -5
+        c = _cls(points=50, p_success=0.5, p_detect=0.8)
+        prior_ev = 50 * 0.5 - _R * 0.8      # below the line
         d = await _gate(conn, rid).request(c, p_success_override=0.99)
+        self.assertLess(prior_ev, 0)
         self.assertTrue(d.allowed)
         self.assertTrue(d.override_decisive)
-        self.assertAlmostEqual(d.ev, 50 * 0.7 - 100 * 0.3)   # +5
+        self.assertAlmostEqual(d.ev, 50 * 0.7 - _R * 0.8)
         self.assertIn("override", d.reason)
-        self.assertIn("-5.0", d.reason)
+        self.assertIn("%.1f" % prior_ev, d.reason)
 
     async def test_flag_is_persisted_with_the_row(self):
         conn, rid = _fresh_run()
         await _gate(conn, rid).request(
-            _cls(points=50, p_success=0.5, p_detect=0.3), p_success_override=0.99)
+            _cls(points=50, p_success=0.5, p_detect=0.8), p_success_override=0.99)
         self.assertTrue(json.loads(_rows(conn)[0]["ev_json"])["override_decisive"])
 
     async def test_override_that_changes_nothing_is_not_flagged(self):
@@ -333,7 +406,7 @@ class TestOverrideIsLoud(unittest.IsolatedAsyncioTestCase):
     async def test_override_that_still_leaves_a_refusal_is_not_flagged(self):
         conn, rid = _fresh_run()
         d = await _gate(conn, rid).request(
-            _cls(points=50, p_success=0.5, p_detect=0.7), p_success_override=0.99)
+            _cls(points=10, p_success=0.5, p_detect=0.7), p_success_override=0.99)
         self.assertFalse(d.allowed)
         self.assertFalse(d.override_decisive)
 
@@ -538,7 +611,7 @@ class TestSupervisedMode(unittest.IsolatedAsyncioTestCase):
         pending = await _wait_for_pending(g)
         g.answer(pending[0]["id"], True)
         d = await task
-        self.assertAlmostEqual(d.ev, 50 * 0.5 - 100 * 0.7)
+        self.assertAlmostEqual(d.ev, 50 * 0.5 - _R * 0.7)
 
     async def test_operator_may_approve_what_the_ev_would_refuse(self):
         conn, rid = _fresh_run()
@@ -663,7 +736,7 @@ class TestAnswerIsFinal(unittest.IsolatedAsyncioTestCase):
         # on a stale id must not overturn the arbiter.
         conn, rid = _fresh_run()
         g = _gate(conn, rid)
-        await g.request(_cls(points=50, p_success=0.5, p_detect=0.7))
+        await g.request(_cls(points=10, p_success=0.5, p_detect=0.7))
         approval_id = _rows(conn)[0]["id"]
         self.assertFalse(g.answer(approval_id, True))
         self.assertEqual(_rows(conn)[0]["decision"], "refused")
