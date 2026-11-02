@@ -116,9 +116,10 @@ class AnthropicClient(provider.HttpLlmClient):
             if block["type"] == "text":
                 text_parts.append(block["text"])
             elif block["type"] == "tool_use":
+                arguments = provider.parse_arguments(block.get("input"))
                 calls.append(ToolCall(
-                    str(block["id"]), str(block["name"]),
-                    provider.parse_arguments(block.get("input"))))
+                    str(block["id"]), str(block["name"]), arguments,
+                    arguments.get(provider.ARGUMENTS_ERROR_KEY)))
         usage = payload.get("usage") or {}
         # Cached-prompt tokens are reported separately by the API and are not
         # counted here; no request sets cache_control.

@@ -54,6 +54,13 @@ class ToolCall(NamedTuple):
     id: str
     name: str
     arguments: dict
+    # Set when the model's arguments could not be read. Two independent
+    # mechanisms guard this, because a convention a later caller has to
+    # remember is the kind that gets forgotten: the sentinel keys below make
+    # a `**arguments` dispatch raise, and this field makes the failure part
+    # of the type, so a dispatcher that passes the dict whole still has
+    # something to check that it cannot help seeing.
+    error: Optional[str] = None
 
 
 class Completion(NamedTuple):
@@ -140,7 +147,9 @@ def normalize_tool_call(entry: dict, index: int = 0) -> ToolCall:
     # A local server that omits the id would otherwise fail a response that
     # is fine apart from that; the loop only needs ids to be unique per turn.
     call_id = entry.get("id") or "call_%d" % index
-    return ToolCall(str(call_id), str(name), parse_arguments(raw))
+    arguments = parse_arguments(raw)
+    return ToolCall(str(call_id), str(name), arguments,
+                    arguments.get(ARGUMENTS_ERROR_KEY))
 
 
 # ── Transport ──
@@ -159,14 +168,24 @@ def http_post_json(url: str, headers: Dict[str, str], body: dict) -> dict:
     Every message raised here is built from the status code or the exception
     class alone. `requests` exceptions can carry the request URL, and error
     bodies can echo the Authorization header, so neither is ever formatted
-    into a message, and `from None` stops the original from riding along on
-    the traceback.
+    into a message.
+
+    The failure is also raised *outside* the except block. `from None` keeps
+    the original off every normal path — traceback, `format_exception` and
+    `logging(exc_info=True)` all honour `__suppress_context__` — but it does
+    not clear `__context__` on the object, and a `requests.RequestException`
+    holds a `.request` whose `.headers` contain the key. An error serialiser
+    that walks the chain by hand would reach it. Raising once the except
+    block has exited leaves `__context__` genuinely empty, which makes the
+    guarantee independent of how any future caller formats errors. This
+    project writes LLM interactions to SQLite, so that matters.
     """
     # Imported here, not at module level: importing requests is noisy on some
     # platforms (urllib3 warns about LibreSSL), and the agent package has to
     # import cleanly on a C2 that never talks to a model.
     import requests
 
+    failure = None
     try:
         # allow_redirects=False: a redirect would carry a custom auth header
         # such as x-api-key to whichever host answered. requests only strips
@@ -174,8 +193,9 @@ def http_post_json(url: str, headers: Dict[str, str], body: dict) -> dict:
         resp = requests.post(url, headers=headers, json=body,
                              timeout=_TIMEOUT_SECONDS, allow_redirects=False)
     except requests.RequestException as exc:
-        raise TransportError(
-            "request failed (%s)" % type(exc).__name__) from None
+        failure = "request failed (%s)" % type(exc).__name__
+    if failure is not None:
+        raise TransportError(failure)
     if resp.status_code != 200:
         raise TransportError("HTTP %d%s" % (
             resp.status_code, _STATUS_HINTS.get(resp.status_code, "")))
@@ -270,18 +290,26 @@ class HttpLlmClient(LlmClient):
         url, headers, body = self._build_request(
             system, messages, list(tools) if self.supports_tools else [],
             max_tokens, temperature)
+        # Each failure is captured and raised once the except block has
+        # exited, so the resulting ProviderError has no __context__ at all.
+        # See http_post_json's docstring: `from None` hides the original from
+        # every normal path but leaves it reachable on the object, and a
+        # transport exception can hold the request headers.
+        failure = None
         try:
             payload = await asyncio.to_thread(
                 self._transport, url, headers, body)
         except TransportError as exc:
-            raise self._fail(str(exc)) from None
+            failure = str(exc)
         except ProviderError:
             raise
         except Exception as exc:
             # Only the class: a message from an arbitrary transport, or from
             # the library under it, may hold the URL or the headers.
-            raise self._fail(
-                "request failed (%s)" % type(exc).__name__) from None
+            failure = "request failed (%s)" % type(exc).__name__
+        if failure is not None:
+            raise self._fail(failure)
+        bad_shape = False
         try:
             return self._parse_response(payload)
         except ProviderError:
@@ -289,8 +317,9 @@ class HttpLlmClient(LlmClient):
         except (KeyError, IndexError, TypeError, AttributeError, ValueError):
             # Not formatting the payload: it is the one thing here that a
             # hostile or buggy server controls.
-            raise self._fail(
-                "the response did not have the expected shape") from None
+            bad_shape = True
+        if bad_shape:
+            raise self._fail("the response did not have the expected shape")
 
 
 def usage_tokens(usage: Any, key: str) -> int:

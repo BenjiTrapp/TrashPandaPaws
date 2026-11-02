@@ -70,6 +70,26 @@ _TOOL = provider.ToolSpec(
 # ── Client selection ──
 
 
+def _walk_chain(exc) -> str:
+    """Everything a hand-written error serialiser could reach from `exc`.
+
+    Walks the exception chain and, at each link, the attributes that carry
+    request state. A crash reporter that does this is the one path `from
+    None` does not cover.
+    """
+    parts, seen, current = [], set(), exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(repr(current))
+        parts.append(repr(getattr(current, "__dict__", {})))
+        for attr in ("request", "response"):
+            held = getattr(current, attr, None)
+            parts.append(repr(held))
+            parts.append(repr(getattr(held, "headers", None)))
+        current = current.__context__ or current.__cause__
+    return " ".join(parts)
+
+
 class TestClientSelection(unittest.TestCase):
     def test_anthropic_provider(self):
         c = provider.create_client(_cfg(provider="anthropic", api_key="k",
@@ -169,6 +189,74 @@ class TestClientSelection(unittest.TestCase):
 
 
 # ── Capability tiers ──
+
+
+class TestABrokenToolCallCannotBeDispatchedByAccident(unittest.TestCase):
+    """A malformed `arguments` must be impossible to miss, not merely visible.
+
+    The next task writes the dispatcher. Returning `{}` would let a tool run
+    on its defaults with parameters the model never chose, and a convention
+    that the dispatcher "must remember to check a key" is the kind that gets
+    forgotten. So two independent mechanisms carry the failure: the sentinel
+    keys make a `**arguments` dispatch raise, and `ToolCall.error` puts it in
+    the type for a dispatcher that passes the dict whole.
+    """
+
+    def _broken(self, raw):
+        return provider.normalize_tool_call(
+            {"id": "c1", "function": {"name": "run_cmd", "arguments": raw}})
+
+    def test_the_error_is_a_field_not_only_a_key(self):
+        for raw in ("{not json", "[1, 2]", '"a string"', "17", 17, []):
+            call = self._broken(raw)
+            self.assertIsNotNone(call.error, repr(raw))
+            self.assertEqual(call.error,
+                             call.arguments[provider.ARGUMENTS_ERROR_KEY])
+
+    def test_a_kwargs_dispatch_raises(self):
+        def run_cmd(cmd):
+            return cmd
+        call = self._broken("{not json")
+        with self.assertRaises(TypeError):
+            run_cmd(**call.arguments)
+
+    def test_a_whole_dict_dispatch_has_the_field_to_check(self):
+        # The failure mode this guards: a tool that reads arguments.get(...)
+        # would otherwise run with None and never know why.
+        call = self._broken("{not json")
+        self.assertIsNone(call.arguments.get("cmd"))
+        self.assertTrue(call.error)
+
+    def test_a_good_call_carries_no_error(self):
+        call = provider.normalize_tool_call(
+            {"id": "c1", "function": {"name": "run_cmd",
+                                      "arguments": '{"cmd": "id"}'}})
+        self.assertIsNone(call.error)
+        self.assertEqual(call.arguments, {"cmd": "id"})
+
+    def test_an_empty_argument_list_is_not_an_error(self):
+        for raw in ("", "   ", "{}", None, {}):
+            call = self._broken(raw)
+            self.assertIsNone(call.error, repr(raw))
+            self.assertEqual(call.arguments, {})
+
+    def test_the_raw_text_is_bounded_and_kept(self):
+        call = self._broken("{" + "x" * 5000)
+        self.assertLessEqual(
+            len(call.arguments[provider.RAW_ARGUMENTS_KEY]), 200)
+        self.assertIn("x", call.arguments[provider.RAW_ARGUMENTS_KEY])
+
+    def test_the_anthropic_path_sets_the_field_too(self):
+        # Anthropic sends `input` as an object, so the failure shape differs:
+        # a non-object input is the case that reaches here.
+        client = provider.create_client(_cfg(
+            provider="anthropic", api_key="k", model="claude-sonnet-4"))
+        payload = {"content": [{"type": "tool_use", "id": "t1",
+                                "name": "run_cmd", "input": "not an object"}],
+                   "usage": {"input_tokens": 1, "output_tokens": 1},
+                   "stop_reason": "tool_use"}
+        completion = client._parse_response(payload)
+        self.assertIsNotNone(completion.tool_calls[0].error)
 
 
 class TestCapabilityTiers(unittest.TestCase):
@@ -693,10 +781,16 @@ class TestErrorsNameProviderAndModelNotTheKey(unittest.TestCase):
             self.assertIn("RuntimeError", str(err))  # the class, only
 
     def test_the_original_exception_is_not_chained(self):
+        # Asserting the property, not the mechanism. `from None` only sets
+        # __suppress_context__, which hides the original from every standard
+        # rendering while leaving it on the object — and a transport
+        # exception can hold the request headers. The failure is raised once
+        # the except block has exited, so there is no chain to suppress.
         for client in self._clients(RuntimeError(_KEY)):
             err = self._fail(client)
             self.assertIsNone(err.__cause__)
-            self.assertTrue(err.__suppress_context__)
+            self.assertIsNone(err.__context__)
+            self.assertNotIn(_KEY, _walk_chain(err))
 
     def test_key_is_absent_from_every_rendering_of_a_client(self):
         for client in (_anthropic(_Stub()), _openai(_Stub())):
@@ -761,7 +855,10 @@ class TestRealTransport(unittest.TestCase):
         self.assertNotIn(_KEY, str(cm.exception))
         self.assertNotIn("https://x", str(cm.exception))
         self.assertIsNone(cm.exception.__cause__)
-        self.assertTrue(cm.exception.__suppress_context__)
+        # The RequestException holds a .request whose .headers carry the key,
+        # so the chain has to be empty rather than merely hidden.
+        self.assertIsNone(cm.exception.__context__)
+        self.assertNotIn(_KEY, _walk_chain(cm.exception))
 
     def test_an_http_error_reports_the_status_not_the_body(self):
         # Servers do echo the Authorization header in error bodies.
