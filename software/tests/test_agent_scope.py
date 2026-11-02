@@ -424,6 +424,64 @@ class TestExemptionBoundaries(unittest.TestCase):
         self.assertFalse(reason.startswith(self.UNREADABLE), reason)
 
 
+class TestCleanupRefusals(unittest.TestCase):
+    """Refusals added when the scan was tightened: each pins one behaviour."""
+
+    def _refused(self, cmd):
+        reason = _scope().check(cmd, _none)
+        self.assertIsNotNone(reason, cmd)
+        return reason
+
+    def test_trailing_at_sign_is_refused_and_named(self):
+        self.assertIn("10.0.9.5@", self._refused("nmap 10.0.9.5@"))
+
+    def test_bare_number_as_a_target_is_an_address_not_a_port(self):
+        for cmd in ("nmap 22", "nmap 65535"):
+            self.assertEqual(scope.extract_targets(cmd)[1], [cmd.split()[1]], cmd)
+            self.assertIn("'%s'" % cmd.split()[1], self._refused(cmd))
+
+    def test_bare_number_after_a_flag_is_a_value(self):
+        for cmd in ("nmap -p 22 10.0.1.5", "nmap --max-rate 50 10.0.1.5"):
+            self.assertIsNone(_scope().check(cmd, _none), cmd)
+
+    def test_file_descriptor_glued_to_a_redirect_is_not_a_target(self):
+        for cmd in ("nmap 10.0.1.5 2>/tmp/err", "nmap 10.0.1.5 2>&1",
+                    "nmap 10.0.1.5 1>/tmp/out"):
+            self.assertIsNone(_scope().check(cmd, _none), cmd)
+
+    def test_bare_number_before_a_spaced_redirect_is_still_refused(self):
+        # With a space the shell passes 22 to nmap as an address.
+        for cmd in ("nmap 10.0.1.5 22 > /tmp/out", "nmap 10.0.1.5 2 >/tmp/out",
+                    "nmap 10.0.1.5 22>/tmp/out", "nmap 10.0.1.5 2>/tmp/err 22"):
+            self.assertIn("cannot verify", self._refused(cmd), cmd)
+
+    def test_catch_all_refusal_names_the_command(self):
+        def boom(host):
+            raise RuntimeError("resolver down")
+        reason = _scope().check("nmap dc01.corp", boom)
+        self.assertIn("RuntimeError", reason)
+        self.assertIn("nmap dc01.corp", reason)
+
+    def test_catch_all_refusal_clips_a_long_command(self):
+        def boom(host):
+            raise RuntimeError("resolver down")
+        reason = _scope().check("nmap dc01 " + "x" * 5000, boom)
+        self.assertIn("scope check failed", reason)
+        self.assertLess(len(reason), 300)
+
+    def test_zone_id_is_never_trimmed_to_a_bare_address(self):
+        with self.assertRaises(ValueError):
+            scope._parse_networks("fe80::1%eth0")
+        self.assertIn("fe80::1%eth0", self._refused("nmap fe80::1%eth0"))
+
+    def test_long_unresolvable_argument_is_clipped_in_the_reason(self):
+        arg = "10.0.9.5:" + "9" * 5000
+        reason = self._refused("nmap " + arg)
+        self.assertIn(arg[:40], reason)
+        self.assertNotIn(arg, reason)
+        self.assertLess(len(reason), 400)
+
+
 class TestScopeConstruction(unittest.TestCase):
     def test_malformed_allow_entry_raises(self):
         with self.assertRaises(ValueError):
