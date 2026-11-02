@@ -950,8 +950,15 @@ class TestTruncation(unittest.TestCase):
         self.assertIn("OUTPUT TRUNCATED", out)
 
     def test_truncation_counts_characters_not_bytes(self):
-        """Nicht-ASCII darf nicht mitten in ein Zeichen schneiden."""
-        src = "ü" * 3000
+        """Nicht-ASCII darf nicht mitten in ein Zeichen schneiden.
+
+        6000, nicht 3000: 3000 Zeichen liegen *unter* dem 4000er-Limit, also
+        wird gar nicht gekürzt und `assertTrue(trunc)` schlägt fehl. Die
+        naheliegende "Reparatur" wäre, in Bytes zu messen — `ü` sind zwei —
+        was die Zusicherung erfüllt, den Testnamen aber zur Lüge macht und
+        mitten in ein Zeichen schneidet. Zeichen slicen, nie `encode()`.
+        """
+        src = "ü" * 6000
         out, trunc = loop.truncate(src, 4000)
         self.assertTrue(trunc)
         self.assertEqual(out.count("ü"), 4000)
