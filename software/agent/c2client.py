@@ -36,6 +36,7 @@ Usage:
 """
 
 import asyncio
+import ipaddress
 import threading
 import warnings
 from typing import Any, Awaitable, Callable, List, Optional, Sequence
@@ -66,6 +67,15 @@ class BeaconGone(Exception):
 # ── Session ──
 
 _REQUEST_TIMEOUT_SECONDS = 30
+
+
+def _is_loopback(host: Optional[str]) -> bool:
+    if host in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        return ipaddress.ip_address(host or "").is_loopback
+    except ValueError:
+        return False
 
 # The C2 serves a self-signed certificate (spec §18), so verify=False is the
 # default and urllib3 warns on every request.
@@ -177,6 +187,17 @@ class C2Client:
         self._token = Secret(token)
         self._verify_tls = bool(verify_tls)
         self._session = session if session is not None else _RequestsSession()
+        if token and parts.scheme == "http" and not _is_loopback(parts.hostname):
+            # Warn rather than refuse. The LLM transport refuses this, but the
+            # C2 is the operator's own infrastructure and plain http over a
+            # container network is a normal deployment, so a refusal would
+            # block a legitimate setup. It is still worth saying: during an
+            # engagement the route to the C2 may cross the client's network,
+            # and a bearer token in cleartext there is a real exposure.
+            warnings.warn(
+                "the C2 token is sent over plain http to %s; use https, or "
+                "keep the route on loopback or a private container network"
+                % self._host, UserWarning, stacklevel=2)
 
     def __repr__(self) -> str:
         return "<C2Client host=%r>" % self._host

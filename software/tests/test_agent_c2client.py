@@ -70,7 +70,7 @@ class _ConnectError(Exception):
 
 
 def _client(fake, token="tok", **kw):
-    return c2client.C2Client("http://c2", token, session=fake, **kw)
+    return c2client.C2Client("http://127.0.0.1:8099", token, session=fake, **kw)
 
 
 def _walk_chain(exc) -> str:
@@ -102,7 +102,7 @@ class TestTasking(unittest.IsolatedAsyncioTestCase):
         await _client(fake).queue_task(
             "raccoon-fox", "shell", "id", data="d", timeout=60)
         self.assertEqual(fake.calls, [
-            ("POST", "http://c2/api/agents/raccoon-fox/task")])
+            ("POST", "http://127.0.0.1:8099/api/agents/raccoon-fox/task")])
         self.assertEqual(fake.last_json, {
             "cmd": "shell", "args": "id", "data": "d", "timeout": 60,
             "lane": "agent"})
@@ -130,7 +130,7 @@ class TestTasking(unittest.IsolatedAsyncioTestCase):
         fake = FakeC2(get_response=[{"id": "a"}, {"id": "b"}])
         self.assertEqual(await _client(fake).list_agents(),
                          [{"id": "a"}, {"id": "b"}])
-        self.assertEqual(fake.calls, [("GET", "http://c2/api/agents")])
+        self.assertEqual(fake.calls, [("GET", "http://127.0.0.1:8099/api/agents")])
 
     async def test_list_agents_rejects_an_answer_that_is_not_a_list(self):
         with self.assertRaises(c2client.C2Unavailable):
@@ -140,7 +140,7 @@ class TestTasking(unittest.IsolatedAsyncioTestCase):
         fake = FakeC2(get_response={"id": "raccoon-fox", "interval": 30})
         agent = await _client(fake).get_agent("raccoon-fox")
         self.assertEqual(agent["interval"], 30)
-        self.assertEqual(fake.last_url, "http://c2/api/agents/raccoon-fox")
+        self.assertEqual(fake.last_url, "http://127.0.0.1:8099/api/agents/raccoon-fox")
 
     async def test_unknown_agent_returns_none(self):
         self.assertIsNone(await _client(FakeC2(status=404)).get_agent("nope"))
@@ -151,7 +151,7 @@ class TestTasking(unittest.IsolatedAsyncioTestCase):
         fake = FakeC2(get_response={})
         await _client(fake).get_agent("../server/exec")
         self.assertEqual(fake.last_url,
-                         "http://c2/api/agents/..%2Fserver%2Fexec")
+                         "http://127.0.0.1:8099/api/agents/..%2Fserver%2Fexec")
 
     async def test_dot_segments_and_empty_ids_are_refused_before_any_request(self):
         fake = FakeC2()
@@ -167,7 +167,7 @@ class TestTasking(unittest.IsolatedAsyncioTestCase):
         fake = FakeC2()
         await _client(fake).set_beacon_interval("raccoon-fox", 30, 20)
         self.assertEqual(fake.calls, [
-            ("POST", "http://c2/api/agents/raccoon-fox/task")])
+            ("POST", "http://127.0.0.1:8099/api/agents/raccoon-fox/task")])
         self.assertEqual(fake.last_json["cmd"], "sleep")
         self.assertEqual(fake.last_json["args"], "30 20")
 
@@ -190,7 +190,7 @@ class TestResults(unittest.IsolatedAsyncioTestCase):
     async def test_pending_result_is_none(self):
         fake = FakeC2(get_response={"status": "pending"})
         self.assertIsNone(await _client(fake).get_task_result("ab12cd34"))
-        self.assertEqual(fake.last_url, "http://c2/api/tasks/ab12cd34")
+        self.assertEqual(fake.last_url, "http://127.0.0.1:8099/api/tasks/ab12cd34")
 
     async def test_a_finished_result_carries_success(self):
         ok = FakeC2(get_response={"status": "ok", "output": "root"})
@@ -315,7 +315,7 @@ class TestServerTools(unittest.IsolatedAsyncioTestCase):
             ["nmap", "-sV", "10.0.1.5"], tool="nmap", timeout=900)
         self.assertEqual(fake.last_json["argv"], ["nmap", "-sV", "10.0.1.5"])
         self.assertNotIn("cmd", fake.last_json)
-        self.assertEqual(fake.calls, [("POST", "http://c2/api/server/exec")])
+        self.assertEqual(fake.calls, [("POST", "http://127.0.0.1:8099/api/server/exec")])
 
     async def test_exec_marks_the_run_as_agent_origin(self):
         """Sonst landet Agent-Ausgabe im Operator-Panel."""
@@ -364,7 +364,7 @@ class TestServerTools(unittest.IsolatedAsyncioTestCase):
     async def test_running_result_is_none(self):
         fake = FakeC2(get_response={"status": "running", "output": ""})
         self.assertIsNone(await _client(fake).get_server_tool_result("r1"))
-        self.assertEqual(fake.last_url, "http://c2/api/server/exec/result/r1")
+        self.assertEqual(fake.last_url, "http://127.0.0.1:8099/api/server/exec/result/r1")
 
     async def test_finished_result_is_returned_with_success(self):
         fake = FakeC2(get_response={"status": "ok", "output": "Nmap done"})
@@ -410,7 +410,7 @@ class TestFailureModes(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(c2client.C2Unavailable) as cm:
             await _client(FakeC2(status=500)).list_agents()
         self.assertIn("500", str(cm.exception))
-        self.assertIn("c2", str(cm.exception))
+        self.assertIn("127.0.0.1:8099", str(cm.exception))
 
     async def test_a_redirect_is_an_error_not_followed(self):
         fake = FakeC2(status=302)
@@ -462,7 +462,7 @@ class TestTokenIsNeverExposed(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(_TOKEN, text)
 
     def test_repr_names_the_host(self):
-        self.assertIn("c2", repr(_client(FakeC2())))
+        self.assertIn("127.0.0.1:8099", repr(_client(FakeC2())))
 
     def test_the_repr_names_host_and_port_only(self):
         c = c2client.C2Client("https://c2.example:8443/", "t", session=FakeC2())
@@ -496,7 +496,7 @@ class TestTokenIsNeverExposed(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(c2client.C2Unauthorized) as cm:
             await c.list_agents()
         self.assertIn("401", str(cm.exception))
-        self.assertIn("c2", str(cm.exception))
+        self.assertIn("127.0.0.1:8099", str(cm.exception))
         self.assertNotIn(_TOKEN, str(cm.exception))
         self.assertNotIn("echoes", str(cm.exception))
         self.assertIsNone(cm.exception.__context__)
@@ -514,6 +514,51 @@ class TestTokenIsNeverExposed(unittest.IsolatedAsyncioTestCase):
 
 
 # ── The real session ──
+
+
+
+class TestCleartextTokenWarning(unittest.TestCase):
+    """A bearer token on plain http to a remote host is worth saying out loud.
+
+    A warning rather than a refusal: the LLM transport refuses this, but the
+    C2 is the operator's own infrastructure and plain http across a container
+    network is a normal deployment, so refusing would block a legitimate
+    setup. It is still a real exposure — during an engagement the route to
+    the C2 may cross the client's network.
+    """
+
+    class _Fake:
+        def request(self, *a, **kw):
+            raise AssertionError("construction must not make a request")
+
+    def _warnings(self, url, token="ZZ-distinctive-token-9x"):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            c2client.C2Client(url, token, session=self._Fake())
+        return [str(w.message) for w in caught
+                if issubclass(w.category, UserWarning)]
+
+    def test_remote_host_over_plain_http_warns(self):
+        for url in ("http://c2", "http://10.0.1.5:8080", "http://c2.corp:8080"):
+            self.assertEqual(len(self._warnings(url)), 1, url)
+
+    def test_the_warning_names_the_host_but_not_the_token(self):
+        token = "ZZ-distinctive-token-9x"
+        message = self._warnings("http://10.0.1.5:8080", token)[0]
+        self.assertIn("10.0.1.5:8080", message)
+        self.assertNotIn(token, message)
+
+    def test_https_is_quiet(self):
+        self.assertEqual(self._warnings("https://c2"), [])
+
+    def test_loopback_over_plain_http_is_quiet(self):
+        # The documented deployment: the agent and the C2 on one host.
+        for url in ("http://127.0.0.1:8080", "http://localhost:8080",
+                    "http://[::1]:8080"):
+            self.assertEqual(self._warnings(url), [], url)
+
+    def test_no_token_is_quiet(self):
+        self.assertEqual(self._warnings("http://c2", ""), [])
 
 
 class TestRealSession(unittest.IsolatedAsyncioTestCase):
@@ -547,13 +592,19 @@ class TestRealSession(unittest.IsolatedAsyncioTestCase):
     async def _list(self, request, **kw):
         fake = self._fake_requests(request)
         with unittest.mock.patch.dict(sys.modules, {"requests": fake}):
-            return await c2client.C2Client("http://c2", "tok", **kw).list_agents()
+            # Construction warns about the token on plain http. That is a
+            # different subject from what this class measures, so it is
+            # silenced here and asserted in TestCleartextTokenWarning.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                client = c2client.C2Client("http://127.0.0.1:8099", "tok", **kw)
+            return await client.list_agents()
 
     async def test_the_request_goes_through_requests_request(self):
         request = unittest.mock.Mock(return_value=self._answer())
         self.assertEqual(await self._list(request), [])
         args, kwargs = request.call_args
-        self.assertEqual(args, ("GET", "http://c2/api/agents"))
+        self.assertEqual(args, ("GET", "http://127.0.0.1:8099/api/agents"))
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer tok")
         self.assertIs(kwargs["verify"], False)
         self.assertIs(kwargs["allow_redirects"], False)
@@ -582,7 +633,7 @@ class TestRealSession(unittest.IsolatedAsyncioTestCase):
             return self._answer()
         fake = self._fake_requests(request)
         with unittest.mock.patch.dict(sys.modules, {"requests": fake}):
-            c = c2client.C2Client("http://c2", "tok")
+            c = c2client.C2Client("http://127.0.0.1:8099", "tok")
             await c.list_agents()
             after_first = len(warnings.filters)
             for _ in range(20):
@@ -617,7 +668,7 @@ class TestRealSession(unittest.IsolatedAsyncioTestCase):
             return self._answer()
         fake = self._fake_requests(request)
         with unittest.mock.patch.dict(sys.modules, {"requests": fake}):
-            c = c2client.C2Client("http://c2", "tok")
+            c = c2client.C2Client("http://127.0.0.1:8099", "tok")
             started = time.monotonic()
             await asyncio.gather(*[c.list_agents() for _ in range(16)])
             elapsed = time.monotonic() - started
@@ -630,7 +681,7 @@ class TestRealSession(unittest.IsolatedAsyncioTestCase):
             return self._answer()
         fake = self._fake_requests(request)
         with unittest.mock.patch.dict(sys.modules, {"requests": fake}):
-            c = c2client.C2Client("http://c2", "tok")
+            c = c2client.C2Client("http://127.0.0.1:8099", "tok")
             await asyncio.gather(*[c.list_agents() for _ in range(16)])
             installed = len(warnings.filters)
             await asyncio.gather(*[c.list_agents() for _ in range(16)])
