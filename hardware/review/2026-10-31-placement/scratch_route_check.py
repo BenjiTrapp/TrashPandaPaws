@@ -21,18 +21,18 @@ Geometry: USB3 and USB 2.0 0.20 mm wide at a 0.375 mm pitch (gap 0.175), MDI
 note allows 1.0) from the centre of every U3 pad.
 
 Runs, each on a fresh copy:
-  base     SuperSpeed + USB 2.0 + the MDI0 / MDI1 pairs round the south end of
-           J2's pin field (ruling AM), with the netlist as it is.
-  X        base + the MDI2 / MDI3 pairs from the west, with the J2 pin nets of
-           MDI2 and MDI3 exchanged and their polarity turned (ruling AJ,
-           revised: both legal). Zero vias.
-  Y        the MDI0, MDI1 and MDI2 pairs round the south end, MDI3 from the
-           west with its polarity turned on J2. Zero vias.
-The exchanged nets are applied to the scratch copy only; netlist.yaml and the
-board are unchanged.
+  board    the board as committed: SuperSpeed + USB 2.0, the MDI0 / MDI1 pairs
+           round the south end of J2's pin field (ruling AM), the MDI2 / MDI3
+           pairs from the west. J2's pins 7 to 10 carry MDI3_N, MDI3_P,
+           MDI2_N, MDI2_P (ruling AQ, variant X: the two pairs exchanged and
+           turned, inside cable pairs C/D), so nothing crosses and there are no
+           vias in the MDI pairs.
   rule     the escapes of every U3 signal pad, with and without the
            "track to U3 pad on fine-pitch parts" rule, and three controls that
            must still be reported.
+It also prints the MDI net -> J2 pin -> RJ45 pin -> cable pair table of the
+board and fails if an MDI net leaves its group of cable pairs (MDI0 and MDI1
+on A/B, MDI2 and MDI3 on C/D).
 Exit status 0 when every run and control behaves as stated.
 """
 
@@ -172,7 +172,7 @@ def left_offset(points, d):
     return out
 
 
-# ---- the order of the MDI pairs ---------------------------------------------
+# ---- the order of the MDI pairs, and the cable pair each one reaches --------
 
 def crossing(a, b, c, d):
     def o(p, q, r):
@@ -180,15 +180,28 @@ def crossing(a, b, c, d):
     return o(a, b, c) * o(a, b, d) < 0 and o(c, d, a) * o(c, d, b) < 0
 
 
+CABLE_PAIRS = {"A": (1, 2), "B": (3, 6), "C": (4, 5), "D": (7, 8)}
+GROUPS = {"MDI0": "AB", "MDI1": "AB", "MDI2": "CD", "MDI3": "CD"}
+
+
 def mdi_order(s):
-    """Straight lines from U3's eight MDI signal pads to J2 pins: as netlist.yaml
-    has it, as placed; with J2 mirrored to the bottom side; and the best any
-    legal re-assignment can do on one layer (ruling AJ, revised: MDI0 with MDI1
-    and MDI2 with MDI3 may exchange, and P/N polarity may turn, nothing else)."""
+    """Straight lines from U3's eight MDI signal pads to J2 pins: (a) with the
+    original netlist (U3 pin n to J2 pin n), (b) as the board now has it,
+    (c) the best any legal re-assignment can do (ruling AJ, revised: MDI0 with
+    MDI1 and MDI2 with MDI3 may exchange, P/N polarity may turn, nothing else),
+    (d) with J2 on the bottom side. Also the cable-pair table of the board."""
+    import yaml
+    netlist = yaml.safe_load((KICAD.parent / "netlist.yaml").read_text())
+    note = {str(p): (i or {}).get("note", "") for p, i in
+            netlist["components"]["J2"]["pins"].items()}
+    rj45 = {p: int(re.search(r"cable J(\d)", n).group(1))
+            for p, n in note.items() if "cable J" in n}
+    pair_of = {pin: k for k, v in CABLE_PAIRS.items() for pin in v}
+
     u3 = {n: s.P("U3", n) for n in map(str, (1, 2, 4, 5, 6, 7, 9, 10))}
     j2 = s.board.FindFootprintByReference("J2")
 
-    def pins():
+    def j2_pads():
         return {p.GetNumber(): (pcbnew.ToMM(p.GetPosition().x) - ORIGIN[0],
                                 pcbnew.ToMM(p.GetPosition().y) - ORIGIN[1])
                 for p in j2.Pads()}
@@ -197,10 +210,22 @@ def mdi_order(s):
         lines = [(u3[a], pin_pos[b]) for a, b in pairs_map]
         return sum(crossing(*x, *y) for x, y in itertools.combinations(lines, 2))
 
-    natural = [(str(n), str(n)) for n in (1, 2, 4, 5, 6, 7, 9, 10)]
-    pin_pos = pins()
-    placed = count(natural, pin_pos)
-    # legal maps: U3 pair -> J2 cable pair, pairs given as (P pin, N pin)
+    pins = j2_pads()
+    original = count([(str(n), str(n)) for n in (1, 2, 4, 5, 6, 7, 9, 10)], pins)
+    # the board as it is: the J2 pin of each net
+    by_net = {}
+    for fp in s.board.GetFootprints():
+        for pad in fp.Pads():
+            if re.fullmatch(r"MDI[0-3]_[PN]", pad.GetNetname()):
+                by_net.setdefault(pad.GetNetname(), {})[fp.GetReference()] = pad.GetNumber()
+    built = count([(v["U3"], v["J2"]) for v in by_net.values()], pins)
+    table, bad = [], []
+    for net in sorted(by_net):
+        pin = by_net[net]["J2"]
+        cable = pair_of.get(rj45[pin])
+        table.append(f"{net} -> J2.{pin} -> RJ45 {rj45[pin]} -> pair {cable}")
+        if cable not in GROUPS[net[:4]]:
+            bad.append(net)
     u3_pairs = {0: ("1", "2"), 1: ("4", "5"), 2: ("6", "7"), 3: ("9", "10")}
     j2_pairs = {"A": ("1", "2"), "B": ("3", "4"), "C": ("7", "8"), "D": ("9", "10")}
     best = None
@@ -214,12 +239,12 @@ def mdi_order(s):
                 if flips[k]:
                     ju = ju[::-1]
                 m += [(u3_pairs[k][0], ju[0]), (u3_pairs[k][1], ju[1])]
-            c = count(m, pin_pos)
+            c = count(m, pins)
             best = c if best is None else min(best, c)
     j2.Flip(j2.GetPosition(), pcbnew.FLIP_DIRECTION_LEFT_RIGHT)
     j2.SetOrientationDegrees(270)
-    mirrored = count(natural, pins())
-    return placed, best, mirrored
+    mirrored = count([(str(n), str(n)) for n in (1, 2, 4, 5, 6, 7, 9, 10)], j2_pads())
+    return original, built, best, mirrored, table, bad
 
 
 # ---- SuperSpeed and USB 2.0 -------------------------------------------------
@@ -309,47 +334,26 @@ def wrap(s, nets, pads, centre, lane_x, pin_n, pin_p):
     s.trace(net_p, [(pad_p[0] + NECK_LEN, pad_p[1])] + cut(right, pin_p[1]) + [pin_p], MW)
 
 
-def lay_mdi(s, variant):
+def lay_mdi(s):
     u = {n: s.P("U3", n) for n in ("1", "2", "4", "5", "6", "7", "9", "10")}
     j = {str(n): s.P("J2", str(n)) for n in range(1, 11)}
     x0 = u["5"][0] + NECK_LEN
-    if variant == "Y":
-        # MDI3 polarity turned on J2
-        s.set_net("J2", "9", "MDI3_N")
-        s.set_net("J2", "10", "MDI3_P")
-        wrap(s, ("MDI2_N", "MDI2_P"), (u["7"], u["6"]),
-             [(x0, 22.6), (31.3, 22.6), (33.65, 24.95), (40.35, 24.95), (42.4, 22.9)],
-             42.4, j["8"], j["7"])
-        wrap(s, ("MDI1_N", "MDI1_P"), (u["5"], u["4"]),
-             [(x0, 23.4), (30.95, 23.4), (33.7, 26.15), (40.25, 26.15), (43.7, 22.7)],
-             43.7, j["4"], j["3"])
-        wrap(s, ("MDI0_N", "MDI0_P"), (u["2"], u["1"]),
-             [(x0, 24.6), (31.0, 24.6), (33.75, 27.35), (40.15, 27.35), (45.0, 22.5)],
-             45.0, j["2"], j["1"])
-        x0d = u["10"][0] + NECK_LEN
-        s.trace("MDI3_N", [u["10"], (x0d, 21.2)], NECK)
-        s.trace("MDI3_P", [u["9"], (x0d, 21.6)], NECK)
-        s.trace("MDI3_N", [(x0d, 21.2), (36.0, 21.2), (37.0, 22.2), (37.245, 22.445), j["9"]], MW)
-        s.trace("MDI3_P", [(x0d, 21.6), (34.0, 21.6), (36.115, 23.715), j["10"]], MW)
-        return
+    # MDI1 and MDI0 round the south end, the inner pair first
     wrap(s, ("MDI1_N", "MDI1_P"), (u["5"], u["4"]),
          [(x0, 23.4), (33.0, 23.4), (34.6, 25.0), (40.2, 25.0), (42.7, 22.5)],
          42.7, j["4"], j["3"])
     wrap(s, ("MDI0_N", "MDI0_P"), (u["2"], u["1"]),
          [(x0, 24.6), (31.0, 24.6), (32.6, 26.2), (41.3, 26.2), (44.0, 23.5)],
          44.0, j["2"], j["1"])
-    if variant == "X":
-        # MDI2 and MDI3 exchanged on J2, both turned: pin 7 MDI3_N, 8 MDI3_P,
-        # 9 MDI2_N, 10 MDI2_P
-        for pin, net in (("7", "MDI3_N"), ("8", "MDI3_P"), ("9", "MDI2_N"), ("10", "MDI2_P")):
-            s.set_net("J2", pin, net)
-        x0d = u["10"][0] + NECK_LEN
-        for net, pin in (("MDI3_N", "10"), ("MDI3_P", "9"), ("MDI2_N", "7"), ("MDI2_P", "6")):
-            s.trace(net, [u[pin], (x0d, u[pin][1])], NECK)
-        s.trace("MDI3_N", [(x0d, 21.2), (35.5, 21.2), (36.8, 19.905), j["7"]], MW)
-        s.trace("MDI3_P", [(x0d, 21.6), (36.6, 21.6), (37.0, 21.175), j["8"]], MW)
-        s.trace("MDI2_N", [(x0d, 22.4), (36.5, 22.4), (36.6, 22.445), j["9"]], MW)
-        s.trace("MDI2_P", [(x0d, 22.8), (34.0, 22.8), (34.915, 23.715), j["10"]], MW)
+    # MDI3 (north at U3) to J2 pins 7 (N) and 8 (P), MDI2 to pins 9 (N) and 10
+    # (P), straight from the west: the nets are where the netlist puts them
+    x0d = u["10"][0] + NECK_LEN
+    for net, pin in (("MDI3_N", "10"), ("MDI3_P", "9"), ("MDI2_N", "7"), ("MDI2_P", "6")):
+        s.trace(net, [u[pin], (x0d, u[pin][1])], NECK)
+    s.trace("MDI3_N", [(x0d, 21.2), (35.5, 21.2), (36.8, 19.905), j["7"]], MW)
+    s.trace("MDI3_P", [(x0d, 21.6), (36.6, 21.6), (37.0, 21.175), j["8"]], MW)
+    s.trace("MDI2_N", [(x0d, 22.4), (36.5, 22.4), (36.6, 22.445), j["9"]], MW)
+    s.trace("MDI2_P", [(x0d, 22.8), (34.0, 22.8), (34.915, 23.715), j["10"]], MW)
 
 
 def lay_escapes(s):
@@ -376,32 +380,32 @@ def run(label, work, drop_rule=False, board=None):
 def main():
     status = 0
     with tempfile.TemporaryDirectory() as tmp:
-        placed, legal, mirrored = mdi_order(Scratch(tmp))
-    print(f"MDI order, straight lines U3 pad -> J2 pin (28 pin pairs): as placed {placed}; "
-          f"best legal re-assignment on one layer {legal}; J2 mirrored to the bottom {mirrored}")
+        original, built, best, mirrored, table, bad = mdi_order(Scratch(tmp))
+    print("MDI order, straight lines U3 pad -> J2 pin (28 pin pairs): original netlist "
+          f"{original}; board now {built}; best legal re-assignment {best}; "
+          f"J2 mirrored to the bottom {mirrored}")
+    print("MDI nets on J2:")
+    for line in table:
+        print("  ", line)
+    print("every MDI net stays inside its group of cable pairs (MDI0/1 on A/B, "
+          f"MDI2/3 on C/D): {'yes' if not bad else 'NO: ' + str(bad)}")
+    status |= 1 if bad else 0
 
-    def usb_and(variant):
-        def work(s):
-            info = lay_usb(s)
-            lay_mdi(s, variant)
-            return info
-        return work
+    def work(s):
+        info = lay_usb(s)
+        lay_mdi(s)
+        return info
 
-    for variant, text in (("", "base: SuperSpeed + USB 2.0 + MDI0/MDI1 round the south end"),
-                          ("X", "X: base + MDI2/MDI3 exchanged and turned on J2, from the west"),
-                          ("Y", "Y: MDI0, MDI1, MDI2 round the south end, MDI3 turned")):
-        errors, unconnected, info = run(variant, usb_and(variant))
-        if variant == "Y":
-            pass
-        left = sorted({i["description"].split("[")[1].split("]")[0]
-                       for u in unconnected for i in u["items"] if "[" in i["description"]
-                       and i["description"].split("[")[1].split("]")[0].startswith(("USB", "MDI"))
-                       and variant != ""})
-        print(f"{text}: {len(errors)} violation(s)"
-              + (f"; nets still unconnected: {left}" if left else ""))
-        for v in errors:
-            print("  ", describe(v))
-        status |= 1 if errors else 0
+    errors, unconnected, info = run("board", work)
+    left = sorted({i["description"].split("[")[1].split("]")[0]
+                   for u in unconnected for i in u["items"] if "[" in i["description"]
+                   and i["description"].split("[")[1].split("]")[0].startswith(("USB", "MDI"))
+                   and not i["description"].split("[")[1].split("]")[0] == "MDI_CT"})
+    print(f"board as committed, SuperSpeed + USB 2.0 + all four MDI pairs: "
+          f"{len(errors)} violation(s); signal nets still unconnected: {left or 'none'}")
+    for v in errors:
+        print("  ", describe(v))
+    status |= 1 if errors or left else 0
 
     for drop in (True, False):
         errors, _, _ = run("rule", lay_escapes, drop_rule=drop)

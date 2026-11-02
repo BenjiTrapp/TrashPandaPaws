@@ -1,4 +1,4 @@
-# raccoon-tap — placement baseline (task 8, round 2, 2026-11-02)
+# raccoon-tap — placement baseline (task 8, round 3, 2026-11-02)
 
 The board after `tools/gen_pcb.py` was last run on it: U3 turned, every part
 from tasks 5 to 7 placed, mounting added, the power plane split. Task 9 routes
@@ -6,19 +6,19 @@ this board and freezes the geometry; nothing here is routed. Later review runs
 compare against this directory. `../2026-10-31-baseline/` describes a board that
 no longer exists (33 footprints, U3 at 0 degrees, none of tasks 5 to 7).
 
-This replaces the first-round baseline (58 -> 70 mm board, slots, C21 on the
-bottom, 3.33 mm and all). What round 2 changed is in "Round 2" at the end.
+This replaces the earlier baselines of this task. What rounds 2 and 3 changed is
+in "Rounds 2 and 3" at the end.
 
 Measured design state (SHA-256 of the analysed files):
 
 | File | SHA-256 |
 |---|---|
-| `hardware/kicad/raccoon-tap.kicad_sch` | `d1bfd3ce4d9a49d1bad106be4983fa513651d9c52070a235f994bc6900d93151` |
-| `hardware/kicad/raccoon-tap.kicad_pcb` | `d0d7dea15b8fea4d5a74c3829d954be61f2fca984d964c41e62fc95be05e12d2` |
+| `hardware/kicad/raccoon-tap.kicad_sch` | `344164db00edf4910d6972afe34defc89f81067478801e28a34b6adfbe9f0720` |
+| `hardware/kicad/raccoon-tap.kicad_pcb` | `e069ec37855ef34e7bc33985ca5f9187cf6d910df11b600575233fe471f77c0f` |
 
 ![top side](placement-top.png)
 
-`placement-bottom.png` is the bottom side: nothing on it now.
+The bottom side carries no parts, so there is no bottom picture.
 
 ## Measured state
 
@@ -47,7 +47,8 @@ lesson):
 | round 1: first full placement | 3 | 53 | |
 | round 1, final | 0 | 47 | 170 |
 | round 2: 58 mm board, holes at 54.5, slots dropped, C21 on top | 0 | 46 | 166 |
-| round 2, final: C25/R13 and U8 moved, U9 declared as a flow-through, the new U3 rule | **0** | **46** | **164** |
+| round 2, final: C25/R13 and U8 moved, U9 declared as a flow-through, the new U3 rule | 0 | 46 | 164 |
+| round 3: J2 pins 7 to 10 re-netted (ruling AQ), board and schematic regenerated | **0** | **46** | **164** |
 
 EMC score: 50.5 from 76.0 because the new parts are unrouted and read as ICs
 by the analyzer, not because placement got worse. Four errors: `DC-001` on U8
@@ -69,67 +70,86 @@ crystal pins 35/36 on the bottom. The MDI pairs no longer wrap round the package
 or cross the SuperSpeed fan-out. Y1, C19, C20, R14 and the decoupling ring moved
 with it.
 
-## The MDI pair order (rulings AJ-revised and AM)
+## The MDI pair order (rulings AJ-revised, AM and AQ)
 
 **The problem.** U3's pins and J2's pins both run counter-clockwise round their
 package, so two parts that face each other present the pairs in opposite order:
 U3's east edge reads MDI3, MDI2, MDI1, MDI0 from north to south, J2's pin row
-MDI0 to MDI3. Every rotation of both parts reverses it. `scratch_route_check.py`
-counts crossings of straight lines from U3's eight MDI signal pads to J2's pins:
+MDI0 to MDI3. Every rotation of both parts reverses it. J2's pins are
+through-hole, so a track reaches them from either face, and that is what the
+route below uses.
 
-```
-as the netlist has it, as placed:                  27 of 28 pin pairs cross
-best legal re-assignment, straight lines:          16
-J2 on the bottom side (not chosen):                 0
-```
+**Which re-assignments are legal** (ruling AJ, revised; [RTL-DS] Table 4,
+section 5.4): MDI0 is BI_DA and MDI1 is BI_DB, the 10/100 pairs, so they must
+stay on cable pairs A and B (auto-negotiation and every 10/100 frame run on
+them). MDI2 is BI_DC and MDI3 is BI_DD, and in crossover mode the PHY exchanges
+them with each other. Legal: exchange MDI0 with MDI1, exchange MDI2 with MDI3,
+turn the polarity of any pair; nothing across the A/B - C/D boundary.
 
-Which re-assignments are legal (ruling AJ, revised, from [RTL-DS] Table 4
-section 5.4): MDI0 and MDI1 are the 10/100 pair (BI_DA, BI_DB), so MDI0 with
-MDI1 may exchange, MDI2 with MDI3 may exchange, and the polarity of any pair may
-turn. The two groups cannot trade places. The first round's claim that a single
-layer cannot do this was wrong: the pins of J2 are through-hole and reachable
-from either face, and the pairs can go round the end of the pin field.
+**What the netlist now says (ruling AQ, variant X).** MDI2 and MDI3 are
+exchanged on J2 and both turned. Cable pair identity comes from J2's pin notes
+in `netlist.yaml` (`pair n -> cable J<k>`, k the RJ45 pin, [LPJG] sheet 1/2);
+cable pairs are the 1000BASE-T ones: A = RJ45 1/2, B = 3/6, C = 4/5, D = 7/8.
 
-**The route (ruling AM), shown to fit.** MDI0 and MDI1, the southern pair at U3,
-go east, pass under J2's pin 10, through the gap between pin 9 and the shield
-pad SH1, up the channel between J2's pin columns and its T-posts, and into pins
-1 to 4 from the east; the north-going lane is the outer one, so the pairs peel
-off in order and nothing crosses. Pins on the west column are reached between
-two east-column pins. Dimensions (`J2` at rotation 90, origin 47.3 / 18.0):
+| J2 pin | RJ45 pin | Cable pair | Before | After |
+|---|---|---|---|---|
+| 1 | 1 | A | MDI0_P | MDI0_P |
+| 2 | 2 | A | MDI0_N | MDI0_N |
+| 3 | 3 | B | MDI1_P | MDI1_P |
+| 4 | 6 | B | MDI1_N | MDI1_N |
+| 7 | 4 | C | MDI2_P | **MDI3_N** |
+| 8 | 5 | C | MDI2_N | **MDI3_P** |
+| 9 | 7 | D | MDI3_P | **MDI2_N** |
+| 10 | 8 | D | MDI3_N | **MDI2_P** |
+
+**Why it stays inside C/D.** Five independent pieces of evidence:
+
+1. Pins 1 to 4 are not touched; only pins 7 to 10 change, and pins 7 to 10 reach
+   RJ45 pins 4, 5, 7 and 8, which are cable pairs C and D.
+2. After the change pins 7 to 10 still carry exactly MDI2 and MDI3 (two nets of
+   each), and pins 1 to 4 exactly MDI0 and MDI1. No MDI net moved group.
+3. Each MDI pair is whole on one cable pair (MDI3 on C, MDI2 on D) and the four
+   pairs use A, B, C and D once each.
+4. `mdi_group_problems` in `hardware/tests/check_fab_release.py` computes this
+   from the netlist (its pin-to-RJ45 table is read from the J2 pin notes) on every
+   run, and has mutation tests: moving one net, or one whole pair, across the
+   boundary is reported; a pair split over two cable pairs is reported; the legal
+   exchanges and polarity changes pass.
+5. `scratch_route_check.py` prints the table above from the board's own pad nets
+   and fails if an MDI net is outside its group.
+
+The datasheet does not say whether the PHY detects the C/D exchange independently
+of A/B. A first-build check is recorded in `netlist.yaml`
+`design_notes.mdi_pair_mapping`: link at 1000 Mb/s with a straight cable and with
+a crossover cable.
+
+**The route (ruling AM), shown to fit with the nets as committed.** MDI0 and
+MDI1 go east, pass under J2's pin 10, through the gap between pin 9 and the
+shield pad SH1, up the channel between the pin columns and the T-posts, and into
+pins 1 to 4 from the east; the north-going lane is the outer one, so the pairs
+peel off in order. West-column pins are reached between two east-column pins.
+MDI3 and MDI2 come from the west, MDI3 to pins 7/8 and MDI2 to pins 9/10, and no
+longer cross. Dimensions (J2 at rotation 90, origin 47.3 / 18.0):
 
 | | |
 |---|---|
-| gap between pin 9's pad and SH1 | 2.71 mm (two pairs need 2.14, three 2.5) |
+| gap between pin 9's pad and SH1 | 2.71 mm (the two lanes need 2.14) |
 | channel, pin column to T-post | 3.97 mm |
 | strip south of pin 10 | y 24.7 to 27.5 mm, free of parts |
-| `C25` / `R13` | moved to y 29.9 mm to keep that strip free |
+| `C25` / `R13` | at y 29.9 mm to keep that strip free |
 
-`scratch_route_check.py` lays it on a copy of the board and runs the DRC with
-the project's rules. The run is clean (0 violations, 0 vias) in the three cases
-below. In the first the netlist is as it is; the others change nets on the
-scratch copy only (`netlist.yaml` is unchanged):
+`scratch_route_check.py` lays SuperSpeed, USB 2.0 and all four MDI pairs on a
+copy of the board and runs the DRC with the project's rules: 0 violations, no
+signal net left unconnected, 0 vias in the MDI pairs, 0.63 mm between the two
+wrapped pairs. Straight ratsnest lines are only an indicator (27 crossings with
+the original netlist, 20 now, 16 at best for any legal assignment, 0 with J2
+mirrored); the routed picture has none.
 
-| | MDI0, MDI1 | MDI2, MDI3 | Needs |
-|---|---|---|---|
-| base | round the south end, from the east | not drawn: they reverse each other | nothing |
-| **X** | round the south end | from the west, planar | J2 pins 7 to 10 re-netted: 7 = MDI3_N, 8 = MDI3_P, 9 = MDI2_N, 10 = MDI2_P (exchange and polarity, both legal) |
-| **Y** | MDI0, MDI1 and MDI2 round the south end (three lanes) | MDI3 from the west | J2 pin 9 = MDI3_N, pin 10 = MDI3_P (polarity only) |
-
-X has the margin: two lanes in a gap that needs 2.14 of 2.71 mm, pair spacing
-0.63 mm. Y changes two pad nets instead of four but sends three lanes through the
-gap with 0.21 mm between pairs (the stackup note asks 0.37 to 0.56 mm). **I
-applied neither:** which freedom to use is the controller's, and it changes
-`netlist.yaml`. After that edit the schematic is regenerated and the PCB's pad
-nets follow with KiCad's Update PCB from Schematic (nothing is routed, so
-nothing is lost).
-
-**Without any netlist change** MDI0/MDI1 still go round the south end; the
-MDI2/MDI3 pair order is then fixed by one pair dipping to the bottom layer
-(4 vias), or, the controller's fallback, the MDI2/3 group diving under the
-other (8 vias). Not routed.
-
-**Not chosen:** J2 on the bottom side (0 crossings, but the jack then hangs
-13.45 mm under the board, a mechanical decision) and a tab-down jack variant.
+**Why not the alternatives** (ruling AQ): variant Y (MDI0 to MDI2 round the
+south end, three lanes) leaves 0.21 mm between pairs against the 0.37 to 0.56 mm
+of the stackup note; a dip through the bottom layer costs 4 vias and puts a
+100 ohm pair over In2 (power), breaking the rule that In1 is never broken under a
+pair; J2 on the bottom side and a tab-down jack were not chosen (mechanics).
 
 ## Mounting
 
@@ -227,7 +247,13 @@ against a signal pad alike. Measured in the scratch run on the escapes of the 14
 U3 signal pads: **16 violations without the rule, 0 with it**, and three
 controls the rule must not clear: a track 0.19 mm from a U3 pad, a track
 0.25 mm from a +1V0 pad of another footprint, a via 0.25 mm from a +1V0 pad of
-U3. All three are still reported.
+U3. All three are still reported. `check_fab_release.py` now holds the rule in
+place (`u3_track_rule_problems`): it must exist, its condition must be exactly
+tracks against pads of U3 with no net or net-class restriction (so both
+directions stay covered, and vias, zones and other footprints stay out), and its
+minimum must be exactly 0.2 mm. Mutation tests: missing rule, scope widened to
+vias or other item types, scope widened to another footprint, a net or class
+restriction added to either side, minimum 0.1, 0.15 or 0.3.
 
 ## Other placement work
 
@@ -262,39 +288,49 @@ U3. All three are still reported.
 
 ## For task 9
 
-1. **Settle the MDI2/MDI3 order**: variant X, variant Y, or the 4-via dip. X and
-   Y are netlist edits (above); the A/B route round the south end is the same
-   either way.
+1. **MDI:** MDI0 and MDI1 round the south end of J2's pin field and in from the
+   east (outer lane to the northernmost pins); MDI3 and MDI2 from the west to pins
+   7/8 and 9/10. Do not re-assign MDI nets across the A/B - C/D boundary. If the
+   route proves unworkable the controller's fallback is the MDI2/3 group diving
+   under the other (8 vias), which puts a 100 ohm pair over In2: judge it
+   against `netlist.yaml` `stackup.rules`.
 2. **Keep clear on F.Cu**: the south strip (y 24.7 to 27.5, x 31 to 40), the
    gap between J2 pin 9 and SH1, the channel x 41.7 to 45.7 up to y 12, the
    corridor between U3 and J2, the USB lane band (x 6.5 to 26.2, y 13.4 to 19.6
    and the RX approach at y 20 to 22), the crystal channel (x 23.3 to 24.7,
    y 25.7 to 29.6), U9's channel.
 3. **The necks** are at most 0.15 mm wide for at most 1.0 mm from the pad
-   centre; 0.6 mm clears every clearance the 0.2 mm class asks for in the scratch
-   run, and the placement does not make any neck longer (the nearest feature to
-   a U3 signal pad is 3.3 mm away).
+   centre; 0.6 mm clears every clearance the 0.2 mm class asks for in the
+   scratch run. The rule "track to U3 pad on fine-pitch parts" (0.2 mm,
+   tracks, U3 only) is what lets a track leave a pad next to a supply pad; keep
+   it, it is checked.
 4. **U9:** D- through the channel (0.2 mm line, 0.375 mm each side); keep the
    channel free of everything else; a GND trace from U9 pin 2 to J3's pad 7 along
-   y = 18; VBUS via east of pin 5.
+   y = 18; VBUS via east of pin 5; U9 has jumper pad groups, so D+ needs no
+   copper between pins 1 and 6.
 5. **USB 2.0:** four vias, the pair on the bottom layer from x 12.2 to x 21.5.
+   That layer's reference is In2 (power): short, 480 Mbit/s, but it is a pair over
+   a power plane too; judge it.
 6. **U8 is a tee** with short stubs; TX_P and RX_N sit 0.8 mm apart in its
-   channel; the open stretch is about 5 mm. These are to be judged, not just
+   channel; about 5 mm of each pair is open. These are to be judged, not just
    cleared.
 7. **TP6 and TP7** are 18 to 21 mm from the pins they probe (the bottom edge is
    the only place they fit); low-speed, a long thin trace is fine.
+8. **First build:** 1000 Mb/s link with a straight and a crossover cable (the
+   C/D exchange).
 
-## Round 2 (what changed from the first baseline)
+## Rounds 2 and 3 (what changed from the first baseline)
 
 | Finding | Done |
 |---|---|
-| F-1 MDI order, AJ withdrawn, AM adopted | README corrected; the planar route shown with the scratch run; two netlist variants recorded; the wrong "pair assignment is not critical" sentence in `netlist.yaml` `design_notes.mdi_pair_mapping` corrected |
-| F-2 Power clearance at U3 | the rule above, verified on 14 escapes plus three controls |
-| F-3 board back to 58 mm | outline 58 x 36, holes at (54.5, 3.5) and (54.5, 32.5), slots and the strain-relief claim dropped |
-| F-4 C21 to the top side | (34.4, 18.0), 3.3 mm from pin 6 |
-| F-5 U8 fit | recorded as clearance-only; U8 moved 3 mm nearer J3 |
-| U9 channel | verified in DS4260, made possible, footprint with jumper pad groups |
-| provenance of the U8 span | "3.33" now says it was read from a drawing that prints "0.33" |
+| R2 F-1 MDI order (AJ withdrawn, AM adopted) | README corrected; the A/B route round the south end shown with the scratch run; the wrong "pair assignment is not critical" sentence in `netlist.yaml` corrected |
+| R3 ruling AQ, variant X | `netlist.yaml` nets of MDI2/MDI3 re-netted on J2 pins 7 to 10; schematic, BOM and PCB regenerated; before/after table and the C/D proof above; `mdi_group_problems` and its tests in `check_fab_release.py` |
+| R2 F-2 Power clearance at U3 | the rule, verified on 14 escapes plus three controls; R3: tested in `check_fab_release.py` |
+| R2 F-3 board back to 58 mm | outline 58 x 36, holes at (54.5, 3.5) and (54.5, 32.5), slots and the strain-relief claim dropped |
+| R2 F-4 C21 to the top side | (34.4, 18.0), 3.3 mm from pin 6 |
+| R2 F-5 U8 | recorded as clearance-only; U8 moved 3 mm nearer J3 |
+| R2 U9 channel | verified in DS4260, made possible, footprint with jumper pad groups |
+| R2 provenance of the U8 span | the "3.33" now says it was read from a drawing that prints "0.33" |
 
 ## Files
 

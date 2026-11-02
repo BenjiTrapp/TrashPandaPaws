@@ -1713,10 +1713,15 @@ nets:
   MDI0_N: [U3.2,  J2.2]
   MDI1_P: [U3.4,  J2.3]
   MDI1_N: [U3.5,  J2.4]
-  MDI2_P: [U3.6,  J2.7]
-  MDI2_N: [U3.7,  J2.8]
-  MDI3_P: [U3.9,  J2.9]
-  MDI3_N: [U3.10, J2.10]
+  # MDI2 and MDI3 are exchanged on J2, with their polarity turned (ruling AQ):
+  # MDI3 on J2 pins 7/8 (cable pair C, RJ45 4/5), MDI2 on pins 9/10 (cable pair D,
+  # RJ45 7/8). U3's own crossover mode exchanges these two as well ([RTL-DS]
+  # Table 4). See design_notes.mdi_pair_mapping for the table and the proof that
+  # nothing leaves cable pairs C/D.
+  MDI2_P: [U3.6,  J2.10]
+  MDI2_N: [U3.7,  J2.9]
+  MDI3_P: [U3.9,  J2.8]
+  MDI3_N: [U3.10, J2.7]
 
   MDI_CT:            # PHY-side centre-tap common, bypassed to GND
     - J2.5
@@ -2068,7 +2073,19 @@ design_notes:
     mode (table 11), the LEDs may blink at power-on or during EEPROM/SPI access
     (5.11), and "LED OFF Mode" (all select bits 0) makes the pins float.
   mdi_pair_mapping: >
-    J2 PHY-side pins carry to cable pins as: TD1 -> J1/J2, TD2 -> J3/J6, TD3 -> J4/J5, TD4 -> J7/J8 ([LPJG] sheet 1/2). That is the standard 1000BASE-T assignment. CORRECTED in task 8 (ruling AJ, revised; an earlier version of this note said exact pair-to-pair assignment was not critical): [RTL-DS] Table 4 section 5.4 makes MDI0 the 10/100 transmit pair (BI_DA) and MDI1 the 10/100 receive pair (BI_DB). Auto-negotiation and every 10/100 frame run on those two pairs only, and the crossover correction exchanges only A with B and C with D. Pair assignment IS critical across that boundary: MDI0/MDI1 must stay on cable pairs A/B and MDI2/MDI3 on C/D, or there is no link at all. Legal freedoms: exchange MDI0 with MDI1, exchange MDI2 with MDI3, turn the polarity of any pair. Keep each pair routed as a pair. Where the layout uses a freedom (see hardware/review/2026-10-31-placement/README.md), the nets in this file are changed first.
+    J2 PHY-side pins carry to cable (RJ45) pins as: TD1 -> 1/2, TD2 -> 3/6, TD3 -> 4/5, TD4 -> 7/8 ([LPJG] sheet 1/2; pin notes of J2 below). That is the standard 1000BASE-T assignment: cable pair A = RJ45 1/2, B = 3/6, C = 4/5, D = 7/8.
+    PAIR ASSIGNMENT IS NOT FREE ACROSS A/B AND C/D (ruling AJ, revised in task 8; an earlier version of this note said exact pair-to-pair assignment was not critical, which was wrong). [RTL-DS] Table 4 (section 5.4): MDI0 is BI_DA and MDI1 is BI_DB, the 10/100 transmit and receive pairs. Auto-negotiation and every 10/100 frame run on those two pairs only; in crossover mode the PHY exchanges MDI0 with MDI1 and MDI2 with MDI3 (MDI2 is BI_DC, MDI3 is BI_DD, and each is the other's crossover partner). So MDI0/MDI1 must stay on cable pairs A/B and MDI2/MDI3 on C/D, or there is no link at all. Legal freedoms: exchange MDI0 with MDI1, exchange MDI2 with MDI3, turn the polarity of any pair. Keep each pair routed as a pair.
+    USED IN TASK 8 (ruling AQ, variant X; layout reason in hardware/review/2026-10-31-placement/README.md): MDI2 and MDI3 are exchanged on J2 and both turned. Before and after, with the cable pair each J2 pin reaches (pin -> RJ45 pins from the J2 pin notes):
+      J2 pin | RJ45 pin | cable pair | before          | after
+      1      | 1        | A          | MDI0_P          | MDI0_P (unchanged)
+      2      | 2        | A          | MDI0_N          | MDI0_N (unchanged)
+      3      | 3        | B          | MDI1_P          | MDI1_P (unchanged)
+      4      | 6        | B          | MDI1_N          | MDI1_N (unchanged)
+      7      | 4        | C          | MDI2_P          | MDI3_N
+      8      | 5        | C          | MDI2_N          | MDI3_P
+      9      | 7        | D          | MDI3_P          | MDI2_N
+      10     | 8        | D          | MDI3_N          | MDI2_P
+    Groups: A/B carries MDI0 and MDI1 before and after (pins 1-4 untouched); C/D carries MDI2 and MDI3 before and after (pins 7-10 only). No MDI net crosses a group boundary. tests/check_fab_release.py checks this from the data (mdi_group_problems), including the pin-to-RJ45 table above, with mutation tests. FIRST BUILD: the datasheet does not say whether the C/D exchange is detected independently of A/B, so check the link at 1000 Mb/s with a straight cable and with a crossover cable before trusting it.
     TD3 -> J4/J5, TD4 -> J7/J8 ([LPJG] sheet 1/2). That is the standard
     1000BASE-T assignment. AutoMDX in both the PHY and the jack means pair
     order and polarity are corrected automatically, so exact pair-to-pair

@@ -35,6 +35,20 @@ Added in task 7:
     into both places; a pair gap below the class clearance needs a scoped
     rule in raccoon-tap.kicad_dru, never a lower class clearance.
 
+Added in task 8:
+
+  * u3_track_rule_problems: the rule in raccoon-tap.kicad_dru that lets a track
+    pass a U3 pad at 0.2 mm (the Power class asks 0.3 mm, which U3's 0.4 mm
+    pitch cannot give) must exist, be scoped to tracks and to U3 and to nothing
+    else, in either direction, and have exactly the signal class's 0.2 mm as
+    its minimum. Without it task 9 cannot route out of U3's pads; loosened or
+    widened it would weaken the board's clearances.
+  * mdi_group_problems: MDI0 and MDI1 (the 10/100 pairs, BI_DA and BI_DB) must
+    sit on cable pairs A and B, MDI2 and MDI3 (BI_DC, BI_DD) on C and D, each
+    MDI pair whole on one cable pair, all four cable pairs used once. Exchanging
+    MDI2 with MDI3 or MDI0 with MDI1 and turning polarity are allowed; moving a
+    net across the A/B - C/D boundary gives a board with no link at all.
+
 Usage:
     python3 check_fab_release.py [-v]
 """
@@ -464,6 +478,100 @@ def unpaired_diff_pair_nets(netlist, pro_json):
 
 
 _LOAD = object()
+
+
+U3_TRACK_RULE = "track to U3 pad on fine-pitch parts"
+# Tracks only (not vias, zones or pads), pads of U3 only, any net on either
+# side: a signal track against a supply pad and a supply escape against a signal
+# pad are the same condition.
+U3_TRACK_RULE_CONDITION = ("A.Type == 'Track' && B.Type == 'Pad' && "
+                           "B.memberOfFootprint('U3')")
+U3_TRACK_RULE_MIN_MM = PAIR_CLEARANCE_MIN
+
+
+def u3_track_rule_problems(dru_text=_LOAD):
+    """One message per reason the U3 track-to-pad rule is not what task 8 wrote.
+
+    It must be present, its condition must be exactly U3_TRACK_RULE_CONDITION
+    (whitespace aside: no other item type, no other footprint, no net or net
+    class restriction that would drop one of the two directions) and its minimum
+    must be U3_TRACK_RULE_MIN_MM, the signal classes' own clearance, so nothing
+    is allowed nearer than a signal track already was."""
+    if dru_text is _LOAD:
+        dru_text = load_dru()
+    rules = {name: (" ".join(condition.split()), float(minimum))
+             for name, condition, minimum in _DRU_RULE.findall(dru_text or "")}
+    if U3_TRACK_RULE not in rules:
+        return [f"raccoon-tap.kicad_dru has no rule {U3_TRACK_RULE!r}: a track "
+                f"cannot leave a U3 pad next to a supply pad at the Power "
+                f"class's 0.3 mm"]
+    condition, minimum = rules[U3_TRACK_RULE]
+    problems = []
+    if condition != U3_TRACK_RULE_CONDITION:
+        problems.append(f"rule {U3_TRACK_RULE!r} has condition {condition!r}, "
+                        f"it must be {U3_TRACK_RULE_CONDITION!r}: tracks "
+                        f"against pads of U3, any net")
+    if not math.isclose(minimum, U3_TRACK_RULE_MIN_MM, abs_tol=1e-9):
+        problems.append(f"rule {U3_TRACK_RULE!r} says min {minimum:g}, it must "
+                        f"be {U3_TRACK_RULE_MIN_MM:g} (the signal class "
+                        f"clearance: lower weakens the board, higher does not "
+                        f"clear the 0.4 mm pitch)")
+    return problems
+
+
+# RJ45 pins of the four cable pairs of 1000BASE-T (IEEE 802.3 clause 40) and the
+# group each MDI pair of the RTL8153B belongs to ([RTL-DS] Table 4: MDI0 BI_DA,
+# MDI1 BI_DB, MDI2 BI_DC, MDI3 BI_DD). A and B carry 10/100 and auto-negotiation.
+CABLE_PAIRS = {"A": (1, 2), "B": (3, 6), "C": (4, 5), "D": (7, 8)}
+MDI_GROUPS = {"MDI0": "AB", "MDI1": "AB", "MDI2": "CD", "MDI3": "CD"}
+
+
+def mdi_group_problems(netlist):
+    """One message per reason the MDI nets do not stay inside their group of
+    cable pairs. J2's pin -> RJ45 pin table is read from the pin notes
+    ("... -> cable J4 ...": the RJ45 pin), so it is the netlist's own."""
+    problems = []
+    rj45 = {}
+    pins = netlist["components"]["J2"].get("pins", {})
+    for pin, info in pins.items():
+        match = re.search(r"cable J(\d)\b", str((info or {}).get("note", "")))
+        if match:
+            rj45[str(pin)] = int(match.group(1))
+    pair_of = {pin: letter for letter, pins_ in CABLE_PAIRS.items()
+               for pin in pins_}
+    landing = {}
+    for net, endpoints in netlist["nets"].items():
+        match = re.fullmatch(r"(MDI[0-3])_([PN])", net)
+        if not match:
+            continue
+        j2 = [str(e).split(".", 1)[1] for e in endpoints or []
+              if str(e).startswith("J2.")]
+        if len(j2) != 1:
+            problems.append(f"{net}: expected one J2 pin, found {j2}")
+            continue
+        if j2[0] not in rj45:
+            problems.append(f"{net}: J2 pin {j2[0]} has no 'cable J<n>' in its "
+                            f"note, the RJ45 pin is unknown")
+            continue
+        cable = pair_of.get(rj45[j2[0]])
+        landing.setdefault(match.group(1), set()).add(cable)
+        if cable is None or cable not in MDI_GROUPS[match.group(1)]:
+            problems.append(
+                f"{net} is on J2 pin {j2[0]} = RJ45 pin {rj45[j2[0]]} = cable "
+                f"pair {cable}, outside its group {MDI_GROUPS[match.group(1)]} "
+                f"({match.group(1)} is "
+                f"{'10/100 and auto-negotiation' if MDI_GROUPS[match.group(1)] == 'AB' else 'gigabit only'})")
+    used = []
+    for mdi, cables in sorted(landing.items()):
+        if len(cables) != 1:
+            problems.append(f"{mdi}: its two nets are on different cable pairs "
+                            f"{sorted(str(c) for c in cables)}")
+        used += list(cables)
+    if sorted(map(str, used)) != sorted(CABLE_PAIRS):
+        problems.append(f"the four MDI pairs must use cable pairs A, B, C and D "
+                        f"once each, they use {sorted(map(str, used))}")
+    return problems
+
 
 
 def check_no_placeholder_geometry(pro_json, stackup_note, dru_text=_LOAD,
@@ -1370,6 +1478,127 @@ class VbusGuardCannotBeSilenced(unittest.TestCase):
         netlist["components"][ref]["value"] = f"{old + 12.0}uF"
         self.assertAlmostEqual(sum_bulk_capacitance(netlist, "+5V"),
                                before + 12.0)
+
+
+class U3TrackRuleCannotBeLoosened(unittest.TestCase):
+    """The rule is the only thing that lets task 9 route out of U3's pads; an
+    untested rule could be deleted or widened without anything noticing."""
+
+    def test_the_committed_rule_passes(self):
+        self.assertEqual(u3_track_rule_problems(), [])
+
+    def mutate(self, old, new):
+        # edit inside this rule only: other rules carry similar text
+        dru = load_dru()
+        start = dru.index(f'(rule "{U3_TRACK_RULE}"')
+        head, rule = dru[:start], dru[start:]
+        self.assertIn(old, rule)
+        return u3_track_rule_problems(head + rule.replace(old, new, 1))
+
+    def test_a_missing_rule_is_reported(self):
+        problems = u3_track_rule_problems(
+            load_dru().replace(U3_TRACK_RULE, "renamed"))
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("has no rule", problems[0])
+        self.assertEqual(len(u3_track_rule_problems(None)), 1)
+
+    def test_a_rule_that_is_not_limited_to_tracks_is_reported(self):
+        # without the track scope it would also relax pad-to-pad and via spacing
+        for old, new in [("A.Type == 'Track' && ", ""),
+                         ("A.Type == 'Track'", "A.Type == 'Track' || A.Type == 'Via'"),
+                         ("A.Type == 'Track'", "A.Type != 'Zone'")]:
+            problems = self.mutate(old, new)
+            self.assertTrue(any("condition" in p for p in problems), (new, problems))
+
+    def test_a_rule_that_is_not_limited_to_u3_is_reported(self):
+        for old, new in [(" && B.memberOfFootprint('U3')", ""),
+                         ("B.memberOfFootprint('U3')", "B.memberOfFootprint('U8')"),
+                         ("B.memberOfFootprint('U3')",
+                          "B.memberOfFootprint('U3') || B.memberOfFootprint('U9')")]:
+            problems = self.mutate(old, new)
+            self.assertTrue(any("condition" in p for p in problems), (new, problems))
+
+    def test_a_rule_that_drops_a_direction_is_reported(self):
+        # restricting either side to a net class would leave a signal track
+        # against a supply pad, or a supply escape against a signal pad, at 0.3
+        for old, new in [("A.Type == 'Track'", "A.Type == 'Track' && A.NetClass == 'USB3'"),
+                         ("B.Type == 'Pad'", "B.Type == 'Pad' && B.NetClass == 'Power'"),
+                         ("B.Type == 'Pad'", "B.Type == 'Pad' && B.Net != 'GND'")]:
+            problems = self.mutate(old, new)
+            self.assertTrue(any("condition" in p for p in problems), (new, problems))
+
+    def test_a_looser_or_useless_minimum_is_reported(self):
+        for new in ("0.1mm", "0.15mm", "0.3mm"):
+            problems = self.mutate("(min 0.2mm)", f"(min {new})")
+            self.assertEqual(len(problems), 1, (new, problems))
+            self.assertIn("must be 0.2", problems[0])
+
+
+class MdiPairsStayInTheirCableGroup(unittest.TestCase):
+    """Ruling AJ, revised: moving an MDI net across the A/B - C/D boundary
+    gives a board with no link at all (A/B carry 10/100 and auto-negotiation)."""
+
+    @staticmethod
+    def swapped(netlist, a, b):
+        """Exchange the J2 pins of nets a and b."""
+        nets = netlist["nets"]
+        ja = next(e for e in nets[a] if e.startswith("J2."))
+        jb = next(e for e in nets[b] if e.startswith("J2."))
+        nets[a] = [jb if e == ja else e for e in nets[a]]
+        nets[b] = [ja if e == jb else e for e in nets[b]]
+        return netlist
+
+    def test_the_committed_netlist_passes(self):
+        self.assertEqual(mdi_group_problems(load_netlist()), [])
+
+    def test_the_exchange_used_in_task_8_is_what_the_netlist_says(self):
+        nets = load_netlist()["nets"]
+        j2 = lambda net: next(e for e in nets[net] if e.startswith("J2."))
+        self.assertEqual([j2(n) for n in ("MDI0_P", "MDI0_N", "MDI1_P", "MDI1_N")],
+                         ["J2.1", "J2.2", "J2.3", "J2.4"])
+        self.assertEqual([j2(n) for n in ("MDI3_N", "MDI3_P", "MDI2_N", "MDI2_P")],
+                         ["J2.7", "J2.8", "J2.9", "J2.10"])
+
+    def test_the_legal_freedoms_pass(self):
+        for a, b in [("MDI2_P", "MDI3_P"), ("MDI2_N", "MDI3_N"),   # exchange C/D
+                     ("MDI0_P", "MDI1_P"), ("MDI0_N", "MDI1_N"),   # exchange A/B
+                     ("MDI2_P", "MDI2_N"), ("MDI0_P", "MDI0_N")]:  # polarity
+            netlist = self.swapped(copy.deepcopy(load_netlist()), a, b)
+            # an exchange of one net of each pair splits nothing only if both
+            # nets of the pair move: do the second net as well
+            if a.endswith("_P") and b.endswith("_P"):
+                netlist = self.swapped(netlist, a[:-1] + "N", b[:-1] + "N")
+            elif a.endswith("_N") and b.endswith("_N"):
+                netlist = self.swapped(netlist, a[:-1] + "P", b[:-1] + "P")
+            self.assertEqual(mdi_group_problems(netlist), [], (a, b))
+
+    def test_a_net_moved_across_the_boundary_is_reported(self):
+        for a, b in [("MDI1_P", "MDI2_P"), ("MDI0_N", "MDI3_N"),
+                     ("MDI1_N", "MDI3_P")]:
+            netlist = self.swapped(copy.deepcopy(load_netlist()), a, b)
+            problems = mdi_group_problems(netlist)
+            self.assertTrue(any("outside its group" in p for p in problems),
+                            (a, b, problems))
+
+    def test_a_whole_pair_moved_across_the_boundary_is_reported(self):
+        netlist = copy.deepcopy(load_netlist())
+        for x, y in [("MDI1_P", "MDI2_P"), ("MDI1_N", "MDI2_N")]:
+            self.swapped(netlist, x, y)
+        problems = mdi_group_problems(netlist)
+        self.assertEqual(len([p for p in problems if "outside its group" in p]),
+                         4, problems)
+
+    def test_a_pair_split_over_two_cable_pairs_is_reported(self):
+        netlist = self.swapped(copy.deepcopy(load_netlist()), "MDI2_P", "MDI3_P")
+        problems = mdi_group_problems(netlist)
+        self.assertTrue(any("different cable pairs" in p for p in problems),
+                        problems)
+
+    def test_an_unreadable_pin_table_is_reported(self):
+        netlist = copy.deepcopy(load_netlist())
+        netlist["components"]["J2"]["pins"][7]["note"] = "PHY side, pair 3"
+        problems = mdi_group_problems(netlist)
+        self.assertTrue(any("no 'cable J<n>'" in p for p in problems), problems)
 
 
 if __name__ == "__main__":

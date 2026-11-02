@@ -2682,10 +2682,10 @@
         "4": "MDI1_N",
         "5": "MDI_CT",
         "6": "MDI_CT",
-        "7": "MDI2_P",
-        "8": "MDI2_N",
-        "9": "MDI3_P",
-        "10": "MDI3_N",
+        "7": "MDI3_N",
+        "8": "MDI3_P",
+        "9": "MDI2_N",
+        "10": "MDI2_P",
         "11": "LED_G_A",
         "12": "ETH_LED1",
         "13": "LED_Y_A",
@@ -2773,10 +2773,10 @@
         "2": "MDI0_N",
         "4": "MDI1_P",
         "5": "MDI1_N",
-        "6": "MDI2_P",
-        "7": "MDI2_N",
-        "9": "MDI3_P",
         "10": "MDI3_N",
+        "9": "MDI3_P",
+        "7": "MDI2_N",
+        "6": "MDI2_P",
         "30": "ETH_LED1",
         "32": "ETH_LED0",
         "17": "USB2_D_N",
@@ -4861,8 +4861,8 @@
         }
       ]
     },
-    "MDI2_P": {
-      "name": "MDI2_P",
+    "MDI3_N": {
+      "name": "MDI3_N",
       "pins": [
         {
           "component": "J2",
@@ -4872,8 +4872,8 @@
         },
         {
           "component": "U3",
-          "pin_number": "6",
-          "pin_name": "MDIP2",
+          "pin_number": "10",
+          "pin_name": "MDIN3",
           "pin_type": "bidirectional"
         }
       ],
@@ -4882,33 +4882,7 @@
       "has_pwr_flag": false,
       "labels": [
         {
-          "name": "MDI2_P",
-          "type": "label"
-        }
-      ]
-    },
-    "MDI2_N": {
-      "name": "MDI2_N",
-      "pins": [
-        {
-          "component": "J2",
-          "pin_number": "8",
-          "pin_name": "TD3_N",
-          "pin_type": "passive"
-        },
-        {
-          "component": "U3",
-          "pin_number": "7",
-          "pin_name": "MDIN2",
-          "pin_type": "bidirectional"
-        }
-      ],
-      "point_count": 4,
-      "no_connect": false,
-      "has_pwr_flag": false,
-      "labels": [
-        {
-          "name": "MDI2_N",
+          "name": "MDI3_N",
           "type": "label"
         }
       ]
@@ -4918,8 +4892,8 @@
       "pins": [
         {
           "component": "J2",
-          "pin_number": "9",
-          "pin_name": "TD4_P",
+          "pin_number": "8",
+          "pin_name": "TD3_N",
           "pin_type": "passive"
         },
         {
@@ -4939,8 +4913,34 @@
         }
       ]
     },
-    "MDI3_N": {
-      "name": "MDI3_N",
+    "MDI2_N": {
+      "name": "MDI2_N",
+      "pins": [
+        {
+          "component": "J2",
+          "pin_number": "9",
+          "pin_name": "TD4_P",
+          "pin_type": "passive"
+        },
+        {
+          "component": "U3",
+          "pin_number": "7",
+          "pin_name": "MDIN2",
+          "pin_type": "bidirectional"
+        }
+      ],
+      "point_count": 4,
+      "no_connect": false,
+      "has_pwr_flag": false,
+      "labels": [
+        {
+          "name": "MDI2_N",
+          "type": "label"
+        }
+      ]
+    },
+    "MDI2_P": {
+      "name": "MDI2_P",
       "pins": [
         {
           "component": "J2",
@@ -4950,8 +4950,8 @@
         },
         {
           "component": "U3",
-          "pin_number": "10",
-          "pin_name": "MDIN3",
+          "pin_number": "6",
+          "pin_name": "MDIP2",
           "pin_type": "bidirectional"
         }
       ],
@@ -4960,7 +4960,7 @@
       "has_pwr_flag": false,
       "labels": [
         {
-          "name": "MDI3_N",
+          "name": "MDI2_P",
           "type": "label"
         }
       ]
@@ -6713,35 +6713,20 @@
           "pin_number": "7",
           "pin_name": "TD3_P",
           "pin_type": "passive",
-          "net": "MDI2_P",
+          "net": "MDI3_N",
           "connected_to": [
             {
               "ref": "U3",
               "value": "RTL8153B",
               "type": "ic",
-              "pin": "6",
-              "pin_name": "MDIP2"
+              "pin": "10",
+              "pin_name": "MDIN3"
             }
           ]
         },
         {
           "pin_number": "8",
           "pin_name": "TD3_N",
-          "pin_type": "passive",
-          "net": "MDI2_N",
-          "connected_to": [
-            {
-              "ref": "U3",
-              "value": "RTL8153B",
-              "type": "ic",
-              "pin": "7",
-              "pin_name": "MDIN2"
-            }
-          ]
-        },
-        {
-          "pin_number": "9",
-          "pin_name": "TD4_P",
           "pin_type": "passive",
           "net": "MDI3_P",
           "connected_to": [
@@ -6755,17 +6740,32 @@
           ]
         },
         {
-          "pin_number": "10",
-          "pin_name": "TD4_N",
+          "pin_number": "9",
+          "pin_name": "TD4_P",
           "pin_type": "passive",
-          "net": "MDI3_N",
+          "net": "MDI2_N",
           "connected_to": [
             {
               "ref": "U3",
               "value": "RTL8153B",
               "type": "ic",
-              "pin": "10",
-              "pin_name": "MDIN3"
+              "pin": "7",
+              "pin_name": "MDIN2"
+            }
+          ]
+        },
+        {
+          "pin_number": "10",
+          "pin_name": "TD4_N",
+          "pin_type": "passive",
+          "net": "MDI2_P",
+          "connected_to": [
+            {
+              "ref": "U3",
+              "value": "RTL8153B",
+              "type": "ic",
+              "pin": "6",
+              "pin_name": "MDIP2"
             }
           ]
         },
@@ -6970,35 +6970,20 @@
           "pin_number": "7",
           "pin_name": "TD3_P",
           "pin_type": "passive",
-          "net": "MDI2_P",
+          "net": "MDI3_N",
           "connected_to": [
             {
               "ref": "U3",
               "value": "RTL8153B",
               "type": "ic",
-              "pin": "6",
-              "pin_name": "MDIP2"
+              "pin": "10",
+              "pin_name": "MDIN3"
             }
           ]
         },
         {
           "pin_number": "8",
           "pin_name": "TD3_N",
-          "pin_type": "passive",
-          "net": "MDI2_N",
-          "connected_to": [
-            {
-              "ref": "U3",
-              "value": "RTL8153B",
-              "type": "ic",
-              "pin": "7",
-              "pin_name": "MDIN2"
-            }
-          ]
-        },
-        {
-          "pin_number": "9",
-          "pin_name": "TD4_P",
           "pin_type": "passive",
           "net": "MDI3_P",
           "connected_to": [
@@ -7012,17 +6997,32 @@
           ]
         },
         {
-          "pin_number": "10",
-          "pin_name": "TD4_N",
+          "pin_number": "9",
+          "pin_name": "TD4_P",
           "pin_type": "passive",
-          "net": "MDI3_N",
+          "net": "MDI2_N",
           "connected_to": [
             {
               "ref": "U3",
               "value": "RTL8153B",
               "type": "ic",
-              "pin": "10",
-              "pin_name": "MDIN3"
+              "pin": "7",
+              "pin_name": "MDIN2"
+            }
+          ]
+        },
+        {
+          "pin_number": "10",
+          "pin_name": "TD4_N",
+          "pin_type": "passive",
+          "net": "MDI2_P",
+          "connected_to": [
+            {
+              "ref": "U3",
+              "value": "RTL8153B",
+              "type": "ic",
+              "pin": "6",
+              "pin_name": "MDIP2"
             }
           ]
         },
@@ -9443,8 +9443,8 @@
               "ref": "J2",
               "value": "LPJG16402AQNL",
               "type": "connector",
-              "pin": "7",
-              "pin_name": "TD3_P"
+              "pin": "10",
+              "pin_name": "TD4_N"
             }
           ]
         },
@@ -9458,8 +9458,8 @@
               "ref": "J2",
               "value": "LPJG16402AQNL",
               "type": "connector",
-              "pin": "8",
-              "pin_name": "TD3_N"
+              "pin": "9",
+              "pin_name": "TD4_P"
             }
           ]
         },
@@ -9553,8 +9553,8 @@
               "ref": "J2",
               "value": "LPJG16402AQNL",
               "type": "connector",
-              "pin": "9",
-              "pin_name": "TD4_P"
+              "pin": "8",
+              "pin_name": "TD3_N"
             }
           ]
         },
@@ -9568,8 +9568,8 @@
               "ref": "J2",
               "value": "LPJG16402AQNL",
               "type": "connector",
-              "pin": "10",
-              "pin_name": "TD4_N"
+              "pin": "7",
+              "pin_name": "TD3_P"
             }
           ]
         },
@@ -13967,8 +13967,8 @@
               "ref": "J2",
               "value": "LPJG16402AQNL",
               "type": "connector",
-              "pin": "7",
-              "pin_name": "TD3_P"
+              "pin": "10",
+              "pin_name": "TD4_N"
             }
           ]
         },
@@ -13982,8 +13982,8 @@
               "ref": "J2",
               "value": "LPJG16402AQNL",
               "type": "connector",
-              "pin": "8",
-              "pin_name": "TD3_N"
+              "pin": "9",
+              "pin_name": "TD4_P"
             }
           ]
         },
@@ -13997,8 +13997,8 @@
               "ref": "J2",
               "value": "LPJG16402AQNL",
               "type": "connector",
-              "pin": "9",
-              "pin_name": "TD4_P"
+              "pin": "8",
+              "pin_name": "TD3_N"
             }
           ]
         },
@@ -14012,8 +14012,8 @@
               "ref": "J2",
               "value": "LPJG16402AQNL",
               "type": "connector",
-              "pin": "10",
-              "pin_name": "TD4_N"
+              "pin": "7",
+              "pin_name": "TD3_P"
             }
           ]
         },
@@ -20568,10 +20568,10 @@
       "MDI1_P": "signal",
       "MDI1_N": "signal",
       "MDI_CT": "signal",
-      "MDI2_P": "signal",
-      "MDI2_N": "signal",
-      "MDI3_P": "signal",
       "MDI3_N": "signal",
+      "MDI3_P": "signal",
+      "MDI2_N": "signal",
+      "MDI2_P": "signal",
       "LED_G_A": "output_drive",
       "ETH_LED1": "high_speed",
       "LED_Y_A": "output_drive",
@@ -20833,8 +20833,8 @@
       },
       {
         "type": "differential",
-        "positive": "MDI2_P",
-        "negative": "MDI2_N",
+        "positive": "MDI3_P",
+        "negative": "MDI3_N",
         "shared_ics": [
           "J2",
           "U3"
@@ -20846,8 +20846,8 @@
       },
       {
         "type": "differential",
-        "positive": "MDI3_P",
-        "negative": "MDI3_N",
+        "positive": "MDI2_P",
+        "negative": "MDI2_N",
         "shared_ics": [
           "J2",
           "U3"
@@ -21204,7 +21204,7 @@
       "_sheet": 0
     },
     {
-      "name": "MDI2_P",
+      "name": "MDI3_N",
       "type": "label",
       "x": 31.75,
       "y": 57.15,
@@ -21212,7 +21212,7 @@
       "_sheet": 0
     },
     {
-      "name": "MDI2_N",
+      "name": "MDI3_P",
       "type": "label",
       "x": 31.75,
       "y": 59.69,
@@ -21220,7 +21220,7 @@
       "_sheet": 0
     },
     {
-      "name": "MDI3_P",
+      "name": "MDI2_N",
       "type": "label",
       "x": 67.31,
       "y": 41.91,
@@ -21228,7 +21228,7 @@
       "_sheet": 0
     },
     {
-      "name": "MDI3_N",
+      "name": "MDI2_P",
       "type": "label",
       "x": 67.31,
       "y": 44.45,
@@ -25817,7 +25817,7 @@
       "hardware/kicad/raccoon-tap.kicad_sch"
     ],
     "source_hashes": {
-      "hardware/kicad/raccoon-tap.kicad_sch": "d1bfd3ce4d9a49d1bad106be4983fa513651d9c52070a235f994bc6900d93151"
+      "hardware/kicad/raccoon-tap.kicad_sch": "344164db00edf4910d6972afe34defc89f81067478801e28a34b6adfbe9f0720"
     },
     "run_id": "20261102T092822Z-d400a9",
     "config_hash": null,

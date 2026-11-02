@@ -76,10 +76,13 @@ JX, JY = 47.3, 18.0           # J2 origin; the jack's front face is at x = 57.65
 # order. U3's pins 1-10 and J2's pins 1-10 both run counter-clockwise round
 # their package, so two parts that face each other present the pairs in
 # reversed order (MDI3..0 against MDI0..3), for every rotation of both parts.
-# Drawn as straight ratsnest lines the eight signal pins cross 27 times.
+# Drawn as straight ratsnest lines the eight signal pins cross 27 times (original netlist).
 # Which pairs may be exchanged is limited (ruling AJ, revised): MDI0 and MDI1
 # are the 10/100 pair, so only MDI0<->MDI1, MDI2<->MDI3 and P/N polarity are
-# free; the two groups cannot trade places.
+# free; the two groups cannot trade places. Ruling AQ uses two of them: MDI2
+# and MDI3 are exchanged and turned on J2 (pins 7 to 10 = MDI3_N, MDI3_P,
+# MDI2_N, MDI2_P, still cable pairs C and D), which is in netlist.yaml and so
+# in the pad nets generated here.
 #
 # THE PLANAR ROUTE THE PLACEMENT LEAVES ROOM FOR (ruling AM). J2's pins are
 # through-hole, so a track can reach them from either face. The southern pairs
@@ -88,10 +91,9 @@ JX, JY = 47.3, 18.0           # J2 origin; the jack's front face is at x = 57.65
 # 4 mm channel between the pin columns and the T-posts (x 41.7 to 45.7), and
 # into the pins from the east: the outermost lane to the northernmost pins.
 # F.Cu is kept free of parts along all of it, and C25 and R13 stay below
-# y 29. MDI2 and MDI3 come from the west and cross each other unless the nets of
-# J2's pins 7 to 10 are changed in the legal ways (ruling AJ, revised); the
-# README and scratch_route_check.py in the placement review directory
-# show two variants that route without a via.
+# y 29. MDI2 and MDI3 then come from the west without crossing. Zero vias in the
+# MDI pairs; hardware/review/2026-10-31-placement/scratch_route_check.py lays
+# all of it on a copy of the board and runs the DRC.
 PLACEMENT = {
     # --- connectors --------------------------------------------------------
     # J3 rotated 180 so the shell overhangs the LEFT edge while the pads stay
