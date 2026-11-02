@@ -25,13 +25,24 @@ Added in task 6:
     be satisfied by merely renaming a net;
   * the committed bom.csv and schematic are what the generators write.
 
+Added in task 7:
+
+  * check_no_placeholder_geometry: the USB3 and MDI net classes in the KiCad
+    project carry the differential-pair width and gap that hardware/fab/
+    stackup-note.md documents, and those numbers reproduce the impedance
+    targets under PCBWay's own published formula, so a guess cannot pass by
+    being copied into both places.
+
 Usage:
     python3 check_fab_release.py [-v]
 """
 
 import copy
 import csv
+import json
+import math
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -44,6 +55,8 @@ HARDWARE = Path(__file__).resolve().parent.parent
 NETLIST = HARDWARE / "netlist.yaml"
 BOM = HARDWARE / "bom.csv"
 SCHEMATIC = HARDWARE / "kicad" / "raccoon-tap.kicad_sch"
+PRO = HARDWARE / "kicad" / "raccoon-tap.kicad_pro"
+STACKUP_NOTE = HARDWARE / "fab" / "stackup-note.md"
 GEN_BOM = HARDWARE / "tools" / "gen_bom.py"
 GEN_SCHEMATIC = HARDWARE / "tools" / "gen_schematic.py"
 
@@ -67,6 +80,17 @@ def load_netlist(path=NETLIST):
 def load_bom(path=BOM):
     with open(path, newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def load_pro(path=PRO):
+    with open(path) as handle:
+        return json.load(handle)
+
+
+def load_stackup_note(path=STACKUP_NOTE):
+    """The stackup note as text, or None if it does not exist."""
+    path = Path(path)
+    return path.read_text(encoding="utf-8") if path.exists() else None
 
 
 # Part-number cells that are present but say nothing. PCBWay buys by part
@@ -299,6 +323,146 @@ def gated_rail_inrush_ma(netlist, gated_rail):
     return gated_rail_inrush_profile(netlist, gated_rail)["peak_ma"]
 
 
+# --- Differential-pair geometry (task 7) -----------------------------------
+
+# PCBWay's "Edge Coupled Microstrip" calculator, https://www.pcbway.com/
+# pcb_prototype/impedance_calculator.html, function EdgeCoupledMicrostrip().
+# The page converts every input to mil with these factors (its <li data-val>
+# lists); they are kept as the page has them, not rounded to 25.4 / 39.37.
+# Excerpt of the page source: hardware/fab/pcbway-source-excerpts.txt [1].
+_PCBWAY_MIL_PER_OZ = 1.379
+_PCBWAY_MIL_PER_MM = 39.3
+
+# Impedance of each net class the note documents, from netlist.yaml
+# stackup.impedance. A computed geometry has to land near these.
+GEOMETRY_CLASSES = {"USB3": 90.0, "MDI": 100.0}
+# How far the formula may sit from the target before the geometry counts as
+# not computed. PCBWay quotes +/-10 % for the process (capabilities row 35);
+# this guard is much tighter, because it only has to catch a number that was
+# never run through the formula.
+GEOMETRY_FORMULA_TOLERANCE = 0.03
+
+NOTE_REQUIRED_HEADINGS = (
+    "## Stackup",
+    "## Dielectric constant",
+    "## Result per impedance target",
+    "## Tolerance",
+    "## Minimum trace width and spacing",
+    "## Fit on 58 x 36 mm",
+    "## Open items",
+)
+_GEOMETRY_BLOCK = re.compile(
+    r"<!-- netclass-geometry -->\s*```yaml\n(.*?)\n```", re.DOTALL)
+
+
+def pcbway_edge_coupled_zd(t_oz, h_mm, w_mm, s_mm, er):
+    """Differential impedance in ohm that PCBWay's Edge Coupled Microstrip
+    calculator prints for copper thickness t (oz/ft2), dielectric height h,
+    trace width w and spacing s (mm), and dielectric constant er."""
+    t, h = t_oz * _PCBWAY_MIL_PER_OZ, h_mm * _PCBWAY_MIL_PER_MM
+    w, s = w_mm * _PCBWAY_MIL_PER_MM, s_mm * _PCBWAY_MIL_PER_MM
+    zo = 87.0 / math.sqrt(1.41 + er) * math.log(5.98 * h / (0.8 * w + t))
+    return 2.0 * zo * (1.0 - 0.48 * math.exp(-0.96 * s / h))
+
+
+def check_no_placeholder_geometry(pro_json, stackup_note):
+    """One message per reason the USB3 and MDI net classes are not the
+    geometry that hardware/fab/stackup-note.md documents.
+
+    `stackup_note` is the note's text, or None if the file does not exist.
+    The note carries a machine-readable block (the `netclass-geometry`
+    marker followed by a yaml fence) with the inputs fed to the calculator
+    and, per class, the width, gap and clearance that came out. The check
+
+      * reports a missing note, a missing block and a missing heading;
+      * compares diff_pair_width, diff_pair_gap, track_width and clearance of
+        each class with the note, and requires clearance <= gap (KiCad's DRC
+        would otherwise flag the two traces of a pair against each other);
+      * recomputes the impedance from the note's own inputs with PCBWay's
+        published formula and reports a result further than
+        GEOMETRY_FORMULA_TOLERANCE from the target;
+      * requires every non-zero differential-pair preset of the interactive
+        router to be one of the documented geometries.
+    """
+    if not stackup_note or not stackup_note.strip():
+        return ["hardware/fab/stackup-note.md is missing or empty: the "
+                "diff-pair geometry has no documented source"]
+    problems = [f"stackup note has no section {h!r}"
+                for h in NOTE_REQUIRED_HEADINGS if h not in stackup_note]
+    block = _GEOMETRY_BLOCK.search(stackup_note)
+    if not block:
+        return problems + ["stackup note has no machine-readable "
+                           "`<!-- netclass-geometry -->` yaml block"]
+    try:
+        documented = yaml.safe_load(block.group(1))
+        inputs = documented["inputs"]
+        t_oz, h_mm, er = (float(inputs[k]) for k in ("t_oz", "h_mm", "er"))
+        classes = documented["classes"]
+    except (yaml.YAMLError, KeyError, TypeError, ValueError) as error:
+        return problems + [f"netclass-geometry block is unreadable: {error!r}"]
+
+    by_name = {c.get("name"): c
+               for c in pro_json.get("net_settings", {}).get("classes", [])}
+    allowed = set()
+    for name, target in GEOMETRY_CLASSES.items():
+        entry = classes.get(name) if isinstance(classes, dict) else None
+        if not isinstance(entry, dict):
+            problems.append(f"{name}: not documented in the stackup note")
+            continue
+        try:
+            width, gap = float(entry["width_mm"]), float(entry["gap_mm"])
+            clearance = float(entry["clearance_mm"])
+            documented_target = float(entry["target_ohm"])
+        except (KeyError, TypeError, ValueError) as error:
+            problems.append(f"{name}: note entry is incomplete: {error!r}")
+            continue
+        if documented_target != target:
+            problems.append(f"{name}: note targets {documented_target:g} ohm, "
+                            f"netlist.yaml stackup.impedance says {target:g}")
+        allowed.add((width, gap))
+        zd = pcbway_edge_coupled_zd(t_oz, h_mm, width, gap, er)
+        if abs(zd - target) > GEOMETRY_FORMULA_TOLERANCE * target:
+            problems.append(
+                f"{name}: width {width} / gap {gap} give {zd:.1f} ohm under "
+                f"PCBWay's formula for the note's inputs, target {target:g}")
+        if not 0.1 <= width / h_mm <= 2.0:
+            problems.append(f"{name}: w/h = {width / h_mm:.2f} is outside "
+                            f"0.1..2.0, where PCBWay's calculator warns")
+        if clearance > gap:
+            problems.append(f"{name}: clearance {clearance} is larger than "
+                            f"the pair gap {gap}; DRC would flag the pair")
+        netclass = by_name.get(name)
+        if netclass is None:
+            problems.append(f"{name}: no such net class in the project")
+            continue
+        for key, want in (("diff_pair_width", width), ("diff_pair_gap", gap),
+                          ("track_width", width), ("clearance", clearance)):
+            if not math.isclose(netclass.get(key, math.nan), want,
+                                abs_tol=1e-9):
+                problems.append(
+                    f"{name}: {key} is {netclass.get(key)!r}, the stackup "
+                    f"note documents {want}")
+    presets = pro_json.get("board", {}).get("design_settings", {}).get(
+        "diff_pair_dimensions", [])
+    shown = set()
+    for preset in presets:
+        pair = (preset.get("width"), preset.get("gap"))
+        if pair == (0.0, 0.0):
+            continue
+        shown.add(pair)
+        if not any(math.isclose(pair[0], w, abs_tol=1e-9)
+                   and math.isclose(pair[1], g, abs_tol=1e-9)
+                   for w, g in allowed):
+            problems.append(f"router preset width {pair[0]} / gap {pair[1]} "
+                            f"is not a documented geometry")
+    for w, g in sorted(allowed):
+        if not any(math.isclose(w, a, abs_tol=1e-9)
+                   and math.isclose(g, b, abs_tol=1e-9) for a, b in shown):
+            problems.append(f"documented geometry width {w} / gap {g} is "
+                            f"missing from the router's diff-pair presets")
+    return problems
+
+
 class FabReleaseChecks(unittest.TestCase):
 
     def test_vbus_bulk_capacitance_within_usb_limit(self):
@@ -309,6 +473,137 @@ class FabReleaseChecks(unittest.TestCase):
 
     def test_every_bom_row_has_a_part_number(self):
         self.assertEqual(check_mpn_coverage(load_bom()), [])
+
+
+class DiffPairGeometry(unittest.TestCase):
+
+    def test_diff_pair_geometry_is_calculated_not_placeholder(self):
+        self.assertEqual(
+            check_no_placeholder_geometry(load_pro(), load_stackup_note()), [])
+
+
+class DiffPairGeometryCheckCanFail(unittest.TestCase):
+    """check_no_placeholder_geometry must reject what it claims to reject."""
+
+    @staticmethod
+    def netclass(pro, name):
+        return next(c for c in pro["net_settings"]["classes"]
+                    if c["name"] == name)
+
+    def test_the_committed_files_pass(self):
+        self.assertEqual(
+            check_no_placeholder_geometry(load_pro(), load_stackup_note()), [])
+
+    def test_a_missing_note_is_reported(self):
+        for note in (None, "", "  \n"):
+            problems = check_no_placeholder_geometry(load_pro(), note)
+            self.assertEqual(len(problems), 1, repr(note))
+            self.assertIn("stackup-note.md", problems[0])
+
+    def test_the_old_placeholders_are_reported(self):
+        # the values the net classes carried before task 7
+        pro = load_pro()
+        usb3, mdi = self.netclass(pro, "USB3"), self.netclass(pro, "MDI")
+        usb3.update(diff_pair_width=0.2, diff_pair_gap=0.2, clearance=0.2)
+        mdi.update(diff_pair_width=0.18, diff_pair_gap=0.25, clearance=0.2)
+        problems = check_no_placeholder_geometry(pro, load_stackup_note())
+        for name, key in [("USB3", "diff_pair_width"), ("USB3", "diff_pair_gap"),
+                          ("MDI", "diff_pair_width"), ("MDI", "diff_pair_gap")]:
+            self.assertTrue(any(p.startswith(name) and key in p
+                                for p in problems), (name, key, problems))
+
+    def test_a_change_of_one_value_is_reported(self):
+        for name, key in [("USB3", "diff_pair_gap"), ("MDI", "diff_pair_width"),
+                          ("USB3", "track_width"), ("MDI", "clearance")]:
+            pro = load_pro()
+            self.netclass(pro, name)[key] += 0.01
+            problems = check_no_placeholder_geometry(pro, load_stackup_note())
+            self.assertTrue(any(p.startswith(name) and key in p
+                                for p in problems), (name, key, problems))
+
+    def test_a_note_edited_to_match_a_guess_is_still_reported(self):
+        # copying 0.2 / 0.2 into both files does not make 0.2 / 0.2 a 90 ohm
+        # geometry under PCBWay's formula
+        note = load_stackup_note().replace(
+            "USB3: {target_ohm: 90.0, width_mm: 0.23, gap_mm: 0.16,",
+            "USB3: {target_ohm: 90.0, width_mm: 0.2, gap_mm: 0.2,")
+        pro = load_pro()
+        self.netclass(pro, "USB3").update(diff_pair_width=0.2,
+                                          diff_pair_gap=0.2, track_width=0.2)
+        pro["board"]["design_settings"]["diff_pair_dimensions"][1].update(
+            width=0.2, gap=0.2)
+        problems = check_no_placeholder_geometry(pro, note)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("PCBWay's formula", problems[0])
+
+    def test_a_clearance_above_the_pair_gap_is_reported(self):
+        pro = load_pro()
+        note = load_stackup_note().replace(
+            "gap_mm: 0.16, clearance_mm: 0.16", "gap_mm: 0.16, clearance_mm: 0.2")
+        self.netclass(pro, "USB3")["clearance"] = 0.2
+        problems = check_no_placeholder_geometry(pro, note)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("clearance", problems[0])
+
+    def test_a_stale_router_preset_is_reported(self):
+        pro = load_pro()
+        pro["board"]["design_settings"]["diff_pair_dimensions"].append(
+            {"gap": 0.2, "via_gap": 0.25, "width": 0.2})
+        problems = check_no_placeholder_geometry(pro, load_stackup_note())
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("preset", problems[0])
+
+    def test_a_documented_geometry_missing_from_the_presets_is_reported(self):
+        pro = load_pro()
+        presets = pro["board"]["design_settings"]["diff_pair_dimensions"]
+        del presets[2]
+        problems = check_no_placeholder_geometry(pro, load_stackup_note())
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("missing from the router", problems[0])
+
+    def test_a_note_without_the_machine_readable_block_is_reported(self):
+        note = load_stackup_note().replace("<!-- netclass-geometry -->", "")
+        problems = check_no_placeholder_geometry(load_pro(), note)
+        self.assertTrue(any("netclass-geometry" in p for p in problems))
+
+    def test_a_note_without_a_required_section_is_reported(self):
+        for heading in NOTE_REQUIRED_HEADINGS:
+            note = load_stackup_note().replace(heading, "## Renamed")
+            problems = check_no_placeholder_geometry(load_pro(), note)
+            self.assertTrue(any(heading in p for p in problems), heading)
+
+    def test_a_class_missing_from_the_project_is_reported(self):
+        pro = load_pro()
+        pro["net_settings"]["classes"] = [
+            c for c in pro["net_settings"]["classes"] if c["name"] != "MDI"]
+        problems = check_no_placeholder_geometry(pro, load_stackup_note())
+        self.assertTrue(any(p.startswith("MDI") and "no such net class" in p
+                            for p in problems), problems)
+
+    def test_the_formula_port_reproduces_the_pcbway_page_arithmetic(self):
+        # 89.938 and 98.886 ohm are what the page's own JavaScript returns
+        # for these inputs (run under Node, see stackup-note.md)
+        self.assertAlmostEqual(
+            pcbway_edge_coupled_zd(1.0, 0.1855, 0.23, 0.16, 4.74), 89.938,
+            places=2)
+        self.assertAlmostEqual(
+            pcbway_edge_coupled_zd(1.0, 0.1855, 0.20, 0.18, 4.74), 98.886,
+            places=2)
+
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_formula_port_agrees_with_the_page_function_itself(self):
+        # the page's JavaScript, unchanged, from the committed excerpt
+        script = HARDWARE / "fab" / "run_pcbway_page_formula.js"
+        for t, h, w, s, er in [(1, 0.1855, 0.23, 0.16, 4.74),
+                               (1, 0.1855, 0.20, 0.18, 4.74),
+                               (1, 0.1715, 0.15, 0.25, 4.5)]:
+            printed = subprocess.run(
+                ["node", str(script), str(t), str(h), str(w), str(s), str(er)],
+                check=True, capture_output=True, text=True).stdout
+            page = float(re.search(r"Zd = ([0-9.]+) ohm", printed).group(1))
+            self.assertAlmostEqual(
+                pcbway_edge_coupled_zd(t, h, w, s, er), page, delta=0.006)
 
 
 class MpnCoverageCanFail(unittest.TestCase):

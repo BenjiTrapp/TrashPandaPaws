@@ -1,0 +1,179 @@
+PCBWay source excerpts for hardware/fab/stackup-note.md
+=====================================================
+Retrieved 2026-11-02 with curl from www.pcbway.com. These are VERBATIM
+excerpts of the pages as served that day: "raw" sections are the page's own
+source lines; "text" sections have HTML tags removed and whitespace collapsed.
+Excerpts that stop mid-sentence end in "..."; that is where the excerpt was
+cut, not where the page stops. The full pages are NOT committed:
+PCBWay's pages carry a changing news block, so a re-fetch will not reproduce
+the md5 values below, only the excerpted passages. Nothing here is paraphrased;
+where the note interprets a passage, the note says so.
+
+----------------------------------------------------------------------
+[1] https://www.pcbway.com/pcb_prototype/impedance_calculator.html
+    full page as fetched: md5 cefc2bfc0484abc4ed9abb988aea1ba7 (301157 bytes)
+----------------------------------------------------------------------
+-- raw, lines 1490-1497: introduction and notes above the calculator
+                            With PCBWay impedance calculator, you can calculate the approximate impedance of your PCB / high frequency circuit board.
+                            The surface finish is neglected. We recommend the software from Polar Instruments if you want to get exact impedance calculation.<br/>
+
+                            Note: The results are only for approximation and rough estimation, the final values and the corresponding layer construction have to be calculated by us.
+                            The stackup information check <a href="https://www.pcbway.com/multi-layer-laminated-structure.html?tdsourcetag=s_pcqq_aiomsg" target="_blank">here.</a><br/>
+
+                            Instructions: Please select the value to be determined. You can then adjust the other parameters according to your needs.<br/>
+<strong>Note: For the three models — Microstrip, Edge Coupled, and Coplanar Waveguide, the outer layer impedance testing does not include the solder mask. If your design involves solder mask, we recommend using Shortcut to Si9000 software for calculation. <br/>You may also contact your sales representative, who can provide you with the relevant impedance stack-up information.</strong>
+
+-- raw, lines 4415-4486: the JavaScript function EdgeCoupledMicrostrip(), run by
+-- the "Edge Coupled Microstrip" calculator when an input changes, complete;
+-- and lines 4881-4884: fix(), which it calls to round to 0.01
+        function EdgeCoupledMicrostrip(val, fname) {
+            if (val.length == 0) {
+                $('#EdgeCoupledMicrostripZd').val('');
+            }
+            switch (fname) {
+                case "t":
+                    t = parseFloat(val);
+                    tunit = document.getElementById("EdgeCoupledMicrostript").getElementsByClassName("active")[0].dataset.val;
+                    break;
+                case "h":
+                    h = parseFloat(val);
+                    hunit = document.getElementById("EdgeCoupledMicrostriph").getElementsByClassName("active")[0].dataset.val;
+                    break;
+                case "s":
+                    s = parseFloat(val);
+                    sunit = document.getElementById("EdgeCoupledMicrostrips").getElementsByClassName("active")[0].dataset.val;
+                    break;
+                case "w":
+                    w = parseFloat(val);
+                    wunit = document.getElementById("EdgeCoupledMicrostripw").getElementsByClassName("active")[0].dataset.val;
+                    break;
+                case "Er":
+                    Er = parseFloat(val);
+                    break;
+                default:
+            }
+            var t0 = t * tunit;
+            var h0 = h * hunit;
+            var s0 = s * sunit;
+            var w0 = w * wunit;
+            if (!isNaN(t) && !isNaN(h) && !isNaN(s) && !isNaN(w) && !isNaN(Er)) {
+                with (Math) {
+                    Zo = 87 / sqrt(1.41 + Er) * log(5.98 * h0 / (0.8 * w0 + t0))
+                    Zd = 2 * Zo * (1 - 0.48 * exp(-0.96 * s0 / h0))
+                    Zo = fix(Zo)
+                    Zd = fix(Zd)
+                }
+                //Zd = 174 / Math.sqrt(Er + 1.41) * Math.log(5.98 * h0 / (0.8 * w0 + t0)) * (1 - 0.48 * Math.exp(-0.96 * s0 / h0));
+                $('#EdgeCoupledMicrostripZo')[0].value = parseFloat(Zo).toFixed(4);
+                $('#EdgeCoupledMicrostripZd')[0].value = parseFloat(Zd).toFixed(4);
+            }
+            $('.all-total-msg .msg').hide();
+            if (((w0 / h0) < 0.1) || ((w0 / h0) > 2.0)) {
+                $("#m-edge-im-warning-msg-tip .msg1").show();
+            } else {
+                if ((t0 < 0.1) || (t0 > 7)) {
+                    $("#m-edge-im-warning-msg-tip .msg2").show();
+                } else {
+                    if ((h0 < 1.0) || (h0 > 157)) {
+                        $("#m-edge-im-warning-msg-tip .msg3").show();
+                    } else {
+                        if ((w0 < 2) || (w0 > 1000)) {
+                            $("#m-edge-im-warning-msg-tip .msg4").show();
+                        } else {
+                            if ((s0 <= 0.0) || (s0 > 1000)) {
+                                $("#m-edge-im-warning-msg-tip .msg5").show();
+                            } else {
+                                if ((Er < 1.0) || (Er >= 15.0)) {
+                                    $("#m-edge-im-warning-msg-tip .msg6").show();
+                                } else {
+                                    if ((Zd < 0.0) || (Zd > 10000000)) {
+                                        $("#m-edge-im-warning-msg-tip .msg7").show();
+                                    } else {
+                                        $("#m-edge-im-warning-msg-tip .blank-msg").show();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        function fix(indata) {
+            with (Math) { utdata = round(indata * 100) / 100 }
+            return utdata
+        }
+
+-- raw: the unit factors (data-val) the page multiplies each input by, one
+-- list per input: t (EdgeCoupledMicrostript), h (...h), w (...w), s (...s)
+<ul class="down-val js-down-val" id="EdgeCoupledMicrostript">
+<li data-val="1.379" class="active">oz/ft²</li>
+<li data-val="1">mil</li>
+<li data-val="393">cm</li>
+<li data-val="39.3">mm</li>
+<li data-val="0.0393">μm</li>
+<li data-val="1000">inch</li>
+
+<ul class="down-val js-down-val" id="EdgeCoupledMicrostriph">
+<li data-val="1">mil</li>
+<li data-val="393">cm</li>
+<li data-val="39.3" class="active">mm</li>
+<li data-val="0.0393">μm</li>
+<li data-val="1000">inch</li>
+
+<ul class="down-val js-down-val" id="EdgeCoupledMicrostripw">
+<li data-val="1" class="active">mil</li>
+<li data-val="393">cm</li>
+<li data-val="39.3">mm</li>
+<li data-val="0.0393">μm</li>
+<li data-val="1000">inch</li>
+
+<ul class="down-val js-down-val" id="EdgeCoupledMicrostrips">
+<li data-val="1" class="active">mil</li>
+<li data-val="393">cm</li>
+<li data-val="39.3">mm</li>
+<li data-val="0.0393">μm</li>
+<li data-val="1000">inch</li>
+
+----------------------------------------------------------------------
+[2] https://www.pcbway.com/multi-layer-laminated-structure.html
+    full page as fetched: md5 441225e2dfeb2807b542b45ec7ed01d5 (5757654 bytes)
+    text: "PCB standard stackup" list, 4 Layers, Thickness 1.6MM, entries
+    1 to 3 of 112 (the entries with 1OZ outer and 1OZ inner copper)
+----------------------------------------------------------------------
+Friendly Reminder: This is a through-hole board stack-up, not applicable for blind and buried vias. PCBWay supports customers to customize structures, and will continue to increase the structure diagrams. | 4 Layers | Total: | 112 | View all | 1 | 4-layers PCB | Regular | Thickness: | 1.6MM | Finished Outer Copper: | 1OZ | Inner Copper: | 1OZ | Inner layer Residual copper ratio: | 70% | L1-CU | PP | L2-CU | CORE | L3-CU | PP | L4-CU | Layer | Material | Thickness | (mm) | Thickness after lamination(mm) | L1-CU | Outer Base Copper 0.5OZ | 0.0175 | 0.0175 | (Plating to 1OZ) | PP | 7628 RC46% | DK:4.74 | 0.1960 | 0.1855 | L2-CU | Inner Copper 1OZ | 0.0350 | 1.1 | (Core with Cu) | CORE | Core | DK:4.6 | 1.0300 | L3-CU | Inner Copper 1OZ | 0.0350 | PP | 7628 RC46% | DK:4.74 | 0.1960 | 0.1855 | L4-CU | Outer Base Copper 0.5OZ | 0.0175 | 0.0175 | (Plating to 1OZ) | Thickness after lamination: 1.51mm, tolerance: ±10%. | Finished PCB Thickness: 1.61mm, tolerance: ±10%. | Inner layer Residual copper ratio > 60%, it is suitable to choose a lamination structure with 70% inner layer Residual copper ratio. | 2 | 4-layers PCB | Regular | Thickness: | 1.6MM | Finished Outer Copper: | 1OZ | Inner Copper: | 1OZ | Inner layer Residual copper ratio: | 50% | L1-CU | PP | L2-CU | CORE | L3-CU | PP | L4-CU | Layer | Material | Thickness | (mm) | Thickness after lamination(mm) | L1-CU | Outer Base Copper 0.5OZ | 0.0175 | 0.0175 | (Plating to 1OZ) | PP | 7628 RC46% | DK:4.74 | 0.1960 | 0.1785 | L2-CU | Inner Copper 1OZ | 0.0350 | 1.1 | (Core with Cu) | CORE | Core | DK:4.6 | 1.0300 | L3-CU | Inner Copper 1OZ | 0.0350 | PP | 7628 RC46% | DK:4.74 | 0.1960 | 0.1785 | L4-CU | Outer Base Copper 0.5OZ | 0.0175 | 0.0175 | (Plating to 1OZ) | Thickness after lamination: 1.49mm, tolerance: ±10%. | Finished PCB Thickness: 1.59mm, tolerance: ±10%. | 40% | 3 | 4-layers PCB | Regular | Thickness: | 1.6MM | Finished Outer Copper: | 1OZ | Inner Copper: | 1OZ | Inner layer Residual copper ratio: | 30% | L1-CU | PP | L2-CU | CORE | L3-CU | PP | L4-CU | Layer | Material | Thickness | (mm) | Thickness after lamination(mm) | L1-CU | Outer Base Copper 0.5OZ | 0.0175 | 0.0175 | (Plating to 1OZ) | PP | 7628 RC46% | DK:4.74 | 0.1960 | 0.1715 | L2-CU | Inner Copper 1OZ | 0.0350 | 1.1 | (Core with Cu) | CORE | Core | DK:4.6 | 1.0300 | L3-CU | Inner Copper 1OZ | 0.0350 | PP | 7628 RC46% | DK:4.74 | 0.1960 | 0.1715 | L4-CU | Outer Base Copper 0.5OZ | 0.0175 | 0.0175 | (Plating to 1OZ) | Thickness after lamination: 1.48mm, tolerance: ±10%. | Finished PCB Thickness: 1.58mm, tolerance: ±10%. | Inner layer Residual copper ratio ≤ 40%, it is suitable to choose a lamination structure with 30% inner layer Residual copper ratio.
+
+----------------------------------------------------------------------
+[3] https://www.pcbway.com/capabilities.html
+    full page as fetched: md5 99631525a246844abb6787b283bdcdf9 (249681 bytes)
+    text (tags removed, whitespace collapsed)
+----------------------------------------------------------------------
+-- impedance control tolerance (row 35)
+35| impedance control| Impedance control tolerance| ±10%，50Ω and below：±5Ω| \| bow and twist| bow and twist tolerance| bow and twist≤0.75%| ...
+
+-- standard-PCB minimum trace and spacing
+Min Trace | 0.1mm/4mil | Min manufacturable trace is 4mil(0.1mm), Please view the below "Advanced PCB" or contact us if your board exceeds these. | Min Spacing | Min manufacturable spacing is 4mil(0.1mm), Please view the below "Advanced PCB" or contact us if your board exceeds these. | Outer Layer Copper Thickness | 1oz/2oz/3oz/4oz/5oz/6oz/7oz/8oz (35um/70um/105um/140um/175um/210um/245um/280um) | Also known as copper...
+
+-- Advanced PCB table: column headers
+Advanced PCB Capabilities - Advanced PCB| Categories | No.| Items | PCB process parameters | Remarks | Normal process | Medium difficulty | High difficulty | Non-standard review | Unable to make| product type| 1| Multilayer PCB Layers| 3L≤Layers≤16L|...
+
+-- Advanced PCB table: row 15, outer-layer minimum width/spacing
+15| The min width/spacing of outer layer (before compensation)| copper thickness 18um| ≥4/5 mil| ≥4/4 mil or parts 3.5/3.5mil| Local 3.5/3.5mil, only the distance from the GBA chip area line to the PAD| copper thickness 35um| ≥5/6 mil| ≥5/5 mil| copper thickness 70um| ≥7/8mil| ≥6/7mil| copper thickness 105um| ≥10/12 mil| ≥8/10 mil| 16| grid trace width/spacing| copper thickness 18um| ≥7/9 mil| ≥6/8 mil| copper thickn...
+
+----------------------------------------------------------------------
+[4] https://www.pcbway.com/pcb_prototype/Impedance_Control.html
+    full page as fetched: md5 0c921e891dbb85ee9bc076cae6bdb604 (197480 bytes)
+    text (tags removed, whitespace collapsed), one passage per line; the
+    four "stackup N#" lines belong to a figure that is an image on the page
+----------------------------------------------------------------------
+Dielectric constant: Dielectric constant is inversely proportional to impedance. A higher dielectric constant comes with a lower impedance. Dielectric constant is primarily controlled through material selection. Different board materials have distinct dielectric constants, which are related to the resin materials used. For instance, FR4 board materials have dielectric constants ranging from 3.9 to 4.5, decreasing with increasing frequency. PTFE board materials have dielectric constants ranging from 2.2 to 3.9. High-speed signal transmission requires higher impedance values, thus necessitating lower dielectric constants.
+Soldermask thickness: Soldermask thickness is inversely proportional to impedance. Within a certain range, the thicker the soldermask, the lower the impedance. Typically, printing one pass of solder mask reduces single-ended impedance by 2 ohms and differential impedance by 8 ohms. The reduction value doubles when printing two passes compared to one pass. After printing three times or more, the impedance value no longer changes.
+Consider copper balance and resin flow. When one side or both sides of the semi-cured sheets involve etched traces, during the lamination process, the resin will fill the gaps left by the etched traces, resulting in reduced resin thickness between the layers. The lower the copper balance, the more resin will be added, leaving less remaining. So, if you need a semi-cured sheet thickness of 5 mils between two layers, choose a slightly thicker semi-cured sheet based on the copper balance.
+Design stackup. The min. dielectric thickness between layers should be 50um.
+the trace/space width for stackup 1# is 70/130um;
+the trace/space width for stackup 2# is 95/140um;
+the trace/space width for stackup 3# is 125/130um;
+the trace/space width for stackup 4# is 105/150um.
+Choose wider trace width, not narrower. There is a limit to how narrow traces can be in the fabrication process, whereas there is no limit to how wide they can be. If, during fabrication, the PCB manufacturer needs to reduce the trace width to achieve a specific impedance and reaches the narrow limit, it can lead to complications. This might result in increased costs, relaxed impedance control, or design modifications. Therefore, when calculating, aiming for relatively wider trace width means slightly lower target impedance, for example, if the target impedance is 50 ohms, we should aim for around 49 ohms, avoiding calculations close to 51 ohms.
+Overall trends in impedance control. Our design may have multiple impedance control targets, either bias toward larger or bias toward smaller values. Avoid cases where, for example, the 100 ohms bias toward larger values and the 90 ohms biased toward smaller values.
+Communicate with the PCB manufacturer. Sometimes, there may be calculation errors in copper balance and resin flow, and the dielectric constant of new materials might not match the nominal values. Some PCB manufacturers may not have the required glass fabric in stock, leading to difficulties in implementing the stack-up or causing delays. When encountering such situations, the best approach is to communicate with the PCB manufacturer from the beginning of the design, asking them to design a stack-up based on the designer&#39;s requirements and their own experience. Through multiple rounds of communication and confirmation, an ideal stack-up can be achieved with a few iterations, which will facilitate the subsequent design process.
