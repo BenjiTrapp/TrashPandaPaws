@@ -742,8 +742,11 @@ class TestLifecycleEndpoints(_ServiceCase):
             self.assertEqual(resp.status, 404, verb)
 
     async def test_paused_and_running_are_told_apart_in_the_list(self):
+        # Its own beacon: two campaigns do not share one.
+        self.rig.c2.agents["raccoon-owl"] = dict(
+            self.rig.c2.agents["raccoon-fox"], id="raccoon-owl")
         first = await self.start_campaign()
-        second = await self.start_campaign()
+        second = await self.start_campaign(beacons=["raccoon-owl"])
         await self.post("/campaign/%d/pause" % first)
         await self._paused(first)
         states = await self.campaign_states()

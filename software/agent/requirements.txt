@@ -15,6 +15,14 @@
 
 aiohttp>=3.9.0
 
+# Cron parsing for the scheduler. Hand-rolling five fields is tempting and
+# about eighty lines, and the reason not to is the day-of-month/day-of-week
+# interaction: when both are set, cron means OR, not AND — `0 0 13 * 5` fires
+# every Friday *and* on the 13th. Getting that wrong fires a campaign outside
+# an agreed testing window, which is a rules-of-engagement problem rather
+# than an inconvenience. Pure Python, no transitive dependencies.
+croniter>=1.4.0
+
 # Inherited from the C2's set, listed so this file stands alone.
 requests>=2.31.0
 pyyaml>=6.0

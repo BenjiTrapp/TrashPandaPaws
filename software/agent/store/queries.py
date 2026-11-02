@@ -311,6 +311,122 @@ def get_script_by_name(conn, name) -> Optional[Dict[str, Any]]:
     return _one(conn.execute("SELECT * FROM scripts WHERE name = ?", (name,)).fetchone())
 
 
+# ── Schedules ──
+
+_RESULT_MAX = 200
+
+
+def _next_run(expression: str, after: Optional[datetime] = None) -> str:
+    # Imported here, not at the top: the scheduler imports this module, and
+    # cron arithmetic belongs with the scheduler. Moving it here would put a
+    # dependency on croniter into the one module every other part of the
+    # agent reads the store through.
+    from software.agent import scheduler
+    return scheduler.next_occurrence(expression, after)
+
+
+def create_schedule(conn, prompt, config_json, schedule) -> int:
+    """Store a recurring task; the id is the table's integer rowid.
+
+    `schedule` is not checked here beyond what computing the first run
+    demands: an expression croniter rejects raises, and nothing is stored.
+    The service validates first so the operator gets a readable reason.
+    """
+    next_run = _next_run(schedule)
+    cur = conn.execute(
+        "INSERT INTO scheduled_tasks (prompt, config_json, schedule, next_run, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (prompt, config_json, schedule, next_run, _now()))
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_schedule(conn, sid) -> Optional[Dict[str, Any]]:
+    return _one(conn.execute(
+        "SELECT * FROM scheduled_tasks WHERE id = ?", (sid,)).fetchone())
+
+
+def list_schedules(conn) -> List[Dict[str, Any]]:
+    return _dicts(conn.execute("SELECT * FROM scheduled_tasks ORDER BY id"))
+
+
+def delete_schedule(conn, sid) -> bool:
+    cur = conn.execute("DELETE FROM scheduled_tasks WHERE id = ?", (sid,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def pause_schedule(conn, sid) -> bool:
+    cur = conn.execute(
+        "UPDATE scheduled_tasks SET status = 'paused' "
+        "WHERE id = ? AND status = 'active'", (sid,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def resume_schedule(conn, sid) -> bool:
+    """Reactivate, with the next run counted from now.
+
+    Not from where it was left: a schedule paused for a week would otherwise
+    come back due, and run at once, at a moment nobody chose.
+    """
+    row = get_schedule(conn, sid)
+    if row is None or row["status"] != "paused":
+        return False
+    conn.execute(
+        "UPDATE scheduled_tasks SET status = 'active', next_run = ? WHERE id = ?",
+        (_next_run(row["schedule"]), sid))
+    conn.commit()
+    return True
+
+
+def get_due_schedules(conn) -> List[Dict[str, Any]]:
+    return _dicts(conn.execute(
+        "SELECT * FROM scheduled_tasks WHERE status = 'active' AND next_run <= ? "
+        "ORDER BY next_run, id", (_now(),)))
+
+
+def advance_schedule(conn, sid, last_result, *, ran=True) -> None:
+    """Move next_run on, and record what happened.
+
+    To the first slot after both now and the old next_run: after the old one
+    so it always moves, after now so a slot that was missed is gone and not
+    queued behind the one that was caught. `ran=False` is for a slot that was
+    passed over; last_run then keeps naming the last time something started.
+    """
+    row = get_schedule(conn, sid)
+    if row is None:
+        return
+    after = max(datetime.now(timezone.utc),
+                datetime.fromisoformat(row["next_run"]))
+    conn.execute(
+        "UPDATE scheduled_tasks SET next_run = ?, last_result = ?, last_run = ? "
+        "WHERE id = ?",
+        (_next_run(row["schedule"], after), last_result[:_RESULT_MAX],
+         _now() if ran else row["last_run"], sid))
+    conn.commit()
+
+
+def set_schedule_running(conn, sid, run_id) -> None:
+    conn.execute("UPDATE scheduled_tasks SET running_run_id = ? WHERE id = ?",
+                 (run_id, sid))
+    conn.commit()
+
+
+def finish_schedule(conn, sid, run_id, last_result) -> bool:
+    """Clear the running mark and record how the run ended.
+
+    Only if the row still names `run_id`: two callers settling the same run,
+    or a row started again in between, must not both write.
+    """
+    cur = conn.execute(
+        "UPDATE scheduled_tasks SET running_run_id = NULL, last_result = ? "
+        "WHERE id = ? AND running_run_id = ?",
+        (last_result[:_RESULT_MAX], sid, run_id))
+    conn.commit()
+    return cur.rowcount > 0
+
+
 # ── CVE cache ──
 
 def cache_cves(conn, cache_key, source, entries) -> int:

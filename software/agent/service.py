@@ -13,11 +13,16 @@ sit at the root:
     POST /campaign/<id>/approve          {"approval_id", "allowed"}
     POST /campaign/<id>/pause | resume | stop
 
+    GET  /schedules                      every schedule, with its last result
+    POST /schedules                      {"schedule", "prompt", "campaign"}
+    DELETE /schedules/<id>
+    POST /schedules/<id>/pause | resume
+
 Errors are `{"error": ...}` with a status that says what kind: 400 for a form
-that cannot be used, 401/403 for the token, 404 for an unknown run or
-approval, 409 for a state change that does not apply, 503 for a service or a
-C2 that is not ready. A 503 from POST /campaign also carries `reason`, which
-is what /status reports.
+that cannot be used, 401/403 for the token, 404 for an unknown run, approval
+or schedule, 409 for a state change that does not apply or a beacon that
+another campaign holds, 503 for a service or a C2 that is not ready. A 503
+from POST /campaign also carries `reason`, which is what /status reports.
 
 No response carries a secret. /status names the provider and the model, never
 the key, and /beacons passes on a fixed list of fields rather than whatever
@@ -40,9 +45,10 @@ from typing import Any, Dict, List, Optional
 
 from aiohttp import web
 
-from software.agent import c2client, config
+from software.agent import c2client, config, scheduler
 from software.agent.llm import provider
 from software.agent.orchestrator import Campaign, restore_orphans
+from software.agent.store import queries
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,10 @@ TOKEN_HEADER = "X-Agent-Token"
 # boundary because nobody looked.
 _BEACON_FIELDS = ("id", "hostname", "os", "arch", "user", "status",
                   "interval", "uplink_iface")
+
+# How long a schedule's description may be. It is shown in a list and in a
+# notification; it is not given to the model.
+_PROMPT_MAX = 500
 
 
 # ── Responses ──
@@ -276,6 +286,18 @@ class _Service:
                 form, tier=self.cfg.capability_tier)
         except config.ConfigError as exc:
             return _error(400, str(exc))
+        # After the form, so a bad one is still a 400, and before anything is
+        # created. Nothing from here to manager.add() suspends (start() has no
+        # suspension point either), so no other request can start a campaign
+        # in the gap.
+        held = scheduler.beacons_in_use(self.manager)
+        for beacon in campaign_cfg.beacons:
+            if beacon in held:
+                # 409, not 400: the form is fine, the state is not. Paused
+                # campaigns hold their beacons too; they will be resumed.
+                return _error(409, "beacon %s is already in use by campaign %d"
+                                   % (beacon, held[beacon]),
+                              run_id=held[beacon])
         try:
             client = self.client_factory(self.cfg)
         except provider.ProviderError as exc:
@@ -375,6 +397,76 @@ class _Service:
         campaign.stop()
         return _json({"run_id": campaign.run_id, "status": campaign.state})
 
+    # ── Schedules ──
+
+    async def list_schedules(self, request):
+        return _json({"schedules": [_schedule(row)
+                                    for row in queries.list_schedules(self.conn)]})
+
+    async def create_schedule(self, request):
+        try:
+            body = await request.json()
+        except ValueError:
+            return _error(400, "the request body is not valid JSON")
+        if not isinstance(body, dict):
+            return _error(400, "the request body must be a JSON object")
+        # Everything is checked now. The alternative is finding out at the
+        # first slot, at whatever hour that is, that nothing will ever fire.
+        expression = body.get("schedule")
+        problem = scheduler.validate_cron(expression)
+        if problem is not None:
+            return _error(400, problem)
+        prompt = body.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return _error(400, "prompt must be a non-empty description of the "
+                               "schedule")
+        if len(prompt) > _PROMPT_MAX:
+            return _error(400, "prompt is longer than %d characters"
+                               % _PROMPT_MAX)
+        try:
+            campaign_cfg = config.CampaignConfig.from_form(
+                body.get("campaign"), tier=self.cfg.capability_tier)
+        except config.ConfigError as exc:
+            return _error(400, str(exc))
+        sid = queries.create_schedule(
+            self.conn, prompt.strip(),
+            json.dumps(scheduler.campaign_form(campaign_cfg)),
+            " ".join(expression.split()))
+        return _json({"id": sid,
+                      "next_run": queries.get_schedule(self.conn, sid)["next_run"]})
+
+    def _find_schedule(self, request) -> Optional[Dict[str, Any]]:
+        return queries.get_schedule(self.conn, int(request.match_info["sid"]))
+
+    async def delete_schedule(self, request):
+        row = self._find_schedule(request)
+        if row is None:
+            return _error(404, "no such schedule")
+        # The row only: a campaign it started is not stopped. That run is the
+        # operator's to stop, and is listed with the others.
+        queries.delete_schedule(self.conn, row["id"])
+        return _json({"id": row["id"]})
+
+    async def pause_schedule(self, request):
+        row = self._find_schedule(request)
+        if row is None:
+            return _error(404, "no such schedule")
+        if not queries.pause_schedule(self.conn, row["id"]):
+            return _error(409, "only an active schedule can be paused "
+                               "(this one is %s)" % row["status"])
+        return _json({"id": row["id"], "status": "paused"})
+
+    async def resume_schedule(self, request):
+        row = self._find_schedule(request)
+        if row is None:
+            return _error(404, "no such schedule")
+        if not queries.resume_schedule(self.conn, row["id"]):
+            return _error(409, "only a paused schedule can be resumed "
+                               "(this one is %s)" % row["status"])
+        return _json({"id": row["id"], "status": "active",
+                      "next_run": queries.get_schedule(
+                          self.conn, row["id"])["next_run"]})
+
 
 def _beacon(agent) -> Dict[str, Any]:
     out = {key: agent.get(key) for key in _BEACON_FIELDS}
@@ -388,6 +480,16 @@ def _approval(row) -> Dict[str, Any]:
             "requested_at": row["requested_at"],
             "classification": _loads(row["classification_json"]),
             "ev": _loads(row["ev_json"])}
+
+
+def _schedule(row) -> Dict[str, Any]:
+    # A named handful, as with beacons. `campaign` is the stored form, which
+    # holds the campaign's settings and, by how it is built, nothing else.
+    out = {key: row[key] for key in (
+        "id", "prompt", "schedule", "status", "next_run", "last_run",
+        "last_result", "running_run_id", "created_at")}
+    out["campaign"] = _loads(row["config_json"])
+    return out
 
 
 # ── Startup and shutdown ──
@@ -461,12 +563,31 @@ def make_app(cfg, conn, c2, manager, *,
         web.post(r"/campaign/{run_id:\d+}/pause", service.pause),
         web.post(r"/campaign/{run_id:\d+}/resume", service.resume),
         web.post(r"/campaign/{run_id:\d+}/stop", service.stop),
+        web.get("/schedules", service.list_schedules),
+        web.post("/schedules", service.create_schedule),
+        web.delete(r"/schedules/{sid:\d+}", service.delete_schedule),
+        web.post(r"/schedules/{sid:\d+}/pause", service.pause_schedule),
+        web.post(r"/schedules/{sid:\d+}/resume", service.resume_schedule),
     ])
 
+    # A list and not an attribute of the app: setting a key on an application
+    # that has started is deprecated, and startup is exactly when this is set.
+    polling = []  # type: List[asyncio.Task]
+
     async def _startup(_app):
+        # In this order: the poll must not see a run that restore_orphans is
+        # about to mark failed, nor start one it would then take for a crash.
         await on_startup(cfg, conn, c2, manager)
+        polling.append(scheduler.start_loop(
+            conn, manager, cfg, c2=c2, client_factory=client_factory))
 
     async def _cleanup(_app):
+        # Before the campaigns are stopped: a poll running during the
+        # shutdown could start one the stop below would not know about.
+        for task in polling:
+            task.cancel()
+        await asyncio.gather(*polling, return_exceptions=True)
+        polling.clear()
         await _stop_running(manager)
 
     app.on_startup.append(_startup)
