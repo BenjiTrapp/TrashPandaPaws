@@ -16,10 +16,29 @@ What this does:
   * thermal via array under U3's exposed pad, tented from the back
   * GND stitching vias around the board
 
-What this deliberately does NOT do: route anything. The seven differential
-pairs need KiCad's interactive differential-pair router with a human deciding
-geometry and length matching. An autorouted result would be an unverifiable
-artefact - see OPEN_QUESTIONS.md.
+It places; it does not route. Routing is done by tools/route_pcb.py, as
+targeted geometry written on purpose and checked with kicad-cli's DRC and
+kicad-happy's EMC analysis (decision: docs/superpowers/specs/
+2026-10-30-raccoon-tap-fab-release-design.md, section 6.3).
+
+FROZEN ONCE ROUTED. This script builds the board from nothing (NewBoard), so
+a run over a routed board deletes every track and via of the routing. It
+therefore counts the track segments in the target file first and refuses,
+with a non-zero exit, when there are any. `--force` is the deliberate way
+past that refusal, for someone who means to throw the routing away. Once the
+board is routed, geometry lives in the board and connectivity in
+netlist.yaml: a net change goes into netlist.yaml and reaches the board via
+the schematic (Update PCB from Schematic), never via this script.
+
+SUPERSEDED (kept as the record of the earlier decision; section 6.3 of the
+spec explains why it was reversed): "What this deliberately does NOT do:
+route anything. The seven differential pairs need KiCad's interactive
+differential-pair router with a human deciding geometry and length matching.
+An autorouted result would be an unverifiable artefact - see
+OPEN_QUESTIONS.md." The FreeRouting half of that objection still stands and
+no autorouter is used; the "unverifiable" half no longer holds, because the
+routed result is checked (DRC, kicad-happy skew, reference-plane and
+decoupling checks) rather than trusted.
 
 MUST be run with KiCad's bundled Python, which has the pcbnew bindings:
 
@@ -29,13 +48,13 @@ Versions/3.9/bin/python3 tools/gen_pcb.py
 
 import argparse
 import math
+import re
 import sys
 from pathlib import Path
 
-try:
-    import pcbnew
-except ImportError:
-    sys.exit("error: pcbnew not importable - run this with KiCad's bundled Python")
+# Imported in main(), after the guard against overwriting a routed board, so
+# that the guard works under any interpreter.
+pcbnew = None
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -606,12 +625,40 @@ def build(netlist, out_path):
             "nets": len(net_objects), "report": report}
 
 
+def routed_track_count(path):
+    """Track segments and arcs in an existing board file (0 if there is none)."""
+    path = Path(path)
+    if not path.exists():
+        return 0
+    return len(re.findall(r"^\s*\((?:segment|arc)\b", path.read_text(), re.M))
+
+
 def main():
+    global pcbnew
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("netlist", nargs="?", default=str(DEFAULT_NETLIST))
     parser.add_argument("--out", default=str(DEFAULT_OUT))
+    parser.add_argument("--force", action="store_true",
+                        help="overwrite a routed board, discarding its routing")
     args = parser.parse_args()
+
+    tracks = routed_track_count(args.out)
+    if tracks and not args.force:
+        print(f"error: {args.out} ist geroutet ({tracks} Leiterbahnsegmente); "
+              "gen_pcb.py baut das Board neu auf und wuerde das Routing vernichten. "
+              f"The board is routed ({tracks} track segments) and this run would "
+              "destroy the routing: change geometry in the board and connectivity "
+              "in netlist.yaml. Pass --force only if you mean to throw the "
+              "routing away.", file=sys.stderr)
+        return 3
+    try:
+        import pcbnew as _pcbnew
+    except ImportError:
+        print("error: pcbnew not importable - run this with KiCad's bundled Python",
+              file=sys.stderr)
+        return 1
+    pcbnew = _pcbnew
 
     sys.path.insert(0, str(HARDWARE))
     import yaml
@@ -626,7 +673,7 @@ def main():
         print(f"  UNPLACED       {stats['unplaced']} (parked off-board)")
     for line in stats["report"]:
         print(f"  note: {line}")
-    print("\nNot routed. Verify with:")
+    print("\nNot routed (tools/route_pcb.py routes). Verify with:")
     print(f"  kicad-cli pcb drc --severity-all {args.out}")
     return 0
 

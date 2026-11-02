@@ -76,6 +76,8 @@ STACKUP_NOTE = HARDWARE / "fab" / "stackup-note.md"
 DRU = HARDWARE / "kicad" / "raccoon-tap.kicad_dru"
 GEN_BOM = HARDWARE / "tools" / "gen_bom.py"
 GEN_SCHEMATIC = HARDWARE / "tools" / "gen_schematic.py"
+GEN_PCB = HARDWARE / "tools" / "gen_pcb.py"
+PCB = HARDWARE / "kicad" / "raccoon-tap.kicad_pcb"
 
 # A USB device may present at most 10 uF of capacitance across VBUS at attach
 # (the USB inrush limit). Limit as stated in the release plan, Task 5.
@@ -1599,6 +1601,54 @@ class MdiPairsStayInTheirCableGroup(unittest.TestCase):
         netlist["components"]["J2"]["pins"][7]["note"] = "PHY side, pair 3"
         problems = mdi_group_problems(netlist)
         self.assertTrue(any("no 'cable J<n>'" in p for p in problems), problems)
+
+
+def run_gen_pcb_on_routed_board(extra_args=(), routed=True):
+    """Run tools/gen_pcb.py against a copy of the committed board, given one
+    track segment if `routed`. The guard has to act before pcbnew is imported,
+    so this runs under the interpreter of the test suite, which has no pcbnew:
+    without the guard the script gets as far as the import and fails there.
+    Returns the CompletedProcess plus whether the target file was left as it
+    was."""
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "raccoon-tap.kicad_pcb"
+        text = PCB.read_text()
+        if routed:
+            net = re.search(r'\(net\s+"([^"]+)"\)', text).group(1)
+            segment = ('\t(segment\n\t\t(start 120 100)\n\t\t(end 121 100)\n'
+                       '\t\t(width 0.2)\n\t\t(layer "F.Cu")\n'
+                       f'\t\t(net "{net}")\n'
+                       '\t\t(uuid "00000000-0000-0000-0000-000000000001")\n\t)\n')
+            text = text[:text.rstrip().rindex(")")] + segment + ")\n"
+        target.write_text(text)
+        result = subprocess.run([sys.executable, str(GEN_PCB), "--out", str(target),
+                                 *extra_args], capture_output=True, text=True)
+        result.untouched = target.read_text() == text
+        return result
+
+
+class RoutedBoardIsFrozen(unittest.TestCase):
+    """From task 9 on the geometry lives in the board: gen_pcb.py builds a new
+    board from nothing, so one run would delete every track."""
+
+    def test_gen_pcb_refuses_to_overwrite_a_routed_board(self):
+        result = run_gen_pcb_on_routed_board()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("geroutet", result.stderr)
+        self.assertIn("--force", result.stderr)
+        self.assertTrue(result.untouched)
+
+    def test_the_refusal_is_the_guard_and_not_a_missing_pcbnew(self):
+        result = run_gen_pcb_on_routed_board()
+        self.assertNotIn("pcbnew", result.stderr)
+
+    def test_force_is_the_deliberate_way_past_the_guard(self):
+        result = run_gen_pcb_on_routed_board(["--force"])
+        self.assertNotIn("geroutet", result.stderr)
+
+    def test_an_unrouted_board_is_not_refused(self):
+        result = run_gen_pcb_on_routed_board(routed=False)
+        self.assertNotIn("geroutet", result.stderr)
 
 
 if __name__ == "__main__":
