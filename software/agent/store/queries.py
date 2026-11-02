@@ -1,5 +1,6 @@
 """All SQL access for the agent store, as plain functions over a connection."""
 
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -297,6 +298,45 @@ def search_scripts(conn, query, limit) -> List[Dict[str, Any]]:
 
 def get_script_by_name(conn, name) -> Optional[Dict[str, Any]]:
     return _one(conn.execute("SELECT * FROM scripts WHERE name = ?", (name,)).fetchone())
+
+
+# ── CVE cache ──
+
+def cache_cves(conn, cache_key, source, entries) -> int:
+    """Replace whatever is cached under cache_key with `entries`.
+
+    Replaced rather than appended to: a refetch after the TTL would otherwise
+    leave the stale rows beside the fresh ones, and the lookup could not tell
+    which to believe. One timestamp for the batch, because they were fetched
+    together.
+    """
+    now = _now()
+    try:
+        conn.execute("DELETE FROM cve_cache WHERE cache_key = ?", (cache_key,))
+        for entry in entries:
+            conn.execute(
+                "INSERT INTO cve_cache (cache_key, cve_id, description, cvss_score, "
+                "cvss_vector, severity, references_json, published, source, fetched_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (cache_key, entry["cve_id"], entry.get("description") or "",
+                 entry.get("cvss_score"), entry.get("cvss_vector"),
+                 entry.get("severity"),
+                 json.dumps(entry.get("references") or []),
+                 entry.get("published"), source, now))
+    except Exception:
+        # Half a batch under one key would read as the complete answer.
+        conn.rollback()
+        raise
+    conn.commit()
+    return len(entries)
+
+
+def get_cached_cves(conn, cache_key, max_age_days) -> List[Dict[str, Any]]:
+    cutoff = _iso(datetime.now(timezone.utc) - timedelta(days=max_age_days))
+    return _dicts(conn.execute(
+        "SELECT * FROM cve_cache WHERE cache_key = ? AND fetched_at >= ? "
+        "ORDER BY cvss_score IS NULL, cvss_score DESC, cve_id",
+        (cache_key, cutoff)))
 
 
 # ── LLM accounting ──
