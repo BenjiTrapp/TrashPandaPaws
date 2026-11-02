@@ -55,6 +55,28 @@ _GLOB_CHARS = frozenset("*?[]")
 # of a word or after @ / , = and before the end or : / ,
 _BRACKETED_V6 = re.compile(r"(?:^|(?<=[@/,=]))\[([0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)\](?=$|[:/,])")
 _PUNCT = frozenset("();<>|&")
+# A bare number is a port or a count only as the value of a flag known to take
+# one. After any other flag (-sV 22, --open 22) it is a target: nmap reads 22
+# as 0.0.0.22. An unlisted flag therefore refuses the command, never passes it.
+_NUMERIC_FLAGS = frozenset((
+    "-p", "--port", "--ports", "--top-ports", "--max-rate", "--min-rate",
+    "--max-retries", "--host-timeout", "--max-rtt-timeout", "--min-rtt-timeout",
+    "--initial-rtt-timeout", "--max-parallelism", "--min-parallelism",
+    "--max-hostgroup", "--min-hostgroup", "--scan-delay", "--max-scan-delay",
+    "--mtu", "--data-length", "--ttl", "--source-port", "-g", "-T", "--rate",
+    "--retries", "--threads", "-t", "--timeout", "--wait", "--connect-timeout",
+    "--delay", "--jitter"))
+# Programs whose first positional argument is a number, with the flags of their
+# own that take a value. The exemption ends at the first other positional
+# word, so `timeout 60 nmap -n 22` still refuses the 22.
+_NUMBER_FIRST = {
+    "timeout": ("-s", "--signal", "-k", "--kill-after"),
+    "sleep": (),
+    "head": ("-n", "-c", "--lines", "--bytes"),
+    "tail": ("-n", "-c", "--lines", "--bytes"),
+    "nice": ("-n", "--adjustment"),
+}
+_DURATION = re.compile(r"\d+(?:\.\d+)?[smhd]?", re.ASCII)
 # A file descriptor glued to a redirect (2>&1, 1>out) at the start of a word.
 # `nmap 22 > out` has a space, so the 22 stays an argument and is refused.
 _REDIRECT_FD = re.compile(r"(?<![^\s;|&(])\d(?=[<>])", re.ASCII)
@@ -195,15 +217,14 @@ def _scan_value(value: str, found, unknown, bare, after_flag: bool = False) -> N
         value = host
     elif "@" in value:
         value = value.rpartition("@")[2]
-        if not value:
-            unknown.append(value_in)
-            return
     pieces = value.split(",")
+    named = False
     for piece in pieces:
         if piece.startswith("[") and piece.endswith("]"):
             piece = piece[1:-1]
         if not piece:
             continue
+        named = True
         kind = _classify(piece, len(pieces) == 1, "." in value, after_flag)
         if kind in (_UNKNOWN, _PATH):
             unknown.append(piece)
@@ -211,6 +232,8 @@ def _scan_value(value: str, found, unknown, bare, after_flag: bool = False) -> N
             found.append(piece)
         elif kind == _BARE:
             bare.append(piece)
+    if not named:  # `10.0.9.5@` and `10.0.9.5@,` name nothing to check
+        unknown.append(value_in)
 
 
 def _scan(command) -> Tuple[List[str], List[str], List[str]]:
@@ -223,25 +246,43 @@ def _scan(command) -> Tuple[List[str], List[str], List[str]]:
     except ValueError:
         return found, [command[:_CLIP]], bare
     at_start, skip_next, after_flag = True, False, False
+    fresh, wrapper, options_ended = True, "", False  # fresh: a command's first word
     for word in words:
         if not word:
             continue
         if set(word) <= _PUNCT:
             at_start, skip_next, after_flag = True, ">" in word, False
+            fresh, wrapper, options_ended = True, "", False
             if "<" in word:
                 unknown.append(word)
             continue
         if skip_next:
-            skip_next = after_flag = False
+            skip_next = after_flag = fresh = False
             continue
         is_program, at_start = at_start, False
+        starts_command, fresh = fresh, False
         follows_flag = after_flag
-        after_flag = word.startswith("-") and "=" not in word
+        is_flag = word.startswith("-") and word != "-" and not options_ended
+        if word == "--" and not options_ended:
+            options_ended = True
+            after_flag = False
+            continue
+        own_flags = _NUMBER_FIRST.get(wrapper, ())
+        after_flag = is_flag and (word in _NUMERIC_FLAGS or word in own_flags)
+        spare_number = (wrapper and not starts_command and not is_flag
+                        and not follows_flag and _DURATION.fullmatch(word))
+        if starts_command:
+            name = word.rsplit("/", 1)[-1].lower()
+            wrapper = name if name in _NUMBER_FIRST else ""
+        elif not is_flag and not follows_flag:
+            wrapper = ""
+        if spare_number:
+            continue
         if not word.isascii() or _is_dynamic(word):
             unknown.append(word)
         elif word == "-":
             unknown.append(word)
-        elif word.startswith("-"):
+        elif is_flag:
             flag, _, value = word.partition("=")
             if flag.lower() in _TARGET_FLAGS or flag.startswith(_TARGET_FLAG_PREFIXES):
                 unknown.append(word)
@@ -317,22 +358,22 @@ class Scope:
     def _check_host(self, name: str, addr) -> Optional[str]:
         if addr is None:
             return ("hostname '%s' has no finding tying it to an address; "
-                    "use its IP address" % name)
+                    "use its IP address" % _clip(name))
         try:
             if not isinstance(addr, str):
                 raise ValueError(addr)
             ip = ipaddress.ip_address(addr)
         except ValueError:
-            return "hostname '%s' resolves to %r, which is not a single address" % (
-                name, addr)
+            return "hostname '%s' resolves to %s, which is not a single address" % (
+                _clip(name), _clip(repr(addr)))
         return self._verdict("%s (%s)" % (name, addr), [_as_network(ip)])
 
     def _verdict(self, label: str, nets) -> Optional[str]:
         for net in nets:
             for denied in self._deny:
                 if _overlaps(net, denied):
-                    return "'%s' overlaps the denied range %s" % (label, denied)
+                    return "'%s' overlaps the denied range %s" % (_clip(label), denied)
             if not any(_contains(a, net) for a in self._allow):
                 return "'%s' is not entirely inside the authorised ranges (%s)" % (
-                    label, ", ".join(str(a) for a in self._allow) or "none")
+                    _clip(label), ", ".join(str(a) for a in self._allow) or "none")
         return None

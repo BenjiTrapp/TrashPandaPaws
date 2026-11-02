@@ -482,6 +482,88 @@ class TestCleanupRefusals(unittest.TestCase):
         self.assertLess(len(reason), 400)
 
 
+class TestFlagArity(unittest.TestCase):
+    """A bare number is a port or count only after a flag that takes one."""
+
+    def _passes(self, cmds):
+        for cmd in cmds:
+            self.assertIsNone(_scope().check(cmd, _none), cmd)
+
+    def _refused(self, cmds):
+        for cmd in cmds:
+            reason = _scope().check(cmd, _none)
+            self.assertIsNotNone(reason, cmd)
+            self.assertIn("cannot verify", reason, cmd)
+
+    def test_number_after_a_boolean_flag_is_a_target(self):
+        self._refused(("nmap -sV 22", "nmap -Pn 22", "nmap -v 80", "nmap -sS 5",
+                       "nmap --open 22", "nmap -n 22"))
+
+    def test_number_after_a_numeric_flag_is_a_value(self):
+        self._passes(("nmap -p 22 10.0.1.5", "nmap --top-ports 100 10.0.1.5",
+                      "nmap -T 4 10.0.1.5", "nmap --host-timeout 30 10.0.1.5",
+                      "nmap --ttl 64 10.0.1.5", "nmap --open=22 10.0.1.5"))
+
+    def test_double_dash_ends_option_parsing(self):
+        self._refused(("nmap 10.0.1.5 -- 22", "nmap -- -p 22",
+                       "nmap 10.0.1.5 -p 22 -- 80"))
+        self._passes(("nmap 10.0.1.5 -- 10.0.1.6",))
+
+    def test_number_exemption_is_per_command_not_sticky(self):
+        # -p is numeric only as its own flag; the 22 here follows -sV.
+        self._refused(("nmap -p 80 -sV 22",))
+
+    def test_the_number_wrappers_take_their_first_argument(self):
+        self._passes(("timeout 60 nmap 10.0.1.5", "timeout -s TERM 60 nmap 10.0.1.5",
+                      "timeout -k 5 60 nmap 10.0.1.5", "/usr/bin/timeout 60 nmap 10.0.1.5",
+                      "sleep 5; nmap 10.0.1.5", "sleep 1.5 && nmap 10.0.1.5",
+                      "nmap 10.0.1.5 && sleep 2", "nmap 10.0.1.5 | head 5",
+                      "nmap 10.0.1.5 | head -n 5", "nmap 10.0.1.5 | tail -n 20",
+                      "nice -n 10 nmap 10.0.1.5"))
+
+    def test_the_wrapper_exemption_does_not_reach_the_wrapped_command(self):
+        self._refused(("timeout 60 nmap 22", "timeout 60 nmap -n 22",
+                       "nice -n 10 nmap -n 22", "sleep 5 && nmap 22",
+                       "sleep 5 nmap 22", "nmap 10.0.1.5 | head 5 22"))
+
+    def test_a_wrapper_name_elsewhere_exempts_nothing(self):
+        # Only the program at the start of a command takes the exemption.
+        self._refused(("nmap sleep 5", "nmap 10.0.1.5 > out head 22",
+                       "nmap 10.0.1.5 head 5"))
+
+    def test_known_over_refusals(self):
+        # Fail-closed costs, pinned so a change to them is deliberate.
+        self._refused(("sudo timeout 60 nmap 10.0.1.5", "FOO=1 sleep 5",
+                       "ping -c 4 10.0.1.5", "curl -m 5 http://10.0.1.5"))
+
+    def test_at_sign_with_only_separators_after_it_is_refused(self):
+        for cmd in ("nmap 10.0.9.5@,", "nmap 10.0.9.5@,,", "nmap 10.0.9.5@[]"):
+            self.assertIn("cannot verify", _scope().check(cmd, _none) or "", cmd)
+
+
+class TestReasonsAreBounded(unittest.TestCase):
+    """No path echoes attacker-shaped text without a ceiling."""
+
+    LONG = "a" * 5000
+
+    def test_unnamed_hostname_is_clipped(self):
+        reason = _scope().check("nmap %s.com" % self.LONG, _none)
+        self.assertIn("no finding", reason)
+        self.assertLess(len(reason), 400)
+
+    def test_multi_address_resolution_is_clipped(self):
+        reason = _scope().check("nmap dc01.corp", lambda host: "10.0.1.5 " * 1000)
+        self.assertIn("not a single address", reason)
+        self.assertLess(len(reason), 400)
+
+    def test_verdict_label_is_clipped(self):
+        host = self.LONG + ".com"
+        for addr in ("10.0.9.5", "192.0.2.1"):  # denied, then outside the allowlist
+            reason = _scope().check("nmap " + host, lambda h, a=addr: a)
+            self.assertIsNotNone(reason, addr)
+            self.assertLess(len(reason), 400, addr)
+
+
 class TestScopeConstruction(unittest.TestCase):
     def test_malformed_allow_entry_raises(self):
         with self.assertRaises(ValueError):
