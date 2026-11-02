@@ -570,6 +570,62 @@ class TestAvEnumerationStillReportsThroughTheLegacyEndpoint(ServerTestBase):
             self._operator_post_raw("/api/server/avenum", {}).status_code, 400)
 
 
+class TestRunEvictionNeverDropsALiveRun(ServerTestBase):
+    """The 50-run cap must not evict a run that is still executing.
+
+    The agent generates tool runs continuously, so without this an operator's
+    long-running command would be pushed out while still going: its own
+    result endpoint would 404, the legacy endpoint would report the next
+    newest operator run or idle, and the GUI panel — which stops polling at
+    the first status that is not "running" — would render an error over a
+    command that had not finished.
+    """
+
+    def _slow_run(self, origin="operator"):
+        return self._operator_post(
+            "/api/server/exec",
+            {"argv": ["sh", "-c", "sleep 30"], "tool": "slow",
+             "origin": origin, "timeout": 60})["run_id"]
+
+    def test_a_running_operator_tool_survives_a_flood_of_agent_runs(self):
+        live = self._slow_run()
+        for i in range(srv.TOOL_RUNS_MAX + 10):
+            done = self._operator_post(
+                "/api/server/exec",
+                {"argv": ["echo", "n%d" % i], "tool": "echo",
+                 "origin": "agent"})["run_id"]
+            self._wait_tool(done)
+        still = self._operator_get("/api/server/exec/result/%s" % live)
+        self.assertEqual(still["status"], "running")
+
+    def test_the_legacy_endpoint_still_finds_that_run(self):
+        live = self._slow_run()
+        for i in range(srv.TOOL_RUNS_MAX + 10):
+            self._wait_tool(self._operator_post(
+                "/api/server/exec",
+                {"argv": ["echo", "n%d" % i], "tool": "echo",
+                 "origin": "agent"})["run_id"])
+        latest = self._operator_get("/api/server/exec/result")
+        self.assertEqual(latest["status"], "running")
+        self.assertEqual(latest["tool"], "slow")
+        self.assertIsNotNone(live)
+
+    def test_finished_runs_are_still_evicted(self):
+        # The cap has to do its job; the point is only which entries it takes.
+        first = self._operator_post(
+            "/api/server/exec",
+            {"argv": ["echo", "first"], "tool": "echo"})["run_id"]
+        self._wait_tool(first)
+        for i in range(srv.TOOL_RUNS_MAX + 5):
+            self._wait_tool(self._operator_post(
+                "/api/server/exec",
+                {"argv": ["echo", "n%d" % i], "tool": "echo"})["run_id"])
+        gone = self.client.get(
+            "/api/server/exec/result/%s" % first,
+            headers={"Authorization": "Bearer %s" % TEST_TOKEN})
+        self.assertEqual(gone.status_code, 404)
+
+
 class TestAiProxy(ServerTestBase):
     def _app_for(self, url):
         app = create_app(self.crypto, TEST_TOKEN, self.data_dir,

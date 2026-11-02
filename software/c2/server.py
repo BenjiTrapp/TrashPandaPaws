@@ -525,8 +525,21 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         run_id = uuid.uuid4().hex[:12]
         with tool_runs_lock:
             tool_runs[run_id] = run
-            while len(tool_runs) > TOOL_RUNS_MAX:
-                del tool_runs[next(iter(tool_runs))]
+            # Evict finished runs only, oldest first. Dropping by insertion
+            # order alone would let 50 agent runs push out an operator tool
+            # that is still executing: its own result endpoint would then
+            # 404, and the legacy endpoint would report idle, so the GUI
+            # panel would stop polling and render an error over a command
+            # that is still going. The agent generates runs continuously, so
+            # that is the likely case rather than the odd one. If every entry
+            # is live the dict is allowed to exceed the cap — real
+            # concurrency bounds it, and dropping a live run is worse.
+            if len(tool_runs) > TOOL_RUNS_MAX:
+                for old_id, old in list(tool_runs.items()):
+                    if len(tool_runs) <= TOOL_RUNS_MAX:
+                        break
+                    if old is not run and old["status"] != "running":
+                        del tool_runs[old_id]
         return run_id, run
 
     def _finish_run(run, output, status, tail=""):
