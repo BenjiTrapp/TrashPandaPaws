@@ -55,27 +55,64 @@ _GLOB_CHARS = frozenset("*?[]")
 # of a word or after @ / , = and before the end or : / ,
 _BRACKETED_V6 = re.compile(r"(?:^|(?<=[@/,=]))\[([0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)\](?=$|[:/,])")
 _PUNCT = frozenset("();<>|&")
-# A bare number is a port or a count only as the value of a flag known to take
-# one. After any other flag (-sV 22, --open 22) it is a target: nmap reads 22
-# as 0.0.0.22. An unlisted flag therefore refuses the command, never passes it.
-_NUMERIC_FLAGS = frozenset((
+# A bare number is a port or count only as the value of a flag known to take
+# one *for the program in command position*: `-c 4` is a count for ping, while
+# `-n 22` is a boolean flag then an address for nmap. After any other flag it
+# is a target (nmap reads 22 as 0.0.0.22), so an unlisted flag refuses the
+# command and never passes it. A program missing from _PROGRAM_FLAGS gets only
+# the shared scanner list below; do not widen that fallback.
+_NUMERIC_FLAGS = (
     "-p", "--port", "--ports", "--top-ports", "--max-rate", "--min-rate",
     "--max-retries", "--host-timeout", "--max-rtt-timeout", "--min-rtt-timeout",
     "--initial-rtt-timeout", "--max-parallelism", "--min-parallelism",
     "--max-hostgroup", "--min-hostgroup", "--scan-delay", "--max-scan-delay",
     "--mtu", "--data-length", "--ttl", "--source-port", "-g", "-T", "--rate",
     "--retries", "--threads", "-t", "--timeout", "--wait", "--connect-timeout",
-    "--delay", "--jitter"))
-# Programs whose first positional argument is a number, with the flags of their
-# own that take a value. The exemption ends at the first other positional
-# word, so `timeout 60 nmap -n 22` still refuses the 22.
-_NUMBER_FIRST = {
-    "timeout": ("-s", "--signal", "-k", "--kill-after"),
+    "--delay", "--jitter")
+_PRIVILEGE_VALUE_FLAGS = ("-u", "-U", "--user", "-g", "--group")
+_PROGRAM_FLAGS = {
+    "nmap": _NUMERIC_FLAGS,
+    "masscan": _NUMERIC_FLAGS,
+    "ping": ("-c", "-i", "-W", "-t", "-s", "-w"),
+    "curl": ("-m", "--max-time", "--connect-timeout", "--retry", "--retry-delay",
+             "--retry-max-time", "--limit-rate"),
+    "wget": ("-t", "-T", "--tries", "--timeout", "--wait"),
+    "nc": ("-w", "-i", "-q", "-p"),
+    "ncat": ("-w", "-i", "-q", "-p"),
+    "ssh": ("-p",),
     "sleep": (),
     "head": ("-n", "-c", "--lines", "--bytes"),
     "tail": ("-n", "-c", "--lines", "--bytes"),
+    # Prefixes: their own flags that take a separate value. Guessing from the
+    # word's shape fails (see safety._WRAPPER_VALUE_FLAGS).
+    "timeout": ("-s", "--signal", "-k", "--kill-after"),
     "nice": ("-n", "--adjustment"),
+    "ionice": ("-c", "-n", "--class", "--classdata"),
+    "stdbuf": ("-i", "-o", "-e", "--input", "--output", "--error"),
+    "env": ("-u", "--unset", "-C", "--chdir"),
+    "xargs": ("-n", "-i", "-p", "-d", "-s", "-l", "--max-args", "--max-procs",
+              "--delimiter", "--max-lines"),
+    "watch": ("-n", "--interval"),
+    "time": ("-f", "-o", "--format", "--output"),
+    "sudo": _PRIVILEGE_VALUE_FLAGS,
+    "doas": _PRIVILEGE_VALUE_FLAGS,
+    "runas": _PRIVILEGE_VALUE_FLAGS,
+    "pkexec": _PRIVILEGE_VALUE_FLAGS,
+    "nohup": (), "exec": (), "setsid": (), "command": (), "busybox": (),
 }
+# Programs in front of the real one; the program is the next positional word.
+_PREFIXES = frozenset((
+    "sudo", "doas", "runas", "pkexec", "env", "nohup", "exec", "setsid",
+    "command", "busybox", "time", "stdbuf", "ionice", "xargs", "watch",
+    "timeout", "nice"))
+# Programs whose first positional argument is a duration or count, which is
+# ignored; the exemption ends at the first other positional word, so
+# `timeout 60 nmap -n 22` still refuses the 22.
+_NUMBER_FIRST = frozenset(("timeout", "nice", "sleep", "head", "tail"))
+# `nc host 80`: the second positional word is the port. The first stays a target,
+# so `nc 80` is still refused.
+_PORT_AFTER_HOST = frozenset(("nc", "ncat", "netcat", "telnet"))
+_ASSIGNMENT = re.compile(r"\w+=", re.ASCII)
 _DURATION = re.compile(r"\d+(?:\.\d+)?[smhd]?", re.ASCII)
 # A file descriptor glued to a redirect (2>&1, 1>out) at the start of a word.
 # `nmap 22 > out` has a space, so the 22 stays an argument and is refused.
@@ -88,6 +125,8 @@ _NET, _UNKNOWN, _HOST, _BARE, _PATH, _IGNORE = (
 _HINT = ("name each target individually as an IP address, CIDR block or "
          "range, without files, variables or shorthand")
 
+_NUMBER_HINT = ("; a number that is a flag's value must be attached to it "
+                "(-c4, -p22, --count=4), anywhere else it reads as an address")
 
 _CLIP = 80  # what a refusal echoes of attacker-shaped text
 
@@ -246,38 +285,52 @@ def _scan(command) -> Tuple[List[str], List[str], List[str]]:
     except ValueError:
         return found, [command[:_CLIP]], bare
     at_start, skip_next, after_flag = True, False, False
-    fresh, wrapper, options_ended = True, "", False  # fresh: a command's first word
+    # looking: the segment's program is not known yet; prefix: the last prefix
+    # seen while looking; num_open: its leading number is still to come.
+    looking, prog, prefix, num_open, options_ended = True, "", "", False, False
+    positionals = 0
     for word in words:
         if not word:
             continue
         if set(word) <= _PUNCT:
             at_start, skip_next, after_flag = True, ">" in word, False
-            fresh, wrapper, options_ended = True, "", False
+            looking, prog, prefix, num_open, options_ended = True, "", "", False, False
+            positionals = 0
             if "<" in word:
                 unknown.append(word)
             continue
         if skip_next:
-            skip_next = after_flag = fresh = False
+            skip_next = after_flag = looking = False
             continue
         is_program, at_start = at_start, False
-        starts_command, fresh = fresh, False
         follows_flag = after_flag
         is_flag = word.startswith("-") and word != "-" and not options_ended
         if word == "--" and not options_ended:
             options_ended = True
             after_flag = False
             continue
-        own_flags = _NUMBER_FIRST.get(wrapper, ())
-        after_flag = is_flag and (word in _NUMERIC_FLAGS or word in own_flags)
-        spare_number = (wrapper and not starts_command and not is_flag
-                        and not follows_flag and _DURATION.fullmatch(word))
-        if starts_command:
-            name = word.rsplit("/", 1)[-1].lower()
-            wrapper = name if name in _NUMBER_FIRST else ""
-        elif not is_flag and not follows_flag:
-            wrapper = ""
-        if spare_number:
-            continue
+        if is_flag:
+            known = (_PROGRAM_FLAGS.get(prefix, ()) if looking
+                     else _PROGRAM_FLAGS.get(prog, _NUMERIC_FLAGS))
+            after_flag = word in known
+        else:
+            after_flag = False
+            if word != "-" and not follows_flag:
+                if num_open and _DURATION.fullmatch(word):
+                    num_open = False
+                    continue
+                num_open = False
+                if looking and not _ASSIGNMENT.match(word):
+                    name = word.rsplit("/", 1)[-1].lower()
+                    if name in _PREFIXES:
+                        prefix, num_open = name, name in _NUMBER_FIRST
+                    else:
+                        looking, prog, num_open = False, name, name in _NUMBER_FIRST
+                elif not looking and prog in _PORT_AFTER_HOST:
+                    positionals += 1
+                    if (positionals == 2 and _PORT.fullmatch(word)
+                            and 0 < int(word) <= 65535):
+                        continue
         if not word.isascii() or _is_dynamic(word):
             unknown.append(word)
         elif word == "-":
@@ -336,8 +389,11 @@ class Scope:
     def _check(self, command, resolve_host) -> Optional[str]:
         found, unknown, bare = _scan(command)
         if unknown:
+            hint = _HINT
+            if any(_PORT.fullmatch(u) for u in unknown):
+                hint += _NUMBER_HINT
             return "cannot verify %s against the authorised scope; %s" % (
-                ", ".join("'%s'" % _clip(u) for u in unknown), _HINT)
+                ", ".join("'%s'" % _clip(u) for u in unknown), hint)
         for token in found:
             try:
                 nets = _parse_networks(token)

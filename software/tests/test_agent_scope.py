@@ -532,9 +532,53 @@ class TestFlagArity(unittest.TestCase):
                        "nmap 10.0.1.5 head 5"))
 
     def test_known_over_refusals(self):
-        # Fail-closed costs, pinned so a change to them is deliberate.
-        self._refused(("sudo timeout 60 nmap 10.0.1.5", "FOO=1 sleep 5",
-                       "ping -c 4 10.0.1.5", "curl -m 5 http://10.0.1.5"))
+        # Fail-closed costs, pinned so a change to them is deliberate. Each
+        # reason says to attach the number to its flag; `-c4` then passes.
+        self._refused(("hping3 -c 4 10.0.1.5", "xyz --foo 5 10.0.1.5",
+                       "nmap -c 4 10.0.1.5", "ssh -o 22 10.0.1.5"))
+        self._passes(("hping3 -c4 10.0.1.5", "xyz --foo=5 10.0.1.5"))
+
+    def test_number_hint_tells_the_caller_how_to_comply(self):
+        reason = _scope().check("hping3 -c 4 10.0.1.5", _none)
+        self.assertIn("attached", reason)
+        self.assertNotIn("attached", _scope().check("nmap hosts.txt", _none))
+
+    def test_flag_arity_is_per_program(self):
+        # The same flag is a count for one program and a boolean for another.
+        self._passes(("ping -c 4 10.0.1.5", "ping -c 4 -W 2 10.0.1.5",
+                      "ping -i 2 -s 56 10.0.1.5", "curl -m 5 http://10.0.1.5",
+                      "curl --max-time 5 --retry 3 http://10.0.1.5",
+                      "wget -t 3 -T 10 http://10.0.1.5/x", "nc -w 3 10.0.1.5 80",
+                      "ncat -i 2 -q 1 10.0.1.5 80", "ssh -p 2222 10.0.1.5",
+                      "nc -l -p 4444", "dig +time=5 +tries=2 @10.0.1.5 -x 10.0.1.6"))
+        self._refused(("ping 4", "ping -c 4 4", "ping -n 22", "curl 5",
+                       "curl -s 5", "wget 3", "ssh 22", "dig 5", "nc 80",
+                       "nc -n 22", "nmap -c 4 10.0.1.5", "nmap -w 5 10.0.1.5"))
+
+    def test_host_then_port_programs_take_only_the_second_positional(self):
+        self._passes(("nc 10.0.1.5 80", "nc -vz 10.0.1.5 80", "telnet 10.0.1.5 80"))
+        self._refused(("nc 80", "telnet 80", "nc 10.0.1.5 22 80",
+                       "nc 10.0.1.5 80; nc 22"))
+
+    def test_privilege_and_env_prefixes_do_not_hide_the_program(self):
+        self._passes(("sudo timeout 60 nmap 10.0.1.5", "sudo -u alice timeout 60 nmap 10.0.1.5",
+                      "doas ping -c 4 10.0.1.5", "doas -u bob ping -c 4 10.0.1.5",
+                      "env FOO=1 sleep 5", "FOO=1 sleep 5", "FOO=1 nmap -p 22 10.0.1.5",
+                      "sudo ping -c 4 10.0.1.5", "timeout 60 ping -c 4 10.0.1.5",
+                      "timeout 60 sleep 5", "watch -n 5 ping -c 4 10.0.1.5",
+                      "sudo -n nmap -p 22 10.0.1.5"))
+
+    def test_prefixes_do_not_loosen_the_wrapped_program(self):
+        self._refused(("sudo nmap 22", "sudo -u alice nmap -n 22",
+                       "doas -u bob nmap -sV 22", "env FOO=1 nmap -Pn 22",
+                       "FOO=1 nmap -v 22", "sudo timeout 60 nmap 22",
+                       "sudo timeout 60 nmap -n 22", "watch -n 5 nmap 22",
+                       "sleep 5 22", "timeout 60 22", "sudo 22"))
+
+    def test_unknown_program_keeps_the_shared_fallback(self):
+        # Not in the table: a number is a port only after a shared scanner flag.
+        self._passes(("xyz -p 22 10.0.1.5", "xyz --max-rate 50 10.0.1.5"))
+        self._refused(("xyz --foo 5 10.0.1.5", "xyz -v 22", "xyz 22"))
 
     def test_at_sign_with_only_separators_after_it_is_refused(self):
         for cmd in ("nmap 10.0.9.5@,", "nmap 10.0.9.5@,,", "nmap 10.0.9.5@[]"):
