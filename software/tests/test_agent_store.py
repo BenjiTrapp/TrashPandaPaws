@@ -129,6 +129,22 @@ class TestSchema(unittest.TestCase):
         self.assertEqual([h["content"] for h in hits], ["kerberoasting candidate"])
         self.assertEqual([r["name"] for r in scripts], ["sweep"])
 
+    def test_reopening_after_a_crash_between_ddl_and_rebuild_indexes_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "agent.db")
+            with unittest.mock.patch.object(db, "has_fts5", return_value=False):
+                with self.assertLogs(db.logger, level="WARNING"):
+                    conn = db.open_store(path)
+            queries.save_memory(conn, "s", None, "kerberoasting candidate", "semantic")
+            # The interrupted open: FTS tables and triggers exist, nothing indexed.
+            conn.executescript(db._SCHEMA_PATH.read_text(encoding="utf-8").partition(
+                db._FTS5_MARKER)[2])
+            conn.close()
+            conn = db.open_store(path)
+            hits = queries.search_memory(conn, "s", "kerberoasting", 10)
+            conn.close()
+        self.assertEqual([h["content"] for h in hits], ["kerberoasting candidate"])
+
 
 # ── Run lifecycle ──
 
