@@ -113,6 +113,22 @@ class TestSchema(unittest.TestCase):
         self.assertNotIn("memories_fts", names)
         queries.save_memory(conn, "s", None, "works without fts", "semantic")
 
+    def test_reopening_with_fts5_indexes_rows_written_without_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "agent.db")
+            with unittest.mock.patch.object(db, "has_fts5", return_value=False):
+                with self.assertLogs(db.logger, level="WARNING"):
+                    conn = db.open_store(path)
+            queries.save_memory(conn, "s", None, "kerberoasting candidate", "semantic")
+            queries.save_script(conn, "sweep", "echo a", "bash", "ping sweep", "[]")
+            conn.close()
+            conn = db.open_store(path)
+            hits = queries.search_memory(conn, "s", "kerberoasting", 10)
+            scripts = queries.search_scripts(conn, "ping", 10)
+            conn.close()
+        self.assertEqual([h["content"] for h in hits], ["kerberoasting candidate"])
+        self.assertEqual([r["name"] for r in scripts], ["sweep"])
+
 
 # ── Run lifecycle ──
 
@@ -323,6 +339,8 @@ class TestMemory(unittest.TestCase):
         queries.save_memory(conn, "s", None, "admin and guest accounts", "semantic")
         for q in ('"unbalanced', "AND", "foo AND (bar", "a:b*c", "NOT OR NEAR"):
             queries.search_memory(conn, "s", q, 10)
+        hits = queries.search_memory(conn, "s", "and", 10)
+        self.assertEqual([h["content"] for h in hits], ["admin and guest accounts"])
 
     def test_search_with_only_punctuation_returns_empty(self):
         conn = _conn()

@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 
 _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 _FTS5_MARKER = "-- @fts5"
+_FTS_TABLES = ("memories_fts", "scripts_fts")
 
 _fts5_available = None  # type: Optional[bool]
 
@@ -41,7 +42,15 @@ def open_store(path: str) -> sqlite3.Connection:
     core, _, fts = _SCHEMA_PATH.read_text(encoding="utf-8").partition(_FTS5_MARKER)
     conn.executescript(core)
     if has_fts5(conn):
+        existing = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE name IN (%s)"
+            % ", ".join("?" * len(_FTS_TABLES)), _FTS_TABLES)}
         conn.executescript(fts)
+        # Rows written while FTS5 was unavailable were never indexed.
+        for table in _FTS_TABLES:
+            if table not in existing:
+                conn.execute("INSERT INTO %s(%s) VALUES('rebuild')" % (table, table))
+        conn.commit()
     else:
         logger.warning("SQLite lacks FTS5; memory and script search fall back to LIKE")
     return conn
