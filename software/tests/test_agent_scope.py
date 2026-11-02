@@ -122,13 +122,23 @@ class TestUnresolvable(unittest.TestCase):
     def _unknown(self, cmd):
         return scope.extract_targets(cmd)[1]
 
-    def test_target_file_arguments(self):
+    def test_target_file_flags_are_unresolvable(self):
         for cmd in ("nmap -iL ziele.txt", "nmap -iLziele", "nmap --target-file /tmp/t",
                     "nmap --target-file=/tmp/t", "nmap --targets x", "nmap -iR 100",
-                    "nxc smb targets.txt", "nxc smb t.lst", "nxc smb T.LIST",
-                    "nmap -iL -", "nmap 10.0.1.5 -", "nmap 10.0.1.5,hosts.txt",
-                    "nmap hosts.txt,10.0.1.5"):
+                    "nmap -iL -", "nmap 10.0.1.5 -"):
             self.assertTrue(self._unknown(cmd), cmd)
+
+    def test_a_suffixed_filename_without_a_flag_needs_require_target(self):
+        # "targets.txt" and "cat notes.txt" are the same shape; only the
+        # classification of the command tells them apart.
+        for cmd in ("nxc smb targets.txt", "nxc smb t.lst", "nxc smb T.LIST"):
+            self.assertIsNone(_scope().check(cmd, lambda h: None), cmd)
+            self.assertIsNotNone(
+                _scope().check(cmd, lambda h: None, require_target=True), cmd)
+
+    def test_an_address_in_the_same_word_as_a_file_is_still_checked(self):
+        for cmd in ("nmap 10.0.9.5,hosts.txt", "nmap hosts.txt,10.0.9.5"):
+            self.assertIsNotNone(_scope().check(cmd, lambda h: None), cmd)
 
     def test_shell_expansion_is_unresolvable(self):
         for cmd in ("nmap $TARGET", "nmap $(cat /tmp/t)", "nmap `cat /tmp/t`",
@@ -173,17 +183,36 @@ class TestUnresolvable(unittest.TestCase):
                     "nmap 10.0.1.5,80"):
             self.assertTrue(self._unknown(cmd), cmd)
 
-    def test_path_arguments_are_unresolvable(self):
-        for cmd in ("nxc smb /tmp/hosts", "nxc smb ./hosts", "nxc smb ../hosts",
-                    "nxc smb ~/hosts", "nxc smb ~hosts", "nxc smb /tmp/hosts,/tmp/x",
-                    "nxc smb 10.0.1.5,/tmp/x", "nmap --excludefile /tmp/x",
-                    "nmap --excludefile=/tmp/x", "nmap 10.0.1.5 /dev/stdin",
-                    "nmap -oA /tmp/out 10.0.1.5", "masscan -c conf/hosts"):
+    def test_paths_alone_are_not_refused(self):
+        # A path is not a target. Reading files is most of what there is to
+        # do on a host, and refusing every path refused all of it.
+        for cmd in ("cat /etc/shadow", "ls -la /opt", "cat ./notes.txt",
+                    "cat ../notes", "cat ~/.ssh/id_rsa", "cat notes.txt",
+                    "grep -i pass /var/log/auth.log", "find / -name id_rsa",
+                    "strings /tmp/dump.bin", "nmap -oA /tmp/out 10.0.1.5"):
+            self.assertIsNone(_scope().check(cmd, lambda h: None), cmd)
+
+    def test_a_target_file_flag_is_still_unresolvable(self):
+        for cmd in ("nmap --target-file /tmp/x", "nmap --includefile=/tmp/x",
+                    "masscan -c conf/hosts 10.0.1.0/24"):
             self.assertTrue(self._unknown(cmd), cmd)
 
-    def test_path_refusal_names_the_path(self):
-        reason = _scope().check("nxc smb /tmp/hosts", _none)
-        self.assertIn("/tmp/hosts", reason)
+    def test_an_exclude_file_is_not_a_target_file(self):
+        # It can only narrow a scan, never widen it, so its contents cannot
+        # put a host outside the scope into the command. Refusing it would
+        # cost an unactionable retry.
+        for cmd in ("nmap --excludefile /tmp/x 10.0.1.5",
+                    "nmap --excludefile=/tmp/x 10.0.1.5"):
+            self.assertIsNone(
+                _scope().check(cmd, lambda h: None, require_target=True), cmd)
+
+    def test_an_address_beside_a_path_is_still_checked(self):
+        self.assertIsNotNone(
+            _scope().check("nxc smb 10.0.9.5,/tmp/x", lambda h: None))
+
+    def test_a_targetless_scan_says_so_and_how_to_fix_it(self):
+        reason = _scope().check("nxc smb /tmp/hosts", _none, require_target=True)
+        self.assertIn("no target", reason)
         self.assertIn("individually", reason)
 
     def test_paths_that_are_not_arguments_still_pass(self):
@@ -247,11 +276,26 @@ class TestNumericAddressForms(unittest.TestCase):
 
 
 class TestFailClosed(unittest.TestCase):
-    def test_target_file_argument_is_rejected(self):
+    def test_target_file_flag_is_rejected_on_its_own(self):
+        # A flag that names a file of targets is refused with no help from
+        # the caller, because the flag itself says what the file is.
         for cmd in ("nmap -iL ziele.txt 10.0.1.5",
-                    "nxc smb targets.txt -u a -p b",
-                    "nmap --target-file /tmp/t"):
+                    "nmap --target-file /tmp/t",
+                    "masscan -c /tmp/conf 10.0.1.0/24",
+                    "masscan -c/tmp/conf 10.0.1.0/24"):
             self.assertIsNotNone(_scope().check(cmd, lambda h: None), cmd)
+
+    def test_a_positional_target_file_needs_require_target(self):
+        # `nxc smb targets.txt` names no checkable target, but the word is
+        # just a path — nothing in it says "these are targets". Refusing
+        # every path, which this used to do, also refused `cat notes.txt`
+        # and `ls /opt`, so the agent could not read a file at all. The
+        # router asks for require_target on commands the classifier calls a
+        # scan, and that is what catches this.
+        cmd = "nxc smb targets.txt -u a -p b"
+        self.assertIsNone(_scope().check(cmd, lambda h: None))
+        self.assertIsNotNone(
+            _scope().check(cmd, lambda h: None, require_target=True))
 
     def test_hostname_without_finding_is_rejected(self):
         self.assertIsNotNone(_scope().check("nmap -sV dc01.corp.local", lambda h: None))
@@ -547,7 +591,9 @@ class TestFlagArity(unittest.TestCase):
     def test_number_hint_tells_the_caller_how_to_comply(self):
         reason = _scope().check("hping3 -c 4 10.0.1.5", _none)
         self.assertIn("attached", reason)
-        self.assertNotIn("attached", _scope().check("nmap hosts.txt", _none))
+        # The hint is only for numbers; a target-file flag gets the plain one.
+        self.assertNotIn(
+            "attached", _scope().check("nmap --target-file t", _none))
 
     def test_flag_arity_is_per_program(self):
         # The same flag is a count for one program and a boolean for another.

@@ -109,6 +109,35 @@ def _scope_words(word: str) -> List[str]:
     return _split_equals(word) if "=" in word else [word]
 
 
+_NETWORK_VERBS = frozenset(("netscan", "smbloot", "avenum"))
+
+
+def _reaches_the_network(command: str, server_side: bool) -> bool:
+    """Whether the scope checker must insist on a named target.
+
+    A command that only touches the host it runs on has no target to name —
+    `cat /etc/shadow`, `ls /opt`, `systemctl stop x`. Insisting on one there
+    was the bug: scope refused every path, which made reading a file
+    impossible, and that is most of what there is to do on a host once you
+    are on it.
+
+    A command that reaches out over the network does have a target, and if
+    none can be found the targets are hidden where the checker cannot see
+    them — in a file, typically — so it is refused.
+
+    Two signals, and `server_side` is deliberately not one of them: the
+    server runs arbitrary commands too, so `systemctl stop raccoon` would
+    otherwise be refused for naming no host.
+    """
+    if safety.takes_network_targets(command):
+        return True
+    words = command.split()
+    first = words[0].lower() if words else ""
+    if first == "shell" and len(words) > 1:
+        return _reaches_the_network(command.split(None, 1)[1], server_side)
+    return first in _NETWORK_VERBS
+
+
 def _scope_view(command: str) -> Optional[str]:
     """The command as scope should read it, or None if it will not tokenise."""
     try:
@@ -303,7 +332,9 @@ class Router:
         if view is None:
             return blocked("the command could not be tokenised (unbalanced "
                            "quotes?), so it cannot be checked against the scope")
-        reason = self._scope.check(view, self._resolve_host)
+        reason = self._scope.check(view, self._resolve_host,
+                                   require_target=_reaches_the_network(
+                                       command, server_side))
         if reason:
             return blocked(reason)
 

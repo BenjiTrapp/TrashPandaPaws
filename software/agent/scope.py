@@ -25,7 +25,7 @@ import ipaddress
 import re
 import shlex
 import socket
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 # ── Recognised shapes ──
@@ -48,6 +48,38 @@ _HOST_THEN_PORT_OR_PATH = re.compile(
 _TARGET_FLAGS = ("--target-file", "--targets", "--target-list", "--input-file",
                  "--includefile")
 _TARGET_FLAG_PREFIXES = ("-iL", "-iR")  # -iR: nmap picks random targets
+# Flags whose value is a filename to write, never a target. Without this,
+# `nmap -oX out.xml 10.0.1.5` is refused because out.xml matches the hostname
+# shape, and the refusal reads "use its IP address" — advice the caller
+# cannot follow. Safe to ignore now that a scan must name a target anyway.
+#
+# Only unambiguous spellings are global. A bare `-o` is an output file for
+# curl and wget but an *option* for ssh, and `-w` is a write target for some
+# tools and a timeout for nc — so those are resolved per program below,
+# the same way numeric flags are. Guessing globally cost two tests.
+_OUTPUT_FLAGS = frozenset((
+    "-oa", "-on", "-og", "-ox", "-oj", "-os", "-ow",
+    "--output", "--output-file", "--outfile", "--log", "--logfile",
+    "--log-file", "--stylesheet", "--append-output",
+))
+_PROGRAM_OUTPUT_FLAGS = {
+    "curl": ("-o", "-O", "--remote-name", "--dump-header", "-D", "--trace",
+             "--trace-ascii"),
+    "wget": ("-o", "-O", "--output-document"),
+    "masscan": ("-o",),
+    "tee": ("-a",),
+    "tcpdump": ("-w",),
+    "tshark": ("-w",),
+    "dumpcap": ("-w",),
+}
+# Flags naming a file the tool reads its *configuration* from. A config can
+# carry ranges, so this is the same class as a target file, not an output
+# file, and it is refused rather than ignored.
+_CONFIG_FILE_FLAGS = {
+    "masscan": ("-c", "--conf", "--readrange", "--resume"),
+    "nmap": ("--script-args-file", "--servicedb", "--versiondb"),
+    "hydra": ("-C",),
+}
 _FILE_SUFFIXES = (".txt", ".lst", ".list")
 _DYNAMIC_CHARS = frozenset("$`{}\\%")  # expansion, escapes, URL-encoding
 _GLOB_CHARS = frozenset("*?[]")
@@ -182,7 +214,11 @@ def _parse_networks(piece: str, loose: bool = True) -> list:
 
 def _classify(piece: str, loose: bool, dotted: bool, after_flag: bool = False) -> str:
     if piece.lower().endswith(_FILE_SUFFIXES):
-        return _UNKNOWN
+        # A target-list suffix. Treated as a path rather than refused: this
+        # branch used to refuse it, which also refused `cat notes.txt`. The
+        # case it guards — `nxc smb hosts.txt`, a file of targets with
+        # nothing checked — is caught by `require_target` instead.
+        return _PATH
     if not dotted and _PORT.fullmatch(piece) and 0 < int(piece) <= 65535:
         # Only a flag's value is a port. Anywhere else the tools read the
         # number as an address: `nmap 22` scans 0.0.0.22.
@@ -265,8 +301,22 @@ def _scan_value(value: str, found, unknown, bare, after_flag: bool = False) -> N
             continue
         named = True
         kind = _classify(piece, len(pieces) == 1, "." in value, after_flag)
-        if kind in (_UNKNOWN, _PATH):
+        if kind == _UNKNOWN:
             unknown.append(piece)
+        elif kind == _PATH:
+            # A path is not a target, so it is not refused here. Refusing
+            # every path — which this did — made the agent unable to read a
+            # file at all: `cat /etc/shadow`, `ls /opt`, `grep pass
+            # /var/log/auth.log` were all rejected, and that is most of what
+            # there is to do on a host once you are on it.
+            #
+            # The hole it was closing was `nxc smb /tmp/hosts`, a file of
+            # targets slipping through with nothing checked. That is caught
+            # one layer up instead: a command the classifier calls a scan
+            # must name at least one checkable target, which the router
+            # enforces with `require_target`. A path after a known
+            # target-file flag (-iL, -iR) is still refused, above this.
+            continue
         elif kind in (_NET, _HOST):
             found.append(piece)
         elif kind == _BARE:
@@ -288,14 +338,14 @@ def _scan(command) -> Tuple[List[str], List[str], List[str]]:
     # looking: the segment's program is not known yet; prefix: the last prefix
     # seen while looking; num_open: its leading number is still to come.
     looking, prog, prefix, num_open, options_ended = True, "", "", False, False
-    positionals = 0
+    positionals, output_pending = 0, False
     for word in words:
         if not word:
             continue
         if set(word) <= _PUNCT:
             at_start, skip_next, after_flag = True, ">" in word, False
             looking, prog, prefix, num_open, options_ended = True, "", "", False, False
-            positionals = 0
+            positionals, output_pending = 0, False
             if "<" in word:
                 unknown.append(word)
             continue
@@ -309,7 +359,34 @@ def _scan(command) -> Tuple[List[str], List[str], List[str]]:
             options_ended = True
             after_flag = False
             continue
+        if output_pending and not is_flag:
+            # The filename an output flag writes to. Not a target, and
+            # letting it through reads as a hostname: see _OUTPUT_FLAGS.
+            output_pending = False
+            after_flag = False
+            continue
+        output_pending = False
         if is_flag:
+            bare_flag = word.partition("=")[0]
+            lowered = bare_flag.lower()
+            which = prefix if looking else prog
+            config_flags = _CONFIG_FILE_FLAGS.get(which, ())
+            if (bare_flag in config_flags or lowered in config_flags
+                    or any(bare_flag.startswith(f) and len(bare_flag) > len(f)
+                           and f.startswith("-") and not f.startswith("--")
+                           for f in config_flags)):
+                # A config file can list ranges, so it is a target file.
+                # The startswith arm catches the attached form, `-c/tmp/conf`,
+                # which partition("=") leaves whole.
+                unknown.append(word)
+                after_flag = False
+                continue
+            if (lowered in _OUTPUT_FLAGS
+                    or bare_flag in _PROGRAM_OUTPUT_FLAGS.get(which, ())):
+                # `-oX=out.xml` carries its value; `-oX out.xml` does not.
+                output_pending = "=" not in word
+                after_flag = False
+                continue
             known = (_PROGRAM_FLAGS.get(prefix, ()) if looking
                      else _PROGRAM_FLAGS.get(prog, _NUMERIC_FLAGS))
             after_flag = word in known
@@ -378,15 +455,24 @@ class Scope:
         self._deny = [ipaddress.ip_network(c, strict=False) for c in deny]
 
     def check(self, command: str,
-              resolve_host: Callable[[str], Optional[str]]) -> Optional[str]:
-        """None if every target is in scope, else the reason for refusing."""
+              resolve_host: Callable[[str], Any],
+              *, require_target: bool = False) -> Optional[str]:
+        """None if every target is in scope, else the reason for refusing.
+
+        `require_target` refuses a command that names nothing checkable at
+        all. It is off by default and the router turns it on for commands
+        classified as scanning, because that is where "no targets found"
+        means "the targets are hidden in a file" rather than "this command
+        has no targets". See the note above `_PATH`.
+        """
         try:
-            return self._check(command, resolve_host)
+            return self._check(command, resolve_host,
+                               require_target=require_target)
         except Exception as exc:  # fail closed on any surprise
             return "scope check failed (%s) on %s; refusing" % (
                 type(exc).__name__, _describe(command))
 
-    def _check(self, command, resolve_host) -> Optional[str]:
+    def _check(self, command, resolve_host, require_target=False) -> Optional[str]:
         found, unknown, bare = _scan(command)
         if unknown:
             hint = _HINT
@@ -394,6 +480,10 @@ class Scope:
                 hint += _NUMBER_HINT
             return "cannot verify %s against the authorised scope; %s" % (
                 ", ".join("'%s'" % _clip(u) for u in unknown), hint)
+        if require_target and not found and not bare:
+            return ("this command names no target the scope can check; %s"
+                    % _HINT)
+        verified = 0
         for token in found:
             try:
                 nets = _parse_networks(token)
@@ -403,12 +493,21 @@ class Scope:
                 reason = self._verdict(token, nets)
             if reason:
                 return reason
+            verified += 1
         for word in bare:
             addr = resolve_host(word)
             if addr is not None:
                 reason = self._check_host(word, addr)
                 if reason:
                     return reason
+                verified += 1
+        if require_target and not verified:
+            # Counting only what was actually checked. A single-label word
+            # that resolved to nothing is not a target — `nxc smb
+            # /tmp/hosts` leaves "smb", nxc's protocol argument, and that
+            # must not satisfy the requirement.
+            return ("this command names no target the scope can check; %s"
+                    % _HINT)
         return None
 
     def _check_host(self, name: str, addr) -> Optional[str]:

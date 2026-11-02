@@ -1044,15 +1044,36 @@ def _scanner_of(token):
     return name if name in _SCANNER_LIMITS else None
 
 
-def enforce_scan_limits(command):
-    """Rewrite a scanning command to gentle timing. Idempotent.
+# Programs whose arguments are hosts. Used to decide when a command must
+# name a target the scope checker can see: if one of these runs and no
+# target can be found, the targets are hidden somewhere unreadable — a file,
+# typically — and the command is refused. A program that only touches the
+# host it runs on, like `cat` or `systemctl`, has no target to name, and
+# demanding one there is what made reading a file impossible.
+_NETWORK_TOOLS = frozenset((
+    "nmap", "masscan", "netdiscover", "zmap", "fping", "hping3", "arp-scan",
+    "nxc", "netexec", "crackmapexec", "cme",
+    "smbclient", "smbmap", "enum4linux", "enum4linux-ng", "rpcclient",
+    "ldapsearch", "kerbrute", "hydra", "medusa", "patator",
+    "evil-winrm", "wmiexec", "psexec", "smbexec", "atexec", "dcomexec",
+    "secretsdump", "getuserspns", "getnpusers", "lookupsid", "samrdump",
+    "ntlmrelayx", "responder", "lsassy", "impacket-psexec",
+    "impacket-wmiexec", "impacket-smbexec", "impacket-secretsdump",
+    "sqlmap", "nikto", "whatweb", "wpscan", "gobuster", "feroxbuster",
+    "ffuf", "dirb", "nuclei", "testssl.sh", "sslscan",
+))
 
-    Only fires when the scanner is in command position — possibly behind
-    privilege or wrapper prefixes — so that `man nmap` and
-    `grep nmap /etc/services` are left alone.
+
+def _program_position(command, names):
+    """(tokens, index) of the first program from `names`, or (tokens, None).
+
+    Factored out rather than duplicated: the easy part is matching a name,
+    and the part that had to be fixed twice is skipping privilege and
+    wrapper prefixes without mistaking a wrapper's own option value for the
+    program. One copy of that.
     """
     if not isinstance(command, str):
-        return command
+        return [], None
 
     tokens = command.split()
     index = None
@@ -1062,7 +1083,9 @@ def enforce_scan_limits(command):
         name = _basename(token).lower()
         if name.endswith(".exe"):
             name = name[:-4]
-        if name in _SCANNER_LIMITS:
+        if name.endswith(".py"):
+            name = name[:-3]
+        if name in names:
             index = position
             break
         # Only wrappers, the beacon verb and their own arguments may precede
@@ -1078,7 +1101,35 @@ def enforce_scan_limits(command):
                 or re.match(r"^\w+=", token):
             position += 1
             continue
+        return tokens, None
+    return tokens, index
+
+
+def scanner_position(command):
+    """(tokens, index) of a rate-limitable scanner in command position."""
+    return _program_position(command, _SCANNER_LIMITS)
+
+
+def is_scan(command) -> bool:
+    """True when a rate-limitable scanner sits in command position."""
+    return scanner_position(command)[1] is not None
+
+
+def takes_network_targets(command) -> bool:
+    """True when the program in command position takes hosts as arguments."""
+    return _program_position(command, _NETWORK_TOOLS)[1] is not None
+
+
+def enforce_scan_limits(command):
+    """Rewrite a scanning command to gentle timing. Idempotent.
+
+    Only fires when the scanner is in command position — possibly behind
+    privilege or wrapper prefixes — so that `man nmap` and
+    `grep nmap /etc/services` are left alone.
+    """
+    if not isinstance(command, str):
         return command
+    tokens, index = scanner_position(command)
     if index is None:
         return command
 

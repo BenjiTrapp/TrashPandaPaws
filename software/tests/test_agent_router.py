@@ -597,14 +597,39 @@ class TestRoutedFailOpens(IsolatedAsyncioTestCase):
         self.assertIsNone(res.blocked_reason)
         self.assertEqual(len(c2.exec_calls), 1)
 
-    async def test_a_short_flag_with_an_attached_path_is_refused(self):
-        for command in ("nmap -oA/tmp/out 10.0.1.5",
-                        "masscan -c/tmp/conf 10.0.1.5"):
+    async def test_an_attached_config_file_is_refused(self):
+        # A config file can list ranges, so it is a target file whatever the
+        # spelling. The attached form is the one that used to slip past.
+        for command in ("masscan -c/tmp/conf 10.0.1.5",
+                        "masscan -c /tmp/conf 10.0.1.5"):
             r, c2 = _router()
             res = await r.run_command(command, server_side=True)
             self.assertFalse(res.success, command)
-            self.assertIsNotNone(res.blocked_reason, command)
             self.assertTrue(c2.nothing_ran(), command)
+
+    async def test_an_attached_output_file_is_allowed(self):
+        # This used to be refused, by the rule that refused every path. An
+        # output file cannot carry a target, the scan names its target, and
+        # structured output is something the agent has good reason to ask
+        # for. Refusing it cost a retry the caller could not act on.
+        r, c2 = _router()
+        res = await r.run_command("nmap -oA/tmp/out 10.0.1.5", server_side=True)
+        self.assertIsNone(res.blocked_reason)
+        self.assertEqual(len(c2.exec_calls), 1)
+
+    async def test_a_scan_with_no_target_at_all_is_refused(self):
+        # What replaced "every path is refused": the router asks scope for a
+        # named target when the classifier calls the command a scan.
+        for command in ("nxc smb /tmp/hosts", "nxc smb targets.txt"):
+            r, c2 = _router()
+            res = await r.run_command(command, server_side=True)
+            self.assertFalse(res.success, command)
+            self.assertTrue(c2.nothing_ran(), command)
+
+    async def test_reading_a_file_is_not_a_scan_and_runs(self):
+        r, c2 = _router()
+        res = await r.run_command("cat /etc/shadow", beacon_id="raccoon-fox")
+        self.assertIsNone(res.blocked_reason)
 
     async def test_a_short_flag_with_an_attached_hostname_is_checked(self):
         r, c2 = _router()
