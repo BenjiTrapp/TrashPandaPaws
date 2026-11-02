@@ -9,7 +9,8 @@ asking for it. The order is the specification:
     1. shell metacharacters       refuse
     2. scope                      refuse, fail-closed
     3. classification             tier 1 refuses
-    4. tier 2: the gate           a refusal refuses
+    4. tier 2: the gate           a refusal refuses; an unknown named beacon is
+                                  refused before it, so no decision is spent
     5. scan rate limits           rewrite
     6. path: server or beacon     refuse if it names neither or both
     7. execute
@@ -360,6 +361,18 @@ class Router:
         if classification.tier == safety.TIER_HARD:
             return blocked(classification.reason or "irreversible action")
         if classification.tier == safety.TIER_KNOCK:
+            # Before the gate, not after: in supervised mode a request that
+            # names a beacon this job does not have would put a question in
+            # front of the operator, take their answer, and then be refused
+            # anyway. A decision spent on something that cannot run teaches
+            # people to click through. Only a *named* id is checked here; a
+            # request that names none still asks first (the gate prices the
+            # action, not the route — see test_the_gate_is_asked_before_the_
+            # path_is_chosen). Checked again below, because beacon_ids is
+            # live and an approval can wait minutes for an answer.
+            if (beacon_id is not None and not server_side
+                    and beacon_id not in self._beacon_ids):
+                return blocked("unknown beacon '%s'" % str(beacon_id)[:_CLIP])
             decision = await self.gate.request(
                 classification, p_success_override=p_success_override)
             if not decision.allowed:

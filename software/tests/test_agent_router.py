@@ -11,6 +11,7 @@ refusal while the command also runs would pass every other check.
 """
 
 import ast
+import asyncio
 import json
 import socket
 import sys
@@ -360,6 +361,41 @@ class TestPathSelection(IsolatedAsyncioTestCase):
         r, c2 = _router()
         res = await r.run_command("whoami", beacon_id="raccoon-ghost")
         self.assertIn("raccoon-ghost", res.blocked_reason)
+        self.assertTrue(c2.nothing_ran())
+
+    async def test_an_unknown_beacon_spends_no_decision(self):
+        # Supervised, so a request that reached the gate would sit waiting
+        # for an operator: the approval row is the evidence it did not.
+        r, c2 = _router(mode="supervised")
+        res = await r.run_command("lsassy -u a -p b 10.0.1.5",
+                                  beacon_id="raccoon-ghost")
+        self.assertIn("raccoon-ghost", res.blocked_reason)
+        self.assertNotIn("gate", res.blocked_reason.lower())
+        self.assertEqual(_approvals(r), 0)
+        self.assertTrue(c2.nothing_ran())
+
+    async def test_a_known_beacon_still_asks(self):
+        r, c2 = _router(mode="supervised")
+        res = await r.run_command("lsassy -u a -p b 10.0.1.5",
+                                  beacon_id="raccoon-fox")
+        self.assertIn("gate", res.blocked_reason.lower())
+        self.assertEqual(_approvals(r), 1)
+
+    async def test_a_beacon_that_drops_out_during_the_wait_is_refused(self):
+        r, c2 = _router(mode="supervised")
+        r.gate.approval_timeout = 5.0
+
+        async def answer_then_drop():
+            while not r.gate.pending():
+                await asyncio.sleep(0.01)
+            r._beacon_ids.remove("raccoon-fox")
+            r.gate.answer(r.gate.pending()[0]["id"], True)
+
+        task = asyncio.ensure_future(answer_then_drop())
+        res = await r.run_command("lsassy -u a -p b 10.0.1.5",
+                                  beacon_id="raccoon-fox")
+        await task
+        self.assertIn("raccoon-fox", res.blocked_reason)
         self.assertTrue(c2.nothing_ran())
 
 
