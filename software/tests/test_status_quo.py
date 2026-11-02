@@ -222,7 +222,21 @@ class TestAgentPackageContracts(unittest.TestCase):
     that looks at software/agent/.
 
     Importing it must not load an HTTP library, because the C2's dependency
-    guarantee rests on the transports importing `requests` lazily. And a
+    guarantee rests on the transports importing `requests` lazily. That is
+    what the import test below checks, and it checks it for every module
+    except the two process entry points, `service` and `__main__`, which
+    import aiohttp at module level because serving HTTP is their whole job.
+    The exemption is deliberately that narrow: it is not "the agent may use
+    aiohttp", only "the module that is the server may".
+
+    It is also narrower than the promise it serves. That the C2 pulls in
+    nothing new is proven by TestC2WithoutAgentPackage (the C2's source has
+    no agent import, and the C2 imports with software.agent made
+    unimportable) and by TestRequirementsHaveNotGrown; the agent's own
+    dependency, aiohttp, lives in software/agent/requirements.txt and not in
+    the C2's. What this test adds is that the *transports* (llm/provider.py,
+    c2client.py, tools/vuln.py) stay lazy, so the package is cheap to import.
+    A server library in the entry point is not a violation of that. And a
     stock configuration reports the agent unavailable, on purpose: Sliver and
     agent operation are mutually exclusive, and the shipped raccoon.yaml
     enables Sliver. Someone who sees the agent unavailable out of the box
@@ -239,10 +253,13 @@ class TestAgentPackageContracts(unittest.TestCase):
             def fail(name):
                 raise ImportError("cannot import " + name)
 
+            # The two process entry points, by full name: a module called
+            # `service` anywhere else in the package is not exempt.
+            exempt = {pkg.__name__ + ".__main__", pkg.__name__ + ".service"}
             names = [pkg.__name__]
             for m in pkgutil.walk_packages(pkg.__path__, pkg.__name__ + ".",
                                            onerror=fail):
-                if not m.name.endswith(".__main__"):
+                if m.name not in exempt:
                     names.append(m.name)
             for name in names:
                 importlib.import_module(name)

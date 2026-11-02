@@ -248,6 +248,11 @@ class Campaign:
     def is_unfinished(self) -> bool:
         return self._state in _UNFINISHED
 
+    @property
+    def config(self):
+        """The CampaignConfig this run was started with. Read it, do not edit."""
+        return self._cfg
+
     async def start(self) -> int:
         if self._task is not None:
             raise RuntimeError("this campaign has already been started")
