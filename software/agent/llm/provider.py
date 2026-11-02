@@ -41,6 +41,8 @@ import re
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import urlparse
 
+from software.agent.secret import Secret
+
 # ── Shapes ──
 
 
@@ -208,31 +210,10 @@ def http_post_json(url: str, headers: Dict[str, str], body: dict) -> dict:
     return payload
 
 
-# ── Secret holder ──
+# Re-exported from software.agent.secret: two modules carry live
+# credentials and both need the same guarantee, so the holder does not
+# live in either of them.
 
-
-class Secret:
-    """Holds an API key so no repr, str or vars() dump can print it.
-
-    A plain string attribute would show up in any dump of the client's
-    __dict__ and in any dataclass-style repr someone adds later.
-    """
-
-    __slots__ = ("_value",)
-
-    def __init__(self, value: Optional[str]):
-        self._value = value
-
-    def reveal(self) -> Optional[str]:
-        return self._value
-
-    def __bool__(self) -> bool:
-        return bool(self._value)
-
-    def __repr__(self) -> str:
-        return "<Secret>"
-
-    __str__ = __repr__
 
 
 # ── Client base ──

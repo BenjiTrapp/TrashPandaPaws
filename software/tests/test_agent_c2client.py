@@ -522,6 +522,17 @@ class TestRealSession(unittest.IsolatedAsyncioTestCase):
     class _InsecureRequestWarning(Warning):
         pass
 
+    def setUp(self):
+        # The suppression is installed once per process and remembered in a
+        # module flag. Any test that wipes warnings.filters — which
+        # catch_warnings does — leaves the flag claiming a filter that is no
+        # longer there, so each test starts from a known state. The coupling
+        # is real but bounded: in the running agent nothing resets the
+        # filters, and the consequence if something did is that the warning
+        # comes back, not that anything breaks.
+        c2client._filter_installed = False
+        self.addCleanup(setattr, c2client, "_filter_installed", False)
+
     def _fake_requests(self, request):
         mod = types.ModuleType("requests")
         mod.request = request
@@ -547,18 +558,36 @@ class TestRealSession(unittest.IsolatedAsyncioTestCase):
         self.assertIs(kwargs["verify"], False)
         self.assertIs(kwargs["allow_redirects"], False)
 
-    async def test_the_insecure_request_warning_is_silenced_for_the_call_only(self):
+    async def test_the_insecure_request_warning_is_silenced(self):
+        # Installed once and left installed, deliberately. The earlier
+        # version of this test asserted the filter was removed after the
+        # call, which is what `catch_warnings` gives you — and that had to be
+        # serialised with a lock held across a 30-second network call, so one
+        # hung request stalled every other request in the agent. The trade is
+        # explicit: warning isolation inside this process, for not coupling
+        # every request to the slowest one. It is affordable because the
+        # agent is its own process (spec §7) and nothing else in it raises
+        # this category.
         def request(*a, **kw):
             warnings.warn("unverified", self._InsecureRequestWarning)
             return self._answer()
-        before = list(warnings.filters)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             await self._list(request)
-            # The filter that did the silencing is gone again afterwards.
-            warnings.warn("later", self._InsecureRequestWarning)
-        self.assertEqual([str(w.message) for w in caught], ["later"])
-        self.assertEqual(warnings.filters, before)
+        self.assertEqual([str(w.message) for w in caught], [])
+
+    async def test_the_filter_list_does_not_grow_per_call(self):
+        # The thing a permanent filter must still not do: accumulate.
+        def request(*a, **kw):
+            return self._answer()
+        fake = self._fake_requests(request)
+        with unittest.mock.patch.dict(sys.modules, {"requests": fake}):
+            c = c2client.C2Client("http://c2", "tok")
+            await c.list_agents()
+            after_first = len(warnings.filters)
+            for _ in range(20):
+                await c.list_agents()
+        self.assertEqual(len(warnings.filters), after_first)
 
     async def test_other_warnings_inside_the_call_still_get_through(self):
         def request(*a, **kw):
@@ -578,19 +607,34 @@ class TestRealSession(unittest.IsolatedAsyncioTestCase):
             await self._list(request, verify_tls=True)
         self.assertEqual(len(caught), 1)
 
-    async def test_concurrent_calls_leave_the_filters_as_they_were(self):
-        # catch_warnings saves and restores global state; two threads doing
-        # that interleaved can leave the ignore filter installed for good.
+    async def test_concurrent_calls_do_not_block_each_other(self):
+        # The reason the per-call suppression had to go. With a lock held
+        # across the request, sixteen calls of 20ms each take at least 320ms
+        # because they queue; without it they overlap in the thread pool.
         def request(*a, **kw):
-            time.sleep(0.02)  # long enough for the threads to overlap
+            time.sleep(0.02)
             warnings.warn("unverified", self._InsecureRequestWarning)
             return self._answer()
-        before = list(warnings.filters)
+        fake = self._fake_requests(request)
+        with unittest.mock.patch.dict(sys.modules, {"requests": fake}):
+            c = c2client.C2Client("http://c2", "tok")
+            started = time.monotonic()
+            await asyncio.gather(*[c.list_agents() for _ in range(16)])
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.20, "requests appear to be serialised")
+
+    async def test_concurrent_calls_do_not_corrupt_the_filter_list(self):
+        def request(*a, **kw):
+            time.sleep(0.02)
+            warnings.warn("unverified", self._InsecureRequestWarning)
+            return self._answer()
         fake = self._fake_requests(request)
         with unittest.mock.patch.dict(sys.modules, {"requests": fake}):
             c = c2client.C2Client("http://c2", "tok")
             await asyncio.gather(*[c.list_agents() for _ in range(16)])
-        self.assertEqual(warnings.filters, before)
+            installed = len(warnings.filters)
+            await asyncio.gather(*[c.list_agents() for _ in range(16)])
+        self.assertEqual(len(warnings.filters), installed)
 
 
 # ── Status quo: no new dependency, no import-time cost ──

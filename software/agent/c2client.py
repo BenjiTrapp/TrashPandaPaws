@@ -41,7 +41,7 @@ import warnings
 from typing import Any, Awaitable, Callable, List, Optional, Sequence
 from urllib.parse import quote, urlparse
 
-from software.agent.llm.provider import Secret
+from software.agent.secret import Secret
 
 # ── Errors ──
 #
@@ -67,14 +67,39 @@ class BeaconGone(Exception):
 
 _REQUEST_TIMEOUT_SECONDS = 30
 
-# One `catch_warnings` block saves and restores the process-wide warning
-# filters. Two worker threads doing that at once can interleave so the
-# "ignore" filter is restored as if it were the original, and stays
-# installed for the whole project: exactly the blanket suppression the
-# narrow one below exists to avoid. Hence the lock. The price is that
-# unverified requests are issued one at a time, which is cheap for a C2 on
-# the same network and a concurrency of a few executors.
-_FILTER_LOCK = threading.Lock()
+# The C2 serves a self-signed certificate (spec §18), so verify=False is the
+# default and urllib3 warns on every request.
+#
+# The obvious suppression is a `catch_warnings` block around the call, and
+# that is wrong here: the block saves and restores the process-wide filter
+# list, so two worker threads doing it at once can interleave such that the
+# "ignore" filter is restored as if it had been there all along, and stays
+# installed for everything. Serialising the calls with a lock fixes the race
+# but holds that lock across a network call with a 30-second timeout — so one
+# hung request would stall every other request in the agent, liveness polls
+# included, which is the starvation this client exists to avoid elsewhere.
+#
+# So the filter is installed once, on first use, and never removed. It is
+# process-wide, and that is acceptable because the agent is its own process
+# (spec §7: a separate asyncio service on 127.0.0.1:8099) — the C2 runs
+# elsewhere and is unaffected. The only other HTTP user in this process is
+# the LLM transport, which verifies TLS against real endpoints and would
+# never raise this warning anyway.
+_filter_installed = False
+_INSTALL_LOCK = threading.Lock()
+
+
+def _silence_insecure_request_warning(requests_module) -> None:
+    global _filter_installed
+    if _filter_installed:
+        return
+    with _INSTALL_LOCK:
+        if _filter_installed:
+            return
+        warnings.simplefilter(
+            "ignore",
+            requests_module.packages.urllib3.exceptions.InsecureRequestWarning)
+        _filter_installed = True
 
 
 class _RequestsSession:
@@ -91,17 +116,9 @@ class _RequestsSession:
         # package has to import cleanly on a C2 that never runs the agent.
         import requests
 
-        if kwargs.get("verify") is not False:
-            return requests.request(method, url, **kwargs)
-        # The C2 serves a self-signed certificate (spec §18), so verify=False
-        # is the default and urllib3 warns on every request. The suppression
-        # covers this one call and one category: a module-level
-        # urllib3.disable_warnings() or a global filter would hide the
-        # warning from every other use of requests in the process.
-        category = requests.packages.urllib3.exceptions.InsecureRequestWarning
-        with _FILTER_LOCK, warnings.catch_warnings():
-            warnings.simplefilter("ignore", category)
-            return requests.request(method, url, **kwargs)
+        if kwargs.get("verify") is False:
+            _silence_insecure_request_warning(requests)
+        return requests.request(method, url, **kwargs)
 
 
 # ── Client ──
