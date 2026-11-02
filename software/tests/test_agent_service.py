@@ -941,3 +941,91 @@ class TestShutdown(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestABrowserCannotReachTheService(_ServiceCase):
+    """The service listens on loopback, and the operator browses the web there.
+
+    Without this, a page they visit can POST to the campaign endpoint and
+    start a run: in loopback mode no token is needed, and a form-shaped POST
+    needs no CORS preflight. Measured before the fix: an attacker Origin got
+    200 and a rebound Host got 200.
+
+    The three signals are all things no real caller produces. The C2's proxy
+    uses urllib, which sends no Origin; an operator with curl sends none
+    either.
+    """
+
+    async def get_application(self):
+        self.rig = _rig(agent_token=None)
+        return self.rig.app
+
+    EVIL = "https://evil.example"
+
+    async def test_an_origin_header_is_refused_on_a_read(self):
+        resp = await self.client.get("/status", headers={"Origin": self.EVIL})
+        self.assertEqual(resp.status, 403)
+        self.assertIn("browser", (await resp.json())["error"])
+
+    async def test_an_origin_header_is_refused_on_a_write(self):
+        resp = await self.client.post("/campaign", json=_form(),
+                                      headers={"Origin": self.EVIL})
+        self.assertEqual(resp.status, 403)
+
+    async def test_a_form_shaped_post_is_refused_even_without_an_origin(self):
+        # The shapes a page can send with no preflight. Belt and braces: a
+        # future browser that omits Origin would still be stopped here.
+        for kind in ("text/plain", "application/x-www-form-urlencoded",
+                     "multipart/form-data"):
+            resp = await self.client.post("/campaign", data="{}",
+                                          headers={"Content-Type": kind})
+            self.assertEqual(resp.status, 415, kind)
+
+    async def test_a_rebound_host_is_refused(self):
+        # DNS rebinding: the attacker's name resolves to 127.0.0.1, so the
+        # peer really is loopback and that check passes. The Host header is
+        # what still carries their name.
+        resp = await self.client.get("/status", headers={"Host": self.EVIL})
+        self.assertEqual(resp.status, 403)
+        self.assertIn("Host", (await resp.json())["error"])
+
+    async def test_the_real_caller_still_works(self):
+        self.assertEqual((await self.client.get("/status")).status, 200)
+        self.assertIn((await self.client.post("/campaign", json=_form())).status,
+                      (200, 503))
+
+    async def test_an_unknown_route_is_also_covered(self):
+        resp = await self.client.get("/nope", headers={"Origin": self.EVIL})
+        self.assertEqual(resp.status, 403)
+
+
+class TestWithATokenTheTokenIsTheAuthority(_ServiceCase):
+    """The Host check is deliberately only for the no-token mode.
+
+    With a token set, a browser page does not have it and gets 401, so
+    rebinding buys nothing — while a deployment reaching the agent across a
+    container network legitimately uses a Host this service cannot predict.
+    Checking it there would break that for no gain.
+    """
+
+    TOKEN = "ZZ-not-a-real-token"
+
+    async def get_application(self):
+        self.rig = _rig(agent_token=self.TOKEN)
+        return self.rig.app
+
+    async def test_a_browser_is_still_refused(self):
+        resp = await self.client.get(
+            "/status", headers={"X-Agent-Token": self.TOKEN,
+                                "Origin": "https://evil.example"})
+        self.assertEqual(resp.status, 403)
+
+    async def test_a_rebound_host_without_the_token_is_401(self):
+        resp = await self.client.get("/status", headers={"Host": "evil.example"})
+        self.assertEqual(resp.status, 401)
+
+    async def test_an_unpredictable_host_with_the_token_is_accepted(self):
+        resp = await self.client.get(
+            "/status", headers={"X-Agent-Token": self.TOKEN,
+                                "Host": "agent.internal:8099"})
+        self.assertEqual(resp.status, 200)

@@ -116,6 +116,45 @@ def _same_token(presented, expected) -> bool:
                                hashlib.sha256(expected.encode("utf-8")).digest())
 
 
+def _is_browser_request(request) -> bool:
+    """Whether a browser sent this, which no legitimate caller here is.
+
+    The only clients are the C2's proxy, which uses urllib, and an operator
+    with curl. A browser attaches `Origin` to every cross-origin request and
+    to any POST, and a page cannot suppress it — so its presence is the
+    signal, and absence is what the real callers produce.
+
+    This matters because the service listens on loopback and the operator
+    browses the web on the same machine. Without it, a page they visit can
+    POST to the campaign endpoint and start a run: no token is needed in
+    loopback mode, and a no-cors form POST needs no preflight.
+    """
+    return bool(request.headers.get("Origin"))
+
+
+def _host_is_local(request, cfg) -> bool:
+    """Whether the Host header names this service rather than someone's domain.
+
+    The defence against DNS rebinding: the attacker points their own name at
+    127.0.0.1, so the connection really is from loopback and the peer check
+    passes, but the Host header still carries their name. Only checked when
+    no token is configured — with a token the token is the authority, and a
+    deployment reaching the agent across a container network legitimately
+    uses a Host this could not predict.
+    """
+    host = (request.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+    return host.lower() in _LOCAL_HOSTS or host == str(cfg.bind_host)
+
+
+_LOCAL_HOSTS = frozenset(("127.0.0.1", "::1", "localhost",
+                          "localhost.localdomain", ""))
+
+# What a page can POST without a CORS preflight. Requiring JSON closes the
+# form-shaped submissions; it costs a correct caller one header.
+_SIMPLE_CONTENT_TYPES = ("text/plain", "application/x-www-form-urlencoded",
+                         "multipart/form-data")
+
+
 @web.middleware
 async def require_agent_token(request, handler):
     """Every route, the unknown ones included, answers to the token.
@@ -125,13 +164,26 @@ async def require_agent_token(request, handler):
     the C2 reaches the agent across a container network has to set
     RACCOON_AGENT_TOKEN on both sides.
     """
-    token = request.app[_SERVICE].cfg.agent_token
+    cfg = request.app[_SERVICE].cfg
+    # Before the token, because these refuse a shape no real caller has and
+    # the reason should not depend on whether a token happens to be set.
+    if _is_browser_request(request):
+        return _error(403, "requests from a browser are not accepted; this "
+                           "service is reached by the C2 proxy")
+    if request.method not in ("GET", "HEAD"):
+        kind = (request.headers.get("Content-Type") or "").split(";")[0].strip()
+        if kind.lower() in _SIMPLE_CONTENT_TYPES:
+            return _error(415, "send application/json")
+    token = cfg.agent_token
     if token:
         if not _same_token(request.headers.get(TOKEN_HEADER, ""), token):
             return _error(401, "missing or wrong %s" % TOKEN_HEADER)
     elif not _peer_is_loopback(request):
         return _error(403, "no agent token is configured, so only this "
                            "machine may connect; set RACCOON_AGENT_TOKEN")
+    elif not _host_is_local(request, cfg):
+        return _error(403, "the Host header does not name this service; set "
+                           "RACCOON_AGENT_TOKEN to allow another name")
     return await handler(request)
 
 
