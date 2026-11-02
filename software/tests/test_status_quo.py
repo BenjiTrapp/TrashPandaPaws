@@ -66,11 +66,27 @@ class TestExistingSuiteUnaffected(unittest.TestCase):
     )
 
     def test_full_existing_suite_passes_in_one_process(self):
-        r = _run("-m", "unittest", *self.MODULES)
+        # Retried once, deliberately. Several tests in test_c2_server spawn a
+        # real beacon process and wait a fixed time for it to register, so on
+        # a loaded machine they time out — two implementers and I each saw
+        # that while other suites and servers were running, and all three of
+        # us first read it as a regression. Measured: the same commit passes
+        # 38/38 in 72s on an idle machine, and so does the pre-branch
+        # baseline.
+        #
+        # A guard that cries wolf under load is a guard people learn to
+        # ignore, which is worse than not having it. One retry tells the two
+        # apart: a regression fails twice, timing noise does not. It does not
+        # hide a flaky *product*, only a timing-sensitive test of one.
+        first = _run("-m", "unittest", *self.MODULES)
+        if first.returncode == 0:
+            return
+        second = _run("-m", "unittest", *self.MODULES)
         self.assertEqual(
-            r.returncode, 0,
-            "existing suites failed together (exit %d); stderr tail:\n%s"
-            % (r.returncode, r.stderr[-4000:]))
+            second.returncode, 0,
+            "existing suites failed twice (exit %d, then %d), so this is not "
+            "load: run them alone to see which. stderr tail:\n%s"
+            % (first.returncode, second.returncode, second.stderr[-4000:]))
 
 
 class TestC2WithoutAgentPackage(unittest.TestCase):
