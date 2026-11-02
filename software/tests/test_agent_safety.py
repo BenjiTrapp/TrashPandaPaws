@@ -113,6 +113,18 @@ class TestTierOneSpellings(unittest.TestCase):
                     "shell nft list ruleset", "shell ufw status"):
             self.assertNotEqual(_classify(cmd).tier, safety.TIER_HARD, cmd)
 
+    def test_nft_rule_additions_that_drop_are_firewall_changes(self):
+        self._hard(("shell nft add rule inet filter input drop",
+                    "shell nft insert rule inet filter output ip daddr 10.0.0.1 drop",
+                    "shell nft replace rule inet filter input handle 3 reject",
+                    "shell nft create rule inet filter forward drop"))
+
+    def test_nft_additions_that_do_not_drop_are_not_blocked(self):
+        for cmd in ("shell nft add rule inet filter input accept",
+                    "shell nft add table inet filter",
+                    "shell nft list ruleset"):
+            self.assertNotEqual(_classify(cmd).tier, safety.TIER_HARD, cmd)
+
     def test_network_services_every_spelling(self):
         self._hard(("shell systemctl stop NetworkManager",
                     "shell service networking restart",
@@ -333,6 +345,33 @@ class TestTierTwoClassifiesByEffect(unittest.TestCase):
         """The pre-schtasks spelling, found by adversarial review."""
         self._assert_action(("shell at 09:00 /f c:\\x.exe",
                              "shell at 23:30 /interactive c:\\x.exe"), "persist")
+
+    # ── Second spellings of listed effects ──
+
+    def test_sqlmap_is_exploitation(self):
+        self._assert_action(("sqlmap -u http://10.0.1.5/?id=1 --batch",
+                             "python3 sqlmap.py -u http://10.0.1.5/?id=1"),
+                            "exploit_known_poc")
+
+    def test_remote_execution_tools_share_the_lateral_rule(self):
+        self._assert_action((
+            "impacket-psexec corp/a:b@10.0.1.5", "impacket-wmiexec corp/a:b@10.0.1.5",
+            "impacket-smbexec corp/a:b@10.0.1.5", "impacket-atexec corp/a:b@10.0.1.5",
+            "impacket-dcomexec corp/a:b@10.0.1.5", "psexec.py corp/a:b@10.0.1.5",
+            "wmiexec.py corp/a:b@10.0.1.5", "smbexec.py corp/a:b@10.0.1.5",
+            "atexec.py corp/a:b@10.0.1.5", "dcomexec.py corp/a:b@10.0.1.5",
+            "evil-winrm -i 10.0.1.5 -u a -p b"), "ntlm_relay")
+        self.assertEqual(self._c("evil-winrm -i 10.0.1.5").action_class, "lateral")
+
+    def test_exe_suffixed_persistence_spellings(self):
+        self._assert_action((
+            "shell sc.exe create evil binpath= c:\\x.exe",
+            "shell reg.exe add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v x",
+            "shell net localgroup administrators backdoor /add"), "persist")
+
+    def test_localgroup_listing_is_free(self):
+        self.assertEqual(self._c("shell net localgroup administrators").tier,
+                         safety.TIER_FREE)
 
     def test_deauth_every_spelling(self):
         self._assert_action(("shell aireplay-ng -0 5 -a aa:bb wlan0mon",
@@ -919,6 +958,25 @@ class TestScanLimits(unittest.TestCase):
         self.assertIn("-c 1", safety.enforce_scan_limits("netdiscover -c 500 -r 10.0.1.0/24"))
         self.assertNotIn("-p", safety.enforce_scan_limits("netdiscover -r 10.0.1.0/24"))
 
+    def test_privilege_prefix_with_a_user_flag_still_finds_the_scanner(self):
+        for cmd in ("sudo -u alice nmap -sV 10.0.1.5", "doas -u bob nmap -sV 10.0.1.5",
+                    "sudo --user alice nmap -sV 10.0.1.5",
+                    "sudo -g wheel -u alice nmap -sV 10.0.1.5",
+                    "runas -U alice nmap -sV 10.0.1.5"):
+            out = safety.enforce_scan_limits(cmd)
+            self.assertIn("nmap -T2 --max-rate 50 -sV 10.0.1.5", out, cmd)
+            self.assertEqual(safety.enforce_scan_limits(out), out, cmd)
+
+    def test_plain_privilege_and_bare_scanner_are_still_limited(self):
+        self.assertEqual(safety.enforce_scan_limits("sudo nmap -sV 10.0.1.5"),
+                         "sudo nmap -T2 --max-rate 50 -sV 10.0.1.5")
+        self.assertEqual(safety.enforce_scan_limits("nmap -sV 10.0.1.5"),
+                         "nmap -T2 --max-rate 50 -sV 10.0.1.5")
+
+    def test_privilege_user_value_is_not_mistaken_for_the_scanner_position(self):
+        for cmd in ("sudo -u alice whoami", "sudo -u nmap whoami"):
+            self.assertEqual(safety.enforce_scan_limits(cmd), cmd)
+
     def test_is_idempotent(self):
         for cmd in ("nmap -sV 10.0.1.5", "masscan -p445 10.0.1.0/24",
                     "netdiscover -r 10.0.1.0/24", "shell sudo nmap -T5 10.0.1.5"):
@@ -978,6 +1036,60 @@ class TestScriptValidation(unittest.TestCase):
 
     def test_empty_script_is_accepted(self):
         self.assertIsNone(safety.validate_script("", "bash"))
+
+    # ── Language handling ──
+
+    _BENIGN_PYTHON = (
+        "import socket\n"
+        "# probe the gateway\n"
+        "def probe(host, port=445):\n"
+        "    s = socket.socket()\n"
+        "    s.settimeout(2)\n"
+        "    ok = s.connect_ex((host, port)) == 0\n"
+        "    return {'host': host, 'open': ok}\n"
+        "print(probe('10.0.1.5'))\n")
+
+    def test_benign_python_script_is_accepted(self):
+        self.assertIsNone(safety.validate_script(self._BENIGN_PYTHON, "python"))
+
+    def test_python_punctuation_is_still_shell_metacharacters_to_bash(self):
+        msg = safety.validate_script(self._BENIGN_PYTHON, "bash")
+        self.assertIn("shell metacharacters", msg)
+
+    def test_python_shell_escape_names_line_and_construct(self):
+        code = "import os\nx = 1\nsubprocess.run(['id'])\nos.system('id')\n"
+        msg = safety.validate_script(code, "python")
+        self.assertIn("line 3", msg)
+        self.assertIn("subprocess", msg)
+        self.assertNotIn("line 4", msg)
+
+    def test_every_python_shell_escape_is_refused(self):
+        for line, construct in (
+                ("import subprocess", "subprocess"), ("os.system('id')", "os.system"),
+                ("os.popen('id')", "os.popen"), ("os.execv('/bin/sh', [])", "os.exec"),
+                ("os . system('id')", "os.system"),
+                ("eval(payload)", "eval("), ("exec (payload)", "exec("),
+                ("m = __import__('os')", "__import__"),
+                ("pty.spawn('/bin/sh')", "pty.spawn"),
+                ("commands.getoutput('id')", "commands.getoutput")):
+            msg = safety.validate_script("x = 1\n" + line, "python")
+            self.assertIsNotNone(msg, line)
+            self.assertIn("line 2", msg, line)
+            self.assertIn(construct, msg, line)
+
+    def test_python_lookalikes_are_not_shell_escapes(self):
+        for line in ("import ast", "v = ast.literal_eval('[1, 2]')",
+                     "path = os.path.join('a', 'b')", "pos.systematic = 1"):
+            self.assertIsNone(safety.validate_script(line, "python"), line)
+
+    def test_python_is_not_classified_as_shell_commands(self):
+        self.assertIsNone(safety.validate_script("reboot = 3", "python"))
+
+    def test_shell_dialects_and_unknown_languages_take_the_strict_path(self):
+        for language in ("bash", "sh", "zsh", "dash", "ruby", "", None):
+            self.assertIsNotNone(safety.validate_script("whoami; id", language), language)
+            self.assertIsNotNone(safety.validate_script("reboot", language), language)
+            self.assertIsNone(safety.validate_script("whoami", language), language)
 
 
 class TestClamp(unittest.TestCase):

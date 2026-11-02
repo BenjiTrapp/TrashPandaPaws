@@ -149,6 +149,8 @@ def _strip_privilege(text):
 # all-caps word as a value misses `timeout -s term …` once the line has been
 # lowercased, and one that skips any token after any flag eats the real
 # command in `env -i rm -rf /`, where -i takes nothing.
+_PRIVILEGE_VALUE_FLAGS = ("-u", "-U", "--user", "-g", "--group")
+
 _WRAPPER_VALUE_FLAGS = {
     "timeout": ("-s", "--signal", "-k", "--kill-after"),
     "nice": ("-n", "--adjustment"),
@@ -159,6 +161,9 @@ _WRAPPER_VALUE_FLAGS = {
               "--replace", "--max-procs", "--delimiter", "--max-lines"),
     "watch": ("-n", "--interval"),
     "time": ("-f", "-o", "--format", "--output"),
+    "sudo": _PRIVILEGE_VALUE_FLAGS,
+    "doas": _PRIVILEGE_VALUE_FLAGS,
+    "runas": _PRIVILEGE_VALUE_FLAGS,
 }
 
 
@@ -384,6 +389,8 @@ _RULES = [
                 r"|\s-p\s+\w+\s+(?:drop|reject)|\s-[aidr]\b))"
                 r"|\bip6?tables-restore\b"
                 r"|\bnft\b.*\b(?:flush|delete)\b"
+                r"|\bnft\b(?=.*\b(?:add|insert|replace|create)\b)"
+                r"(?=.*\b(?:drop|reject)\b)"
                 r"|\bufw\b[^|]*?\s(?:enable|disable|reset|default)\b"
                 r"|\bfirewall-cmd\b.*(?:--reload|--add|--remove|--panic)"),
      "firewall_change"),
@@ -419,7 +426,10 @@ _RULES = [
     (re.compile(r"\bntlmrelayx(?:\.py)?\b|impacket-ntlmrelayx"
                 r"|\bkrbrelayx(?:\.py)?\b|\bsmbrelayx(?:\.py)?\b"
                 r"|\bprinterbug(?:\.py)?\b|\bdfscoerce(?:\.py)?\b"
-                r"|\bcoercer\b|\bpetitpotam(?:\.py)?\b|-m\s+coerce"), "ntlm_relay"),
+                r"|\bcoercer\b|\bpetitpotam(?:\.py)?\b|-m\s+coerce"
+                r"|\b(?:impacket-)?(?:psexec|wmiexec|smbexec|atexec|dcomexec)"
+                r"(?:\.py)?\b"
+                r"|\bevil-winrm\b"), "ntlm_relay"),
 
     (re.compile(r"\bwevtutil(?:\.exe)?\b.*\b(?:cl|clear-log)\b"
                 r"|\bclear-eventlog\b"
@@ -442,10 +452,11 @@ _RULES = [
                 r"|\bat\b\s+(?:now\b|-|\d{1,2}:\d{2}\b|\d{1,2}(?:am|pm)\b"
                 r"|midnight\b|noon\b|teatime\b)"
                 r"|\bsystemd-run\b.*--on-"
-                r"|\breg\s+add\b.*currentversion/?run"
-                r"|\bsc\s+create\b"
+                r"|\breg(?:\.exe)?\s+add\b.*currentversion/?run"
+                r"|\bsc(?:\.exe)?\s+create\b"
                 r"|\b(?:useradd|adduser)\b"
                 r"|\bnet\s+user\b.*\s/add\b"
+                r"|\bnet\s+localgroup\b.*\s/add\b"
                 r"|\blaunchctl\s+load\b"
                 r"|authorized_keys\b"
                 r"|/etc/rc\.local\b"
@@ -456,7 +467,8 @@ _RULES = [
 
     (re.compile(r"\bmsf(?:console|cli|venom)\b|\broutersploit\b"
                 r"|\bnmap\b.*--script[= ]\S*(?:exploit|vuln|dos|brute)"
-                r"|\bpython3?\b\s+\S*exploit\S*\.py\b"), "exploit_known_poc"),
+                r"|\bpython3?\b\s+\S*exploit\S*\.py\b"
+                r"|\bsqlmap\b"), "exploit_known_poc"),
 ]
 
 
@@ -1075,6 +1087,19 @@ def enforce_scan_limits(command):
 # ── Stored scripts ──
 
 
+# Python punctuation is syntax, not shell, so the metacharacter screen cannot
+# apply. What matters is a line that reaches back out to a shell, and those
+# are refused by name. This is a screen for the obvious spellings, not a
+# sandbox: an aliased import gets past it.
+_PYTHON_SHELL_ESCAPES = re.compile(
+    r"subprocess"
+    r"|\bos\s*\.\s*(?:system|popen|exec)"
+    r"|\b(?:eval|exec)\s*\("
+    r"|__import__"
+    r"|\bpty\s*\.\s*spawn"
+    r"|\bcommands\s*\.\s*getoutput")
+
+
 def validate_script(code, language):
     """Check a stored script line by line. Returns a message, or None if clean.
 
@@ -1083,14 +1108,25 @@ def validate_script(code, language):
     A stored script has no caller to supply context, and the reference
     implementation this project is modelled on let scripts bypass the safety
     layer entirely — which made the whole leash removable in three lines.
+
+    A python script is screened for shell-escape constructs instead of being
+    classified as shell commands. Any other language, recognised or not, takes
+    the strict shell path.
     """
     if not isinstance(code, str):
         return "script is not a string"
 
+    is_python = language == "python"
     normalised = code.replace("\r\n", "\n").replace("\r", "\n")
     for number, raw in enumerate(normalised.split("\n"), start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
+            continue
+        if is_python:
+            escape = _PYTHON_SHELL_ESCAPES.search(line)
+            if escape:
+                return "line %d: shell escape '%s' is not permitted in a python " \
+                       "script" % (number, re.sub(r"\s+", "", escape.group(0)))
             continue
         if has_shell_metachars(line):
             return "line %d: shell metacharacters are not permitted" % number
