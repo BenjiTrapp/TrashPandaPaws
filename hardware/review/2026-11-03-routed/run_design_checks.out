@@ -26,14 +26,14 @@ PASSED — all checks ok, 0 warning(s)
 === test_check_kicad.py
 ...........................
 ----------------------------------------------------------------------
-Ran 27 tests in 2.193s
+Ran 27 tests in 2.443s
 
 OK
 --- PASS  test_check_kicad.py
 === check_fab_release.py (incl. In1 continuity and pair coupling, ruling BJ)
 ...............................................................................................................................................................................................................
 ----------------------------------------------------------------------
-Ran 207 tests in 51.301s
+Ran 207 tests in 69.719s
 
 OK
 --- PASS  check_fab_release.py (incl. In1 continuity and pair coupling, ruling BJ)

@@ -546,30 +546,56 @@ components:
         OPEN ITEM, see Y1.source. The crystal is rated 100 uW ([ABM8]); the
         chip's side is only "DL Drive Level max 0.3 mW" ([RTL-DS] table 23).
         MEASURE, do not guess. Drive level is P = I_rms^2 * ESR, where I_rms is
-        the current through the crystal; the amplitude at the pin is not the
-        drive level, but it gives the current:
-          I_rms = 2 * pi * f * V_rms * (C0 + C_node)   (standard crystal-drive
-          formula, applied here with f = 25 MHz and C0 = 3 pF [ABM8]; C_node,
-          the capacitance the measured voltage drives, is an ASSUMPTION, see
-          below; the formula is not from the datasheets)
+        the motional current through the crystal. The amplitude at the pin is
+        not the drive level, but it gives the current, and how it does depends
+        on the capacitance the voltage is taken to drive, C_node:
+          I_rms = 2 * pi * f * V_rms * C_node,   f = 25 MHz, V_rms = Vpp/(2*sqrt 2)
+        for a sine (a standard relation; not from the datasheets). Worst-case
+        ESR 50 ohm ([ABM8] table 1), so 100 uW is I = 1.41 mA and 300 uW is
+        2.45 mA. Two definitions of C_node are in use, and they differ;
+        neither is settled here:
+          A. The crystal-vendor formula, I = 2 pi f V_rms (C0 + CL), with the
+             voltage taken at the crystal's input pin. C0 is counted ONCE, here.
+             C_node = C0 + CL = 3 pF (C0, [ABM8], a maximum) + 17.5 pF (CL of
+             load_caps above; 18 pF if the nominal is used) = 20.5 pF
+             (21 pF nominal): 100 uW at 1.24 V p-p (1.21 V at 21 pF), 300 uW at
+             2.15 V p-p (2.10 V).
+          B. All of the crystal's terminal current charges the capacitance at
+             the probed node (the inverter input draws none), so
+             C_node = C19 (27 pF) + the stray capacitance at that node, which is
+             somewhere between 0 and the 4 pF assumed for the whole of CL (Cstray
+             is an assumption, see load_caps): 27 to 31 pF. C0 is NOT added here,
+             because it lies across the crystal, not from the node to ground; its
+             current is already part of the terminal current. (This reading
+             overstates the MOTIONAL current by the C0 branch, so it errs toward
+             over-estimating the power.) 100 uW at 0.94 V p-p (27 pF) to 0.82 V
+             p-p (31 pF); 300 uW at 1.63 to 1.42 V p-p.
+          B'. If C0 were added to B as well (C_node = 34 pF at most): 100 uW
+             at 0.75 V p-p, 300 uW at 1.30 V p-p. Not believed to be right, for
+             the reason given under B, but not excluded either.
+        History: this note once said 1.2 V p-p (100 uW) and 2.1 V p-p (300 uW)
+        and described C_node as 'C0 3 pF + CL_total about 21 pF'. An earlier
+        edit of this note (task 12, first pass) called those figures wrong and
+        replaced them by 1.06 V p-p, using 24 pF = 3 + 21. THAT CORRECTION IS
+        WITHDRAWN: the figures 1.2 / 2.1 V p-p are what definition A gives (at
+        21 pF = C0 3 + CL 18), so they were right; it was the label 'CL_total
+        about 21 pF' that was wrong, since CL is 17.5 to 18 pF here, and 3 + 21
+        double-counted C0. The 31 pF of the same edit ('C0 3 + 27 + 4') also
+        summed to 34, not 31; it is definition B at its upper end.
         Measure V p-p at CKXTAL1 (crystal side) with a probe of 1 pF or less
-        (a normal 10:1 probe adds 10-15 pF and detunes it), V_rms = Vpp/(2*sqrt 2)
-        for a sine. Worst case ESR 50 ohm ([ABM8] table 1). Worked numbers
-        (task 12 correction; an earlier text said 1.2 V p-p and 2.1 V p-p,
-        which are the values for C_node = 21 pF, i.e. without C0, and did not
-        follow from the formula as stated): 100 uW at 50 ohm is I = 1.41 mA.
-          C_node = 24 pF (C0 3 + CL_total about 21): V_rms 0.375 V, 1.06 V p-p
-          C_node = 31 pF (C0 3 + 27 pF C19 + 4 pF stray, the shunt
-                   capacitance at the CKXTAL1 node itself): 0.82 V p-p
-        and for 0.3 mW (the chip's limit, 2.45 mA): 1.84 V p-p and 1.42 V p-p
-        respectively. Which C_node is right was not settled; both are
-        assumptions built on Cstray = 4 pF. A current probe round the crystal
-        lead gives I directly and avoids the formula and the question.
-        RULE: Vpp at CKXTAL1 <= ~0.8 V with R14 = 0R: leave as is. The lower
-        of the two figures is used so that an error falls on the safe side
-        (trimming earlier than needed costs nothing). Above it,
-        fit a larger R14 until it is under; the value is found on the bench,
-        none is sourced here. If the amplitude then drops so far that start-up
+        (a normal 10:1 probe adds 10-15 pF and detunes it). A current probe
+        round the crystal lead gives I directly and settles the question; use
+        one if there is one.
+        RULE for the voltage reading, R14 = 0R: at or below about 0.75 V p-p the
+        drive level is under 100 uW by every definition above: leave as is.
+        Above about 1.25 V p-p it is over 100 uW by every definition: fit a
+        larger R14 until it is under (the value is found on the bench, none is
+        sourced here). In between (0.75 to 1.25 V p-p) the answer depends on
+        the definition, which only a current probe or a vendor statement
+        settles; the crystal's 100 uW is the vendor's maximum rating, not a
+        measured failure point, and the chip's own limit is 0.3 mW, so this
+        zone is a judgement for the person at the bench, not a pass or a fail.
+        Trimming has a cost: if the amplitude drops so far that start-up
         becomes unreliable (check cold start 20 times), replace the crystal with
         one rated 200 uW or more instead.
     pins:
@@ -1977,8 +2003,18 @@ design_notes:
     functional block diagram: I/O on pins 1, 3, 4, 6, GND on pin 2, pin 5 not
     connected; pin 1 is the dotted corner at the bottom left of the top view,
     the same numbering as KiCad's SOT-23-6 footprint (pads 1-3 along one side,
-    4-6 back along the other). Task 8 checked the placed footprint's pad 1
-    against that drawing (see U8 source).
+    4-6 back along the other). NO EARLIER RECORD of a check of pad 1 against
+    the drawing was found (an earlier edit of this text said 'Task 8 checked
+    it'; nothing supports that, and the only 'checked against the drawing' in
+    the placement README concerns the pad span). Checked in task 12 fix round
+    1, on paper only: the library footprint raccoon:SOT-23-6_SP3019_
+    LittelfuseLand has pads 1, 2, 3 down the left column and 4, 5, 6 up the
+    right column; the drawing (page 1, rendered) has 1, 2, 3 along the bottom
+    row and 6, 5, 4 along the top with the dot at pin 1. Turning the footprint
+    90 degrees counter-clockwise gives the drawing, same corner for pin 1, same
+    cyclic order, not mirrored. NOT checked: the physical part. The first
+    build must confirm, before soldering U8, that the dot on the real package
+    is at pad 1 as placed (OPEN_QUESTIONS.md, 'Also open').
 
     LAYOUT (for tasks 8 and 9). U9 is flow-through: D+ enters pad 1 and leaves
     pad 6, D- enters 3 and leaves 4. U8 is NOT flow-through, each line has one

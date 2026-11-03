@@ -135,10 +135,10 @@ ledger has the history of each fix):
 ## Deferred minors
 
 `deferred-minors.md` collects the 35 deferred lines of tasks 1-8 and the minors
-of the task 9 reviews with a disposition each. Task 12 resolved the two that
+of the task 9 reviews with a disposition each. Task 12 dealt with the two that
 needed a decision (the U8 ESD-rating citation, S1, and the crystal drive-level
-arithmetic, S2) and swept up the documentation ones; each row there says how.
-The full account is in the task 12 report.
+arithmetic, S2, which needed a second pass because the first one was wrong) and
+swept up the documentation ones; each row there says how, and which stay.
 
 ## Reproducing
 
