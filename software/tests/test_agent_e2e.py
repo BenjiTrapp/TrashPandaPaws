@@ -39,11 +39,13 @@ from software.agent.store import db, queries  # noqa: E402
 from software.c2.beacon import Beacon  # noqa: E402
 from software.c2.server import ServerCrypto, create_app  # noqa: E402
 from software.tests.test_c2_server import (  # noqa: E402
-    DNS_DOMAIN, TEST_TOKEN, _beacon_config, _reset_server_state)
+    DNS_DOMAIN, TEST_TOKEN, _beacon_config, _pick_port, _reset_server_state)
 
-# Away from the 19999 that test_c2_server uses, so the two suites can run in
-# one process without fighting over the port.
-PORT = 19977
+# A free port, not a fixed one, and for the same reason test_c2_server stopped
+# using 19999: the Flask thread is a daemon and never releases the port, so a
+# second process re-running either suite cannot bind it, and the failure reads
+# as "the beacon did not register" rather than as a port conflict.
+PORT = _pick_port()
 
 
 def _key_for_port(port: int) -> bytes:

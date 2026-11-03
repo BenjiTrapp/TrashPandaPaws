@@ -31,7 +31,33 @@ from software.c2.server import (
 from software.c2.beacon import Beacon
 
 
-CALLBACK_URL = "http://127.0.0.1:19999/api/v1/beacon"
+def _pick_port() -> int:
+    """A free port for this process, honouring RACCOON_TEST_PORT.
+
+    It used to be 19999, written in three places. The Flask thread these
+    tests start is a daemon and never gives the port back, so a second
+    process that re-runs this module while the first is still alive cannot
+    bind it -- and the failure surfaces as "Beacon did not register in
+    time", which points at the beacon rather than at the port. That is
+    exactly what happened once test_status_quo began re-running these suites
+    in a subprocess: the two were green apart and red together.
+    """
+    override = os.environ.get("RACCOON_TEST_PORT")
+    if override:
+        return int(override)
+    import contextlib
+    import socket
+    with contextlib.closing(socket.socket()) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+PORT = _pick_port()
+# Derived from the port, because the server's key is derived from the
+# callback URL: a port that moves and a key that does not means the beacon
+# registers under a key the server will not accept, and a key mismatch is
+# silent -- the fleet simply stays empty.
+CALLBACK_URL = "http://127.0.0.1:%d/api/v1/beacon" % PORT
 DNS_DOMAIN = ""
 TEST_TOKEN = "test-operator-token"
 
@@ -40,7 +66,8 @@ def _derive_key() -> bytes:
     return hashlib.sha256(f"{CALLBACK_URL}:{DNS_DOMAIN}".encode()).digest()
 
 
-def _beacon_config(port: int = 19999, interval: int = 1) -> dict:
+def _beacon_config(port: int = None, interval: int = 1) -> dict:
+    port = PORT if port is None else port
     return {
         "c2": {
             "beacon_interval_seconds": interval,
@@ -73,7 +100,7 @@ def _reset_server_state():
 class ServerTestBase(unittest.TestCase):
     """Starts a Flask test client for each test class."""
 
-    port = 19999
+    port = PORT
 
     @classmethod
     def setUpClass(cls):
