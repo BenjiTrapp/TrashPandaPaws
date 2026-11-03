@@ -3154,37 +3154,67 @@ class CplRotationIsVerifiedAgainstPinOne(unittest.TestCase):
         self.assertNotIn(quarter["1"], pads.values())
 
 
+def gerber_component_openings(text):
+    """({ref: flash count}, unattributed flash count) of a paste gerber. KiCad
+    writes the component of every pad opening as a `%TO.C,<ref>*%` attribute
+    that stays in force until `%TD*%`; that attribute is what the exported file
+    itself says about whose opening it is, so no geometry is guessed."""
+    counts, current, unattributed = {}, None, 0
+    for line in text.splitlines():
+        if line.startswith("%TO.C,"):
+            current = line[len("%TO.C,"):].rstrip("*%")
+            counts.setdefault(current, 0)
+        elif line.startswith("%TD"):
+            current = None
+        elif re.match(r"^X-?\d+Y-?\d+D0[123]\*", line) or line.startswith("G36"):
+            if current is None:
+                unattributed += 1
+            else:
+                counts[current] += 1
+    return counts, unattributed
+
+
 class PasteIsOpenOnlyForTheAssembledParts(unittest.TestCase):
+    """What the stencil opens is read from the exported F.Paste file itself: the
+    only component attributes (`%TO.C`) in it are U3 and Y1, and no opening or
+    region stands outside an attribute. (An earlier version tested a bounding
+    box round the two parts; C7, C15 and R14 are 0.2 to 0.5 mm from that box,
+    so a neighbour's opening could have been taken for U3's.)"""
 
-    def pad_boxes(self, margin=1.2):
-        text = PCB.read_text()
-        boxes = []
-        for ref in ASSEMBLED_REFS:
-            block = footprint_block(text, ref)
-            x, y = map(float, re.search(r"\n\t\t\(at ([-0-9.]+) ([-0-9.]+)", block).groups())
-            pads = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), ref)
-            xs, ys = [p[0] for p in pads.values()], [p[1] for p in pads.values()]
-            boxes.append((min(xs) - margin, max(xs) + margin, min(ys) - margin, max(ys) + margin))
-        return boxes
+    def paste(self):
+        return (GERBER_DIR / "raccoon-tap-F_Paste.gtp").read_text()
 
-    def inside(self, point, boxes):
-        return any(x0 <= point[0] <= x1 and y0 <= point[1] <= y1 for x0, x1, y0, y1 in boxes)
+    def test_the_only_components_in_the_paste_file_are_u3_and_y1(self):
+        text = self.paste()
+        self.assertEqual(sorted(re.findall(r"^%TO\.C,([^*,]+)\*%", text, re.M)),
+                         sorted(ASSEMBLED_REFS))
+        counts, unattributed = gerber_component_openings(text)
+        self.assertEqual(sorted(counts), sorted(ASSEMBLED_REFS))
+        self.assertEqual(unattributed, 0, "an opening that no component attribute covers")
 
-    def test_every_paste_opening_lies_on_u3_or_y1(self):
-        flashes = gerber_flashes((GERBER_DIR / "raccoon-tap-F_Paste.gtp").read_text())
-        boxes = self.pad_boxes()
-        self.assertGreaterEqual(len(flashes), 40 + 4)      # U3's 40 pads, Y1's 4, and the exposed pad
-        outside = [f for f in flashes if not self.inside(f, boxes)]
-        self.assertEqual(outside, [])
+    def test_u3_and_y1_have_their_openings(self):
+        counts, _ = gerber_component_openings(self.paste())
+        self.assertEqual(counts["Y1"], 4)           # four pads
+        self.assertGreaterEqual(counts["U3"], 40)   # 40 pads and the exposed pad's segments
 
     def test_the_full_paste_layer_of_the_board_would_not_pass(self):
-        # the control: the board's own F.Paste has openings elsewhere, so the test above can fail
+        # the control: the board's own F.Paste has openings on other components, so the test
+        # above can fail. The kicad-cli is resolved the way export_fab.py does (KICAD_CLI).
+        cli = load_export_fab().KICAD_CLI
         with tempfile.TemporaryDirectory() as tmp:
-            subprocess.run(["kicad-cli", "pcb", "export", "gerbers", "--layers", "F.Paste",
+            subprocess.run([cli, "pcb", "export", "gerbers", "--layers", "F.Paste",
                             "--output", tmp, str(PCB)], check=True, capture_output=True)
-            flashes = gerber_flashes((Path(tmp) / "raccoon-tap-F_Paste.gtp").read_text())
-        boxes = self.pad_boxes()
-        self.assertGreater(len([f for f in flashes if not self.inside(f, boxes)]), 50)
+            text = (Path(tmp) / "raccoon-tap-F_Paste.gtp").read_text()
+        others = set(re.findall(r"^%TO\.C,([^*,]+)\*%", text, re.M)) - set(ASSEMBLED_REFS)
+        self.assertGreater(len(others), 20, sorted(others))
+        self.assertTrue({"C7", "C15", "R14"} <= others, sorted(others))
+
+    def test_the_check_sees_a_neighbours_opening_and_an_unattributed_one(self):
+        relabelled = self.paste().replace("%TO.C,U3*%", "%TO.C,C7*%", 1)
+        self.assertEqual(sorted(gerber_component_openings(relabelled)[0]), ["C7", "Y1"])
+        bare = self.paste().replace("%TO.C,Y1*%\n", "", 1)
+        counts, unattributed = gerber_component_openings(bare)
+        self.assertEqual((sorted(counts), unattributed), (["U3"], 4))
 
     def test_there_is_no_bottom_paste_layer_and_no_bottom_part_is_assembled(self):
         names = json.loads((GERBER_DIR / MANIFEST_NAME).read_text())["files"]
@@ -3192,37 +3222,201 @@ class PasteIsOpenOnlyForTheAssembledParts(unittest.TestCase):
 
 
 ASSEMBLY_BOM = FAB / "raccoon-tap-assembly-bom.csv"
+CPL_PATH = FAB / "raccoon-tap-cpl.csv"
 ORDERING = FAB / "ORDERING.md"
 
 
+U3_SOURCING = HARDWARE / "review" / "u3-sourcing.md"
+
+
+def assembly_bom_rows(path=ASSEMBLY_BOM):
+    with open(path, newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def generate_assembly_bom(netlist, directory):
+    """Run the real gen_bom.py on `netlist` and return the assembly BOM text it
+    writes, or the ValueError text as ('error', message)."""
+    directory = Path(directory)
+    source = directory / "netlist.yaml"
+    source.write_text(yaml.safe_dump(netlist, sort_keys=False, width=10_000))
+    out = directory / "assembly-bom.csv"
+    result = subprocess.run([sys.executable, str(GEN_BOM), str(source), "--out",
+                             str(directory / "bom.csv"), "--assembly-out", str(out)],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        return "error", result.stderr
+    return "ok", out.read_text()
+
+
+class AssemblyBomIsGeneratedFromTheNetlist(unittest.TestCase):
+    """raccoon-tap-assembly-bom.csv is a derived artefact: gen_bom.py writes it
+    from the `assembly:` mappings of netlist.yaml, as it writes bom.csv. A
+    hand-edited copy differs from a fresh run and fails here."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.netlist = load_netlist()
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.status, cls.fresh = generate_assembly_bom(cls.netlist, cls.tmp.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_the_committed_file_is_what_the_generator_writes(self):
+        self.assertEqual(self.status, "ok", self.fresh)
+        self.assertEqual(ASSEMBLY_BOM.read_text(), self.fresh)
+
+    def test_the_machine_placed_parts_are_those_the_netlist_marks(self):
+        marked = [ref for ref, c in self.netlist["components"].items() if c.get("assembly") is not None]
+        self.assertEqual(sorted(marked), sorted(ASSEMBLED_REFS))
+        self.assertEqual(sorted(load_export_fab().ASSEMBLED), sorted(ASSEMBLED_REFS))
+
+    def test_a_hand_edit_is_detected(self):
+        edited = ASSEMBLY_BOM.read_text().replace("C2802072", "C2802073")
+        self.assertNotEqual(edited, ASSEMBLY_BOM.read_text())
+        self.assertNotEqual(edited, self.fresh)
+
+    def test_the_generator_reads_the_netlist_not_a_stored_copy(self):
+        changed = copy.deepcopy(self.netlist)
+        changed["components"]["U3"]["assembly"]["distributor_pn"] = "C1"
+        changed["components"]["U3"]["assembly"]["placement"] = "Pin 1 at the upper left."
+        with tempfile.TemporaryDirectory() as tmp:
+            status, text = generate_assembly_bom(changed, tmp)
+        self.assertEqual(status, "ok")
+        self.assertIn(",C1\n", text)
+        self.assertIn("Pin 1 at the upper left.", text)
+        self.assertNotIn("C2802072", text)
+
+    def test_a_part_the_netlist_does_not_mark_is_not_in_it(self):
+        changed = copy.deepcopy(self.netlist)
+        del changed["components"]["Y1"]["assembly"]
+        with tempfile.TemporaryDirectory() as tmp:
+            status, text = generate_assembly_bom(changed, tmp)
+        self.assertEqual(status, "ok")
+        self.assertEqual([r["Reference Designator"] for r in csv.DictReader(text.splitlines())], ["U3"])
+
+    def test_the_generator_refuses_a_marked_part_that_is_not_fitted_or_is_incomplete(self):
+        dnp = copy.deepcopy(self.netlist)
+        dnp["components"]["U3"]["populate"] = False
+        incomplete = copy.deepcopy(self.netlist)
+        del incomplete["components"]["Y1"]["assembly"]["distributor"]
+        marked_c5 = copy.deepcopy(self.netlist)
+        marked_c5["components"]["C5"]["assembly"] = {"description": "x", "placement": "x",
+                                                     "distributor": "x", "distributor_pn": "x"}
+        marked_c5["components"]["C5"].pop("mpn", None)
+        for name, netlist in (("DNP", dnp), ("incomplete", incomplete), ("no mpn", marked_c5)):
+            with tempfile.TemporaryDirectory() as tmp:
+                status, text = generate_assembly_bom(netlist, tmp)
+            self.assertEqual(status, "error", name)
+
+    def test_no_assembly_bom_is_written_unless_asked_for(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run([sys.executable, str(GEN_BOM), str(NETLIST), "--out", str(Path(tmp) / "bom.csv")],
+                           check=True, capture_output=True)
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["bom.csv"])
+
+
 class AssemblyBomIsTheTwoMachinePlacedParts(unittest.TestCase):
+    """The generated file checked against sources that are not the generator:
+    the hand-solder BOM, the board, the CPL, the sourcing review."""
 
     def rows(self):
-        with open(ASSEMBLY_BOM, newline="") as fh:
-            return list(csv.DictReader(fh))
+        return assembly_bom_rows()
+
+    def by_ref(self):
+        return {r["Reference Designator"]: r for r in self.rows()}
 
     def test_only_u3_and_y1_are_in_it(self):
         self.assertEqual([r["Reference Designator"] for r in self.rows()], list(ASSEMBLED_REFS))
         self.assertEqual([r["Quantity Per Part Number"] for r in self.rows()], ["1", "1"])
+        self.assertEqual([r["Line#"] for r in self.rows()], ["1", "2"])
 
     def test_part_numbers_are_those_of_the_hand_solder_bom(self):
         main = {r["Reference"]: r for r in load_bom()}
         for row in self.rows():
             ref = row["Reference Designator"]
+            self.assertEqual(row["Part Number"], main[ref]["Part Number"])
             self.assertEqual(row["Manufacturers Part Number"], main[ref]["Part Number"])
             self.assertEqual(row["Manufacturers Name"], main[ref]["Manufacturer"])
 
+    def test_package_is_the_footprint_on_the_board_and_in_the_cpl(self):
+        text = PCB.read_text()
+        cpl = {r["Designator"]: r for r in read_cpl()}
+        for ref, row in self.by_ref().items():
+            names = re.findall(r'^\(footprint "([^"]+)"', footprint_block_header(text, ref), re.M)
+            self.assertEqual([n.split(":")[-1] for n in names], [row["Package"]], ref)
+            self.assertEqual(row["Package"], cpl[ref]["Package"], ref)
+
+    def test_description_agrees_with_the_hand_solder_bom_and_the_footprint(self):
+        main = {r["Reference"]: r for r in load_bom()}
+        by_ref = self.by_ref()
+        # U3: 40 pins on 0.4 mm pitch, 5x5 mm, exposed pad = pin 41
+        u3 = by_ref["U3"]["Part Description"]
+        footprint = by_ref["U3"]["Package"]
+        self.assertIn("QFN-40", u3)
+        self.assertIn("QFN-40", footprint)
+        self.assertRegex(footprint, r"5x5mm_P0\.4mm")
+        self.assertRegex(u3, r"5\s?x\s?5 mm")
+        self.assertRegex(u3, r"0\.4 mm pitch")
+        self.assertIn("pin 41", u3)
+        self.assertIn('(pad "41" ', footprint_block(PCB.read_text(), "U3"))
+        self.assertIn("pin 41", main["U3"]["Source"])
+        # Y1: 25 MHz, CL 18 pF, 3225
+        y1 = by_ref["Y1"]["Part Description"]
+        self.assertIn("25 MHz", y1)
+        self.assertIn("25MHz", main["Y1"]["Description"])
+        self.assertIn("CL 18 pF", y1)
+        self.assertIn("CL 18pF", main["Y1"]["Description"])
+        self.assertIn("3225", y1)
+        self.assertEqual(main["Y1"]["Package"], "3225")
+        self.assertIn("3225", by_ref["Y1"]["Package"])
+
+    def test_the_pin_1_text_agrees_with_the_gerber_and_the_cpl(self):
+        by_ref = self.by_ref()
+        u3 = by_ref["U3"]["Part Description"]
+        self.assertRegex(u3, r"(?i)pin 1 at the lower right of the part as seen from the front")
+        cpl = {r["Designator"]: r for r in read_cpl()}["U3"]
+        pad1 = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"]
+        self.assertGreater(pad1[0], float(cpl["Mid X"]))        # right
+        self.assertLess(pad1[1], float(cpl["Mid Y"]))           # lower (Y is up in the gerber)
+        self.assertEqual(float(cpl["Rotation"]) % 360, 180)
+        # Y1: pads 1 and 3 are the crystal terminals, 2 and 4 ground; no fixed pin-1 mark
+        y1 = by_ref["Y1"]["Part Description"]
+        self.assertIn("Pads 1 and 3 are the terminals, 2 and 4 are ground", y1)
+        self.assertIn("No fixed pin-1 mark", y1)
+        block = footprint_block(PCB.read_text(), "Y1")
+        nets = dict(re.findall(r'\(pad "([1-4])" smd roundrect.*?\(net "([^"]+)"\)', block, re.S))
+        self.assertEqual((nets["2"], nets["4"]), ("GND", "GND"))
+        self.assertNotIn("GND", (nets["1"], nets["3"]))
+
     def test_u3_names_lcsc_c2802072_and_y1_names_a_distributor(self):
-        by_ref = {r["Reference Designator"]: r for r in self.rows()}
+        by_ref = self.by_ref()
         self.assertEqual(by_ref["U3"]["Distributors Part Number"], "C2802072")
-        self.assertIn("LCSC", by_ref["U3"]["Distributor"])
+        self.assertEqual(by_ref["U3"]["Distributor"], "LCSC")
+        self.assertRegex(by_ref["U3"]["Distributors Part Number"], r"^C\d+$")
         self.assertTrue(by_ref["Y1"]["Distributor"])
+        self.assertEqual(by_ref["Y1"]["Distributors Part Number"], "")      # none was verified
+
+    def test_the_lcsc_number_is_the_one_in_the_sourcing_review_and_in_ordering(self):
+        number = self.by_ref()["U3"]["Distributors Part Number"]
+        review = U3_SOURCING.read_text()
+        self.assertRegex(review, rf"LCSC\*?\*? `{number}`")
+        self.assertRegex(review, r"RTL8153B")
+        self.assertIn(number, ORDERING.read_text())
+        self.assertIn(self.by_ref()["Y1"]["Manufacturers Part Number"], ORDERING.read_text())
 
     def test_no_hand_soldered_part_is_in_it(self):
         main = {r["Reference"] for r in load_bom()}
         self.assertTrue(set(ASSEMBLED_REFS) <= main)
         refs = {r["Reference Designator"] for r in self.rows()}
         self.assertEqual(refs, set(ASSEMBLED_REFS))
+
+
+def footprint_block_header(pcb_text, ref):
+    """The first line of the footprint block of `ref`, as it stands in the file."""
+    return "(footprint " + footprint_block(pcb_text, ref).split("\n", 1)[0]
 
 
 def board_vias(pcb_text):
@@ -3283,6 +3477,51 @@ class OrderingStatesEveryRuledRequirement(unittest.TestCase):
         self.assertStated(r"(?i)not a double-sided", "that this is not double-sided SMT")
         bottom = re.findall(r'\(footprint "[^"]+"\n\t\t\(layer "B\.Cu"\)', PCB.read_text())
         self.assertEqual(len(bottom), 3)
+
+    def test_surface_finish_is_enig_by_ruling_ca_everywhere_it_is_mentioned(self):
+        row = next(l for l in self.text.splitlines() if l.startswith("| Surface finish"))
+        self.assertRegex(row, r"\*\*ENIG\*\*.*ruling CA")
+        self.assertStated(r"(?i)surface finish: ENIG \(ruling CA\)", "the finish decision, with its ruling")
+        self.assertStated(r"(?i)QFN-40.{0,80}0\.4 mm pitch.{0,300}ENIG is flat|ENIG is\s+flat", "the ruling's reason: ENIG is flat at 0.4 mm pitch")
+        self.assertStated(r"(?i)HASL.{0,40}uneven", "that HASL is uneven")
+        job_row = next(l for l in self.text.splitlines() if "raccoon-tap-job.gbrjob" in l and l.startswith("|"))
+        self.assertRegex(job_row, r"ENIG.*ruling CA")
+        questions = self.text.split("## Questions for PCBWay", 1)[1]
+        question_11 = questions.split("\n11. ", 1)[1].split("\n\n", 1)[0]
+        self.assertRegex(re.sub(r"\s+", " ", question_11), r"ENIG.*ruling CA")
+        decisions = re.sub(r"\s+", " ", self.text.split("* **Decisions** for the operator:", 1)[1].split("* **The first-build", 1)[0])
+        self.assertNotRegex(decisions.split("The surface finish")[0], r"(?i)finish")
+        self.assertRegex(decisions, r"(?i)surface finish is no longer one.{0,30}ENIG \(ruling CA\)")
+
+    def test_ordering_no_longer_calls_the_finish_open(self):
+        for stale in (r"recommended, not decided", r"Nobody has ruled", r"open decision for the operator",
+                      r"(?i)surface finish is an open"):
+            self.assertNotRegex(self.flat, stale)
+
+    def test_cpl_format_is_declared_unverified_and_the_preview_is_a_gate(self):
+        self.assertStated(r"(?i)CPL.s format is unverified against PCBWay", "that the CPL format, not only the rotation, is unverified")
+        questions = self.text.split("## Questions for PCBWay", 1)[1]
+        q10 = re.sub(r"\s+", " ", questions.split("\n10. ", 1)[1].split("\n11. ", 1)[0])
+        for needed, what in ((r"hard gate", "a hard gate"), (r"before I pay", "before payment"),
+                             (r"`Layer`.{0,20}`Top`", "the Layer value Top"), (r"`T`", "T / B"),
+                             (r"without.{0,10}unit suffix|unit suffix", "the missing mm suffix"),
+                             (r"negative", "the negative Mid Y"),
+                             (r"Designator, Val, Package, Mid X, Mid Y, Rotation, Layer", "the column set"),
+                             (r"rotation convention", "the rotation convention")):
+            self.assertRegex(q10, rf"(?i){needed}", f"Question 10 does not state: {what}")
+        self.assertStated(r"(?i)GATE: do not pay until you have seen PCBWay.s placement preview", "the gate before payment")
+        self.assertStated(r"(?i)no payment before the operator has seen it", "the gate in the open items")
+        header = CPL_PATH.read_text().splitlines()[0].split(",")
+        self.assertIn(", ".join(header), self.flat)               # the column set stated is the file's
+        self.assertEqual({r["Layer"] for r in read_cpl()}, {"Top"})
+        self.assertTrue(float([r for r in read_cpl() if r["Designator"] == "U3"][0]["Mid Y"]) < 0)
+
+    def test_the_narrow_via_is_flagged_as_possibly_out_of_process_in_the_table(self):
+        row = next(l for l in self.text.splitlines() if l.startswith("| 0.56 / 0.3"))
+        self.assertRegex(row, r"(?i)annular ring 0\.13 mm")
+        self.assertRegex(row, r"(?i)may be below PCBWay.s published minimum")
+        self.assertRegex(row, r"(?i)0\.15 mm")
+        self.assertRegex(row, r"(?i)not confirmed")
 
     def test_controlled_impedance_with_targets_and_the_mask_pass_question_first(self):
         self.assertStated(r"90\s*(ohm|Ω)", "90 ohm differential")

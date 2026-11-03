@@ -17,8 +17,15 @@ is ever fitted is named in "Part If Fitted". DNP rows come last. Parts with
 `bom: false` (test pads, cut-open solder jumpers) are not parts and are left
 out. Rules in tools/fitting.py.
 
+The assembly BOM for PCBWay's partial assembly (fab/raccoon-tap-assembly-bom.csv)
+is generated from the same netlist and never edited by hand: a component is
+machine-placed exactly when it carries an `assembly:` mapping (description,
+placement, distributor, distributor_pn). Pass --assembly-out to write it; the
+file is not written otherwise, so a run into a scratch folder cannot touch the
+committed one. tools/export_fab.py writes it together with the gerbers.
+
 Usage:
-    python3 gen_bom.py [--out bom.csv] [netlist.yaml]
+    python3 gen_bom.py [--out bom.csv] [--assembly-out raccoon-tap-assembly-bom.csv] [netlist.yaml]
 """
 
 import argparse
@@ -36,10 +43,17 @@ import fitting  # noqa: E402
 HERE = Path(__file__).resolve().parent
 DEFAULT_NETLIST = HERE.parent / "netlist.yaml"
 DEFAULT_OUT = HERE.parent / "bom.csv"
+DEFAULT_ASSEMBLY_OUT = HERE.parent / "fab" / "raccoon-tap-assembly-bom.csv"
 
 FIELDS = ["Reference", "Quantity", "Populate", "Value", "Tolerance", "Package",
           "Manufacturer", "Part Number", "Part If Fitted", "Description",
           "Source"]
+
+ASSEMBLY_FIELDS = ["Line#", "Quantity Per Part Number", "Reference Designator",
+                   "Part Number", "Part Description", "Package", "Type",
+                   "Manufacturers Name", "Manufacturers Part Number", "Distributor",
+                   "Distributors Part Number"]
+ASSEMBLY_KEYS = ("description", "placement", "distributor", "distributor_pn")
 
 
 def ref_key(ref):
@@ -131,11 +145,65 @@ def build_rows(netlist):
     return rows
 
 
+def assembly_refs(netlist):
+    """The references that PCBWay places: those with an `assembly:` mapping."""
+    return sorted((ref for ref, comp in netlist["components"].items()
+                   if comp.get("assembly") is not None), key=ref_key)
+
+
+def build_assembly_rows(netlist):
+    """Rows of the assembly BOM: one per machine-placed component, by reference.
+    Every field comes from the netlist; a part that is not to be fitted, or that
+    is not a BOM part, is refused rather than sent to the assembler."""
+    components = netlist["components"]
+    rows = []
+    for number, ref in enumerate(assembly_refs(netlist), start=1):
+        comp = components[ref]
+        assembly = comp["assembly"]
+        if not isinstance(assembly, dict):
+            raise ValueError(f"{ref}: assembly must be a mapping of {', '.join(ASSEMBLY_KEYS)}")
+        missing = [k for k in ASSEMBLY_KEYS if k not in assembly]
+        if missing:
+            raise ValueError(f"{ref}: assembly lacks {', '.join(missing)}")
+        if not fitting.in_bom(ref, comp) or not fitting.is_populated(ref, comp):
+            raise ValueError(f"{ref}: marked for machine assembly but not to be fitted")
+        for key in ("mpn", "manufacturer", "footprint"):
+            if not comp.get(key):
+                raise ValueError(f"{ref}: assembled but has no {key}")
+        text = " ".join(f"{assembly['description']} {assembly['placement']}".split())
+        rows.append({
+            "Line#": number,
+            "Quantity Per Part Number": 1,
+            "Reference Designator": ref,
+            "Part Number": comp["mpn"],
+            "Part Description": text,
+            "Package": str(comp["footprint"]).split(":", 1)[-1],
+            "Type": "Surface mount",
+            "Manufacturers Name": comp["manufacturer"],
+            "Manufacturers Part Number": comp["mpn"],
+            "Distributor": first_line(assembly["distributor"]),
+            "Distributors Part Number": first_line(assembly["distributor_pn"]),
+        })
+    return rows
+
+
+def write_assembly_bom(netlist, path):
+    rows = build_assembly_rows(netlist)
+    with open(path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=ASSEMBLY_FIELDS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("netlist", nargs="?", default=str(DEFAULT_NETLIST))
     parser.add_argument("--out", default=str(DEFAULT_OUT))
+    parser.add_argument("--assembly-out", metavar="PATH",
+                        help="also write the BOM for PCBWay's partial assembly "
+                             f"(committed copy: {DEFAULT_ASSEMBLY_OUT})")
     args = parser.parse_args()
 
     with open(args.netlist) as handle:
@@ -155,6 +223,13 @@ def main():
 
     fitted = sum(r["Quantity"] for r in rows)
     dnp = [r["Reference"] for r in rows if r["Populate"] == "DNP"]
+    if args.assembly_out:
+        try:
+            placed = write_assembly_bom(netlist, args.assembly_out)
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        print(f"Generated {args.assembly_out} ({', '.join(r['Reference Designator'] for r in placed)})")
     print(f"Generated {out}")
     print(f"  line items   {len(rows)}")
     print(f"  to be fitted {fitted}")

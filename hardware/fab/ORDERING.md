@@ -21,7 +21,7 @@ two parts and nothing else: U3 and Y1.**
 | `gerber/raccoon-tap-Edge_Cuts.gm1` | board outline |
 | `gerber/raccoon-tap-PTH.drl`, `-NPTH.drl` (+ `-drl_map.pdf`) | Excellon drill, plated and non-plated |
 | `gerber/raccoon-tap-F_Paste.gtp` | stencil: **openings for U3 and Y1 only** (see below) |
-| `gerber/raccoon-tap-job.gbrjob` | KiCad's job file; it says surface finish "None" because the board file does not carry one: ignore it, the finish is chosen in the order form |
+| `gerber/raccoon-tap-job.gbrjob` | KiCad's job file; it says surface finish "None" because the board file does not carry one: ignore it, the finish is chosen in the order form: **ENIG** (ruling CA) |
 | `raccoon-tap-assembly-bom.csv` | the BOM for the assembly: U3 and Y1 |
 | `raccoon-tap-cpl.csv` | component placement list: U3 and Y1 |
 | `stackup-note.md`, `fabrication-note.md`, this file | attach to the order as "special requirements" |
@@ -64,14 +64,17 @@ A test (`ReleaseSetIsVersioned`) fails if a rule ever starts to ignore it.
 | Tracks | 0.18 mm (MDI), 0.20 mm (USB), necks of 0.15 mm for at most 1.0 mm at U3's pads; pair gaps 0.17 mm (USB) and 0.21 mm (MDI); everything else at least 0.2 mm clearance | stackup note |
 | Smallest drill | 0.3 mm (every via); mounting 3.25 mm and 1.1 mm NPTH; through-hole parts 0.9 to 2.7 mm | `raccoon-tap-PTH.drl`, `-NPTH.drl` |
 | Fiducials | 3, 1 mm copper with 2 mm mask opening, at (2.5, 2.5), (47.0, 33.5) and (2.5, 33.5) mm from the top-left corner | board |
-| Surface finish | **ENIG recommended, not decided** (below) | design-guide.md says "HASL or ENIG" |
+| Surface finish | **ENIG** (ruling CA) | controller ruling CA, below |
 | Solder mask colour | green, PCBWay's default. Do not change it without asking Question 1 again: the mask is part of the impedance. | stackup note |
 
-**Surface finish is an open decision for the operator.** U3 has 0.25 mm pads at
-0.4 mm pitch and PCBWay places it with paste, so a flat finish (ENIG) is the
-safe choice; lead-free HASL would also be sufficient for everything the
-operator solders by hand. Nobody has ruled on it; it is not a ruling of this
-project.
+**Surface finish: ENIG (ruling CA).** Choose ENIG on the order form; do not leave
+the default. The ruling's reason: U3 is a QFN-40 on a 0.4 mm pitch, and ENIG is
+flat, whereas HASL leaves an uneven surface that makes fine-pitch stencil assembly
+and the hand-soldering of the neighbouring parts worse. The extra cost is
+immaterial for five boards against a misplaced or badly soldered U3. The job
+file's "None" (above) is not an instruction. Whether PCBWay's ENIG changes the
+impedance numbers is not known: `stackup-note.md` neglects the finish, as PCBWay's own
+calculator does (Question 1 asks them to calculate the pairs with the finish on).
 
 ## Vias: three sizes, and what is covered
 
@@ -81,7 +84,7 @@ The board has 123 vias (pad / drill, mm):
 |---|---|---|
 | 0.6 / 0.3 | 121 | everywhere by default |
 | 0.8 / 0.4 | 1 | J3 pin 1's +5V via (current) |
-| 0.56 / 0.3 | 1 | **the board's minimum via**: U3 pin 3's +1V0 via at (28.31, 24.375) mm from the top-left corner (128.31, 104.375 on the page). Annular ring 0.13 mm; the smaller pad is what keeps In1's hole round it 0.11 mm from both MDI pairs (ruling BP). Ask Question 7. |
+| 0.56 / 0.3 | 1 | **the board's minimum via**: U3 pin 3's +1V0 via at (28.31, 24.375) mm from the top-left corner (128.31, 104.375 on the page). Annular ring 0.13 mm, **which may be below PCBWay's published minimum for an annular ring (believed to be 0.15 mm), i.e. out of process; not confirmed**. The smaller pad is what keeps In1's hole round it 0.11 mm from both MDI pairs (ruling BP). Ask Question 7. |
 
 That is three via sizes on two drill diameters (0.3 and 0.4 mm).
 
@@ -181,8 +184,8 @@ board with parts on both sides is soldered on both sides by hand.
   -116. Measured from the board's **lower-left corner**, U3's centre is at
   (24.0, 13.0) mm and Y1's at (24.0, 5.0) mm. PCBWay's own KiCad instruction
   says to put the origin at the lower-left corner; the board file was frozen, so
-  the origin was not moved. **Check the placement preview PCBWay shows before
-  paying** (Question 10).
+  the origin was not moved. **The placement preview is a gate before payment, not
+  a courtesy** (Question 10, and the box below).
 * **U3 rotation 180**: with the board seen from the front, pin 1 is at the
   **lower right** of the package. U3's library pose (rotation 0) has pin 1 at the
   upper left; the board has it turned half a turn. Pad 1 is at (+2.4375, -1.8) mm
@@ -203,11 +206,26 @@ board with parts on both sides is soldered on both sides by hand.
   turn puts a terminal on ground: fatal. So the instruction to the machine is "long
   axis of the body along the long axis of the pads"; the footprint's L-shaped
   silkscreen mark sits at pad 1 (lower left). Rotation 0.
+* **The CPL's format is unverified against PCBWay, not only its rotation.** Nobody has
+  checked these against PCBWay's template or an accepted file: the `Layer` value `Top`
+  (against `T` / `B`), the absence of a unit suffix (`mm`) on Mid X and Mid Y, the
+  negative Mid Y (a consequence of the page origin), the column set and order
+  (Designator, Val, Package, Mid X, Mid Y, Rotation, Layer). The column names follow what
+  the exporter calls PCBWay's sample; no PCBWay template was fetched or checked in this
+  task. All of it goes to Question 10.
 * **The CPL's rotation convention may not be PCBWay's.** KiCad's rotation is
   counter-clockwise from the library pose. Some assemblers apply their own zero
   orientation to QFN parts. The CPL is correct in KiCad's convention; PCBWay's
   engineers confirm with their preview from the silkscreen mark (Question 10).
   A QFN placed half a turn out is a dead board, so look at the picture.
+
+> **GATE: do not pay until you have seen PCBWay's placement preview of this CPL and
+> have confirmed it yourself.** U3's pin 1 at the **lower right** of the package as seen
+> from the front, Y1's long axis along the long axis of its pads, both on the top
+> side, both inside the outline. The preview is the real safeguard against a format
+> or rotation mismatch; every check in this repository confirms the CPL against the
+> board, none confirms it against PCBWay. If the preview disagrees, stop and correct
+> the CPL (or have PCBWay's engineers do it, in writing) before paying.
 
 ## Sourcing
 
@@ -254,7 +272,7 @@ Not yet asked. Answers go into the order and, where they change a number, into
    mask's effect on 90 ohm and 100 ohm differential on my stackup?** One pass
    keeps every case inside ±10 %; two passes move four tolerance corners
    outside it. Please calculate 90 ohm (0.20 mm / 0.17 mm gap) and 100 ohm (0.18 /
-   0.21) with your mask on and tell me the widths you would use.
+   0.21) with your mask and your ENIG finish on and tell me the widths you would use.
 2. **Confirm the stackup:** 4 layers, 1.6MM, entry 1 of your standard list
    (7628 RC46%, 0.1855 mm after lamination, DK 4.74, 70 % residual copper) for a
    board with a solid ground plane; or state the stackup you will press.
@@ -278,10 +296,19 @@ Not yet asked. Answers go into the order and, where they change a number, into
    assembly and sourcing lead time per part; shipping; any partial-assembly or
    minimum-order surcharge. Also: does the board need rails, tabs or a panel for the
    machine (it has none), and will it be delivered as single boards?
-10. **Placement preview before production:** send me the preview with U3's pin 1
-    at the lower right and the pads of Y1 matched, and let me confirm. The CPL is in
-    the gerbers' coordinate system with Y up and no board-corner origin.
-11. **Surface finish:** price of ENIG against lead-free HASL for this board.
+10. **Placement preview and CPL format: a hard gate before I pay.** Send me the
+    preview of U3 and Y1 on the board **before** I pay, with U3's pin 1 at the lower
+    right and the pads of Y1 matched, and wait for my confirmation. Also tell me, for
+    this CPL, whether you accept: (a) the rotation convention (KiCad's, counter-clockwise
+    from the library pose); (b) the `Layer` value `Top`, or do you need `T` / `Top` /
+    `TopLayer`; (c) Mid X and Mid Y as plain millimetre numbers **without** a unit
+    suffix; (d) a **negative** Mid Y and an origin that is the page origin, not the
+    board's corner (positions from the lower-left corner are in the table above); (e)
+    the columns Designator, Val, Package, Mid X, Mid Y, Rotation, Layer, in that
+    order; or send me your template.
+11. **Surface finish:** ENIG is ruled (ruling CA) and goes on the order form. Confirm
+    that your ENIG is available for this build (4 layers, 1.6 mm, 5 pieces, 0.15 mm
+    necks) and give the price against lead-free HASL, for the record only.
 
 ## What is not yet in hand (for a human)
 
@@ -294,9 +321,11 @@ Not yet asked. Answers go into the order and, where they change a number, into
   12 Nov 2008) section 5.3.1.2, Table 5-2 "USB 3.0 Standard-A Connector Pin Assignments",
   with its note that Tx and Rx are defined from the host's perspective. That citation
   stands by itself; it was enough for the release (ruling U).
-* **PCBWay's answers** to the eleven questions, and the quote.
-* **Decisions** for the operator: resin-filled vias (ruling BD), surface finish,
-  U3 bought by PCBWay or consigned, Y1 from DigiKey or Mouser.
+* **PCBWay's answers** to the eleven questions, and the quote. **The placement
+  preview (Question 10) is a gate: no payment before the operator has seen it.**
+* **Decisions** for the operator: resin-filled vias (ruling BD), U3 bought by PCBWay
+  or consigned, Y1 from DigiKey or Mouser. The surface finish is no longer one: it
+  is ENIG (ruling CA).
 * **The first-build measurements** in `fabrication-note.md`, including U3's case
   temperature: U3 has an estimate (about 82 to 88 C junction at 70 C ambient and
   typical load) built on an assumed theta-JA, not an assessment.

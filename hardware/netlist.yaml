@@ -228,6 +228,15 @@ components:
     package: QFN-40, 5x5mm, exposed pad
     footprint: "Package_DFN_QFN:QFN-40-1EP_5x5mm_P0.4mm_EP3.6x3.6mm"
     description: USB 3.0 to Gigabit Ethernet controller
+    assembly:
+      # Placed by PCBWay (rulings Y and AC). The presence of this key is what makes a
+      # part machine-placed: tools/gen_bom.py writes fab/raccoon-tap-assembly-bom.csv from
+      # it. Everything else is soldered by hand. "placement" is checked against the
+      # gerber and the CPL in tests/check_fab_release.py.
+      description: "USB 3.0 to 10/100/1000 Ethernet controller, QFN-40 5x5 mm, 0.4 mm pitch, exposed pad (pin 41)."
+      placement: "Pin 1 at the lower right of the part as seen from the front of the board."
+      distributor: LCSC
+      distributor_pn: C2802072     # hardware/review/u3-sourcing.md, checked 2026-11-01
     source: >
       [RTL-DS] - 40 pins + exposed pad = pin 41. All 41 pin numbers confirmed
       against [RTL-DS] tables 1-10 and figure 1 in three copies of the PDF,
@@ -453,6 +462,11 @@ components:
     package: "3225"
     footprint: "Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm_HandSoldering"
     description: "25MHz crystal for U3 clock reference, CL 18pF, +/-30ppm over temperature"
+    assembly:
+      description: "25 MHz crystal, CL 18 pF, 3225 4-pad."
+      placement: "No fixed pin-1 mark (see ORDERING.md): align the long axis of the body with the long axis of the pads. Pads 1 and 3 are the terminals, 2 and 4 are ground."
+      distributor: DigiKey or Mouser by manufacturer part number
+      distributor_pn: ""           # no distributor part number was verified
     source: >
       [RTL-DS] 7.4 table 23 and 'Supports 25MHz Crystal'. Part chosen against
       table 23, checked item by item against [ABM8]:

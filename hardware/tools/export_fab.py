@@ -22,7 +22,9 @@ Writes, into one folder:
     check in tests/check_fab_release.py reads it.
 
 The component placement list (CPL) for the partial assembly is written from the
-same board, for U3 and Y1 only.
+same board, for U3 and Y1 only. The assembly BOM beside it is written by
+tools/gen_bom.py from netlist.yaml (the parts that carry an `assembly:` mapping),
+never by hand.
 
 The set is built in a temporary folder and replaces the old one only when every
 step succeeded. Nothing is uploaded, ordered or paid for.
@@ -49,6 +51,8 @@ DRU = HARDWARE / "kicad" / "raccoon-tap.kicad_dru"
 PRO = HARDWARE / "kicad" / "raccoon-tap.kicad_pro"
 OUT = HARDWARE / "fab" / "gerber"
 CPL = HARDWARE / "fab" / "raccoon-tap-cpl.csv"
+ASSEMBLY_BOM = HARDWARE / "fab" / "raccoon-tap-assembly-bom.csv"
+NETLIST = HARDWARE / "netlist.yaml"
 
 KIPY = Path(os.environ.get("KIPY") or "/Applications/KiCad/KiCad.app/Contents/"
             "Frameworks/Python.framework/Versions/3.9/bin/python3")
@@ -181,6 +185,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--out", default=str(OUT))
     ap.add_argument("--cpl", default=str(CPL))
+    ap.add_argument("--assembly-bom", default=str(ASSEMBLY_BOM))
     ap.add_argument("--paste-board", nargs="+", metavar="ARG",
                     help="internal: SRC DST REF... (run under KiCad's Python)")
     args = ap.parse_args(argv)
@@ -198,14 +203,24 @@ def main(argv=None):
             manifest = export_set(build, chk.drc_report_problems)
             cpl = Path(build).parent / "cpl.csv"
             write_cpl(cpl)
-        except ExportFailed as e:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import gen_bom
+            import yaml
+            bom = Path(build).parent / "assembly-bom.csv"
+            placed = [r["Reference Designator"] for r in gen_bom.write_assembly_bom(
+                yaml.safe_load(NETLIST.read_text()), bom)]
+            if tuple(placed) != ASSEMBLED:
+                raise ExportFailed(f"netlist.yaml marks {placed} for assembly, "
+                                   f"this exporter places {list(ASSEMBLED)}")
+        except (ExportFailed, ValueError) as e:
             print(f"export_fab: {e}", file=sys.stderr)
             return 2
         if out.exists():
             shutil.rmtree(out)
         shutil.copytree(build, out)
         shutil.copy(cpl, args.cpl)
-    print(f"wrote {len(manifest['files']) + 1} files to {out} and {args.cpl}")
+        shutil.copy(bom, args.assembly_bom)
+    print(f"wrote {len(manifest['files']) + 1} files to {out}, {args.cpl} and {args.assembly_bom}")
     print(f"board SHA-256 {manifest['inputs']['board']}")
     return 0
 
