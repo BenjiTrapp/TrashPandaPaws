@@ -54,6 +54,36 @@ def load_config(path: str = None) -> dict:
     sys.exit(1)
 
 
+def _check_agent_beacon_conflict(config) -> None:
+    """Warn when the agent layer and Sliver are both switched on.
+
+    A Sliver-managed box talks to the Sliver server, not to this team
+    server, so it never checks in here -- and the agent plans against what
+    the team server knows. The box is therefore invisible to it, and the
+    symptom is a campaign that finds no beacons, which sends the reader
+    looking at the agent rather than at this setting.
+
+    A warning and nothing else. The shipped configs/raccoon.yaml has Sliver
+    enabled and no `agent:` block at all, so the status quo stays silent;
+    only a deployment that asked for both hears about it.
+    """
+    if not isinstance(config, dict):
+        return
+    agent = config.get("agent")
+    if not isinstance(agent, dict) or not agent.get("enabled"):
+        return
+    c2 = config.get("c2")
+    sliver = c2.get("sliver") if isinstance(c2, dict) else None
+    if not isinstance(sliver, dict) or not sliver.get("enabled"):
+        return
+    logging.getLogger("raccoon").warning(
+        "both the agent layer and Sliver are enabled: a Sliver-managed "
+        "drop-box checks in with the Sliver server, never with this team "
+        "server, so the agent cannot see it or task it. Run the Python "
+        "beacon on any box the agent is meant to drive, or switch "
+        "c2.sliver.enabled off.")
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Raccoon Implant")
@@ -63,6 +93,7 @@ def main():
     config = load_config(args.config)
     setup_logging(config)
     logger = logging.getLogger("raccoon")
+    _check_agent_beacon_conflict(config)
 
     from software.notifications import init_notifier
     notifier = init_notifier(config)
