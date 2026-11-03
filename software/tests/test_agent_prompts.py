@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from software.agent import config, prompts, safety
+from software.agent.executor import beacon as beacon_exec
 from software.agent.tools import scoring
 
 
@@ -267,3 +268,118 @@ class TestExecutorPrompt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestThePromptNamesTheTargetPlatform(unittest.TestCase):
+    """The beacon's OS belongs in the prompt, because the C2 already knows it.
+
+    Found in a live run against a Darwin beacon: the model spent turns
+    guessing the platform -- `cat /proc/net/dev`, `cat /proc/sys/kernel/
+    hostname`, `cat /proc/net/route`, `ls /usr/bin/python` -- on a host with
+    no /proc at all. Three discovery tasks reached 11 of their 16 turns
+    without converging and the run hit its token budget.
+
+    The `posix` capability does not help here: it separates Windows from
+    the rest and leaves Linux and macOS indistinguishable, which is exactly
+    the guess being made. The OS string is free information sitting in the
+    record the router already trusts for capabilities.
+    """
+
+    def test_the_os_is_named_next_to_the_beacon(self):
+        s = prompts.capability_section(
+            {"raccoon-fox": ["batch", "posix"]},
+            os_by_beacon={"raccoon-fox": "Darwin 25.5.0"})
+        self.assertIn("Darwin 25.5.0", s)
+
+    def test_each_beacon_gets_its_own_platform(self):
+        s = prompts.capability_section(
+            {"raccoon-fox": ["posix"], "raccoon-pi": ["posix"]},
+            os_by_beacon={"raccoon-fox": "Darwin 25.5.0",
+                          "raccoon-pi": "Linux 6.1.0"})
+        self.assertIn("Darwin 25.5.0", s)
+        self.assertIn("Linux 6.1.0", s)
+
+    def test_a_beacon_with_no_reported_os_is_not_given_one(self):
+        # Inventing a platform would be worse than leaving it open: the
+        # model would run Linux commands on a host nobody vouched for.
+        s = prompts.capability_section({"raccoon-fox": ["posix"]},
+                                       os_by_beacon={})
+        self.assertNotIn("Linux", s)
+        self.assertNotIn("Darwin", s)
+
+    def test_the_section_still_works_without_any_platform_data(self):
+        s = prompts.capability_section({"raccoon-fox": ["batch"]})
+        self.assertIn("raccoon-fox", s)
+
+    def test_the_executor_is_told_what_it_is_standing_on(self):
+        p = prompts.executor(["posix"], scope=_scope(), tier="full",
+                             platforms=["Darwin 25.5.0"])
+        self.assertIn("Darwin 25.5.0", p)
+
+    def test_the_executor_sees_every_platform_it_may_reach(self):
+        # An executor may use any of the campaign's beacons, so one
+        # platform line would be a lie in a mixed fleet.
+        p = prompts.executor(["posix"], scope=_scope(), tier="full",
+                             platforms=["Darwin 25.5.0", "Linux 6.1.0"])
+        self.assertIn("Darwin 25.5.0", p)
+        self.assertIn("Linux 6.1.0", p)
+
+    def test_the_executor_prompt_still_works_without_platforms(self):
+        p = prompts.executor(["batch"], scope=_scope(), tier="full")
+        self.assertIn("executor", p.lower())
+
+
+class TestTheBeaconCommandLanguageIsStated(unittest.TestCase):
+    """A beacon command's first word is a beacon verb, not a program.
+
+    Found in a live run, and it cost the whole campaign: the executor was
+    told to give "one plain command", so it sent `arp -a`, `ifconfig -a`,
+    `netstat -an`. The beacon answers every one of those with
+
+        {"success": false, "output": "Unknown command: arp", "exit_code": -1}
+
+    because it dispatches on a fixed verb set and `arp` is not in it. With
+    no verb list and no rule, the model retried variants until the token
+    budget was gone: four tasks, 39 model calls, zero findings.
+
+    `cat`, `ls` and `pwd` *are* verbs, which is why a handful of commands in
+    that run appeared to work and hid the pattern.
+
+    Verified live: `shell arp -a` returns the ARP table; `arp -a` does not.
+    """
+
+    def test_the_shell_verb_rule_is_stated(self):
+        # The prefix form itself, not the word "shell": the prompt already
+        # said "no shell syntax", which is what made the old wording look
+        # like it covered this.
+        p = prompts.executor(["batch"], scope=_scope(), tier="full")
+        self.assertIn("shell <command>", p)
+
+    def test_a_representative_native_verb_is_offered(self):
+        # The beacon has its own arptable and netscan; a model that knows
+        # them does not need to reach for a program at all.
+        p = prompts.executor(["batch"], scope=_scope(), tier="full")
+        self.assertIn("arptable", p)
+        self.assertIn("netscan", p)
+
+    def test_every_verb_the_beacon_accepts_is_named(self):
+        p = prompts.executor(["batch"], scope=_scope(), tier="full")
+        missing = [v for v in beacon_exec.BEACON_VERBS if v not in p]
+        self.assertEqual(missing, [])
+
+    def test_the_verb_list_matches_the_beacon_itself(self):
+        # The list is the agent's copy of another module's dispatch table,
+        # so it can drift. This is the test that notices.
+        import pathlib
+        import re
+        src = pathlib.Path(__file__).resolve().parents[1] / "c2" / "beacon.py"
+        actual = set(re.findall(r'^\s*(?:el)?if cmd == "([a-z_]+)"',
+                                src.read_text(), re.M))
+        self.assertEqual(set(beacon_exec.BEACON_VERBS), actual)
+
+    def test_the_rule_is_not_in_the_orchestrator_prompt(self):
+        # The orchestrator never runs a command, so the verb set is noise
+        # in a prompt that is already long.
+        p = prompts.orchestrator({"raccoon-fox": ["batch"]}, _scope(),
+                                 {1, 2}, "full")
+        self.assertNotIn("arptable", p)

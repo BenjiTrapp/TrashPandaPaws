@@ -31,6 +31,7 @@ Usage:
 import re
 
 from software.agent import safety
+from software.agent.executor import beacon as beacon_exec
 from software.agent.tools import registry, scoring
 
 # ── Capabilities ──
@@ -55,16 +56,35 @@ def _meaning_lines(caps):
             for c in sorted(set(caps)) if c in _CAPABILITY_MEANING]
 
 
-def capability_section(caps_by_beacon) -> str:
+def _platform_name(reported) -> str:
+    """The OS string a beacon reported, or "" if it reported nothing.
+
+    Self-reported, like the capability list the router already acts on, so
+    it is trusted no further than that: it tells the model which family of
+    commands to reach for, and a command that is wrong anyway still comes
+    back as an error it can read.
+    """
+    return str(reported).strip() if reported else ""
+
+
+def capability_section(caps_by_beacon, os_by_beacon=None) -> str:
     if not caps_by_beacon:
         return "No beacon is attached to this campaign."
+    os_by_beacon = os_by_beacon or {}
     lines = ["Target beacons and what each can do:"]
     seen = set()
     for beacon in sorted(caps_by_beacon):
         caps = list(caps_by_beacon[beacon] or [])
         seen.update(caps)
-        lines.append("- %s: %s" % (beacon, ", ".join(caps) or "no capabilities "
-                                                              "reported"))
+        # The platform goes next to the capabilities because `posix` only
+        # separates Windows from the rest, leaving Linux and macOS
+        # indistinguishable -- and that is the difference that decides
+        # whether /proc exists. A beacon that reported no OS is left
+        # without one rather than given a default.
+        platform = _platform_name(os_by_beacon.get(beacon))
+        lines.append("- %s%s: %s" % (
+            beacon, " (%s)" % platform if platform else "",
+            ", ".join(caps) or "no capabilities reported"))
     meanings = _meaning_lines(seen)
     if meanings:
         lines.append("")
@@ -267,7 +287,7 @@ def _wifi_phases_shown(caps_by_beacon, phases):
 # ── Assembly ──
 
 
-def orchestrator(caps_by_beacon, scope, phases, tier) -> str:
+def orchestrator(caps_by_beacon, scope, phases, tier, os_by_beacon=None) -> str:
     caps_by_beacon = caps_by_beacon or {}
     phases = set(phases)
     every_cap = sorted(set(c for cs in caps_by_beacon.values() for c in cs or []))
@@ -280,7 +300,7 @@ def orchestrator(caps_by_beacon, scope, phases, tier) -> str:
         "executor ends its report with TASK, STATUS, FINDINGS and ERRORS. "
         "Score outcomes with log_score, and keep the findings you rely on "
         "where recall_findings can find them.",
-        capability_section(caps_by_beacon),
+        capability_section(caps_by_beacon, os_by_beacon),
         _tool_section("orchestrator", every_cap, tier, "Your tools:"),
         _score_section(),
         _ev_section(phases),
@@ -292,7 +312,30 @@ def orchestrator(caps_by_beacon, scope, phases, tier) -> str:
     return "\n\n".join(s for s in sections if s)
 
 
-def executor(caps, scope, tier) -> str:
+def _beacon_verb_section() -> str:
+    """The language a beacon command is written in.
+
+    A beacon does not take a program name: it dispatches on its own verb as
+    the first word. Leaving this out cost a live campaign -- `arp -a`,
+    `ifconfig -a` and `netstat -an` all came back "Unknown command", the
+    model retried variants for 39 calls, and the run ended on its token
+    budget with no findings. Several native verbs also do the job directly,
+    so a model that knows them need not reach for a program at all.
+    """
+    lines = ["Beacon commands. A command sent to a beacon starts with one of "
+             "the beacon's own verbs, not with a program name. Anything else "
+             "is answered with \"Unknown command\". To run a program, use "
+             "shell <command> -- `shell arp -a`, not `arp -a`. Commands with "
+             "server_side go to the C2 host instead and are ordinary command "
+             "lines.",
+             "The verbs:"]
+    for verb in sorted(beacon_exec.BEACON_VERBS):
+        hint = beacon_exec.VERB_HINTS.get(verb)
+        lines.append("- %s%s" % (verb, ": %s" % hint if hint else ""))
+    return "\n".join(lines)
+
+
+def executor(caps, scope, tier, platforms=None) -> str:
     caps = list(caps or [])
     lines = [
         "You are an executor in an authorised penetration-testing campaign. "
@@ -311,10 +354,20 @@ def executor(caps, scope, tier) -> str:
         "same one again. Some actions pass an approval gate that can refuse "
         "them, and a refusal is not a fault. Record each finding with "
         "log_discovery as you go." % _forced_flags("nmap"),
+        _beacon_verb_section(),
     ]
     meanings = _meaning_lines(caps)
     if meanings:
         lines.append("What your beacon can do:\n" + "\n".join(meanings))
+    named = [p for p in (_platform_name(x) for x in (platforms or [])) if p]
+    if named:
+        # Stated so the task is not spent establishing it. Every beacon the
+        # executor may use is listed, because one line would be a lie in a
+        # mixed fleet.
+        lines.append(
+            "Platform. Your beacons report: %s. Use commands that exist "
+            "there and do not spend turns working out which system you are "
+            "on." % ", ".join(sorted(set(named))))
     lines.append(
         "End your final answer with exactly this block:\n"
         "TASK: <the task name you were given>\n"

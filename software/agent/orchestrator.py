@@ -262,6 +262,7 @@ class Campaign:
         # objects and reads the current state through them.
         self._beacon_ids = []  # type: List[str]
         self._caps = {}  # type: Dict[str, List[str]]
+        self._platforms = {}  # type: Dict[str, str]
         self._uplinks = {}  # type: Dict[str, Optional[str]]
         self._lowered = []  # type: List[str]
 
@@ -384,7 +385,8 @@ class Campaign:
                 _Guard(self, pausable=True),
                 system=prompts.orchestrator(
                     self._caps, self._cfg, self._cfg.phases,
-                    self._agent_cfg.capability_tier),
+                    self._agent_cfg.capability_tier,
+                    os_by_beacon=self._platforms),
                 prompt=self._brief(resumed),
                 tools=self._watch(registry.orchestrator_tools(
                     self._conn, self.run_id,
@@ -443,7 +445,7 @@ class Campaign:
         later, and the router must not act on capabilities that were
         reported before a beacon was replaced.
         """
-        ids, caps, uplinks = [], {}, {}
+        ids, caps, uplinks, platforms = [], {}, {}, {}
         for beacon_id in self._cfg.beacons:
             agent = await self._c2.get_agent(beacon_id)
             if agent is None:
@@ -454,11 +456,18 @@ class Campaign:
             reported = agent.get("caps")
             caps[beacon_id] = list(reported) if isinstance(reported, list) else []
             uplinks[beacon_id] = agent.get("uplink_iface")
+            # Read with the capabilities, from the same record and at the
+            # same moment: a resume days later may find the host replaced,
+            # and a prompt naming the old platform would be worse than one
+            # naming none.
+            platforms[beacon_id] = str(agent.get("os") or "").strip()
         if not ids:
             raise RuntimeError("none of the campaign's beacons is known to the C2")
         self._beacon_ids[:] = ids
         self._caps.clear()
         self._caps.update(caps)
+        self._platforms.clear()
+        self._platforms.update(platforms)
         self._uplinks.clear()
         self._uplinks.update(uplinks)
 
@@ -616,7 +625,8 @@ class Campaign:
                 scope_key=self._scope_key, online=self._cfg.online_lookups)
             result = await llm_loop.run(
                 _Guard(self, pausable=False),
-                system=prompts.executor(caps, self._cfg, tier),
+                system=prompts.executor(caps, self._cfg, tier,
+                                        platforms=list(self._platforms.values())),
                 prompt="Task name: %s\n\n%s" % (name, description),
                 tools=self._watch(tools),
                 max_turns=self._limits["executor_turns"],

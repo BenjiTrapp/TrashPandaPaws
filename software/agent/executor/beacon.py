@@ -29,6 +29,36 @@ def _liveness(c2, beacon_id):
     return is_alive
 
 
+# The verbs the beacon dispatches on, as its own first word. This is the
+# agent's copy of another module's table (software/c2/beacon.py), kept here
+# because the prompt has to state the language the executor is writing in:
+# without it the model sends `arp -a` and gets "Unknown command: arp" back,
+# with no hint that `shell arp -a` is the form that works. A test compares
+# this set against that dispatch table, so a verb added there and not here
+# fails rather than silently going unoffered.
+BEACON_VERBS = (
+    "shell", "ls", "lsjson", "cat", "pwd", "cd", "cp", "mv", "rm", "mkdir",
+    "chmod", "write", "upload", "download", "loot", "exfil", "netscan",
+    "arptable", "proxyinfo", "avenum", "smbloot", "persist", "unpersist",
+    "sleep", "reconfig", "kill",
+)
+
+# Only where the name does not say it. Kept short on purpose: this goes into
+# every executor prompt.
+VERB_HINTS = {
+    "shell": "run any other program: shell <command>",
+    "lsjson": "like ls, machine-readable",
+    "loot": "collect a directory as a zip",
+    "exfil": "send data out over DNS",
+    "netscan": "scan the local subnet",
+    "arptable": "the ARP neighbour table",
+    "proxyinfo": "the host's proxy configuration",
+    "avenum": "enumerate AV, EDR and SIEM agents",
+    "smbloot": "browse SMB shares without impacket",
+    "sleep": "set the check-in interval and jitter",
+}
+
+
 async def run_on_beacon(c2, beacon_id, command, *, timeout) -> ActionResult:
     parts = command.split(None, 1) if isinstance(command, str) else []
     if not parts:

@@ -1612,3 +1612,61 @@ class TestStatusCarriesWhatTheDrawerShows(_Case):
         self.assertEqual(status["risk_profile"], "normal")
         self.assertEqual(status["opsec_profile"], "normal")
         self.assertEqual(status["phases"], [1, 2, 3, 4])
+
+
+class TestTheTargetPlatformReachesTheModel(_Case):
+    """The OS in the C2 record must reach both prompts.
+
+    From a live run against a Darwin beacon: the model burned turns on
+    `cat /proc/net/dev` and `cat /proc/sys/kernel/hostname`, a host with no
+    /proc, because nothing had told it what it was standing on. The record
+    the router already trusts for capabilities carries the OS, and
+    `_attach_beacons` was dropping it.
+    """
+
+    def _c2(self, **fields):
+        conn, c2 = _env()
+        c2.agents["raccoon-fox"].update(fields)
+        return conn, c2
+
+    def _script(self):
+        return _Script([
+            mock.calls(("dispatch_task", {"task_name": "look",
+                                          "task_description": "look around"})),
+            mock.text("TASK: look\nSTATUS: success\nFINDINGS: none\n"
+                      "ERRORS: none"),
+            mock.text("done")])
+
+    async def test_the_os_is_read_from_the_c2_record(self):
+        conn, c2 = self._c2(os="Darwin 25.5.0")
+        camp = _campaign(conn, c2, self._script())
+        await camp.start()
+        await camp.wait()
+        self.assertEqual(camp._platforms, {"raccoon-fox": "Darwin 25.5.0"})
+
+    async def test_the_orchestrator_is_told_the_platform(self):
+        conn, c2 = self._c2(os="Darwin 25.5.0")
+        client = self._script()
+        camp = _campaign(conn, c2, client)
+        await camp.start()
+        await camp.wait()
+        self.assertIn("Darwin 25.5.0", client.calls[0]["system"])
+
+    async def test_the_executor_is_told_the_platform(self):
+        conn, c2 = self._c2(os="Darwin 25.5.0")
+        client = self._script()
+        camp = _campaign(conn, c2, client)
+        await camp.start()
+        await camp.wait()
+        # calls[0] is the orchestrator, calls[1] the executor it dispatched.
+        self.assertIn("Darwin 25.5.0", client.calls[1]["system"])
+
+    async def test_a_beacon_that_reports_no_os_leaves_it_open(self):
+        conn, c2 = self._c2()
+        c2.agents["raccoon-fox"].pop("os", None)
+        client = self._script()
+        camp = _campaign(conn, c2, client)
+        await camp.start()
+        await camp.wait()
+        self.assertEqual(camp._platforms, {"raccoon-fox": ""})
+        self.assertNotIn("Platform.", client.calls[1]["system"])
