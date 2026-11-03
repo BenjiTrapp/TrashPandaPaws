@@ -15,7 +15,6 @@ Dieses Dokument beschreibt eine autonome Agenten-Schicht, die diese Handarbeit �
 - **Automated Attack** — der Agent arbeitet, der Operator sieht zu und greift parallel selbst ein
 - **Full Automated** — vorkonfiguriert, dann ohne Aufsicht
 
-Die Vorlage ist [Eugene](https://codeberg.org/Haaari/eugene), ein autonomer Offensive-Agent in Rust auf Basis von `rig-core`. Dieses Projekt ist eine **Neuimplementierung in Python**, keine Portierung: Eugenes Architektur, Prompt-Struktur, Scoring-Modell und Safety-Philosophie werden übernommen, der Code nicht.
 
 ### Warum die Kombination mehr ist als die Summe
 
