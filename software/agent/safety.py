@@ -164,6 +164,12 @@ _WRAPPER_VALUE_FLAGS = {
     "sudo": _PRIVILEGE_VALUE_FLAGS,
     "doas": _PRIVILEGE_VALUE_FLAGS,
     "runas": _PRIVILEGE_VALUE_FLAGS,
+    # pkexec was missing here while _program_position already listed it as a
+    # privilege wrapper, so its `-u` swallowed the program that followed and
+    # the scanner lookup returned nothing: no rate limit, and -- the part
+    # that matters -- require_target off, which is the only thing standing
+    # between a targets-from-a-file command and execution.
+    "pkexec": _PRIVILEGE_VALUE_FLAGS,
 }
 
 
@@ -233,8 +239,16 @@ def _program(text):
 
 
 def _basename(token):
-    """Last path component of a token, for either separator."""
-    return token.replace("\\", "/").rsplit("/", 1)[-1]
+    """Last path component of a token, for either separator.
+
+    Quotes are dropped first. This answers "what is this token called", and
+    a quote is not part of a name -- `"nmap"` is nmap. Reading them as part
+    of it hid the program from _program_position and its three callers,
+    while classify() saw it correctly because it normalises first. Only the
+    name loses its quotes; the tokens the caller rebuilds a command from
+    keep theirs, because `--script-args 'a=b c'` is one argument.
+    """
+    return _QUOTES.sub("", token).replace("\\", "/").rsplit("/", 1)[-1]
 
 
 # ── LLM probability clamp ──
@@ -1079,6 +1093,16 @@ def _program_position(command, names):
     if not isinstance(command, str):
         return [], None
 
+    # The tokens stay exactly as given, because enforce_scan_limits rebuilds
+    # the command from them: lowering turned `-sV` into `-sv`, and stripping
+    # quotes turned `--script-args 'a=b c'` into two arguments. Both were
+    # regressions this comment exists to stop coming back.
+    #
+    # Only the *comparison* is quote- and case-insensitive, which is what
+    # classify() does too. Reading the raw token here was the gap: `"nmap"`
+    # hid the program from every caller of this function while classify saw
+    # it perfectly. The structural fix is for the router to pass one reading
+    # to all three callers; this makes the two readings agree meanwhile.
     tokens = command.split()
     index = None
     position = 0

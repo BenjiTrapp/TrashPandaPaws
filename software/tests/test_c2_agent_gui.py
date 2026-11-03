@@ -394,9 +394,6 @@ class TestAccentColours(unittest.TestCase):
                                 "%s is redefined" % inherited)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestDrawerAndDetailUseTheNewFields(unittest.TestCase):
     """The two gaps the GUI could not fill, now that the data exists.
@@ -530,3 +527,6 @@ class TestTheFormOffersBothAgentModes(unittest.TestCase):
         self.assertIsNotNone(block)
         pairs = dict(re.findall(r'(\w+):\s*"(\w+)"', block.group(1)))
         self.assertEqual(pairs, {"supervised": "pause", "auto": "decide"})
+
+if __name__ == "__main__":
+    unittest.main()

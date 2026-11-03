@@ -1046,9 +1046,6 @@ class TestNoNetworkAtImport(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "[]")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestQuietProfileDropsTheOnlineTool(unittest.TestCase):
     """The quiet OpSec profile removes the tool, rather than refusing it.
@@ -1113,3 +1110,6 @@ class TestTheModelSeesTheCommandThatRan(unittest.IsolatedAsyncioTestCase):
     async def test_an_untouched_command_adds_no_key(self):
         out = await self._call(self._Plain())
         self.assertNotIn("effective_command", out)
+
+if __name__ == "__main__":
+    unittest.main()

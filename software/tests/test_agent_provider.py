@@ -935,9 +935,6 @@ class TestNoNewDependencies(unittest.TestCase):
             self.assertNotIn(name, text)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # ── Bedrock: the Converse API ──
 
@@ -1164,3 +1161,6 @@ class TestBedrockSelection(unittest.TestCase):
                 client.complete("s", [{"role": "user", "content": "x"}],
                                 [], 10, 0.0))
         self.assertNotIn(_KEY, _walk_chain(caught.exception))
+
+if __name__ == "__main__":
+    unittest.main()

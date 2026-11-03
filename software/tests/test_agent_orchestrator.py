@@ -1456,9 +1456,6 @@ class TestManager(_Case):
         self.assertIsNotNone(manager.get(rid))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestAnEventCarriesTheCallThatMadeIt(_Case):
     """The detail panel is meant to show the arguments and the raw output.
@@ -1708,3 +1705,6 @@ class TestTheExecutorIsGivenTheBeaconItMayUse(_Case):
         await camp.start()
         await camp.wait()
         self.assertIn("raccoon-fox (Linux 6.1.0)", client.calls[1]["system"])
+
+if __name__ == "__main__":
+    unittest.main()

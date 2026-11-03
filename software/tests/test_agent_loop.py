@@ -797,9 +797,6 @@ class TestObservability(IsolatedAsyncioTestCase):
                            tools=[], max_turns=8)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestControlSignalsEscapeTheLoop(IsolatedAsyncioTestCase):
     """Two things must not become a tool result the model reads and ignores.
@@ -866,3 +863,6 @@ class TestControlSignalsEscapeTheLoop(IsolatedAsyncioTestCase):
         with self.assertRaises(router.RouterAborted):
             await loop.run(client, system="s", prompt="p", tools=tools,
                            max_turns=4)
+
+if __name__ == "__main__":
+    unittest.main()

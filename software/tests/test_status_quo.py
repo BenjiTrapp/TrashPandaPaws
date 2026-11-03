@@ -299,5 +299,38 @@ class TestAgentPackageContracts(unittest.TestCase):
         self.assertIn("Sliver", reason)
 
 
+class TestTheSuiteCannotSilentlyShrink(unittest.TestCase):
+    """No test class may sit after a module's `__main__` guard.
+
+    `unittest.main()` exits at module level, so a class defined below it is
+    never defined when the file is run directly -- and the file still
+    reports OK, with a smaller number nobody reads. Eleven files here had
+    grown that way, because appending a class to the end of a file is the
+    natural thing to do and the guard was in the middle.
+
+    `python -m unittest` imports the module instead of executing it as
+    __main__, so it saw every test and the reported totals were right. The
+    two invocations disagreed by 23 tests in one file. A silent disagreement
+    between two obvious ways to run the suite is worth one test to prevent.
+    """
+
+    def test_no_test_class_is_defined_after_the_main_guard(self):
+        import re
+        offenders = {}
+        for path in sorted(Path(__file__).parent.glob("test_*.py")):
+            text = path.read_text()
+            match = re.search(r'^if __name__ == ["\']__main__["\']:',
+                              text, re.M)
+            if not match:
+                continue
+            below = text[match.end():]
+            classes = re.findall(r"^class\s+(\w+)", below, re.M)
+            if classes:
+                offenders[path.name] = classes
+        self.assertEqual(offenders, {},
+                         "test classes below the __main__ guard are skipped "
+                         "when the file is run directly")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -991,9 +991,6 @@ class TestOutputHandling(IsolatedAsyncioTestCase):
         self.assertIsNone(res.blocked_reason)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestARewrittenCommandIsReportedBack(unittest.IsolatedAsyncioTestCase):
     """If the limiter changes the command, the model has to be told.
@@ -1022,3 +1019,6 @@ class TestARewrittenCommandIsReportedBack(unittest.IsolatedAsyncioTestCase):
         r, _ = _router()
         result = await r.run_command("whoami", beacon_id="raccoon-fox")
         self.assertIsNone(result.effective_command)
+
+if __name__ == "__main__":
+    unittest.main()

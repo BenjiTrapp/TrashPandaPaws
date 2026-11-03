@@ -1229,9 +1229,6 @@ class TestClamp(unittest.TestCase):
         self.assertAlmostEqual(safety.clamp_llm_adjustment(0.5, float("-inf")), 0.3)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestAnAllPortsScanIsNarrowed(unittest.TestCase):
     """At a forced 50 packets a second, -p- is not a scan but a timeout.
@@ -1316,3 +1313,72 @@ class TestAnAllPortsScanIsNarrowed(unittest.TestCase):
         kept = {port for _, port in rows[:safety.SCAN_TOP_PORTS]}
         for port in (21, 22, 80, 443, 445, 3389):
             self.assertIn(port, kept, port)
+
+
+class TestTheProgramIsFoundWhereverItIs(unittest.TestCase):
+    """is_scan, takes_network_targets and enforce_scan_limits must agree
+    with classify about where the program is.
+
+    classify normalises first -- quotes stripped, backslashes folded, case
+    lowered -- but _program_position split the raw string, so a quoted
+    program name or a privilege wrapper whose option value it did not know
+    hid the program from all three. Both consequences are fail-open:
+
+      "nmap" -sV -p- 10.0.1.5              no rate limit, no port cap
+      pkexec -u alice nxc smb /tmp/hosts   require_target off, scope allows
+
+    The second is the one that matters. Paths are deliberately no longer
+    refused outright, so `require_target` is the only thing standing
+    between a targets-from-a-file command and execution; with the program
+    hidden it is False, the scope finds nothing to check, and the command
+    runs with no verdict at all.
+
+    `sudo`, `doas` and `runas` were fixed in an earlier round and have
+    tests. `pkexec` sits in the same privilege tuple in _program_position
+    and was left out of the value-flag table, so the earlier finding was
+    closed on three spellings of four. These tests assert the property --
+    the answer does not depend on how the program was spelled -- rather
+    than the four spellings that exist today.
+    """
+
+    SCAN = "nmap -sV -p- 10.0.1.5"
+    FILE_TARGETS = "nxc smb /tmp/hosts"
+
+    def _wrapped(self, command):
+        return ('%s' % command,
+                '"%s"' % command.split()[0] + " " + command.split(None, 1)[1],
+                "sudo " + command,
+                "sudo -u alice " + command,
+                "doas -u alice " + command,
+                "pkexec -u alice " + command,
+                "pkexec --user alice " + command,
+                "shell " + command,
+                "timeout -s KILL 600 " + command,
+                "env -u LD_PRELOAD " + command)
+
+    def test_a_scan_is_recognised_however_it_is_spelled(self):
+        for form in self._wrapped(self.SCAN):
+            self.assertTrue(safety.is_scan(form), form)
+
+    def test_the_rate_limit_is_applied_however_it_is_spelled(self):
+        for form in self._wrapped(self.SCAN):
+            limited = safety.enforce_scan_limits(form)
+            self.assertIn("--max-rate 50", limited, form)
+            self.assertIn("--top-ports", limited, form)
+            self.assertNotIn("-p-", limited, form)
+
+    def test_a_network_tool_needs_a_target_however_it_is_spelled(self):
+        for form in self._wrapped(self.FILE_TARGETS):
+            self.assertTrue(safety.takes_network_targets(form), form)
+
+    def test_every_privilege_wrapper_in_the_table_knows_its_value_flags(self):
+        # The gap was a wrapper named in _program_position's privilege
+        # tuple with no entry in the value-flag table, so its -u swallowed
+        # the program. Asserted as a property of the two tables rather than
+        # as a list of spellings.
+        for name in ("sudo", "doas", "runas", "pkexec"):
+            self.assertIn(name, safety._WRAPPER_VALUE_FLAGS, name)
+            self.assertIn("-u", safety._WRAPPER_VALUE_FLAGS[name], name)
+
+if __name__ == "__main__":
+    unittest.main()

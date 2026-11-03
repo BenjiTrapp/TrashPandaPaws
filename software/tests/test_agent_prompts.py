@@ -267,9 +267,6 @@ class TestExecutorPrompt(unittest.TestCase):
             len(_orch(phases=(1, 2, 3, 4, 5))))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestThePromptNamesTheTargetPlatform(unittest.TestCase):
     """The beacon's OS belongs in the prompt, because the C2 already knows it.
@@ -498,3 +495,6 @@ class TestTheScanSectionDescribesWhatActuallyHappens(unittest.TestCase):
     def test_the_executor_is_told_to_report_what_ran(self):
         p = prompts.executor(["batch"], scope=_scope(), tier="full")
         self.assertIn("effective_command", p)
+
+if __name__ == "__main__":
+    unittest.main()

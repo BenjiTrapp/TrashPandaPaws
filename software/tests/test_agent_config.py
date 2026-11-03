@@ -822,9 +822,6 @@ class TestShippedYaml(unittest.TestCase):
                                     r"|agent.*unavailable.*sliver")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestOpsecProfilesAreNotSafetySwitches(unittest.TestCase):
     """A profile named "yolo" must not be readable as "safety off".
@@ -979,3 +976,6 @@ class TestTheDefaultForAnUnansweredKnock(unittest.TestCase):
                     self._cfg(mode=mode,
                               unattended_behavior=choice).unattended_behavior,
                     choice, (mode, choice))
+
+if __name__ == "__main__":
+    unittest.main()

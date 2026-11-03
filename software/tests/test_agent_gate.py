@@ -883,9 +883,6 @@ class TestConstruction(unittest.TestCase):
             _gate(conn, rid, unattended_behavior="allow")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # ── The timeout in supervised mode ──
 
@@ -964,3 +961,6 @@ class TestAnUnansweredKnockFollowsTheConfiguration(
             d = await g.request(_cls(tier=safety.TIER_HARD))
             self.assertFalse(d.allowed, behaviour)
             self.assertEqual(d.decided_by, "hard", behaviour)
+
+if __name__ == "__main__":
+    unittest.main()

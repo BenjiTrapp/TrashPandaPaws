@@ -959,9 +959,6 @@ class TestShutdown(unittest.IsolatedAsyncioTestCase):
             queries.get_run(rig.conn, camp.run_id)["status"], "aborted")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestABrowserCannotReachTheService(_ServiceCase):
     """The service listens on loopback, and the operator browses the web there.
@@ -1089,3 +1086,6 @@ class TestABeaconIsOfferedUnderTheIdThatWorks(_ServiceCase):
         self.rig.c2.agents["only-this"] = {"id": "only-this", "caps": []}
         body = await (await self.get("/beacons")).json()
         self.assertEqual(body["beacons"][0]["id"], "only-this")
+
+if __name__ == "__main__":
+    unittest.main()
