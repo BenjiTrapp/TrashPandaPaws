@@ -437,6 +437,7 @@ def stage_mdi2(r):
 USB2_VIA_U9 = {"USB2_D_N": (12.2, 16.2), "USB2_D_P": (12.2, 17.1)}
 USB2_VIA_U3 = {"USB2_D_N": (20.8, 18.65), "USB2_D_P": (21.5, 19.0)}
 USB2_FCU_Y = {"USB2_D_N": 18.33, "USB2_D_P": 18.7}     # their runs west from the pins
+USB2_FCU_JOG = None       # {net: (y where it steps west, dx)}: none in the first layout
 USB2_Y_N = 19.2
 USB2_Y_P = USB2_Y_N + PITCH
 # D+ runs 2.274 mm inside U9 (pins 1 and 6 are one node, pad centres 8.463 and
@@ -471,7 +472,7 @@ def usb2_bcu():
 USB2_BCU = usb2_bcu()
 
 
-def stage_usb2(r):
+def stage_usb2(r, return_via=True):
     """D+/D-: J3 -> U9 (D- through the channel between U9's pad columns; pins
     3/4 and 1/6 are one node each, DS4260) -> four vias -> B.Cu under the TX
     and RX lanes -> U3."""
@@ -491,12 +492,18 @@ def stage_usb2(r):
         vx, vy = USB2_VIA_U3[net]
         y = USB2_FCU_Y[net]
         r.net(net, [pad, (pad[0], pad[1] - NECK_LEN)], NECK_W)
-        r.net(net, [(pad[0], pad[1] - NECK_LEN), (pad[0], y), (vx + abs(vy - y), y), (vx, vy)], USB_W)
+        if USB2_FCU_JOG:
+            yj, dx = USB2_FCU_JOG[net]
+            path = [(pad[0], pad[1] - NECK_LEN), (pad[0], yj), (pad[0] + dx, yj + dx), (pad[0] + dx, y)]
+        else:
+            path = [(pad[0], pad[1] - NECK_LEN), (pad[0], y)]
+        r.net(net, split_at_area(path + [(vx + abs(vy - y), y), (vx, vy)]), USB_W)
         r.via(net, vx, vy, "USB 2.0 back to F.Cu at U3, in the band between RX_P and the pads")
     for net, path in USB2_BCU.items():
         r.net(net, path, USB_W, B, exception="AR")
     # the one free place within 1 mm of a USB 2.0 signal via (kicad-happy RP-001)
-    r.via("GND", 12.4, 18.0, "USB 2.0 return, 0.92 mm from D+'s via at U9")
+    if return_via:
+        r.via("GND", 12.4, 18.0, "USB 2.0 return, 0.92 mm from D+'s via at U9")
 
 
 # ---------------------------------------------------------------------------
@@ -921,6 +928,483 @@ def stage_pad_vias(r):
     r.pad_vias = report
 
 
+# ---------------------------------------------------------------------------
+# Review 1 (rulings BE, BF, BG, BH, BI). The board was routed and committed
+# before these; each is a late stage that rips exactly what it replaces and
+# lays it again, so that a fresh gen_pcb.py + route_pcb.py run still gives the
+# committed copper, and tools/amend_pcb.py applies the same stages in place.
+# ---------------------------------------------------------------------------
+
+U3_AREA = (20.55, 19.55, 27.45, 26.45)       # the "U3_escape" rule area (gen_pcb.py)
+
+
+def split_at_area(points, area=U3_AREA):
+    """Insert the points where a polyline crosses the edge of U3's escape area,
+    so that no segment is both inside and outside it: ruling AU's 0.2 mm then
+    applies only to the part that is in the area (ruling BF). KiCad's
+    insideArea() is true when any copper of a segment touches the area, so the
+    segment beyond the cut still carries AU, but only where its round end
+    reaches into the area: at most half its width past the edge. au_overhangs()
+    measures what lies there."""
+    def inside(q):
+        return area[0] <= q[0] <= area[2] and area[1] <= q[1] <= area[3]
+    out = [points[0]]
+    for a, b in zip(points, points[1:]):
+        if inside(a) != inside(b):
+            lo, hi = 0.0, 1.0
+            for _ in range(40):
+                m = (lo + hi) / 2
+                q = (a[0] + (b[0] - a[0]) * m, a[1] + (b[1] - a[1]) * m)
+                if inside(q) == inside(a):
+                    lo = m
+                else:
+                    hi = m
+            q = (round(a[0] + (b[0] - a[0]) * hi, 4), round(a[1] + (b[1] - a[1]) * hi, 4))
+            if math.hypot(q[0] - out[-1][0], q[1] - out[-1][1]) > 0.001 and \
+                    math.hypot(q[0] - b[0], q[1] - b[1]) > 0.001:
+                out.append(q)
+        out.append(b)
+    return out
+
+
+def au_overhangs(board, step=0.01):
+    """Ruling BF: where ruling AU's 0.2 mm is used outside U3's escape area.
+    For every pair of F.Cu tracks of different nets that both touch the area
+    and come nearer than the class clearance (0.3 mm if either is a supply or
+    GND, else 0.2), the copper of the pair outside the area that is that near:
+    {(net a, net b): (least gap mm, how far past the area edge it reaches mm)}."""
+    A = U3_AREA
+    tr = []
+    for t in board.GetTracks():
+        if t.Type() == pcbnew.PCB_TRACE_T and t.GetLayer() == pcbnew.F_Cu:
+            a, b, w = xy(t.GetStart()), xy(t.GetEnd()), pcbnew.ToMM(t.GetWidth())
+            dx = max(A[0] - max(a[0], b[0]), 0, min(a[0], b[0]) - A[2])
+            dy = max(A[1] - max(a[1], b[1]), 0, min(a[1], b[1]) - A[3])
+            if math.hypot(dx, dy) <= w / 2:          # bounding box: good enough for straight escapes
+                tr.append((t.GetNetname(), a, b, w))
+
+    def outside_by(q):
+        return math.hypot(max(A[0] - q[0], 0, q[0] - A[2]), max(A[1] - q[1], 0, q[1] - A[3]))
+    out = {}
+    for na, a, b, wa in tr:
+        length = math.hypot(b[0] - a[0], b[1] - a[1])
+        k = max(1, int(length / step))
+        for i in range(k + 1):
+            q = (a[0] + (b[0] - a[0]) * i / k, a[1] + (b[1] - a[1]) * i / k)
+            o = outside_by(q)
+            if o <= 0:
+                continue
+            for nb, c, d, wb in tr:
+                if nb == na or nb == partner(na):
+                    continue
+                cls = 0.3 if na in route_grid.POWER or nb in route_grid.POWER else 0.2
+                g = seg_point_distance(c, d, q) - wa / 2 - wb / 2
+                if g < cls - 1e-4:
+                    key = tuple(sorted((na, nb)))
+                    best = out.get(key, (9.0, 0.0))
+                    out[key] = (round(min(best[0], g), 3), round(max(best[1], o), 3))
+    return out
+
+
+def rip(board, net, keep=lambda a, b, layer: False, vias=True):
+    """Remove every track of `net` (except those `keep` says to keep) and, if
+    `vias`, every via of it. Returns the number of items removed."""
+    n = 0
+    for t in list(board.GetTracks()):
+        if t.GetNetname() != net:
+            continue
+        if t.Type() == pcbnew.PCB_VIA_T:
+            if vias:
+                board.Delete(t)
+                n += 1
+        elif not keep(xy(t.GetStart()), xy(t.GetEnd()), t.GetLayer()):
+            board.Delete(t)
+            n += 1
+    return n
+
+
+def rip_from_pad(board, ref, pad):
+    """Remove the copper that hangs off one pad only: follow tracks and vias of
+    the pad's net from the pad until a junction (a point shared by more than
+    two items) or another pad. Returns the items removed."""
+    fp = board.FindFootprintByReference(ref)
+    p = next(q for q in fp.Pads() if q.GetNumber() == str(pad))
+    net = p.GetNetname()
+    start = xy(p.GetPosition())
+    other_pads = [xy(q.GetPosition()) for f in board.GetFootprints() for q in f.Pads()
+                  if q.GetNetname() == net and not (f.GetReference() == ref and q.GetNumber() == str(pad))]
+    items = [t for t in board.GetTracks() if t.GetNetname() == net]
+
+    def ends(t):
+        if t.Type() == pcbnew.PCB_VIA_T:
+            q = xy(t.GetPosition())
+            return [q, q]
+        return [xy(t.GetStart()), xy(t.GetEnd())]
+
+    def near(a, b, d=0.01):
+        return math.hypot(a[0] - b[0], a[1] - b[1]) < d
+
+    def in_pad(q):
+        return p.HitTest(vec(*q))
+    removed, frontier, seen = [], [start], set()
+    while frontier:
+        q = frontier.pop()
+        tracks_at = [t for t in items if t.Type() != pcbnew.PCB_VIA_T and
+                     any((near(e, q) or (q == start and in_pad(e))) for e in ends(t))]
+        vias_at = [t for t in items if t.Type() == pcbnew.PCB_VIA_T and near(ends(t)[0], q)]
+        if q != start and (len(tracks_at) > 2 or any(near(q, o, 0.3) for o in other_pads)):
+            continue                       # a junction or another pad: stop here
+        for t in vias_at + tracks_at:
+            if id(t) in seen:
+                continue
+            seen.add(id(t))
+            removed.append(t)
+            for e in ends(t):
+                if not near(e, q):
+                    frontier.append(e)
+    n = len(removed)
+    for t in removed:
+        board.Delete(t)
+    return n
+
+
+def stage_coupling(r):
+    """Rulings BE / BF / BG. The SuperSpeed TX pair, U3 to the caps, now
+    coupled at the class gap with route_pair, shifted 0.215 mm east right
+    after its necks and fanned out at 45 degrees about 1 mm before C23; TX_CONN
+    coupled from the caps to just east of U8 pin 1, where P drops into U8's
+    channel (ruling AS); pin 14's escape keeps 0.3 mm from RX_N and TX_P
+    outside the escape area except within 0.2 mm of its edge (the named
+    exception of ruling BF, AU_OVERHANGS in tests/check_fab_release.py);
+    USB 2.0's run west from U3 is moved south and steps 0.2 mm west above
+    pin 19, so D- keeps 0.3 mm or more from RX_P outside the escape area but
+    for the last 0.25 mm before it."""
+    board, P = r.board, r.P
+    for net in ("USB3_TX_P", "USB3_TX_N", "USB3_TX_CONN_P", "USB3_TX_CONN_N", "USB2_D_P", "USB2_D_N"):
+        rip(board, net)
+    # pin 14's old escape: everything of +1V0 between its pad and C16.1
+    in_channel = lambda q: 24.55 <= q[0] <= 24.75 and 16.7 <= q[1] <= 20.6
+    rip(board, "+1V0", vias=False, keep=lambda a, b, layer: not (in_channel(a) or in_channel(b)))
+    for k in list(r.lengths):
+        if k.startswith(("USB3_TX", "USB2")):
+            r.lengths.pop(k)
+            r.stubs.pop(k, None)
+    r.vias = [v for v in r.vias if not v[0].startswith("USB2_D")]
+    T = lambda net, pts, w, layer=F: r.net(net, split_at_area(pts), w, layer, exception="AR" if layer == B else None)
+
+    # -- TX, U3 to C22 / C23 ----------------------------------------------------
+    p12, p13 = P("U3", 12), P("U3", 13)
+    c22_1, c23_1 = P("C22", 1), P("C23", 1)
+    yn = p12[1] - NECK_LEN
+    T("USB3_TX_P", [p13, (p13[0], yn)], NECK_W)
+    T("USB3_TX_N", [p12, (p12[0], yn)], NECK_W)
+    xc = 25.4                     # the pair's centre after the 0.2 mm shift east
+    y_fan = c23_1[1] + 1.25       # N leaves at 45 degrees about 1 mm before C23
+    x0 = (p12[0] + p13[0]) / 2
+    centre = [(x0, yn), (x0, yn - 0.1), (xc, yn - 0.1 - (xc - x0)), (xc, y_fan)]
+    lp, ln, _ = route_pair(board, "USB3_TX_P", "USB3_TX_N", split_at_area(centre), p_left=True,
+                           head_p=[(p13[0], yn)], head_n=[(p12[0], yn)],
+                           tail_p=[(xc - PITCH / 2, c22_1[1] + 0.12)],
+                           tail_n=[(c23_1[0], y_fan - (c23_1[0] - xc - PITCH / 2)), (c23_1[0], c23_1[1] + 0.12)])
+    r.lengths["USB3_TX_P"] = r.lengths.get("USB3_TX_P", 0) + lp
+    r.lengths["USB3_TX_N"] = r.lengths.get("USB3_TX_N", 0) + ln
+
+    # -- pin 14 (+1V0): up the channel, 0.3 mm from RX_N and TX_P outside the area
+    x, y = P("U3", 14)
+    T("+1V0", [(x, y), (x, 19.6), (x + 0.1, 19.5), (x + 0.1, 16.75), P("C16", 1)], 0.15)
+
+    # -- TX_CONN, C22 / C23 to J3, U8 as a tee -----------------------------------
+    u8 = {n: P("U8", n) for n in "123456"}
+    y_ch = (u8["2"][1] + u8["5"][1]) / 2 - 0.40
+    j5, j6 = P("J3", 5), P("J3", 6)
+    c22_2, c23_2 = P("C22", 2), P("C23", 2)
+    x3, x1 = u8["3"][0], u8["1"][0]
+    yc0 = TX_CONN_Y_N + PITCH / 2              # the pair's centre leaving the caps
+    yc1 = 15.0                                 # and from x 21 west
+    x_drop = 18.6                              # P leaves N here, 1.6 mm east of U8 pin 1
+    centre = [(c22_2[0], yc0), (21.3, yc0), (21.3 - (yc1 - yc0), yc1), (x_drop, yc1)]
+    # travelling west, N (north) is on the right
+    lp, ln, _ = route_pair(board, "USB3_TX_CONN_P", "USB3_TX_CONN_N", centre, p_left=True,
+                           head_p=[c22_2], head_n=[c23_2, (c23_2[0], TX_CONN_Y_N)],
+                           tail_p=[(x_drop - (y_ch - yc1 - PITCH / 2), y_ch), (x3 - 0.7375, y_ch),
+                                   (x3 - 2.25, 15.1875), (7.8125, 15.1875), (7.0, j6[1]), (j6[0] + 0.9, j6[1])],
+                           tail_n=[(8.3125, yc1 - PITCH / 2), (7.5, j5[1]), (j5[0] + 0.9, j5[1])])
+    r.lengths["USB3_TX_CONN_P"] = r.lengths.get("USB3_TX_CONN_P", 0) + lp
+    r.lengths["USB3_TX_CONN_N"] = r.lengths.get("USB3_TX_CONN_N", 0) + ln
+    r.net("USB3_TX_CONN_N", [(x3, yc1 - PITCH / 2), u8["3"]], USB_W, stub=True)
+    r.net("USB3_TX_CONN_P", [(x1, y_ch), u8["1"]], USB_W, stub=True)
+
+    # -- USB 2.0 (ruling BG): the run west from U3 moved south, vias re-placed
+    global USB2_VIA_U3, USB2_FCU_Y, USB2_BCU, USB2_FCU_JOG
+    USB2_VIA_U3 = {"USB2_D_N": (20.8, 18.75), "USB2_D_P": (21.5, 19.15)}
+    USB2_FCU_Y = {"USB2_D_N": 18.55, "USB2_D_P": 18.92}
+    # the pair steps 0.2 mm west just above pin 19's run: D- then keeps
+    # 0.4 mm from RX_P instead of the 0.2 the adjacent pins leave
+    # (D- steps 0.15 mm later than D+, so the two 45-degree steps keep the pair's pitch)
+    USB2_FCU_JOG = {"USB2_D_P": (19.45, -0.2), "USB2_D_N": (19.3, -0.2)}
+    USB2_BCU = usb2_bcu()
+    stage_usb2(r, return_via=False)
+
+
+def stage_split_area(r):
+    """Ruling BF: every F.Cu track that crosses the edge of U3's escape area is
+    cut into two segments there (the copper is unchanged), so that ruling
+    AU's 0.2 mm holds only for the part inside the area and the DRC checks the
+    part outside at the class clearance. Returns the number of tracks cut."""
+    board = r.board
+    cut = 0
+    for t in list(board.GetTracks()):
+        if t.Type() != pcbnew.PCB_TRACE_T or t.GetLayer() != pcbnew.F_Cu:
+            continue
+        a, b = xy(t.GetStart()), xy(t.GetEnd())
+        net, w = t.GetNetname(), pcbnew.ToMM(t.GetWidth())
+        pts = split_at_area([a, b])
+        if len(pts) == 2:
+            continue
+        board.Delete(t)
+        route_net(board, net, pts, w, pcbnew.F_Cu)
+        cut += 1
+    r.area_cuts = cut
+    return cut
+
+
+def _place_on_bottom(board, ref, pad1_at, toward):
+    """Put footprint `ref` on B.Cu with pad 1 at `pad1_at` and pad 2 in the
+    direction `toward` (a unit vector) from it. Creates the footprint from netlist.yaml if the
+    board does not have it yet (a part added after the board was routed)."""
+    fp = board.FindFootprintByReference(ref)
+    if fp is None:
+        sys.path.insert(0, str(HERE))
+        import yaml
+        import gen_pcb
+        gen_pcb.pcbnew = pcbnew
+        netlist = yaml.safe_load((HERE.parent / "netlist.yaml").read_text())
+        comp = netlist["components"][ref]
+        fp = gen_pcb.load_footprint(ref, comp["footprint"], [])
+        fp.SetReference(ref)
+        fp.SetValue(str(comp.get("value", "")))
+        fp.Reference().SetLayer(pcbnew.F_Fab)
+        fp.Value().SetVisible(False)
+        gen_pcb.apply_fitting(fp, ref, comp)
+        board.Add(fp)
+        for pad in fp.Pads():
+            for name, ends in netlist["nets"].items():
+                if f"{ref}.{pad.GetNumber()}" in (ends or []):
+                    pad.SetNet(board.FindNet(name))
+    if not fp.IsFlipped():
+        fp.Flip(fp.GetPosition(), pcbnew.FLIP_DIRECTION_LEFT_RIGHT)
+    for rot in (0, 90, 180, 270):
+        fp.SetOrientationDegrees(rot)
+        fp.SetPosition(vec(*pad1_at))
+        p1 = next(q for q in fp.Pads() if q.GetNumber() == "1")
+        p2 = next(q for q in fp.Pads() if q.GetNumber() == "2")
+        (ax, ay), (bx, by) = xy(p1.GetPosition()), xy(p2.GetPosition())
+        if (bx - ax) * toward[0] + (by - ay) * toward[1] > 0.5:
+            break
+    off = (pad1_at[0] - xy(p1.GetPosition())[0], pad1_at[1] - xy(p1.GetPosition())[1])
+    pos = xy(fp.GetPosition())
+    fp.SetPosition(vec(pos[0] + off[0], pos[1] + off[1]))
+    return fp
+
+
+# Ruling BH: the capacitors that sit on B.Cu directly at their pin's via, GND
+# pad on the B.Cu pour. Pad 1 starts 0.1 mm clear of the via (ruling BI).
+# C27 hangs south of pin 19's via, clear of ETH_LED1's B.Cu run east of it,
+# with 0.65 mm of pour left between it and the USB 2.0 pair (ruling AW).
+B_CU_CAPS = [("C14", (27.1, 27.15), (1, 0), "U3 pin 37 (+1V0)"),
+             ("C27", (21.1, 20.1), (0, 1), "U3 pin 19 (+1V0)")]
+
+
+def stage_decoupling(r):
+    board = r.board
+    if board.FindFootprintByReference("C14") and not board.FindFootprintByReference("C14").IsFlipped():
+        rip_from_pad(board, "C14", 1)
+        rip_from_pad(board, "C14", 2)
+        r.vias = [v for v in r.vias if "C14" not in v[3]]
+    for ref, (vx, vy), (ux, uy), why in B_CU_CAPS:
+        reach = 0.3 + 0.1 + 0.28 + (0.22 if uy else 0)     # via r + 0.1 + half the pad (+ room for the pour)
+        pad1 = (round(vx + ux * reach, 3), round(vy + uy * reach, 3))
+        _place_on_bottom(board, ref, pad1, (ux, uy))
+        r.net("+1V0", [(vx, vy), pad1], 0.3, B)
+    r.P = Pads(board)
+
+
+# Ruling BI: least copper gap from a via to a pad of a hand-soldered part (all
+# but U3 and Y1, which PCBWay reflows); under a fab's 0.1 mm mask dam less is a
+# via in the pad again. The one via left inside a pad (U8 pin 2, ruling BA,
+# tented from the back) is the listed exception.
+PAD_VIA_GAP = 0.1
+PAD_VIA_EXCEPTIONS = [("U8", "2")]
+REFLOWED = ("U3", "Y1")
+
+
+def pad_via_gaps(board):
+    """[(via net, (x, y), ref, pad, gap mm)] for every via closer than
+    PAD_VIA_GAP to a pad of a hand-soldered part (bounding boxes)."""
+    hits = []
+    pads = [(fp.GetReference(), p) for fp in board.GetFootprints() if fp.GetReference() not in REFLOWED
+            for p in fp.Pads()]
+    for v in board.GetTracks():
+        if v.Type() != pcbnew.PCB_VIA_T:
+            continue
+        x, y = xy(v.GetPosition())
+        rv = pcbnew.ToMM(v.GetWidth(pcbnew.F_Cu)) / 2
+        for ref, p in pads:
+            bb = p.GetBoundingBox()
+            (x0, y0), (x1, y1) = xy(bb.GetOrigin()), xy(bb.GetEnd())
+            dx, dy = max(x0 - x, 0, x - x1), max(y0 - y, 0, y - y1)
+            gap = math.hypot(dx, dy) - rv
+            if p.GetShape() == pcbnew.PAD_SHAPE_CIRCLE:
+                cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+                gap = math.hypot(x - cx, y - cy) - (x1 - x0) / 2 - rv
+                dx, dy = abs(x - cx), abs(y - cy)
+            if gap < PAD_VIA_GAP - 1e-6 and (ref, p.GetNumber()) not in PAD_VIA_EXCEPTIONS:
+                hits.append((v.GetNetname(), (round(x, 3), round(y, 3)), ref, p.GetNumber(), round(gap, 3),
+                             ((x0 + x1) / 2, (y0 + y1) / 2), (dx, dy)))
+    return hits
+
+
+def _move_footprint(board, ref, dx, dy):
+    """Shift a footprint and the ends of tracks that sit in its pads."""
+    fp = board.FindFootprintByReference(ref)
+    inside = []
+    for p in fp.Pads():
+        for t in board.GetTracks():
+            if t.Type() == pcbnew.PCB_TRACE_T and t.GetNetname() == p.GetNetname():
+                for which in ("start", "end"):
+                    q = t.GetStart() if which == "start" else t.GetEnd()
+                    if p.HitTest(q):
+                        inside.append((t, which))
+    pos = xy(fp.GetPosition())
+    fp.SetPosition(vec(pos[0] + dx, pos[1] + dy))
+    for t, which in inside:
+        q = xy(t.GetStart() if which == "start" else t.GetEnd())
+        (t.SetStart if which == "start" else t.SetEnd)(vec(q[0] + dx, q[1] + dy))
+
+
+# Where moving the via would run it into its neighbours, the part moves instead.
+VIA_GAP_MOVE_PART = {("+1V0", "C15", "1"): (0.0, 0.07)}   # pin 34's via; V33 sits north of it
+
+
+def stage_via_gaps(r):
+    """Move every via that comes within PAD_VIA_GAP of a hand-soldered pad
+    straight away from that pad until it is PAD_VIA_GAP + 0.01 clear, taking
+    the ends of its own net's tracks along (or, in VIA_GAP_MOVE_PART, move the
+    part away from the via)."""
+    board = r.board
+    moved = []
+    for net, (x, y), ref, pad, gap, centre, d in pad_via_gaps(board):
+        if (net, ref, pad) in VIA_GAP_MOVE_PART:
+            dx, dy = VIA_GAP_MOVE_PART[(net, ref, pad)]
+            _move_footprint(board, ref, dx, dy)
+            moved.append((net, (x, y), (x, y), ref, pad, gap))
+    for _ in range(3):
+        hits = pad_via_gaps(board)
+        if not hits:
+            break
+        for net, (x, y), ref, pad, gap, centre, (dx, dy) in hits:
+            v = next(t for t in board.GetTracks() if t.Type() == pcbnew.PCB_VIA_T and t.GetNetname() == net
+                     and abs(xy(t.GetPosition())[0] - x) < 1e-3 and abs(xy(t.GetPosition())[1] - y) < 1e-3)
+            if dx == 0 and dy == 0:
+                ux, uy = x - centre[0], y - centre[1]
+            else:
+                ux, uy = (dx if x > centre[0] else -dx), (dy if y > centre[1] else -dy)
+            norm = math.hypot(ux, uy) or 1.0
+            step = PAD_VIA_GAP + 0.01 - gap
+            nx, ny = round(x + ux / norm * step, 3), round(y + uy / norm * step, 3)
+            for t in board.GetTracks():
+                if t.Type() == pcbnew.PCB_TRACE_T and t.GetNetname() == net:
+                    if math.hypot(xy(t.GetStart())[0] - x, xy(t.GetStart())[1] - y) < 1e-3:
+                        t.SetStart(vec(nx, ny))
+                    if math.hypot(xy(t.GetEnd())[0] - x, xy(t.GetEnd())[1] - y) < 1e-3:
+                        t.SetEnd(vec(nx, ny))
+            v.SetPosition(vec(nx, ny))
+            r.vias = [(q[0], nx, ny, q[3]) if q[0] == net and abs(q[1] - x) < 1e-3 and abs(q[2] - y) < 1e-3
+                      else q for q in r.vias]
+            moved.append((net, (x, y), (nx, ny), ref, pad, gap))
+    r.via_moves = moved
+    return moved
+
+
+ANTIPAD_SPARE = 0.1       # review 1: In1's hole round a via keeps this much from any pair track edge
+
+
+def antipad_margins(board):
+    """[(via, margin mm, nearest pair net)] for every non-GND via: the gap from
+    the edge of the hole In1 leaves round it to the nearest F.Cu pair track
+    of another net."""
+    tr = [(t.GetNetname(), xy(t.GetStart()), xy(t.GetEnd()), pcbnew.ToMM(t.GetWidth())) for t in board.GetTracks()
+          if t.Type() == pcbnew.PCB_TRACE_T and t.GetLayer() == pcbnew.F_Cu and t.GetNetname() in PAIR_NETS]
+    out = []
+    for v in board.GetTracks():
+        if v.Type() != pcbnew.PCB_VIA_T or v.GetNetname() == "GND":
+            continue
+        x, y = xy(v.GetPosition())
+        hole = pcbnew.ToMM(v.GetWidth(pcbnew.F_Cu)) / 2 + IN1_CLEARANCE
+        skip = (v.GetNetname(), partner(v.GetNetname()))
+        m = min(((seg_point_distance(a, c, (x, y)) - w / 2 - hole, n) for n, a, c, w in tr if n not in skip),
+                default=(9.0, None))
+        out.append((v, m[0], m[1]))
+    return out
+
+
+def stage_antipads(r):
+    """Nudge every non-GND via whose In1 hole comes within ANTIPAD_SPARE of a
+    pair track, along the direction that raises its least margin, by no more
+    than it needs; in a pocket between two pairs it ends in the middle."""
+    board = r.board
+    tr = [(t.GetNetname(), xy(t.GetStart()), xy(t.GetEnd()), pcbnew.ToMM(t.GetWidth())) for t in board.GetTracks()
+          if t.Type() == pcbnew.PCB_TRACE_T and t.GetLayer() == pcbnew.F_Cu and t.GetNetname() in PAIR_NETS]
+    moves = []
+    gr = route_grid.Router(board, PAIR_NETS)
+    for v, m, near_net in antipad_margins(board):
+        if m >= ANTIPAD_SPARE:
+            continue
+        x, y = xy(v.GetPosition())
+        net = v.GetNetname()
+        hole = pcbnew.ToMM(v.GetWidth(pcbnew.F_Cu)) / 2 + IN1_CLEARANCE
+        skip = (net, partner(net))
+
+        rv = pcbnew.ToMM(v.GetWidth(pcbnew.F_Cu)) / 2
+        others = [it for it in gr.items if it.net != net and it.kind != "hole"]
+
+        def copper_ok(px, py):
+            # the class clearance (and 0.25 hole to hole) to everything of other nets
+            for it in others:
+                c = 0.3 if net in route_grid.POWER or (it.net or "") in route_grid.POWER else 0.2
+                if it.dist(px, py) - rv < c - 1e-6:
+                    return False
+            return True
+
+        def margin(px, py):
+            if not copper_ok(px, py):
+                return -9.0
+            return min(seg_point_distance(a, c, (px, py)) - w / 2 - hole for n, a, c, w in tr if n not in skip)
+        best = (m, x, y)
+        for k in range(16):
+            ang = math.pi * k / 8
+            for step in [i * 0.005 for i in range(1, 25)]:
+                px, py = x + math.cos(ang) * step, y + math.sin(ang) * step
+                mm_ = margin(px, py)
+                if mm_ > best[0] + 1e-6 and (best[0] < ANTIPAD_SPARE or step < math.hypot(best[1] - x, best[2] - y)):
+                    best = (min(mm_, ANTIPAD_SPARE + 0.005), round(px, 3), round(py, 3))
+                if mm_ >= ANTIPAD_SPARE + 0.005:
+                    break
+        _, nx, ny = best
+        for t in board.GetTracks():
+            if t.Type() == pcbnew.PCB_TRACE_T and t.GetNetname() == net:
+                if math.hypot(xy(t.GetStart())[0] - x, xy(t.GetStart())[1] - y) < 1e-3:
+                    t.SetStart(vec(nx, ny))
+                if math.hypot(xy(t.GetEnd())[0] - x, xy(t.GetEnd())[1] - y) < 1e-3:
+                    t.SetEnd(vec(nx, ny))
+        v.SetPosition(vec(nx, ny))
+        r.vias = [(q[0], nx, ny, q[3]) if q[0] == net and abs(q[1] - x) < 1e-3 and abs(q[2] - y) < 1e-3
+                  else q for q in r.vias]
+        moves.append((net, (x, y), (nx, ny), round(m, 3), round(margin(nx, ny), 3), near_net))
+    r.antipad_moves = moves
+    return moves
+
+
 STAGES = [
     ("usb3_tx", stage_usb3_tx),
     ("usb3_rx", stage_usb3_rx),
@@ -935,6 +1419,11 @@ STAGES = [
     ("supplies", stage_supplies),
     ("gnd", stage_gnd),
     ("pad_vias", stage_pad_vias),
+    ("coupling", stage_coupling),
+    ("decoupling", stage_decoupling),
+    ("via_gaps", stage_via_gaps),
+    ("antipads", stage_antipads),
+    ("split_area", stage_split_area),
 ]
 
 
@@ -1011,7 +1500,6 @@ def ar_return(board):
     used, missing = set(), []
     for net, d in (("USB2_D_N", 0.6), ("USB2_D_P", -0.6)):
         pts = USB2_BCU[net]
-        off = offset_line(pts, d if net == "USB2_D_P" else d)
         # D_N is the north track: travelling U9 -> U3 (east), left is north
         off = offset_line(pts, 0.6) if net == "USB2_D_N" else offset_line(pts, -0.6)
         for a, b in zip(off, off[1:]):
@@ -1067,7 +1555,7 @@ def ar_return(board):
 # Which U3 pins each decoupling capacitor is for (gen_pcb.py PLACEMENT).
 DECOUPLING = {"C7": (11,), "C8": (20,), "C9": (39, 40), "C10": (23, 26), "C11": (26, 33),
               "C12": (3,), "C13": (8,), "C14": (37,), "C15": (34,), "C16": (14,),
-              "C17": (22,), "C18": (21, 27)}
+              "C17": (22,), "C18": (21, 27), "C27": (19,)}
 
 
 def decoupling_distances(board):
@@ -1078,6 +1566,43 @@ def decoupling_distances(board):
         d = min(math.hypot(cx - P("U3", n)[0], cy - P("U3", n)[1]) for n in pins)
         rows.append((ref, pins, round(d, 2)))
     return rows
+
+
+COUPLING_TOL = 0.03      # mm either side of the pair gap counted as "at the designed gap"
+
+
+def coupling(board, step=0.05):
+    """Ruling BE: how much of each pair runs at its designed gap. For every
+    track of each net, sampled every `step`, the edge gap to the nearest track
+    of its partner on the same layer. Returns {pair: (total mm, mm at the
+    gap +/- COUPLING_TOL, mm at 0.6 mm or more apart)} per net."""
+    tracks = {}
+    for t in board.GetTracks():
+        if t.Type() == pcbnew.PCB_TRACE_T and t.GetNetname() in PAIR_NETS:
+            tracks.setdefault(t.GetNetname(), []).append(
+                (t.GetLayer(), xy(t.GetStart()), xy(t.GetEnd()), pcbnew.ToMM(t.GetWidth())))
+    out = {}
+    for p, n in PAIRS:
+        gap = MDI_GAP if p.startswith("MDI") else USB_GAP
+        for net, other in ((p, n), (n, p)):
+            total = at = far = 0.0
+            for layer, a, b, w in tracks.get(net, []):
+                length = math.hypot(b[0] - a[0], b[1] - a[1])
+                k = max(1, int(round(length / step)))
+                for i in range(k):
+                    t_ = (i + 0.5) / k
+                    q = (a[0] + (b[0] - a[0]) * t_, a[1] + (b[1] - a[1]) * t_)
+                    best = 99.0
+                    for l2, c, d, w2 in tracks.get(other, []):
+                        if l2 == layer:
+                            best = min(best, seg_point_distance(c, d, q) - w2 / 2 - w / 2)
+                    total += length / k
+                    if abs(best - gap) <= COUPLING_TOL:
+                        at += length / k
+                    elif best >= 0.6:
+                        far += length / k
+            out[net] = (total, at, far)
+    return out
 
 
 def in2_under(board, points, step=0.05):
@@ -1164,6 +1689,20 @@ def main():
           + ("no gap" if not gaps else "; ".join(f"{n}: {len(v)} points, first {v[0]}"
                                                 for n, v in sorted(gaps.items()))))
     status = 1 if gaps else 0
+    lens = {}
+    for t in board.GetTracks():
+        if t.Type() == pcbnew.PCB_TRACE_T and t.GetNetname() in PAIR_NETS:
+            (ax, ay), (bx, by) = xy(t.GetStart()), xy(t.GetEnd())
+            lens[t.GetNetname()] = lens.get(t.GetNetname(), 0) + math.hypot(bx - ax, by - ay)
+    tx_p = lens.get("USB3_TX_P", 0) + lens.get("USB3_TX_CONN_P", 0)
+    tx_n = lens.get("USB3_TX_N", 0) + lens.get("USB3_TX_CONN_N", 0)
+    print("pair copper lengths measured on the board (mm, P / N / diff): "
+          f"USB3 TX U3-J3 {tx_p:.3f} / {tx_n:.3f} / {abs(tx_p - tx_n):.3f}; "
+          + "; ".join(f"{p[:-2]} {lens.get(p, 0):.3f} / {lens.get(n, 0):.3f} / {abs(lens.get(p, 0) - lens.get(n, 0)):.3f}"
+                      for p, n in PAIRS if p.startswith(("USB3_RX", "MDI", "USB2"))))
+    print(f"coupling (edge gap within {COUPLING_TOL} mm of the pair gap), per net: total / at the gap / 0.6 mm or more apart, mm")
+    for net, (tot, at, far) in coupling(board).items():
+        print(f"  {net:15s} {tot:7.2f} {at:7.2f} ({100 * at / tot if tot else 0:4.0f} %) {far:7.2f}")
     if any(t.GetNetname() in B_CU_EXCEPTION_NETS and t.GetLayer() == B for t in board.GetTracks()):
         for net in ("USB2_D_N", "USB2_D_P"):
             seq, n = in2_under(board, USB2_BCU[net])
@@ -1178,6 +1717,13 @@ def main():
         status |= 1 if problems else 0
     for ref, pad, what in getattr(r, "pad_vias", []):
         print(f"ruling BA: {ref}.{pad}: {what}")
+    for net, a, b, ref, pad, gap in getattr(r, "via_moves", []):
+        print(f"ruling BI: {net} via {a} -> {b} ({gap} mm from {ref}.{pad})")
+    for net, a, b, m0, m1, near_net in getattr(r, "antipad_moves", []):
+        print(f"In1 hole: {net} via {a} -> {b}, margin to {near_net} {m0} -> {m1} mm")
+    left = pad_via_gaps(board)
+    print(f"ruling BI: vias closer than {PAD_VIA_GAP} mm to a hand-soldered pad: {len(left)} {[h[:5] for h in left]}")
+    status |= 1 if left else 0
     if "supplies_u3" in args.stages:
         print("decoupling, cap pad 1 to the nearest pad centre of its U3 pin(s), mm:")
         for ref, pins, d in decoupling_distances(board):

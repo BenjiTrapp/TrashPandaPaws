@@ -156,7 +156,12 @@ PLACEMENT = {
     "C10": (19.25, 22.65, 180),  # pins 23 / 26 (+3V3), west of their via
     "C18": (18.9, 24.2, 270),    # pin 27 (+5V_SW), on its line west to the +5V_SW island; pad 1 north
     "C15": (22.45, 27.95, 180),  # pin 34 (+1V0), under its via
-    "C14": (32.6, 28.0, 0),      # pin 37 (+1V0): R11 and R14 leave no room by the pin; on the B.Cu +1V0 link
+    "C14": (32.6, 28.0, 0),      # pin 37 (+1V0); route_pcb.py stage "decoupling" moves it to B.Cu at pin 37's via (ruling BH)
+    # Added after the board was routed (ruling BH): parked off the board here,
+    # placed on B.Cu at pin 19's via by route_pcb.py stage "decoupling", so a
+    # fresh run lays the routing round the parts where they were when it was
+    # laid
+    "C27": (-8.0, 40.0, 0),
     "C11": (19.2, 25.95, 180),   # pins 26 / 33 (+3V3), on the +3V3 plane south-west of U3
     "C9":  (19.2, 27.0, 180),    # pins 39 / 40 (+3V3), the same
     # --- J2 side ------------------------------------------------------------

@@ -955,7 +955,7 @@ components:
     footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
     mpn: CC0402KRX7R9BB104
-    description: "+1V0 decoupling at U3 AVDD10 (37)"
+    description: "+1V0 decoupling at U3 AVDD10 (37), on B.Cu at the pin's via (ruling BH)"
     source: >
       Package stays 0402: spec 5.1 exempts the decoupling capacitors directly
       at U3 and the crystal load capacitors from the 0402 -> 0603 raise,
@@ -985,7 +985,7 @@ components:
     footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
     mpn: CC0402KRX7R9BB104
-    description: "+1V0 decoupling at U3 U3VDD10 (14) and U2VDD10 (19)"
+    description: "+1V0 decoupling at U3 U3VDD10 (14); U2VDD10 (19) has C27"
     source: >
       Package stays 0402: spec 5.1 exempts the decoupling capacitors directly
       at U3 and the crystal load capacitors from the 0402 -> 0603 raise,
@@ -1216,6 +1216,24 @@ components:
       this value; a +/-10 % X7R part that loses a further 10 % to DC bias (CT
       sees up to 2.5 V, 9.3.4) is covered by the 20 % CT allowance in the model. Part:
       Yageo CC0603KRX7R9BB273, X7R 50V 10%. Part and lifecycle: [SOURCING].
+    pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
+
+  C27:
+    value: 100nF
+    tolerance: "X7R, 50V, 10%"
+    package: "0402"
+    footprint: "Capacitor_SMD:C_0402_1005Metric"
+    manufacturer: Yageo
+    mpn: CC0402KRX7R9BB104
+    description: "+1V0 decoupling at U3 U2VDD10 (19), on B.Cu at the pin's via"
+    source: >
+      Ruling BH (task 9 review): pin 19 had no capacitor of its own, and the
+      In2 +1V0 island under it faces In1 across the 1.03 mm core, which gives
+      only picofarads. The F.Cu round pin 19 has no room for a cap and its via
+      (the USB 2.0 vias and pin 20's track are there), so this one sits on
+      B.Cu directly at pin 19's via, GND side on the B.Cu pour. Same part as
+      C12-C16: Yageo CC0402KRX7R9BB104, X7R 50V 10%. Part and lifecycle:
+      [SOURCING]. Hand-soldered like every part but U3 and Y1.
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
 
   U7:
@@ -1557,6 +1575,7 @@ nets:
     - U8.2           # SuperSpeed ESD array
     - U9.2           # USB 2.0 ESD array
     - C26.2
+    - C27.2
     - TP1.1
     - H1.1           # mounting holes, plated, chassis ground
     - H2.1
@@ -1631,6 +1650,7 @@ nets:
     - C14.1
     - C15.1
     - C16.1
+    - C27.1          # pin 19, on B.Cu at the pin's via (ruling BH)
     - TP5.1
 
   # --- Buck ---

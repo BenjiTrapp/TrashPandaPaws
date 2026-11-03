@@ -48,17 +48,17 @@
     "comment_4": "Authorized penetration testing use only"
   },
   "statistics": {
-    "total_components": 58,
+    "total_components": 59,
     "unique_parts": 26,
     "dnp_parts": 0,
     "total_nets": 44,
-    "total_wires": 179,
+    "total_wires": 181,
     "total_no_connects": 6,
     "component_types": {
       "connector": 2,
       "ic": 6,
       "crystal": 1,
-      "capacitor": 26,
+      "capacitor": 27,
       "fiducial": 3,
       "mounting_hole": 2,
       "jumper": 2,
@@ -364,10 +364,19 @@
           "package": "0402",
           "esr_ohm": 0.5,
           "dielectric": "X7R"
+        },
+        {
+          "ref": "C27",
+          "value": "100nF",
+          "farads": 1.0000000000000001e-07,
+          "self_resonant_hz": 15915494.0,
+          "package": "0402",
+          "esr_ohm": 0.5,
+          "dielectric": "X7R"
         }
       ],
-      "total_capacitance_uF": 0.5,
-      "cap_count": 5,
+      "total_capacitance_uF": 0.6,
+      "cap_count": 6,
       "detector": "detect_decoupling",
       "rule_id": "DC-DET",
       "category": "decoupling",
@@ -381,7 +390,8 @@
         "C13",
         "C14",
         "C15",
-        "C16"
+        "C16",
+        "C27"
       ],
       "nets": [],
       "pins": [],
@@ -399,7 +409,8 @@
           "C13",
           "C14",
           "C15",
-          "C16"
+          "C16",
+          "C27"
         ],
         "excluded_by": [],
         "suppressed_candidates": []
@@ -684,8 +695,8 @@
     {
       "category": "decoupling_coverage",
       "rail": "+1V0",
-      "cap_count": 5,
-      "total_uF": 0.5,
+      "cap_count": 6,
+      "total_uF": 0.6,
       "has_bulk": false,
       "has_bypass": true,
       "has_high_freq": false,
@@ -701,7 +712,8 @@
         "C13",
         "C14",
         "C15",
-        "C16"
+        "C16",
+        "C27"
       ],
       "nets": [],
       "pins": [],
@@ -719,7 +731,8 @@
           "C13",
           "C14",
           "C15",
-          "C16"
+          "C16",
+          "C27"
         ],
         "excluded_by": [],
         "suppressed_candidates": []
@@ -2200,10 +2213,11 @@
         "C18",
         "C22",
         "C23",
+        "C27",
         "C7",
         "C9"
       ],
-      "quantity": 13,
+      "quantity": 14,
       "dnp": false,
       "type": "capacitor"
     },
@@ -3706,6 +3720,41 @@
       }
     },
     {
+      "reference": "C27",
+      "value": "100nF",
+      "lib_id": "raccoon:RACCOON_C27",
+      "lib_name": "",
+      "footprint": "Capacitor_SMD:C_0402_1005Metric",
+      "datasheet": "",
+      "description": "",
+      "mpn": "CC0402KRX7R9BB104",
+      "manufacturer": "Yageo",
+      "digikey": "",
+      "mouser": "",
+      "lcsc": "",
+      "element14": "",
+      "x": 241.3,
+      "y": 128.27,
+      "angle": 0.0,
+      "mirror_x": false,
+      "mirror_y": false,
+      "unit": 1,
+      "uuid": "67fc9a53-8a42-3835-c917-fd1d4c8aee41",
+      "in_bom": true,
+      "dnp": false,
+      "on_board": true,
+      "pin_uuids": {},
+      "type": "capacitor",
+      "keywords": "",
+      "_sheet": 0,
+      "category": "capacitor",
+      "parsed_value": 1.0000000000000001e-07,
+      "pin_nets": {
+        "2": "GND",
+        "1": "+1V0"
+      }
+    },
+    {
       "reference": "C3",
       "value": "10uF",
       "lib_id": "raccoon:RACCOON_C3",
@@ -3720,7 +3769,7 @@
       "lcsc": "",
       "element14": "",
       "x": 241.3,
-      "y": 128.27,
+      "y": 143.51,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -3755,7 +3804,7 @@
       "lcsc": "",
       "element14": "",
       "x": 241.3,
-      "y": 143.51,
+      "y": 157.48,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -3790,7 +3839,7 @@
       "lcsc": "",
       "element14": "",
       "x": 241.3,
-      "y": 157.48,
+      "y": 172.72,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -3825,7 +3874,7 @@
       "lcsc": "",
       "element14": "",
       "x": 241.3,
-      "y": 172.72,
+      "y": 186.69,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -3860,7 +3909,7 @@
       "lcsc": "",
       "element14": "",
       "x": 241.3,
-      "y": 186.69,
+      "y": 200.66,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -3895,7 +3944,7 @@
       "lcsc": "",
       "element14": "",
       "x": 241.3,
-      "y": 200.66,
+      "y": 215.9,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -3930,7 +3979,7 @@
       "lcsc": "",
       "element14": "",
       "x": 241.3,
-      "y": 215.9,
+      "y": 229.87,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -3965,7 +4014,7 @@
       "lcsc": "",
       "element14": "",
       "x": 241.3,
-      "y": 229.87,
+      "y": 245.11,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -3996,7 +4045,7 @@
       "lcsc": "",
       "element14": "",
       "x": 241.3,
-      "y": 245.11,
+      "y": 259.08,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4026,8 +4075,8 @@
       "mouser": "",
       "lcsc": "",
       "element14": "",
-      "x": 241.3,
-      "y": 259.08,
+      "x": 316.23,
+      "y": 40.64,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4058,7 +4107,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 40.64,
+      "y": 55.88,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4091,7 +4140,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 55.88,
+      "y": 69.85,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4124,7 +4173,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 69.85,
+      "y": 85.09,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4158,7 +4207,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 85.09,
+      "y": 99.06,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4192,7 +4241,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 99.06,
+      "y": 114.3,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4227,7 +4276,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 114.3,
+      "y": 128.27,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4262,7 +4311,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 128.27,
+      "y": 143.51,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4297,7 +4346,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 143.51,
+      "y": 157.48,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4332,7 +4381,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 157.48,
+      "y": 172.72,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4367,7 +4416,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 172.72,
+      "y": 186.69,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4402,7 +4451,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 186.69,
+      "y": 200.66,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4437,7 +4486,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 200.66,
+      "y": 215.9,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4472,7 +4521,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 215.9,
+      "y": 229.87,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4507,7 +4556,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 229.87,
+      "y": 245.11,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4540,7 +4589,7 @@
       "lcsc": "",
       "element14": "",
       "x": 316.23,
-      "y": 245.11,
+      "y": 259.08,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4572,8 +4621,8 @@
       "mouser": "",
       "lcsc": "",
       "element14": "",
-      "x": 316.23,
-      "y": 259.08,
+      "x": 391.16,
+      "y": 40.64,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4606,7 +4655,7 @@
       "lcsc": "",
       "element14": "",
       "x": 391.16,
-      "y": 40.64,
+      "y": 55.88,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4639,7 +4688,7 @@
       "lcsc": "",
       "element14": "",
       "x": 391.16,
-      "y": 55.88,
+      "y": 69.85,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4672,7 +4721,7 @@
       "lcsc": "",
       "element14": "",
       "x": 391.16,
-      "y": 69.85,
+      "y": 85.09,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -4705,7 +4754,7 @@
       "lcsc": "",
       "element14": "",
       "x": 391.16,
-      "y": 85.09,
+      "y": 99.06,
       "angle": 0.0,
       "mirror_x": false,
       "mirror_y": false,
@@ -5417,6 +5466,12 @@
           "pin_type": "passive"
         },
         {
+          "component": "C27",
+          "pin_number": "2",
+          "pin_name": "B",
+          "pin_type": "passive"
+        },
+        {
           "component": "C3",
           "pin_number": "2",
           "pin_name": "B",
@@ -5501,7 +5556,7 @@
           "pin_type": "power_out"
         }
       ],
-      "point_count": 86,
+      "point_count": 88,
       "no_connect": false,
       "has_pwr_flag": false,
       "labels": [
@@ -5709,6 +5764,12 @@
           "pin_type": "passive"
         },
         {
+          "component": "C27",
+          "pin_number": "1",
+          "pin_name": "A",
+          "pin_type": "passive"
+        },
+        {
           "component": "JP2",
           "pin_number": "2",
           "pin_name": "B",
@@ -5727,7 +5788,7 @@
           "pin_type": "power_out"
         }
       ],
-      "point_count": 28,
+      "point_count": 30,
       "no_connect": false,
       "has_pwr_flag": false,
       "labels": [
@@ -7453,6 +7514,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -7781,6 +7849,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -8104,6 +8179,13 @@
             {
               "ref": "C26",
               "value": "27nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
+              "ref": "C27",
+              "value": "100nF",
               "type": "capacitor",
               "pin": "2",
               "pin_name": "B"
@@ -8456,6 +8538,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -8740,6 +8829,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -9019,6 +9115,13 @@
             {
               "ref": "C26",
               "value": "27nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
+              "ref": "C27",
+              "value": "100nF",
               "type": "capacitor",
               "pin": "2",
               "pin_name": "B"
@@ -9365,6 +9468,13 @@
               "pin_name": "A"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "1",
+              "pin_name": "A"
+            },
+            {
               "ref": "JP2",
               "value": "JP_1V0_LINK",
               "type": "jumper",
@@ -9399,6 +9509,10 @@
             },
             {
               "ref": "C16",
+              "value": "100nF"
+            },
+            {
+              "ref": "C27",
               "value": "100nF"
             }
           ]
@@ -9505,6 +9619,13 @@
               "pin_name": "A"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "1",
+              "pin_name": "A"
+            },
+            {
               "ref": "JP2",
               "value": "JP_1V0_LINK",
               "type": "jumper",
@@ -9539,6 +9660,10 @@
             },
             {
               "ref": "C16",
+              "value": "100nF"
+            },
+            {
+              "ref": "C27",
               "value": "100nF"
             }
           ]
@@ -9735,6 +9860,13 @@
               "pin_name": "A"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "1",
+              "pin_name": "A"
+            },
+            {
               "ref": "JP2",
               "value": "JP_1V0_LINK",
               "type": "jumper",
@@ -9769,6 +9901,10 @@
             },
             {
               "ref": "C16",
+              "value": "100nF"
+            },
+            {
+              "ref": "C27",
               "value": "100nF"
             }
           ]
@@ -9917,6 +10053,13 @@
               "pin_name": "A"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "1",
+              "pin_name": "A"
+            },
+            {
               "ref": "JP2",
               "value": "JP_1V0_LINK",
               "type": "jumper",
@@ -9951,6 +10094,10 @@
             },
             {
               "ref": "C16",
+              "value": "100nF"
+            },
+            {
+              "ref": "C27",
               "value": "100nF"
             }
           ]
@@ -10392,6 +10539,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -10861,6 +11015,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -11125,6 +11286,13 @@
               "pin_name": "A"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "1",
+              "pin_name": "A"
+            },
+            {
               "ref": "JP2",
               "value": "JP_1V0_LINK",
               "type": "jumper",
@@ -11159,6 +11327,10 @@
             },
             {
               "ref": "C16",
+              "value": "100nF"
+            },
+            {
+              "ref": "C27",
               "value": "100nF"
             }
           ]
@@ -11250,6 +11422,13 @@
               "pin_name": "A"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "1",
+              "pin_name": "A"
+            },
+            {
               "ref": "JP2",
               "value": "JP_1V0_LINK",
               "type": "jumper",
@@ -11284,6 +11463,10 @@
             },
             {
               "ref": "C16",
+              "value": "100nF"
+            },
+            {
+              "ref": "C27",
               "value": "100nF"
             }
           ]
@@ -11680,6 +11863,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -11819,6 +12009,13 @@
               "pin_name": "A"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "1",
+              "pin_name": "A"
+            },
+            {
               "ref": "JP2",
               "value": "JP_1V0_LINK",
               "type": "jumper",
@@ -11853,6 +12050,10 @@
             },
             {
               "ref": "C16",
+              "value": "100nF"
+            },
+            {
+              "ref": "C27",
               "value": "100nF"
             }
           ]
@@ -11899,6 +12100,13 @@
               "pin_name": "A"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "1",
+              "pin_name": "A"
+            },
+            {
               "ref": "JP2",
               "value": "JP_1V0_LINK",
               "type": "jumper",
@@ -11933,6 +12141,10 @@
             },
             {
               "ref": "C16",
+              "value": "100nF"
+            },
+            {
+              "ref": "C27",
               "value": "100nF"
             }
           ]
@@ -12069,6 +12281,13 @@
               "pin_name": "A"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "1",
+              "pin_name": "A"
+            },
+            {
               "ref": "JP2",
               "value": "JP_1V0_LINK",
               "type": "jumper",
@@ -12103,6 +12322,10 @@
             },
             {
               "ref": "C16",
+              "value": "100nF"
+            },
+            {
+              "ref": "C27",
               "value": "100nF"
             }
           ]
@@ -12149,6 +12372,13 @@
               "pin_name": "A"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "1",
+              "pin_name": "A"
+            },
+            {
               "ref": "JP2",
               "value": "JP_1V0_LINK",
               "type": "jumper",
@@ -12183,6 +12413,10 @@
             },
             {
               "ref": "C16",
+              "value": "100nF"
+            },
+            {
+              "ref": "C27",
               "value": "100nF"
             }
           ]
@@ -12617,6 +12851,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -13086,6 +13327,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -13313,6 +13561,13 @@
               "pin_name": "A"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "1",
+              "pin_name": "A"
+            },
+            {
               "ref": "JP2",
               "value": "JP_1V0_LINK",
               "type": "jumper",
@@ -13347,6 +13602,10 @@
             },
             {
               "ref": "C16",
+              "value": "100nF"
+            },
+            {
+              "ref": "C27",
               "value": "100nF"
             }
           ]
@@ -13393,6 +13652,13 @@
               "pin_name": "A"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "1",
+              "pin_name": "A"
+            },
+            {
               "ref": "JP2",
               "value": "JP_1V0_LINK",
               "type": "jumper",
@@ -13427,6 +13693,10 @@
             },
             {
               "ref": "C16",
+              "value": "100nF"
+            },
+            {
+              "ref": "C27",
               "value": "100nF"
             }
           ]
@@ -13795,6 +14065,13 @@
             {
               "ref": "C26",
               "value": "27nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
+              "ref": "C27",
+              "value": "100nF",
               "type": "capacitor",
               "pin": "2",
               "pin_name": "B"
@@ -14283,6 +14560,10 @@
           {
             "ref": "C16",
             "value": "100nF"
+          },
+          {
+            "ref": "C27",
+            "value": "100nF"
           }
         ],
         "+3V3": [
@@ -14627,6 +14908,13 @@
             {
               "ref": "C26",
               "value": "27nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
+              "ref": "C27",
+              "value": "100nF",
               "type": "capacitor",
               "pin": "2",
               "pin_name": "B"
@@ -15140,6 +15428,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -15608,6 +15903,13 @@
             {
               "ref": "C26",
               "value": "27nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
+              "ref": "C27",
+              "value": "100nF",
               "type": "capacitor",
               "pin": "2",
               "pin_name": "B"
@@ -16123,6 +16425,13 @@
             {
               "ref": "C26",
               "value": "27nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
+              "ref": "C27",
+              "value": "100nF",
               "type": "capacitor",
               "pin": "2",
               "pin_name": "B"
@@ -16742,6 +17051,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -17260,6 +17576,13 @@
             {
               "ref": "C26",
               "value": "27nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
+              "ref": "C27",
+              "value": "100nF",
               "type": "capacitor",
               "pin": "2",
               "pin_name": "B"
@@ -17796,6 +18119,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -18164,6 +18494,13 @@
             {
               "ref": "C26",
               "value": "27nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
+              "ref": "C27",
+              "value": "100nF",
               "type": "capacitor",
               "pin": "2",
               "pin_name": "B"
@@ -18601,6 +18938,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -19023,6 +19367,13 @@
             {
               "ref": "C26",
               "value": "27nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
+              "ref": "C27",
+              "value": "100nF",
               "type": "capacitor",
               "pin": "2",
               "pin_name": "B"
@@ -19518,6 +19869,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -19831,6 +20189,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -20124,6 +20489,13 @@
               "pin_name": "B"
             },
             {
+              "ref": "C27",
+              "value": "100nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
               "ref": "C3",
               "value": "10uF",
               "type": "capacitor",
@@ -20410,6 +20782,13 @@
             {
               "ref": "C26",
               "value": "27nF",
+              "type": "capacitor",
+              "pin": "2",
+              "pin_name": "B"
+            },
+            {
+              "ref": "C27",
+              "value": "100nF",
               "type": "capacitor",
               "pin": "2",
               "pin_name": "B"
@@ -21045,7 +21424,7 @@
         ]
       },
       "GND": {
-        "pin_count": 42,
+        "pin_count": 43,
         "components": [
           "C1",
           "C10",
@@ -21063,6 +21442,7 @@
           "C21",
           "C25",
           "C26",
+          "C27",
           "C3",
           "C4",
           "C5",
@@ -21087,13 +21467,14 @@
         ]
       },
       "+1V0": {
-        "pin_count": 13,
+        "pin_count": 14,
         "components": [
           "C12",
           "C13",
           "C14",
           "C15",
           "C16",
+          "C27",
           "JP2",
           "TP5",
           "U3"
@@ -22204,7 +22585,7 @@
       "_sheet": 0
     },
     {
-      "name": "+5V_SW",
+      "name": "+1V0",
       "type": "label",
       "x": 233.68,
       "y": 128.27,
@@ -22216,6 +22597,22 @@
       "type": "label",
       "x": 248.92,
       "y": 128.27,
+      "angle": 0.0,
+      "_sheet": 0
+    },
+    {
+      "name": "+5V_SW",
+      "type": "label",
+      "x": 233.68,
+      "y": 143.51,
+      "angle": 0.0,
+      "_sheet": 0
+    },
+    {
+      "name": "GND",
+      "type": "label",
+      "x": 248.92,
+      "y": 143.51,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22223,7 +22620,7 @@
       "name": "+1V0_REG",
       "type": "label",
       "x": 233.68,
-      "y": 143.51,
+      "y": 157.48,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22231,7 +22628,7 @@
       "name": "GND",
       "type": "label",
       "x": 248.92,
-      "y": 143.51,
+      "y": 157.48,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22239,7 +22636,7 @@
       "name": "+5V_SW",
       "type": "label",
       "x": 233.68,
-      "y": 157.48,
+      "y": 172.72,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22247,7 +22644,7 @@
       "name": "GND",
       "type": "label",
       "x": 248.92,
-      "y": 157.48,
+      "y": 172.72,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22255,7 +22652,7 @@
       "name": "+3V3_REG",
       "type": "label",
       "x": 233.68,
-      "y": 172.72,
+      "y": 186.69,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22263,7 +22660,7 @@
       "name": "GND",
       "type": "label",
       "x": 248.92,
-      "y": 172.72,
+      "y": 186.69,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22271,7 +22668,7 @@
       "name": "+3V3",
       "type": "label",
       "x": 233.68,
-      "y": 186.69,
+      "y": 200.66,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22279,7 +22676,7 @@
       "name": "GND",
       "type": "label",
       "x": 248.92,
-      "y": 186.69,
+      "y": 200.66,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22287,7 +22684,7 @@
       "name": "AVDD33_LDO",
       "type": "label",
       "x": 233.68,
-      "y": 200.66,
+      "y": 215.9,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22295,7 +22692,7 @@
       "name": "GND",
       "type": "label",
       "x": 248.92,
-      "y": 200.66,
+      "y": 215.9,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22303,7 +22700,7 @@
       "name": "+3V3",
       "type": "label",
       "x": 233.68,
-      "y": 215.9,
+      "y": 229.87,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22311,15 +22708,7 @@
       "name": "GND",
       "type": "label",
       "x": 248.92,
-      "y": 215.9,
-      "angle": 0.0,
-      "_sheet": 0
-    },
-    {
-      "name": "GND",
-      "type": "label",
-      "x": 308.61,
-      "y": 40.64,
+      "y": 229.87,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22332,10 +22721,18 @@
       "_sheet": 0
     },
     {
-      "name": "+3V3_REG",
+      "name": "GND",
       "type": "label",
       "x": 308.61,
       "y": 69.85,
+      "angle": 0.0,
+      "_sheet": 0
+    },
+    {
+      "name": "+3V3_REG",
+      "type": "label",
+      "x": 308.61,
+      "y": 85.09,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22343,7 +22740,7 @@
       "name": "+3V3",
       "type": "label",
       "x": 323.85,
-      "y": 69.85,
+      "y": 85.09,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22351,7 +22748,7 @@
       "name": "+1V0_REG",
       "type": "label",
       "x": 308.61,
-      "y": 85.09,
+      "y": 99.06,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22359,7 +22756,7 @@
       "name": "+1V0",
       "type": "label",
       "x": 323.85,
-      "y": 85.09,
+      "y": 99.06,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22367,7 +22764,7 @@
       "name": "SW_1V0",
       "type": "label",
       "x": 308.61,
-      "y": 99.06,
+      "y": 114.3,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22375,7 +22772,7 @@
       "name": "+1V0_REG",
       "type": "label",
       "x": 323.85,
-      "y": 99.06,
+      "y": 114.3,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22383,7 +22780,7 @@
       "name": "RSET",
       "type": "label",
       "x": 308.61,
-      "y": 114.3,
+      "y": 128.27,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22391,7 +22788,7 @@
       "name": "GND",
       "type": "label",
       "x": 323.85,
-      "y": 114.3,
+      "y": 128.27,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22399,7 +22796,7 @@
       "name": "+3V3",
       "type": "label",
       "x": 308.61,
-      "y": 128.27,
+      "y": 143.51,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22407,7 +22804,7 @@
       "name": "AVDD33_LDO",
       "type": "label",
       "x": 323.85,
-      "y": 128.27,
+      "y": 143.51,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22415,7 +22812,7 @@
       "name": "SHIELD",
       "type": "label",
       "x": 308.61,
-      "y": 143.51,
+      "y": 157.48,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22423,7 +22820,7 @@
       "name": "GND",
       "type": "label",
       "x": 323.85,
-      "y": 143.51,
+      "y": 157.48,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22431,7 +22828,7 @@
       "name": "XTAL2",
       "type": "label",
       "x": 308.61,
-      "y": 157.48,
+      "y": 172.72,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22439,7 +22836,7 @@
       "name": "XTAL2_Y1",
       "type": "label",
       "x": 323.85,
-      "y": 157.48,
+      "y": 172.72,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22447,7 +22844,7 @@
       "name": "+1V0_REG",
       "type": "label",
       "x": 308.61,
-      "y": 172.72,
+      "y": 186.69,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22455,7 +22852,7 @@
       "name": "FB_1V0",
       "type": "label",
       "x": 323.85,
-      "y": 172.72,
+      "y": 186.69,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22463,7 +22860,7 @@
       "name": "FB_1V0",
       "type": "label",
       "x": 308.61,
-      "y": 186.69,
+      "y": 200.66,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22471,7 +22868,7 @@
       "name": "GND",
       "type": "label",
       "x": 323.85,
-      "y": 186.69,
+      "y": 200.66,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22479,7 +22876,7 @@
       "name": "+3V3",
       "type": "label",
       "x": 308.61,
-      "y": 200.66,
+      "y": 215.9,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22487,28 +22884,12 @@
       "name": "LED_Y_A",
       "type": "label",
       "x": 323.85,
-      "y": 200.66,
+      "y": 215.9,
       "angle": 0.0,
       "_sheet": 0
     },
     {
       "name": "+3V3",
-      "type": "label",
-      "x": 308.61,
-      "y": 215.9,
-      "angle": 0.0,
-      "_sheet": 0
-    },
-    {
-      "name": "LED_G_A",
-      "type": "label",
-      "x": 323.85,
-      "y": 215.9,
-      "angle": 0.0,
-      "_sheet": 0
-    },
-    {
-      "name": "GND",
       "type": "label",
       "x": 308.61,
       "y": 229.87,
@@ -22516,7 +22897,15 @@
       "_sheet": 0
     },
     {
-      "name": "+5V",
+      "name": "LED_G_A",
+      "type": "label",
+      "x": 323.85,
+      "y": 229.87,
+      "angle": 0.0,
+      "_sheet": 0
+    },
+    {
+      "name": "GND",
       "type": "label",
       "x": 308.61,
       "y": 245.11,
@@ -22524,7 +22913,7 @@
       "_sheet": 0
     },
     {
-      "name": "+5V_SW",
+      "name": "+5V",
       "type": "label",
       "x": 308.61,
       "y": 259.08,
@@ -22532,7 +22921,7 @@
       "_sheet": 0
     },
     {
-      "name": "+3V3",
+      "name": "+5V_SW",
       "type": "label",
       "x": 383.54,
       "y": 40.64,
@@ -22540,7 +22929,7 @@
       "_sheet": 0
     },
     {
-      "name": "+1V0",
+      "name": "+3V3",
       "type": "label",
       "x": 383.54,
       "y": 55.88,
@@ -22548,7 +22937,7 @@
       "_sheet": 0
     },
     {
-      "name": "AVDD33_LDO",
+      "name": "+1V0",
       "type": "label",
       "x": 383.54,
       "y": 69.85,
@@ -22556,10 +22945,18 @@
       "_sheet": 0
     },
     {
-      "name": "DVDD10_UPS",
+      "name": "AVDD33_LDO",
       "type": "label",
       "x": 383.54,
       "y": 85.09,
+      "angle": 0.0,
+      "_sheet": 0
+    },
+    {
+      "name": "DVDD10_UPS",
+      "type": "label",
+      "x": 383.54,
+      "y": 99.06,
       "angle": 0.0,
       "_sheet": 0
     },
@@ -22651,8 +23048,8 @@
   "pwr_flag_warnings": [],
   "footprint_filter_warnings": [],
   "sourcing_audit": {
-    "total_bom_components": 42,
-    "mpn_coverage": "42/42",
+    "total_bom_components": 43,
+    "mpn_coverage": "43/43",
     "missing_digikey": [
       "C1",
       "C10",
@@ -22672,6 +23069,7 @@
       "C23",
       "C25",
       "C26",
+      "C27",
       "C3",
       "C4",
       "C5",
@@ -22716,6 +23114,7 @@
       "C23",
       "C25",
       "C26",
+      "C27",
       "C3",
       "C4",
       "C5",
@@ -22747,7 +23146,7 @@
     "ground_nets": {
       "GND": {
         "domain": "signal",
-        "connections": 42,
+        "connections": 43,
         "components": [
           "C1",
           "C10",
@@ -22765,6 +23164,7 @@
           "C21",
           "C25",
           "C26",
+          "C27",
           "C3",
           "C4",
           "C5",
@@ -22809,13 +23209,13 @@
     ]
   },
   "wire_geometry": {
-    "total_wires": 179,
-    "total_length_mm": 454.7,
+    "total_wires": 181,
+    "total_length_mm": 459.7,
     "avg_length_mm": 2.5
   },
   "simulation_readiness": {
-    "total_components": 46,
-    "likely_simulatable": 35,
+    "total_components": 47,
+    "likely_simulatable": 36,
     "needs_model": 11,
     "components_without_model": [
       "J2",
@@ -22830,7 +23230,7 @@
       "U9",
       "Y1"
     ],
-    "simulatable_percent": 76.1
+    "simulatable_percent": 76.6
   },
   "property_issues": {},
   "placement_analysis": {
@@ -22885,19 +23285,20 @@
         "region": "row0_col3",
         "component_count": 8,
         "types": {
+          "fiducial": 1,
           "mounting_hole": 2,
-          "jumper": 2,
+          "jumper": 1,
           "test_point": 4
         },
         "references": [
+          "FID3",
           "H1",
           "H2",
           "JP1",
-          "JP2",
+          "TP3",
           "TP4",
           "TP5",
-          "TP6",
-          "TP7"
+          "TP6"
         ]
       },
       {
@@ -22932,22 +23333,25 @@
         "references": [
           "C25",
           "C26",
-          "C3",
-          "C4"
+          "C27",
+          "C3"
         ]
       },
       {
         "region": "row1_col3",
-        "component_count": 4,
+        "component_count": 5,
         "types": {
+          "jumper": 1,
           "inductor": 1,
-          "resistor": 3
+          "resistor": 2,
+          "test_point": 1
         },
         "references": [
+          "JP2",
           "L2",
           "R11",
           "R12",
-          "R13"
+          "TP7"
         ]
       },
       {
@@ -22981,10 +23385,10 @@
           "capacitor": 4
         },
         "references": [
+          "C4",
           "C5",
           "C6",
-          "C7",
-          "C8"
+          "C7"
         ]
       },
       {
@@ -22994,10 +23398,10 @@
           "resistor": 4
         },
         "references": [
+          "R13",
           "R14",
           "R5",
-          "R6",
-          "R7"
+          "R6"
         ]
       },
       {
@@ -23028,28 +23432,28 @@
         "region": "row3_col2",
         "component_count": 4,
         "types": {
-          "capacitor": 1,
-          "fiducial": 3
+          "capacitor": 2,
+          "fiducial": 2
         },
         "references": [
+          "C8",
           "C9",
           "FID1",
-          "FID2",
-          "FID3"
+          "FID2"
         ]
       },
       {
         "region": "row3_col3",
         "component_count": 4,
         "types": {
-          "resistor": 1,
-          "test_point": 3
+          "resistor": 2,
+          "test_point": 2
         },
         "references": [
+          "R7",
           "R8",
           "TP1",
-          "TP2",
-          "TP3"
+          "TP2"
         ]
       }
     ],
@@ -23547,320 +23951,331 @@
             "srf_hz": 22507908,
             "srf_formatted": "22.51 MHz",
             "type": "MLCC"
+          },
+          {
+            "ref": "C27",
+            "value": "100nF",
+            "farads": 1.0000000000000001e-07,
+            "package": "0402",
+            "esr_ohm": 0.9487,
+            "esl_nH": 0.5,
+            "srf_hz": 22507908,
+            "srf_formatted": "22.51 MHz",
+            "type": "MLCC"
           }
         ],
-        "cap_count": 5,
-        "total_capacitance_uF": 0.5,
+        "cap_count": 6,
+        "total_capacitance_uF": 0.6,
         "impedance_profile": [
           {
             "freq_hz": 1000,
             "freq_formatted": "1.00 kHz",
-            "impedance_ohm": 318.309942
+            "impedance_ohm": 265.258285
           },
           {
             "freq_hz": 1259,
             "freq_formatted": "1.26 kHz",
-            "impedance_ohm": 252.8426
+            "impedance_ohm": 210.702167
           },
           {
             "freq_hz": 1585,
             "freq_formatted": "1.58 kHz",
-            "impedance_ohm": 200.840049
+            "impedance_ohm": 167.366708
           },
           {
             "freq_hz": 1995,
             "freq_formatted": "2.00 kHz",
-            "impedance_ohm": 159.532963
+            "impedance_ohm": 132.944136
           },
           {
             "freq_hz": 2512,
             "freq_formatted": "2.51 kHz",
-            "impedance_ohm": 126.721589
+            "impedance_ohm": 105.601324
           },
           {
             "freq_hz": 3162,
             "freq_formatted": "3.16 kHz",
-            "impedance_ohm": 100.658601
+            "impedance_ohm": 83.882168
           },
           {
             "freq_hz": 3981,
             "freq_formatted": "3.98 kHz",
-            "impedance_ohm": 79.956051
+            "impedance_ohm": 66.630043
           },
           {
             "freq_hz": 5012,
             "freq_formatted": "5.01 kHz",
-            "impedance_ohm": 63.511452
+            "impedance_ohm": 52.92621
           },
           {
             "freq_hz": 6310,
             "freq_formatted": "6.31 kHz",
-            "impedance_ohm": 50.44907
+            "impedance_ohm": 42.040892
           },
           {
             "freq_hz": 7943,
             "freq_formatted": "7.94 kHz",
-            "impedance_ohm": 40.073285
+            "impedance_ohm": 33.394404
           },
           {
             "freq_hz": 10000,
             "freq_formatted": "10.00 kHz",
-            "impedance_ohm": 31.831548
+            "impedance_ohm": 26.52629
           },
           {
             "freq_hz": 12589,
             "freq_formatted": "12.59 kHz",
-            "impedance_ohm": 25.284957
+            "impedance_ohm": 21.070798
           },
           {
             "freq_hz": 15849,
             "freq_formatted": "15.85 kHz",
-            "impedance_ohm": 20.084882
+            "impedance_ohm": 16.737402
           },
           {
             "freq_hz": 19953,
             "freq_formatted": "19.95 kHz",
-            "impedance_ohm": 15.954401
+            "impedance_ohm": 13.295334
           },
           {
             "freq_hz": 25119,
             "freq_formatted": "25.12 kHz",
-            "impedance_ohm": 12.673549
+            "impedance_ohm": 10.561291
           },
           {
             "freq_hz": 31623,
             "freq_formatted": "31.62 kHz",
-            "impedance_ohm": 10.067611
+            "impedance_ohm": 8.389676
           },
           {
             "freq_hz": 39811,
             "freq_formatted": "39.81 kHz",
-            "impedance_ohm": 7.997809
+            "impedance_ohm": 6.664841
           },
           {
             "freq_hz": 50119,
             "freq_formatted": "50.12 kHz",
-            "impedance_ohm": 6.353919
+            "impedance_ohm": 5.294933
           },
           {
             "freq_hz": 63096,
             "freq_formatted": "63.10 kHz",
-            "impedance_ohm": 5.048399
+            "impedance_ohm": 4.206999
           },
           {
             "freq_hz": 79433,
             "freq_formatted": "79.43 kHz",
-            "impedance_ohm": 4.011724
+            "impedance_ohm": 3.343103
           },
           {
             "freq_hz": 100000,
             "freq_formatted": "100.00 kHz",
-            "impedance_ohm": 3.188686
+            "impedance_ohm": 2.657238
           },
           {
             "freq_hz": 125893,
             "freq_formatted": "125.89 kHz",
-            "impedance_ohm": 2.535456
+            "impedance_ohm": 2.11288
           },
           {
             "freq_hz": 158489,
             "freq_formatted": "158.49 kHz",
-            "impedance_ohm": 2.017243
+            "impedance_ohm": 1.681036
           },
           {
             "freq_hz": 199526,
             "freq_formatted": "199.53 kHz",
-            "impedance_ohm": 1.606448
+            "impedance_ohm": 1.338706
           },
           {
             "freq_hz": 251189,
             "freq_formatted": "251.19 kHz",
-            "impedance_ohm": 1.281185
+            "impedance_ohm": 1.067654
           },
           {
             "freq_hz": 316228,
             "freq_formatted": "316.23 kHz",
-            "impedance_ohm": 1.024116
+            "impedance_ohm": 0.85343
           },
           {
             "freq_hz": 398107,
             "freq_formatted": "398.11 kHz",
-            "impedance_ohm": 0.82152
+            "impedance_ohm": 0.6846
           },
           {
             "freq_hz": 501187,
             "freq_formatted": "501.19 kHz",
-            "impedance_ohm": 0.662547
+            "impedance_ohm": 0.552122
           },
           {
             "freq_hz": 630957,
             "freq_formatted": "630.96 kHz",
-            "impedance_ohm": 0.538617
+            "impedance_ohm": 0.448848
           },
           {
             "freq_hz": 794328,
             "freq_formatted": "794.33 kHz",
-            "impedance_ohm": 0.442928
+            "impedance_ohm": 0.369106
           },
           {
             "freq_hz": 1000000,
             "freq_formatted": "1.00 MHz",
-            "impedance_ohm": 0.370031
+            "impedance_ohm": 0.308359
           },
           {
             "freq_hz": 1258925,
             "freq_formatted": "1.26 MHz",
-            "impedance_ohm": 0.315486
+            "impedance_ohm": 0.262905
           },
           {
             "freq_hz": 1584893,
             "freq_formatted": "1.58 MHz",
-            "impedance_ohm": 0.27557
+            "impedance_ohm": 0.229642
           },
           {
             "freq_hz": 1995262,
             "freq_formatted": "2.00 MHz",
-            "impedance_ohm": 0.24709
+            "impedance_ohm": 0.205909
           },
           {
             "freq_hz": 2511886,
             "freq_formatted": "2.51 MHz",
-            "impedance_ohm": 0.227293
+            "impedance_ohm": 0.189411
           },
           {
             "freq_hz": 3162278,
             "freq_formatted": "3.16 MHz",
-            "impedance_ohm": 0.213863
+            "impedance_ohm": 0.178219
           },
           {
             "freq_hz": 3981072,
             "freq_formatted": "3.98 MHz",
-            "impedance_ohm": 0.20494
+            "impedance_ohm": 0.170783
           },
           {
             "freq_hz": 5011872,
             "freq_formatted": "5.01 MHz",
-            "impedance_ohm": 0.19911
+            "impedance_ohm": 0.165925
           },
           {
             "freq_hz": 6309573,
             "freq_formatted": "6.31 MHz",
-            "impedance_ohm": 0.195351
+            "impedance_ohm": 0.162793
           },
           {
             "freq_hz": 7943282,
             "freq_formatted": "7.94 MHz",
-            "impedance_ohm": 0.192956
+            "impedance_ohm": 0.160797
           },
           {
             "freq_hz": 10000000,
             "freq_formatted": "10.00 MHz",
-            "impedance_ohm": 0.191452
+            "impedance_ohm": 0.159544
           },
           {
             "freq_hz": 12589254,
             "freq_formatted": "12.59 MHz",
-            "impedance_ohm": 0.190534
+            "impedance_ohm": 0.158778
           },
           {
             "freq_hz": 15848932,
             "freq_formatted": "15.85 MHz",
-            "impedance_ohm": 0.19001
+            "impedance_ohm": 0.158342
           },
           {
             "freq_hz": 19952623,
             "freq_formatted": "19.95 MHz",
-            "impedance_ohm": 0.189771
+            "impedance_ohm": 0.158142
           },
           {
             "freq_hz": 25118864,
             "freq_formatted": "25.12 MHz",
-            "impedance_ohm": 0.189765
+            "impedance_ohm": 0.158138
           },
           {
             "freq_hz": 31622777,
             "freq_formatted": "31.62 MHz",
-            "impedance_ohm": 0.189993
+            "impedance_ohm": 0.158328
           },
           {
             "freq_hz": 39810717,
             "freq_formatted": "39.81 MHz",
-            "impedance_ohm": 0.190502
+            "impedance_ohm": 0.158751
           },
           {
             "freq_hz": 50118723,
             "freq_formatted": "50.12 MHz",
-            "impedance_ohm": 0.191398
+            "impedance_ohm": 0.159498
           },
           {
             "freq_hz": 63095734,
             "freq_formatted": "63.10 MHz",
-            "impedance_ohm": 0.192869
+            "impedance_ohm": 0.160724
           },
           {
             "freq_hz": 79432823,
             "freq_formatted": "79.43 MHz",
-            "impedance_ohm": 0.195213
+            "impedance_ohm": 0.162678
           },
           {
             "freq_hz": 100000000,
             "freq_formatted": "100.00 MHz",
-            "impedance_ohm": 0.198895
+            "impedance_ohm": 0.165746
           },
           {
             "freq_hz": 125892541,
             "freq_formatted": "125.89 MHz",
-            "impedance_ohm": 0.204608
+            "impedance_ohm": 0.170507
           },
           {
             "freq_hz": 158489319,
             "freq_formatted": "158.49 MHz",
-            "impedance_ohm": 0.213358
+            "impedance_ohm": 0.177799
           },
           {
             "freq_hz": 199526231,
             "freq_formatted": "199.53 MHz",
-            "impedance_ohm": 0.22654
+            "impedance_ohm": 0.188783
           },
           {
             "freq_hz": 251188643,
             "freq_formatted": "251.19 MHz",
-            "impedance_ohm": 0.245992
+            "impedance_ohm": 0.204993
           },
           {
             "freq_hz": 316227766,
             "freq_formatted": "316.23 MHz",
-            "impedance_ohm": 0.274009
+            "impedance_ohm": 0.22834
           },
           {
             "freq_hz": 398107171,
             "freq_formatted": "398.11 MHz",
-            "impedance_ohm": 0.313322
+            "impedance_ohm": 0.261102
           },
           {
             "freq_hz": 501187234,
             "freq_formatted": "501.19 MHz",
-            "impedance_ohm": 0.367106
+            "impedance_ohm": 0.305922
           },
           {
             "freq_hz": 630957344,
             "freq_formatted": "630.96 MHz",
-            "impedance_ohm": 0.439053
+            "impedance_ohm": 0.365878
           },
           {
             "freq_hz": 794328235,
             "freq_formatted": "794.33 MHz",
-            "impedance_ohm": 0.533567
+            "impedance_ohm": 0.444639
           },
           {
             "freq_hz": 1000000000,
             "freq_formatted": "1.00 GHz",
-            "impedance_ohm": 0.656038
+            "impedance_ohm": 0.546698
           }
         ],
         "min_impedance": {
           "freq_formatted": "25.12 MHz",
-          "impedance_ohm": 0.189765
+          "impedance_ohm": 0.158138
         }
       },
       "+3V3": {
@@ -25501,7 +25916,7 @@
         "suggestion": "Capacitor value '100nF' used with 2 different footprints \u2014 consider standardizing",
         "value": "100nF",
         "footprint_breakdown": {
-          "Capacitor_SMD:C_0402_1005Metric": 13,
+          "Capacitor_SMD:C_0402_1005Metric": 14,
           "Capacitor_SMD:C_0603_1608Metric": 2
         }
       },
@@ -25631,18 +26046,18 @@
     ]
   },
   "assembly_complexity": {
-    "total_components": 58,
-    "smd_count": 58,
+    "total_components": 59,
+    "smd_count": 59,
     "tht_count": 0,
     "complexity_score": 48,
     "difficulty_breakdown": {
-      "hard": 17,
+      "hard": 18,
       "medium": 33,
       "easy": 8
     },
     "package_breakdown": {
       "other_SMD": 17,
-      "0402": 16,
+      "0402": 17,
       "0603": 14,
       "SOT-23": 5,
       "1206": 2,
@@ -25653,7 +26068,7 @@
     "unique_footprints": 8,
     "observations": [
       "Moderate assembly complexity (score 48/100)",
-      "17 hard-to-solder component(s) (0201/0402/BGA/QFN)"
+      "18 hard-to-solder component(s) (0201/0402/BGA/QFN)"
     ]
   },
   "usb_compliance": {
@@ -25777,6 +26192,7 @@
       "C23",
       "C25",
       "C26",
+      "C27",
       "C3",
       "C4",
       "C5",
@@ -25804,8 +26220,8 @@
     ]
   },
   "bom_lock": {
-    "total_bom_components": 42,
-    "components_with_mpn": 42,
+    "total_bom_components": 43,
+    "components_with_mpn": 43,
     "missing_mpn": [],
     "missing_mpn_count": 0,
     "generic_values": [],
@@ -25817,9 +26233,9 @@
       "hardware/kicad/raccoon-tap.kicad_sch"
     ],
     "source_hashes": {
-      "hardware/kicad/raccoon-tap.kicad_sch": "344164db00edf4910d6972afe34defc89f81067478801e28a34b6adfbe9f0720"
+      "hardware/kicad/raccoon-tap.kicad_sch": "1a05a336e41eed85213eccd75a8c79f16cbdf1d4915e4478cecb11761f0864ef"
     },
-    "run_id": "20261102T170237Z-f63cc7",
+    "run_id": "20261103T081736Z-28407d",
     "config_hash": null,
     "upstream_artifacts": {}
   },
@@ -26146,6 +26562,6 @@
   },
   "capability_mode_ref": {
     "source": "analysis/capability_mode.json",
-    "run_id": "20261102T170237Z-f63cc7"
+    "run_id": "20261103T081736Z-28407d"
   }
 }

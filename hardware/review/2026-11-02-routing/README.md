@@ -14,5 +14,14 @@ Ruling BA (2026-11-03): `tools/amend_pcb.py pad_vias` moved U9's VBUS via and C4
 GND via off their pads and tented U8 pin 2's in-pad GND via from the back
 (`hardware/fab/fabrication-note.md`); the files here are re-taken after it.
 
+Review 1 (2026-11-03, rulings BE to BI): `tools/amend_pcb.py coupling
+decoupling via_gaps antipads split_area` re-laid USB3 TX / TX_CONN coupled with
+`route_pair`, re-routed pin 14's escape, moved USB 2.0 off RX_P, put C14 and a
+new C27 on B.Cu at the vias of pins 37 and 19, kept every via 0.1 mm of copper
+from hand-soldered pads, and cut every F.Cu track at the edge of U3's escape
+area. `tools/scan_board.py` reports via-in-pad gaps, area-edge segments, where
+ruling AU still reaches past the edge, the coupled length of every pair and the
+In1 antipad margins. The files here are re-taken after it.
+
 The routing report (order, EMC after each pair, lengths, vias, decoupling
 distances) is in the task 9 report of the release run.

@@ -7,23 +7,23 @@
       "hardware/review/2026-11-02-routing/pcb.json"
     ],
     "source_hashes": {
-      "hardware/review/2026-11-02-routing/schematic.json": "abb3659e037c2eed960ca0781bf211d9bb3059557fd7753d7b26881030614abc",
-      "hardware/review/2026-11-02-routing/pcb.json": "fb827c1cb9c9290b696397ad3ab96bfb4fe413ebf2684eb16070d050519c02c2"
+      "hardware/review/2026-11-02-routing/schematic.json": "1c6a50b1eb729e785993f79ce6aa9be4c9d5f78952d29274b27e75ab73a30e71",
+      "hardware/review/2026-11-02-routing/pcb.json": "2e2023de98f9337e9fc1493db62620a07194a07c4cb9a1471f5fda9207495cba"
     },
-    "run_id": "20261103T073547Z-04acb0",
+    "run_id": "20261103T081736Z-28407d",
     "config_hash": null,
     "upstream_artifacts": {
       "schematic": {
         "path": "hardware/review/2026-11-02-routing/schematic.json",
-        "sha256": "abb3659e037c2eed960ca0781bf211d9bb3059557fd7753d7b26881030614abc",
+        "sha256": "1c6a50b1eb729e785993f79ce6aa9be4c9d5f78952d29274b27e75ab73a30e71",
         "schema_version": "1.4.0",
-        "run_id": "20261102T170237Z-f63cc7"
+        "run_id": "20261103T081736Z-28407d"
       },
       "pcb": {
         "path": "hardware/review/2026-11-02-routing/pcb.json",
-        "sha256": "fb827c1cb9c9290b696397ad3ab96bfb4fe413ebf2684eb16070d050519c02c2",
+        "sha256": "2e2023de98f9337e9fc1493db62620a07194a07c4cb9a1471f5fda9207495cba",
         "schema_version": "1.4.0",
-        "run_id": "20261103T073547Z-04acb0"
+        "run_id": "20261103T081736Z-28407d"
       }
     }
   },
@@ -33,13 +33,13 @@
     "experimental_fields": []
   },
   "summary": {
-    "total_findings": 50,
+    "total_findings": 49,
     "categories_checked": 8,
-    "active": 50,
+    "active": 49,
     "suppressed": 0,
     "by_severity": {
       "error": 12,
-      "warning": 34,
+      "warning": 33,
       "info": 4
     },
     "emc_risk_score": 0
@@ -116,7 +116,7 @@
       "rule_id": "GP-001",
       "confidence": "heuristic",
       "title": "Signal has partial reference plane gap",
-      "description": "Net MDI2_P has 90% reference plane coverage over 12.4mm of routing. Return current must detour around the gap, creating a loop antenna.",
+      "description": "Net MDI2_P has 92% reference plane coverage over 12.4mm of routing. Return current must detour around the gap, creating a loop antenna.",
       "components": [],
       "nets": [
         "MDI2_P"
@@ -132,7 +132,7 @@
         "standard_ref": ""
       },
       "signal_net": "MDI2_P",
-      "coverage_pct": 90.0,
+      "coverage_pct": 91.7,
       "trace_mm": 12.4,
       "is_high_speed_or_clock": false,
       "suppressed": false,
@@ -148,7 +148,7 @@
       "rule_id": "GP-001",
       "confidence": "heuristic",
       "title": "Signal has partial reference plane gap",
-      "description": "Net MDI3_N has 92% reference plane coverage over 15.1mm of routing. Return current must detour around the gap, creating a loop antenna.",
+      "description": "Net MDI3_N has 93% reference plane coverage over 15.1mm of routing. Return current must detour around the gap, creating a loop antenna.",
       "components": [],
       "nets": [
         "MDI3_N"
@@ -164,7 +164,7 @@
         "standard_ref": ""
       },
       "signal_net": "MDI3_N",
-      "coverage_pct": 91.7,
+      "coverage_pct": 92.9,
       "trace_mm": 15.1,
       "is_high_speed_or_clock": false,
       "suppressed": false,
@@ -180,7 +180,7 @@
       "rule_id": "GP-001",
       "confidence": "heuristic",
       "title": "Signal has partial reference plane gap",
-      "description": "Net MDI2_N has 92% reference plane coverage over 14.5mm of routing. Return current must detour around the gap, creating a loop antenna.",
+      "description": "Net MDI2_N has 93% reference plane coverage over 14.5mm of routing. Return current must detour around the gap, creating a loop antenna.",
       "components": [],
       "nets": [
         "MDI2_N"
@@ -196,7 +196,7 @@
         "standard_ref": ""
       },
       "signal_net": "MDI2_N",
-      "coverage_pct": 91.7,
+      "coverage_pct": 92.9,
       "trace_mm": 14.5,
       "is_high_speed_or_clock": false,
       "suppressed": false,
@@ -205,38 +205,6 @@
         "layout"
       ],
       "finding_id": "emc:GP-001:mdi2_n"
-    },
-    {
-      "category": "ground_plane",
-      "severity": "warning",
-      "rule_id": "GP-001",
-      "confidence": "heuristic",
-      "title": "Signal has partial reference plane gap",
-      "description": "Net MDI3_P has 92% reference plane coverage over 12.9mm of routing. Return current must detour around the gap, creating a loop antenna.",
-      "components": [],
-      "nets": [
-        "MDI3_P"
-      ],
-      "recommendation": "Route this signal to avoid ground plane gaps, or fill the void. If a split is intentional, add a bridge capacitor across the gap.",
-      "detector": "emc_ground_plane",
-      "summary": "Signal has partial reference plane gap",
-      "pins": [],
-      "evidence_source": "heuristic_rule",
-      "report_context": {
-        "section": "Ground Plane",
-        "impact": "",
-        "standard_ref": ""
-      },
-      "signal_net": "MDI3_P",
-      "coverage_pct": 92.3,
-      "trace_mm": 12.9,
-      "is_high_speed_or_clock": false,
-      "suppressed": false,
-      "suppression_reason": "",
-      "stages": [
-        "layout"
-      ],
-      "finding_id": "emc:GP-001:mdi3_p"
     },
     {
       "category": "ground_plane",
@@ -260,7 +228,7 @@
         "standard_ref": ""
       },
       "signal_net": "ETH_LED1",
-      "coverage_pct": 92.9,
+      "coverage_pct": 93.2,
       "trace_mm": 41.2,
       "is_high_speed_or_clock": true,
       "suppressed": false,
@@ -276,10 +244,10 @@
       "rule_id": "GP-001",
       "confidence": "heuristic",
       "title": "Signal has partial reference plane gap",
-      "description": "Net MDI1_P has 94% reference plane coverage over 28.2mm of routing. Return current must detour around the gap, creating a loop antenna.",
+      "description": "Net MDI3_P has 93% reference plane coverage over 12.9mm of routing. Return current must detour around the gap, creating a loop antenna.",
       "components": [],
       "nets": [
-        "MDI1_P"
+        "MDI3_P"
       ],
       "recommendation": "Route this signal to avoid ground plane gaps, or fill the void. If a split is intentional, add a bridge capacitor across the gap.",
       "detector": "emc_ground_plane",
@@ -291,16 +259,16 @@
         "impact": "",
         "standard_ref": ""
       },
-      "signal_net": "MDI1_P",
-      "coverage_pct": 94.4,
-      "trace_mm": 28.2,
+      "signal_net": "MDI3_P",
+      "coverage_pct": 93.3,
+      "trace_mm": 12.9,
       "is_high_speed_or_clock": false,
       "suppressed": false,
       "suppression_reason": "",
       "stages": [
         "layout"
       ],
-      "finding_id": "emc:GP-001:mdi1_p"
+      "finding_id": "emc:GP-001:mdi3_p"
     },
     {
       "category": "ground_plane",
@@ -395,7 +363,7 @@
       "rule_id": "DC-003",
       "confidence": "deterministic",
       "title": "Decoupling cap C24 far from via",
-      "description": "C24 is 3.7mm from the nearest via (~2.6nH connection inductance). Long traces between cap and via degrade high-frequency decoupling effectiveness.",
+      "description": "C24 is 3.8mm from the nearest via (~2.7nH connection inductance). Long traces between cap and via degrade high-frequency decoupling effectiveness.",
       "components": [
         "C24",
         "U6"
@@ -1647,15 +1615,6 @@
       ]
     },
     {
-      "net": "MDI1_P",
-      "score": 95.5,
-      "finding_count": 2,
-      "rules": [
-        "DP-004",
-        "GP-001"
-      ]
-    },
-    {
       "net": "GND",
       "score": 97.0,
       "finding_count": 1,
@@ -1729,6 +1688,14 @@
     },
     {
       "net": "MDI0_N",
+      "score": 97.0,
+      "finding_count": 1,
+      "rules": [
+        "DP-004"
+      ]
+    },
+    {
+      "net": "MDI1_P",
       "score": 97.0,
       "finding_count": 1,
       "rules": [
@@ -1935,11 +1902,11 @@
   },
   "category_summary": {
     "ground_plane": {
-      "count": 9,
+      "count": 8,
       "max_severity": "error",
       "severities": {
         "error": 3,
-        "warning": 6,
+        "warning": 5,
         "info": 0
       },
       "suppressed_count": 0
@@ -2019,27 +1986,27 @@
     "board_width_mm": 58.0,
     "board_height_mm": 36.0,
     "layer_count": 4,
-    "footprint_count": 58,
-    "via_count": 125,
+    "footprint_count": 59,
+    "via_count": 123,
     "has_stackup": false,
-    "total_components": 58,
+    "total_components": 59,
     "total_nets": 44,
     "highest_frequency_hz": 25000000.0,
     "crystal_frequencies_hz": [
       25000000.0
     ]
   },
-  "elapsed_s": 0.008,
+  "elapsed_s": 0.007,
   "audience_summary": {
     "designer": {
-      "total_findings": 50,
+      "total_findings": 49,
       "by_severity": {
         "error": 12,
-        "warning": 34,
+        "warning": 33,
         "info": 4
       },
       "by_category": {
-        "ground_plane": 9,
+        "ground_plane": 8,
         "decoupling": 3,
         "io_filtering": 3,
         "clock_routing": 3,
@@ -2135,7 +2102,7 @@
             "standard_ref": ""
           },
           "signal_net": "ETH_LED1",
-          "coverage_pct": 92.9,
+          "coverage_pct": 93.2,
           "trace_mm": 41.2,
           "is_high_speed_or_clock": true,
           "suppressed": false,
@@ -2355,9 +2322,9 @@
       ]
     },
     "reviewer": {
-      "total_findings": 46,
+      "total_findings": 45,
       "by_category": {
-        "ground_plane": 9,
+        "ground_plane": 8,
         "decoupling": 3,
         "io_filtering": 3,
         "clock_routing": 3,
@@ -2449,13 +2416,6 @@
           "summary": "USB diff pair changes layers",
           "recommendation": "Add ground stitching vias within 2\u00d7 dielectric height of each signal via. Preferably route diff pairs on a single layer to avoid layer transitions entirely.",
           "category": "diff_pair"
-        },
-        {
-          "rule_id": "GP-001",
-          "severity": "warning",
-          "summary": "Signal has partial reference plane gap",
-          "recommendation": "Route this signal to avoid ground plane gaps, or fill the void. If a split is intentional, add a bridge capacitor across the gap.",
-          "category": "ground_plane"
         },
         {
           "rule_id": "GP-001",
@@ -2693,28 +2653,28 @@
     "manager": {
       "risk_level": "high",
       "blocker_count": 12,
-      "warning_count": 34,
+      "warning_count": 33,
       "stage_readiness": {
         "schematic": "pass",
         "layout": "needs_work",
         "pre_fab": "needs_work",
         "bring_up": "pass"
       },
-      "one_liner": "12 errors, 34 warnings across 7 categories. Layout, pre-fab stages have blockers."
+      "one_liner": "12 errors, 33 warnings across 7 categories. Layout, pre-fab stages have blockers."
     }
   },
   "trust_summary": {
-    "total_findings": 50,
+    "total_findings": 49,
     "trust_level": "mixed",
     "by_confidence": {
       "deterministic": 34,
-      "heuristic": 16,
+      "heuristic": 15,
       "datasheet_backed": 0
     },
     "by_evidence_source": {
       "datasheet": 0,
       "topology": 34,
-      "heuristic_rule": 16,
+      "heuristic_rule": 15,
       "symbol_footprint": 0,
       "bom": 0,
       "geometry": 0,
@@ -2724,6 +2684,6 @@
   },
   "capability_mode_ref": {
     "source": "analysis/capability_mode.json",
-    "run_id": "20261103T073547Z-04acb0"
+    "run_id": "20261103T081736Z-28407d"
   }
 }

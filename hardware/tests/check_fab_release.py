@@ -616,6 +616,104 @@ CABLE_PAIRS = {"A": (1, 2), "B": (3, 6), "C": (4, 5), "D": (7, 8)}
 MDI_GROUPS = {"MDI0": "AB", "MDI1": "AB", "MDI2": "CD", "MDI3": "CD"}
 
 
+# Ruling BF (task 9 review 1): ruling AU's 0.2 mm may reach past the edge of
+# U3's escape area only as far as a track's round end does. Every place where
+# it is used there, with the least gap and how far past the edge it reaches;
+# a new place, a smaller gap or a longer reach fails. The two of pin 14's
+# +1V0 escape are the named exception of ruling BF (first-build check:
+# fabrication-note.md); the others were found by the review (Minor) and are
+# geometry the U3 placement forces at its pins.
+AU_OVERHANGS = {
+    # (net, net): (least gap mm, reach past the edge mm)
+    ("+1V0", "USB3_RX_N"): (0.228, 0.201),     # BF exception: pin 14
+    ("+1V0", "USB3_TX_P"): (0.250, 0.120),     # BF exception: pin 14
+    ("+1V0", "+3V3"): (0.289, 0.040),
+    ("+1V0", "MDI1_P"): (0.262, 0.110),
+    ("+1V0", "MDI2_N"): (0.262, 0.120),
+    ("+1V0", "RSET"): (0.250, 0.200),
+    ("+1V0", "XTAL1"): (0.297, 0.020),
+    ("+1V0", "XTAL2"): (0.297, 0.020),
+    ("+3V3", "DVDD10_UPS"): (0.225, 0.143),
+}
+AU_POWER_NETS = {"GND", "+5V", "+3V3", "+1V0", "SW_1V0"}   # the Power class, as route_grid.POWER
+_SEGMENT = re.compile(r"\n\t\(segment\n\t\t\(start ([-0-9.]+) ([-0-9.]+)\)\n\t\t\(end ([-0-9.]+) ([-0-9.]+)\)"
+                      r"\n\t\t\(width ([0-9.]+)\)\n\t\t\(layer \"F.Cu\"\)\n\t\t\(net \"([^\"]*)\"\)")
+
+
+def _seg_dist(a, b, q):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    t = 0.0 if dx == dy == 0 else max(0.0, min(1.0, ((q[0] - a[0]) * dx + (q[1] - a[1]) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(q[0] - a[0] - t * dx, q[1] - a[1] - t * dy)
+
+
+def _partner(net):
+    for a, b in (("_P", "_N"), ("_N", "_P")):
+        if net.endswith(a):
+            return net[:-2] + b
+    return None
+
+
+def u3_area_edge_problems(pcb_text=_LOAD, step=0.01):
+    """Ruling BF: one message per F.Cu segment that runs both inside and
+    outside U3's escape area, and per place where ruling AU is used past the
+    area's edge that AU_OVERHANGS does not list or that is nearer or reaches
+    further than it says."""
+    pcb_text = PCB.read_text(encoding="utf-8") if pcb_text is _LOAD else pcb_text
+    area = _rule_area(pcb_text, U3_ESCAPE_AREA)
+    if area is None:
+        return [f"no zone named {U3_ESCAPE_AREA}"]
+    xs, ys = [p[0] for p in area[2]], [p[1] for p in area[2]]
+    A = (min(xs), min(ys), max(xs), max(ys))
+    eps = 1e-4
+
+    def inside(q):
+        return A[0] + eps < q[0] < A[2] - eps and A[1] + eps < q[1] < A[3] - eps
+
+    def outside(q):
+        return q[0] < A[0] - eps or q[0] > A[2] + eps or q[1] < A[1] - eps or q[1] > A[3] + eps
+
+    def outside_by(q):
+        return math.hypot(max(A[0] - q[0], 0, q[0] - A[2]), max(A[1] - q[1], 0, q[1] - A[3]))
+    problems, touching = [], []
+    for m in _SEGMENT.finditer(pcb_text):
+        a, b = (float(m.group(1)), float(m.group(2))), (float(m.group(3)), float(m.group(4)))
+        w, net = float(m.group(5)), m.group(6)
+        if (inside(a) and outside(b)) or (inside(b) and outside(a)):
+            problems.append(f"{net} segment {a} -> {b} runs across the edge of {U3_ESCAPE_AREA}: "
+                            "cut it there (ruling BF)")
+        dx = max(A[0] - max(a[0], b[0]), 0, min(a[0], b[0]) - A[2])
+        dy = max(A[1] - max(a[1], b[1]), 0, min(a[1], b[1]) - A[3])
+        if math.hypot(dx, dy) <= w / 2:
+            touching.append((net, a, b, w))
+    found = {}
+    for na, a, b, wa in touching:
+        k = max(1, int(math.hypot(b[0] - a[0], b[1] - a[1]) / step))
+        for i in range(k + 1):
+            q = (a[0] + (b[0] - a[0]) * i / k, a[1] + (b[1] - a[1]) * i / k)
+            o = outside_by(q)
+            if o <= 0:
+                continue
+            for nb, c, d, wb in touching:
+                if nb in (na, _partner(na)):
+                    continue
+                cls = 0.3 if na in AU_POWER_NETS or nb in AU_POWER_NETS else 0.2
+                g = _seg_dist(c, d, q) - wa / 2 - wb / 2
+                if g < cls - 1e-4:
+                    key = tuple(sorted((na, nb)))
+                    gap, reach = found.get(key, (9.0, 0.0))
+                    found[key] = (min(gap, g), max(reach, o))
+    for key, (g, o) in sorted(found.items()):
+        if key not in AU_OVERHANGS:
+            problems.append(f"{key[0]} / {key[1]}: ruling AU used {o:.3f} mm past the edge of "
+                            f"{U3_ESCAPE_AREA} at {g:.3f} mm, not in AU_OVERHANGS")
+            continue
+        g0, o0 = AU_OVERHANGS[key]
+        if g < g0 - 0.002 or o > o0 + 0.002:
+            problems.append(f"{key[0]} / {key[1]}: {g:.3f} mm at {o:.3f} mm past the edge, "
+                            f"AU_OVERHANGS allows {g0} mm at {o0} mm")
+    return problems
+
+
 def mdi_group_problems(netlist):
     """One message per reason the MDI nets do not stay inside their group of
     cable pairs. J2's pin -> RJ45 pin table is read from the pin notes
@@ -1753,6 +1851,36 @@ class MdiPairsStayInTheirCableGroup(unittest.TestCase):
         netlist["components"]["J2"]["pins"][7]["note"] = "PHY side, pair 3"
         problems = mdi_group_problems(netlist)
         self.assertTrue(any("no 'cable J<n>'" in p for p in problems), problems)
+
+
+class U3EscapeRuleStaysAtItsArea(unittest.TestCase):
+    """Ruling BF: ruling AU's 0.2 mm is not carried out of U3's escape area by
+    long segments, and where it reaches past the edge is listed."""
+
+    def test_the_committed_board_passes(self):
+        self.assertEqual(u3_area_edge_problems(), [])
+
+    def test_a_segment_across_the_edge_is_reported(self):
+        pcb = PCB.read_text(encoding="utf-8")
+        _, _, pts = _rule_area(pcb, U3_ESCAPE_AREA)
+        x0, y0 = min(p[0] for p in pts), min(p[1] for p in pts)
+        seg = (f'\t(segment\n\t\t(start {x0 + 0.5:g} {y0 + 0.5:g})\n\t\t(end {x0 + 0.5:g} {y0 - 3:g})\n'
+               '\t\t(width 0.2)\n\t\t(layer "F.Cu")\n\t\t(net "ETH_LED0")\n\t)\n')
+        problems = u3_area_edge_problems(pcb[:pcb.rstrip().rindex(")")] + seg + ")\n")
+        self.assertTrue(any("runs across the edge" in p for p in problems), problems)
+
+    def test_an_unlisted_or_grown_overhang_is_reported(self):
+        saved = dict(AU_OVERHANGS)
+        try:
+            AU_OVERHANGS.pop(("+1V0", "USB3_TX_P"))
+            problems = u3_area_edge_problems()
+            self.assertTrue(any("not in AU_OVERHANGS" in p and "USB3_TX_P" in p for p in problems), problems)
+            AU_OVERHANGS[("+1V0", "USB3_TX_P")] = (0.26, 0.12)
+            problems = u3_area_edge_problems()
+            self.assertTrue(any("AU_OVERHANGS allows" in p for p in problems), problems)
+        finally:
+            AU_OVERHANGS.clear()
+            AU_OVERHANGS.update(saved)
 
 
 def run_gen_pcb_on_routed_board(extra_args=(), routed=True):
