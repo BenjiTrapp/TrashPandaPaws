@@ -2030,6 +2030,17 @@ class In1ContinuityCanFail(unittest.TestCase):
             run_probe(self.board("antipad", ("via", "+3V3", round(x, 2), round(y + 0.52, 2), 0.6, 0.3)), "--in1"))
         self.assertTrue(any("USB3_RX" in m and "not an allowed exception" in m for m in problems), problems)
 
+    def test_a_stub_via_of_its_own_net_mid_run_on_usb_2_0_is_found(self):
+        # ruling BU: the own-via exception is by position, not by net. The task 10
+        # review planted these two (D+ at 11.52, 17.08; D- at 10.93, 16.2) and the
+        # first version passed them.
+        for net, (x, y) in (("USB2_D_P", (11.52, 17.08)), ("USB2_D_N", (10.93, 16.2))):
+            with self.subTest(net=net):
+                problems = in1_continuity_problems(
+                    run_probe(self.board("stub-" + net, ("via", net, x, y, 0.6, 0.3)), "--in1"))
+                self.assertTrue(any(m.startswith(net + ":") and "not an allowed exception" in m
+                                    for m in problems), problems)
+
     def test_the_d_minus_exception_covers_one_via_and_not_another(self):
         # D- runs north-south at x 9.6 between y 16.2 and 18.9; D+ is 1.2 mm to the east
         x, y = next(s[:2] for s in self.coupling["coupling"]["USB2_D_N"]
@@ -2086,9 +2097,18 @@ class PairCouplingHoldsTheRulings(unittest.TestCase):
     def test_every_as_built_region_is_argued_in_the_accepted_findings(self):
         text = " ".join(ACCEPTED_FINDINGS.read_text(encoding="utf-8").split())
         for region in COUPLING_REGIONS:
-            if region["basis"].startswith("as-built"):
+            if region["kind"] == "ratchet":
+                self.assertTrue(region["basis"].startswith(RATCHET), region)
                 self.assertIn(region["name"], text,
-                              f"{region['name']} has no ruling behind it and no entry in {ACCEPTED_FINDINGS.name}")
+                              f"{region['name']} is a ratchet and has no entry in {ACCEPTED_FINDINGS.name}")
+
+    def test_every_cap_names_its_ruling_or_says_it_is_a_ratchet(self):
+        for region in COUPLING_REGIONS:
+            self.assertIn(region["kind"], ("granted", "ratchet"), region)
+            if region["kind"] == "granted":
+                self.assertRegex(region["basis"], r"^ruling [A-Z]{2}\b", region)
+            else:
+                self.assertTrue(region["basis"].startswith(RATCHET), region)
 
     def test_the_floor_is_below_what_the_board_has(self):
         for net, row in self.summary.items():
@@ -2257,7 +2277,9 @@ IN1_SAMPLE_STEP = 0.02     # mm along the track, on the centre line and both edg
 #   own J2 pin   an MDI track ends on its own through-hole pin of the MagJack,
 #                and In1 has to leave a hole round that pin;
 #   own via      a USB 2.0 track changes layer (ruling AR) and In1 leaves a hole
-#                round its own via;
+#                round its own via. Only the four layer-change vias, by position
+#                (ruling BU): an exception by net instead of by place is a gap, a
+#                stub via mid-run would have passed;
 #   D- over D+   the single exception between nets: where USB2_D_N passes the
 #                antipad of USB2_D_P's layer-change via at (21.5, 19.15), half
 #                its width has no ground for about 0.5 mm (task 9 re-review
@@ -2265,10 +2287,12 @@ IN1_SAMPLE_STEP = 0.02     # mm along the track, on the centre line and both edg
 IN1_EXCEPTIONS = (
     {"name": "own J2 pin", "nets": r"MDI[0-3]_[PN]", "hole": "pad", "whose": "own",
      "label": r"J2\.\d+", "max_run_mm": 1.3},
-    {"name": "own layer-change via", "nets": r"USB2_D_[PN]", "hole": "via", "whose": "own",
-     "label": "via", "max_run_mm": 1.3},
+    {"name": "own layer-change via, D-", "nets": "USB2_D_N", "hole": "via", "whose": "own",
+     "label": "via", "at": ((12.2, 16.2), (20.8, 18.75)), "max_run_mm": 1.3},
+    {"name": "own layer-change via, D+", "nets": "USB2_D_P", "hole": "via", "whose": "own",
+     "label": "via", "at": ((12.2, 17.1), (21.5, 19.15)), "max_run_mm": 1.3},
     {"name": "D- over the antipad of D+'s layer-change via", "nets": "USB2_D_N", "hole": "via",
-     "whose": "partner", "label": "via", "at": (21.5, 19.15), "max_run_mm": 0.55},
+     "whose": "partner", "label": "via", "at": ((21.5, 19.15),), "max_run_mm": 0.55},
 )
 # Ruling AR (revised): the one stretch of a pair that may leave F.Cu, USB 2.0
 # only, across at most one In2 island boundary, flanked by GND vias that stand
@@ -2290,7 +2314,8 @@ def _exception_for(net, gap):
             continue
         if not re.fullmatch(rule["label"], hole["label"]):
             continue
-        if "at" in rule and math.hypot(rule["at"][0] - hole["at"][0], rule["at"][1] - hole["at"][1]) > 0.05:
+        if "at" in rule and not any(math.hypot(x - hole["at"][0], y - hole["at"][1]) <= 0.05
+                                    for x, y in rule["at"]):
             continue
         return rule
     return None
@@ -2396,64 +2421,68 @@ UNREGIONED_SLACK_MM = 0.3
 # and its edge-to-edge gap to the partner's copper (track, pad or via, same
 # layer) is more than 10 % from the target. Each region is a box in board
 # coordinates (origin at the board's own origin) or a radius round the pads of
-# the named parts; `cap_mm` is the most path length of that net the region may
-# hold. `basis` says where the cap comes from:
-#   ruling XX    the ruling grants this region, with the figure given there (a
-#                little over it to allow for path length against extent)
-#   as-built XX  no ruling quantifies this region; the cap is the committed
-#                board's length with a margin, and only stops it getting worse.
-#                Listed in hardware/review/2026-11-03-routed/accepted-findings.md.
+# the named parts; `cap_mm` is the most PATH length of that net the region may
+# hold (path, not extent: the conductor length makes the discontinuity). Every
+# region has a `kind` (ruling BW):
+#   granted  a controller ruling gave this figure; `basis` names it
+#            ("ruling XX ..."). The cap is that figure and nothing is added.
+#   ratchet  no ruling gave this figure (or the cap is the ruling's figure plus
+#            an allowance of the implementer's). The cap is the committed
+#            board's length with a margin; it only stops the board getting
+#            worse and is NOT verified against a requirement. `basis` starts
+#            with RATCHET and the region is argued in
+#            hardware/review/2026-11-03-routed/accepted-findings.md.
+RATCHET = "as-built ratchet, not verified against a requirement"
 _RX = r"USB3_RX_[PN]"
 _TXC = r"USB3_TX_CONN_[PN]"
+_MDI_REGION = {"name": "J2 pin lead-in", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu", "kind": "ratchet",
+               "basis": RATCHET + "; rulings AM / AQ route it planar and quantify nothing"}
 COUPLING_REGIONS = (
     # U3's pads: the neck, at most 1.0 mm from the pad centre (rulings AG, AI)
     {"name": "U3 neck", "nets": r"(USB3_(TX|RX)_[PN]|USB2_D_[PN]|MDI\d_[PN])", "near": (("U3",), NECK_MAX_LENGTH_MM),
-     "cap_mm": NECK_MAX_LENGTH_MM, "basis": "ruling AG/AI"},
-    # TX: the 45 degree fan-out to the two AC capacitors (ruling BE)
+     "cap_mm": NECK_MAX_LENGTH_MM, "kind": "granted", "basis": "ruling AG/AI (neck at most 1.0 mm from the pad centre)"},
+    # TX: the 45 degree fan-out to the two AC capacitors. Ruling BE and the
+    # stackup note say about 1 mm; no ruling gives a cap.
     {"name": "TX capacitor landing", "nets": r"USB3_TX(_CONN)?_[PN]", "near": (("C22", "C23"), 1.6),
-     "cap_mm": 1.4, "basis": "ruling BE"},
-    # U8's straddle (ruling AS: about 5 mm per pair)
+     "cap_mm": 1.4, "kind": "ratchet", "basis": RATCHET + "; ruling BE named a fan-out of about 1 mm, no cap"},
+    # U8's straddle. Ruling AS: about 5 mm per pair, as extent; the 1.0 mm on top is the
+    # implementer's allowance for path against extent, not granted.
     {"name": "U8 straddle", "nets": _RX, "box": (12.0, 19.0, 0, 40), "layer": "F.Cu",
-     "cap_mm": 6.0, "basis": "ruling AS (about 5 mm) + path length against extent"},
-    {"name": "U8 straddle", "nets": r"USB3_TX_CONN_N", "box": (12.0, 19.0, 0, 40), "layer": "F.Cu",
-     "cap_mm": 7.0, "basis": "ruling BE (accepted past AS's 5 mm, review M3)"},
-    {"name": "U8 straddle", "nets": r"USB3_TX_CONN_P", "box": (12.0, 19.0, 0, 40), "layer": "F.Cu",
-     "cap_mm": 8.5, "basis": "ruling BE (accepted past AS's 5 mm, review M3)"},
-    # J3: its +5V pin sits between the RX pins and the pairs fan out to its 2 mm pitch (BN, BE)
+     "cap_mm": 6.0, "kind": "ratchet",
+     "basis": RATCHET + "; ruling AS granted about 5 mm of extent, the 1.0 mm of path allowance is not granted"},
+    # Ruling BV: 8.0 mm of PATH for TX_CONN's straddle. A granted concession under
+    # reservation, not an engineering target: forced by U8's SOT-23-6 pad rows,
+    # TX has no EMC iterations left. Verified by the SuperSpeed first-build check
+    # (hardware/fab/fabrication-note.md); if the link proves marginal U8's
+    # package is the first thing to change.
+    {"name": "U8 straddle", "nets": _TXC, "box": (12.0, 19.0, 0, 40), "layer": "F.Cu",
+     "cap_mm": 8.0, "kind": "granted",
+     "basis": "ruling BV (8.0 mm of path; granted concession, not an engineering target)"},
+    # J3: its +5V pin sits between the RX pins and the pairs fan out to its 2 mm pitch
     {"name": "J3 fan-out", "nets": _RX, "box": (4.5, 9.0, 0, 40), "layer": "F.Cu",
-     "cap_mm": 2.0, "basis": "ruling BN (1.5 mm) + path length against extent"},
+     "cap_mm": 2.0, "kind": "ratchet",
+     "basis": RATCHET + "; ruling BN granted 1.5 mm, the 0.5 mm of path allowance is not granted"},
     {"name": "J3 fan-out", "nets": _TXC, "box": (4.5, 9.0, 0, 40), "layer": "F.Cu",
-     "cap_mm": 2.7, "basis": "ruling BE (about 2.5 mm)"},
+     "cap_mm": 2.7, "kind": "ratchet",
+     "basis": RATCHET + "; the 2.5 mm is the task 9 re-review's measurement, ruling BE gave no figure"},
     # USB 2.0: the D+/D- crossover between J3 and U9 (task 8, the U9 channel)
     {"name": "USB 2.0 J3 to U9 crossover", "nets": "USB2_D_N", "box": (4.5, 12.6, 0, 40),
-     "cap_mm": 11.0, "basis": "as-built (no ruling quantifies it)"},
+     "cap_mm": 11.0, "kind": "ratchet", "basis": RATCHET},
     {"name": "USB 2.0 J3 to U9 crossover", "nets": "USB2_D_P", "box": (4.5, 12.6, 0, 40),
-     "cap_mm": 4.6, "basis": "as-built (no ruling quantifies it)"},
+     "cap_mm": 4.6, "kind": "ratchet", "basis": RATCHET},
     # USB 2.0: the skew meander on B.Cu that matches D+ to D- (EMC DP-001)
     {"name": "USB 2.0 skew meander", "nets": "USB2_D_P", "box": (14.5, 17.5, 0, 40), "layer": "B.Cu",
-     "cap_mm": 5.0, "basis": "as-built (no ruling quantifies it)"},
-    # USB 2.0: the two layer changes at U3's end (ruling AR)
+     "cap_mm": 5.0, "kind": "ratchet", "basis": RATCHET},
+    # USB 2.0: the two layer changes at U3's end. Ruling AR allows the layer
+    # change and quantifies no length.
     {"name": "USB 2.0 layer change at U3", "nets": "USB2_D_N", "box": (20.5, 23.6, 18.0, 20.0),
-     "cap_mm": 1.2, "basis": "ruling AR (layer change)"},
+     "cap_mm": 1.2, "kind": "ratchet", "basis": RATCHET + "; ruling AR allows the layer change, not a length"},
     {"name": "USB 2.0 layer change at U3", "nets": "USB2_D_P", "box": (20.5, 23.6, 18.0, 20.0),
-     "cap_mm": 1.0, "basis": "ruling AR (layer change)"},
+     "cap_mm": 1.0, "kind": "ratchet", "basis": RATCHET + "; ruling AR allows the layer change, not a length"},
     # MDI: the lead-in to J2's pin columns (rulings AM, AQ: planar, pins of one pair 2.5 mm apart)
-    {"name": "J2 pin lead-in", "nets": "MDI0_N", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
-     "cap_mm": 5.5, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
-    {"name": "J2 pin lead-in", "nets": "MDI0_P", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
-     "cap_mm": 4.5, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
-    {"name": "J2 pin lead-in", "nets": "MDI1_N", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
-     "cap_mm": 4.2, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
-    {"name": "J2 pin lead-in", "nets": "MDI1_P", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
-     "cap_mm": 3.1, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
-    {"name": "J2 pin lead-in", "nets": "MDI2_N", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
-     "cap_mm": 7.0, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
-    {"name": "J2 pin lead-in", "nets": "MDI2_P", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
-     "cap_mm": 5.0, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
-    {"name": "J2 pin lead-in", "nets": "MDI3_N", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
-     "cap_mm": 4.3, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
-    {"name": "J2 pin lead-in", "nets": "MDI3_P", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
-     "cap_mm": 2.3, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
+    *({**_MDI_REGION, "nets": net, "cap_mm": cap} for net, cap in (
+        ("MDI0_N", 5.5), ("MDI0_P", 4.5), ("MDI1_N", 4.2), ("MDI1_P", 3.1),
+        ("MDI2_N", 7.0), ("MDI2_P", 5.0), ("MDI3_N", 4.3), ("MDI3_P", 2.3))),
 )
 # Each pair's length as committed, to turn the caps into a floor on the share
 # of the pair that stays inside the window.
@@ -2550,7 +2579,7 @@ def pair_coupling_problems(probe, targets=None):
         for (name, cap, basis), length in row["regions"].items():
             if length > cap:
                 problems.append(f"{net}: {length:.2f} mm outside the impedance window in {name!r}, "
-                                f"more than the {cap} mm {basis} grants")
+                                f"more than its cap of {cap} mm ({basis})")
         if row["unregioned"] > UNREGIONED_SLACK_MM:
             problems.append(f"{net}: {row['unregioned']:.2f} mm outside the impedance window in no "
                             f"region any ruling grants (slack {UNREGIONED_SLACK_MM} mm)")

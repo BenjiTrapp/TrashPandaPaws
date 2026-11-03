@@ -46,6 +46,7 @@ test_bom_csv_is_what_the_generator_writes (__main__.GeneratedFilesAreCurrent) ..
 test_schematic_is_what_the_generator_writes (__main__.GeneratedFilesAreCurrent) ... ok
 test_schematic_symbols_carry_the_part_number (__main__.GeneratedFilesAreCurrent) ... ok
 test_a_gap_in_the_ground_under_any_pair_is_found (__main__.In1ContinuityCanFail) ... ok
+test_a_stub_via_of_its_own_net_mid_run_on_usb_2_0_is_found (__main__.In1ContinuityCanFail) ... ok
 test_ruling_ar_fails_without_a_flank_via (__main__.In1ContinuityCanFail) ... ok
 test_the_d_minus_exception_covers_one_via_and_not_another (__main__.In1ContinuityCanFail) ... ok
 test_the_j2_pin_exception_does_not_cover_a_stretch_beyond_the_pin (__main__.In1ContinuityCanFail) ... ok
@@ -72,6 +73,7 @@ test_a_pair_that_stays_coupled_but_for_two_millimetres_in_no_region_is_found (__
 test_a_region_cannot_grow_past_its_cap (__main__.PairCouplingCanFail) ... ok
 test_the_floor_follows_from_the_caps (__main__.PairCouplingCanFail) ... ok
 test_every_as_built_region_is_argued_in_the_accepted_findings (__main__.PairCouplingHoldsTheRulings) ... ok
+test_every_cap_names_its_ruling_or_says_it_is_a_ratchet (__main__.PairCouplingHoldsTheRulings) ... ok
 test_every_pair_is_as_coupled_as_the_rulings_granted (__main__.PairCouplingHoldsTheRulings) ... ok
 test_every_region_is_in_use (__main__.PairCouplingHoldsTheRulings) ... ok
 test_the_figures_the_ledger_records_are_what_is_measured (__main__.PairCouplingHoldsTheRulings) ... ok
@@ -131,7 +133,6 @@ test_populate_must_be_a_boolean (__main__.VbusGuardCannotBeSilenced) ... ok
 test_unreadable_value_on_the_rail_raises (__main__.VbusGuardCannotBeSilenced) ... ok
 
 ----------------------------------------------------------------------
-Ran 131 tests in 35.560s
+Ran 133 tests in 37.020s
 
 OK
-exit 0

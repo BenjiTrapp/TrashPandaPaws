@@ -44,3 +44,21 @@ the board being ordered; S1 and S2 need a decision.
 | D7 | task 7 | "Only entries 1-3 of 112 are 1OZ/1OZ" is unsupported (only 1-3 are excerpted); "it shortens the neck that is needed" for outer-end routing was never measured ("may shorten"); the 111.9 Ω as-built disclosure does not say that is about +24 % (USB3) and +12 % (MDI) outside the ±10 % window; the PCBWay excerpt "after printing three times or more the impedance no longer changes" is not covered by the table (open item 1 should say three or more); `stackup-note.md` neck wording (ruling AI, from pad centre) for task 12. |
 | D8 | task 8 | "The only reading that fits" for the 0.33 / 3.33 mm span is a little strong (the disclosure itself is honest). |
 | D9 | task 9 review 1 | Routing order deviates from the plan (low speed before supplies); the claim "the only place AU applies outside the area" is wrong (7 more overhangs of 0.03-0.22 mm, now bounded by `AU_OVERHANGS` and ruling BQ); `route_pcb.py:1014` dead code; the README below the board images still describes the HAT (65 × 56 mm, 2 layers); ruling BM's "parking spot" pattern for C27 to be documented in `gen_pcb.py` and the placement README. |
+
+## From the task 10 review (nine minors, for the final review; not fixed here)
+
+| # | Finding |
+|---|---|
+| T10-M1 | The D− over D+'s-via In1 exception (0.5 mm at (21.5, 19.15)) has no controller ruling; it is bounded by position and cap and codifies task 9 re-review M1. Needs explicit ratification. |
+| T10-M2 | Arc tracks (`PCB_ARC_T`) are invisible to both probes; the board has none. Add an assertion that no arc lies on a pair net. |
+| T10-M3 | Accepted finding B6: "USBLC6's VBUS pin only senses the rail and needs no decoupling" is inaccurate (VBUS is the Transil rail; a capacitor near pin 5 is common practice) and DS4260 does not support it. Correct or source it. |
+| T10-M4 | `rebuild_check.py` does not compare Edge.Cuts, zone parameters, text size or the title block (the reviewer checked all 26 by hand and they are identical). |
+| T10-M5 | The gate's DRC runs on stored fills; `--refill-zones` gives the same result today (`drc-refilled.rpt`) but nothing keeps the stored fills current. |
+| T10-M6 | The In1 evidence on 732475b ("17 messages") is one gap reported per sample; exception-failure messages should be aggregated per (net, hole). |
+| T10-M7 | Hard-coded coordinates in the mutation tests and region boxes (x 9.5 for RX_P, (9.6, 17.5), flank via (19.1, 18.49)); they fail closed on a re-route and need upkeep. |
+| T10-M8 | The at-gap floor (floor − 5 %) is stricter than the ±10 % window; a failure there is not an impedance violation. State it in the docstring. |
+| T10-M9 | Accepted finding A2 (TX to RX spacing 0.505 mm in U8's channel) is held by no check. |
+
+U3's missing thermal assessment stays open for task 11 or the first build (the
+review's hand estimate: 0.40 W typical, about 1.2 W at 3x; measure the case-top
+temperature after 30 min of bidirectional `iperf3`, pass at 35 K rise or less).

@@ -49,4 +49,4 @@ board default, tented on both sides.
 |---|---|
 | `lsusb -t` shows the adapter at 5000M; `iperf3` bidirectional for 30 min at 940 Mb/s; `dmesg` free of xHCI link errors and of a fall-back to USB 2.0 | ruling BF: pin 14's +1V0 escape runs 0.229 mm from USB3_RX_N and 0.250 mm from USB3_TX_P for up to 0.21 / 0.12 mm past the edge of U3's escape area, under the class clearance of 0.3 mm (`AU_OVERHANGS` in `tests/check_fab_release.py`) |
 | link stability and error counters at 1000 Mb/s under load | ruling AX: MDI1 and MDI2 at 0.22 mm |
-
+| `lsusb -t` at 5000M, `iperf3` bidirectional 30 min at 940 Mb/s, no xHCI link errors (same check as above) | ruling BV: the verification of the **granted concession** of 8.0 mm of path for TX_CONN's straddle at U8 (a concession under reservation, not an engineering target; `COUPLING_REGIONS` in `tests/check_fab_release.py`). **If the link proves marginal, change U8's package first** |

@@ -26,7 +26,7 @@ for shorts and unconnected items.
 | `check_netlist.py` | exit 0, 0 warnings | `check_netlist.out` |
 | `check_kicad.py` (incl. `check_pcb_connectivity(pcb, netlist, report)`, ruling N) | exit 0 | `check_kicad.out` |
 | `test_check_kicad.py` | 27 tests OK | |
-| `check_fab_release.py` | **131 tests OK** (109 before; 22 new, see below) | `check_fab_release.out` |
+| `check_fab_release.py` | **133 tests OK** (109 before; 24 new, see below) | `check_fab_release.out` |
 | `tools/rebuild_check.py` | 1136 of 1136 items identical (tracks, vias, footprints, zones, silkscreen text) | `run_design_checks.out` |
 | `run_design_checks.sh` | all of the above | `run_design_checks.out` |
 

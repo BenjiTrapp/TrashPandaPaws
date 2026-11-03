@@ -96,6 +96,12 @@ def main():
         problems = c.in1_continuity_problems(c.run_probe(board, "--in1"))
         print("  ", [m for m in problems if m.startswith("USB3_RX")][:2])
 
+        print("\n== defect (ruling BU): a stub via of its own net mid-run on USB 2.0 ==")
+        for net, (x, y) in (("USB2_D_P", (11.52, 17.08)), ("USB2_D_N", (10.93, 16.2))):
+            board = c.mutate_board(tmp, "via", net, x, y, 0.6, 0.3)
+            problems = [m for m in c.in1_continuity_problems(c.run_probe(board, "--in1")) if m.startswith(net + ":")]
+            print(f"  {net} via at ({x}, {y}): {len(problems)} problem(s), e.g. {problems[:1]}")
+
         print("\n== defect: the north AR flank via removed ==")
         board = c.mutate_board(tmp, "remove-via", 19.1, 18.49)
         print("  ", [m for m in c.in1_continuity_problems(c.run_probe(board, "--in1")) if "flank" in m])

@@ -22,18 +22,32 @@ stops it getting worse.
 
 ## A. Coupling and In1 reference (ruling BJ)
 
-### A1 U8 straddle: TX_CONN is over the figure ruling AS granted
+### A1 U8 straddle: TX_CONN has a granted concession of 8.0 mm of path (ruling BV)
 
-Region `U8 straddle`. RX: 5.31 mm (P) and 5.52 mm (N) of path outside the
-window, cap 6.0 mm. Ruling AS granted "about 5 mm" and the re-review of task 9
-confirmed 4.6 mm of extent. **TX_CONN: 7.99 mm (P) and 6.68 mm (N)** of path
-(6.2 mm of extent, review M3), caps 8.5 / 7.0 mm. Ruling BE accepted this as
-the remainder the placement forces: TX_CONN's tee leaves the line 0.5–0.7 mm
-beyond the pads on each side, where RX tees straight at the pad. Roughly 1 mm
-could be recovered by re-laying it; that is a routing change on a frozen,
-reviewed board and was not made. Risk and measurement are those of ruling AS,
-now with the larger figure: SuperSpeed enumeration at 5000M, `iperf3`
-bidirectional 30 min, `dmesg` without xHCI link errors.
+Region `U8 straddle`. **TX_CONN: 7.99 mm (P) and 6.68 mm (N) of path** outside
+the window (6.2 mm of straight-line extent, task 9 re-review M3). Ruling AS
+granted "about 5 mm" as extent; ruling BV (which corrects BS's 6.5 mm) sets the
+TX_CONN cap at **8.0 mm of path length**, because the conductor length, not
+the extent, makes the discontinuity. The cap in `COUPLING_REGIONS` is 8.0 mm
+for both nets, `kind: granted`, and the margin on TX_CONN_P is 0.01 mm.
+
+**This is a granted concession under reservation, not an engineering target.**
+The straddle is forced by U8's SOT-23-6 pad rows, and TX has no EMC iterations
+left; TX_CONN's tee leaves the line 0.5-0.7 mm beyond the pads on each side
+(RX tees straight at the pad), so roughly 1 mm could be recovered by re-laying
+it, which is a routing change on a frozen, reviewed board and was not made.
+
+*Verification and fall-back:* the SuperSpeed first-build check is the
+verification of this concession (`lsusb -t` at 5000M, `iperf3` bidirectional
+30 min at 940 Mbit/s, `dmesg` free of xHCI link errors and of a fall-back to
+USB 2.0; it is also in `hardware/fab/fabrication-note.md`). **If the link
+proves marginal, U8's package is the first thing to change** (a part whose pad
+rows do not force the pair apart), not the pair routing.
+
+RX at the same place: 5.31 / 5.52 mm of path against a ratchet cap of 6.0 mm
+(ruling AS granted about 5 mm of extent; the 1.0 mm on top is the
+implementer's allowance for path against extent and is not granted, so it is a
+ratchet, A6).
 
 ### A2 U8 channel spacing between TX and RX is 0.505 mm, not 0.8 mm
 
@@ -72,14 +86,18 @@ over x 34–41 to reach pins 9 and 10, which stand in two rows 2.54 mm apart. Fi
 `ethtool -S` error counters flat; with a straight and a crossover cable
 (`netlist.yaml` `mdi_group` note).
 
-### A5 In1 reference: three named exceptions, no unexplained gap
+### A5 In1 reference: named exceptions by position, no unexplained gap
 
 Under every pair track on F.Cu, centre line and both edges every 0.02 mm, after
 refilling the zones, there is **no point without In1 ground except**:
 
 * each MDI track's own J2 pin: In1 has to leave a hole round the through-hole
   pin (1.04–1.18 mm along the track);
-* each USB 2.0 track's own layer-change via (ruling AR), 0.5–0.7 mm per via;
+* each USB 2.0 track's own layer-change via (ruling AR), 0.5–0.7 mm per via,
+  **only the four vias at (12.2, 16.2), (20.8, 18.75) for D− and (12.2, 17.1),
+  (21.5, 19.15) for D+, by position (ruling BU)**. A first version exempted any
+  own-net via on these nets, and a stub via planted mid-run by the task 10 review
+  passed; it now fails (`test_a_stub_via_of_its_own_net_mid_run_on_usb_2_0_is_found`);
 * **D− passing the In1 hole of D+'s layer-change via at (21.5, 19.15), 0.5 mm**
   (task 9 re-review M1, introduced when ruling BG moved D− south). At 480 Mbit/s
   and at the layer change itself. It is listed by position so a second
@@ -87,6 +105,28 @@ refilling the zones, there is **no point without In1 ground except**:
 
 The tool's `GP-001` warnings on MDI2/MDI3 (93–94 % reference coverage) are this
 J2 pin hole: 1.06 mm of 12.4 mm is 91 %.
+
+### A6 Every cap names its ruling or is a ratchet (ruling BW)
+
+`COUPLING_REGIONS` has two kinds. **Granted**, with the ruling named: `U3 neck`
+(AG / AI, 1.0 mm from the pad centre), `U8 straddle` for TX_CONN (BV, 8.0 mm).
+**Ratchet**, each stating "as-built ratchet, not verified against a
+requirement" in the code and argued here; a cap only stops the board getting
+worse:
+
+| Region | Cap | Why it is a ratchet |
+|---|---|---|
+| `TX capacitor landing` | 1.4 mm | ruling BE named a fan-out of about 1 mm and no cap; measured 0.83-1.32 |
+| `U8 straddle` (RX) | 6.0 mm | AS granted about 5 mm of extent; the 1.0 mm is the implementer's path allowance |
+| `J3 fan-out` (RX) | 2.0 mm | BN granted 1.5 mm; the 0.5 mm is allowance |
+| `J3 fan-out` (TX_CONN) | 2.7 mm | the 2.5 mm is the task 9 re-review's measurement; BE gave no figure |
+| `USB 2.0 layer change at U3` | 1.2 / 1.0 mm | AR allows the layer change, not a length; measured 0.93 / 0.74 |
+| `USB 2.0 J3 to U9 crossover`, `USB 2.0 skew meander` | 11.0 / 4.6, 5.0 mm | A3 |
+| `J2 pin lead-in` | per net | A4 |
+
+The floors on the share inside the window follow from these caps, so the floor
+on RX and on every USB 2.0 and MDI net is a ratchet too; on TX_CONN it follows
+from the BV concession plus the J3 and capacitor-landing ratchets.
 
 ## B. Tool findings
 
