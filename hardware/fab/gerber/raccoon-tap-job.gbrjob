@@ -5,7 +5,7 @@
       "Application": "Pcbnew",
       "Version": "10.0.6"
     },
-    "CreationDate": "2026-11-03T12:31:09+01:00"
+    "CreationDate": "2026-11-03T17:23:27+01:00"
   },
   "GeneralSpecs": {
     "ProjectId": {
@@ -19,27 +19,8 @@
     },
     "LayerNumber": 4,
     "BoardThickness": 1.6,
-    "Finish": "None"
+    "Finish": "ENIG"
   },
-  "DesignRules": [
-    {
-      "Layers": "Outer",
-      "PadToPad": 0.2,
-      "PadToTrack": 0.2,
-      "TrackToTrack": 0.2,
-      "MinLineWidth": 0.15,
-      "TrackToRegion": 0.3,
-      "RegionToRegion": 0.3
-    },
-    {
-      "Layers": "Inner",
-      "PadToPad": 0.0,
-      "PadToTrack": 0.0,
-      "TrackToTrack": 0.2,
-      "TrackToRegion": 0.3,
-      "RegionToRegion": 0.3
-    }
-  ],
   "FilesAttributes": [
     {
       "Path": "raccoon-tap-F_Cu.gtl",
@@ -85,6 +66,11 @@
       "Path": "raccoon-tap-Edge_Cuts.gm1",
       "FileFunction": "Profile",
       "FilePolarity": "Positive"
+    },
+    {
+      "Path": "raccoon-tap-F_Paste.gtp",
+      "FileFunction": "Paste,Top",
+      "FilePolarity": "Positive"
     }
   ],
   "MaterialStackup": [
@@ -98,54 +84,61 @@
     },
     {
       "Type": "SolderMask",
-      "Thickness": 0.01,
-      "Name": "Top Solder Mask"
+      "Name": "Top Solder Mask",
+      "Notes": "solder mask: PCBWay's, the number of passes is Question 1 of ORDERING.md"
     },
     {
       "Type": "Copper",
       "Thickness": 0.035,
-      "Name": "F.Cu"
+      "Name": "F.Cu",
+      "Notes": "outer base copper 0.5 oz plated to 1 oz finished"
     },
     {
       "Type": "Dielectric",
-      "Thickness": 0.48,
+      "Thickness": 0.1855,
       "Material": "FR4",
-      "Name": "F.Cu/GND",
-      "Notes": "Type: dielectric layer 1 (from F.Cu to GND)"
+      "DielectricConstant": 4.74,
+      "Notes": "prepreg 7628 RC46%, 0.1855 mm after lamination (0.1960 nominal); PCBWay standard stackup 4 layers 1.6MM entry 1, see stackup-note.md",
+      "Name": "F.Cu/GND"
     },
     {
       "Type": "Copper",
       "Thickness": 0.035,
-      "Name": "GND"
+      "Name": "GND",
+      "Notes": "inner copper 1 oz"
     },
     {
       "Type": "Dielectric",
-      "Thickness": 0.48,
+      "Thickness": 1.03,
       "Material": "FR4",
-      "Name": "GND/Power",
-      "Notes": "Type: dielectric layer 2 (from GND to Power)"
+      "DielectricConstant": 4.6,
+      "Notes": "core 1.0300 mm; PCBWay standard stackup 4 layers 1.6MM entry 1, see stackup-note.md",
+      "Name": "GND/Power"
     },
     {
       "Type": "Copper",
       "Thickness": 0.035,
-      "Name": "Power"
+      "Name": "Power",
+      "Notes": "inner copper 1 oz"
     },
     {
       "Type": "Dielectric",
-      "Thickness": 0.48,
+      "Thickness": 0.1855,
       "Material": "FR4",
-      "Name": "Power/B.Cu",
-      "Notes": "Type: dielectric layer 3 (from Power to B.Cu)"
+      "DielectricConstant": 4.74,
+      "Notes": "prepreg 7628 RC46%, 0.1855 mm after lamination (0.1960 nominal); PCBWay standard stackup 4 layers 1.6MM entry 1, see stackup-note.md",
+      "Name": "Power/B.Cu"
     },
     {
       "Type": "Copper",
       "Thickness": 0.035,
-      "Name": "B.Cu"
+      "Name": "B.Cu",
+      "Notes": "outer base copper 0.5 oz plated to 1 oz finished"
     },
     {
       "Type": "SolderMask",
-      "Thickness": 0.01,
-      "Name": "Bottom Solder Mask"
+      "Name": "Bottom Solder Mask",
+      "Notes": "solder mask: PCBWay's, the number of passes is Question 1 of ORDERING.md"
     },
     {
       "Type": "SolderPaste",

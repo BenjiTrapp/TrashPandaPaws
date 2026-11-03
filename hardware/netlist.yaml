@@ -241,7 +241,7 @@ components:
       # it. Everything else is soldered by hand. "placement" is checked against the
       # gerber and the CPL in tests/check_fab_release.py.
       description: "USB 3.0 to 10/100/1000 Ethernet controller, QFN-40 5x5 mm, 0.4 mm pitch, exposed pad (pin 41)."
-      placement: "Pin 1 at the lower right of the part as seen from the front of the board."
+      placement: "Pin-1 dot on the corner of U3 that carries the silkscreen triangle, the corner nearest Y1 (Y1 is centred on one side of U3, so two of U3's corners are equally near it: pin 1 is the one of those two toward J2, the RJ45, and away from J3, the USB plug)."
       distributor: LCSC
       distributor_pn: C2802072     # hardware/review/u3-sourcing.md, checked 2026-11-01
     source: >

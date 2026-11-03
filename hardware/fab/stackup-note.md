@@ -4,8 +4,10 @@ Board: `hardware/kicad/raccoon-tap.kicad_pcb`, 4 layers, 1.6 mm, 1 oz outer
 copper. Layer use: `F.Cu` signals, `In1.Cu` solid GND, `In2.Cu` power, `B.Cu`
 signals plus a GND pour (`netlist.yaml` `stackup`).
 
-This note is attached to the order (task 11), together with
-`fabrication-note.md` (tented vias, assembly split). Every number below has a source
+This note is the basis of the order's stackup and impedance text (task 11):
+`ORDERING.md` states its numbers to PCBWay in a short block and sends this
+note itself only if PCBWay's engineers ask; `fabrication-note.md` (tented vias,
+assembly split) is its companion. Every number below has a source
 or is marked as derived. The PCBWay passages it relies on are quoted verbatim
 in `pcbway-source-excerpts.txt` next to this file, as sections `[1]` to `[4]`
 (fetched 2026-11-02; the full pages are **not** committed, see Open items).
@@ -73,6 +75,11 @@ does not enter the microstrip calculation.
 block (checked with grep), and `gen_pcb.py` only sets four copper layers, so
 the board file carries no dielectric thicknesses. Task 8 regenerates that file
 and may add the table above to it; this task must not touch it.
+KiCad therefore writes its default stackup (0.48 mm per dielectric) into the job
+file `gerber/raccoon-tap-job.gbrjob`; `tools/export_fab.py` replaces it with the
+table above (prepreg 0.1855 mm DK 4.74, core 1.03 mm DK 4.6), and
+`tests/check_fab_release.py` (`JobFileAgreesWithTheStackupNote`) compares the job
+file with this table.
 
 ## Dielectric constant
 
@@ -360,8 +367,17 @@ Margins of this geometry against the first column ("≥5/6 mil", width / spacing
 | `USB3` | 0.20 mm = 7.9 mil | 2.9 mil | pair gap 0.17 mm = 6.7 mil | **0.7 mil** |
 | `MDI` | 0.18 mm = 7.1 mil | 2.1 mil | pair gap 0.21 mm = 8.3 mil | 2.3 mil |
 
-Every other spacing is the class clearance, 0.2 mm = 7.9 mil, 1.9 mil over 6.
-The one thin margin is the 0.17 mm USB3 pair gap (0.7 mil, about 0.02 mm).
+**Correction (task 11, measured on the routed board with pcbnew):** the table
+covers the controlled pairs only. The board as a whole goes below both columns'
+figures for spacing: its minimum spacing is **0.15 mm = 5.9 mil, between adjacent
+pads of U3** (0.4 mm pitch), under the 6 mil of the first column; and its
+minimum track, **0.15 mm = 5.9 mil, runs for 90.5 mm** on 26 nets round U3 and Y1,
+not only in the necks at U3's pads. Other spacings: 0.17 mm (USB3 pair gaps),
+0.19 mm (one USB3_TX_CONN track to C22's pad, inside the pair), otherwise at
+least the class clearance of 0.2 mm = 7.9 mil. The board therefore needs the
+**5/5 mil** class (the second column), and `ORDERING.md` declares 5/5mil on the
+order form. Among the controlled pairs the thin margin remains the 0.17 mm USB3
+pair gap (0.7 mil over 6 mil, about 0.02 mm).
 Row 15 says "(before compensation)": whether PCBWay's compensation changes
 these file values is not stated, so the margin is the margin on the design
 file only. Whether the impedance service applies a stricter figure is Open
@@ -513,8 +529,10 @@ before anything is ordered; none has been asked yet.
    will press. The reading of the 70 % residual-copper entry for a board with a
    solid ground plane is the note's.
 3. **Confirm the minimum width and spacing for the impedance-control
-   service.** None is published on the pages read. If theirs is stricter than
-   5/6 mil, the 0.17 mm USB3 pair gap is the number at risk (0.7 mil margin).
+   service.** None is published on the pages read. The order declares 5/5 mil,
+   which the board needs anyway (0.15 mm track and pad gap, see "Minimum trace
+   width and spacing"). If the impedance service is stricter than that, the
+   0.15 mm necks at U3 and the 0.17 mm USB3 pair gap are the numbers at risk.
 4. **Column header of the capabilities table.** The note reads the first data
    column of row 15 as "Normal process" because it is the first of the
    columns the table header lists ("Normal process | Medium difficulty |

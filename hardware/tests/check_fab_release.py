@@ -2739,6 +2739,7 @@ FAB = HARDWARE / "fab"
 GERBER_DIR = FAB / "gerber"
 MANIFEST_NAME = "release-manifest.json"
 DRC_REPORT_NAME = "raccoon-tap-drc.rpt"
+JOB_NAME = "raccoon-tap-job.gbrjob"
 EXPORT_FAB = HARDWARE / "tools" / "export_fab.py"
 ASSEMBLED_REFS = ("U3", "Y1")
 
@@ -2978,6 +2979,15 @@ class GerberSetIsTheExportOfTheBoard(unittest.TestCase):
             compared += 1
         self.assertGreaterEqual(compared, 11)
         self.assertEqual(set(committed["files"]), set(self.manifest["files"]))
+
+    def test_the_job_file_is_what_a_new_export_gives(self):
+        # the .gbrjob is skipped above for its time stamp; its content (the amended
+        # stackup, finish and file list) must still be the exporter's, not a hand edit
+        def content(path):
+            job = json.loads(Path(path).read_text())
+            job["Header"].pop("CreationDate", None)
+            return job
+        self.assertEqual(content(GERBER_DIR / JOB_NAME), content(self.fresh / JOB_NAME))
 
     def test_the_new_drc_report_is_clean_and_so_is_the_committed_one(self):
         self.assertEqual(drc_report_problems((self.fresh / DRC_REPORT_NAME).read_text()), [])
@@ -3478,7 +3488,11 @@ class AssemblyBomIsTheTwoMachinePlacedParts(unittest.TestCase):
     def test_the_pin_1_text_agrees_with_the_gerber_and_the_cpl(self):
         by_ref = self.by_ref()
         u3 = by_ref["U3"]["Part Description"]
-        self.assertRegex(u3, r"(?i)pin 1 at the lower right of the part as seen from the front")
+        # ruling CB: the text PCBWay's operator reads must not depend on how a picture is turned
+        self.assertRegex(u3, r"(?i)pin-1 dot on the corner of U3 that carries the silkscreen triangle, "
+                             r"the corner nearest Y1")
+        self.assertRegex(u3, r"(?i)toward J2")
+        self.assertNotRegex(u3, r"(?i)\b(left|right|above|below|upper|lower)\b")
         cpl = {r["Designator"]: r for r in read_cpl()}["U3"]
         pad1 = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"]
         self.assertGreater(pad1[0], float(cpl["Mid X"]))        # right
@@ -3681,6 +3695,342 @@ class ReleaseSetIsVersioned(unittest.TestCase):
         result = subprocess.run(["git", "check-ignore", "-q", "gerber/x.gbr"], cwd=HARDWARE,
                                 capture_output=True)
         self.assertEqual(result.returncode, 0)
+
+
+def board_segments(pcb_text):
+    """[(width, length, layer, net)] of every track segment of the board."""
+    out = []
+    for block in re.findall(r"\n\t\(segment\n(.*?)\n\t\)", pcb_text, re.S):
+        sx, sy = map(float, re.search(r"\(start ([-0-9.]+) ([-0-9.]+)\)", block).groups())
+        ex, ey = map(float, re.search(r"\(end ([-0-9.]+) ([-0-9.]+)\)", block).groups())
+        width = float(re.search(r"\(width ([0-9.]+)\)", block).group(1))
+        layer = re.search(r'\(layer "([^"]+)"\)', block).group(1)
+        net = re.search(r'\(net "([^"]*)"\)', block).group(1)
+        out.append((width, math.hypot(ex - sx, ey - sy), layer, net))
+    return out
+
+
+MIL = 0.0254
+
+
+def _ordering_section(text, heading):
+    return text.split(heading, 1)[1].split("\n## ", 1)[0]
+
+
+def _table_row(text, first_cell):
+    return next(l for l in text.splitlines() if l.startswith(f"| {first_cell}"))
+
+
+class OrderingDeclaresTheBoardsProcessClass(unittest.TestCase):
+    """Task 11 review I2: the board carries about 90 mm of 0.15 mm track, not only
+    U3's necks, and its finest gap is 0.15 mm between U3's pads. Both are under
+    6 mil, so the order form must say 5/5 mil. The numbers come from the board."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = ORDERING.read_text()
+        cls.segments = board_segments(PCB.read_text())
+
+    def test_the_finest_track_is_declared_with_its_real_extent(self):
+        finest = min(w for w, *_ in self.segments)
+        thin = [s for s in self.segments if s[0] == finest]
+        length = sum(s[1] for s in thin)
+        self.assertEqual(finest, 0.15)
+        self.assertGreater(length, 50)                     # far more than the necks at U3
+        row = _table_row(self.text, "Tracks")
+        self.assertIn(f"{len(thin)} segments, {length:.1f} mm, at {finest:g} mm", row)
+        self.assertIn(f"on {len({s[3] for s in thin})} nets", row)
+        self.assertEqual({s[2] for s in thin}, {"F.Cu"})
+        self.assertIn("all on `F.Cu`", row)
+        self.assertNotRegex(re.sub(r"\s+", " ", self.text), r"necks of 0\.15 mm for at most 1\.0 mm at U3's pads")
+
+    def test_the_finest_gap_is_u3s_pad_gap_and_is_declared(self):
+        block = footprint_block(PCB.read_text(), "U3")
+        y1 = footprint_local_pad(block, "1")[1]
+        y2 = footprint_local_pad(block, "2")[1]
+        width = float(re.search(r'\n\t\t\(pad "1" \w+ \w+\s+\(at [^)]*\)\s+\(size ([0-9.]+) ([0-9.]+)\)',
+                                block).group(2))
+        gap = round(abs(y2 - y1) - width, 4)
+        self.assertEqual(gap, 0.15)
+        self.assertRegex(_table_row(self.text, "Spacing"), rf"Minimum {gap:g} mm \(5\.9 mil\): between adjacent pads of U3")
+
+    def test_the_form_says_5_5_mil_and_that_is_the_right_class(self):
+        finest = min(w for w, *_ in self.segments)
+        self.assertGreaterEqual(finest, 5 * MIL)           # inside 5/5 mil
+        self.assertLess(finest, 6 * MIL)                   # outside 6/6 mil, the form's default
+        guide = _ordering_section(self.text, "## Placing the order")
+        self.assertRegex(_table_row(guide, "**Min track/spacing**"), r"\*\*5/5mil\*\*.*default is 6/6mil")
+        self.assertRegex(_table_row(self.text, "Process class"), r"\*\*\"Min track/spacing\": 5/5mil\*\*")
+        questions = self.text.split("## Questions for PCBWay", 1)[1]
+        q4 = re.sub(r"\s+", " ", questions.split("\n4. ", 1)[1].split("\n5. ", 1)[0])
+        self.assertIn("5/5mil", q4)
+
+
+def pth_slots(drill_text):
+    """[(width, length, x1, y1, x2, y2)] in mm of every G85 routed slot of an Excellon file."""
+    tools = {t: float(d) for t, d in re.findall(r"^(T\d+)C([0-9.]+)$", drill_text, re.M)}
+    out, tool = [], None
+    for line in drill_text.splitlines():
+        if re.fullmatch(r"T\d+", line):
+            tool = line
+        m = re.fullmatch(r"X([-0-9.]+)Y([-0-9.]+)G85X([-0-9.]+)Y([-0-9.]+)", line)
+        if m:
+            x1, y1, x2, y2 = map(float, m.groups())
+            out.append((tools[tool], math.hypot(x2 - x1, y2 - y1) + tools[tool], x1, y1, x2, y2))
+    return out
+
+
+class OrderingStatesThePlatedSlots(unittest.TestCase):
+    """Task 11 review I4: J3's shell tabs are plated slots, a feature of their own."""
+
+    def test_the_slots_in_the_drill_file_are_stated_with_their_size(self):
+        slots = pth_slots((GERBER_DIR / "raccoon-tap-PTH.drl").read_text())
+        self.assertEqual(len(slots), 2)
+        self.assertEqual({(round(w, 3), round(l, 3)) for w, l, *_ in slots}, {(1.0, 2.5)})
+        text = ORDERING.read_text()
+        row = _table_row(text, "Plated slots")
+        self.assertIn(f"**{len(slots)}, each 1.0 x 2.5 mm, plated", row)
+        self.assertIn("G85", row)
+        for *_, x1, y1, x2, y2 in slots:
+            self.assertIn(f"Y {y1:g}", row)
+            self.assertAlmostEqual((x1 + x2) / 2 - 100, 2.55, places=3)    # from the left edge
+        questions = text.split("## Questions for PCBWay", 1)[1]
+        self.assertRegex(re.sub(r"\s+", " ", questions.split("\n12. ", 1)[1]), r"plated slots, not round holes")
+        self.assertRegex(_ordering_section(text, "## Placing the order"), r"2 PLATED SLOTS, 1\.0 x 2\.5 mm")
+
+
+def stackup_note_dielectrics(note_text):
+    """[(thickness mm, DK)] of the dielectric rows of the stackup note's table,
+    top to bottom: the after-lamination column where it is filled, else nominal."""
+    out = []
+    for row in re.findall(r"^\| (?:prepreg|core) \|.*$", note_text, re.M):
+        cells = [c.strip().strip("*") for c in row.strip("|").split("|")]
+        dk = float(re.search(r"DK:([0-9.]+)", cells[1]).group(1))
+        out.append((float(cells[3] or cells[2]), dk))
+    return out
+
+
+def job_file_problems(job, note_text):
+    problems = []
+    dielectrics = [(l.get("Thickness"), l.get("DielectricConstant"))
+                   for l in job.get("MaterialStackup", []) if l.get("Type") == "Dielectric"]
+    if dielectrics != stackup_note_dielectrics(note_text):
+        problems.append(f"job file dielectrics {dielectrics} are not the stackup note's "
+                        f"{stackup_note_dielectrics(note_text)}")
+    if job["GeneralSpecs"].get("Finish") != "ENIG":
+        problems.append(f"job file finish is {job['GeneralSpecs'].get('Finish')!r}, not ENIG (ruling CA)")
+    if "DesignRules" in job:
+        problems.append("job file carries KiCad's netclass DesignRules")
+    if [l.get("Thickness") for l in job.get("MaterialStackup", []) if l.get("Type") == "Copper"] != [0.035] * 4:
+        problems.append("job file copper is not 1 oz on four layers")
+    if job["GeneralSpecs"].get("BoardThickness") != 1.6:
+        problems.append("job file board thickness is not 1.6 mm")
+    return problems
+
+
+class JobFileAgreesWithTheStackupNote(unittest.TestCase):
+    """Task 11 review I1: the job file goes to PCBWay in the zip, and KiCad wrote
+    0.48 mm dielectrics into it. The exporter amends it; this holds it to the note."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.job = json.loads((GERBER_DIR / JOB_NAME).read_text())
+        cls.note = STACKUP_NOTE.read_text()
+
+    def test_the_note_table_is_what_the_impedance_rests_on(self):
+        rows = stackup_note_dielectrics(self.note)
+        self.assertEqual(rows, [(0.1855, 4.74), (1.03, 4.6), (0.1855, 4.74)])
+        self.assertEqual(rows[0], (STACKUP_H_MM, STACKUP_ER))
+
+    def test_the_committed_job_file_agrees(self):
+        self.assertEqual(job_file_problems(self.job, self.note), [])
+
+    def test_it_lists_every_gerber_that_goes_in_the_zip(self):
+        listed = {f["Path"] for f in self.job["FilesAttributes"]}
+        gerbers = {n for n in zip_files(ORDERING.read_text()) if not n.endswith((".drl", ".gbrjob"))}
+        self.assertEqual(listed, gerbers)
+        paste = next(f for f in self.job["FilesAttributes"] if f["Path"].endswith("F_Paste.gtp"))
+        self.assertEqual(paste["FileFunction"], "Paste,Top")
+
+    def test_kicads_default_stackup_would_fail(self):
+        bad = json.loads(json.dumps(self.job))
+        for layer in bad["MaterialStackup"]:
+            if layer["Type"] == "Dielectric":
+                layer.pop("DielectricConstant", None)
+                layer["Thickness"] = 0.48
+        bad["GeneralSpecs"]["Finish"] = "None"
+        bad["DesignRules"] = [{"Layers": "Outer", "TrackToTrack": 0.2}]
+        self.assertEqual(len(job_file_problems(bad, self.note)), 3)
+
+    def test_the_exporter_refuses_to_override_a_stackup_it_did_not_expect(self):
+        export = load_export_fab()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / JOB_NAME
+            path.write_text(json.dumps(self.job))         # already amended: not KiCad's default
+            with self.assertRaises(export.ExportFailed):
+                export.amend_job_file(path, GERBER_DIR / "raccoon-tap-F_Paste.gtp")
+
+
+def zip_files(ordering_text):
+    """The file names of the `zip` command in ORDERING.md."""
+    line = next(l for l in ordering_text.splitlines() if re.search(r"\bzip ~/\S+\.zip ", l))
+    return line.split(".zip ", 1)[1].split()
+
+
+class OrderingGuidesThePcbwayForm(unittest.TestCase):
+    """Task 11 review I3: the step from "the data exists" to "I can order alone"."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = ORDERING.read_text()
+        cls.guide = _ordering_section(cls.text, "## Placing the order: PCBWay's form, field by field")
+        cls.excerpts = re.sub(r"\s+", " ", __import__("html").unescape(
+            (FAB / "pcbway-source-excerpts.txt").read_text()))
+
+    def test_the_zip_is_the_set_less_what_is_not_for_pcbway(self):
+        manifest = json.loads((GERBER_DIR / MANIFEST_NAME).read_text())["files"]
+        expected = {n for n in manifest if not n.endswith((".rpt", ".pdf"))}
+        names = zip_files(self.text)
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(set(names), expected)
+        self.assertIn(f"exactly these {len(expected)} files", re.sub(r"\s+", " ", self.guide))
+
+    def test_every_ruled_choice_is_a_row_of_the_form_table(self):
+        for field, choice in (("**Min track/spacing**", r"5/5mil"), ("Min hole size", r"0\.3mm"),
+                              ("**Surface finish**", r"Immersion gold\(ENIG\).*ruling CA"),
+                              ("Via process", r"Tenting vias"), ("Layers", r"4 Layers"),
+                              ("Thickness", r"1\.6"), ("Finished copper", r"1 oz"), ("Inner Copper", r"1 oz"),
+                              ("Customized Services and Advanced Options: **Impedance control**", r"tick it"),
+                              ("**All vias filled with resin and capped**", r"operator decides \(ruling BD\)"),
+                              ("Assembly side(s)", r"\*\*Top side\*\*.*ruling BL"),
+                              ("Do you accept alternatives", r"\*\*No\*\*"),
+                              ("Contains sensitive components", r"\*\*Yes\*\*")):
+            self.assertRegex(_table_row(self.guide, field), choice, field)
+
+    def test_the_labels_it_names_are_on_pcbways_page(self):
+        for label in ("Min track/spacing:", "5/5mil", "6/6mil", "Min hole size:", "0.3mm ↑", "Via process:",
+                      "Tenting vias", "Surface finish:", "Immersion gold(ENIG)", "HASL lead free",
+                      "Impedance control", "Custom stackup", "All vias filled with resin and capped",
+                      "Other special request:", "Turnkey", "Kitted or Consigned", "Combo", "Assembly side(s):",
+                      "Contains sensitive components/parts", "Do you accept alternatives/substitutes made in China?",
+                      "Function test:", "Firmware loading:", "Number of Unique Parts:", "FR4-TG", "Edge connector:",
+                      "Remove product No.", "Finished copper:", "Inner Copper:", "The PCBs above need assembly",
+                      "Customized Services and Advanced Options"):
+            self.assertIn(label, self.excerpts, label)
+
+    def test_what_it_quotes_from_pcbway_is_in_the_excerpts(self):
+        flat = re.sub(r"\s+", " ", self.text)
+        quotes = ("For gerber files, we will process according to the files, and this option is invalid.",
+                  "If impedance requirements are specified in the documentation but not selected in the order, "
+                  "it will be regarded as ignoring the impedance requirement.",
+                  "We suggest choose to do panel if single PCB qty is more than 20pcs or any side of single "
+                  "board is smaller than 50mm.",
+                  "We normally will reduce apatures for ICs to make stencil, so if don't want to change the "
+                  "apatures, please note it when place the order.",
+                  "If you check this option, all vias will be filled with resin,then capped and plated cover.",
+                  "ICs with more than 16pins ... (SOP,QFP,QFN,BGA)",
+                  "Normally ... automatically upgraded to TG150 for FREE",
+                  "Select the menu bar Place-> Drilling and Position Offset, place the origin at the bottom left "
+                  "corner of the PCB board frame",
+                  "The board's origin is defined as the (0, 0) value and is located at the lower left corner of "
+                  "the board from a top point of view.",
+                  "Moisture Sensitivity Level (MSL) Level 3")
+        for quote in quotes:
+            self.assertIn(re.sub(r"\s+", " ", quote), flat, quote)
+            if quote.startswith("Moisture"):
+                continue                                   # the Realtek datasheet, checked below
+            for piece in quote.split(" ... "):
+                self.assertIn(piece, self.excerpts, piece)
+
+    def test_the_msl_figure_is_the_datasheets(self):
+        result = subprocess.run(["pdftotext", "-raw", str(HARDWARE / "datasheets" /
+                                 "RTL8153B-VB-CG_rev1.4_lcsc-datasheet.pdf"), "-"],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            self.skipTest("pdftotext not available")
+        self.assertIn("Moisture Sensitivity Level (MSL) Level 3", result.stdout)
+        self.assertIn("Table 25. Environmental Characteristics", result.stdout)
+
+    def test_the_special_requirement_blocks_carry_the_ruled_requirements(self):
+        block_a = re.sub(r"\s+", " ", self.guide.split("### Block A", 1)[1].split("### Block B", 1)[0])
+        for needed in (r"ENIG", r"entry 1", r"0\.1855 mm", r"IMPEDANCE CONTROL", r"90 ohm", r"100 ohm",
+                       r"how many mask passes", r"Do not change any trace width or gap",
+                       r"0\.56/0\.30 mm", r"tented on the bottom", r"9 in U3's exposed pad, 1 in U8 pin 2",
+                       r"PLATED SLOTS", r"U3 and Y1, nothing else", r"no bottom stencil",
+                       r"placement preview before I pay", r"Minimum track 0\.15 mm"):
+            self.assertRegex(block_a, needed)
+        self.assertNotRegex(block_a, r"\bruling\b")        # PCBWay does not know the ledger
+        block_c = self.guide.split("### Block C", 1)[1].split("### 4.", 1)[0]
+        body = "\n".join(l[4:] for l in block_c.splitlines() if l.startswith("    "))
+        self.assertLessEqual(len(body), 500)               # the box's maxlength (excerpt [5])
+        self.assertIn('maxlength="500"', (FAB / "pcbway-source-excerpts.txt").read_text())
+        self.assertIn("MSL 3", body)
+
+
+class PinOneGateIsRotationIndependent(unittest.TestCase):
+    """Ruling CB: the check before payment names U3's pin-1 corner by things on the
+    board (the silkscreen triangle, Y1, J2), not by "lower right", which a turned or
+    mirrored preview makes ambiguous. The geometry it states is the board's."""
+
+    CB = r"U3's pin-1 dot (must sit )?on the corner carrying the silkscreen triangle: the corner nearest Y1"
+
+    def test_both_gate_boxes_state_ruling_cb_and_that_payment_waits(self):
+        text = ORDERING.read_text()
+        boxes = [re.sub(r"\s+", " ", " ".join(l.lstrip("> ") for l in box.splitlines()))
+                 for box in re.findall(r"(?:^>.*\n)+", text, re.M)]
+        gates = [b for b in boxes if "GATE" in b]
+        self.assertEqual(len(gates), 2)
+        for box in gates:
+            self.assertRegex(box, self.CB)
+            self.assertRegex(box, r"(?i)payment waits for")
+            self.assertRegex(box, r"toward J2")
+            self.assertNotRegex(box, r"(?i)lower right|upper left")
+        self.assertLess(text.index("PAYMENT GATE"), text.index("## What is in"))    # seen first
+        q10 = text.split("## Questions for PCBWay", 1)[1].split("\n10. ", 1)[1].split("\n11. ", 1)[0]
+        self.assertNotRegex(q10, r"(?i)lower right")
+        self.assertRegex(re.sub(r"\s+", " ", q10), r"corner carrying the silkscreen triangle, the corner nearest Y1")
+        self.assertRegex(re.sub(r"\s+", " ", _ordering_section(text, "## Placing the order")),
+                         r"(?i)payment waits for that confirmation")
+
+    def test_the_corner_it_names_is_the_pin_one_corner_on_the_board(self):
+        cpl = {r["Designator"]: r for r in read_cpl()}
+        u3 = (float(cpl["U3"]["Mid X"]), float(cpl["U3"]["Mid Y"]))
+        y1 = (float(cpl["Y1"]["Mid X"]), float(cpl["Y1"]["Mid Y"]))
+        pad1 = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"]
+        half = 2.5                                          # QFN-40 5 x 5 mm
+        corners = [(u3[0] + sx * half, u3[1] + sy * half) for sx in (-1, 1) for sy in (-1, 1)]
+        pin1 = min(corners, key=lambda c: math.dist(c, pad1))
+        by_y1 = sorted(corners, key=lambda c: math.dist(c, y1))
+        # "nearest Y1" is a tie of two corners, which is why the gate adds J2
+        self.assertAlmostEqual(math.dist(by_y1[0], y1), math.dist(by_y1[1], y1), places=6)
+        self.assertLess(math.dist(by_y1[1], y1), math.dist(by_y1[2], y1))
+        self.assertIn(pin1, by_y1[:2])
+        pcb = PCB.read_text()
+        def at(ref):
+            x, y = re.search(r"\n\t\t\(at ([-0-9.]+) ([-0-9.]+)", footprint_block(pcb, ref)).groups()
+            return float(x), -float(y)                      # board Y down, CPL and gerber Y up
+        other = by_y1[1] if pin1 == by_y1[0] else by_y1[0]
+        self.assertLess(math.dist(pin1, at("J2")), math.dist(other, at("J2")))
+        self.assertGreater(math.dist(pin1, at("J3")), math.dist(other, at("J3")))
+        # and the silkscreen triangle, carried onto the board, is at that corner
+        block = footprint_block(pcb, "U3")
+        mx, my = footprint_silk_marker(block)
+        rx, ry = _rotate_up(mx, -my, float(cpl["U3"]["Rotation"]))
+        marker = (u3[0] + rx, u3[1] + ry)
+        self.assertEqual(min(corners, key=lambda c: math.dist(c, marker)), pin1)
+
+
+class OrderingCitesItsPcbwayConventions(unittest.TestCase):
+    """Task 11 review I6: the lower-left-origin statement had no source."""
+
+    def test_the_origin_statement_is_quoted_from_a_committed_excerpt(self):
+        excerpts = (FAB / "pcbway-source-excerpts.txt").read_text()
+        self.assertIn("[6] https://www.pcbway.com/helpcenter/design_instruction/Generate_Position_File_in_Kicad.html",
+                      excerpts)
+        text = re.sub(r"\s+", " ", ORDERING.read_text())
+        self.assertNotIn("PCBWay's own KiCad instruction says to put the origin at the lower-left corner; the", text)
+        self.assertRegex(text, r"excerpt \[6\]")
+        self.assertRegex(text, r"(?i)is an assumption to confirm in the quote\**\s*\(Question 10 \(d\)\)")
 
 
 class U3ThermalIsNotLeftSilent(unittest.TestCase):

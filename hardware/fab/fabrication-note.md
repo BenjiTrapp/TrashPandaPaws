@@ -1,7 +1,8 @@
 # Fabrication note: vias, solder mask, assembly
 
-Board: `hardware/kicad/raccoon-tap.kicad_pcb` (routed, task 9). Attach this
-note to the PCBWay order together with `stackup-note.md` (task 11).
+Board: `hardware/kicad/raccoon-tap.kicad_pcb` (routed, task 9). This note is
+the operator's record, next to `stackup-note.md`; what PCBWay is told is the
+short text (block A) under "Placing the order" in `ORDERING.md`.
 
 Assembly split: PCBWay reflows **U3 and Y1** only; every other part is soldered
 by hand with an iron and flux. A via that is open in a pad of a hand-soldered

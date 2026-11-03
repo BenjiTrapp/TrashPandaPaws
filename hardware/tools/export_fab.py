@@ -17,6 +17,15 @@ Writes, into one folder:
     (the board file itself is never written);
   * the DRC report of the board (`kicad-cli pcb drc --severity-all
     --refill-zones`), which has to be clean or nothing is written;
+  * KiCad's job file, `raccoon-tap-job.gbrjob`, amended (`amend_job_file`):
+    the board file has no stackup section, so KiCad writes its default stackup
+    (0.48 mm of FR4 between each pair of copper layers), finish "None" and its
+    netclass clearances as "DesignRules". All three contradict the order. The
+    stackup is replaced by PCBWay's entry 1 as `fab/stackup-note.md` gives it,
+    the finish by ENIG (ruling CA), and the DesignRules block is removed: the
+    board's real minima (0.15 mm track, 0.15 mm gap between U3's pads, 0.17 mm
+    USB3 pair gap) are stated in `fab/ORDERING.md`, not in KiCad's netclass
+    figures. The paste layer, plotted separately, is added to its file list;
   * `release-manifest.json`: SHA-256 of the board, its rules file and its
     project file, of every file in the set, and the KiCad version. The freshness
     check in tests/check_fab_release.py reads it.
@@ -63,6 +72,62 @@ KICAD_CLI = os.environ.get("KICAD_CLI") or shutil.which("kicad-cli") or \
 MANIFEST = "release-manifest.json"
 DRC_REPORT = "raccoon-tap-drc.rpt"
 GERBER_LAYERS = "F.Cu,In1.Cu,In2.Cu,B.Cu,F.Silkscreen,B.Silkscreen,F.Mask,B.Mask,Edge.Cuts"
+JOB_FILE = "raccoon-tap-job.gbrjob"
+PASTE_FILE = "raccoon-tap-F_Paste.gtp"
+FINISH = "ENIG"                                  # ruling CA
+
+# PCBWay "PCB standard stackup", 4 layers, 1.6MM, entry 1, as the table in
+# hardware/fab/stackup-note.md ("## Stackup") gives it; tests/check_fab_release.py
+# reads that table and compares (JobFileAgreesWithTheStackupNote). Thicknesses are
+# after lamination where the note has that column filled, else nominal (the core).
+_PREPREG = {"Type": "Dielectric", "Thickness": 0.1855, "Material": "FR4",
+            "DielectricConstant": 4.74,
+            "Notes": "prepreg 7628 RC46%, 0.1855 mm after lamination (0.1960 nominal); "
+                     "PCBWay standard stackup 4 layers 1.6MM entry 1, see stackup-note.md"}
+_CORE = {"Type": "Dielectric", "Thickness": 1.03, "Material": "FR4", "DielectricConstant": 4.6,
+         "Notes": "core 1.0300 mm; PCBWay standard stackup 4 layers 1.6MM entry 1, see stackup-note.md"}
+_OUTER_CU = "outer base copper 0.5 oz plated to 1 oz finished"
+_INNER_CU = "inner copper 1 oz"
+
+
+def _job_stackup():
+    mask = "solder mask: PCBWay's, the number of passes is Question 1 of ORDERING.md"
+    return [
+        {"Type": "Legend", "Name": "Top Silk Screen"},
+        {"Type": "SolderPaste", "Name": "Top Solder Paste"},
+        {"Type": "SolderMask", "Name": "Top Solder Mask", "Notes": mask},
+        {"Type": "Copper", "Thickness": 0.035, "Name": "F.Cu", "Notes": _OUTER_CU},
+        dict(_PREPREG, Name="F.Cu/GND"),
+        {"Type": "Copper", "Thickness": 0.035, "Name": "GND", "Notes": _INNER_CU},
+        dict(_CORE, Name="GND/Power"),
+        {"Type": "Copper", "Thickness": 0.035, "Name": "Power", "Notes": _INNER_CU},
+        dict(_PREPREG, Name="Power/B.Cu"),
+        {"Type": "Copper", "Thickness": 0.035, "Name": "B.Cu", "Notes": _OUTER_CU},
+        {"Type": "SolderMask", "Name": "Bottom Solder Mask", "Notes": mask},
+        {"Type": "SolderPaste", "Name": "Bottom Solder Paste"},
+        {"Type": "Legend", "Name": "Bottom Silk Screen"},
+    ]
+
+
+def amend_job_file(path, paste_gerber):
+    """Correct KiCad's job file in place (see the module docstring): stackup,
+    finish, no netclass DesignRules, and the separately plotted paste layer in
+    the file list, with the function and polarity its own X2 header declares."""
+    path = Path(path)
+    job = json.loads(path.read_text())
+    if [l.get("Thickness") for l in job["MaterialStackup"] if l["Type"] == "Dielectric"] != [0.48] * 3:
+        raise ExportFailed(f"{path.name}: KiCad's stackup is not the expected default; "
+                           "the board may have gained a stackup section, check it before overriding")
+    job["GeneralSpecs"]["Finish"] = FINISH
+    job.pop("DesignRules", None)
+    job["MaterialStackup"] = _job_stackup()
+    header = Path(paste_gerber).read_text()
+    function = re.search(r"%TF\.FileFunction,([^*]+)\*%", header).group(1)
+    polarity = re.search(r"%TF\.FilePolarity,([^*]+)\*%", header).group(1)
+    files = [f for f in job["FilesAttributes"] if f["Path"] != Path(paste_gerber).name]
+    files.append({"Path": Path(paste_gerber).name, "FileFunction": function, "FilePolarity": polarity})
+    job["FilesAttributes"] = files
+    path.write_text(json.dumps(job, indent=2) + "\n")
 
 
 def assembled_refs(netlist_path=None):
@@ -156,7 +221,8 @@ def export_set(out_dir, drc_problems, board=PCB, dru=DRU, pro=PRO, refs=None):
              *refs])
         run([KICAD_CLI, "pcb", "export", "gerbers", "--layers", "F.Paste",
              "--output", scratch, scratch / "raccoon-tap.kicad_pcb"])
-        shutil.copy(scratch / "raccoon-tap-F_Paste.gtp", out_dir / "raccoon-tap-F_Paste.gtp")
+        shutil.copy(scratch / PASTE_FILE, out_dir / PASTE_FILE)
+    amend_job_file(out_dir / JOB_FILE, out_dir / PASTE_FILE)
 
     if {k: sha256_of(p) for k, p in (("board", board), ("rules", dru), ("project", pro))} != inputs:
         raise ExportFailed("the board, rules or project file changed during the export")

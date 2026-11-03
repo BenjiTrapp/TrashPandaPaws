@@ -11,6 +11,20 @@ Board: `hardware/kicad/raccoon-tap.kicad_pcb`, SHA-256
 The operator solders this board by hand with an iron and flux. **PCBWay places
 two parts and nothing else: U3 and Y1.**
 
+> **PAYMENT GATE (ruling CB). Do not pay until PCBWay's placement preview shows
+> U3's pin-1 dot on the corner carrying the silkscreen triangle: the corner
+> nearest Y1.** Y1 is centred on one side of U3, so two corners of U3 are equally
+> near it; of those two, pin 1 is the one **toward J2 (the RJ45 jack) and away
+> from J3 (the USB plug)**, and it is the only corner of U3 with a filled triangle
+> beside it. This test does not depend on how the preview is turned or mirrored.
+> **Payment waits for your written confirmation of it to PCBWay.** The other
+> checks of the preview are in the box under "CPL" below.
+
+How to use this file: read "The PCB" to "Hand-soldering the rest" once, then
+fill the form with **"Placing the order: PCBWay's form, field by field"**, which
+also has the text to paste into the special-requirements boxes and the exact
+list of files for the zip.
+
 ## What is in `hardware/fab/`
 
 | File | Goes to PCBWay as |
@@ -21,11 +35,11 @@ two parts and nothing else: U3 and Y1.**
 | `gerber/raccoon-tap-Edge_Cuts.gm1` | board outline |
 | `gerber/raccoon-tap-PTH.drl`, `-NPTH.drl` (+ `-drl_map.pdf`) | Excellon drill, plated and non-plated |
 | `gerber/raccoon-tap-F_Paste.gtp` | stencil: **openings for U3 and Y1 only** (see below) |
-| `gerber/raccoon-tap-job.gbrjob` | KiCad's job file; it says surface finish "None" because the board file does not carry one: ignore it, the finish is chosen in the order form: **ENIG** (ruling CA) |
+| `gerber/raccoon-tap-job.gbrjob` | KiCad's X2 job file, **amended by the exporter** (`export_fab.py`, `amend_job_file`): KiCad wrote its default stackup (0.48 mm of FR4 between every pair of layers), finish "None" and its netclass clearances, because the board file has no stackup section. It now carries the stackup of `stackup-note.md` (prepreg 0.1855 mm, DK 4.74; core 1.03 mm), finish **ENIG** (ruling CA), the paste layer in its file list, and no "DesignRules" block (KiCad's 0.2 mm would understate the board; the real minima are under "The PCB"). Goes in the zip |
 | `raccoon-tap-assembly-bom.csv` | the BOM for the assembly: U3 and Y1 |
 | `raccoon-tap-cpl.csv` | component placement list: U3 and Y1 |
-| `stackup-note.md`, `fabrication-note.md`, this file | attach to the order as "special requirements" |
-| `gerber/raccoon-tap-drc.rpt`, `gerber/release-manifest.json` | proof the set is the export of a board that passed DRC (not for PCBWay, for you) |
+| `stackup-note.md`, `fabrication-note.md`, this file | **not pasted into the order**: they are the operator's record and carry internal ruling letters. The text PCBWay gets is the short block under "Placing the order". Send `stackup-note.md` if PCBWay's engineers ask what the impedance geometry rests on |
+| `gerber/raccoon-tap-drc.rpt`, `gerber/release-manifest.json`, `gerber/*-drl_map.pdf` | proof the set is the export of a board that passed DRC, and drill maps for reading (not for PCBWay, for you; not in the zip) |
 
 Not for PCBWay: `hardware/bom.csv` is the **hand-solder BOM**, see below.
 
@@ -61,8 +75,11 @@ A test (`ReleaseSetIsVersioned`) fails if a rule ever starts to ignore it.
 | Copper | 1 oz finished outer, 1 oz inner | stackup note |
 | Stackup | PCBWay "PCB standard stackup", 4 layers, 1.6MM, **entry 1** (7628 RC46% prepreg 0.1855 mm after lamination, DK 4.74; core 1.03 mm; inner residual copper 70 %) | stackup note |
 | Quantity | 5 | task plan |
-| Tracks | 0.18 mm (MDI), 0.20 mm (USB), necks of 0.15 mm for at most 1.0 mm at U3's pads; pair gaps 0.17 mm (USB) and 0.21 mm (MDI); everything else at least 0.2 mm clearance | stackup note |
-| Smallest drill | 0.3 mm (every via); mounting 3.25 mm and 1.1 mm NPTH; through-hole parts 0.9 to 2.7 mm | `raccoon-tap-PTH.drl`, `-NPTH.drl` |
+| Tracks | **Minimum track width 0.15 mm (5.9 mil), and it is not confined to U3's pads.** Measured on the board (pcbnew, every segment): **127 segments, 90.5 mm, at 0.15 mm, all on `F.Cu`, on 26 nets**, inside the area x 16.4 to 31.1 mm, y 15.9 to 32.2 mm from the board's top-left corner (round U3 and Y1). 25.2 mm of it lies in U3's escape area (the square reaching 3.45 mm from U3's centre), including the impedance pairs' necks of 0.5 to 0.6 mm per net at U3's pads; 65.3 mm runs outside it: +1V0 15.5 mm, XTAL1 9.6, +5V_SW 8.9, RSET 7.1, XTAL2_Y1 5.0, XTAL2 4.3, +3V3 4.1, DVDD10_UPS 3.6, GND 3.0, AVDD33_LDO 2.2, ETH_LED1 1.4, ETH_LED0 0.6. Controlled widths: 0.18 mm (MDI), 0.20 mm (USB). Other widths 0.3 to 0.8 mm (power) | board (pcbnew 10.0.6, 2026-11-03) |
+| Spacing | **Minimum 0.15 mm (5.9 mil): between adjacent pads of U3** (0.4 mm pitch, 0.25 mm pads). Then 0.17 mm (USB pair gaps, `F.Cu` and `B.Cu`), 0.19 mm (a USB3_TX_CONN track to C22's pad, inside the pair), and at least 0.2 mm everywhere else; copper pours keep at least 0.30 mm | board (pcbnew, every pair of copper items of different nets) |
+| Process class on the order form | **"Min track/spacing": 5/5mil**, not the form's default 6/6mil: both the track width and the pad gap are 5.9 mil, under 6. 5/5 mil is 0.127 mm, so it holds both with 0.023 mm to spare. PCBWay's Advanced PCB table (row 15, 35 um copper) has "≥5/6 mil" and "≥5/5 mil" in its first two process columns (`pcbway-source-excerpts.txt` [3]); this note reads them as "normal process" and "medium difficulty", so expect 5/5 mil to cost more | form: excerpt [5]; table: excerpt [3] |
+| Smallest drill | 0.3 mm (every via but one); plated holes for parts 0.9, 1.0, 1.02 and 1.7 mm; **H1 and H2, the mounting holes, 2.7 mm plated**; non-plated: 2 x 1.1 mm (J3's locating pegs) and 2 x 3.25 mm (J2's locating pegs) | `raccoon-tap-PTH.drl`, `-NPTH.drl`, board |
+| Plated slots | **2, each 1.0 x 2.5 mm, plated: J3's shell tabs (USB plug, net GND).** Long axis across the board's left edge (along X); centres 2.55 mm from the left edge, 12.15 mm and 23.85 mm from the top edge; copper pad round each 1.6 x 4.0 mm. In `raccoon-tap-PTH.drl` as G85 routed slots (tool T4, 1.0 mm, from X 103.3 to 101.8 at Y -92.15 and at Y -103.85). **They must be made as slots, not round holes**: J3 cannot be fitted otherwise, and a plated slot cannot be added after plating. Question 12 | `raccoon-tap-PTH.drl`; board (J3 pad `SH`, drill 1.0 x 2.5 mm) |
 | Fiducials | 3, 1 mm copper with 2 mm mask opening, at (2.5, 2.5), (47.0, 33.5) and (2.5, 33.5) mm from the top-left corner | board |
 | Surface finish | **ENIG** (ruling CA) | controller ruling CA, below |
 | Solder mask colour | green, PCBWay's default. Do not change it without asking Question 1 again: the mask is part of the impedance. | stackup note |
@@ -72,7 +89,7 @@ the default. The ruling's reason: U3 is a QFN-40 on a 0.4 mm pitch, and ENIG is
 flat, whereas HASL leaves an uneven surface that makes fine-pitch stencil assembly
 and the hand-soldering of the neighbouring parts worse. The extra cost is
 immaterial for five boards against a misplaced or badly soldered U3. The job
-file's "None" (above) is not an instruction. Whether PCBWay's ENIG changes the
+file says ENIG as well (the exporter replaced KiCad's "None", above). Whether PCBWay's ENIG changes the
 impedance numbers is not known: `stackup-note.md` neglects the finish, as PCBWay's own
 calculator does (Question 1 asks them to calculate the pairs with the finish on).
 
@@ -101,7 +118,8 @@ That is three via sizes on two drill diameters (0.3 and 0.4 mm).
 
 The design file already says so (`tenting back yes` on those ten, checked in
 the `B_Mask` gerber: no opening at either place). **State it on the order as
-well**, so that a "vias not covered" default is not applied to them. Every other
+well** (block A under "Placing the order" does), so that a "vias not covered"
+default is not applied to them. Every other
 via follows the board default: tented on both sides.
 
 **Resin-filled and capped vias: a priced option, not decided here (ruling BD).**
@@ -109,10 +127,16 @@ They would remove the open via of U8 pin 2 and make U3's thermal vias solder-
 tight, but PCBWay offers them for all vias of a board and charges for it
 (for a single via it is out of proportion, ruling BD). The price has **not**
 been obtained: PCBWay publishes none, it appears only in the quote form.
-To get it: in PCBWay's Advanced PCB quote (4 layers, 58 x 36 mm, quantity 5) switch on
-the option listed there as "All vias filled with resin and capped" (the wording is
-from a search result for that form; the form itself was not opened, and it may differ)
-and read the difference, then give it to the operator, who decides. If the operator takes the option, the B-side tenting
+To get it: in PCBWay's quote form (4 layers, 58 x 36 mm, quantity 5, every other
+field as under "Placing the order") tick the option listed under "Customized
+Services and Advanced Options" as "All vias filled with resin and capped" (label
+read from the standard quote page on 2026-11-03, excerpt [5]; its tooltip: "If you
+check this option, all vias will be filled with resin,then capped and plated
+cover.") and read the difference, then give it to the operator, who decides. Weigh against it,
+for the present choice: U3's nine paste windows sit over the open tops of its
+thermal vias, which are closed only by the mask at the back. Voids from outgassing,
+or a blown back tent, are the usual risk of that arrangement (a general risk, not
+from a source in this repository); the X-ray in Question 9 is the check. If the operator takes the option, the B-side tenting
 request above becomes moot for the ten vias and Question 7 must be asked
 again for filled 0.3 mm vias.
 
@@ -182,15 +206,27 @@ board with parts on both sides is soldered on both sides by hand.
   page origin of the KiCad file, because the board has no drill/place origin.
   Hence Mid Y is negative. The board outline runs from X 100 to 158 and Y -80 to
   -116. Measured from the board's **lower-left corner**, U3's centre is at
-  (24.0, 13.0) mm and Y1's at (24.0, 5.0) mm. PCBWay's own KiCad instruction
-  says to put the origin at the lower-left corner; the board file was frozen, so
-  the origin was not moved. **The placement preview is a gate before payment, not
-  a courtesy** (Question 10, and the box below).
-* **U3 rotation 180**: with the board seen from the front, pin 1 is at the
-  **lower right** of the package. U3's library pose (rotation 0) has pin 1 at the
-  upper left; the board has it turned half a turn. Pad 1 is at (+2.4375, -1.8) mm
-  from the centre in the gerber, the pin-1 triangle on the silkscreen is just
-  outside the right-hand pad column at the height of pin 1.
+  (24.0, 13.0) mm and Y1's at (24.0, 5.0) mm.
+* **This departs from PCBWay's own KiCad instruction.** PCBWay's help-centre page
+  "Generate Position File Centroid File(pick place) in Kicad" (last updated
+  16/07/2024; fetched 2026-11-03, excerpt [6] in `pcbway-source-excerpts.txt`)
+  says: "Select the menu bar Place-> Drilling and Position Offset, place the
+  origin at the bottom left corner of the PCB board frame". PCBWay's general
+  centroid article (excerpt [7]) says: "The board's origin is defined as the (0,
+  0) value and is located at the lower left corner of the board from a top point
+  of view." The board file is frozen, so its origin was not moved and the CPL
+  keeps the page origin. Whether PCBWay accepts that, or wants the lower-left
+  values above, **is an assumption to confirm in the quote** (Question 10 (d)).
+  **The placement preview is a gate before payment, not a courtesy** (Question 10,
+  and the box below).
+* **U3 rotation 180**: U3's library pose (rotation 0) has pin 1 at the upper
+  left; the board has it turned half a turn. Pad 1 is at (+2.4375, -1.8) mm
+  from the centre in the gerber (Y up), and the pin-1 triangle on the silkscreen
+  is just outside the pad column at the height of pin 1. **To check a picture, do
+  not use "left" or "right"**: a preview may be turned or mirrored. Use ruling
+  CB: the pin-1 dot sits on the corner carrying the silkscreen triangle, the
+  corner nearest Y1 (of the two corners that face Y1, the one toward J2, the RJ45).
+  The board's F.Fab outline has its chamfer at the same corner.
 * How it was verified (`CplRotationIsVerifiedAgainstPinOne`): the rotation is
   derived from where the **copper gerber** has pad 1 (from its X2 attribute
   `%TO.P,U3,1`), less where the footprint puts pad 1 at rotation 0; then the
@@ -220,12 +256,15 @@ board with parts on both sides is soldered on both sides by hand.
   A QFN placed half a turn out is a dead board, so look at the picture.
 
 > **GATE: do not pay until you have seen PCBWay's placement preview of this CPL and
-> have confirmed it yourself.** U3's pin 1 at the **lower right** of the package as seen
-> from the front, Y1's long axis along the long axis of its pads, both on the top
-> side, both inside the outline. The preview is the real safeguard against a format
-> or rotation mismatch; every check in this repository confirms the CPL against the
-> board, none confirms it against PCBWay. If the preview disagrees, stop and correct
-> the CPL (or have PCBWay's engineers do it, in writing) before paying.
+> have confirmed it yourself.** **U3's pin-1 dot must sit on the corner carrying the
+> silkscreen triangle: the corner nearest Y1** (ruling CB; of the two corners of U3
+> that face Y1, the one toward J2, the RJ45, and away from J3, the USB plug). Y1's
+> long axis along the long axis of its pads, both parts on the top side, both inside
+> the outline. These tests hold however the picture is turned or mirrored. The
+> preview is the real safeguard against a format or rotation mismatch; every check
+> in this repository confirms the CPL against the board, none confirms it against
+> PCBWay. **Payment waits for that confirmation.** If the preview disagrees, stop and
+> correct the CPL (or have PCBWay's engineers do it, in writing) before paying.
 
 ## Sourcing
 
@@ -241,9 +280,13 @@ From `hardware/review/u3-sourcing.md` (checked 2026-11-01):
   you recommend" and that "No substitutes will be used without getting your
   approval".
 * **Fallback: consign.** If PCBWay answers "cannot source" or quotes a silly
-  price, the operator buys 8 pieces (5 + 3 spare) from LCSC (about $28.5 to $30.4,
-  plus shipping and import VAT) and sends them on **one continuous cut-tape strip**
-  with the markings on every package matching the BOM.
+  price, the operator buys 8 pieces (5 + 3 spare) from LCSC ($28.52 for 8 at the
+  1-piece price, or $30.35 for 10 at the 10-piece price, `u3-sourcing.md`; plus
+  shipping and import VAT) and sends them on **one continuous cut-tape strip**
+  with the markings on every package matching the BOM. U3 is **MSL 3** ([RTL-DS]
+  table 25, "Moisture Sensitivity Level (MSL) Level 3"): ask LCSC for dry pack, or
+  tell PCBWay the strip must be baked before reflow (the form's "sensitive
+  components" box, below).
 * Do **not** buy U3 from brokers (UppConn, PCBX, DigiPart, eBay): possibly
   relabelled stock, for a part that cannot be replaced.
 
@@ -252,8 +295,9 @@ From `hardware/review/u3-sourcing.md` (checked 2026-11-01):
 DigiKey (27,729 in stock, $0.884 at 10) and Mouser (9,289), both of which PCBWay
 names first. The assembly BOM carries the manufacturer part number only; **no
 DigiKey or Mouser part number is recorded** (none was verified). Check the
-variant: distributor listings disagree on whether "D2Y" is ±20 or ±50 ppm; either
-satisfies [RTL-DS] table 23, but confirm ±30 ppm on the order confirmation.
+variant: distributor listings disagree on whether the D2Y **tolerance at 25 C** is
+±20 or ±50 ppm; either satisfies [RTL-DS] table 23. What to confirm on the order
+confirmation is the **stability over 0 to 70 C: ±30 ppm** (`netlist.yaml`, Y1).
 
 ## Hand-soldering the rest
 
@@ -264,6 +308,109 @@ solder them from it). R12 and C24 are DNP (column Populate): leave the pads empt
 The three bottom-side parts C9, C14, C27 are lines of the 100 nF row. U8 pin 2's
 via and the rest of the assembly notes are in `fabrication-note.md`; its first-
 build checks (SuperSpeed link, thermals of U3) come after the first board is up.
+
+## Placing the order: PCBWay's form, field by field
+
+The labels below are copied from PCBWay's standard quote page
+(`https://www.pcbway.com/orderonline.aspx`, fetched 2026-11-03; the passages are
+excerpt [5] in `pcbway-source-excerpts.txt`). The page was read as HTML, not
+filled in or submitted, so the steps after it (upload, checkout, where the BOM and
+CPL are attached) **were not seen**; where this table says "not known", it is not.
+If a label on the live form differs, go by the meaning, and ask rather than guess.
+
+### 1. The zip with the board data
+
+From the repository root:
+
+    python3 hardware/tests/check_fab_release.py -v
+    cd hardware/fab/gerber && zip ~/raccoon-tap-pcbway.zip raccoon-tap-F_Cu.gtl raccoon-tap-GND.g1 raccoon-tap-Power.g2 raccoon-tap-B_Cu.gbl raccoon-tap-F_Mask.gts raccoon-tap-B_Mask.gbs raccoon-tap-F_Silkscreen.gto raccoon-tap-B_Silkscreen.gbo raccoon-tap-Edge_Cuts.gm1 raccoon-tap-F_Paste.gtp raccoon-tap-PTH.drl raccoon-tap-NPTH.drl raccoon-tap-job.gbrjob
+
+Do not zip until the check passes. The zip holds exactly these 13 files: four
+copper layers, two masks, two legends, the outline, the top paste layer (U3 and Y1
+only), the plated and non-plated drill files and the job file. Not in it: the DRC
+report, the manifest and the two drill-map PDFs. The assembly BOM and the CPL are
+separate uploads for the assembly (`raccoon-tap-assembly-bom.csv`,
+`raccoon-tap-cpl.csv`); where PCBWay asks for them is **not known** (not on the
+quote page).
+
+### 2. PCB section
+
+| Field on the form | Choose | Why |
+|---|---|---|
+| Board type | Single pieces | five single boards. The assembly section of the same page says: "We suggest choose to do panel if single PCB qty is more than 20pcs or any side of single board is smaller than 50mm." This board is 36 mm on one side, so expect PCBWay to propose rails or a panel (Question 9); accept or refuse it when they do |
+| Size (single) | 58 x 36 mm | outline |
+| Quantity (single) | 5 | |
+| Layers | 4 Layers | |
+| Material | FR-4 | |
+| FR4-TG | the form's default | the design does not specify a TG. The page says multilayer FR-4 is "Normally ... automatically upgraded to TG150 for FREE", with exceptions such as custom stackup and resin-filled vias |
+| Thickness | 1.6 | |
+| **Min track/spacing** | **5/5mil** (the form's default is 6/6mil: change it) | the board's minimum track and minimum gap are both 0.15 mm = 5.9 mil (see "The PCB") |
+| Min hole size | 0.3mm ↑ | smallest drill 0.3 mm |
+| Solder mask | Green | the mask is part of the impedance; do not change it without asking Question 1 again |
+| Silkscreen | White | the design specifies no colour; white is the default |
+| Edge connector | No | |
+| **Surface finish** | **Immersion gold(ENIG)** (the default is HASL lead free: change it) | ruling CA. Thickness of immersion gold: the design does not specify one; leave the default |
+| Via process | Tenting vias | the page says of this field: "For gerber files, we will process according to the files, and this option is invalid." The mask gerbers already tent every via on both sides except ten that are open on the top only (U3's nine, U8 pin 2's) |
+| Finished copper | 1 oz Cu | |
+| Inner Copper | 1 oz | |
+| Remove product No. | the operator's choice | not a design requirement |
+| Customized Services and Advanced Options: **Impedance control** | **tick it** | the page warns: "If impedance requirements are specified in the documentation but not selected in the order, it will be regarded as ignoring the impedance requirement." |
+| Custom stackup | leave unticked | the board uses PCBWay's own standard stackup, entry 1, named in the text below. Whether PCBWay needs this box ticked to hold a named standard entry is Question 2; tick it only if they say so |
+| **All vias filled with resin and capped** | **the operator decides (ruling BD)** | to get the price: quote once without and once with it ticked, read the difference, give it to the operator. Not ticked unless the operator says so |
+| Every other advanced option (castellated holes, edge plating, via in pad, ...) | unticked | none is used |
+| **Other special request** | **paste block A below** | |
+| SMD-Stencil, "Order together with PCB" | **not known** whether PCBWay's assembly brings its own stencil (Question 9). If you order one here: Stencil side Top, and paste block B into its "Other Special request" box | the stencil is cut from `raccoon-tap-F_Paste.gtp` |
+
+### 3. Assembly section ("The PCBs above need assembly": tick it)
+
+| Field on the form | Choose | Why |
+|---|---|---|
+| 3 flexible options | **Turnkey** if PCBWay buys both parts (U3 from LCSC `C2802072`, named in the BOM; Y1 by manufacturer part number); **Combo** if the operator consigns U3 (fallback, "Sourcing" above) | operator's decision |
+| Board type | Single pieces (see the PCB section's row) | |
+| Assembly side(s) | **Top side** | U3 and Y1 are both on top. The three bottom parts are hand-soldered (ruling BL), so not "Both sides" |
+| Quantity | 5 | |
+| Contains sensitive components/parts | **Yes**, and paste block C into the box that opens | U3 is MSL 3 |
+| Do you accept alternatives/substitutes made in China? | **No** | U3 has no substitute; Y1 is ruled to be the ABM8 (ruling AC) |
+| Function test | No | |
+| Firmware loading | No | |
+| Number of Unique Parts | 2 | |
+| Number of SMD Parts | 2 | per board |
+| Number of BGA/QFP Parts | 1 | U3; the form's own hint counts "ICs with more than 16pins ... (SOP,QFP,QFN,BGA)" |
+| Number of Through-Hole Parts | 0 | PCBWay fits none |
+
+### Block A: PCB "Other special request" (paste as it stands)
+
+    4 layers, 1.6 mm, 1 oz outer / 1 oz inner, ENIG, green mask, white legend.
+    Stackup: your standard 4-layer 1.6MM stackup, entry 1 (7628 RC46% prepreg, 0.1855 mm after lamination, DK 4.74; core 1.03 mm). The job file in the zip carries the same stackup.
+    IMPEDANCE CONTROL, L1 (top) referenced to L2 (GND): 90 ohm differential +/-10% at 0.20 mm track / 0.17 mm gap (nets USB3_*, USB2_*); 100 ohm differential +/-10% at 0.18 mm / 0.21 mm gap (nets MDI0..MDI3). The geometry already allows 8 ohm for ONE pass of solder mask. Before production, tell me how many mask passes you print and the widths you calculate. Do not change any trace width or gap without asking me first. Please supply an impedance test coupon and report.
+    Minimum track 0.15 mm (5.9 mil); minimum spacing 0.15 mm (between QFN pads).
+    Vias: 121 x 0.6/0.3 mm, 1 x 0.8/0.4 mm, and 1 x 0.56/0.30 mm (0.13 mm annular ring): please confirm it is within your process.
+    Via covering as in the mask gerbers: all vias tented on both sides, except 10 vias inside pads (9 in U3's exposed pad, 1 in U8 pin 2) that are open on top and must stay tented on the bottom.
+    2 PLATED SLOTS, 1.0 x 2.5 mm, for J3 (G85 in the PTH drill file): please make them as slots, not round holes.
+    Partial assembly, top side only: U3 and Y1, nothing else (BOM and CPL attached). Three parts on the bottom are soldered by hand later: no bottom stencil, no bottom assembly.
+    Please send the placement preview before I pay, and wait for my confirmation.
+
+### Block B: stencil "Other Special request" (only if a stencil is ordered there)
+
+    Top side only. Openings for U3 and Y1 only, as in raccoon-tap-F_Paste.gtp; no other pad gets paste. U3's exposed pad is already split into 9 windows. Please ask me before changing any aperture.
+
+The tooltip of that box says: "We normally will reduce apatures for ICs to make
+stencil, so if don't want to change the apatures, please note it when place the
+order." Block B asks to be told, rather than forbidding a change: whether Y1's
+apertures should be reduced is PCBWay's call to propose and the operator's to
+accept.
+
+### Block C: assembly, "Contains sensitive components/parts" (max. 500 characters)
+
+    RTL8153B-VB-CG (U3): moisture sensitivity level MSL 3 (Realtek datasheet, table 25). If the parts are not in sealed dry pack, it needs to bake before placement. QFN-40, 0.4 mm pitch, exposed pad: please X-ray the exposed pad.
+
+### 4. Before paying
+
+1. PCBWay's answers to the questions below, Question 1 (mask passes) first.
+2. The operator's decisions: resin fill (price from the resin row of section 2), U3
+   bought or consigned.
+3. **The placement preview, checked against the payment gate at the top of this
+   file (ruling CB). Payment waits for that confirmation.**
 
 ## Questions for PCBWay
 
@@ -277,12 +424,18 @@ Not yet asked. Answers go into the order and, where they change a number, into
    0.21) with your mask and your ENIG finish on and tell me the widths you would use.
 2. **Confirm the stackup:** 4 layers, 1.6MM, entry 1 of your standard list
    (7628 RC46%, 0.1855 mm after lamination, DK 4.74, 70 % residual copper) for a
-   board with a solid ground plane; or state the stackup you will press.
+   board with a solid ground plane; or state the stackup you will press. Do I
+   need to tick "Custom stackup" for you to hold that entry? (The job file in the
+   zip carries the same stackup; KiCad's default of 0.48 mm per dielectric was
+   replaced by the exporter, so if your CAM reads a different stackup from it, tell
+   me.)
 3. **Will you change any trace width or gap on the controlled pairs?** If so,
    send an engineering question first; I do not accept silent compensation.
-4. **Minimum width and spacing in the impedance-control service**, if stricter than
-   5/6 mil: the USB pair gap is 0.17 mm (6.7 mil, 0.7 mil over 6 mil) and the
-   necks at U3 are 0.15 mm (5.9 mil).
+4. **Process class: I have declared "Min track/spacing" 5/5mil.** The board's
+   minimum track is 0.15 mm (5.9 mil), about 90 mm of it on the top layer round
+   U3 and Y1, and its minimum spacing is 0.15 mm (5.9 mil) between U3's pads.
+   Confirm that 5/5 mil covers it, and tell me if the impedance-control service has
+   a stricter minimum: the USB pair gap is 0.17 mm (6.7 mil).
 5. **Impedance report:** will a test coupon and report come with the boards, and at
    what cost?
 6. **Vias covered from the back (ten, listed above):** confirm they are tented,
@@ -291,7 +444,8 @@ Not yet asked. Answers go into the order and, where they change a number, into
    Same for the 0.3 mm drill generally.
 8. **Resin-filled and capped vias for the whole board: the price difference** for 5
    boards (ruling BD). Operator decides.
-9. **Assembly, U3 and Y1 only:** setup / engineering fee; stencil fee and whether
+9. **Assembly, U3 and Y1 only:** setup / engineering fee; whether the assembly
+   includes its own stencil or I must order one in the PCB form; stencil fee and whether
    one-sided; placement fee for 2 positions x 5; **X-ray of the QFN's exposed pad,
    included or charged**; part cost as you charge it and the spare quantity you add;
    whether you accept **LCSC C2802072** for U3 (say so before ordering if you cannot);
@@ -299,18 +453,26 @@ Not yet asked. Answers go into the order and, where they change a number, into
    minimum-order surcharge. Also: does the board need rails, tabs or a panel for the
    machine (it has none), and will it be delivered as single boards?
 10. **Placement preview and CPL format: a hard gate before I pay.** Send me the
-    preview of U3 and Y1 on the board **before** I pay, with U3's pin 1 at the lower
-    right and the pads of Y1 matched, and wait for my confirmation. Also tell me, for
+    preview of U3 and Y1 on the board **before** I pay, and wait for my confirmation.
+    I will check that U3's pin-1 dot sits on the corner carrying the silkscreen
+    triangle, the corner nearest Y1 (of the two corners facing Y1, the one toward the
+    RJ45 jack J2), and that Y1's pads are matched. Also tell me, for
     this CPL, whether you accept: (a) the rotation convention (KiCad's, counter-clockwise
     from the library pose); (b) the `Layer` value `Top`, or do you need `T` / `Top` /
     `TopLayer`; (c) Mid X and Mid Y as plain millimetre numbers **without** a unit
     suffix; (d) a **negative** Mid Y and an origin that is the page origin, not the
-    board's corner (positions from the lower-left corner are in the table above); (e)
+    board's corner, although your KiCad instruction puts the origin at the bottom
+    left corner of the board (positions from the lower-left corner: U3 24.0 / 13.0 mm,
+    Y1 24.0 / 5.0 mm); (e)
     the columns Designator, Val, Package, Mid X, Mid Y, Rotation, Layer, in that
     order; or send me your template.
 11. **Surface finish:** ENIG is ruled (ruling CA) and goes on the order form. Confirm
     that your ENIG is available for this build (4 layers, 1.6 mm, 5 pieces, 0.15 mm
-    necks) and give the price against lead-free HASL, for the record only.
+    minimum track) and give the price against lead-free HASL, for the record only.
+12. **J3's two plated slots, 1.0 x 2.5 mm** (G85 routed slots in the PTH drill
+    file, centres 2.55 mm from the left edge and 12.15 / 23.85 mm from the top):
+    confirm they will be made as plated slots, not round holes, and state your slot
+    tolerance.
 
 ## What is not yet in hand (for a human)
 
@@ -323,7 +485,7 @@ Not yet asked. Answers go into the order and, where they change a number, into
   12 Nov 2008) section 5.3.1.2, Table 5-2 "USB 3.0 Standard-A Connector Pin Assignments",
   with its note that Tx and Rx are defined from the host's perspective. That citation
   stands by itself; it was enough for the release (ruling U).
-* **PCBWay's answers** to the eleven questions, and the quote. **The placement
+* **PCBWay's answers** to the twelve questions, and the quote. **The placement
   preview (Question 10) is a gate: no payment before the operator has seen it.**
 * **Decisions** for the operator: resin-filled vias (ruling BD), U3 bought by PCBWay
   or consigned, Y1 from DigiKey or Mouser. The surface finish is no longer one: it
