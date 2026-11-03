@@ -253,6 +253,12 @@ _YAML_SECRET_PATHS = (("agent", "llm", "api_key"),
                       ("agent", "service", "agent_token"))
 
 _API_KEY_ENV = "AGENT_API_KEY"
+# Bedrock's own variable, read only when the provider is bedrock. An AWS
+# caller already keeps the token there, so requiring it to be copied into a
+# second place would mean one more copy of a credential for no gain — and
+# the copy is the thing that ends up committed. AGENT_API_KEY still wins, so
+# a deployment with several providers configured stays explicit.
+_BEDROCK_KEY_ENV = "AWS_BEARER_TOKEN_BEDROCK"
 _C2_TOKEN_ENV = "RACCOON_TOKEN"
 _AGENT_TOKEN_ENV = "RACCOON_AGENT_TOKEN"
 
@@ -386,6 +392,8 @@ def load(argv=None, yaml_path=None, env=None) -> AgentConfig:
 
     key_file = values.pop("api_key_file")
     api_key = _read_keyfile(key_file) if key_file else _from_env(env, _API_KEY_ENV)
+    if not api_key and str(values.get("provider") or "").lower() == "bedrock":
+        api_key = _from_env(env, _BEDROCK_KEY_ENV)
 
     tier = values.pop("capability_tier") or llm_provider.capability_tier(
         values["model"], values["provider"])

@@ -11,6 +11,7 @@ without a live API. The one test of the real transport function replaces the
 
 import ast
 import asyncio
+import copy
 import json
 import sys
 import traceback
@@ -21,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from software.agent.llm import anthropic_client, openai_client, provider
+from software.agent.llm import bedrock_client, anthropic_client, openai_client, provider
 
 _KEY = "sk-live-SECRET-0123456789abcdef"
 
@@ -936,3 +937,230 @@ class TestNoNewDependencies(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── Bedrock: the Converse API ──
+
+_BEDROCK_MODEL = "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+_BEDROCK_REPLY = {
+    "output": {"message": {"role": "assistant", "content": [
+        {"text": "looking"},
+        {"toolUse": {"toolUseId": "tooluse_abc", "name": "run_command",
+                     "input": {"command": "whoami", "beacon_id": "b1"}}}]}},
+    "stopReason": "tool_use",
+    "usage": {"inputTokens": 585, "outputTokens": 75, "totalTokens": 660},
+}
+
+
+def _bedrock(stub, **kw):
+    return bedrock_client.BedrockClient(
+        model=_BEDROCK_MODEL, api_key=_KEY, transport=stub, **kw)
+
+
+class TestBedrockWireFormat(unittest.IsolatedAsyncioTestCase):
+    """The four places Converse differs from the Anthropic Messages API.
+
+    Each one is where an implementation copied from the Anthropic client
+    would break, so each one is asserted against the documented shape rather
+    than against whatever the code happens to produce. Verified once against
+    the live endpoint before these were written.
+    """
+
+    def _request(self, messages=None, tools=None, system="sys"):
+        stub = _Stub(_BEDROCK_REPLY)
+        client = _bedrock(stub)
+        return client._build_request(
+            system, messages if messages is not None
+            else [{"role": "user", "content": "go"}],
+            tools or [], 300, 0.25)
+
+    def test_the_model_id_is_in_the_path_not_the_body(self):
+        url, _, body = self._request()
+        self.assertTrue(url.endswith("/model/%s/converse" % _BEDROCK_MODEL), url)
+        self.assertNotIn("model", body)
+
+    def test_the_region_prefixed_id_survives_the_url(self):
+        # A bare id is rejected by the API, and the "-v1:0" suffix must not
+        # be read as a port.
+        url, _, _ = self._request()
+        self.assertIn("eu.anthropic.", url)
+        self.assertIn("-v1:0/converse", url)
+
+    def test_system_is_a_list_of_blocks(self):
+        _, _, body = self._request(system="be careful")
+        self.assertEqual(body["system"], [{"text": "be careful"}])
+
+    def test_no_system_key_when_there_is_no_system_prompt(self):
+        _, _, body = self._request(system="")
+        self.assertNotIn("system", body)
+
+    def test_limits_go_in_inference_config(self):
+        _, _, body = self._request()
+        self.assertEqual(body["inferenceConfig"],
+                         {"maxTokens": 300, "temperature": 0.25})
+
+    def test_a_tool_is_wrapped_in_a_toolspec_with_a_json_schema(self):
+        spec = provider.ToolSpec(
+            name="run_command", description="run it",
+            parameters={"type": "object", "properties": {}})
+        _, _, body = self._request(tools=[spec])
+        self.assertEqual(body["toolConfig"]["tools"], [{"toolSpec": {
+            "name": "run_command", "description": "run it",
+            "inputSchema": {"json": {"type": "object", "properties": {}}}}}])
+
+    def test_the_token_travels_as_a_bearer_header(self):
+        _, headers, _ = self._request()
+        self.assertEqual(headers["Authorization"], "Bearer " + _KEY)
+
+    def test_blocks_are_single_key_objects_not_tagged_ones(self):
+        # {"text": ...}, not {"type": "text", "text": ...}.
+        _, _, body = self._request()
+        block = body["messages"][0]["content"][0]
+        self.assertEqual(block, {"text": "go"})
+
+    def test_a_tool_result_is_a_block_in_a_user_message(self):
+        _, _, body = self._request(messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "t1", "name": "run_command",
+                             "arguments": {"command": "whoami"}}]},
+            {"role": "tool", "tool_call_id": "t1", "content": "root"}])
+        last = body["messages"][-1]
+        self.assertEqual(last["role"], "user")
+        self.assertEqual(last["content"], [{"toolResult": {
+            "toolUseId": "t1", "content": [{"text": "root"}],
+            "status": "success"}}])
+
+    def test_results_for_one_turn_merge_into_a_single_user_message(self):
+        _, _, body = self._request(messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "t1", "name": "a", "arguments": {}},
+                            {"id": "t2", "name": "b", "arguments": {}}]},
+            {"role": "tool", "tool_call_id": "t1", "content": "one"},
+            {"role": "tool", "tool_call_id": "t2", "content": "two"}])
+        self.assertEqual(len(body["messages"]), 3)
+        self.assertEqual(len(body["messages"][-1]["content"]), 2)
+
+    def test_tool_results_come_first_in_a_user_message(self):
+        _, _, body = self._request(messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "t1", "name": "a", "arguments": {}}]},
+            {"role": "user", "content": "and also this"},
+            {"role": "tool", "tool_call_id": "t1", "content": "root"}])
+        content = body["messages"][-1]["content"]
+        self.assertIn("toolResult", content[0])
+
+    def test_an_assistant_turn_is_never_an_empty_content_list(self):
+        # The API rejects one, and a turn with neither text nor a call is
+        # what a failed completion leaves behind.
+        _, _, body = self._request(messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": ""}])
+        self.assertEqual(body["messages"][-1]["content"], [{"text": ""}])
+
+    def test_an_unsupported_role_is_a_provider_error(self):
+        with self.assertRaises(provider.ProviderError):
+            self._request(messages=[{"role": "system", "content": "no"}])
+
+
+class TestBedrockResponse(unittest.IsolatedAsyncioTestCase):
+    async def _complete(self, payload):
+        stub = _Stub(payload)
+        return await _bedrock(stub).complete(
+            "sys", [{"role": "user", "content": "go"}], [], 300, 0.0)
+
+    async def test_text_and_tool_use_are_both_read(self):
+        out = await self._complete(_BEDROCK_REPLY)
+        self.assertEqual(out.text, "looking")
+        self.assertEqual(len(out.tool_calls), 1)
+
+    async def test_tool_use_input_arrives_already_parsed(self):
+        # Unlike OpenAI, which sends a JSON string. parse_arguments passes a
+        # dict through, so this must not end up double-decoded.
+        call = (await self._complete(_BEDROCK_REPLY)).tool_calls[0]
+        self.assertEqual(call.arguments,
+                         {"command": "whoami", "beacon_id": "b1"})
+        self.assertIsNone(call.error)
+        self.assertEqual(call.id, "tooluse_abc")
+
+    async def test_token_counts_use_the_camel_case_names(self):
+        out = await self._complete(_BEDROCK_REPLY)
+        self.assertEqual((out.input_tokens, out.output_tokens), (585, 75))
+        self.assertEqual(out.total_tokens, 660)
+
+    async def test_a_missing_total_is_derived(self):
+        payload = copy.deepcopy(_BEDROCK_REPLY)
+        del payload["usage"]["totalTokens"]
+        out = await self._complete(payload)
+        self.assertEqual(out.total_tokens, 585 + 75)
+
+    async def test_the_stop_reason_passes_through(self):
+        self.assertEqual((await self._complete(_BEDROCK_REPLY)).stop_reason,
+                         "tool_use")
+
+    async def test_blocks_the_loop_does_not_use_are_ignored(self):
+        payload = copy.deepcopy(_BEDROCK_REPLY)
+        payload["output"]["message"]["content"].insert(
+            0, {"reasoningContent": {"reasoningText": {"text": "thinking"}}})
+        out = await self._complete(payload)
+        self.assertEqual(out.text, "looking")
+        self.assertEqual(len(out.tool_calls), 1)
+
+    async def test_an_unreadable_tool_input_is_reported_on_the_call(self):
+        payload = copy.deepcopy(_BEDROCK_REPLY)
+        payload["output"]["message"]["content"][1]["toolUse"]["input"] = "nope"
+        call = (await self._complete(payload)).tool_calls[0]
+        self.assertIsNotNone(call.error)
+
+    async def test_an_empty_output_is_a_provider_error_not_a_crash(self):
+        with self.assertRaises(provider.ProviderError):
+            await self._complete({"stopReason": "end_turn"})
+
+
+class TestBedrockSelection(unittest.TestCase):
+    def test_the_provider_is_offered(self):
+        self.assertIn("bedrock", provider._PROVIDERS)
+
+    def test_create_client_builds_a_bedrock_client(self):
+        client = provider.create_client(
+            _cfg(provider="bedrock", api_key=_KEY, model=_BEDROCK_MODEL))
+        self.assertIsInstance(client, bedrock_client.BedrockClient)
+
+    def test_the_default_endpoint_is_regional(self):
+        self.assertEqual(provider.bedrock_base_url("eu-west-1"),
+                         "https://bedrock-runtime.eu-west-1.amazonaws.com")
+
+    def test_a_key_is_required(self):
+        with self.assertRaises(provider.ProviderError):
+            provider.create_client(
+                _cfg(provider="bedrock", api_key=None, model=_BEDROCK_MODEL))
+
+    def test_a_model_is_required(self):
+        with self.assertRaises(provider.ProviderError):
+            provider.create_client(
+                _cfg(provider="bedrock", api_key=_KEY, model=None))
+
+    def test_a_bedrock_model_id_reaches_the_full_tier(self):
+        # The region prefix must not stop the allowlist matching.
+        self.assertEqual(provider.capability_tier(_BEDROCK_MODEL, "bedrock"),
+                         "full")
+
+    def test_the_key_is_absent_from_every_rendering(self):
+        client = provider.create_client(
+            _cfg(provider="bedrock", api_key=_KEY, model=_BEDROCK_MODEL))
+        self.assertNotIn(_KEY, repr(client))
+        self.assertNotIn(_KEY, str(client))
+        self.assertNotIn(_KEY, repr(vars(client)))
+
+    def test_a_failure_leaks_neither_the_key_nor_a_chain(self):
+        import asyncio
+        stub = _Stub(RuntimeError("headers %r" % {"Authorization": _KEY}))
+        client = _bedrock(stub)
+        with self.assertRaises(provider.ProviderError) as caught:
+            asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+                client.complete("s", [{"role": "user", "content": "x"}],
+                                [], 10, 0.0))
+        self.assertNotIn(_KEY, _walk_chain(caught.exception))

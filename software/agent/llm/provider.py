@@ -401,6 +401,9 @@ _LOOPBACK_NAMES = ("localhost",)
 # wrong one fails only at the first call, long after configuration.
 _PROVIDERS = {
     "anthropic":  ("anthropic", "https://api.anthropic.com", True, False),
+    # Bedrock's default endpoint is regional, so it is computed rather than
+    # written here; see bedrock_base_url.
+    "bedrock":    ("bedrock", None, True, False),
     "openrouter": ("openai", "https://openrouter.ai/api/v1", True, False),
     "opencode":   ("openai", None, True, True),
     "local":      ("openai", "http://127.0.0.1:11434/v1", False, False),
@@ -430,10 +433,34 @@ def _checked_base_url(name: str, url: str, has_key: bool) -> str:
     return url
 
 
+# ── Bedrock's regional endpoint ──
+
+_BEDROCK_DEFAULT_REGION = "eu-central-1"
+
+
+def bedrock_base_url(region=None) -> str:
+    """The Converse endpoint for a region.
+
+    Regional rather than fixed, and defaulting to an EU region: a model id
+    carries its own region prefix (eu., us.), and sending an EU id to a US
+    endpoint fails at the first call rather than at configuration. The
+    environment's AWS_REGION is read here because that is where an AWS
+    caller already keeps it; the config cascade can still override it with
+    an explicit base_url.
+    """
+    if not region:
+        import os
+        region = (os.environ.get("AWS_REGION")
+                  or os.environ.get("AWS_DEFAULT_REGION")
+                  or _BEDROCK_DEFAULT_REGION)
+    return "https://bedrock-runtime.%s.amazonaws.com" % region
+
+
 def create_client(cfg) -> LlmClient:
     """Build the client for cfg.provider, or raise ProviderError."""
     # Imported here: the client modules import this one for the shared types.
-    from software.agent.llm import anthropic_client, openai_client
+    from software.agent.llm import (anthropic_client, bedrock_client,
+                                    openai_client)
 
     name = str(getattr(cfg, "provider", None) or "").strip().lower()
     if not name:
@@ -448,6 +475,8 @@ def create_client(cfg) -> LlmClient:
     api_key = getattr(cfg, "api_key", None) or None
     model = str(getattr(cfg, "model", None) or "").strip()
     base_url = getattr(cfg, "base_url", None) or default_url
+    if kind == "bedrock" and not base_url:
+        base_url = bedrock_base_url()
     if needs_key and not api_key:
         raise ProviderError("provider %r requires an api_key" % name)
     if not model:
@@ -460,6 +489,9 @@ def create_client(cfg) -> LlmClient:
 
     if kind == "anthropic":
         return anthropic_client.AnthropicClient(
+            model=model, api_key=api_key, base_url=base_url)
+    if kind == "bedrock":
+        return bedrock_client.BedrockClient(
             model=model, api_key=api_key, base_url=base_url)
     return openai_client.OpenAiCompatibleClient(
         provider=name, model=model, api_key=api_key, base_url=base_url)
