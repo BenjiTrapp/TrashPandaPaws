@@ -118,7 +118,8 @@ def _scope_words(word: str) -> List[str]:
 _NETWORK_VERBS = frozenset(("netscan", "smbloot", "avenum"))
 
 
-def _reaches_the_network(command: str, server_side: bool) -> bool:
+def _reaches_the_network(command: str, server_side: bool,
+                        classified: bool = False) -> bool:
     """Whether the scope checker must insist on a named target.
 
     A command that only touches the host it runs on has no target to name —
@@ -131,17 +132,41 @@ def _reaches_the_network(command: str, server_side: bool) -> bool:
     none can be found the targets are hidden where the checker cannot see
     them — in a file, typically — so it is refused.
 
-    Two signals, and `server_side` is deliberately not one of them: the
-    server runs arbitrary commands too, so `systemctl stop raccoon` would
-    otherwise be refused for naming no host.
+    Three answers, not two. A known network tool always has to name its
+    target. A known host-local program never does. A program **nobody
+    listed** has to name one as well — otherwise `wget -i /tmp/urls.txt`
+    and `curl -K /tmp/urls` reach the network with no scope verdict at all,
+    which is what keying this on a list of tools to *catch* cost: it fails
+    open on everything the list forgot.
+
+    `classified` is the exception to that third answer, and it is the whole
+    reason this composition lives here rather than in safety. The scope
+    runs **before** the tier decision, deliberately, so that no operator
+    approval is spent on a request that cannot run. That ordering means a
+    refusal here hides the classification completely: measured, thirteen of
+    twenty classified actions were answered with "name a target" instead of
+    their own reason — `shutdown -h now` and `iptables -F` refused as if
+    they were scans, and every tier-2 action among them taken out of the
+    operator's hands. So a command the classifier already has an answer for
+    is exempt from the unknown-program rule. A known network tool is not:
+    `nxc smb /tmp/hosts` classifies as tier 2 and must still be refused for
+    hiding its targets, rather than reaching the gate and then running.
+
+    `server_side` is deliberately not a signal: the server runs arbitrary
+    commands too, so `systemctl stop raccoon` would otherwise be refused
+    for naming no host.
     """
     if safety.takes_network_targets(command):
         return True
     words = command.split()
     first = words[0].lower() if words else ""
     if first == "shell" and len(words) > 1:
-        return _reaches_the_network(command.split(None, 1)[1], server_side)
-    return first in _NETWORK_VERBS
+        return _reaches_the_network(command.split(None, 1)[1], server_side,
+                                    classified)
+    if first in _NETWORK_VERBS:
+        return True
+    # The unknown-program rule, and its one exception.
+    return not classified and not safety.is_host_local(command)
 
 
 def _route_problem(beacon_id, server_side, beacon_ids) -> Optional[str]:
@@ -371,15 +396,25 @@ class Router:
         if view is None:
             return blocked("the command could not be tokenised (unbalanced "
                            "quotes?), so it cannot be checked against the scope")
-        reason = self._scope.check(view, self._resolve_host,
-                                   require_target=_reaches_the_network(
-                                       command, server_side))
-        if reason:
-            return blocked(reason)
-
+        # Classified before the scope is asked, though still refused after
+        # it. classify() is a pure string read -- it decides nothing, asks
+        # nobody and costs nothing -- and the scope needs its answer: a
+        # command the classifier already has a reason for is exempt from
+        # the unknown-program target rule, so that a tier-1 refusal gives
+        # its own reason and a tier-2 action still reaches the operator.
+        # See _reaches_the_network.
         kind = self.target_kind(beacon_id, server_side=server_side)
         classification = safety.classify(
             command, kind, self._uplink_check(beacon_id), self._phase5_enabled)
+
+        reason = self._scope.check(view, self._resolve_host,
+                                   require_target=_reaches_the_network(
+                                       command, server_side,
+                                       classified=classification.tier
+                                       != safety.TIER_FREE))
+        if reason:
+            return blocked(reason)
+
         if classification.tier == safety.TIER_HARD:
             return blocked(classification.reason or "irreversible action")
         if classification.tier == safety.TIER_KNOCK:

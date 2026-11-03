@@ -1380,5 +1380,69 @@ class TestTheProgramIsFoundWhereverItIs(unittest.TestCase):
             self.assertIn(name, safety._WRAPPER_VALUE_FLAGS, name)
             self.assertIn("-u", safety._WRAPPER_VALUE_FLAGS[name], name)
 
+
+
+class TestTheTwoTargetPredicates(unittest.TestCase):
+    """The two halves the router composes; the composition is tested there.
+
+    Deliberately not one predicate with a negation: three answers exist,
+    and the third is "nobody listed this program". Collapsing it into
+    either of the other two is what made `wget -i /tmp/urls.txt` pass with
+    no scope verdict, and then what made `shutdown -h now` be answered with
+    "name a target".
+    """
+
+    LOCAL = ("ip addr show", "netstat -rn", "cat /etc/resolv.conf",
+             "hostname -f", "uname -srm", "whoami", "pwd", "ls /opt",
+             "which cve-search", "searchsploit dnsmasq", "df -h /",
+             "scutil --get ComputerName", "lsof -i -n -P", "ps -ef")
+    NETWORK = ("nmap -sV 10.0.1.5", "nxc smb 10.0.1.5", "smbclient -L x",
+               "ldapsearch -x", "hydra -l a -P b ssh://x", "sqlmap -u x")
+    UNKNOWN = ("wget -i /tmp/u", "curl -K /tmp/u", "custom-sweeper --targets f",
+               "ssh admin@h", "rsync -a a b")
+
+    def test_a_host_local_program_is_recognised(self):
+        for command in self.LOCAL:
+            self.assertTrue(safety.is_host_local(command), command)
+            self.assertFalse(safety.takes_network_targets(command), command)
+
+    def test_a_known_network_tool_is_recognised(self):
+        for command in self.NETWORK:
+            self.assertTrue(safety.takes_network_targets(command), command)
+            self.assertFalse(safety.is_host_local(command), command)
+
+    def test_an_unlisted_program_is_neither(self):
+        for command in self.UNKNOWN:
+            self.assertFalse(safety.is_host_local(command), command)
+            self.assertFalse(safety.takes_network_targets(command), command)
+
+    def test_nothing_readable_is_not_host_local(self):
+        for command in ("", "   ", None, 42, "|"):
+            self.assertFalse(safety.is_host_local(command), repr(command))
+
+    def test_the_wrappers_do_not_change_either_answer(self):
+        for prefix in ("", "sudo ", "sudo -u alice ", "pkexec -u alice ",
+                       "shell ", "timeout -s KILL 600 ", "env -u LD_PRELOAD "):
+            self.assertTrue(safety.is_host_local(prefix + "ip addr show"),
+                            prefix)
+            self.assertTrue(
+                safety.takes_network_targets(prefix + "nmap 10.0.1.5"), prefix)
+
+
+class TestTheHostLocalListHoldsNoWrapper(unittest.TestCase):
+    """A wrapper in _HOST_LOCAL_TOOLS hides the program it wraps.
+
+    _program_position checks membership before it skips wrappers, so a
+    wrapper listed as host-local stops the scan at itself and whatever
+    follows is never read. `shell wget -i /tmp/u` and
+    `env -u LD_PRELOAD nxc smb /tmp/hosts` both came back host-local that
+    way while the inversion was being written -- fail-open, and silent.
+    """
+
+    def test_the_two_sets_are_disjoint(self):
+        wrappers = set(safety._WRAPPERS) | {"shell", "sudo", "doas",
+                                            "runas", "pkexec"}
+        self.assertEqual(sorted(wrappers & set(safety._HOST_LOCAL_TOOLS)), [])
+
 if __name__ == "__main__":
     unittest.main()

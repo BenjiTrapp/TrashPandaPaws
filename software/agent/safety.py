@@ -1075,7 +1075,12 @@ _NETWORK_TOOLS = frozenset((
     "ldapsearch", "kerbrute", "hydra", "medusa", "patator",
     "evil-winrm", "wmiexec", "psexec", "smbexec", "atexec", "dcomexec",
     "secretsdump", "getuserspns", "getnpusers", "lookupsid", "samrdump",
-    "ntlmrelayx", "responder", "lsassy", "impacket-psexec",
+    # responder is deliberately absent: its argument is an interface, not a
+    # host, so requiring a target of it answered a tier-2 action with "name
+    # a target" instead of putting it in front of the operator. It is
+    # classified either way, and a classified action is exempt from the
+    # unknown-program rule -- see router._reaches_the_network.
+    "ntlmrelayx", "lsassy", "impacket-psexec",
     "impacket-wmiexec", "impacket-smbexec", "impacket-secretsdump",
     "sqlmap", "nikto", "whatweb", "wpscan", "gobuster", "feroxbuster",
     "ffuf", "dirb", "nuclei", "testssl.sh", "sslscan",
@@ -1143,9 +1148,90 @@ def is_scan(command) -> bool:
     return scanner_position(command)[1] is not None
 
 
+# Programs whose arguments are *not* hosts: readers, local inspectors,
+# filesystem and package tooling, and the beacon's own verbs that take a
+# path or nothing. This is the list the decision is keyed on, and the
+# direction matters.
+#
+# It used to be the other way round -- a target was required only when the
+# program appeared in _NETWORK_TOOLS below -- and a program missing from
+# that list got no scope verdict at all when its targets sat in a file:
+# `wget -i /tmp/urls.txt` and `curl -K /tmp/urls` both ran unchecked.
+# Paths are deliberately no longer refused outright, so require_target is
+# the only thing left between a targets-from-a-file command and execution.
+# Keying a fail-closed decision on a list of things to *catch* fails open on
+# everything the list forgot; keying it on a list of things to *exempt*
+# costs one retry with a readable reason instead. This module had already
+# learned that twice, for device writes and for read-only inspectors.
+#
+# The cost is real and runs the other way: a host-local program missing
+# here is refused although it was harmless. The entries below are therefore
+# not guessed -- the local-inspection group is every command the live
+# campaigns actually issued, and a test pins them.
+# A wrapper must never appear below. _program_position checks membership
+# *before* it skips wrappers, so a wrapper in this set stops the scan at
+# itself and the program it wraps is never read -- `shell wget -i file` and
+# `env -u LD_PRELOAD nxc smb /tmp/hosts` both looked host-local that way.
+# A test pins the two sets disjoint.
+_HOST_LOCAL_TOOLS = frozenset((
+    # Readers and text tools.
+    "cat", "head", "tail", "less", "more", "strings", "xxd", "od", "hexdump",
+    "grep", "egrep", "fgrep", "awk", "sed", "sort", "uniq", "cut", "tr",
+    "wc", "diff", "base64", "md5sum", "sha1sum", "sha256sum", "file",
+    # Filesystem.
+    "ls", "lsjson", "pwd", "cd", "cp", "mv", "rm", "mkdir", "rmdir", "ln",
+    "touch", "chmod", "chown", "stat", "find", "du", "df", "mount", "umount",
+    "lsblk", "blkid", "readlink", "realpath", "basename", "dirname",
+    "tar", "zip", "unzip", "gzip", "gunzip", "bzip2", "xz", "write",
+    # Host and system facts.
+    "uname", "hostname", "whoami", "id", "groups", "uptime", "date",
+    "printenv", "which", "whereis", "type", "getconf",
+    "lsb_release", "sw_vers", "scutil", "sysctl", "systemctl", "launchctl",
+    "service", "systemd-resolve", "resolvectl", "timedatectl", "hostnamectl",
+    "dmesg", "journalctl", "last", "w", "who", "logname",
+    # Processes.
+    "ps", "top", "htop", "pgrep", "pidof", "lsof", "fuser", "jobs",
+    # Local network *inspection*. Their arguments name interfaces, routes and
+    # sockets on this host, not remote targets.
+    "ip", "ifconfig", "iwconfig", "iw", "netstat", "ss", "sockstat", "route",
+    "arp", "ndp", "ethtool", "nmcli", "networksetup", "netsh", "ipconfig",
+    "brctl", "bridge", "tc", "ulimit",
+    # Accounts and packages.
+    "getent", "passwd", "id", "apt", "apt-get", "dpkg", "rpm", "yum", "dnf",
+    "brew", "pip", "pip3", "pkg", "snap", "flatpak",
+    # Local lookups against a database on this host.
+    "searchsploit", "apropos", "man", "whatis",
+    # Beacon verbs that take a path or nothing. Three deliberate absences:
+    # netscan takes a subnet, smbloot takes a host, and `shell` is a
+    # wrapper rather than a program -- _program_position skips it and reads
+    # what follows, so listing it here would have made `shell wget -i file`
+    # look host-local.
+    "loot", "exfil", "arptable", "proxyinfo", "avenum", "sleep",
+    "persist", "unpersist", "reconfig", "upload", "download", "kill",
+))
+
+
 def takes_network_targets(command) -> bool:
-    """True when the program in command position takes hosts as arguments."""
+    """True when the program in command position is a known network tool.
+
+    One half of the require_target decision. The other half is
+    is_host_local below, and the router composes them -- see its comment
+    for why the composition cannot live here.
+    """
     return _program_position(command, _NETWORK_TOOLS)[1] is not None
+
+
+def is_host_local(command) -> bool:
+    """True when the program in command position is known not to take hosts.
+
+    The complement of the question above, and deliberately not its
+    negation: three answers exist, and the third one is "nobody listed this
+    program". A command with nothing readable in command position is not
+    host-local either -- that is not a reason to skip a check.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return False
+    return _program_position(command, _HOST_LOCAL_TOOLS)[1] is not None
 
 
 # How many ports an all-ports request is narrowed to, and why there is a

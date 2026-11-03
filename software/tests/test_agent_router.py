@@ -261,8 +261,21 @@ class TestCheckOrder(IsolatedAsyncioTestCase):
                                       server_side=True)
         self.assertTrue(res.success)
         self.assertEqual(
-            seen, ["metachars", "scope", "classify", "gate", "limits",
+            seen, ["metachars", "classify", "scope", "gate", "limits",
                    "execute", "detect", "truncate"])
+        # The sequence above is pinned, but the property it exists for is
+        # narrower than the sequence: nothing may ask the operator before
+        # the checks that can refuse on their own. classify and scope
+        # swapped places once the scope began needing the classification --
+        # a classified action is exempt from the unknown-program target
+        # rule, so that a tier-1 refusal gives its own reason instead of
+        # "name a target" and a tier-2 action still reaches the drawer.
+        # Both are pure reads either way, and both still precede the gate.
+        self.assertLess(seen.index("metachars"), seen.index("gate"))
+        self.assertLess(seen.index("scope"), seen.index("gate"))
+        self.assertLess(seen.index("classify"), seen.index("gate"))
+        self.assertLess(seen.index("gate"), seen.index("execute"))
+        self.assertLess(seen.index("limits"), seen.index("execute"))
 
     async def test_metachars_are_screened_before_scope(self):
         r, _ = _router()
@@ -1019,6 +1032,86 @@ class TestARewrittenCommandIsReportedBack(unittest.IsolatedAsyncioTestCase):
         r, _ = _router()
         result = await r.run_command("whoami", beacon_id="raccoon-fox")
         self.assertIsNone(result.effective_command)
+
+
+
+class TestATargetIsRequiredUnlessSomethingElseAnswers(IsolatedAsyncioTestCase):
+    """Three answers to "must this name a target", composed here.
+
+    A known network tool always must. A known host-local program never
+    must. A program nobody listed must as well -- otherwise
+    `wget -i /tmp/urls.txt` reaches the network with no scope verdict,
+    which is what keying the rule on a list of tools to *catch* cost.
+
+    The exception is a command the classifier already has an answer for.
+    The scope runs before the tier decision on purpose, so a refusal here
+    hides the classification: measured while writing this, thirteen of
+    twenty classified actions came back "name a target" instead of their
+    own reason, and every tier-2 action among them was taken out of the
+    operator's hands. A known network tool stays required even when
+    classified, so `nxc smb /tmp/hosts` is refused for hiding its targets
+    rather than reaching the gate and then running.
+    """
+
+    HIDDEN = ("wget -i /tmp/urls.txt", "curl -K /tmp/urls",
+              "nxc smb /tmp/hosts",
+              "rsync -a --files-from=/tmp/hosts /data dest:/tmp",
+              "custom-sweeper --targets /tmp/hosts")
+
+    # Every command the live campaigns issued, by category.
+    LOCAL = ("ip addr show", "ip route show", "ip neigh show", "ifconfig -a",
+             "netstat -rn", "netstat -an", "route -n get default", "arp -an",
+             "lsof -i -n -P", "ss -tlnp", "cat /etc/resolv.conf",
+             "cat /etc/hosts", "hostname -f", "uname -srm", "whoami", "id",
+             "pwd", "ls /usr/bin/python3", "which cve-search", "df -h /",
+             "shell ip addr show", "shell netstat -rn",
+             "scutil --get ComputerName")
+
+    # One per classified action that names no host. None may be answered
+    # with "name a target": tier 1 must give its own reason, tier 2 must
+    # reach the gate.
+    CLASSIFIED = ("useradd tester", "crontab -e", "wevtutil cl Security",
+                  "vssadmin delete shadows /all",
+                  "procdump -ma lsass.exe out.dmp", "airmon-ng start wlan0",
+                  "aireplay-ng --deauth 10 -a AA wlan0mon",
+                  "responder -I eth0", "dd if=/dev/zero of=/dev/sda",
+                  "iptables -F", "shutdown -h now",
+                  "truncate -s 0 /var/log/auth.log",
+                  "ip link set eth0 down", "launchctl load -w x.plist")
+
+    async def test_a_hidden_target_is_refused_by_the_scope(self):
+        r, c2 = _router()
+        for command in self.HIDDEN:
+            res = await r.run_command(command, beacon_id="raccoon-fox")
+            self.assertIsNotNone(res.blocked_reason, command)
+            self.assertIn("target", res.blocked_reason.lower(), command)
+
+    async def test_a_host_local_command_is_not_asked_for_a_target(self):
+        r, c2 = _router()
+        for command in self.LOCAL:
+            res = await r.run_command(command, beacon_id="raccoon-fox")
+            if res.blocked_reason:
+                self.assertNotIn("names no target",
+                                 res.blocked_reason.lower(), command)
+
+    async def test_no_classified_action_is_answered_with_name_a_target(self):
+        # The regression this class was written for. A scope refusal here
+        # replaces the hard-block list's own reasons and removes the
+        # operator's decision.
+        r, c2 = _router(gate_allows=False)
+        for command in self.CLASSIFIED:
+            res = await r.run_command(command, beacon_id="raccoon-fox")
+            self.assertIsNotNone(res.blocked_reason, command)
+            self.assertNotIn("names no target",
+                             res.blocked_reason.lower(), command)
+
+    async def test_a_network_tool_stays_required_even_when_classified(self):
+        # nxc smb /tmp/hosts classifies tier 2. It must not reach the gate.
+        r, c2 = _router()
+        res = await r.run_command("nxc smb /tmp/hosts",
+                                  beacon_id="raccoon-fox")
+        self.assertIn("target", (res.blocked_reason or "").lower())
+        self.assertEqual(_approvals(r), 0)
 
 if __name__ == "__main__":
     unittest.main()
