@@ -1,0 +1,788 @@
+PCBWay source excerpts for hardware/fab/stackup-note.md
+=====================================================
+(and, sections [5] to [7], for hardware/fab/ORDERING.md: retrieved 2026-11-03)
+Retrieved 2026-11-02 with curl from www.pcbway.com. These are VERBATIM
+excerpts of the pages as served that day: "raw" sections are the page's own
+source lines; "text" sections have HTML tags removed and whitespace collapsed.
+Excerpts that stop mid-sentence end in "..."; that is where the excerpt was
+cut, not where the page stops. The full pages are NOT committed:
+PCBWay's pages carry a changing news block, so a re-fetch will not reproduce
+the md5 values below, only the excerpted passages. Nothing here is paraphrased;
+where the note interprets a passage, the note says so.
+
+----------------------------------------------------------------------
+[1] https://www.pcbway.com/pcb_prototype/impedance_calculator.html
+    full page as fetched: md5 cefc2bfc0484abc4ed9abb988aea1ba7 (301157 bytes)
+----------------------------------------------------------------------
+-- raw, lines 1490-1497: introduction and notes above the calculator
+                            With PCBWay impedance calculator, you can calculate the approximate impedance of your PCB / high frequency circuit board.
+                            The surface finish is neglected. We recommend the software from Polar Instruments if you want to get exact impedance calculation.<br/>
+
+                            Note: The results are only for approximation and rough estimation, the final values and the corresponding layer construction have to be calculated by us.
+                            The stackup information check <a href="https://www.pcbway.com/multi-layer-laminated-structure.html?tdsourcetag=s_pcqq_aiomsg" target="_blank">here.</a><br/>
+
+                            Instructions: Please select the value to be determined. You can then adjust the other parameters according to your needs.<br/>
+<strong>Note: For the three models — Microstrip, Edge Coupled, and Coplanar Waveguide, the outer layer impedance testing does not include the solder mask. If your design involves solder mask, we recommend using Shortcut to Si9000 software for calculation. <br/>You may also contact your sales representative, who can provide you with the relevant impedance stack-up information.</strong>
+
+-- raw, lines 4415-4486: the JavaScript function EdgeCoupledMicrostrip(), run by
+-- the "Edge Coupled Microstrip" calculator when an input changes, complete;
+-- and lines 4881-4884: fix(), which it calls to round to 0.01
+        function EdgeCoupledMicrostrip(val, fname) {
+            if (val.length == 0) {
+                $('#EdgeCoupledMicrostripZd').val('');
+            }
+            switch (fname) {
+                case "t":
+                    t = parseFloat(val);
+                    tunit = document.getElementById("EdgeCoupledMicrostript").getElementsByClassName("active")[0].dataset.val;
+                    break;
+                case "h":
+                    h = parseFloat(val);
+                    hunit = document.getElementById("EdgeCoupledMicrostriph").getElementsByClassName("active")[0].dataset.val;
+                    break;
+                case "s":
+                    s = parseFloat(val);
+                    sunit = document.getElementById("EdgeCoupledMicrostrips").getElementsByClassName("active")[0].dataset.val;
+                    break;
+                case "w":
+                    w = parseFloat(val);
+                    wunit = document.getElementById("EdgeCoupledMicrostripw").getElementsByClassName("active")[0].dataset.val;
+                    break;
+                case "Er":
+                    Er = parseFloat(val);
+                    break;
+                default:
+            }
+            var t0 = t * tunit;
+            var h0 = h * hunit;
+            var s0 = s * sunit;
+            var w0 = w * wunit;
+            if (!isNaN(t) && !isNaN(h) && !isNaN(s) && !isNaN(w) && !isNaN(Er)) {
+                with (Math) {
+                    Zo = 87 / sqrt(1.41 + Er) * log(5.98 * h0 / (0.8 * w0 + t0))
+                    Zd = 2 * Zo * (1 - 0.48 * exp(-0.96 * s0 / h0))
+                    Zo = fix(Zo)
+                    Zd = fix(Zd)
+                }
+                //Zd = 174 / Math.sqrt(Er + 1.41) * Math.log(5.98 * h0 / (0.8 * w0 + t0)) * (1 - 0.48 * Math.exp(-0.96 * s0 / h0));
+                $('#EdgeCoupledMicrostripZo')[0].value = parseFloat(Zo).toFixed(4);
+                $('#EdgeCoupledMicrostripZd')[0].value = parseFloat(Zd).toFixed(4);
+            }
+            $('.all-total-msg .msg').hide();
+            if (((w0 / h0) < 0.1) || ((w0 / h0) > 2.0)) {
+                $("#m-edge-im-warning-msg-tip .msg1").show();
+            } else {
+                if ((t0 < 0.1) || (t0 > 7)) {
+                    $("#m-edge-im-warning-msg-tip .msg2").show();
+                } else {
+                    if ((h0 < 1.0) || (h0 > 157)) {
+                        $("#m-edge-im-warning-msg-tip .msg3").show();
+                    } else {
+                        if ((w0 < 2) || (w0 > 1000)) {
+                            $("#m-edge-im-warning-msg-tip .msg4").show();
+                        } else {
+                            if ((s0 <= 0.0) || (s0 > 1000)) {
+                                $("#m-edge-im-warning-msg-tip .msg5").show();
+                            } else {
+                                if ((Er < 1.0) || (Er >= 15.0)) {
+                                    $("#m-edge-im-warning-msg-tip .msg6").show();
+                                } else {
+                                    if ((Zd < 0.0) || (Zd > 10000000)) {
+                                        $("#m-edge-im-warning-msg-tip .msg7").show();
+                                    } else {
+                                        $("#m-edge-im-warning-msg-tip .blank-msg").show();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        function fix(indata) {
+            with (Math) { utdata = round(indata * 100) / 100 }
+            return utdata
+        }
+
+-- raw: the unit factors (data-val) the page multiplies each input by, one
+-- list per input: t (EdgeCoupledMicrostript), h (...h), w (...w), s (...s)
+<ul class="down-val js-down-val" id="EdgeCoupledMicrostript">
+<li data-val="1.379" class="active">oz/ft²</li>
+<li data-val="1">mil</li>
+<li data-val="393">cm</li>
+<li data-val="39.3">mm</li>
+<li data-val="0.0393">μm</li>
+<li data-val="1000">inch</li>
+
+<ul class="down-val js-down-val" id="EdgeCoupledMicrostriph">
+<li data-val="1">mil</li>
+<li data-val="393">cm</li>
+<li data-val="39.3" class="active">mm</li>
+<li data-val="0.0393">μm</li>
+<li data-val="1000">inch</li>
+
+<ul class="down-val js-down-val" id="EdgeCoupledMicrostripw">
+<li data-val="1" class="active">mil</li>
+<li data-val="393">cm</li>
+<li data-val="39.3">mm</li>
+<li data-val="0.0393">μm</li>
+<li data-val="1000">inch</li>
+
+<ul class="down-val js-down-val" id="EdgeCoupledMicrostrips">
+<li data-val="1" class="active">mil</li>
+<li data-val="393">cm</li>
+<li data-val="39.3">mm</li>
+<li data-val="0.0393">μm</li>
+<li data-val="1000">inch</li>
+
+----------------------------------------------------------------------
+[2] https://www.pcbway.com/multi-layer-laminated-structure.html
+    full page as fetched: md5 441225e2dfeb2807b542b45ec7ed01d5 (5757654 bytes)
+    text: "PCB standard stackup" list, 4 Layers, Thickness 1.6MM, entries
+    1 to 3 of 112 (each of these three has 1OZ outer and 1OZ inner copper;
+    entries 4 to 112 were not excerpted, so nothing here says whether any of
+    them has the same copper)
+----------------------------------------------------------------------
+Friendly Reminder: This is a through-hole board stack-up, not applicable for blind and buried vias. PCBWay supports customers to customize structures, and will continue to increase the structure diagrams. | 4 Layers | Total: | 112 | View all | 1 | 4-layers PCB | Regular | Thickness: | 1.6MM | Finished Outer Copper: | 1OZ | Inner Copper: | 1OZ | Inner layer Residual copper ratio: | 70% | L1-CU | PP | L2-CU | CORE | L3-CU | PP | L4-CU | Layer | Material | Thickness | (mm) | Thickness after lamination(mm) | L1-CU | Outer Base Copper 0.5OZ | 0.0175 | 0.0175 | (Plating to 1OZ) | PP | 7628 RC46% | DK:4.74 | 0.1960 | 0.1855 | L2-CU | Inner Copper 1OZ | 0.0350 | 1.1 | (Core with Cu) | CORE | Core | DK:4.6 | 1.0300 | L3-CU | Inner Copper 1OZ | 0.0350 | PP | 7628 RC46% | DK:4.74 | 0.1960 | 0.1855 | L4-CU | Outer Base Copper 0.5OZ | 0.0175 | 0.0175 | (Plating to 1OZ) | Thickness after lamination: 1.51mm, tolerance: ±10%. | Finished PCB Thickness: 1.61mm, tolerance: ±10%. | Inner layer Residual copper ratio > 60%, it is suitable to choose a lamination structure with 70% inner layer Residual copper ratio. | 2 | 4-layers PCB | Regular | Thickness: | 1.6MM | Finished Outer Copper: | 1OZ | Inner Copper: | 1OZ | Inner layer Residual copper ratio: | 50% | L1-CU | PP | L2-CU | CORE | L3-CU | PP | L4-CU | Layer | Material | Thickness | (mm) | Thickness after lamination(mm) | L1-CU | Outer Base Copper 0.5OZ | 0.0175 | 0.0175 | (Plating to 1OZ) | PP | 7628 RC46% | DK:4.74 | 0.1960 | 0.1785 | L2-CU | Inner Copper 1OZ | 0.0350 | 1.1 | (Core with Cu) | CORE | Core | DK:4.6 | 1.0300 | L3-CU | Inner Copper 1OZ | 0.0350 | PP | 7628 RC46% | DK:4.74 | 0.1960 | 0.1785 | L4-CU | Outer Base Copper 0.5OZ | 0.0175 | 0.0175 | (Plating to 1OZ) | Thickness after lamination: 1.49mm, tolerance: ±10%. | Finished PCB Thickness: 1.59mm, tolerance: ±10%. | 40% | 3 | 4-layers PCB | Regular | Thickness: | 1.6MM | Finished Outer Copper: | 1OZ | Inner Copper: | 1OZ | Inner layer Residual copper ratio: | 30% | L1-CU | PP | L2-CU | CORE | L3-CU | PP | L4-CU | Layer | Material | Thickness | (mm) | Thickness after lamination(mm) | L1-CU | Outer Base Copper 0.5OZ | 0.0175 | 0.0175 | (Plating to 1OZ) | PP | 7628 RC46% | DK:4.74 | 0.1960 | 0.1715 | L2-CU | Inner Copper 1OZ | 0.0350 | 1.1 | (Core with Cu) | CORE | Core | DK:4.6 | 1.0300 | L3-CU | Inner Copper 1OZ | 0.0350 | PP | 7628 RC46% | DK:4.74 | 0.1960 | 0.1715 | L4-CU | Outer Base Copper 0.5OZ | 0.0175 | 0.0175 | (Plating to 1OZ) | Thickness after lamination: 1.48mm, tolerance: ±10%. | Finished PCB Thickness: 1.58mm, tolerance: ±10%. | Inner layer Residual copper ratio ≤ 40%, it is suitable to choose a lamination structure with 30% inner layer Residual copper ratio.
+
+----------------------------------------------------------------------
+[3] https://www.pcbway.com/capabilities.html
+    full page as fetched: md5 99631525a246844abb6787b283bdcdf9 (249681 bytes)
+    text (tags removed, whitespace collapsed)
+----------------------------------------------------------------------
+-- impedance control tolerance (row 35)
+35| impedance control| Impedance control tolerance| ±10%，50Ω and below：±5Ω| \| bow and twist| bow and twist tolerance| bow and twist≤0.75%| ...
+
+-- standard-PCB minimum trace and spacing
+Min Trace | 0.1mm/4mil | Min manufacturable trace is 4mil(0.1mm), Please view the below "Advanced PCB" or contact us if your board exceeds these. | Min Spacing | Min manufacturable spacing is 4mil(0.1mm), Please view the below "Advanced PCB" or contact us if your board exceeds these. | Outer Layer Copper Thickness | 1oz/2oz/3oz/4oz/5oz/6oz/7oz/8oz (35um/70um/105um/140um/175um/210um/245um/280um) | Also known as copper...
+
+-- Advanced PCB table: column headers
+Advanced PCB Capabilities - Advanced PCB| Categories | No.| Items | PCB process parameters | Remarks | Normal process | Medium difficulty | High difficulty | Non-standard review | Unable to make| product type| 1| Multilayer PCB Layers| 3L≤Layers≤16L|...
+
+-- Advanced PCB table: row 15, outer-layer minimum width/spacing
+15| The min width/spacing of outer layer (before compensation)| copper thickness 18um| ≥4/5 mil| ≥4/4 mil or parts 3.5/3.5mil| Local 3.5/3.5mil, only the distance from the GBA chip area line to the PAD| copper thickness 35um| ≥5/6 mil| ≥5/5 mil| copper thickness 70um| ≥7/8mil| ≥6/7mil| copper thickness 105um| ≥10/12 mil| ≥8/10 mil| 16| grid trace width/spacing| copper thickness 18um| ≥7/9 mil| ≥6/8 mil| copper thickn...
+
+----------------------------------------------------------------------
+[4] https://www.pcbway.com/pcb_prototype/Impedance_Control.html
+    full page as fetched: md5 0c921e891dbb85ee9bc076cae6bdb604 (197480 bytes)
+    text (tags removed, whitespace collapsed), one passage per line; the
+    four "stackup N#" lines belong to a figure that is an image on the page
+----------------------------------------------------------------------
+Factors that Influence Impedance When one parameter varies while keeping other conditions constant, the factors affecting impedance are as follows:
+Dielectric constant: Dielectric constant is inversely proportional to impedance. A higher dielectric constant comes with a lower impedance. Dielectric constant is primarily controlled through material selection. Different board materials have distinct dielectric constants, which are related to the resin materials used. For instance, FR4 board materials have dielectric constants ranging from 3.9 to 4.5, decreasing with increasing frequency. PTFE board materials have dielectric constants ranging from 2.2 to 3.9. High-speed signal transmission requires higher impedance values, thus necessitating lower dielectric constants.
+Soldermask thickness: Soldermask thickness is inversely proportional to impedance. Within a certain range, the thicker the soldermask, the lower the impedance. Typically, printing one pass of solder mask reduces single-ended impedance by 2 ohms and differential impedance by 8 ohms. The reduction value doubles when printing two passes compared to one pass. After printing three times or more, the impedance value no longer changes.
+Consider copper balance and resin flow. When one side or both sides of the semi-cured sheets involve etched traces, during the lamination process, the resin will fill the gaps left by the etched traces, resulting in reduced resin thickness between the layers. The lower the copper balance, the more resin will be added, leaving less remaining. So, if you need a semi-cured sheet thickness of 5 mils between two layers, choose a slightly thicker semi-cured sheet based on the copper balance.
+Design stackup. The min. dielectric thickness between layers should be 50um.
+the trace/space width for stackup 1# is 70/130um;
+the trace/space width for stackup 2# is 95/140um;
+the trace/space width for stackup 3# is 125/130um;
+the trace/space width for stackup 4# is 105/150um.
+Choose wider trace width, not narrower. There is a limit to how narrow traces can be in the fabrication process, whereas there is no limit to how wide they can be. If, during fabrication, the PCB manufacturer needs to reduce the trace width to achieve a specific impedance and reaches the narrow limit, it can lead to complications. This might result in increased costs, relaxed impedance control, or design modifications. Therefore, when calculating, aiming for relatively wider trace width means slightly lower target impedance, for example, if the target impedance is 50 ohms, we should aim for around 49 ohms, avoiding calculations close to 51 ohms.
+Overall trends in impedance control. Our design may have multiple impedance control targets, either bias toward larger or bias toward smaller values. Avoid cases where, for example, the 100 ohms bias toward larger values and the 90 ohms biased toward smaller values.
+Communicate with the PCB manufacturer. Sometimes, there may be calculation errors in copper balance and resin flow, and the dielectric constant of new materials might not match the nominal values. Some PCB manufacturers may not have the required glass fabric in stock, leading to difficulties in implementing the stack-up or causing delays. When encountering such situations, the best approach is to communicate with the PCB manufacturer from the beginning of the design, asking them to design a stack-up based on the designer&#39;s requirements and their own experience. Through multiple rounds of communication and confirmation, an ideal stack-up can be achieved with a few iterations, which will facilitate the subsequent design process.
+
+----------------------------------------------------------------------
+[5] https://www.pcbway.com/orderonline.aspx (the standard PCB quote form,
+    with its assembly section), added for hardware/fab/ORDERING.md
+    retrieved 2026-11-03 with curl; full page as fetched:
+    md5 4b6867930cf00d2d4a4df813d7050dd4 (495947 bytes)
+----------------------------------------------------------------------
+-- raw, lines 2318-2324
+<h4 class="list-search-row-title">Min track/spacing:<em class="smintip" data="Minimum width of the copper trace and minimum distance between two traces. PCBWay engineers will double-check the Min Track/Spacing.&lt;br&gt;
+&lt;a href=&quot;/helpcenter/ordering_parameter_instruction/What_is_the_Min_Track_Spacing_for_1oz__2oz__3oz__Copper_weight_.html&quot; target=&quot;_blank&quot;&gt;Learn More &amp;gt;&amp;gt;&lt;/a&gt;"><img src="/img/images/help-tip.gif" alt="tip help" /></em></h4>
+<a href="javascript:void(0)" class="filter-tag clsLineWeight " data="3/3mil">3/3mil<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsLineWeight " data="4/4mil">4/4mil<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsLineWeight " data="5/5mil">5/5mil <i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsLineWeight active" data="6/6mil">6/6mil<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsLineWeight " data="8/8mil">8/8mil ↑ <i></i></a>
+-- raw, lines 2330-2337
+<h4 class="list-search-row-title">Min hole size:<em class="smintip" data="Minimum diameter of holes. PCBWay engineers will double-check the min hole size."><img src="/img/images/help-tip.gif" alt="tip help" /></em></h4>
+<a href="javascript:void(0)" class="filter-tag clsVias " data="0.15">0.15mm<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsVias " data="0.2">0.2mm<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsVias " data="0.25">0.25mm<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsVias active" data="0.3">0.3mm ↑<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsVias " data="0.8">0.8mm ↑<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsVias " data="1.0">1.0mm ↑<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsVias " data="-1">No Drill<i></i></a>
+-- raw, lines 2503-2509
+<a href="javascript:void(0)" class="filter-tag clsPlatingType " data="HASL with lead">HASL with lead<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsPlatingType active" data="HASL lead free">HASL lead free<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsPlatingType " data="Immersion gold">Immersion gold(ENIG)<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsPlatingType " data="OSP">OSP<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsPlatingType " data="Hard Gold">Hard gold<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsPlatingType " data="Immersion Silver">Immersion silver(Ag)<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsPlatingType " data="Immersion Tin">Immersion tin<i></i></a>
+-- raw, lines 2601-2611
+<h4 class="list-search-row-title">Via process:<em class="smintip" data="For gerber files, we will process according to the files, and this option is invalid.&lt;br&gt;
+For .PCB or .PCBDOC files, we will process with the parameters you select.&lt;br&gt;
+&lt;a href=&quot;/helpcenter/ordering_parameter_instruction/Via_Process.html
+&quot; target=&quot;_blank&quot;&gt;Learn More &amp;gt;&amp;gt;&lt;/a&gt;&lt;br&gt;
+&lt;img src=&quot;https://pcbwayfile.s3.us-west-2.amazonaws.com/msgfile/23/02/27/1419211244042.png&quot;&gt;"><img src="/img/images/help-tip.gif" alt="tip help" /></em></h4>
+<a href="javascript:void(0)" class="filter-tag clsSolderCover active" data="Tenting vias">Tenting vias<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsSolderCover " data="Plugged vias">Plugged vias with solder mask<i></i></a>
+<a href="javascript:void(0)" class="filter-tag clsSolderCover " data="Vias not covered">Vias not covered<i></i></a>
+<input type="hidden" value="Tenting vias" name="radSolderCover" />
+<p id="dvTentingvias" style="color:#B59F38;font-size: 12px;margin:-4px 0 6px; ">*For Gerber files this choice will not affect anything, PCB will be made using the parameters of the files.</p>
+<p id="dvPluggedvias" style="color:#B59F38;font-size: 12px;margin:-4px 0 6px; display:none;">*If you want to do filled vias with resin, please select in Additional Options!</p>
+-- raw, lines 2615-2615
+<h4 class="list-search-row-title">Finished copper:<em class="smintip" data="The weight in ounces of copper in one square foot of PCB, this option will determine the thickness of copper on the outer layers. PCBWay provides the thickness of copper on outer layers of 1-20oz.PTH holes or vias that are cutted through to create a partial or half hole to form an opening into the side of the hole barrel. Generally they are used for mounting a PCB to another one.
+-- raw, lines 2644-2644
+<h4 class="list-search-row-title">Inner Copper:<em class="smintip" data="The copper weight on the inner layers for multilayer PCBs. The default inner copper weight is 1 oz.&lt;br&gt;
+-- raw, lines 2867-2867
+<label class="clsIgnore"><input type="checkbox" name="hidImpedanceControl" value="Yes" data="Impedance control" /> Impedance control <em class="smintip" data="Conductors in a PCB carry various signals, and to increase their transmission speed, their frequency must be raised. However, factors such as etching, layer thickness, and line width can cause impedance variations in the PCB, leading to signal distortion. Therefore, for high-speed PCB conductors, their impedance values should be controlled within a certain range, known as &quot;impedance control&quot;. The impedance tolerance is generally &#177;10%. If impedance requirements are specified in the documentation but not selected in the order, it will be regarded as ignoring the impedance requirement.&lt;br&gt;
+-- raw, lines 2876-2876
+<label class="clsIgnore"><input type="checkbox" name="hidCustomStackup" value="Yes" data="Custom Stackup" /> Custom stackup <em class="smintip" data="Apply to multilayer PCBs only. If you need to customize a specific stack-up, please upload the stack-up file together or contact your sales representative.&lt;br&gt;&lt;a href=&quot;/multi-layer-laminated-structure.html&quot; target=&quot;_blank&quot;&gt;Learn More &amp;gt;&amp;gt;&lt;/a&gt;"><img src="/img/images/help-tip.gif" alt="Layers pcb help" /></em></label>
+-- raw, lines 2884-2884
+<label class="clsIgnore"><input type="checkbox" name="hidViaPadOrViaResin" id="hidViaPadOrViaResin" value="Yes" data="All vias filled with resin and capped" datatip="Non-selectable! Please uncheck All vias filled with resin and capped first!" /> All vias filled with resin and capped <em class="smintip" data="If you check this option, all vias will be filled with resin,then capped and plated cover."><img src="/img/images/help-tip.gif" alt="Layers pcb help" /></em></label>
+-- raw, lines 2961-2963
+Other special request:
+</h4>
+<textarea placeholder="Fill in any PCB details to make it as clear as possible for us to understand your requirements." id="txtPCBNote" name="txtPCBNote" class="form-control inquiry-content"></textarea>
+-- raw, lines 3184-3187
+Other Special <br>
+request:
+<em class="smintip" data="We normally will reduce apatures for ICs to make stencil, so if don&#39;t want to change the apatures, please note it when place the order.">
+<img src="/img/images/help-tip.gif" alt="Layers pcb help" />
+-- raw, lines 3226-3245
+<span>Turnkey</span>
+<p>PCBWay supply parts</p>
+</div>
+</div>
+<div class="switch-options js-smt-partvias">
+<div class="diy-label-flag">
+<input type="radio" name="partVias" value="2" />
+</div>
+<div class="flexopt">
+<span>Kitted or Consigned</span>
+<p>Customer supply parts</p>
+</div>
+</div>
+<div class="switch-options js-smt-partvias">
+<div class="diy-label-flag">
+<input type="radio" name="partVias" value="3" />
+</div>
+<div class="flexopt">
+<span>Combo</span>
+<p>You supply some parts we do the rest</p>
+-- raw, lines 3277-3286
+Assembly side(s):
+<em class="smintip" data="Are the parts mounted on one side only or both sides?">
+<img src="/img/images/help-tip.gif" alt="tip help">
+</em>
+</h4>
+
+<div class="ui2-form-col18 js-smt-selval">
+<input type="hidden" value="3" name="hidAssemblySide" />
+<a class="filter-tag active" href="javascript:void(0)" data="3">
+Top side<i></i>
+-- raw, lines 3344-3347
+<textarea class="form-control inquiry-content" name="txtICSensitiveNote" maxlength="500" placeholder="The following components need to be paid attention to during the assembly process:
+Mfg Part No., welding temperature
+Mfg Part No., it is forbidden to use plate washer water to avoid corrosion
+Mfg Part No., it needs to bake before placement"></textarea>
+-- raw, lines 3352-3352
+Do you accept alternatives/substitutes made in China?
+-- raw, lines 3446-3449
+<h4 class="list-search-row-title">
+Number of<br> 
+BGA/QFP Parts:<em class="smintip" data="Number of ICs with more than 16pins and SMD irregular parts with more than 10pins on each board.
+(SOP,QFP,QFN,BGA)"><img src="/img/images/help-tip.gif" alt="tip help" /></em>
+
+-- raw, lines 2207-2207
+*Normally, the base material of Multi-layer PCB is automatically upgraded to TG150 for FREE with more stable and higher quality. Except for some parameters (eg.: Weighty finished copper; Greater board thickness; Custom stackup; Via in pad/ Via filled with resin, etc.)
+-- raw, lines 2347-2347
+<a href="javascript:void(0)" class="filter-tag clsSolderColor active" data="Green"><em class="mask_col mask_col_green"></em>Green<i></i></a>
+-- raw, lines 2384-2384
+<a href="javascript:void(0)" class="filter-tag clsFontColor active" data="White"><em class="mask_col mask_col_white"></em>White<i></i></a>
+-- raw, lines 3254-3254
+<em class="smintip" data="We suggest choose to do panel if single PCB qty is more than 20pcs or any side of single board is smaller than 50mm.">
+-- text, lines 1795-3465: the form's visible labels and choices in page order, tags
+-- removed, HTML entities decoded, one item per line; tooltips are not shown here
+-- (the raw lines above carry those that ORDERING.md quotes)
+Board type
+:
+Single pieces
+Panel by Customer
+Panel by Supplier
+Panel requirements:
+Break-away rail:
+Yes
+No
+(e.g. Panel in 2*3, size of the break-away rail, total 5 panels=total 30 individual boards)
+Route Process:
+Panel as PCBWay prefer
+Panel as PCBWay prefer
+Panel as V-Scoring
+Panel as Tab Route
+Both V-Scoring&Tab-routing
+X-out Allowance in Panel
+:
+Accept
+Not Accept
+Different design
+in panel
+:
+[... a list of numeric choices is omitted here ...]
+*
+Size (
+single
+):
+X
+mm
+inch'↔mm
+*
+Quantity (
+single
+):
+pcs
+[... a list of numeric choices is omitted here ...]
+Other：
+(≥5 ㎡ to manually enter the number!)
+Layers:
+1 Layer
+2 Layers
+4 Layers
+6 Layers
+8 Layers
+10 Layers
+12 Layers
+14 Layers
+Copper layer:
+--
+Top layer
+Bottom layer
+None
+Soldermask:
+--
+Top side
+Bottom side
+Both sides
+None
+Silkscreen:
+--
+Top side
+Bottom side
+Both sides
+None
+Material:
+FR-4
+Aluminum
+Rogers
+HDI(Buried/blind vias)
+≥4 Layers
+Copper Base
+Transparent
+*Material model can be remarked below. HDI is available for 4-layer or more.
+Rogers:
+Rogers 4003C
+Rogers 4350B
+Thermal conductivity:
+1.0W/(m⋅K)
+1.5W/(m⋅K)
+2.0W/(m⋅K)
+3.0W/(m⋅K)
+The base material of 1-layer 2W/(m.K) Aluminum PCBs is automatically changed from
+CSEM brand Part No. CS-AL-88-AD2 material to equal material BOYU brand Part No.
+AL-01-B20. The performance of the two materials should be the same, but please
+notice that the UL logo will be changed after replacing the material. You can please
+check the materials datasheets here to compare.
+[Download Material Datasheets]
+Thermoelectric separation:
+Thermoelectric separation
+Structure of MCPCB:
+Metal core in the middle
+Metal base on the bottom side
+FR4-TG
+:
+TG 130-140
+TG 150-160
+TG 170-180
+S1000H TG150
+S1000-2M TG170
+*The base material of 2-layer PCBs is automatically upgraded to TG150 for FREE with more stable and higher quality. Except for some parameters (eg.: Weighty finished copper; Greater board thickness; Custom stackup; Via in pad/ Via filled with resin, etc.)
+*Normally, the base material of Multi-layer PCB is automatically upgraded to TG150 for FREE with more stable and higher quality. Except for some parameters (eg.: Weighty finished copper; Greater board thickness; Custom stackup; Via in pad/ Via filled with resin, etc.)
+*The base material of 2-layer PCBs is automatically upgraded to S1000H TG150 for FREE with more stable and higher quality.
+*Base material with high TG has good CAF resistance, high heat resistance, dimensional stability and is suitable for lead-free soldering process.
+[Download Material Report]
+[Compared with previous material parameters]
+*Base material with high TG has good CAF resistance, high heat resistance, dimensional stability and is suitable for lead-free soldering process.
+[Download Material Report]
+[Compared with previous material parameters]
+Thickness:
+0.2
+0.3
+0.4
+0.6
+0.8
+1.0
+1.2
+1.6
+2.0
+2.4
+2.6
+2.8
+3.0
+3.2
+≥1.7-8.0
+* Unit: mm
+*Finished PCB Thickness: 0.15mm~0.2mm
+*Finished PCB Thickness: 0.25mm~0.3mm
+Thickness:
+0.203
+0.305
+0.406
+0.508
+0.813
+1.524
+* Unit: mm
+Thickness:
+0.101
+0.168
+0.254
+0.338
+0.422
+0.508
+0.762
+1.524
+* Unit: mm
+Min track/spacing:
+3/3mil
+4/4mil
+5/5mil
+6/6mil
+8/8mil ↑
+Min hole size:
+0.15mm
+0.2mm
+0.25mm
+0.3mm ↑
+0.8mm ↑
+1.0mm ↑
+No Drill
+Solder mask:
+Green
+Red
+Yellow
+Blue
+White
+Black
+Purple
+Matte black
+Matte green
+Transparent
+Translucent
+None
+Silkscreen:
+White
+Black
+Yellow
+None
+UV printing Multi-color :
+None
+Single-sided: Top
+Single-sided: Bottom
+Double-sided
+*The uploaded PCB file should contain color renderings,
+learn more >>
+Edge connector:
+Yes
+No
+Bevelling:
+No
+No
+Yes (20°)
+Yes (30°)
+Yes (45°)
+HASL with lead
+HASL lead free
+Immersion gold(ENIG)
+OSP
+Hard gold
+Immersion silver(Ag)
+Immersion tin
+ENEPIG
+None/Plain copper
+*The above options are only Edge connector Surface Finish
+Thickness of Immersion Gold:
+1U"
+2U"
+3U"
+Au/Ni thickness:
+Au:10U"/Ni:120U"
+Please choose other options of Gold /Nickel thickness here
+Thickness of ENEPIG:
+Ni:200U" Pd:2U" Au:2U"
+Please choose other options of Au/Pd thickness here
+Surface finish:
+HASL with lead
+HASL lead free
+Immersion gold(ENIG)
+OSP
+Hard gold
+Immersion silver(Ag)
+Immersion tin
+HASL lead free + Selective Immersion gold
+HASL lead free + Selective Hard gold
+Immersion gold + Selective Hard gold
+ENEPIG
+None/Plain copper
+Tick means you accept we might change "HASL" to "ENIG" at our discretion without extra charge.
+Thickness of ENEPIG:
+Ni:200U" Pd:2U" Au:2U"
+Please choose other options of Au/Pd thickness here
+Au/Ni thickness:
+Au:5U"/Ni:120U"
+Please choose other options of Gold /Nickel thickness here
+Thickness of Immersion Gold:
+1U"
+2U"
+3U"
+Thickness of Immersion gold:
+1U"
+Please choose other options of Immersion gold thickness here
+Thickness of Hard gold:
+Au:10U"/Ni:120U"
+Please choose other options of Gold/Nickel thickness here
+Immersion gold / Hard gold thickness:
+Immersion gold: 1U", Hard gold: Au:10U"/Ni:120U"
+Please choose other options thickness here
+Via process:
+Tenting vias
+Plugged vias with solder mask
+Vias not covered
+*For Gerber files this choice will not affect anything, PCB will be made using the parameters of the files.
+*If you want to do filled vias with resin, please select in Additional Options!
+Finished copper:
+Bare board(0 oz Cu)
+1 oz Cu
+2 oz Cu
+3 oz Cu
+4 oz Cu
+5 oz Cu
+6 oz Cu
+7 oz Cu
+8 oz Cu
+9 oz Cu
+10 oz Cu
+11 oz Cu
+12 oz Cu
+13 oz Cu
+Inner Copper:
+1 oz
+1.5 oz
+2 oz
+3 oz
+4 oz
+5 oz
+6 oz
+Remove product No. :
+No
+Yes (extra+$ 1.5)
+Specify a location
+Customized Services and Advanced Options
+(Castellated holes,Edge plating,Impedance control...)
+More
+We may add extra cost for these special options which will be confirmed after review.
+Peelable soldermask:
+None
+Top side
+Bottom side
+Both sides
+Hole copper thickness:
+Standard(20um)
+25um
+30um
+35um
+50um
+55um
+70um
+UL marking:
+None
+Yes - add to top silkscreen
+Yes - add to bottom silkscreen
+Yes - add to top soldermask
+Yes - add to bottom soldermask
+Yes - add to top copper
+Yes - add to bottom copper
+Yes - as PCBWay default
+Yes - as customer specified
+Date code:
+None
+Add as PCBWay prefer
+Add as customer's required
+Update the designed date code
+Package box:
+With PCBWay logo
+Neutral box
+Add serial numbers:
+None
+Yes - Accept non-consecutive serial numbers - solid font
+Yes -Don't accept non-consecutive serial numbers - solid font
+Serial Number Printing Location:
+Follow the factory's default format and location
+Specified format and position
+Half-cut/Castellated holes
+Edge plating
+Impedance control
+Halogen-free
+Custom stackup
+Carbon ink
+All vias filled with resin and capped
+Via in pad
+Press-fit holes
+Countersink/Counterbore
+Z-axis milling
+Black FR4 (black core)
+Embedded copper PCB
+Cavity PCB
+Semi-Flex PCB
+Whole/Partially hybrid PCB
+Back drill PCB
+Leadless partially plated hard gold
+Paper between PCBs
+Other special request:
++ Add PO No.
+[... a list of numeric choices is omitted here ...]
+/200
+SMD-Stencil
+Order together with PCB
+Stencil type:
+Framework
+Non-framework
+Allow combining several PCBs on a single SMD stencil.
+Multi-level/ Step stencil:
+Yes
+No
+Size (mm) :
+[... a list of numeric choices is omitted here ...]
+(Valid area 190×290mm)
+[... a list of numeric choices is omitted here ...]
+(Valid area 190×290mm)
+[... a list of numeric choices is omitted here ...]
+(Valid area 240×340mm)
+[... a list of numeric choices is omitted here ...]
+(Valid area 270×370mm)
+[... a list of numeric choices is omitted here ...]
+(Valid area 380×380mm)
+[... a list of numeric choices is omitted here ...]
+(Valid area 350×450mm)
+[... a list of numeric choices is omitted here ...]
+(Valid area 500×500mm)
+[... a list of numeric choices is omitted here ...]
+(Valid area 220×400mm)
+[... a list of numeric choices is omitted here ...]
+(Valid area 220×600mm)
+400×1000mm
+(Valid area 220×760mm)
+[... a list of numeric choices is omitted here ...]
+(Valid area 320×600mm)
+400×1200mm
+(Valid area 220×1000mm)
+400×1400mm
+(Valid area 220×1200mm)
+500×1200mm
+(Valid area 320×1000mm)
+500×1400mm
+(Valid area 320×1200mm)
+[... a list of numeric choices is omitted here ...]
+(Valid area 190×290mm)
+[... a list of numeric choices is omitted here ...]
+(Valid area 550×550mm)
+Stencil side:
+Top
+Bottom
+Top+Bottom(On Single Stencil)
+Top & Bottom(On Separate Stencil)
+Quantity:
+Pieces
+Thickness:
+0.08mm
+0.10mm
+0.12mm
+0.15mm
+0.2mm
+0.25mm
+0.3mm
+Existing fiducials:
+None
+half lasered
+lasered through
+Electropolishing:
+Yes
+No
++ Add PO No.
+[... a list of numeric choices is omitted here ...]
+/200
+Other Special
+request:
+Assembly Service
+The PCBs above need assembly
+3 flexible options:
+Turnkey
+PCBWay supply parts
+Kitted or Consigned
+Customer supply parts
+Combo
+You supply some parts we do the rest
+Board type
+:
+Single pieces
+Panelized PCBs
+We suggest choose to do panel if single PCB qty is more than 20pcs or any side of single board is smaller than 50mm.
+Assembly side(s):
+Top side
+Bottom side
+Both sides
+*
+Quantity:
+pcs
+Please fill in total quantity of single PCBs.
+*
+Pay attention:
+Contains sensitive components/parts
+No
+Yes
+Do you accept alternatives/substitutes made in China?
+No
+Yes
+Function test:
+No
+Yes
+Firmware loading:
+No
+Yes
++ Add PO No.
+[... a list of numeric choices is omitted here ...]
+/200
+Other Parameters
+(Fill in to get the exact price, or leave it blank to wait for final quote.)
+More
+They can be left blank if you're not sure about the number of Unique Parts, SMT Parts, BGA/QFP Parts or THT parts.
+Number of Unique Parts:
+Number of
+SMD Parts:
+Number of
+BGA/QFP Parts:
+Number of
+Through-Hole
+Parts:
+----------------------------------------------------------------------
+[6] https://www.pcbway.com/helpcenter/design_instruction/Generate_Position_File_in_Kicad.html
+    "Generate Position File Centroid File(pick place) in Kicad", added for
+    hardware/fab/ORDERING.md; retrieved 2026-11-03 with curl; full page as
+    fetched: md5 7d8dc1e0a0f052ca9c8b0fd3c91c3b45 (212370 bytes)
+    text (tags removed, image tags replaced by [IMG], HTML entities decoded,
+    whitespace collapsed)
+----------------------------------------------------------------------
+Note:You can export the pick and place file directly through the PCBWay plugin 1.Set the origin point Select the menu bar Place-> Drilling and Position Offset, place the origin at the bottom left corner of the PCB board frame, and then place [Layer Alignment Mark] to the position of the origin just placed. [IMG] [IMG] 2.Generate Footprint Position File Click the menu [File] >> [Fabrication Output] >> [Footprint Position (.pos) File], select the output directory, other default, click [Generate Position File]. Open the package location file with Notepad or text editor. You can see the contents have reference number, value, package, X Y coordinate, orientation, board surface, etc. [IMG] [IMG] Check "Generate Gerber Files in Kicad" here - https://www.pcbway.com/blog/help_center/Generate_Gerber_file_from_Kicad.html
+-- the same page, after the article: "Last updated on 16/07/2024"
+
+----------------------------------------------------------------------
+[7] https://www.pcbway.com/helpcenter/design_instruction/How_to_create_a_Centroid_File_from_Eagle__Altium_Sprint_Layout_and_ORCAD_.html
+    added for hardware/fab/ORDERING.md; retrieved 2026-11-03 with curl;
+    full page as fetched: md5 219f42e8af9cc666c6479b00a29896ee (214863 bytes)
+    text (tags removed, HTML entities decoded, whitespace collapsed), the
+    passage on location
+----------------------------------------------------------------------
+Location Location: the X and Y Locations refer to the values that identify the horizontal and vertical location of a PCB component with respect to the board's origin. The location is measured from the origin to the component's center. The board's origin is defined as the (0, 0) value and is located at the lower left corner of the board from a top point of view. Even the reverse side of the board uses the lower left corner as the origin’s reference point. The X and Y location values are measured to the ten thousandth of an inch (0.000). Rotation Rotation is the direction of rotation of a PCB component's placement orientation referenced from a top point of view. The rotation is a 0 to 360 degree value from the origin. Both the top and reserve side components use a top point of view as their reference point.

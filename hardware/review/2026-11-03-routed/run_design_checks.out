@@ -1,0 +1,44 @@
+=== kicad-cli pcb drc  (0 errors, 0 unconnected)
+DRC: 0 errors, 0 unconnected, 10 warnings (silk_over_copper, silk_overlap)
+--- PASS  kicad-cli pcb drc  (0 errors, 0 unconnected)
+=== kicad-cli sch erc  (0 violations)
+ERC: 0 violations (errors and warnings)
+--- PASS  kicad-cli sch erc  (0 violations)
+=== check_netlist.py
+Netlist: hardware/netlist.yaml
+  components      59
+  pins            184
+  nets            38
+  endpoints       178
+  no_connect      6
+
+PASSED - netlist is consistent, 0 warning(s)
+--- PASS  check_netlist.py
+=== check_kicad.py (incl. check_pcb_connectivity)
+Syntax
+Generated artefacts vs netlist.yaml
+PCB net encoding
+PCB connectivity vs netlist.yaml
+PCB fitting flags vs netlist.yaml
+
+PASSED — all checks ok, 0 warning(s)
+--- PASS  check_kicad.py (incl. check_pcb_connectivity)
+=== test_check_kicad.py
+...........................
+----------------------------------------------------------------------
+Ran 27 tests in 2.247s
+
+OK
+--- PASS  test_check_kicad.py
+=== check_fab_release.py (incl. In1 continuity and pair coupling, ruling BJ)
+....................................................................................................................................................................................................................
+----------------------------------------------------------------------
+Ran 212 tests in 48.517s
+
+OK
+--- PASS  check_fab_release.py (incl. In1 continuity and pair coupling, ruling BJ)
+=== rebuild_check.py (gen_pcb + route_pcb reproduce the committed board)
+committed 1136 items, rebuilt 1136; identical 1136 of 1136
+--- PASS  rebuild_check.py (gen_pcb + route_pcb reproduce the committed board)
+
+design checks: 7 passed, 0 failed

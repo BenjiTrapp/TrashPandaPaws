@@ -25,11 +25,22 @@ from pathlib import Path
 import yaml
 
 DEFAULT = Path(__file__).resolve().parent.parent / "netlist.yaml"
+REPO = Path(__file__).resolve().parents[2]
 
 # Pin types that must be driven by a rail.
 POWER_INPUT_TYPES = {"power_in"}
 # Pin types that are allowed to sit on exactly one net without complaint.
 PASSIVE_TYPES = {"passive", "no_connect"}
+
+
+def shown(path):
+    """The path as printed: relative to the repository root, so the committed
+    output of this check does not carry the operator's home directory."""
+    resolved = Path(path).resolve()
+    try:
+        return str(resolved.relative_to(REPO))
+    except ValueError:
+        return str(path)
 
 
 def load(path):
@@ -121,7 +132,7 @@ def main():
             warnings.append(f"rail {rail!r} is declared but has no net")
 
     # Report.
-    print(f"Netlist: {path}")
+    print(f"Netlist: {shown(path)}")
     print(f"  components      {len(components)}")
     print(f"  pins            {len(all_pins)}")
     print(f"  nets            {len(nets)}")

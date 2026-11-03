@@ -1,0 +1,66 @@
+Syntax
+  ok    raccoon-tap.kicad_sch: parentheses balanced
+Generated artefacts vs netlist.yaml
+  ok    schematic has all 59 netlist refs
+  ok    BOM has all 45 netlist refs that are parts
+  ok    schematic values match netlist
+  ok    BOM values match netlist
+  ok    every component has a footprint
+  ok    raccoon-tap.kicad_pcb: parentheses balanced
+PCB net encoding
+  ok    netlist supplied to validate net names
+  ok    no integer net references in a table-less board
+  ok    pads carry net references
+  ok    every net reference carries a name
+  ok    every referenced net name is in netlist.yaml
+  ok    all 9 zone(s) carry a netlist net name
+PCB connectivity vs netlist.yaml
+  ok    netlist assigns each pin to one net only
+  ok    PCB has exactly the 59 netlist components
+  ok    net GND: PCB pads match netlist
+  ok    net +5V: PCB pads match netlist
+  ok    net +5V_SW: PCB pads match netlist
+  ok    net LS_CT: PCB pads match netlist
+  ok    net +3V3_REG: PCB pads match netlist
+  ok    net +3V3: PCB pads match netlist
+  ok    net +1V0_REG: PCB pads match netlist
+  ok    net +1V0: PCB pads match netlist
+  ok    net SW_1V0: PCB pads match netlist
+  ok    net FB_1V0: PCB pads match netlist
+  ok    net AVDD33_LDO: PCB pads match netlist
+  ok    net DVDD10_UPS: PCB pads match netlist
+  ok    net RSET: PCB pads match netlist
+  ok    net XTAL1: PCB pads match netlist
+  ok    net XTAL2: PCB pads match netlist
+  ok    net XTAL2_Y1: PCB pads match netlist
+  ok    net USB2_D_P: PCB pads match netlist
+  ok    net USB2_D_N: PCB pads match netlist
+  ok    net USB3_TX_P: PCB pads match netlist
+  ok    net USB3_TX_CONN_P: PCB pads match netlist
+  ok    net USB3_TX_N: PCB pads match netlist
+  ok    net USB3_TX_CONN_N: PCB pads match netlist
+  ok    net USB3_RX_P: PCB pads match netlist
+  ok    net USB3_RX_N: PCB pads match netlist
+  ok    net MDI0_P: PCB pads match netlist
+  ok    net MDI0_N: PCB pads match netlist
+  ok    net MDI1_P: PCB pads match netlist
+  ok    net MDI1_N: PCB pads match netlist
+  ok    net MDI2_P: PCB pads match netlist
+  ok    net MDI2_N: PCB pads match netlist
+  ok    net MDI3_P: PCB pads match netlist
+  ok    net MDI3_N: PCB pads match netlist
+  ok    net MDI_CT: PCB pads match netlist
+  ok    net SHIELD: PCB pads match netlist
+  ok    net LED_Y_A: PCB pads match netlist
+  ok    net ETH_LED0: PCB pads match netlist
+  ok    net LED_G_A: PCB pads match netlist
+  ok    net ETH_LED1: PCB pads match netlist
+  ok    no PCB pad sits on a net the netlist lacks
+  ok    no pad number carries two different nets
+  ok    no_connect pins have no net in the PCB
+  ok    every numbered PCB pad is in the netlist
+PCB fitting flags vs netlist.yaml
+  ok    footprint DNP / position-file flags match the netlist
+
+PASSED — all checks ok, 0 warning(s)
+exit 0

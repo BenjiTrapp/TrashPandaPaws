@@ -1,4 +1,18 @@
-# Raccoon HAT — Circuit Design Guide
+# Raccoon HAT — Circuit Design Guide (LEGACY, v1, abandoned design)
+
+> [!CAUTION]
+> **This guide describes `raccoon-hat`, the abandoned first design: a 2-layer,
+> 65 × 56 mm Raspberry Pi HAT with its own Power-over-Ethernet stage. Do not
+> build from it.** The released board is `raccoon-tap` (4 layers, 58 × 36 mm,
+> USB-powered, no PoE stage). Its source of truth is
+> [`netlist.yaml`](netlist.yaml), not this file. The guide is kept as the
+> record of the v1 design; several of its sections were corrected in place when
+> the RTL8153B pinout was verified (§2.1, task 3), and those corrections are the
+> parts still worth reading. Everything else (the PoE front end, the 2-layer
+> stackup, the 65 × 56 mm outline, the "REGOUT must be wired" note, which the
+> external buck of OPEN_QUESTIONS item 3f makes moot) is v1 and does not apply
+> to `raccoon-tap`. Surface finish of the released board is ENIG (ruling CA,
+> `fab/ORDERING.md`).
 
 > [!WARNING]
 > **Concept stage — not manufacturable as written.** A design audit on
@@ -228,7 +242,7 @@ pin-assignment figure on page 4.
 | Pin | Name | Type | Pin | Name | Type |
 |----:|------|------|----:|------|------|
 | 1 | MDIP0 | I/O | 21 | VDD5 | P 5.0 V |
-| 2 | MDIN0 | I/O | 22 | DVDD10_UPS | P 1.0 V |
+| 2 | MDIN0 | I/O | 22 | DVDD10_UPS | **LDO output 1.0 V** (not a supply input, see below) |
 | 3 | AVDD10 | P 1.0 V | 23 | DVDD33 | P 3.3 V |
 | 4 | MDIP1 | I/O | 24 | EEDO / LED2 / SPISDO / LANWAKEB / GPIO | shared |
 | 5 | MDIN1 | I/O | 25 | EEDI / SPISDI / ENSWREG | shared |
@@ -246,22 +260,46 @@ pin-assignment figure on page 4.
 | 17 | U2DM | I/O | 37 | AVDD10 | P 1.0 V |
 | 18 | U2DP | I/O | 38 | RSET | I |
 | 19 | U2VDD10 | P 1.0 V | 39 | AVDD33 | P 3.3 V |
-| 20 | AVDD33 | P 3.3 V | 40 | AVDD33 | P 3.3 V |
+| 20 | AVDD33 | **LDO output 3.3 V** (see below) | 40 | AVDD33 | P 3.3 V |
 | | | | 41 | GND | P (exposed pad) |
 
-Grouped supplies: `AVDD33` = 11, 20, 39, 40 · `DVDD33` = 23, 33 ·
+Grouped supplies: `AVDD33` = 11, 20, 39, 40 (datasheet Table 8; pin 20 is
+nevertheless an LDO *output*, see below) · `DVDD33` = 23, 33 ·
 `AVDD10` = 3, 8, 37 · `GND` = 29 and 41 (pad).
 
-**Power tree.** The chip needs **both 5 V and 3.3 V supplied externally** and
-generates its own 1.0 V rail internally:
+**Pins 20 and 22 are outputs of U3's embedded LDOs.** Datasheet Table 6 lists
+`AVDD33` pin 20 as "Linear Regulator (LDO) 3.3V Output" and `DVDD10_UPS` pin 22
+as "Linear Regulator (LDO) 1.0V Output", both "designed for RTL8153B-VB internal
+use only. Do not provide this power source to other devices"; §6.15 asks for
+"only an output capacitor between its output and analog ground". Tables 8 and 21
+list both pins among the supplies by *name*. Pin 22 is settled: §6.14 names the
+pins the 1.0 V output may feed (DVDD10, AVDD10, U3VDD10, U2VDD10) and 22 is not
+one; §6.15 note 2 says it "should be separated" from the 1.0 V rail. Pin 20 is
+**not settled by the datasheet**: Table 6 says output, Table 8 groups it with the
+supplies, and the "internal use only" phrase is also attached to REGOUT, which
+§6.14 requires wired to the chip's own pins, so it cannot be read as "isolate
+this pin". It is kept off 3.3 V behind its own capacitor with a DNP link (R12) to
+3.3 V, and a first-build procedure decides. Neither pin goes on a supply rail;
+each has its own output capacitor. An earlier revision of this
+guide and of `netlist.yaml` put pin 22 on the 1.0 V rail and pin 20 on 3.3 V;
+that was wrong. Reasoning, the capacitor values and the first-build check are in
+`netlist.yaml` → `components.U3.design_notes.ldo_outputs`; pin numbers are
+established in `review/u3-pinout-verdict.md`.
+
+**Power tree.** The chip needs **both 5 V and 3.3 V supplied externally**. Its
+1.0 V core rail can come from its own switching regulator (`REGOUT`) or, as
+built here, from an external buck (U6, `ENSWREG` low, `REGOUT` left open):
 
 ```
 USB VBUS 5V ─┬─→ VDD5 (21), VDDREG5 (27)
-             └─→ U4 AP2112K ─→ 3.3V ─→ VDDREG33 (26), DVDD33 (23, 33),
-                                        AVDD33 (11, 20, 39, 40)
+             ├─→ U4 AP2112K ─→ 3.3V ─→ VDDREG33 (26), DVDD33 (23, 33),
+             │                          AVDD33 (11, 39, 40)
+             └─→ U6 SY8089 ─→ 1.0V ─→ DVDD10 (34), AVDD10 (3, 8, 37),
+                                       U3VDD10 (14), U2VDD10 (19)
+                                       (the role REGOUT (28) has when used)
 
-REGOUT (28) ─→ 1.0V ─→ DVDD10 (34), AVDD10 (3, 8, 37),
-                        U3VDD10 (14), U2VDD10 (19)
+AVDD33 (20)    LDO output ── C8 ── GND     (not on 3.3 V)
+DVDD10_UPS (22) LDO output ── C17 ── GND   (not on 1.0 V)
 ```
 
 > **Mandatory, and missing from earlier revisions of this guide:**
@@ -274,8 +312,10 @@ REGOUT (28) ─→ 1.0V ─→ DVDD10 (34), AVDD10 (3, 8, 37),
 >    output — the embedded LDO is for the chip's internal use only (§6.15
 >    Note 1). U4 cannot be dropped.
 > 3. **`RSET` (38) needs an external reference resistor** to set the internal
->    current reference. No such part exists in the BOM. Read the required value
->    off the datasheet's reference application before layout.
+>    current reference. The datasheet (rev 1.4) gives pin 38 only as "Reference
+>    (External Resistor Reference)" and states no value. `netlist.yaml` fits R11 =
+>    2.49 kΩ 1 %, taken from the Olimex RTL8153**VC** design; it is unconfirmed
+>    for the -VB and is to be verified on the first build.
 >
 > Datasheet §6.14 also warns the switching regulator "requires a well-designed
 > PCB layout in order to achieve good power efficiency and lower the output
@@ -290,11 +330,14 @@ USB3_SSTX-──→ J3 USB-A SSTX-  [SuperSpeed TX-]
 USB3_SSRX+──→ J3 USB-A SSRX+  [SuperSpeed RX+]
 USB3_SSRX-──→ J3 USB-A SSRX-  [SuperSpeed RX-]
 
-AVDD33    ── C7 (100nF) to GND   [3.3V Analog]
-DVDD33    ── C8 (100nF) to GND   [3.3V Digital]
-DVDD12    ── Internal LDO output ── C9 (10uF) to GND
+AVDD33 (11, 39, 40) ── 100nF to GND each group   [3.3V Analog supply]
+DVDD33    ── 100nF to GND                           [3.3V Digital supply]
+AVDD33 (20)    ── C8 (2.2uF) to GND                 [LDO output, not a supply]
+DVDD10_UPS (22) ── C17 (100nF) to GND               [LDO output, not a supply]
+(There is no DVDD12 pin on the -VB; earlier revisions of this guide named one.)
 
-XI/XO     ── Y1 (25MHz) ── C13, C14 (10pF load caps each)
+XI/XO     ── Y1 (25MHz, CL 18pF) ── C19, C20 (27pF C0G load caps each);
+             R14 (0R drive-level trim) in series on the XO side
 
 SPI_CLK   ──→ U5 pin 6 (CLK)
 SPI_MOSI  ──→ U5 pin 5 (DI)
@@ -378,7 +421,7 @@ Directly connects to the SI3402-B PoE PD controller.
 - 4× M2.5 mounting holes at Pi standard positions
 - Board thickness: 1.6mm
 - Copper: 1oz (35μm) both layers
-- Surface finish: HASL or ENIG
+- Surface finish: HASL or ENIG for this v1 board (never decided; the released `raccoon-tap` uses ENIG, ruling CA)
 
 ### Layer Stackup (2-layer)
 - **F.Cu** — Signal routing, component pads

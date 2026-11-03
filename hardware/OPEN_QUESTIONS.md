@@ -1,13 +1,85 @@
-# Raccoon HAT — Open Engineering Questions
+# Raccoon Tap — Open Engineering Questions and Design History
 
-Status of the v1 HAT hardware sources, and the list of things that must be
-resolved by a hardware engineer before this board can go to fabrication.
+Two different boards live in `hardware/`, and this document is about both. The
+history below was written while the first one was still the plan; read the
+banner first so that a section about one is not taken for a section about the
+other.
 
-> **Maturity:** the KiCad sources in `kicad/` are a **concept stage** design.
-> The board is not routed and the schematic is not fully connected. Do not send
-> these files to a fab house. See "Source file state" below.
+> **`raccoon-hat` — ABANDONED, do not build.** The first design: a 2-layer,
+> 65 × 56 mm Raspberry Pi HAT with its own Power-over-Ethernet stage (Si3402-B,
+> TPS54302). An audit on 2026-09-24 found it unbuildable (items 0 to 0c below).
+> Its files — `kicad/raccoon-hat.*` and `design-guide.md` — are kept as the
+> record only. They are not generated from `netlist.yaml`, are not checked by
+> the release checks, and must not be sent to a fab house.
+>
+> **`raccoon-tap` — the current design, with an orderable fabrication
+> package.** A 4-layer, 58 × 36 mm USB 3.0 to Gigabit Ethernet tap that takes its
+> power from the Raspberry Pi's USB port (`kicad/raccoon-tap.*`, connectivity in
+> `netlist.yaml`, revision `2.1-draft`). State when task 12 was finished: routed
+> (task 9) and **frozen**; `kicad-cli pcb drc`: 0 errors, 0 unconnected items, 10
+> silkscreen warnings; `kicad-cli sch erc`: 0 violations; all 7 checks of
+> `tests/run_design_checks.sh` pass; the PCBWay package is in `fab/` (start with
+> `fab/ORDERING.md`). **Nothing has been ordered, built or measured on a bench.**
+> What the design rests on without a measurement is collected under "To measure
+> on the first build" below; read it before treating any current, temperature or
+> resistor value as established.
+>
+> Sections below that concern only `raccoon-hat` say so in their heading.
 
-## Resolved
+## To measure on the first build
+
+*(Am ersten Aufbau zu messen.)* Values the design depends on that no datasheet
+states and that nobody has measured. Each is an assumption until a row below is
+done. Test pads and links are the ones `netlist.yaml` `design_notes.
+measurement_points` adds: TP1 GND, TP2 raw +5V, TP3 +5V_SW, TP4 +3V3, TP5 +1V0,
+TP6 AVDD33_LDO (U3 pin 20), TP7 DVDD10_UPS (U3 pin 22), and the pre-bridged
+solder jumpers JP1 (in +3V3, between U4 and the load) and JP2 (in +1V0, between
+the buck and the load). To open a jumper, cut the bridge with a knife (check
+with a meter that it is open), solder the ammeter to its two pads, read, and
+close it again with solder; opening one removes the load's decoupling from the
+regulator, so measure quickly.
+
+| Quantity | Assumed, and where the assumption comes from | How to measure | Test pad | If it deviates |
+|---|---|---|---|---|
+| **`+1V0` current** (U6 to U3's AVDD10, DVDD10, U3VDD10, U2VDD10) | **0.51 A** design current = 3 × 170 mA, where 170 mA is Icc10 *typical* at 1000 Mbit/s with heavy traffic ([RTL-DS] table 26, no maximum is published) and the factor 3 is an assumption (`design_notes.rail_currents`). The inductor L2 is sized at a 1 A design point (item 3f); [RTL-DS] does not give the 1.0 V rail current at all, so that 1 A is itself an assumption. | `iperf3` bidirectional at line rate; cut JP2, ammeter across it. Also read the voltage at TP5 under load: [RTL-DS] table 21 allows 0.95 to 1.05 V. | **JP2** (current), **TP5** (voltage), TP1 | Above 0.51 A: the note is wrong, not necessarily the board; compare with the 1 A inductor design point (above about 1 A the inductance and ripple calculation of 3f must be redone) and with U6's 2 A. If TP5 leaves 0.95 to 1.05 V under load, the divider R5/R6 or the load is wrong. Either result is a respin question, not a patch. |
+| **`+3V3` current** (U4 to U3's AVDD33, DVDD33, VDDREG33 and the LEDs) | **0.22 A** = 3 × 70 mA (Icc33 typical, [RTL-DS] table 26) + two LEDs at 1.1 mA; the task 6 figure (`design_notes.rail_currents`). U4's dissipation at that current is 0.36 W; with [AP2112]'s theta-JA of 184 C/W that is 66 K of rise, 91 C junction at 25 C ambient (`accepted-findings.md` B13). | `iperf3` at line rate; cut JP1, ammeter across it. Also the supply-current comparison with R12 open and fitted (item 3 step 4 in `design_notes.ldo_outputs`). | **JP1**, **TP4** | Above 0.22 A: the note is wrong. U4 reaches 125 C at 25 C ambient at about 0.32 A (100 K / 184 K/W / 1.7 V; my arithmetic, not a datasheet value). The cure the note names, feeding U3's 3.3 V loads from the buck instead of the LDO, is a respin. |
+| **`RSET` value for the -VB** (R11, 2.49 kohm 1 %, 0603) | 2.49 kohm is Olimex's value for the RTL8153**VC** (their R8). The RTL8153B-VB datasheet gives pin 38 only as "Reference (External Resistor Reference)" and states no value ([RTL-DS] table 6; items 3e and `design_notes.rset`). It is a variant-independent function, so the value is plausible, **not confirmed**. | There is no dedicated test pad. The node is R11's pad 1 (the other pad is GND). Record the DC voltage there against TP1 with a high-impedance meter (no expected value exists in any document held, so this is a record, not a pass/fail). The decisive test is functional: link at 1000 Mbit/s, `iperf3` at 940 Mbit/s, `ethtool -S` error counters clean over 30 min. | R11 pad 1, TP1 | **No threshold exists.** If the link, the throughput and the counters are clean, keep 2.49 kohm and write the measured node voltage into `design_notes.rset`. If not, R11 is a hand-fitted 0603: the first thing to find is Realtek's value for the -VB (request the reference schematic through Realtek or a distributor's FAE), not a trial and error on the resistor. |
+| **U3 case temperature** | **Estimate only:** 0.40 W typical ([RTL-DS] table 26: 5 V x 0.5 mA + 3.3 V x 70 mA + 1.0 V x 170 mA) times an **ASSUMED theta-JA of 30 to 45 K/W**, which is 12 to 18 K of rise. **The datasheet gives no theta-JA and no theta-JC; the 30 to 45 K/W has no source in this repository** (it is the range usual for a 5 x 5 mm QFN-40 with a soldered, vias-to-ground exposed pad). `fab/fabrication-note.md` "U3 thermal" has the table; nothing, kicad-happy included, has assessed U3. | IR thermometer or a thermocouple taped to the top of the package, `iperf3` bidirectional for 30 min at 940 Mbit/s, room at about 25 C. | none (the package top) | Expected case rise 10 to 20 K (that range is the assumed estimate above, not a specification). **Investigate at 30 K or more**: either theta-JA or the power is outside the assumption (compare the two current rows above first); at a 70 C ambient the junction would then be about 100 C or more against the datasheet's 125 C. The enclosure's ambient is not known. |
+| **Crystal drive level** (Y1 on U3's CKXTAL1/2) | Y1 is rated 100 uW ([ABM8]); the chip's side is only "DL drive level max 0.3 mW" ([RTL-DS] table 23). The voltage that corresponds to 100 uW at the worst-case ESR of 50 ohm depends on which capacitance that voltage is taken to drive, and two definitions are in use: the vendor formula with C0 + CL = 20.5 pF gives **1.24 V p-p**, the node-current reading with C19 plus stray = 27 to 31 pF gives **0.94 to 0.82 V p-p** (0.75 V if C0 were added on top). Neither is settled (`design_notes.drive_level` in `netlist.yaml`, which also withdraws a wrong correction made earlier in task 12). | Probe CKXTAL1 with a probe of 1 pF or less (a 10:1 probe detunes it); better, a current probe round the crystal lead, which gives the current directly and settles which definition applies. | no pad (a pad would load the node); probe the C19/Y1 side | At or below about 0.75 V p-p with R14 = 0 ohm: under 100 uW by every definition, leave. Above about 1.25 V p-p: over by every definition, fit a larger R14 (value found on the bench; none is sourced). In between: depends on the definition, a judgement for the person at the bench. If start-up then becomes unreliable (check 20 cold starts), use a crystal rated 200 uW or more. |
+
+Also open, with the procedure already written in `netlist.yaml` (not repeated
+here): U8's pin 1 on the physical part (before soldering, confirm that the dot on
+the SP3019 package is at pad 1 as placed; the footprint's pad numbering was
+compared with the datasheet drawing on paper only, `design_notes.esd_protection`,
+and ERC and DRC cannot see a pin-1 orientation error on the real part), pin 20's role and the R12 decision (`U3 design_notes.ldo_outputs`, probing
+TP6), pin 22's quiet 1.0 V and C17's value (TP7), the VBUS attach inrush peak
+(`design_notes.vbus_inrush`, TP2 and TP3), LED polarity (`design_notes.
+led_polarity`), the MDI C/D pair exchange with a straight and a crossover cable
+(`design_notes.mdi_pair_mapping`), and the SuperSpeed link under load (`fab/
+fabrication-note.md` "First-build checks": the 8.0 mm TX_CONN_P straddle concession
+and the +1V0 escape that runs 0.229 mm from USB3_RX_N).
+
+## Before unfreezing the board
+
+The board file is the geometry now; `tools/gen_pcb.py` refuses to run over a
+routed board. If it is ever reopened and re-routed, one thing is known to bite
+(ruling CH): `tools/route_pcb.py` keeps a hand-written `REFLOWED = ("U3", "Y1")`
+for its via-to-pad gap rule. It is a fourth, separate statement of "which parts
+PCBWay assembles". The real source is the `assembly:` marks in `netlist.yaml`,
+which the export path (`tools/export_fab.py`, `tools/gen_bom.py`) reads. If the
+marks change and `REFLOWED` does not, the rule is applied to the wrong parts: a
+part that is now hand-soldered but still listed there stays exempt, and a via
+left open in its pad would draw solder out of the joint with nothing reporting
+it. Nothing checks that the two agree, and it has no effect while the board stays
+frozen. The same warning is at the definition in `route_pcb.py` and in the
+`gen_pcb.py` docstring.
+
+## Resolved (raccoon-hat, history)
+
+Both fixes below were made to the abandoned `raccoon-hat` design. The parts they
+concern (TPS54302, Si3402-B) are not on `raccoon-tap`: the PoE stage was dropped
+by item 0. They stay as the record of what a document that drifted from its
+datasheet would have cost.
 
 ### R10 feedback divider — wrong reference voltage (fixed 2026-09-24)
 
@@ -52,7 +124,12 @@ Reference class table (AN956 Table 3 / AN1130 Table 3.4):
 | 3 | 6.49–12.95 W | 48.7 Ω |
 | 4 | 12.95–25.5 W (Type 2) | 33.2 Ω |
 
-## Open — electrical
+## Electrical items, with their status
+
+Items 0 to 0c concern the abandoned `raccoon-hat` and are history. Every item
+carries its status in the heading; "closed" names the task of the fabrication
+release plan (`docs/superpowers/plans/2026-10-31-raccoon-tap-fab-release.md`)
+that closed it. What is still open is in "To measure on the first build".
 
 ### 0. RESOLVED: architecture decision — Option A
 
@@ -223,13 +300,23 @@ A decision is needed on isolated vs. non-isolated before the schematic can be
 completed, because it determines whether T1, the opto-coupler and TLV431 are in
 or out.
 
-### 1. Feed-forward capacitor across R9
+### 1. CLOSED as a decision (task 6), open as a measurement: feed-forward capacitor
 
-TI's 5 V reference design places a ~75 pF capacitor across the upper divider
-resistor to improve phase margin. This board has no such component. Decide
-whether to add it before fabrication.
+*(The original question concerned the TPS54302 divider R9, which is gone with the
+PoE stage. The same question exists for U6.)* TI's 5 V reference design placed a
+~75 pF capacitor across the upper divider resistor to improve phase margin. On
+`raccoon-tap` the pad is there and nothing is fitted: **C24, DNP**, across R5
+(output to FB). The SY8089 application note ([SY8089], committed in
+`datasheets/`) gives one figure: a 22 pF ceramic in parallel with R1 "may
+further speed up the load transient responses". `netlist.yaml` C24's "Part If
+Fitted" names 10 pF, which is not that figure and has no source; if the pad is
+ever fitted, try 22 pF first and reconcile the BOM. Whether this load needs it
+is unknown, so it stays empty until a scope measurement on the first build says
+otherwise (`design_notes.feed_forward`).
 
-### 2. PoE front-end is not specified
+### 2. MOOT (dropped with the PoE stage, item 0): PoE front-end is not specified
+
+Concerned only `raccoon-hat`. Kept for the record.
 
 `design-guide.md` §1.1 documents only part of the SI3402-B circuit. The
 following are undefined in every source file and cannot be derived from the
@@ -249,7 +336,7 @@ This is the isolated 48 V section. It needs to be designed against the
 SI3402-B datasheet and reference application, with creepage/clearance for
 mains-adjacent PoE isolation, and then reviewed.
 
-### 3. RESOLVED (pinout) / TODO (footprint): the RTL8153B was mis-specified
+### 3. RESOLVED (pinout: task 3; footprint: KiCad standard, in use): the RTL8153B was mis-specified
 
 Verified against the RTL8153B-VB-CG datasheet (rev 1.0 / 1.4) and Realtek's
 product page on 2026-09-24.
@@ -289,12 +376,22 @@ symbol does not account for:
 | SPISCK | **30** | 40 |
 
 The signal pins above come from explicit datasheet tables and are reliable. The
-**power and regulator pins are not yet confirmed** — the pin-assignment figure
-did not extract cleanly from the PDF, so `AVDD10`, `AVDD33`, `DVDD10`, `DVDD33`,
-`VDD5`, `REGOUT`, `DVDD10_UPS`, `RSET` and `GND` positions must be read off the
-datasheet figure directly before the symbol is finalised. Do not infer them.
+**power and regulator pins were not yet confirmed** when this was written — the
+pin-assignment figure did not extract cleanly from the PDF, so `AVDD10`,
+`AVDD33`, `DVDD10`, `DVDD33`, `VDD5`, `REGOUT`, `DVDD10_UPS`, `RSET` and `GND`
+positions had to be read off the datasheet figure directly before the symbol
+was finalised.
 
-#### 3c. SPI flash conflicts with the LEDs — and is probably unnecessary
+> **CLOSED by task 3** (`review/u3-pinout-verdict.md`, verdict `belegt`, §6):
+> all 40 pins and the exposed pad were taken from three copies of Realtek's own
+> datasheet, by machine from the §5 tables (`datasheets/crosscheck_u3_pinout.py`,
+> with a self-test) and by reading Figure 1 from the rendered page. The doubt
+> raised here was about where the numbers came from, not about wrong values;
+> `design-guide.md` §2.1 was right. Pin 22 was then taken off the shared `+1V0`
+> rail and pin 20 given its own net (task 5, `netlist.yaml` `design_notes.
+> ldo_outputs`; pin 20's role is still not settled by the datasheet).
+
+#### 3c. RESOLVED (U5 is not in `netlist.yaml`; the LEDs are kept): SPI flash conflicts with the LEDs — and is probably unnecessary
 
 The LED outputs are **shared pins**:
 
@@ -314,9 +411,10 @@ EEPROM". The SPI flash interface is for PXE boot ROM images, which this
 application does not use.
 
 **Recommendation: drop U5 and C10, and keep the LEDs.** That removes the pin
-conflict and a part.
+conflict and a part. (Done: `netlist.yaml` has no U5. Its `C10` is a different
+part from the one meant here; the designators were renumbered.)
 
-#### 3d. The external 3.3 V LDO is REQUIRED — earlier suspicion was wrong
+#### 3d. RESOLVED (U4 is in the netlist): the external 3.3 V LDO is REQUIRED — earlier suspicion was wrong
 
 An initial reading suggested the chip's "built-in switching regulator and LDO
 regulator" might make U4 (AP2112K) redundant. **Checking the datasheet showed the
@@ -333,29 +431,31 @@ only input is USB VBUS at 5 V, so **U4 stays** and its capacitors with it.
 
 The internal switching regulator generates only the 1.0 V core rail.
 
-#### 3e. Two mandatory connections are missing entirely
+#### 3e. RESOLVED (REGOUT moot since 3f; R11 added, value unconfirmed): two mandatory connections are missing entirely
 
 | Requirement | Source | Status in repo |
 |---|---|---|
-| `REGOUT` (28) must be externally wired to `DVDD10` (34), `AVDD10` (3, 8, 37), `U3VDD10` (14), `U2VDD10` (19) | datasheet §6.14, explicit | **absent** — without it the chip has no 1.0 V core supply. Only applies if the internal SWR is used; see 3f. |
-| `RSET` (38) needs an external reference resistor | pin table §5.6 | **absent** — no such part in the BOM |
+| `REGOUT` (28) must be externally wired to `DVDD10` (34), `AVDD10` (3, 8, 37), `U3VDD10` (14), `U2VDD10` (19) | datasheet §6.14, explicit | was **absent** — without it the chip has no 1.0 V core supply. Only applies if the internal SWR is used; **moot since 3f**: `REGOUT` is left open and the same pins are fed from the external buck U6. |
+| `RSET` (38) needs an external reference resistor | pin table §5.6 | was **absent**; **R11 added** (see below) |
 
-**`RSET` value resolved: 2.49 kΩ 1% to GND.** The RTL8153B-VB datasheet gives no
-value and defers to a reference schematic that is not published. Traced from
+**`RSET` value chosen: 2.49 kΩ 1% to GND (R11) — chosen, not confirmed.** The
+RTL8153B-VB datasheet gives no value and defers to a reference schematic that is
+not published. Traced from
 Olimex's OSHW design instead: `U3.RSET → R8.1`, `R8.2 → GND`, `R8 = 2.49k 1%
 0402`. The pin sets an internal current reference, which is a
 variant-independent function, so this is a sound starting value — but it comes
-from the **VC** variant and is not confirmed for the **-VB**. Verify on first
-build.
+from the **VC** variant and is not confirmed for the **-VB**. See "To measure on
+the first build" for how and what to do if it is wrong.
 
 §6.14 additionally warns the switching regulator "requires a well-designed PCB
 layout in order to achieve good power efficiency and lower the output voltage
 ripple and input overshoot" — relevant given the board is currently 2-layer with
 zero vias.
 
-The full verified pinout is now recorded in `design-guide.md` §2.1.
+The full verified pinout is recorded in `design-guide.md` §2.1 and, with its
+sources pin by pin, in `review/u3-pinout-verdict.md`.
 
-### 3f. RESOLVED: external buck on a 4-layer board
+### 3f. RESOLVED (decision 2026-09-25; U6, L2, R5, R6 are in the netlist): external buck on a 4-layer board
 
 **Decided 2026-09-25: `ENSWREG` → GND, internal switching regulator disabled,
 1.0 V supplied by an external buck, on a 4-layer stackup.** Chosen for lowest
@@ -396,7 +496,7 @@ Two independent cross-checks came out consistent: the 1 A design point gives
 choice matches. The 1.0 V rail current is not specified in [RTL-DS], so 1 A is a
 conservative assumption to confirm by measurement on the first build.
 
-### 3g. Stackup
+### 3g. Stackup — CLOSED by task 7 (geometry), open with PCBWay (confirmation)
 
 4 layers, 1.6 mm, 1 oz outer:
 
@@ -412,9 +512,20 @@ D+/D−, **100 Ω** differential for the MDI pairs, both referenced to In1. Ask 
 fab for a stackup that hits these at their actual core/prepreg thicknesses rather
 than assuming a trace geometry.
 
+> **CLOSED by task 7** (`fab/stackup-note.md`): the geometry was calculated with
+> PCBWay's own impedance calculator for its stackup entry 1 (1.6 mm, 1 OZ outer
+> and inner, 70 % residual copper, 0.1855 mm prepreg), not assumed: USB3 0.20 mm
+> track / 0.17 mm gap, MDI 0.18 mm / 0.21 mm, centred on the calculator's value
+> less PCBWay's "typically 8 ohm" for one mask pass. As built, nominal 89.7 and
+> 99.2 Ω — **the note's numbers, not PCBWay's**. PCBWay's own engineering
+> confirmation with their mask is still outstanding (`stackup-note.md`, Open
+> items 1 to 3; `fab/ORDERING.md` lists them as questions that have not been
+> asked). The task 10 coupling check measures the as-built gaps on the routed
+> board against those numbers.
+
 Full rule list is in `netlist.yaml` under `stackup.rules`.
 
-### 4. RESOLVED: J2 replaced with a gigabit MagJack
+### 4. RESOLVED (J2 replaced 2026-09-24; footprint built; placed and routed in tasks 8 and 9): J2 replaced with a gigabit MagJack
 
 **The HR911105A was a 10/100Base-TX part** — its datasheet is titled "…Integrated
 Magnetics and LED for **10/100Base-TX** NIC Applications", corroborated by four
@@ -464,11 +575,11 @@ Verified pinout, now recorded in `netlist.yaml`:
 The cable-side mapping is the standard 1000BASE-T assignment, so the pair
 grouping the design guide intended is correct.
 
-Footprint to build: 10 × ⌀0.90 signal pins in two rows at 1.27 mm pitch and
+Footprint (built as `raccoon:RJ45_LPJG16402AQNL`): 10 × ⌀0.90 signal pins in two rows at 1.27 mm pitch and
 2.54 mm row spacing, 4 × ⌀1.02 LED pins, 2 × ⌀1.70 shield posts, 2 × ⌀3.25
 T-posts, 15.75 mm overall span.
 
-### 5. D3 / D4 package vs. usage
+### 5. MOOT (PoE-stage parts, dropped by item 0): D3 / D4 package vs. usage
 
 The guide uses D3 and D4 as single series diodes on the VC2+/VC2− rails, but
 specifies BAT54S — a *dual* diode in SOT-23. Either the part or the usage is
@@ -477,7 +588,7 @@ wrong. Decide on package and pinout.
 > Moot under Option A — D3/D4 are PoE-stage parts and are dropped. Kept for the
 > record in case a later revision brings PoE back onto the board.
 
-### 6. RESOLVED: Bob Smith termination is integrated in the new jack
+### 6. RESOLVED (2026-09-24, with item 4): Bob Smith termination is integrated in the new jack
 
 `bom.csv` listed `R1-R2, 2, 75R, "75 Ohm Ethernet Termination"`, which appeared
 in neither the schematic nor the PCB — and two resistors would have been wrong
@@ -496,21 +607,24 @@ Note on numbering: the PCB originally numbered its eight resistors `R1…R8`
 while the guide and BOM used `R3…R10`. The PCB was renumbered to `R3…R10` on
 2026-09-24 to match.
 
-### 7. W25Q16 HOLD# pin
+### 7. MOOT (U5 W25Q16 dropped, item 3c): W25Q16 HOLD# pin
 
 §2.2 documents CS#, CLK, DI, DO, WP#, VCC and GND but not `HOLD#` (pin 7),
 which must not float. Normally tied to VCC.
 
-### 8. J1 GPIO pins 27/28 (ID_SD / ID_SC)
+### 8. MOOT (no GPIO header on `raccoon-tap`, item 0): J1 GPIO pins 27/28 (ID_SD / ID_SC)
 
 Documented as "optional HAT EEPROM" but no EEPROM exists in the BOM. Either add
 the EEPROM (required for a compliant HAT ID) or leave the pins unconnected and
 drop the claim.
 
-## Open — source file state
+## Source file state of `raccoon-hat` (history: the audit of 2026-09-24)
 
-Findings from a structural audit of the KiCad files (2026-09-24). KiCad was not
-available to run ERC/DRC; these were established by parsing the files.
+Findings from a structural audit of the abandoned `raccoon-hat` KiCad files on
+2026-09-24, before KiCad was installed (10.0.6 has been since 2026-09-25; see
+"ERC" below); they were established by parsing the files. None of this describes
+`raccoon-tap`, whose files are generated from `netlist.yaml` and checked by
+`tests/run_design_checks.sh`.
 
 | File | Issue |
 |---|---|
@@ -521,7 +635,7 @@ available to run ERC/DRC; these were established by parsing the files.
 | Footprints | No courtyards and almost no silkscreen/fab geometry, so courtyard DRC cannot run. |
 | Layout | 73 track segments and 0 vias for 228 pads, everything on `F.Cu`. The board is not routed. |
 
-### Value conflicts between `design-guide.md` and the schematic
+### Value conflicts between `design-guide.md` and the schematic (`raccoon-hat`, history)
 
 The guide is treated as authoritative *where a datasheet confirms it*. Cross-checking
 found one case where the guide is wrong and the schematic is right, so "the guide
@@ -550,9 +664,9 @@ wins" is not applied blindly.
 |---|---|---|---|
 | C8 | schematic 10 µF | **100 nF** | RTL8153B VDD33 decoupling. Guide and BOM both say 100 nF, which is correct for high-frequency decoupling; the schematic was the outlier. |
 
-**Still unresolved — these belong to the PoE/buck section and may disappear
-entirely depending on the item 0 decision, so they were deliberately not touched.
-`tests/check_kicad.py` reports them as warnings rather than failures:**
+**Never resolved, now moot.** These belong to the PoE/TPS54302 section that
+item 0 removed; the designators below mean nothing on `raccoon-tap` (its
+`C1`..`C27` are different parts). Kept as the record of the disagreement:
 
 | Ref | Guide | Schematic | BOM | Role |
 |---|---|---|---|---|
@@ -563,21 +677,17 @@ entirely depending on the item 0 decision, so they were deliberately not touched
 | C12 | 22 µF | 100 nF | 22 µF | TPS54302 output |
 | C15 … C19 | not mentioned | present | absent | unknown function |
 
-`C9` is worth resolving independently of the PoE decision — DVDD12 is the
-RTL8153B's internal LDO output and survives every option. Schematic and BOM both
-say 100 nF; only the guide says 10 µF. An internal-LDO bypass usually wants the
-larger value, so confirm against the RTL8153B datasheet.
-
 ## Footprints
 
 | Part | Footprint | Status |
 |---|---|---|
-| U3 | `Package_DFN_QFN:QFN-40-1EP_5x5mm_P0.4mm_EP3.6x3.6mm` | **KiCad standard.** Matches the datasheet package table exactly: D/E = 5.00 BSC, e = 0.40 BSC, D2/E2 = 3.60 nom (3.45–3.75), JEDEC MO-220. Confirm the library name resolves in your KiCad install — it could not be checked here. |
+| U3 | `Package_DFN_QFN:QFN-40-1EP_5x5mm_P0.4mm_EP3.6x3.6mm` | **KiCad standard.** Matches the datasheet package table exactly: D/E = 5.00 BSC, e = 0.40 BSC, D2/E2 = 3.60 nom (3.45–3.75), JEDEC MO-220. Resolves in KiCad 10: `kicad-cli pcb drc` reports 0 footprint errors. |
 | J2 | `raccoon:RJ45_LPJG16402AQNL` | **Built** — see below. |
 | U4, U6 | `Package_TO_SOT_SMD:SOT-23-5` | KiCad standard. |
-| L2, R*, C* | KiCad standard 0402/0603/0805/1210 | — |
-| Y1 | `Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm` | Placeholder — depends on the crystal chosen (see item on load caps). |
-| J3 | `raccoon:USB-A_3.0_Plug` | **TODO** — not built yet. No good KiCad standard exists for a USB 3.0 A-plug; needs the chosen connector's drawing. |
+| U8, U9 | `raccoon:SOT-23-6_SP3019_LittelfuseLand`, `raccoon:SOT-23-6_USBLC6-2` | Built (task 8 for U8, from the land pattern on the SP3019 datasheet's page 5). |
+| L2, R*, C* | KiCad standard 0402/0603/0805/1210/3225 | — |
+| Y1 | `Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm_HandSoldering` | Abracon ABM8 3225 crystal, 25 MHz, CL 18 pF; the load capacitors C19/C20 are calculated in `netlist.yaml` `components.Y1.design_notes.load_caps`. |
+| J3 | `Connector_USB:USB3_A_Plug_Wuerth_692112030100_Horizontal` | KiCad-maintained footprint for the Würth 692112030100 (see "J3 connector" below). |
 
 ### J2 footprint — how the coordinates were established
 
@@ -608,36 +718,37 @@ the ⌀3.25 T-posts are plastic and therefore NPTH with no pad.
 Geometry check: smallest copper-to-copper gap is 0.308 mm (pad 11 to the adjacent
 T-post hole), above a typical 0.2 mm fab minimum.
 
-
-| Script | Purpose |
-|---|---|
-| `tools/fix_pcb_nets.py` | Repairs the PCB net encoding (net table, integer ids, zone `net_name`) and keeps resistor numbering aligned. Idempotent; `--check` for a dry run. |
-| `tests/check_kicad.py` | Structural regression check across schematic, PCB and BOM: net encoding, reference-designator agreement, value agreement, balanced parentheses. Exit code 0/1, so it is CI-friendly. Known gaps and deferred conflicts are declared in the script and reported as warnings. |
-
-Neither replaces KiCad's ERC/DRC, which remains the authority and has **not**
-been run — KiCad was not available in the environment where these checks were
-written.
-
-### Naming
+### Naming (`raccoon-hat`, moot)
 
 `design-guide.md` §3.4 calls the PoE input connector **J14**, which is the
-Raspberry Pi's own designator for its PoE header. The mating connector on this
-board needs its own reference (`J4`); no such part currently exists in the
-schematic, PCB or BOM.
+Raspberry Pi's own designator for its PoE header. `raccoon-tap` has no PoE
+connector, so the question no longer arises.
 
 ## Tooling
 
 | Script | Purpose |
 |---|---|
-| `tools/fix_pcb_nets.py` | Repairs the old PCB's net encoding. Idempotent, `--check` for a dry run. |
+| `tools/fix_pcb_nets.py` | Repairs the abandoned `raccoon-hat` PCB's net encoding. Idempotent, `--check` for a dry run. |
 | `tools/gen_schematic.py` | Generates `kicad/raccoon-tap.kicad_sch` from `netlist.yaml`. Deterministic UUIDs, so regenerating gives a stable diff. Self-contained symbols. |
-| `tests/check_netlist.py` | Validates `netlist.yaml`: shorts, floating pins, non-existent refs/pins, power inputs not on a rail, nets with under two endpoints. **Run this before generating.** |
-| `tests/check_kicad.py` | Structural regression check across schematic, PCB and BOM. |
+| `tools/gen_bom.py` | Generates `bom.csv` (hand-solder BOM) and the PCBWay assembly BOM from `netlist.yaml`. |
+| `tools/gen_pcb.py` | Places the footprints. **Refuses a routed board** (the board is frozen); read its docstring before `--force`. |
+| `tools/route_pcb.py`, `tools/route_grid.py`, `tools/amend_pcb.py` | The routing of task 9 and the amendments after it. Not to be run over the frozen board; see "Before unfreezing the board". |
+| `tools/export_fab.py` | Exports the PCBWay set to `fab/` (gerbers, drill, CPL, assembly BOM, manifest); runs the DRC first. |
+| `tools/rebuild_check.py` | Rebuilds the board in a scratch directory and compares it item by item with the committed one. |
+| `tools/scan_board.py` | The via-to-pad scans the DRC does not do (ruling BI). |
+| `tests/check_netlist.py` | Validates `netlist.yaml`: shorts, floating pins, non-existent refs/pins, power inputs not on a rail, nets with under two endpoints. |
+| `tests/check_kicad.py` | Structural regression check across schematic, PCB and BOM, including the routed board's connectivity against `netlist.yaml`. |
+| `tests/check_fab_release.py` | The fabrication-release checks: datasheet-derived rules, the In1 continuity and pair-coupling checks (ruling BJ), the release set's freshness. |
+| `tests/run_design_checks.sh` | **The gate.** KiCad's DRC and ERC plus all of the above; exit 0 only if all 7 checks pass. See its header for how to call it (name `kicad-cli` through `KICAD_CLI`, do not change `PATH`). |
 
-Neither replaces KiCad's ERC/DRC, which remains the authority and has **not**
-been run — KiCad was not available in the environment where these were written.
+`hardware/tests/run_all.sh` is something else: the on-device runner for the
+drop-box, not part of the design checks (ruling C).
 
-### Verification done on the generated schematic
+KiCad's own ERC and DRC remain the authority and are part of the gate; neither
+the checks above nor KiCad can say whether a value agrees with a datasheet
+(`review/2026-10-31-baseline/README.md` shows what each is blind to).
+
+### Verification done on the generated schematic (state of 2026-09-25: 37 symbols, 28 nets; the current netlist has 59 components and 38 nets)
 
 The netlist was reconstructed *from* the generated `.kicad_sch` — pin positions
 computed from the symbol definitions, wires traced as a graph, labels resolved —
@@ -663,6 +774,48 @@ For contrast, the same measurement on the old `raccoon-hat.kicad_sch`:
 `check_netlist.py` earned its place immediately: on first run it caught two
 shorts and a floating pin that I had introduced by swapping the anode and
 cathode of the jack's LEDs.
+
+### kicad-happy — Schaltungsanalyse und Skripte
+
+Die Analyse-Skripte stammen aus `aklofas/kicad-happy`, vendored unter
+`vendor/kicad-happy/` (Subtree, `--squash`, kein Submodul). Gepinnt auf den
+Upstream-Tag `v2` (Commit `2fd9aa0`). Der Pfad `vendor/` ist nicht gitignored.
+Die Config `.opencode/opencode.json` registriert die Skills aus
+`./vendor/kicad-happy/skills`.
+
+Aufruf mit Python 3.12, nicht mit dem System-Python. `KH` ist der Interpreter
+für kicad-happy; `KIPY` ist der Interpreter aus dem KiCad-Bundle, der die
+`pcbnew`-Bindings enthält (für `gen_pcb.py` und `route_pcb.py`):
+
+```
+KH=/opt/homebrew/bin/python3.12
+KIPY=/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/3.9/bin/python3
+$KH vendor/kicad-happy/skills/kicad/scripts/analyze_schematic.py \
+    hardware/kicad/raccoon-tap.kicad_sch --output "${TMPDIR:-/tmp}/t1.json"
+```
+
+Das System-`python3` ist 3.9.6 und liegt unter dem Mindestmaß von 3.10 des
+Toolkits. Es bricht schon beim Import ab, weil moderne Typ-Syntax wie
+`list | None` zur Laufzeit ausgewertet wird (die Fehlerstelle ist
+`sexp_parser.py:115`, `def find_first(...) -> list | None:`):
+
+```
+python3 vendor/kicad-happy/skills/kicad/scripts/analyze_schematic.py \
+    hardware/kicad/raccoon-tap.kicad_sch --output "${TMPDIR:-/tmp}/t1_sys.json"
+  File ".../sexp_parser.py", line 115, in <module>
+    def find_first(node: list, keyword: str) -> list | None:
+TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'
+```
+
+Upgrade auf einen neueren Upstream-Stand:
+
+```
+git subtree pull --prefix vendor/kicad-happy \
+    https://github.com/aklofas/kicad-happy.git <tag> --squash
+```
+
+Danach `.opencode/opencode.json` und die Versionsangabe in diesem Abschnitt
+prüfen.
 
 ## ERC — now run with the real tool
 
@@ -721,7 +874,23 @@ shield pads are named `SH`, so J3's shield pin was renamed to match.
 > not verified geometry. They must be replaced with numbers from the
 > fabricator's impedance calculator for their actual 4-layer stackup.
 
-## PCB — generated and DRC-checked, not routed
+## PCB — generated and DRC-checked (task 8 state); routed by task 9, frozen since
+
+> **Task 9 update (2026-11-03).** The board was then **routed** (934 track
+> segments, 123 vias) and is **frozen**: `gen_pcb.py` refuses to run over it.
+> The text below describes the generator and the DRC progress as they were when
+> the board was placed and unrouted; the figures in it (43 violations, 134
+> unconnected pads, 33 footprints, 29 nets) are from that time. The current
+> state is in the banner at the top of this document and in
+> `review/2026-11-03-routed/README.md`.
+
+> **Task 8 update (2026-11-02).** The board described below has been
+> re-placed: still 58 x 36 mm, 58 footprints, U3 turned to 180 degrees, two
+> mounting holes, In2 split into islands. The figures in the rest of
+> this section are from the earlier board. Current numbers, findings and the
+> hand-off to routing (including the MDI pair-order reversal that rotation does
+> not fix, and the U3 track-clearance rule) are in
+> `review/2026-10-31-placement/README.md`.
 
 `tools/gen_pcb.py` builds `kicad/raccoon-tap.kicad_pcb` through KiCad's own
 `pcbnew` API, so the file is written by KiCad rather than hand-assembled. It must
@@ -791,13 +960,47 @@ and the exposed pad is closer still, while the Power netclass asks for 0.30 mm.
 That spacing is set by the package, not by the layout. Clearance from U3's pads to
 anything else keeps the full netclass value, so no board-level rule is weakened.
 
-### Still to do on the PCB
+### The PCB items, with their status
 
-| Item | Note |
+This table was "Still to do on the PCB". Each row now says what became of it.
+
+| Item | Status |
 |---|---|
-| **Routing** | Not done, and deliberately not autorouted. KiCad has no built-in autorouter; FreeRouting is external and is documented to ignore inner layers on 4-layer boards, routing GND and VCC as surface tracks. The difficulty here is 7 differential pairs, where autorouters do not hold intra-pair spacing, length matching or reference-plane continuity. Use KiCad's interactive differential-pair router. |
-| **Diff-pair geometry** | The width/gap values in the net classes are placeholders. Get real numbers from the fab's impedance calculator for their actual 4-layer stackup before routing. |
-| **In2 power plane** | Generated as a single +3V3 pour. Split it into +5V, +3V3 and +1V0 islands by hand. |
-| **Placement review** | Placement is by signal flow and passes courtyard checks, but has not been optimised. In particular the decoupling caps should end up closer to their supply pins than a generator can reasonably decide. |
-| **J2 orientation** | Check against the mechanical drawing that the RJ45 opening faces the board edge. |
-| **SHIELD tie** | J2's shield net needs a deliberate connection strategy — see `netlist.yaml` `design_notes.shield_tie`. |
+| **Routing** | **CLOSED by task 9, on a reversed decision** (spec §6.3, `docs/superpowers/specs/2026-10-30-raccoon-tap-fab-release-design.md`). See the paragraph below the table. |
+| **Diff-pair geometry** | **CLOSED by task 7** (`fab/stackup-note.md`): the placeholder net-class values were replaced by a calculation with PCBWay's calculator for their stackup entry 1. The geometry as routed is **measured** against those numbers by task 10 (the pair-coupling check, ruling BJ). PCBWay's own confirmation is still outstanding (`fab/ORDERING.md`). |
+| **In2 power plane** | Done in task 8: six islands (+5V, +5V_SW twice, +1V0, +3V3 twice), generated by `gen_pcb.py`. |
+| **Placement review** | **Addressed by tasks 8 and 9, not closed by a separate review.** The decoupling capacitors were placed and routed with real vias, and the distance from each capacitor to its U3 pin was measured (0.43 to 4.28 mm, `review/2026-11-03-routed/accepted-findings.md` B6); the longest, C16 and C17, were not re-opened, and C14's return loop is longer than its distance. Whether that is close enough is not established short of a first-build ripple and emissions check. |
+| **J2 orientation** | Done in task 8: the opening faces the right-hand edge. Not checked against the vendor drawing, which is not in the repository. |
+| **SHIELD tie** | **Decided 2026-11-01:** 1 nF (C25) in parallel with 1 Mohm (R13) to GND, `netlist.yaml` `design_notes.shield_tie`. |
+
+**Routing: the reversed decision (task 9, spec §6.3).** The earlier text of this
+row said: *"Not done, and deliberately not autorouted. KiCad has no built-in
+autorouter; FreeRouting is external and is documented to ignore inner layers on
+4-layer boards, routing GND and VCC as surface tracks. The difficulty here is 7
+differential pairs, where autorouters do not hold intra-pair spacing, length
+matching or reference-plane continuity. Use KiCad's interactive differential-pair
+router."* Its reasoning had two parts, and **the load-bearing one is
+SUPERSEDED**:
+
+* *FreeRouting ignores inner layers.* Still valid, and respected by not using
+  FreeRouting. The board was not autorouted: the pairs, the buck loop and U3's
+  escapes are geometry written on purpose by `tools/route_pcb.py`, the rest
+  connection by connection with `tools/route_grid.py`.
+* *"An autorouted result would be an unverifiable artefact"* (the `gen_pcb.py`
+  docstring's words). **Superseded.** The argument was that nothing could tell a
+  machine-made layout from a good one. The routed board is now judged by
+  KiCad's DRC (0 errors, 0 unconnected), by `check_kicad.py` (the routed
+  board's connectivity against `netlist.yaml`, ruling N), and by two checks the
+  DRC cannot do: continuity of the In1 reference plane under every pair and the
+  as-built coupling of every pair (`check_fab_release.py`, ruling BJ), plus
+  kicad-happy as a supplementary reader.
+
+What the new argument does **not** claim: that the routing is as good as a
+practised hand with the interactive router would have drawn it. It is not (the
+spec says so: the cost knowingly accepted so that the board needs no operator
+time). Several couplings and reference-plane gaps are accepted and argued
+individually (`review/2026-11-03-routed/accepted-findings.md` A1 to A5); the
+signal-integrity result is established by the first-build `iperf3` and `dmesg`
+checks in `fab/fabrication-note.md`, not by the checks above, and kicad-happy
+found only 1 of the 12 known defects of task 2 on its own. So the reversal
+rests on "checked", not on "good": a checked result can still be a mediocre one.

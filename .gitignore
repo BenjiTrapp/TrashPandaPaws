@@ -25,6 +25,7 @@ bin/*.tmp
 
 # KiCad local user state (active layer, zoom, open tabs)
 *.kicad_prl
+*.lck
 *-backups/
 fp-info-cache
 

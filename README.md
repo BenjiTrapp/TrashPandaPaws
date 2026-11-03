@@ -188,8 +188,10 @@ sudo reboot
 | RJ45 Jack                | HR911105A             | Downstream Ethernet connector |
 | GPIO Header              | 2x20 pin 2.54mm      | Pi HAT interface              |
 
-Full BOM: [`hardware/bom.csv`](hardware/bom.csv)
-PCB Design: [`hardware/kicad/`](hardware/kicad/) (Schematic + PCB, KiCad 10)
+The table above is the abandoned `raccoon-hat` design. `hardware/bom.csv` and
+`hardware/netlist.yaml` are **not** its BOM: they describe the replacement,
+`raccoon-tap` (below). PCB files: [`hardware/kicad/`](hardware/kicad/) holds both
+(`raccoon-hat.*` abandoned, `raccoon-tap.*` current), KiCad 10.
 
 > [!WARNING]
 > **The v1 HAT hardware is at concept stage and is not manufacturable as-is.**
@@ -205,18 +207,30 @@ PCB Design: [`hardware/kicad/`](hardware/kicad/) (Schematic + PCB, KiCad 10)
 > build today.
 
 <details>
-<summary><strong>PCB Layout</strong> (click to expand)</summary>
+<summary><strong>PCB Layout</strong> (click to expand; shows the Raccoon Tap board, not the HAT)</summary>
 <br>
 <p align="center">
-  <img src="static/pcb_boardKiCad.png" alt="Raccoon HAT v1.0 PCB Layout (KiCad)" width="800">
+  <img src="static/pcb_boardKiCad.png" alt="Raccoon Tap rev 2.1-draft PCB layout in KiCad: 58x36 mm 4-layer board, routed, front copper and silkscreen over the back GND pour; USB 3.0 plug left, RTL8153B centre, RJ45 MagJack right" width="800">
 </p>
+<p align="center"><em>Raccoon Tap (rev 2.1-draft), routed layout: front copper (red), back copper with its GND pour (blue), silkscreen. USB 3.0 plug J3 on the left, RTL8153B U3 in the centre, RJ45 MagJack J2 on the right.</em></p>
 <p align="center">
-  <img src="static/pcb_board_KiCad.png" alt="Raccoon HAT v1.0 PCB 3D Render" width="800">
+  <img src="static/pcb_board_KiCad.png" alt="Raccoon Tap rev 2.1-draft PCB 3D render from KiCad, top side; the USB plug and the RJ45 jack have no 3D models and show as their pads only" width="800">
 </p>
+<p align="center"><em>Raccoon Tap (rev 2.1-draft), KiCad 3D render of the top side. J2 (RJ45 MagJack) and J3 (USB 3.0 plug) have no 3D models in the library and appear as their footprints only.</em></p>
 
-65×56mm 2-layer board with SI3402-B PoE PD, TPS54302 DC-DC, RTL8153B USB-GbE,
-AP2112K LDO, W25Q16 SPI Flash, RJ45 downstream jack, USB-A 3.0 to Pi,
-2×20 GPIO header, and all passives (19 caps, 8 resistors). GND pour on back copper.
+**What the pictures show: `raccoon-tap`, not the HAT.** A 58 × 36 mm, 4-layer USB 3.0
+to Gigabit Ethernet adapter for the Raspberry Pi 4's USB port: RTL8153B-VB-CG,
+AP2112K and SY8089 regulators, ESD protection, RJ45 MagJack, USB-A 3.0 plug. It takes
+its power from the USB port; it has **no PoE stage and no GPIO header** (PoE is
+left to the official Raspberry Pi PoE+ HAT). It is routed, passes KiCad's DRC and ERC
+and has a PCBWay fabrication package in [`hardware/fab/`](hardware/fab/) (start
+with `hardware/fab/ORDERING.md`). **Nothing has been ordered, built or measured.**
+Status and the list of things to measure on a first build:
+[`hardware/OPEN_QUESTIONS.md`](hardware/OPEN_QUESTIONS.md).
+
+The abandoned `raccoon-hat` was a 65 × 56 mm 2-layer board with SI3402-B PoE PD,
+TPS54302 DC-DC, W25Q16 SPI flash and a 2×20 GPIO header. Its files are kept as the
+record only.
 </details>
 
 ### v2: Integrated Carrier Board (CM4)

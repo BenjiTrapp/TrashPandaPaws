@@ -1,0 +1,383 @@
+{
+  "analyzer_type": "cross_analysis",
+  "schema_version": "1.4.0",
+  "inputs": {
+    "source_files": [
+      "hardware/review/2026-11-03-routed/schematic.json",
+      "hardware/review/2026-11-03-routed/pcb.json"
+    ],
+    "source_hashes": {
+      "hardware/review/2026-11-03-routed/schematic.json": "07cac903126f0679160f00cda2ed68ed896614026f3e6473f7a559cf269e7a46",
+      "hardware/review/2026-11-03-routed/pcb.json": "2e18ac31bc113b3ba953b142efa6ab5e07957cc9f47fdb2d7d92a2659b7696bd"
+    },
+    "run_id": "20261103T101856Z-3c8267",
+    "config_hash": null,
+    "upstream_artifacts": {
+      "schematic": {
+        "path": "hardware/review/2026-11-03-routed/schematic.json",
+        "sha256": "07cac903126f0679160f00cda2ed68ed896614026f3e6473f7a559cf269e7a46",
+        "schema_version": "1.4.0",
+        "run_id": "20261103T101856Z-3c8267"
+      },
+      "pcb": {
+        "path": "hardware/review/2026-11-03-routed/pcb.json",
+        "sha256": "2e18ac31bc113b3ba953b142efa6ab5e07957cc9f47fdb2d7d92a2659b7696bd",
+        "schema_version": "1.4.0",
+        "run_id": "20261103T101856Z-3c8267"
+      }
+    }
+  },
+  "compat": {
+    "minimum_consumer_version": "1.4.0",
+    "deprecated_fields": [],
+    "experimental_fields": []
+  },
+  "elapsed_s": 0.011,
+  "summary": {
+    "total_findings": 4,
+    "by_severity": {
+      "error": 3,
+      "warning": 0,
+      "info": 1
+    }
+  },
+  "findings": [
+    {
+      "detector": "check_return_path_enhanced",
+      "rule_id": "RP-002",
+      "category": "return_path",
+      "summary": "ethernet net ETH_LED1 crosses GND plane gap",
+      "description": "ethernet signal ETH_LED1 crosses a gap in GND plane on layer F.Cu.",
+      "components": [],
+      "nets": [
+        "ETH_LED1",
+        "GND"
+      ],
+      "pins": [],
+      "severity": "error",
+      "confidence": "deterministic",
+      "evidence_source": "topology",
+      "recommendation": "Re-route ETH_LED1 to avoid the GND plane gap, or bridge with a stitching capacitor.",
+      "report_context": {
+        "section": "Return Path",
+        "impact": "Increased EMI from enlarged return path loop",
+        "standard_ref": ""
+      },
+      "finding_id": "cross_analysis:RP-002:eth_led1",
+      "stages": [
+        "layout"
+      ]
+    },
+    {
+      "detector": "check_plane_splits",
+      "rule_id": "PS-002",
+      "category": "plane_integrity",
+      "summary": "GND plane split: 5 islands, 2 signals crossing",
+      "description": "GND plane has 5 disconnected islands. Signals crossing: USB2_D_N, ETH_LED1.",
+      "components": [],
+      "nets": [
+        "GND",
+        "USB2_D_N",
+        "ETH_LED1"
+      ],
+      "pins": [],
+      "severity": "error",
+      "confidence": "deterministic",
+      "evidence_source": "topology",
+      "recommendation": "Bridge the plane gap with copper pour or stitching vias. If zones were modified after the last fill, run KiCad Edit \u2192 Fill All Zones (B) and re-run the analyzer first \u2014 stale zone fills are a common cause of apparent plane splits.",
+      "report_context": {
+        "section": "Plane Integrity",
+        "impact": "Return path discontinuity increases EMI",
+        "standard_ref": ""
+      },
+      "finding_id": "cross_analysis:PS-002:gnd",
+      "stages": [
+        "layout"
+      ]
+    },
+    {
+      "detector": "check_plane_splits",
+      "rule_id": "PS-002",
+      "category": "plane_integrity",
+      "summary": "+3V3 plane split: 3 islands, 1 signals crossing",
+      "description": "+3V3 plane has 3 disconnected islands. Signals crossing: ETH_LED1.",
+      "components": [],
+      "nets": [
+        "+3V3",
+        "ETH_LED1"
+      ],
+      "pins": [],
+      "severity": "error",
+      "confidence": "deterministic",
+      "evidence_source": "topology",
+      "recommendation": "Bridge the plane gap with copper pour or stitching vias. If zones were modified after the last fill, run KiCad Edit \u2192 Fill All Zones (B) and re-run the analyzer first \u2014 stale zone fills are a common cause of apparent plane splits.",
+      "report_context": {
+        "section": "Plane Integrity",
+        "impact": "Return path discontinuity increases EMI",
+        "standard_ref": ""
+      },
+      "finding_id": "cross_analysis:PS-002:+3v3",
+      "stages": [
+        "layout"
+      ]
+    },
+    {
+      "detector": "check_plane_splits",
+      "rule_id": "PS-002",
+      "category": "plane_integrity",
+      "summary": "+3V3_REG plane split: 2 islands",
+      "description": "+3V3_REG plane has 2 disconnected islands.",
+      "components": [],
+      "nets": [
+        "+3V3_REG"
+      ],
+      "pins": [],
+      "severity": "info",
+      "confidence": "deterministic",
+      "evidence_source": "topology",
+      "recommendation": "Bridge the plane gap with copper pour or stitching vias. If zones were modified after the last fill, run KiCad Edit \u2192 Fill All Zones (B) and re-run the analyzer first \u2014 stale zone fills are a common cause of apparent plane splits.",
+      "report_context": {
+        "section": "Plane Integrity",
+        "impact": "Return path discontinuity increases EMI",
+        "standard_ref": ""
+      },
+      "finding_id": "cross_analysis:PS-002:+3v3_reg",
+      "stages": [
+        "layout"
+      ]
+    }
+  ],
+  "assessments": [],
+  "checks_run": [
+    {
+      "check": "CC-001",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 2,
+      "findings": 0
+    },
+    {
+      "check": "EG-001",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 2,
+      "findings": 0
+    },
+    {
+      "check": "DA-001",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 0,
+      "findings": 0
+    },
+    {
+      "check": "XV-001..003",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 59,
+      "findings": 0
+    },
+    {
+      "check": "NR-001",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 934,
+      "findings": 0
+    },
+    {
+      "check": "RP-002",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 934,
+      "findings": 1
+    },
+    {
+      "check": "TW-001",
+      "ran": false,
+      "reason_skipped": "no power regulator current estimates in schematic analysis",
+      "items_examined": 0,
+      "findings": 0
+    },
+    {
+      "check": "PS-002",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 38,
+      "findings": 3
+    },
+    {
+      "check": "VS-002",
+      "ran": true,
+      "reason_skipped": null,
+      "items_examined": 123,
+      "findings": 0
+    },
+    {
+      "check": "DP-005",
+      "ran": false,
+      "reason_skipped": "no differential pairs classified in schematic net_classifications",
+      "items_examined": 0,
+      "findings": 0
+    }
+  ],
+  "trust_summary": {
+    "total_findings": 4,
+    "trust_level": "high",
+    "by_confidence": {
+      "deterministic": 4,
+      "heuristic": 0,
+      "datasheet_backed": 0
+    },
+    "by_evidence_source": {
+      "datasheet": 0,
+      "topology": 4,
+      "heuristic_rule": 0,
+      "symbol_footprint": 0,
+      "bom": 0,
+      "geometry": 0,
+      "api_lookup": 0
+    },
+    "provenance_coverage_pct": 0.0
+  },
+  "audience_summary": {
+    "designer": {
+      "total_findings": 4,
+      "by_severity": {
+        "error": 3,
+        "warning": 0,
+        "info": 1
+      },
+      "by_category": {
+        "return_path": 1,
+        "plane_integrity": 3
+      },
+      "top_issues": [
+        {
+          "detector": "check_return_path_enhanced",
+          "rule_id": "RP-002",
+          "category": "return_path",
+          "summary": "ethernet net ETH_LED1 crosses GND plane gap",
+          "description": "ethernet signal ETH_LED1 crosses a gap in GND plane on layer F.Cu.",
+          "components": [],
+          "nets": [
+            "ETH_LED1",
+            "GND"
+          ],
+          "pins": [],
+          "severity": "error",
+          "confidence": "deterministic",
+          "evidence_source": "topology",
+          "recommendation": "Re-route ETH_LED1 to avoid the GND plane gap, or bridge with a stitching capacitor.",
+          "report_context": {
+            "section": "Return Path",
+            "impact": "Increased EMI from enlarged return path loop",
+            "standard_ref": ""
+          },
+          "finding_id": "cross_analysis:RP-002:eth_led1",
+          "stages": [
+            "layout"
+          ]
+        },
+        {
+          "detector": "check_plane_splits",
+          "rule_id": "PS-002",
+          "category": "plane_integrity",
+          "summary": "GND plane split: 5 islands, 2 signals crossing",
+          "description": "GND plane has 5 disconnected islands. Signals crossing: USB2_D_N, ETH_LED1.",
+          "components": [],
+          "nets": [
+            "GND",
+            "USB2_D_N",
+            "ETH_LED1"
+          ],
+          "pins": [],
+          "severity": "error",
+          "confidence": "deterministic",
+          "evidence_source": "topology",
+          "recommendation": "Bridge the plane gap with copper pour or stitching vias. If zones were modified after the last fill, run KiCad Edit \u2192 Fill All Zones (B) and re-run the analyzer first \u2014 stale zone fills are a common cause of apparent plane splits.",
+          "report_context": {
+            "section": "Plane Integrity",
+            "impact": "Return path discontinuity increases EMI",
+            "standard_ref": ""
+          },
+          "finding_id": "cross_analysis:PS-002:gnd",
+          "stages": [
+            "layout"
+          ]
+        },
+        {
+          "detector": "check_plane_splits",
+          "rule_id": "PS-002",
+          "category": "plane_integrity",
+          "summary": "+3V3 plane split: 3 islands, 1 signals crossing",
+          "description": "+3V3 plane has 3 disconnected islands. Signals crossing: ETH_LED1.",
+          "components": [],
+          "nets": [
+            "+3V3",
+            "ETH_LED1"
+          ],
+          "pins": [],
+          "severity": "error",
+          "confidence": "deterministic",
+          "evidence_source": "topology",
+          "recommendation": "Bridge the plane gap with copper pour or stitching vias. If zones were modified after the last fill, run KiCad Edit \u2192 Fill All Zones (B) and re-run the analyzer first \u2014 stale zone fills are a common cause of apparent plane splits.",
+          "report_context": {
+            "section": "Plane Integrity",
+            "impact": "Return path discontinuity increases EMI",
+            "standard_ref": ""
+          },
+          "finding_id": "cross_analysis:PS-002:+3v3",
+          "stages": [
+            "layout"
+          ]
+        }
+      ]
+    },
+    "reviewer": {
+      "total_findings": 3,
+      "by_category": {
+        "return_path": 1,
+        "plane_integrity": 2
+      },
+      "top_issues": [
+        {
+          "rule_id": "RP-002",
+          "severity": "error",
+          "summary": "ethernet net ETH_LED1 crosses GND plane gap",
+          "recommendation": "Re-route ETH_LED1 to avoid the GND plane gap, or bridge with a stitching capacitor.",
+          "category": "return_path"
+        },
+        {
+          "rule_id": "PS-002",
+          "severity": "error",
+          "summary": "GND plane split: 5 islands, 2 signals crossing",
+          "recommendation": "Bridge the plane gap with copper pour or stitching vias. If zones were modified after the last fill, run KiCad Edit \u2192 Fill All Zones (B) and re-run the analyzer first \u2014 stale zone fills are a common cause of apparent plane splits.",
+          "category": "plane_integrity"
+        },
+        {
+          "rule_id": "PS-002",
+          "severity": "error",
+          "summary": "+3V3 plane split: 3 islands, 1 signals crossing",
+          "recommendation": "Bridge the plane gap with copper pour or stitching vias. If zones were modified after the last fill, run KiCad Edit \u2192 Fill All Zones (B) and re-run the analyzer first \u2014 stale zone fills are a common cause of apparent plane splits.",
+          "category": "plane_integrity"
+        }
+      ]
+    },
+    "manager": {
+      "risk_level": "moderate",
+      "blocker_count": 3,
+      "warning_count": 0,
+      "stage_readiness": {
+        "schematic": "pass",
+        "layout": "needs_work",
+        "pre_fab": "pass",
+        "bring_up": "pass"
+      },
+      "one_liner": "3 errors across 2 categories. Layout stage has blockers."
+    }
+  },
+  "capability_mode_ref": {
+    "source": "analysis/capability_mode.json",
+    "run_id": "20261103T101856Z-3c8267"
+  }
+}

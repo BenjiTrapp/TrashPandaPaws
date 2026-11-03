@@ -1,0 +1,9 @@
+Netlist: hardware/netlist.yaml
+  components      59
+  pins            184
+  nets            38
+  endpoints       178
+  no_connect      6
+
+PASSED - netlist is consistent, 0 warning(s)
+exit 0

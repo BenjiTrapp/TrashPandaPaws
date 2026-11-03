@@ -1,0 +1,152 @@
+{
+  "Header": {
+    "GenerationSoftware": {
+      "Vendor": "KiCad",
+      "Application": "Pcbnew",
+      "Version": "10.0.6"
+    },
+    "CreationDate": "2026-11-03T17:23:27+01:00"
+  },
+  "GeneralSpecs": {
+    "ProjectId": {
+      "Name": "raccoon-tap",
+      "GUID": "72616363-6f6f-46e2-9d74-61702e6b6963",
+      "Revision": "2.1-draft"
+    },
+    "Size": {
+      "X": 58.1,
+      "Y": 36.1
+    },
+    "LayerNumber": 4,
+    "BoardThickness": 1.6,
+    "Finish": "ENIG"
+  },
+  "FilesAttributes": [
+    {
+      "Path": "raccoon-tap-F_Cu.gtl",
+      "FileFunction": "Copper,L1,Top",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "raccoon-tap-GND.g1",
+      "FileFunction": "Copper,L2,Inr",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "raccoon-tap-Power.g2",
+      "FileFunction": "Copper,L3,Inr",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "raccoon-tap-B_Cu.gbl",
+      "FileFunction": "Copper,L4,Bot",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "raccoon-tap-F_Silkscreen.gto",
+      "FileFunction": "Legend,Top",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "raccoon-tap-B_Silkscreen.gbo",
+      "FileFunction": "Legend,Bot",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "raccoon-tap-F_Mask.gts",
+      "FileFunction": "SolderMask,Top",
+      "FilePolarity": "Negative"
+    },
+    {
+      "Path": "raccoon-tap-B_Mask.gbs",
+      "FileFunction": "SolderMask,Bot",
+      "FilePolarity": "Negative"
+    },
+    {
+      "Path": "raccoon-tap-Edge_Cuts.gm1",
+      "FileFunction": "Profile",
+      "FilePolarity": "Positive"
+    },
+    {
+      "Path": "raccoon-tap-F_Paste.gtp",
+      "FileFunction": "Paste,Top",
+      "FilePolarity": "Positive"
+    }
+  ],
+  "MaterialStackup": [
+    {
+      "Type": "Legend",
+      "Name": "Top Silk Screen"
+    },
+    {
+      "Type": "SolderPaste",
+      "Name": "Top Solder Paste"
+    },
+    {
+      "Type": "SolderMask",
+      "Name": "Top Solder Mask",
+      "Notes": "solder mask: PCBWay's, the number of passes is Question 1 of ORDERING.md"
+    },
+    {
+      "Type": "Copper",
+      "Thickness": 0.035,
+      "Name": "F.Cu",
+      "Notes": "outer base copper 0.5 oz plated to 1 oz finished"
+    },
+    {
+      "Type": "Dielectric",
+      "Thickness": 0.1855,
+      "Material": "FR4",
+      "DielectricConstant": 4.74,
+      "Notes": "prepreg 7628 RC46%, 0.1855 mm after lamination (0.1960 nominal); PCBWay standard stackup 4 layers 1.6MM entry 1, see stackup-note.md",
+      "Name": "F.Cu/GND"
+    },
+    {
+      "Type": "Copper",
+      "Thickness": 0.035,
+      "Name": "GND",
+      "Notes": "inner copper 1 oz"
+    },
+    {
+      "Type": "Dielectric",
+      "Thickness": 1.03,
+      "Material": "FR4",
+      "DielectricConstant": 4.6,
+      "Notes": "core 1.0300 mm; PCBWay standard stackup 4 layers 1.6MM entry 1, see stackup-note.md",
+      "Name": "GND/Power"
+    },
+    {
+      "Type": "Copper",
+      "Thickness": 0.035,
+      "Name": "Power",
+      "Notes": "inner copper 1 oz"
+    },
+    {
+      "Type": "Dielectric",
+      "Thickness": 0.1855,
+      "Material": "FR4",
+      "DielectricConstant": 4.74,
+      "Notes": "prepreg 7628 RC46%, 0.1855 mm after lamination (0.1960 nominal); PCBWay standard stackup 4 layers 1.6MM entry 1, see stackup-note.md",
+      "Name": "Power/B.Cu"
+    },
+    {
+      "Type": "Copper",
+      "Thickness": 0.035,
+      "Name": "B.Cu",
+      "Notes": "outer base copper 0.5 oz plated to 1 oz finished"
+    },
+    {
+      "Type": "SolderMask",
+      "Name": "Bottom Solder Mask",
+      "Notes": "solder mask: PCBWay's, the number of passes is Question 1 of ORDERING.md"
+    },
+    {
+      "Type": "SolderPaste",
+      "Name": "Bottom Solder Paste"
+    },
+    {
+      "Type": "Legend",
+      "Name": "Bottom Silk Screen"
+    }
+  ]
+}

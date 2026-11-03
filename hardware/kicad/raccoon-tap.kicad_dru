@@ -15,3 +15,61 @@
 (rule "intra-footprint pad clearance on fine-pitch parts"
 	(condition "A.memberOfFootprint('U3') && B.memberOfFootprint('U3')")
 	(constraint clearance (min 0.1mm)))
+
+# A track leaving a U3 pad runs past the next pad at 0.40mm pitch minus the
+# half-widths of both: 0.20mm for a 0.20mm track, 0.225mm for a 0.15mm neck.
+# The Power class asks 0.30mm of anything on a supply or GND item, so a signal
+# track next to a supply pad, or a supply escape next to a signal pad, fails by
+# the package's geometry whatever the layout does. Under this rule the
+# class clearance (0.3mm Power, 0.2mm signal) no longer applies between a track
+# and a pad of U3: the track-to-pad distance is held at 0.2mm, the signal
+# class's own clearance, so no track is allowed nearer to a U3 pad than a signal
+# track already was (rulings AG and AI stand). Another rule can still allow
+# less: a coupled USB3 pair's track against its partner's pad (the 0.17mm rule
+# below) is lower, which is moot at U3's 0.4mm pitch. The rule names U3 and
+# tracks only. Vias, zones and every other footprint, U8 and U9 included, keep
+# the class clearance.
+(rule "track to U3 pad on fine-pitch parts"
+	(condition "A.Type == 'Track' && B.Type == 'Pad' && B.memberOfFootprint('U3')")
+	(constraint clearance (min 0.2mm)))
+
+# Ruling AU: the same situation as the rule above, between two tracks. Two
+# escapes from neighbouring U3 pads are about 0.25mm apart at the 0.40mm pitch
+# (0.15mm tracks, the narrowest the board allows), and the Power class asks
+# 0.30mm of anything next to a supply or GND track, so every supply or GND
+# escape beside an escape of another net fails by the package's geometry.
+# Within U3's escape the distance between two tracks is held at 0.2mm, the
+# signal class's own clearance: nothing comes nearer than two signal tracks
+# already may, and no board-wide rule is weakened. Tracks are not members of a
+# footprint, so the scope is geometric: the rule area "U3_escape" (gen_pcb.py,
+# a square 3.45mm from U3's centre, which takes in the pads and the 1.0mm
+# necks) on F.Cu. insideArea() is true when any copper of a segment touches
+# the area, round end included, so a segment that starts in it, or merely ends
+# on its edge, keeps the 0.2mm along its whole length. Cutting tracks at the
+# edge does not bound that (ruling BQ). tools/route_pcb.py stage
+# split_area_out cuts every F.Cu track a second time 0.25mm plus half its
+# width past the edge: only the short piece between the two cuts still
+# touches the area, so the rule reaches at most about 0.35mm past the edge,
+# and tests/check_fab_release.py (AU_OVERHANGS, U3EscapeRuleStaysAtItsArea)
+# fails on a segment that would carry it further.
+(rule "track to track at the U3 escape"
+	(condition "A.Type == 'Track' && B.Type == 'Track' && A.insideArea('U3_escape') && B.insideArea('U3_escape')")
+	(constraint clearance (min 0.2mm)))
+
+# The two traces of a controlled-impedance pair sit closer together than the
+# class clearance. USB3 and MDI keep a 0.2mm class clearance, because it also
+# sets the spacing between pairs and from other nets; only the gap INSIDE one
+# coupled pair gets its own, smaller number. Geometry and sources:
+# hardware/fab/stackup-note.md.
+#
+# A.isCoupledDiffPair() is true only for the two nets of one pair that KiCad
+# recognises by name (..._P with ..._N, the suffix last: the SuperSpeed TX pair
+# after the AC-coupling capacitors is therefore USB3_TX_CONN_P / _CONN_N, not
+# USB3_TX_P_CONN, which KiCad does not pair), so a trace of the pair against any
+# other net, or another pair, still gets the class clearance. Two pads are left
+# out: the spacing of the pads of one footprint is the package's, and the rule
+# above for U3 already covers it. MDI needs no rule: its pair gap (0.21mm) is
+# above the class clearance.
+(rule "intra-pair clearance USB3"
+	(condition "A.NetClass == 'USB3' && B.NetClass == 'USB3' && A.isCoupledDiffPair() && (A.Type != 'Pad' || B.Type != 'Pad')")
+	(constraint clearance (min 0.17mm)))

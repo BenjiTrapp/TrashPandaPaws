@@ -1,0 +1,39 @@
+============================================================
+FABRICATION RELEASE GATE — FAIL — Issues must be resolved
+============================================================
+
+  9 pass  0 warn  1 fail  2 skip
+
+  Trust: LOW — 70% deterministic, 30% heuristic (158 findings)
+  Provenance: 23.6% of findings carry detector provenance
+
+--- ROUTING ---
+  [PASS] All nets routed (38/38)
+
+--- BOM ---
+  [PASS] All components have MPNs (43/43)
+  [PASS] All components have footprints assigned
+
+--- DFM ---
+  [PASS] DFM tier: standard
+
+--- DOCUMENTATION ---
+  [PASS] Revision marking found
+  [PASS] Board name found on silkscreen
+
+--- CONSISTENCY ---
+  [PASS] Schematic (59 placeable) matches PCB (59 footprints)
+  [FAIL] Net count mismatch: schematic 44 vs PCB 38 (diff 6)
+         schematic_nets: 44
+         pcb_nets: 38
+
+--- GERBERS ---
+  [SKIP] Gerber analysis not provided
+  [SKIP] Gerber analysis not provided
+
+--- THERMAL ---
+  [PASS] Thermal score 100/100 — no critical/high findings
+
+--- EMC ---
+  [PASS] EMC score 0/100 — no critical findings
+
