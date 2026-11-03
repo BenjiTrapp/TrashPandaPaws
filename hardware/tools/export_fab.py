@@ -22,9 +22,10 @@ Writes, into one folder:
     check in tests/check_fab_release.py reads it.
 
 The component placement list (CPL) for the partial assembly is written from the
-same board, for U3 and Y1 only. The assembly BOM beside it is written by
-tools/gen_bom.py from netlist.yaml (the parts that carry an `assembly:` mapping),
-never by hand.
+same board. Which parts are machine-assembled (U3 and Y1, rulings Y and AC) is
+read from netlist.yaml, the components that carry an `assembly:` mapping, and
+nowhere else: the paste layer, the manifest, the CPL and, through tools/gen_bom.py,
+the assembly BOM beside it all take their references from there.
 
 The set is built in a temporary folder and replaces the old one only when every
 step succeeded. Nothing is uploaded, ordered or paid for.
@@ -62,7 +63,22 @@ KICAD_CLI = os.environ.get("KICAD_CLI") or shutil.which("kicad-cli") or \
 MANIFEST = "release-manifest.json"
 DRC_REPORT = "raccoon-tap-drc.rpt"
 GERBER_LAYERS = "F.Cu,In1.Cu,In2.Cu,B.Cu,F.Silkscreen,B.Silkscreen,F.Mask,B.Mask,Edge.Cuts"
-ASSEMBLED = ("U3", "Y1")      # rulings Y and AC: PCBWay places these two and nothing else
+
+
+def assembled_refs(netlist_path=None):
+    """The references PCBWay places: the components of netlist.yaml that carry an
+    `assembly:` mapping (rulings Y and AC make them U3 and Y1; the netlist, not
+    this file, says so). The single source for the CPL, the paste layer, the
+    manifest and, through tools/gen_bom.py, the assembly BOM. Imported late:
+    this file also runs under KiCad's Python, which has no PyYAML."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import gen_bom
+    import yaml
+    netlist_path = netlist_path or NETLIST
+    refs = tuple(gen_bom.assembly_refs(yaml.safe_load(Path(netlist_path).read_text())))
+    if not refs:
+        raise ExportFailed(f"{netlist_path} marks no component with `assembly:`")
+    return refs
 
 
 class ExportFailed(RuntimeError):
@@ -108,11 +124,14 @@ def export_drc(board, report):
     run([KICAD_CLI, "pcb", "drc", "--severity-all", "--refill-zones", "--output", report, board])
 
 
-def export_set(out_dir, drc_problems, board=PCB, dru=DRU, pro=PRO):
+def export_set(out_dir, drc_problems, board=PCB, dru=DRU, pro=PRO, refs=None):
     """Build the set in `out_dir` (which must be empty or new). Returns the
     manifest dictionary. `drc_problems(report_text, board_name)` is
     check_fab_release.drc_report_problems; any problem it names stops the
-    export before a gerber is written. Raises ExportFailed when a step fails."""
+    export before a gerber is written. `refs` are the parts with paste openings
+    (default: those the netlist marks, `assembled_refs()`). Raises ExportFailed
+    when a step fails."""
+    refs = tuple(refs) if refs is not None else assembled_refs()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     inputs = {"board": sha256_of(board), "rules": sha256_of(dru), "project": sha256_of(pro)}
@@ -134,7 +153,7 @@ def export_set(out_dir, drc_problems, board=PCB, dru=DRU, pro=PRO):
         shutil.copy(pro, scratch / "raccoon-tap.kicad_pro")
         shutil.copy(dru, scratch / "raccoon-tap.kicad_dru")
         run([KIPY, __file__, "--paste-board", board, scratch / "raccoon-tap.kicad_pcb",
-             *ASSEMBLED])
+             *refs])
         run([KICAD_CLI, "pcb", "export", "gerbers", "--layers", "F.Paste",
              "--output", scratch, scratch / "raccoon-tap.kicad_pcb"])
         shutil.copy(scratch / "raccoon-tap-F_Paste.gtp", out_dir / "raccoon-tap-F_Paste.gtp")
@@ -150,19 +169,21 @@ def export_set(out_dir, drc_problems, board=PCB, dru=DRU, pro=PRO):
                  "tests/check_fab_release.py (check_gerber_freshness) compares them.",
         "kicad": kicad_version(),
         "inputs": inputs,
-        "paste_openings_only_for": list(ASSEMBLED),
+        "paste_openings_only_for": list(refs),
         "files": files,
     }
     (out_dir / MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return manifest
 
 
-def write_cpl(path, board=PCB, refs=ASSEMBLED):
+def write_cpl(path, board=PCB, refs=None):
     """CPL for `refs` in the gerber coordinate system: KiCad's own position
     export (Y up, as in the gerbers, origin at the page origin because the board
     has no drill/place origin), renamed to the column heads PCBWay's sample
     uses. Rotation is KiCad's footprint orientation; whether it is the right one
-    is checked against the pin-1 marking in tests/check_fab_release.py."""
+    is checked against the pin-1 marking in tests/check_fab_release.py. `refs`
+    default to the parts the netlist marks for assembly (`assembled_refs()`)."""
+    refs = tuple(refs) if refs is not None else assembled_refs()
     with tempfile.TemporaryDirectory() as scratch:
         pos = Path(scratch) / "pos.csv"
         run([KICAD_CLI, "pcb", "export", "pos", "--format", "csv", "--units", "mm",
@@ -203,15 +224,13 @@ def main(argv=None):
             manifest = export_set(build, chk.drc_report_problems)
             cpl = Path(build).parent / "cpl.csv"
             write_cpl(cpl)
-            sys.path.insert(0, str(Path(__file__).resolve().parent))
             import gen_bom
             import yaml
             bom = Path(build).parent / "assembly-bom.csv"
             placed = [r["Reference Designator"] for r in gen_bom.write_assembly_bom(
                 yaml.safe_load(NETLIST.read_text()), bom)]
-            if tuple(placed) != ASSEMBLED:
-                raise ExportFailed(f"netlist.yaml marks {placed} for assembly, "
-                                   f"this exporter places {list(ASSEMBLED)}")
+            if tuple(placed) != assembled_refs():      # one source: cannot differ
+                raise ExportFailed(f"assembly BOM {placed} and CPL {list(assembled_refs())} disagree")
         except (ExportFailed, ValueError) as e:
             print(f"export_fab: {e}", file=sys.stderr)
             return 2

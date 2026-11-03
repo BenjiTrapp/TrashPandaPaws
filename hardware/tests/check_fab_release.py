@@ -3249,6 +3249,12 @@ def generate_assembly_bom(netlist, directory):
     return "ok", out.read_text()
 
 
+def assembly_bom_is_current(path, netlist, scratch):
+    """True when the file at `path` is exactly what gen_bom.py writes for `netlist`."""
+    status, fresh = generate_assembly_bom(netlist, scratch)
+    return status == "ok" and Path(path).read_text() == fresh
+
+
 class AssemblyBomIsGeneratedFromTheNetlist(unittest.TestCase):
     """raccoon-tap-assembly-bom.csv is a derived artefact: gen_bom.py writes it
     from the `assembly:` mappings of netlist.yaml, as it writes bom.csv. A
@@ -3266,17 +3272,25 @@ class AssemblyBomIsGeneratedFromTheNetlist(unittest.TestCase):
 
     def test_the_committed_file_is_what_the_generator_writes(self):
         self.assertEqual(self.status, "ok", self.fresh)
-        self.assertEqual(ASSEMBLY_BOM.read_text(), self.fresh)
+        self.assertTrue(assembly_bom_is_current(ASSEMBLY_BOM, self.netlist, self.tmp.name))
 
     def test_the_machine_placed_parts_are_those_the_netlist_marks(self):
+        # ASSEMBLED_REFS is the expected answer (rulings Y and AC), written out on purpose:
+        # the exporter derives its own list from the netlist (ExporterTakesTheAssembledPartsFromTheNetlist)
         marked = [ref for ref, c in self.netlist["components"].items() if c.get("assembly") is not None]
         self.assertEqual(sorted(marked), sorted(ASSEMBLED_REFS))
-        self.assertEqual(sorted(load_export_fab().ASSEMBLED), sorted(ASSEMBLED_REFS))
+        self.assertEqual(sorted(load_export_fab().assembled_refs()), sorted(ASSEMBLED_REFS))
 
-    def test_a_hand_edit_is_detected(self):
-        edited = ASSEMBLY_BOM.read_text().replace("C2802072", "C2802073")
-        self.assertNotEqual(edited, ASSEMBLY_BOM.read_text())
-        self.assertNotEqual(edited, self.fresh)
+    def test_the_equality_check_itself_fails_on_a_hand_edited_copy(self):
+        # the check behind test_the_committed_file_is_what_the_generator_writes, run on a scratch
+        # copy of the committed file with one character of the LCSC number changed
+        with tempfile.TemporaryDirectory() as tmp:
+            edited = Path(tmp) / "edited.csv"
+            text = ASSEMBLY_BOM.read_text()
+            edited.write_text(text.replace("C2802072", "C2802073"))
+            self.assertNotEqual(edited.read_text(), text, "the edit did not change anything")
+            self.assertTrue(assembly_bom_is_current(ASSEMBLY_BOM, self.netlist, tmp))
+            self.assertFalse(assembly_bom_is_current(edited, self.netlist, tmp))
 
     def test_the_generator_reads_the_netlist_not_a_stored_copy(self):
         changed = copy.deepcopy(self.netlist)
@@ -3316,6 +3330,69 @@ class AssemblyBomIsGeneratedFromTheNetlist(unittest.TestCase):
             subprocess.run([sys.executable, str(GEN_BOM), str(NETLIST), "--out", str(Path(tmp) / "bom.csv")],
                            check=True, capture_output=True)
             self.assertEqual([p.name for p in Path(tmp).iterdir()], ["bom.csv"])
+
+
+class ExporterTakesTheAssembledPartsFromTheNetlist(unittest.TestCase):
+    """Which parts PCBWay places has one home: the `assembly:` marks of
+    netlist.yaml. The CPL, the paste layer and the manifest of export_fab.py
+    follow the marks. ASSEMBLED_REFS above is the expected answer for the real
+    netlist; here a netlist whose marks differ from it (Y1 unmarked, R14 marked)
+    shows that the exporter follows the netlist and not that tuple."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.export = load_export_fab()
+        netlist = load_netlist()
+        del netlist["components"]["Y1"]["assembly"]
+        netlist["components"]["R14"]["assembly"] = {
+            "description": "0R, 0402.", "placement": "No polarity.",
+            "distributor": "DigiKey", "distributor_pn": ""}
+        cls.netlist_path = Path(cls.tmp.name) / "netlist.yaml"
+        cls.netlist_path.write_text(yaml.safe_dump(netlist, sort_keys=False, width=10_000))
+        cls.expected = ("R14", "U3")
+        assert cls.expected != tuple(sorted(ASSEMBLED_REFS))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def patched(self):
+        from unittest import mock
+        return mock.patch.object(self.export, "NETLIST", self.netlist_path)
+
+    def test_assembled_refs_are_the_marked_components(self):
+        self.assertEqual(self.export.assembled_refs(self.netlist_path), self.expected)
+        with self.patched():
+            self.assertEqual(self.export.assembled_refs(), self.expected)
+        self.assertEqual(self.export.assembled_refs(), tuple(ASSEMBLED_REFS))     # the real netlist
+
+    def test_the_cpl_follows_the_marks(self):
+        with self.patched(), tempfile.TemporaryDirectory() as tmp:
+            self.export.write_cpl(Path(tmp) / "cpl.csv")
+            rows = read_cpl(Path(tmp) / "cpl.csv")
+        self.assertEqual(sorted(r["Designator"] for r in rows), sorted(self.expected))
+
+    def test_the_paste_layer_and_the_manifest_follow_the_marks(self):
+        with self.patched():
+            manifest = self.export.export_set(Path(self.tmp.name) / "set", drc_report_problems)
+        self.assertEqual(sorted(manifest["paste_openings_only_for"]), sorted(self.expected))
+        paste = (Path(self.tmp.name) / "set" / "raccoon-tap-F_Paste.gtp").read_text()
+        self.assertEqual(sorted(re.findall(r"^%TO\.C,([^*,]+)\*%", paste, re.M)), sorted(self.expected))
+
+    def test_a_netlist_that_marks_nothing_is_refused(self):
+        netlist = load_netlist()
+        for comp in netlist["components"].values():
+            comp.pop("assembly", None)
+        path = Path(self.tmp.name) / "none.yaml"
+        path.write_text(yaml.safe_dump(netlist, sort_keys=False, width=10_000))
+        with self.assertRaises(self.export.ExportFailed):
+            self.export.assembled_refs(path)
+
+    def test_the_committed_set_and_cpl_are_for_the_marked_parts(self):
+        manifest = json.loads((GERBER_DIR / MANIFEST_NAME).read_text())
+        self.assertEqual(manifest["paste_openings_only_for"], list(ASSEMBLED_REFS))
+        self.assertEqual([r["Designator"] for r in read_cpl()], list(ASSEMBLED_REFS))
 
 
 class AssemblyBomIsTheTwoMachinePlacedParts(unittest.TestCase):
