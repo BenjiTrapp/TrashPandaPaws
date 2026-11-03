@@ -53,6 +53,10 @@ def _run_command(ctx):
                "path": result.path}
         if result.blocked_reason:
             out["blocked_reason"] = result.blocked_reason
+        if result.effective_command:
+            # The limiter rewrote it. Said plainly, because a model that is
+            # not told believes it scanned every port and writes that down.
+            out["effective_command"] = result.effective_command
         return out
     return run_command
 
@@ -104,7 +108,10 @@ def entries():
                 "server_side. Give one plain command with no shell syntax "
                 "(no ; & | ` $ ( ) < > or line breaks) and name every target "
                 "explicitly. A refused command comes back with blocked_reason; "
-                "read it and change the command rather than repeating it.",
+                "read it and change the command rather than repeating it. A "
+                "command that was narrowed comes back with "
+                "effective_command, which is what actually ran: report that, "
+                "not what you asked for.",
                 {"type": "object",
                  "properties": {
                      "command": {"type": "string",

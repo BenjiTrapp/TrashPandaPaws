@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from software.agent import config, prompts, safety
+from software.agent import safety
 from software.agent.executor import beacon as beacon_exec
 from software.agent.tools import scoring
 
@@ -476,3 +477,24 @@ class TestTheExecutorKnowsWhichBeaconsExist(unittest.TestCase):
         # "What your beacon can do" block would repeat it.
         text = self._executor()
         self.assertEqual(text.count("accepts several tasks in one check-in"), 1)
+
+
+class TestTheScanSectionDescribesWhatActuallyHappens(unittest.TestCase):
+    """The prompt has to match the limiter, not the limiter's old plan.
+
+    The first attempt at this was prose only -- "a full-port scan will not
+    finish, name the ports instead" -- and the model asked for `-p-` twice
+    anyway. The limiter now narrows it. Prose that still says the scan comes
+    back partial would describe behaviour that no longer exists.
+    """
+
+    def test_the_narrowing_is_stated_with_the_real_number(self):
+        section = prompts._scan_section()
+        self.assertIn(str(safety.SCAN_TOP_PORTS), section)
+
+    def test_the_section_no_longer_promises_a_partial_result(self):
+        self.assertNotIn("partial result", prompts._scan_section())
+
+    def test_the_executor_is_told_to_report_what_ran(self):
+        p = prompts.executor(["batch"], scope=_scope(), tier="full")
+        self.assertIn("effective_command", p)

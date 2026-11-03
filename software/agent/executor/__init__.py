@@ -32,6 +32,11 @@ class ActionResult(NamedTuple):
     # Set when the router refused the command. The model reads this and
     # corrects itself; it is never an exception.
     blocked_reason: Optional[str] = None
+    # Set when the limiter rewrote the command, and then it is what actually
+    # ran. A rewrite the caller cannot see is worse than a refusal it can:
+    # without this the model believes it scanned 65535 ports when the
+    # limiter narrowed it to a thousand, and says so under FINDINGS.
+    effective_command: Optional[str] = None
 
 
 def blocked(reason: str) -> ActionResult:

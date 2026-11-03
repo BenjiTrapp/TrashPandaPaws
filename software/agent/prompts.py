@@ -165,11 +165,10 @@ def _forced_flags(program):
 
 def _scan_section():
     # The duration is stated because the rate limit turns a port range into
-    # one, and the model was choosing ranges without it: live, `nmap -p-`
-    # under --max-rate 50 is about 22 minutes, and it asked for it with a
-    # 300-second timeout, got partial output, and asked again. The built-in
-    # timeout is read back from the executor's table rather than written
-    # here, so a change there cannot leave this quoting an old number.
+    # one. Prose alone was tried first and did not work: the model asked for
+    # `-p-` in two separate live runs after being told it would not finish,
+    # so the limiter now narrows the request and this says what it does.
+    # Both numbers are read back from the code that enforces them.
     from software.agent.executor import server_tool
     nmap_timeout = server_tool._TOOL_TIMEOUTS["nmap"]
     return "\n".join([
@@ -180,12 +179,15 @@ def _scan_section():
         "- netdiscover: %s" % _forced_flags("netdiscover"),
         "Scan hosts one at a time rather than running service detection "
         "across a whole /24 in one command.",
-        "What the rate costs in time. At these rates a scan of all 65535 "
-        "ports (-p-) takes roughly 20 minutes and will not finish inside "
-        "the %d-second limit nmap runs under, so it comes back as a partial "
-        "result. Name the ports you care about instead, and leave the "
-        "timeout alone unless you have a reason: each program has a "
-        "built-in limit chosen for it." % nmap_timeout,
+        "Ports. At this rate all 65535 ports would take about 20 minutes and "
+        "would not finish inside the %d-second limit nmap runs under, so a "
+        "request for all of them (-p-, or a range that wide) is narrowed to "
+        "nmap's %d most common ports. The result carries "
+        "effective_command, which is what actually ran — report that and "
+        "not what you asked for. To scan something outside that set, name "
+        "the ports. Leave the timeout alone unless you have a reason: each "
+        "program has a built-in limit chosen for it."
+        % (nmap_timeout, safety.SCAN_TOP_PORTS),
     ])
 
 

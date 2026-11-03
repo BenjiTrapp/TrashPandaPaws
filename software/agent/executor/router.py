@@ -352,7 +352,12 @@ class Router:
                 "detection budget spent (last signal: %s)" % signal)
 
         text, cut = truncate(result.output, self._truncate_chars)
-        return result._replace(output=text, truncated=result.truncated or cut)
+        # The rewrite is reported only when there was one, so an untouched
+        # command carries no noise. `command` is the model's own string.
+        rewritten = (screened.command
+                     if screened.command.strip() != command.strip() else None)
+        return result._replace(output=text, truncated=result.truncated or cut,
+                               effective_command=rewritten)
 
     async def _screen(self, command, beacon_id, server_side,
                       p_success_override) -> Union[ActionResult, _Plan]:

@@ -1080,3 +1080,36 @@ class TestQuietProfileDropsTheOnlineTool(unittest.TestCase):
             scope_key="scope:10.0.1.0/24", online=False)]
         self.assertNotIn("lookup_cve", built)
         self.assertIn("check_exploit", built)
+
+
+class TestTheModelSeesTheCommandThatRan(unittest.IsolatedAsyncioTestCase):
+    """run_command's result must carry the rewrite, not just the router's.
+
+    The limiter narrows -p- to --top-ports and adds -T2 --max-rate 50. If
+    the tool result does not say so, the model reports having scanned all
+    65535 ports under FINDINGS, and the campaign record is wrong in a way
+    nobody can see afterwards.
+    """
+
+    class _Rewriting:
+        async def run_command(self, command, **kwargs):
+            return ActionResult(
+                True, "open: 22", 0, False, "server",
+                effective_command="nmap -T2 --max-rate 50 --top-ports 1000 "
+                                  "10.0.1.5")
+
+    class _Plain:
+        async def run_command(self, command, **kwargs):
+            return ActionResult(True, "root", 0, False, "beacon")
+
+    async def _call(self, router):
+        tools = {t.spec.name: t for t in _executor(router=router)}
+        return await tools["run_command"].fn(command="nmap -p- 10.0.1.5")
+
+    async def test_the_rewrite_is_in_the_result(self):
+        out = await self._call(self._Rewriting())
+        self.assertIn("--top-ports", out["effective_command"])
+
+    async def test_an_untouched_command_adds_no_key(self):
+        out = await self._call(self._Plain())
+        self.assertNotIn("effective_command", out)

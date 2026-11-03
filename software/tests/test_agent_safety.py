@@ -1231,3 +1231,88 @@ class TestClamp(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAnAllPortsScanIsNarrowed(unittest.TestCase):
+    """At a forced 50 packets a second, -p- is not a scan but a timeout.
+
+    Observed twice live. 65535 ports at --max-rate 50 is about 22 minutes of
+    port scanning alone, against nmap's 900-second limit, so the run comes
+    back as partial output with success false -- and with -sV requested, the
+    version detection never starts at all. That is what blocked a campaign
+    from ever confirming a service version.
+
+    Telling the model was tried first and did not work: the scan section
+    states the duration and the limit, and the model asked for
+    `nmap -sS -sV -p- 192.168.64.5` anyway. A limit that only exists in the
+    prompt is a suggestion.
+
+    --top-ports is nmap's own frequency ordering rather than a list chosen
+    here, and it only applies where the rate limit does: the router calls
+    this function only when limit_scan_rate is set, so the yolo profile
+    lifts the narrowing with the rest.
+    """
+
+    def _narrowed(self, command):
+        return safety.enforce_scan_limits(command)
+
+    def test_dash_p_dash_is_replaced(self):
+        out = self._narrowed("nmap -sV -p- 10.0.1.5")
+        self.assertNotIn("-p-", out)
+        self.assertIn("--top-ports", out)
+
+    def test_a_written_out_full_range_is_replaced(self):
+        for spelling in ("-p 1-65535", "-p1-65535", "-p 0-65535",
+                         "--ports 1-65535"):
+            out = self._narrowed("nmap %s 10.0.1.5" % spelling)
+            self.assertIn("--top-ports", out, spelling)
+            self.assertNotIn("65535", out, spelling)
+
+    def test_a_named_port_list_is_left_alone(self):
+        out = self._narrowed("nmap -sV -p 22,80,443 10.0.1.5")
+        self.assertIn("-p 22,80,443", out)
+        self.assertNotIn("--top-ports", out)
+
+    def test_a_modest_range_is_left_alone(self):
+        out = self._narrowed("nmap -p 1-1024 10.0.1.5")
+        self.assertIn("-p 1-1024", out)
+        self.assertNotIn("--top-ports", out)
+
+    def test_the_rewrite_is_idempotent(self):
+        once = self._narrowed("nmap -sV -p- 10.0.1.5")
+        self.assertEqual(self._narrowed(once), once)
+
+    def test_the_target_survives_the_rewrite(self):
+        self.assertIn("10.0.1.5", self._narrowed("nmap -p- 10.0.1.5"))
+
+    def test_the_rate_limit_is_still_applied(self):
+        self.assertIn("-T2 --max-rate 50", self._narrowed("nmap -p- 10.0.1.5"))
+
+    def test_a_non_scanner_mention_is_untouched(self):
+        for cmd in ("man nmap", "grep -- -p- /etc/nmap.conf"):
+            self.assertEqual(self._narrowed(cmd), cmd, cmd)
+
+    def test_a_common_service_port_is_inside_the_kept_set(self):
+        # The point of using nmap's own ordering: the narrowing must not
+        # hide the ports an enumeration phase exists to find. Read from
+        # nmap-services where it is available, so this is a claim about
+        # nmap's list and not about a number written here.
+        import pathlib
+        import re
+        for candidate in ("/opt/homebrew/share/nmap/nmap-services",
+                          "/usr/local/share/nmap/nmap-services",
+                          "/usr/share/nmap/nmap-services"):
+            path = pathlib.Path(candidate)
+            if path.exists():
+                break
+        else:
+            self.skipTest("nmap-services not installed")
+        rows = []
+        for line in path.read_text().splitlines():
+            m = re.match(r"^(\S+)\s+(\d+)/tcp\s+([\d.]+)", line)
+            if m:
+                rows.append((float(m.group(3)), int(m.group(2))))
+        rows.sort(key=lambda r: -r[0])
+        kept = {port for _, port in rows[:safety.SCAN_TOP_PORTS]}
+        for port in (21, 22, 80, 443, 445, 3389):
+            self.assertIn(port, kept, port)

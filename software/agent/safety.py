@@ -1003,6 +1003,10 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
 
 _SCANNER_LIMITS = {
     "nmap": {
+        # Narrowing an all-ports request applies to nmap only: see
+        # SCAN_TOP_PORTS. masscan is left to its own decision rather than
+        # assumed to want the same flag, which it does not have.
+        "cap_ports": True,
         # The `=`-joined spellings carry their value in the same token; the
         # bare spellings take the next token with them. Keeping the two
         # groups disjoint matters — a pattern that matches both swallows the
@@ -1120,6 +1124,42 @@ def takes_network_targets(command) -> bool:
     return _program_position(command, _NETWORK_TOOLS)[1] is not None
 
 
+# How many ports an all-ports request is narrowed to, and why there is a
+# number here at all: at the forced --max-rate 50 a 65535-port scan is about
+# 22 minutes of probing against nmap's 900-second limit, so `-p-` returns
+# partial output with success false, and a requested -sV never starts. Two
+# live campaigns were blocked from ever confirming a service version that
+# way. Telling the model was tried first and did not work -- the scan
+# section states the duration and the limit, and it asked for `-p-` anyway.
+#
+# The selection is nmap's own frequency ordering (--top-ports), not a list
+# chosen here, so the ports an enumeration phase exists to find are the ones
+# kept. The narrowing rides on the rate limit: the router calls
+# enforce_scan_limits only when limit_scan_rate is set, so the yolo profile
+# lifts this with the rest of it.
+SCAN_TOP_PORTS = 1000
+
+# An all-ports request, in the spellings nmap accepts. A range counts as
+# "all" once it spans this many ports, so -p 1-1024 is left alone and
+# -p 0-65535 is not.
+_ALL_PORTS_SPAN = 20000
+
+_ALL_PORTS_BARE = re.compile(r"^(?:-p|--ports)$")
+_ALL_PORTS_JOINED = re.compile(r"^(?:-p|--ports=)(.*)$")
+
+
+def _is_all_ports(value) -> bool:
+    """True for "-" and for a range wide enough to be the whole space."""
+    value = (value or "").strip()
+    if value == "-":
+        return True
+    m = re.match(r"^(\d*)-(\d+)$", value)
+    if not m:
+        return False
+    low = int(m.group(1) or 1)
+    return int(m.group(2)) - low >= _ALL_PORTS_SPAN
+
+
 def enforce_scan_limits(command):
     """Rewrite a scanning command to gentle timing. Idempotent.
 
@@ -1137,6 +1177,13 @@ def enforce_scan_limits(command):
     head = tokens[:index + 1]
     rest = []
     skip_next = False
+    capped = False
+
+    def next_token(all_tokens, scanner_index, current):
+        following = all_tokens[scanner_index + 1:]
+        position = following.index(current)
+        return following[position + 1] if position + 1 < len(following) else ""
+
     for token in tokens[index + 1:]:
         if skip_next:
             skip_next = False
@@ -1147,9 +1194,25 @@ def enforce_scan_limits(command):
         if any(p.match(lowered) for p in limits["strip_with_value"]):
             skip_next = True
             continue
+        if limits.get("cap_ports"):
+            # Dropped here and re-injected below, so the cap appears once
+            # however many ways the request was spelled; that is what keeps
+            # the rewrite idempotent.
+            if _ALL_PORTS_BARE.match(lowered):
+                if _is_all_ports(next_token(tokens, index, token)):
+                    skip_next = True
+                    capped = True
+                    continue
+            else:
+                joined = _ALL_PORTS_JOINED.match(lowered)
+                if joined and _is_all_ports(joined.group(1)):
+                    capped = True
+                    continue
         rest.append(token)
 
-    return " ".join(head + list(limits["inject"]) + rest)
+    cap = (["--top-ports", str(SCAN_TOP_PORTS)]
+           if capped and "--top-ports" not in rest else [])
+    return " ".join(head + list(limits["inject"]) + cap + rest)
 
 
 # ── Stored scripts ──

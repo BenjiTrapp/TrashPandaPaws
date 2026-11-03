@@ -988,3 +988,32 @@ class TestOutputHandling(IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestARewrittenCommandIsReportedBack(unittest.IsolatedAsyncioTestCase):
+    """If the limiter changes the command, the model has to be told.
+
+    The scan limiter narrows an all-ports request to --top-ports, and it
+    already silently added -T2 --max-rate 50. Leaving that unsaid means the
+    model believes it scanned 65535 ports when it scanned a thousand, and
+    reports as much under FINDINGS. A rewrite the caller cannot see is worse
+    than a refusal it can.
+    """
+
+    async def test_a_narrowed_scan_reports_what_ran(self):
+        r, _ = _router()
+        result = await r.run_command("nmap -sV -p- 10.0.1.5",
+                                     beacon_id="raccoon-fox")
+        self.assertIsNotNone(result.effective_command)
+        self.assertIn("--top-ports", result.effective_command)
+
+    async def test_the_rate_flags_are_part_of_what_ran(self):
+        r, _ = _router()
+        result = await r.run_command("nmap -sV 10.0.1.5",
+                                     beacon_id="raccoon-fox")
+        self.assertIn("--max-rate 50", result.effective_command)
+
+    async def test_an_untouched_command_claims_no_rewrite(self):
+        r, _ = _router()
+        result = await r.run_command("whoami", beacon_id="raccoon-fox")
+        self.assertIsNone(result.effective_command)
