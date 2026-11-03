@@ -49,6 +49,21 @@ Added in task 8:
     MDI2 with MDI3 or MDI0 with MDI1 and turning polarity are allowed; moving a
     net across the A/B - C/D boundary gives a board with no link at all.
 
+Added in task 10 (ruling BJ), the two properties of the routed board that the
+DRC cannot see, measured on the committed board under KiCad's Python
+(board_probe.py; they error, not skip, if it is missing):
+
+  * in1_continuity_problems: every pair track on F.Cu has In1 GND under its
+    centre line and both edges, all along, with three named exceptions and
+    ruling AR's conditions for the USB 2.0 stretch on B.Cu;
+  * pair_coupling_problems: the length of each pair net outside its +/-10 %
+    differential-impedance window lies in a named region with a cap (what the
+    rulings granted), nowhere else, and the share inside the window stays above
+    the floor those caps leave.
+  Both have mutation tests on scratch copies of the board (board_mutate.py), and
+  hardware/review/2026-11-03-routed/mutation_evidence.py runs them on the real
+  boards of task 9 that carried the defects.
+
 Usage:
     python3 check_fab_release.py [-v]
 """
@@ -1931,6 +1946,210 @@ def run_gen_pcb_on_routed_board(extra_args=(), routed=True):
         return result
 
 
+ACCEPTED_FINDINGS = HARDWARE / "review" / "2026-11-03-routed" / "accepted-findings.md"
+
+
+def _mid_sample(probe, net):
+    """A point on a pair net's F.Cu track, in the middle of the samples."""
+    samples = [s for s in probe["coupling"][net] if s[5] == "F.Cu"]
+    return samples[len(samples) // 2][:2]
+
+
+def _pad_at(probe, ref, num):
+    return next(p["at"] for p in probe["pads"] if p["ref"] == ref and p["num"] == str(num))
+
+
+class PairsKeepTheirIn1Reference(unittest.TestCase):
+    """Ruling BJ, first property: ground under every pair, all along it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.probe = committed_probe("--in1")
+
+    def test_every_pair_has_a_continuous_in1_ground_under_it(self):
+        self.assertEqual(in1_continuity_problems(self.probe), [])
+
+    def test_every_named_exception_is_in_use(self):
+        used = set()
+        for net, entry in self.probe["in1"]["nets"].items():
+            for gap in entry["gaps"]:
+                if gap["hole"]:
+                    rule = _exception_for(net, gap)
+                    used.add(rule["name"] if rule else None)
+        self.assertEqual(used, {r["name"] for r in IN1_EXCEPTIONS},
+                         "an exception nothing uses is a loophole kept for nothing")
+
+    def test_every_pair_was_walked_along_its_whole_length(self):
+        for net in BOARD_PAIR_NETS:
+            entry = self.probe["in1"]["nets"][net]
+            self.assertGreater(entry["samples"], 3 * entry["layers"].get("F.Cu", 0) / IN1_SAMPLE_STEP * 0.9, net)
+
+    def test_ruling_ar_flank_vias_are_in_the_pour_and_the_plane(self):
+        flank = [v for v in self.probe["in1"]["ar"]["vias"] if 18.0 < v["at"][0] < 20.0]
+        self.assertTrue(flank)
+        self.assertTrue(all(v["in_bcu_pour"] and v["in_in1"] for v in flank))
+
+
+class In1ContinuityCanFail(unittest.TestCase):
+    """The check is only a guard if it fails on the defect it exists for. Each
+    test plants one on a scratch copy of the committed board."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.coupling = committed_probe("--coupling")
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+
+    def board(self, name, *steps):
+        source = PCB
+        for i, step in enumerate(steps):
+            target = Path(self.tmp.name) / f"{name}-{i}.kicad_pcb"
+            run = subprocess.run([str(kicad_python()), str(BOARD_MUTATE), str(source), str(target), *map(str, step)],
+                                 capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr[-1500:])
+            source = target
+        return source
+
+    def test_a_gap_in_the_ground_under_any_pair_is_found(self):
+        steps = []
+        for net in BOARD_PAIR_NETS:
+            x, y = _mid_sample(self.coupling, net)
+            steps.append(("void-in1", round(x - 0.4, 2), round(y - 0.25, 2), round(x + 0.4, 2), round(y + 0.25, 2)))
+        problems = in1_continuity_problems(run_probe(self.board("voids", *steps), "--in1"))
+        for net in BOARD_PAIR_NETS:
+            with self.subTest(net=net):
+                self.assertTrue(any(m.startswith(net + ":") and "without In1 ground" in m for m in problems),
+                                f"{net} lost its reference and nothing said so")
+
+    def test_the_wider_gap_of_a_via_antipad_beside_a_superspeed_pair_is_found(self):
+        # the ordinary way a pair loses its plane: a signal or supply via next to it
+        # RX_P runs east-west near x 9.5 with RX_N to its north: a +3V3 via 0.52 mm
+        # south of it touches no copper and still opens In1 under the pair
+        x, y = next(s[:2] for s in self.coupling["coupling"]["USB3_RX_P"] if abs(s[0] - 9.5) < 0.03)
+        problems = in1_continuity_problems(
+            run_probe(self.board("antipad", ("via", "+3V3", round(x, 2), round(y + 0.52, 2), 0.6, 0.3)), "--in1"))
+        self.assertTrue(any("USB3_RX" in m and "not an allowed exception" in m for m in problems), problems)
+
+    def test_the_d_minus_exception_covers_one_via_and_not_another(self):
+        # D- runs north-south at x 9.6 between y 16.2 and 18.9; D+ is 1.2 mm to the east
+        x, y = next(s[:2] for s in self.coupling["coupling"]["USB2_D_N"]
+                    if s[5] == "F.Cu" and abs(s[0] - 9.6) < 0.03 and abs(s[1] - 17.5) < 0.03)
+        problems = in1_continuity_problems(
+            run_probe(self.board("partnervia", ("via", "USB2_D_P", round(x + 0.52, 2), round(y, 2), 0.6, 0.3)),
+                      "--in1"))
+        self.assertTrue(any(m.startswith("USB2_D_N:") and "not an allowed exception" in m for m in problems), problems)
+
+    def test_the_j2_pin_exception_does_not_cover_a_stretch_beyond_the_pin(self):
+        x, y = _pad_at(self.coupling, "J2", 10)       # MDI2_P's pin
+        problems = in1_continuity_problems(
+            run_probe(self.board("mdivoid", ("void-in1", x - 2.5, y - 2.5, x + 2.5, y + 2.5)), "--in1"))
+        self.assertTrue(any(m.startswith("MDI2_P:") and "without In1 ground" in m for m in problems), problems)
+
+    def test_ruling_ar_fails_without_a_flank_via(self):
+        problems = in1_continuity_problems(
+            run_probe(self.board("noflank", ("remove-via", 19.1, 18.49)), "--in1"))
+        self.assertTrue(any("flank" in m and "north" in m for m in problems), problems)
+
+
+class PairCouplingHoldsTheRulings(unittest.TestCase):
+    """Ruling BJ, second property: each pair stays at its designed gap for what
+    the rulings granted, and no longer apart than they allowed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.probe = committed_probe("--coupling")
+        cls.summary = coupling_summary(cls.probe)
+
+    def test_every_pair_is_as_coupled_as_the_rulings_granted(self):
+        self.assertEqual(pair_coupling_problems(self.probe), [])
+
+    def test_the_pair_gaps_are_the_ones_in_the_project(self):
+        self.assertAlmostEqual(pair_gap_mm("USB3_RX_P"), 0.17)
+        self.assertAlmostEqual(pair_gap_mm("MDI0_P"), 0.21)
+
+    def test_the_figures_the_ledger_records_are_what_is_measured(self):
+        # TX 65/60 %, TX_CONN 50 %, RX 56/54 % at the designed gap by route_pcb.py,
+        # which does not count the partner's pads; with pads and vias counted
+        # the same board reads a little more coupled
+        def gap(net):
+            return self.summary[net]["at_gap"] / self.summary[net]["length"]
+        for net, least in (("USB3_TX_P", 0.60), ("USB3_TX_N", 0.55), ("USB3_TX_CONN_P", 0.45),
+                           ("USB3_TX_CONN_N", 0.45), ("USB3_RX_P", 0.54), ("USB3_RX_N", 0.52)):
+            self.assertGreaterEqual(gap(net), least, net)
+
+    def test_every_region_is_in_use(self):
+        used = {key for row in self.summary.values() for key in row["regions"]}
+        for region in COUPLING_REGIONS:
+            self.assertIn((region["name"], region["cap_mm"], region["basis"]), used,
+                          f"{region['name']} for {region['nets']} holds nothing: remove it")
+
+    def test_every_as_built_region_is_argued_in_the_accepted_findings(self):
+        text = " ".join(ACCEPTED_FINDINGS.read_text(encoding="utf-8").split())
+        for region in COUPLING_REGIONS:
+            if region["basis"].startswith("as-built"):
+                self.assertIn(region["name"], text,
+                              f"{region['name']} has no ruling behind it and no entry in {ACCEPTED_FINDINGS.name}")
+
+    def test_the_floor_is_below_what_the_board_has(self):
+        for net, row in self.summary.items():
+            self.assertLess(coupled_floor(net), row["window"] / row["length"], net)
+
+
+class PairCouplingCanFail(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+
+    def problems_after(self, *step):
+        board = mutate_board(self.tmp.name, *step)
+        return pair_coupling_problems(run_probe(board, "--coupling"))
+
+    def test_a_pair_that_runs_apart_for_most_of_its_length_is_found(self):
+        # what task 9's first review found: RX 28 % coupled, about 0.28 mm
+        # further apart than designed along 70 % of the pair
+        problems = self.problems_after("shift", "USB3_RX_N", 0, 0.45, 7.5, 24.5)
+        net = [m for m in problems if m.startswith("USB3_RX_N:")]
+        self.assertTrue(any("below the floor" in m for m in net), net)
+        self.assertTrue(any("no region" in m for m in net), net)
+
+    def test_a_pair_that_stays_coupled_but_for_two_millimetres_in_no_region_is_found(self):
+        problems = self.problems_after("shift", "USB3_RX_N", 0, -0.3, 7.5, 11.3)
+        self.assertTrue(any(m.startswith("USB3_RX_N:") and "no region" in m for m in problems), problems)
+
+    def test_a_region_cannot_grow_past_its_cap(self):
+        # U8's straddle: AS granted about 5 mm, the cap is 6; push RX_P further out of the window
+        problems = self.problems_after("shift", "USB3_RX_P", 0, 0.5, 11.3, 13.6)
+        self.assertTrue(any(m.startswith("USB3_RX_P:") and "U8 straddle" in m for m in problems), problems)
+
+    def test_a_pair_pushed_into_its_partner_is_found_too(self):
+        problems = self.problems_after("shift", "USB3_TX_CONN_P", 0, -0.12, 21.3, 25.0)
+        self.assertTrue(any(m.startswith("USB3_TX_CONN_P:") for m in problems), problems)
+
+    def test_the_floor_follows_from_the_caps(self):
+        self.assertAlmostEqual(coupled_floor("USB3_RX_P"),
+                               1 - (NECK_MAX_LENGTH_MM + 6.0 + 2.0 + UNREGIONED_SLACK_MM) / 23.1)
+
+
+class BoardNamesItself(unittest.TestCase):
+    """Task 10: the release gate and the baseline both found a board with no
+    name and no revision on it; `amend_pcb.py silk_id` put them there."""
+
+    def test_the_silkscreen_carries_the_name_and_the_revision(self):
+        text = PCB.read_text()
+        texts = re.findall(r'\(gr_text "([^"]+)"\s*\(at [^)]*\)\s*\(layer "F\.SilkS"\)', text)
+        self.assertIn("RACCOON TAP", texts)
+        revision = re.search(r'\(rev "([^"]+)"\)', SCHEMATIC.read_text()).group(1)
+        self.assertIn(f"REV {revision}".upper(), [t.upper() for t in texts])
+
+    def test_the_pcb_title_block_has_the_schematics_revision(self):
+        revision = re.search(r'\(rev "([^"]+)"\)', SCHEMATIC.read_text()).group(1)
+        block = re.search(r"\(title_block(.*?)\n\t\)", PCB.read_text(), re.S)
+        self.assertIsNotNone(block, "the PCB has no title block")
+        self.assertIn(f'(rev "{revision}")', block.group(1))
+
+
 class RoutedBoardIsFrozen(unittest.TestCase):
     """From task 9 on the geometry lives in the board: gen_pcb.py builds a new
     board from nothing, so one run would delete every track."""
@@ -1953,6 +2172,397 @@ class RoutedBoardIsFrozen(unittest.TestCase):
     def test_an_unrouted_board_is_not_refused(self):
         result = run_gen_pcb_on_routed_board(routed=False)
         self.assertNotIn("geroutet", result.stderr)
+
+
+
+# ---------------------------------------------------------------------------
+# Ruling BJ: what KiCad's DRC cannot see on the routed board.
+#
+# Twice a real defect reached a review because no rule describes it: a pair
+# that lost the continuous In1 ground plane that is its reference, and a pair
+# that ran apart from its partner, at the wrong impedance, for most of its
+# length. Both are measured here on the committed board, under KiCad's own
+# Python (tests/board_probe.py), and the judgement is made in this file. The
+# gate still needs `kicad-cli pcb drc` beside this: these checks compare
+# geometry and net labels, so shorts and unconnected items stay the DRC's job
+# (ruling P).
+# ---------------------------------------------------------------------------
+
+KIPY_DEFAULT = Path("/Applications/KiCad/KiCad.app/Contents/Frameworks/"
+                    "Python.framework/Versions/3.9/bin/python3")
+BOARD_PROBE = HARDWARE / "tests" / "board_probe.py"
+BOARD_MUTATE = HARDWARE / "tests" / "board_mutate.py"
+
+BOARD_PAIRS = (("USB3_TX_P", "USB3_TX_N"), ("USB3_TX_CONN_P", "USB3_TX_CONN_N"),
+               ("USB3_RX_P", "USB3_RX_N"), ("USB2_D_P", "USB2_D_N"),
+               ("MDI0_P", "MDI0_N"), ("MDI1_P", "MDI1_N"),
+               ("MDI2_P", "MDI2_N"), ("MDI3_P", "MDI3_N"))
+BOARD_PAIR_NETS = tuple(n for pair in BOARD_PAIRS for n in pair)
+
+
+class ProbeUnavailable(RuntimeError):
+    """KiCad's Python is not there. A guard that cannot run is not a guard
+    that passed, so this is an error and never a skip."""
+
+
+def kicad_python():
+    import os
+    path = Path(os.environ.get("KIPY") or KIPY_DEFAULT)
+    if not path.exists():
+        raise ProbeUnavailable(
+            f"{path} does not exist: the In1 and coupling checks need KiCad's "
+            f"Python (pcbnew). Set KIPY to it.")
+    return path
+
+
+def run_probe(board, *flags):
+    result = subprocess.run([str(kicad_python()), str(BOARD_PROBE), "--board", str(board), *flags],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"board_probe.py failed ({result.returncode}):\n{result.stderr[-2000:]}")
+    return json.loads(result.stdout)
+
+
+def mutate_board(directory, mode, *args, source=PCB):
+    """A copy of `source` in `directory` with a planted defect (board_mutate.py)."""
+    target = Path(directory) / "mutated.kicad_pcb"
+    result = subprocess.run([str(kicad_python()), str(BOARD_MUTATE), str(source), str(target),
+                             mode, *map(str, args)], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"board_mutate.py {mode} failed:\n{result.stderr[-2000:]}")
+    return target
+
+
+_PROBE_CACHE = {}
+
+
+def committed_probe(*flags):
+    """The probe of the committed board, run once per flag set per process."""
+    key = tuple(sorted(flags))
+    if key not in _PROBE_CACHE:
+        _PROBE_CACHE[key] = run_probe(PCB, *flags)
+    return _PROBE_CACHE[key]
+
+
+# --- In1 continuity -------------------------------------------------------
+
+IN1_SAMPLE_STEP = 0.02     # mm along the track, on the centre line and both edges
+
+# The places where a pair track has no In1 ground under it and that is known
+# and ruled. Anything else, anywhere, is a failure. A gap is excused only if
+# board_probe.py attributes it to a hole in In1 round a via or hole of the
+# kind and net named here, and only for `max_run_mm` along one sampled line
+# (a straight pass through the hole is at most its diameter).
+#
+#   own J2 pin   an MDI track ends on its own through-hole pin of the MagJack,
+#                and In1 has to leave a hole round that pin;
+#   own via      a USB 2.0 track changes layer (ruling AR) and In1 leaves a hole
+#                round its own via;
+#   D- over D+   the single exception between nets: where USB2_D_N passes the
+#                antipad of USB2_D_P's layer-change via at (21.5, 19.15), half
+#                its width has no ground for about 0.5 mm (task 9 re-review
+#                M1; 480 Mbit/s, at the layer change itself).
+IN1_EXCEPTIONS = (
+    {"name": "own J2 pin", "nets": r"MDI[0-3]_[PN]", "hole": "pad", "whose": "own",
+     "label": r"J2\.\d+", "max_run_mm": 1.3},
+    {"name": "own layer-change via", "nets": r"USB2_D_[PN]", "hole": "via", "whose": "own",
+     "label": "via", "max_run_mm": 1.3},
+    {"name": "D- over the antipad of D+'s layer-change via", "nets": "USB2_D_N", "hole": "via",
+     "whose": "partner", "label": "via", "at": (21.5, 19.15), "max_run_mm": 0.55},
+)
+# Ruling AR (revised): the one stretch of a pair that may leave F.Cu, USB 2.0
+# only, across at most one In2 island boundary, flanked by GND vias that stand
+# in the B.Cu pour and in the In1 plane.
+B_CU_PAIR_NETS = ("USB2_D_P", "USB2_D_N")
+AR_MAX_ISLAND_BOUNDARIES = 1
+AR_FLANK_REACH_MM = 1.5
+
+
+def _partner_net(net):
+    return net[:-1] + ("N" if net.endswith("P") else "P")
+
+
+def _exception_for(net, gap):
+    hole = gap["hole"]
+    whose = "own" if hole["net"] == net else "partner" if hole["net"] == _partner_net(net) else "other"
+    for rule in IN1_EXCEPTIONS:
+        if not re.fullmatch(rule["nets"], net) or rule["hole"] != hole["kind"] or rule["whose"] != whose:
+            continue
+        if not re.fullmatch(rule["label"], hole["label"]):
+            continue
+        if "at" in rule and math.hypot(rule["at"][0] - hole["at"][0], rule["at"][1] - hole["at"][1]) > 0.05:
+            continue
+        return rule
+    return None
+
+
+def in1_continuity_problems(probe):
+    """One message per reason a differential pair does not have a continuous
+    ground plane on In1 under it (F.Cu tracks, centre line and both edges
+    every IN1_SAMPLE_STEP), plus the ruling AR conditions for the pair stretch
+    on B.Cu. `probe` is board_probe.py's output with --in1."""
+    problems = []
+    if sorted(probe["pairs"]) != sorted(BOARD_PAIR_NETS):
+        problems.append(f"the board's pair nets are {sorted(probe['pairs'])}, not the expected "
+                        f"{sorted(BOARD_PAIR_NETS)}: a pair the check does not know is not checked")
+    in1 = probe["in1"]
+    if in1["in1_gnd_zones"] != 1:
+        problems.append(f"{in1['in1_gnd_zones']} GND zones on In1, expected exactly 1")
+    if in1["in1_other_zones"]:
+        problems.append(f"In1 carries zones of other nets {in1['in1_other_zones']}: the reference is "
+                        f"not a plain ground plane")
+    for net in BOARD_PAIR_NETS:
+        entry = in1["nets"].get(net)
+        if not entry:
+            problems.append(f"{net}: no track on the board")
+            continue
+        on_f = entry["layers"].get("F.Cu", 0.0)
+        if on_f <= 0:
+            problems.append(f"{net}: nothing on F.Cu was sampled")
+        elif entry["samples"] < 0.9 * 3 * on_f / IN1_SAMPLE_STEP:
+            problems.append(f"{net}: only {entry['samples']} samples along {on_f:.1f} mm of F.Cu track, "
+                            f"expected about {3 * on_f / IN1_SAMPLE_STEP:.0f}")
+        for layer in entry["layers"]:
+            if layer not in ("F.Cu", "B.Cu"):
+                problems.append(f"{net}: pair track on {layer}")
+            if layer == "B.Cu" and net not in B_CU_PAIR_NETS:
+                problems.append(f"{net}: {entry['layers'][layer]:.1f} mm on B.Cu, where the plane next to "
+                                f"it is In2 (power); only USB 2.0 may (ruling AR)")
+        runs = {}
+        unexplained = []
+        for gap in entry["gaps"]:
+            if gap["hole"] is None:
+                unexplained.append(gap)
+                continue
+            rule = _exception_for(net, gap)
+            if rule is None:
+                h = gap["hole"]
+                problems.append(f"{net}: no In1 ground at {tuple(gap['at'])}, inside the hole round "
+                                f"{h['net']} {h['kind']} {h['label']} at {tuple(h['at'])}; that is not an "
+                                f"allowed exception")
+                continue
+            key = (rule["name"], tuple(gap["hole"]["at"]), gap["side"])
+            runs[key] = runs.get(key, 0) + 1
+            if runs[key] * IN1_SAMPLE_STEP > rule["max_run_mm"]:
+                problems.append(f"{net}: {rule['name']} at {tuple(gap['hole']['at'])} is "
+                                f"{runs[key] * IN1_SAMPLE_STEP:.2f} mm along the track, more than the "
+                                f"{rule['max_run_mm']} mm the exception allows")
+        if unexplained:
+            xs = [g["at"][0] for g in unexplained]
+            ys = [g["at"][1] for g in unexplained]
+            problems.append(f"{net}: {len(unexplained)} sampled points without In1 ground under them and "
+                            f"no hole to explain it, x {min(xs):.2f}..{max(xs):.2f}, y {min(ys):.2f}..{max(ys):.2f}")
+    problems += _ar_problems(in1["ar"])
+    return sorted(set(problems))
+
+
+def _ar_problems(ar):
+    problems = []
+    if not ar["in2"]:
+        return ["no pair track on B.Cu was found: the USB 2.0 stretch of ruling AR is gone or unrecognised"]
+    islands = {label for seq in ar["in2"].values() for label, _, _ in seq if label != "gap"}
+    if len(islands) > AR_MAX_ISLAND_BOUNDARIES + 1:
+        problems.append(f"the B.Cu pair stretch runs over {len(islands)} In2 islands {sorted(islands)}, "
+                        f"more than {AR_MAX_ISLAND_BOUNDARIES} boundary (ruling AR)")
+    window = sorted(x for seq in ar["in2"].values() for label, x, _ in seq
+                    if label == "gap" and ar["bbox"][0] + 1.0 < x < ar["bbox"][2] - 1.0)
+    if not window:
+        return problems
+    lo, hi = window[0], window[-1]
+    ys = [y for seq in ar["in2"].values() for _, x, y in seq if lo - 0.5 <= x <= hi + 0.5]
+    north = [v for v in ar["vias"] if lo - AR_FLANK_REACH_MM <= v["at"][0] <= hi + AR_FLANK_REACH_MM
+             and v["at"][1] < min(ys)]
+    south = [v for v in ar["vias"] if lo - AR_FLANK_REACH_MM <= v["at"][0] <= hi + AR_FLANK_REACH_MM
+             and v["at"][1] > max(ys)]
+    for side, vias in (("north", north), ("south", south)):
+        good = [v for v in vias if v["in_bcu_pour"] and v["in_in1"]]
+        if not good:
+            problems.append(f"no GND via on the {side} side of the In2 gap crossing at x {lo:.2f}..{hi:.2f} "
+                            f"that stands in both the B.Cu pour and the In1 plane (ruling AR flank)")
+    return problems
+
+
+# --- Pair coupling --------------------------------------------------------
+
+COUPLING_STEP = 0.05
+PROBE_FAR = 99.0
+STACKUP_H_MM, STACKUP_ER, STACKUP_T_OZ = 0.1855, 4.74, 1.0
+# Slack for the stretch of any pair net that is outside its impedance window
+# and in no named region below: a corner, a step, the end of a neck.
+UNREGIONED_SLACK_MM = 0.3
+
+# Where a pair net may leave the impedance window and by how much. A sample is
+# outside the window if the as-built differential impedance for its track width
+# and its edge-to-edge gap to the partner's copper (track, pad or via, same
+# layer) is more than 10 % from the target. Each region is a box in board
+# coordinates (origin at the board's own origin) or a radius round the pads of
+# the named parts; `cap_mm` is the most path length of that net the region may
+# hold. `basis` says where the cap comes from:
+#   ruling XX    the ruling grants this region, with the figure given there (a
+#                little over it to allow for path length against extent)
+#   as-built XX  no ruling quantifies this region; the cap is the committed
+#                board's length with a margin, and only stops it getting worse.
+#                Listed in hardware/review/2026-11-03-routed/accepted-findings.md.
+_RX = r"USB3_RX_[PN]"
+_TXC = r"USB3_TX_CONN_[PN]"
+COUPLING_REGIONS = (
+    # U3's pads: the neck, at most 1.0 mm from the pad centre (rulings AG, AI)
+    {"name": "U3 neck", "nets": r"(USB3_(TX|RX)_[PN]|USB2_D_[PN]|MDI\d_[PN])", "near": (("U3",), NECK_MAX_LENGTH_MM),
+     "cap_mm": NECK_MAX_LENGTH_MM, "basis": "ruling AG/AI"},
+    # TX: the 45 degree fan-out to the two AC capacitors (ruling BE)
+    {"name": "TX capacitor landing", "nets": r"USB3_TX(_CONN)?_[PN]", "near": (("C22", "C23"), 1.6),
+     "cap_mm": 1.4, "basis": "ruling BE"},
+    # U8's straddle (ruling AS: about 5 mm per pair)
+    {"name": "U8 straddle", "nets": _RX, "box": (12.0, 19.0, 0, 40), "layer": "F.Cu",
+     "cap_mm": 6.0, "basis": "ruling AS (about 5 mm) + path length against extent"},
+    {"name": "U8 straddle", "nets": r"USB3_TX_CONN_N", "box": (12.0, 19.0, 0, 40), "layer": "F.Cu",
+     "cap_mm": 7.0, "basis": "ruling BE (accepted past AS's 5 mm, review M3)"},
+    {"name": "U8 straddle", "nets": r"USB3_TX_CONN_P", "box": (12.0, 19.0, 0, 40), "layer": "F.Cu",
+     "cap_mm": 8.5, "basis": "ruling BE (accepted past AS's 5 mm, review M3)"},
+    # J3: its +5V pin sits between the RX pins and the pairs fan out to its 2 mm pitch (BN, BE)
+    {"name": "J3 fan-out", "nets": _RX, "box": (4.5, 9.0, 0, 40), "layer": "F.Cu",
+     "cap_mm": 2.0, "basis": "ruling BN (1.5 mm) + path length against extent"},
+    {"name": "J3 fan-out", "nets": _TXC, "box": (4.5, 9.0, 0, 40), "layer": "F.Cu",
+     "cap_mm": 2.7, "basis": "ruling BE (about 2.5 mm)"},
+    # USB 2.0: the D+/D- crossover between J3 and U9 (task 8, the U9 channel)
+    {"name": "USB 2.0 J3 to U9 crossover", "nets": "USB2_D_N", "box": (4.5, 12.6, 0, 40),
+     "cap_mm": 11.0, "basis": "as-built (no ruling quantifies it)"},
+    {"name": "USB 2.0 J3 to U9 crossover", "nets": "USB2_D_P", "box": (4.5, 12.6, 0, 40),
+     "cap_mm": 4.6, "basis": "as-built (no ruling quantifies it)"},
+    # USB 2.0: the skew meander on B.Cu that matches D+ to D- (EMC DP-001)
+    {"name": "USB 2.0 skew meander", "nets": "USB2_D_P", "box": (14.5, 17.5, 0, 40), "layer": "B.Cu",
+     "cap_mm": 5.0, "basis": "as-built (no ruling quantifies it)"},
+    # USB 2.0: the two layer changes at U3's end (ruling AR)
+    {"name": "USB 2.0 layer change at U3", "nets": "USB2_D_N", "box": (20.5, 23.6, 18.0, 20.0),
+     "cap_mm": 1.2, "basis": "ruling AR (layer change)"},
+    {"name": "USB 2.0 layer change at U3", "nets": "USB2_D_P", "box": (20.5, 23.6, 18.0, 20.0),
+     "cap_mm": 1.0, "basis": "ruling AR (layer change)"},
+    # MDI: the lead-in to J2's pin columns (rulings AM, AQ: planar, pins of one pair 2.5 mm apart)
+    {"name": "J2 pin lead-in", "nets": "MDI0_N", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
+     "cap_mm": 5.5, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
+    {"name": "J2 pin lead-in", "nets": "MDI0_P", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
+     "cap_mm": 4.5, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
+    {"name": "J2 pin lead-in", "nets": "MDI1_N", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
+     "cap_mm": 4.2, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
+    {"name": "J2 pin lead-in", "nets": "MDI1_P", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
+     "cap_mm": 3.1, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
+    {"name": "J2 pin lead-in", "nets": "MDI2_N", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
+     "cap_mm": 7.0, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
+    {"name": "J2 pin lead-in", "nets": "MDI2_P", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
+     "cap_mm": 5.0, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
+    {"name": "J2 pin lead-in", "nets": "MDI3_N", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
+     "cap_mm": 4.3, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
+    {"name": "J2 pin lead-in", "nets": "MDI3_P", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu",
+     "cap_mm": 2.3, "basis": "as-built (rulings AM/AQ route it planar, none quantify it)"},
+)
+# Each pair's length as committed, to turn the caps into a floor on the share
+# of the pair that stays inside the window.
+NOMINAL_LENGTH_MM = {
+    "USB3_TX_P": 4.5, "USB3_TX_N": 4.6, "USB3_TX_CONN_P": 21.8, "USB3_TX_CONN_N": 22.2,
+    "USB3_RX_P": 23.1, "USB3_RX_N": 24.1, "USB2_D_P": 21.4, "USB2_D_N": 24.8,
+    "MDI0_P": 34.2, "MDI0_N": 34.4, "MDI1_P": 28.2, "MDI1_N": 28.4,
+    "MDI2_P": 12.4, "MDI2_N": 14.5, "MDI3_P": 12.9, "MDI3_N": 15.1}
+# Of the rest of the board: the share at the designed gap (+/- 0.03 mm) is
+# smaller than the share inside the window by the length at 0.20 to 0.27 mm,
+# which is inside it; this much of the pair's length may sit there.
+BAND_ALLOWANCE = 0.05
+
+
+def coupled_floor(net):
+    """The least share of `net` that must be inside the impedance window:
+    what is left after its regions' caps and the slack, over its length."""
+    caps = sum(r["cap_mm"] for r in COUPLING_REGIONS if re.fullmatch(r["nets"], net))
+    return 1.0 - (caps + UNREGIONED_SLACK_MM) / NOMINAL_LENGTH_MM[net]
+
+
+def pair_target_ohm(net, targets=None):
+    targets = targets or netlist_impedance_targets(load_netlist())
+    return targets["MDI" if net.startswith("MDI") else "USB3"]
+
+
+def pair_gap_mm(net):
+    pro = load_pro()
+    cls = "MDI" if net.startswith("MDI") else "USB3"
+    return next(c["diff_pair_gap"] for c in pro["net_settings"]["classes"] if c["name"] == cls)
+
+
+def _in_window(net, width, gap, target):
+    z = as_built_zd(STACKUP_T_OZ, STACKUP_H_MM, width, max(gap, 0.0), STACKUP_ER)
+    return abs(z - target) <= 0.1 * target
+
+
+def _region_of(net, x, y, layer, pads):
+    for region in COUPLING_REGIONS:
+        if not re.fullmatch(region["nets"], net) or region.get("layer", layer) != layer:
+            continue
+        if "box" in region:
+            x0, x1, y0, y1 = region["box"]
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return region
+        else:
+            refs, radius = region["near"]
+            if any(math.hypot(x - p["at"][0], y - p["at"][1]) <= radius
+                   for p in pads if p["ref"] in refs):
+                return region
+    return None
+
+
+def coupling_summary(probe, targets=None):
+    """Per pair net: length, length inside the impedance window, length at the
+    designed gap +/- 0.03 mm, and the out-of-window length by region."""
+    targets = targets or netlist_impedance_targets(load_netlist())
+    out = {}
+    for net in BOARD_PAIR_NETS:
+        samples = probe["coupling"].get(net, [])
+        target = pair_target_ohm(net, targets)
+        gap = pair_gap_mm(net)
+        row = {"length": 0.0, "window": 0.0, "at_gap": 0.0, "regions": {}, "unregioned": 0.0}
+        for x, y, g, w, length, layer in samples:
+            row["length"] += length
+            if abs(g - gap) <= 0.03:
+                row["at_gap"] += length
+            if _in_window(net, w, g, target):
+                row["window"] += length
+                continue
+            region = _region_of(net, x, y, layer, probe["pads"])
+            if region is None:
+                row["unregioned"] += length
+            else:
+                key = (region["name"], region["cap_mm"], region["basis"])
+                row["regions"][key] = row["regions"].get(key, 0.0) + length
+        out[net] = row
+    return out
+
+
+def pair_coupling_problems(probe, targets=None):
+    """One message per reason a pair is less coupled than the rulings granted:
+    a region over its cap, uncoupled length in no region, or a share of the
+    pair inside the impedance window below the floor that the caps leave."""
+    problems = []
+    if sorted(probe["pairs"]) != sorted(BOARD_PAIR_NETS):
+        problems.append(f"the board's pair nets are {sorted(probe['pairs'])}, not the expected "
+                        f"{sorted(BOARD_PAIR_NETS)}")
+    summary = coupling_summary(probe, targets)
+    for net, row in summary.items():
+        if row["length"] <= 0:
+            problems.append(f"{net}: no track measured")
+            continue
+        for (name, cap, basis), length in row["regions"].items():
+            if length > cap:
+                problems.append(f"{net}: {length:.2f} mm outside the impedance window in {name!r}, "
+                                f"more than the {cap} mm {basis} grants")
+        if row["unregioned"] > UNREGIONED_SLACK_MM:
+            problems.append(f"{net}: {row['unregioned']:.2f} mm outside the impedance window in no "
+                            f"region any ruling grants (slack {UNREGIONED_SLACK_MM} mm)")
+        share, floor = row["window"] / row["length"], coupled_floor(net)
+        if share < floor:
+            problems.append(f"{net}: {100 * share:.0f} % of its length inside the impedance window, "
+                            f"below the floor of {100 * floor:.0f} % the granted regions leave")
+        at_gap, floor_gap = row["at_gap"] / row["length"], floor - BAND_ALLOWANCE
+        if at_gap < floor_gap:
+            problems.append(f"{net}: {100 * at_gap:.0f} % of its length at the designed gap, below "
+                            f"the floor of {100 * floor_gap:.0f} %")
+    return problems
 
 
 if __name__ == "__main__":

@@ -7,6 +7,12 @@
 		(legacy_teardrops no)
 	)
 	(paper "A4")
+	(title_block
+		(title "Raccoon Tap - USB 3.0 Gigabit Ethernet Tap")
+		(date "2026-11-01")
+		(rev "2.1-draft")
+		(company "TrashPandaPaws")
+	)
 	(layers
 		(0 "F.Cu" signal)
 		(4 "In1.Cu" signal "GND")
@@ -10648,6 +10654,30 @@
 		)
 		(layer "Edge.Cuts")
 		(uuid "0e596913-7cdd-443f-ba5a-aa6946652df3")
+	)
+	(gr_text "RACCOON TAP"
+		(at 103.5 82.9 0)
+		(layer "F.SilkS")
+		(uuid "aa54e3db-eb54-4555-b705-5106a4805ad3")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.17)
+			)
+			(justify left)
+		)
+	)
+	(gr_text "REV 2.1-DRAFT"
+		(at 103.5 84.3 0)
+		(layer "F.SilkS")
+		(uuid "54f6b1a7-ab83-4813-bcbe-ea28741bac8a")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.17)
+			)
+			(justify left)
+		)
 	)
 	(segment
 		(start 137.3 113.45)

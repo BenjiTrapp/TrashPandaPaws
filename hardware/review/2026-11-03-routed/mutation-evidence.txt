@@ -1,0 +1,87 @@
+== committed board, coupling ==
+  USB3_TX_P        68 % in the window,  65 % at the designed gap, floor 40 %, in no region 0.00 mm
+  USB3_TX_N        62 % in the window,  60 % at the designed gap, floor 41 %, in no region 0.00 mm
+  USB3_TX_CONN_P   52 % in the window,  50 % at the designed gap, floor 41 %, in no region 0.00 mm
+  USB3_TX_CONN_N   52 % in the window,  50 % at the designed gap, floor 49 %, in no region 0.00 mm
+  USB3_RX_P        66 % in the window,  65 % at the designed gap, floor 60 %, in no region 0.00 mm
+  USB3_RX_N        66 % in the window,  63 % at the designed gap, floor 61 %, in no region 0.25 mm
+  USB2_D_P         54 % in the window,  49 % at the designed gap, floor 44 %, in no region 0.00 mm
+  USB2_D_N         51 % in the window,  44 % at the designed gap, floor 46 %, in no region 0.00 mm
+  MDI0_P           86 % in the window,  86 % at the designed gap, floor 83 %, in no region 0.00 mm
+  MDI0_N           83 % in the window,  83 % at the designed gap, floor 80 %, in no region 0.00 mm
+  MDI1_P           88 % in the window,  87 % at the designed gap, floor 84 %, in no region 0.00 mm
+  MDI1_N           84 % in the window,  84 % at the designed gap, floor 81 %, in no region 0.00 mm
+  MDI2_P           58 % in the window,  57 % at the designed gap, floor 49 %, in no region 0.00 mm
+  MDI2_N           50 % in the window,  49 % at the designed gap, floor 43 %, in no region 0.00 mm
+  MDI3_P           80 % in the window,  80 % at the designed gap, floor 72 %, in no region 0.00 mm
+  MDI3_N           70 % in the window,  69 % at the designed gap, floor 63 %, in no region 0.00 mm
+  problems: []
+== committed board, In1 ==
+  problems: []
+
+== 732475b: task 9 as reviewed: the board of review 1 (TX 0 % coupled, RX 28 %, USB 2.0 over D+'s antipad) ==
+  coupling problems 27, In1 problems 17; share of each SuperSpeed net inside the impedance window: TX_P 10 %, TX_N 10 %, TX_CONN_P 35 %, TX_CONN_N 36 %, RX_P 39 %, RX_N 39 %
+    USB3_TX_P: 1.59 mm outside the impedance window in 'TX capacitor landing', more than the 1.4 mm ruling BE grants
+    USB3_TX_P: 1.84 mm outside the impedance window in no region any ruling grants (slack 0.3 mm)
+    USB3_TX_P: 10 % of its length inside the impedance window, below the floor of 40 % the granted regions leave
+    USB3_TX_P: 1 % of its length at the designed gap, below the floor of 35 %
+    USB2_D_N: no In1 ground at (21.36, 18.43), inside the hole round USB2_D_P via via at (21.5, 19.0); that is not an allowed exception
+    USB2_D_N: no In1 ground at (21.38, 18.43), inside the hole round USB2_D_P via via at (21.5, 19.0); that is not an allowed exception
+
+== 584ece4: after fix round 1 (TX coupled, RX still 28 %) ==
+  coupling problems 10, In1 problems 0; share of each SuperSpeed net inside the impedance window: TX_P 68 %, TX_N 62 %, TX_CONN_P 52 %, TX_CONN_N 52 %, RX_P 39 %, RX_N 39 %
+    USB3_RX_P: 8.58 mm outside the impedance window in 'U8 straddle', more than the 6.0 mm ruling AS (about 5 mm) + path length against extent grants
+    USB3_RX_P: 2.50 mm outside the impedance window in 'J3 fan-out', more than the 2.0 mm ruling BN (1.5 mm) + path length against extent grants
+    USB3_RX_P: 2.29 mm outside the impedance window in no region any ruling grants (slack 0.3 mm)
+    USB3_RX_P: 39 % of its length inside the impedance window, below the floor of 60 % the granted regions leave
+
+== b13cff9: after fix round 2 (ruling BK: RX 56 / 54 %) ==
+  coupling problems 0, In1 problems 0; share of each SuperSpeed net inside the impedance window: TX_P 68 %, TX_N 62 %, TX_CONN_P 52 %, TX_CONN_N 52 %, RX_P 66 %, RX_N 66 %
+
+== defect: RX_N 0.45 mm further from RX_P along x 7.5 to 24.5 (task 9 review 1 found RX 28 % coupled) ==
+  USB3_RX_N        15 % in the window,  10 % at the designed gap, floor 61 %, in no region 8.49 mm
+    USB3_RX_N: 3.33 mm outside the impedance window in 'J3 fan-out', more than the 2.0 mm ruling BN (1.5 mm) + path length against extent grants
+    USB3_RX_N: 7.95 mm outside the impedance window in 'U8 straddle', more than the 6.0 mm ruling AS (about 5 mm) + path length against extent grants
+    USB3_RX_N: 8.49 mm outside the impedance window in no region any ruling grants (slack 0.3 mm)
+    USB3_RX_N: 15 % of its length inside the impedance window, below the floor of 61 % the granted regions leave
+    USB3_RX_N: 10 % of its length at the designed gap, below the floor of 56 %
+
+== defect: TX_P 0.30 mm further from TX_N along its whole run ==
+  USB3_TX_P         0 % in the window,   0 % at the designed gap, floor 40 %, in no region 1.87 mm
+    USB3_TX_P: 1.11 mm outside the impedance window in 'U3 neck', more than the 1.0 mm ruling AG/AI grants
+    USB3_TX_P: 1.48 mm outside the impedance window in 'TX capacitor landing', more than the 1.4 mm ruling BE grants
+    USB3_TX_P: 1.87 mm outside the impedance window in no region any ruling grants (slack 0.3 mm)
+    USB3_TX_P: 0 % of its length inside the impedance window, below the floor of 40 % the granted regions leave
+    USB3_TX_P: 0 % of its length at the designed gap, below the floor of 35 %
+
+== defect: MDI1_N 0.30 mm further from MDI1_P along its whole run ==
+  MDI1_N           23 % in the window,  22 % at the designed gap, floor 81 %, in no region 12.39 mm
+    MDI1_N: 8.53 mm outside the impedance window in 'J2 pin lead-in', more than the 4.2 mm as-built (rulings AM/AQ route it planar, none quantify it) grants
+    MDI1_N: 1.01 mm outside the impedance window in 'U3 neck', more than the 1.0 mm ruling AG/AI grants
+    MDI1_N: 12.39 mm outside the impedance window in no region any ruling grants (slack 0.3 mm)
+    MDI1_N: 23 % of its length inside the impedance window, below the floor of 81 % the granted regions leave
+    MDI1_N: 22 % of its length at the designed gap, below the floor of 76 %
+
+== defect: a hole in In1 under each pair (0.8 x 0.5 mm, at the middle of its F.Cu run) ==
+  USB3_TX_P       FOUND: USB3_TX_P: 91 sampled points without In1 ground under them and no hole to explain it, x 24.91..25.32, y 19.41..19.88
+  USB3_TX_N       FOUND: USB3_TX_N: 106 sampled points without In1 ground under them and no hole to explain it, x 25.31..26.10, y 16.21..19.88
+  USB3_TX_CONN_P  FOUND: USB3_TX_CONN_P: 111 sampled points without In1 ground under them and no hole to explain it, x 13.19..13.97, y 16.12..16.61
+  USB3_TX_CONN_N  FOUND: USB3_TX_CONN_N: 57 sampled points without In1 ground under them and no hole to explain it, x 25.90..26.10, y 14.76..15.12
+  USB3_RX_P       FOUND: USB3_RX_P: 113 sampled points without In1 ground under them and no hole to explain it, x 12.96..13.75, y 19.01..19.47
+  USB3_RX_N       FOUND: USB3_RX_N: 133 sampled points without In1 ground under them and no hole to explain it, x 12.95..14.00, y 18.20..19.25
+  USB2_D_P        FOUND: USB2_D_P: 66 sampled points without In1 ground under them and no hole to explain it, x 11.12..11.56, y 16.96..17.18
+  USB2_D_N        FOUND: USB2_D_N: 95 sampled points without In1 ground under them and no hole to explain it, x 9.50..9.98, y 16.29..16.77
+  MDI0_P          FOUND: MDI0_P: 105 sampled points without In1 ground under them and no hole to explain it, x 41.43..42.17, y 25.56..26.04
+  MDI0_N          FOUND: MDI0_N: 142 sampled points without In1 ground under them and no hole to explain it, x 39.84..41.61, y 13.46..25.76
+  MDI1_P          FOUND: MDI1_P: 120 sampled points without In1 ground under them and no hole to explain it, x 36.70..37.48, y 25.30..25.48
+  MDI1_N          FOUND: MDI1_N: 120 sampled points without In1 ground under them and no hole to explain it, x 34.96..35.74, y 24.91..25.09
+  MDI2_P          FOUND: MDI2_P: 120 sampled points without In1 ground under them and no hole to explain it, x 31.29..32.07, y 22.71..22.89
+  MDI2_N          FOUND: MDI2_N: 120 sampled points without In1 ground under them and no hole to explain it, x 34.69..35.47, y 22.31..22.49
+  MDI3_P          FOUND: MDI3_P: 120 sampled points without In1 ground under them and no hole to explain it, x 31.20..31.98, y 20.20..20.39
+  MDI3_N          FOUND: MDI3_N: 120 sampled points without In1 ground under them and no hole to explain it, x 29.20..29.98, y 19.82..20.00
+
+== defect: a +3V3 via 0.52 mm beside RX_P (touches nothing; its antipad opens In1) ==
+   ['USB3_RX_P: no In1 ground at (9.04, 21.285), inside the hole round +3V3 via via at (9.47, 21.7); that is not an allowed exception', 'USB3_RX_P: no In1 ground at (9.06, 21.285), inside the hole round +3V3 via via at (9.47, 21.7); that is not an allowed exception']
+
+== defect: the north AR flank via removed ==
+   ['no GND via on the north side of the In2 gap crossing at x 18.80..19.35 that stands in both the B.Cu pour and the In1 plane (ruling AR flank)']

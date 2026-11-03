@@ -1,0 +1,19 @@
+DRC: 0 errors, 0 unconnected, 10 warnings (silk_over_copper, silk_overlap)
+--- PASS  kicad-cli pcb drc  (0 errors, 0 unconnected)
+ERC: 0 violations (errors and warnings)
+--- PASS  kicad-cli sch erc  (0 violations)
+PASSED - netlist is consistent, 0 warning(s)
+--- PASS  check_netlist.py
+PASSED — all checks ok, 0 warning(s)
+--- PASS  check_kicad.py (incl. check_pcb_connectivity)
+----------------------------------------------------------------------
+Ran 27 tests in 2.308s
+OK
+--- PASS  test_check_kicad.py
+----------------------------------------------------------------------
+Ran 131 tests in 35.225s
+OK
+--- PASS  check_fab_release.py (incl. In1 continuity and pair coupling, ruling BJ)
+committed 1136 items, rebuilt 1136; identical 1136 of 1136
+--- PASS  rebuild_check.py (gen_pcb + route_pcb reproduce the committed board)
+design checks: 7 passed, 0 failed

@@ -1,0 +1,117 @@
+{
+  "gate_version": "1.0",
+  "overall_status": "FAIL",
+  "summary": {
+    "total_checks": 12,
+    "pass": 9,
+    "warn": 0,
+    "fail": 1,
+    "skip": 2
+  },
+  "checks": [
+    {
+      "category": "routing",
+      "check_id": "routing_completeness",
+      "status": "pass",
+      "message": "All nets routed (38/38)",
+      "details": null
+    },
+    {
+      "category": "bom",
+      "check_id": "mpn_coverage",
+      "status": "pass",
+      "message": "All components have MPNs (43/43)",
+      "details": null
+    },
+    {
+      "category": "bom",
+      "check_id": "footprint_assignment",
+      "status": "pass",
+      "message": "All components have footprints assigned",
+      "details": null
+    },
+    {
+      "category": "dfm",
+      "check_id": "fab_capability",
+      "status": "pass",
+      "message": "DFM tier: standard",
+      "details": null
+    },
+    {
+      "category": "documentation",
+      "check_id": "revision_marking",
+      "status": "pass",
+      "message": "Revision marking found",
+      "details": null
+    },
+    {
+      "category": "documentation",
+      "check_id": "board_name",
+      "status": "pass",
+      "message": "Board name found on silkscreen",
+      "details": null
+    },
+    {
+      "category": "consistency",
+      "check_id": "component_count",
+      "status": "pass",
+      "message": "Schematic (59 placeable) matches PCB (59 footprints)",
+      "details": null
+    },
+    {
+      "category": "consistency",
+      "check_id": "net_count",
+      "status": "fail",
+      "message": "Net count mismatch: schematic 44 vs PCB 38 (diff 6)",
+      "details": {
+        "schematic_nets": 44,
+        "pcb_nets": 38
+      }
+    },
+    {
+      "category": "gerbers",
+      "check_id": "layer_completeness",
+      "status": "skip",
+      "message": "Gerber analysis not provided",
+      "details": null
+    },
+    {
+      "category": "gerbers",
+      "check_id": "layer_alignment",
+      "status": "skip",
+      "message": "Gerber analysis not provided",
+      "details": null
+    },
+    {
+      "category": "thermal",
+      "check_id": "thermal_risk",
+      "status": "pass",
+      "message": "Thermal score 100/100 \u2014 no critical/high findings",
+      "details": null
+    },
+    {
+      "category": "emc",
+      "check_id": "emc_risk",
+      "status": "pass",
+      "message": "EMC score 0/100 \u2014 no critical findings",
+      "details": null
+    }
+  ],
+  "elapsed_s": 0.0,
+  "trust_posture": {
+    "trust_level": "low",
+    "total_findings": 158,
+    "by_confidence": {
+      "deterministic": 111,
+      "heuristic": 47,
+      "datasheet_backed": 0
+    },
+    "provenance_coverage_pct": 23.6,
+    "per_analyzer": {
+      "schematic": "mixed",
+      "pcb": "high",
+      "thermal": "low",
+      "emc": "mixed"
+    }
+  }
+}

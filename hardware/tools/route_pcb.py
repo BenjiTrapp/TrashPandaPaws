@@ -1568,6 +1568,37 @@ def stage_pin3_via(r):
     move_via(r, "+1V0", PIN3_VIA_OLD, PIN3_VIA, PIN3_VIA_D)
 
 
+# Task 10: the release gate found no board name or revision on the board, in
+# silkscreen or title block. Two lines on F.SilkS in the free corner at the
+# top left (x 3.5 to 16.5, y 2 to 5: no pad, via or other silk within 0.3 mm),
+# and the title block, from the schematic's.
+SILK_ID = [("RACCOON TAP", (3.5, 2.9)), ("REV 2.1-DRAFT", (3.5, 4.3))]
+SILK_ID_SIZE, SILK_ID_THICKNESS = 1.0, 0.17
+TITLE_BLOCK = {"title": "Raccoon Tap - USB 3.0 Gigabit Ethernet Tap", "revision": "2.1-draft",
+               "company": "TrashPandaPaws", "date": "2026-11-01"}
+
+
+def stage_silk_id(r):
+    board = r.board
+    if any(t.GetText() == SILK_ID[0][0] for t in board.GetDrawings() if t.Type() == pcbnew.PCB_TEXT_T):
+        print("silk_id: the board already carries its name; nothing to do")
+        return
+    for text, (x, y) in SILK_ID:
+        item = pcbnew.PCB_TEXT(board)
+        item.SetText(text)
+        item.SetLayer(pcbnew.F_SilkS)
+        item.SetPosition(vec(x, y))
+        item.SetTextSize(pcbnew.VECTOR2I(mm(SILK_ID_SIZE), mm(SILK_ID_SIZE)))
+        item.SetTextThickness(mm(SILK_ID_THICKNESS))
+        item.SetHorizJustify(pcbnew.GR_TEXT_H_ALIGN_LEFT)
+        board.Add(item)
+    block = board.GetTitleBlock()
+    block.SetTitle(TITLE_BLOCK["title"])
+    block.SetRevision(TITLE_BLOCK["revision"])
+    block.SetCompany(TITLE_BLOCK["company"])
+    block.SetDate(TITLE_BLOCK["date"])
+
+
 STAGES = [
     ("usb3_tx", stage_usb3_tx),
     ("usb3_rx", stage_usb3_rx),
@@ -1591,6 +1622,7 @@ STAGES = [
     ("c9", stage_c9),
     ("pin3_via", stage_pin3_via),
     ("split_area_out", stage_split_area_out),
+    ("silk_id", stage_silk_id),
 ]
 
 

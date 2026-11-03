@@ -32,8 +32,12 @@ Amendments, in the order they were made:
              ruling BQ: tracks cut again 0.25 mm (+ half their width) past
              the edge of U3's escape area, which bounds ruling AU's reach.
 
+  silk_id    task 10: board name and revision on F.SilkS and in the title block,
+             which the release gate found missing.
+
 Run them in this order (review 1: coupling decoupling via_gaps antipads
-split_area; review 2: rx c9 pin3_via; review 3: split_area_out).
+split_area; review 2: rx c9 pin3_via; review 3: split_area_out; task 10:
+silk_id).
 
 An amendment that finds nothing to do says so and changes nothing. The zones
 are refilled before the board is saved.
@@ -52,7 +56,7 @@ AMENDMENTS = {"pad_vias": rp.stage_pad_vias, "coupling": rp.stage_coupling,
               "decoupling": rp.stage_decoupling, "via_gaps": rp.stage_via_gaps,
               "antipads": rp.stage_antipads, "split_area": rp.stage_split_area,
               "rx": rp.stage_rx, "c9": rp.stage_c9, "pin3_via": rp.stage_pin3_via,
-              "split_area_out": rp.stage_split_area_out}
+              "split_area_out": rp.stage_split_area_out, "silk_id": rp.stage_silk_id}
 
 
 def main():
