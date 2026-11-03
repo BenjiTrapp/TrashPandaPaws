@@ -632,9 +632,13 @@ class TestSupervisedMode(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await task).allowed)
 
     async def test_timeout_records_timeout_as_decider(self):
+        # Named configuration: a timeout refuses under "skip". With
+        # "decide" the arbiter answers and with "pause" the run suspends,
+        # which are different tests below. Leaving it unnamed made this
+        # test depend on whatever the default happened to be.
         conn, rid = _fresh_run()
-        d = await _gate(conn, rid, mode="supervised",
-                        approval_timeout=0.1).request(_cls())
+        d = await _gate(conn, rid, mode="supervised", approval_timeout=0.1,
+                        unattended_behavior="skip").request(_cls())
         self.assertFalse(d.allowed)
         self.assertEqual(d.decided_by, "timeout")
         row = _rows(conn)[0]
@@ -720,8 +724,12 @@ class TestAnswerIsFinal(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_rows(conn)[0]["decision"], "refused")
 
     async def test_answer_after_timeout_cannot_resurrect_the_action(self):
+        # "skip" so the outcome is a plain refusal and the test isolates
+        # the property it is named for: once settled, a late answer changes
+        # nothing.
         conn, rid = _fresh_run()
-        g = _gate(conn, rid, mode="supervised", approval_timeout=0.05)
+        g = _gate(conn, rid, mode="supervised", approval_timeout=0.05,
+                  unattended_behavior="skip")
         task = asyncio.create_task(g.request(_cls()))
         approval_id = (await _wait_for_pending(g))[0]["id"]
         d = await task
@@ -764,8 +772,12 @@ class TestAnswerIsFinal(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(g.answer(row["id"], False))
 
     async def test_timeout_arriving_first_wins_over_a_late_answer_in_the_same_tick(self):
+        # "skip" so the timeout resolves to a refusal; the race this pins is
+        # between the timer and a late answer, not the policy that settles
+        # the row afterwards.
         conn, rid = _fresh_run()
-        g = _gate(conn, rid, mode="supervised", approval_timeout=5.0)
+        g = _gate(conn, rid, mode="supervised", approval_timeout=5.0,
+                  unattended_behavior="skip")
         seen = {}
 
         async def timed_out(awaitable, timeout):
@@ -873,3 +885,82 @@ class TestConstruction(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── The timeout in supervised mode ──
+
+class TestAnUnansweredKnockFollowsTheConfiguration(
+        unittest.IsolatedAsyncioTestCase):
+    """Design section 10.7: "Timeout: behaviour from the configuration".
+
+    The timeout is listed there as a third case beside supervised and Full
+    Automated, and it can only happen in supervised mode -- Full Automated
+    decides immediately and never waits. unattended_behavior was read only
+    when mode was "auto", so the one place it was specified for was the one
+    place it did not apply.
+
+    Found live. A supervised run was started with unattended_behavior
+    "pause"; the gate knocked three times for exploit_known_poc and refused
+    each one by timeout, carrying on instead of suspending. Three identical
+    refusals are the symptom: a pause would have produced one.
+
+    An operator who has not answered for the whole timeout is, for this
+    purpose, not attending.
+    """
+
+    async def _timeout(self, behaviour):
+        conn, rid = _fresh_run()
+        g = _gate(conn, rid, mode="supervised", approval_timeout=0.05,
+                  unattended_behavior=behaviour)
+        return conn, g, g.request(_cls())
+
+    async def test_pause_suspends_instead_of_refusing(self):
+        conn, g, pending = await self._timeout("pause")
+        with self.assertRaises(gate.GatePauseRequested):
+            await pending
+
+    async def test_skip_refuses_on_the_record(self):
+        conn, g, pending = await self._timeout("skip")
+        d = await pending
+        self.assertFalse(d.allowed)
+        self.assertEqual(_rows(conn)[0]["decided_by"], "timeout")
+
+    async def test_decide_hands_it_to_the_expected_value_arbiter(self):
+        # points 200 at p_success 0.6 against p_detect 0.3 clears a zero
+        # threshold, which is the live case: EV +110 for the vsftpd exploit.
+        conn, rid = _fresh_run()
+        g = _gate(conn, rid, mode="supervised", approval_timeout=0.05,
+                  unattended_behavior="decide", ev_threshold=0.0)
+        d = await g.request(_cls(points=200, p_success=0.6, p_detect=0.3))
+        self.assertTrue(d.allowed)
+        self.assertEqual(_rows(conn)[0]["decided_by"], "ev")
+
+    async def test_decide_still_refuses_a_bad_bet(self):
+        conn, rid = _fresh_run()
+        g = _gate(conn, rid, mode="supervised", approval_timeout=0.05,
+                  unattended_behavior="decide", ev_threshold=1e9)
+        d = await g.request(_cls())
+        self.assertFalse(d.allowed)
+        self.assertEqual(_rows(conn)[0]["decided_by"], "ev")
+
+    async def test_an_answer_still_wins_over_the_configuration(self):
+        # The timeout path must not take an approval away from an operator
+        # who answered in time, whatever the configuration says.
+        conn, rid = _fresh_run()
+        g = _gate(conn, rid, mode="supervised", approval_timeout=5.0,
+                  unattended_behavior="pause")
+        task = asyncio.create_task(g.request(_cls()))
+        pending = await _wait_for_pending(g)
+        self.assertTrue(g.answer(pending[0]["id"], True))
+        d = await task
+        self.assertTrue(d.allowed)
+        self.assertEqual(d.decided_by, "operator")
+
+    async def test_a_tier_one_action_is_unaffected_by_any_of_this(self):
+        for behaviour in ("decide", "skip", "pause"):
+            conn, rid = _fresh_run()
+            g = _gate(conn, rid, mode="supervised", approval_timeout=0.05,
+                      unattended_behavior=behaviour)
+            d = await g.request(_cls(tier=safety.TIER_HARD))
+            self.assertFalse(d.allowed, behaviour)
+            self.assertEqual(d.decided_by, "hard", behaviour)

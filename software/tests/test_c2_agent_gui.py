@@ -174,12 +174,15 @@ class TestFullAutoForm(unittest.TestCase):
     def setUpClass(cls):
         cls.js = AGENT_JS.read_text()
 
-    def test_form_has_all_nine_sections_in_order(self):
-        # Eight from the spec, in its order, and OpSec after them: it was
-        # added later and is the one the operator must not be able to miss.
+    def test_form_has_every_section_in_order(self):
+        # Eight from spec 17.2 in its order, OpSec after them because it
+        # arrived later and must not be missable, and Mode first because it
+        # decides what the rest of the form means: 17.1 (supervised) and
+        # 17.2 (Full Automated) are both started here.
         self.assertEqual(_js_list(self.js, "FORM_SECTIONS"),
-                         ["Target beacons", "Scope", "Phases", "Risk profile",
-                          "Approvals", "Budget", "Model", "Schedule", "OpSec"])
+                         ["Mode", "Target beacons", "Scope", "Phases",
+                          "Risk profile", "Approvals", "Budget", "Model",
+                          "Schedule", "OpSec"])
 
     def test_the_form_is_in_english(self):
         for german in ("Ziel-Beacons", "Phasen", "Risikoprofil", "Anklopfen",
@@ -248,10 +251,17 @@ class TestFullAutoForm(unittest.TestCase):
         for b in ("decide", "skip", "pause"):
             self.assertIn('"%s"' % b, self.js)
 
-    def test_the_form_starts_the_campaign_in_auto_mode(self):
-        # Without it the service treats the run as supervised and the
-        # unattended behaviour chosen above would have no effect.
-        self.assertRegex(self.js, r"mode:\s*\"auto\"")
+    def test_the_form_starts_the_campaign_in_the_chosen_mode(self):
+        # This test used to require mode: "auto" and carried the reasoning
+        # that led there -- "otherwise the service treats the run as
+        # supervised and the unattended behaviour would have no effect".
+        # That had the cause backwards. The unattended choice belongs to
+        # Full Automated (17.2); supervised (17.1) is a different mode whose
+        # whole point is that knocks reach the operator. Hardcoding auto
+        # meant the knock card could not be reached from the GUI at all, so
+        # the test was pinning the defect.
+        self.assertRegex(self.js, r"mode:\s*F\.mode")
+        self.assertNotRegex(self.js, r"mode:\s*\"auto\"\s*,")
 
     # ── Budget ──
 
@@ -466,3 +476,57 @@ class TestThePhaseLabelsMatchThePhases(unittest.TestCase):
                                       set(range(1, 9)))
         for number, name in prompts.PHASE_NAMES.items():
             self.assertIn("Phase %d - %s" % (number, name), text)
+
+
+class TestTheFormOffersBothAgentModes(unittest.TestCase):
+    """Design 17.1 is supervised; 17.2 is Full Automated. Both are startable.
+
+    The form sent a hardcoded mode: "auto" with a comment explaining that
+    otherwise "the unattended behaviour chosen above would never apply".
+    The reasoning had the cause the wrong way round: that setting belongs to
+    the Full Automated form (17.2, "knocking without an operator"), and
+    supervised mode is a different mode with its own screen (17.1), whose
+    mockup is the pinned knock card with [Allow][No] in the drawer.
+
+    So "Automated Attack" started Full Automated, and the operator knock
+    card -- implemented, polled for, and the whole point of watching a run
+    -- could not be reached from the GUI at all. Every knock in testing had
+    to be produced by posting to the API by hand.
+    """
+
+    def _js(self):
+        return AGENT_JS.read_text()
+
+    def test_the_mode_is_not_hardcoded(self):
+        self.assertNotRegex(self._js(), r'mode:\s*"auto"\s*,')
+
+    def test_both_modes_are_offered(self):
+        js = self._js()
+        self.assertIn("Automated Attack", js)
+        self.assertIn("Full Automated", js)
+
+    def test_the_mode_values_are_the_ones_the_service_accepts(self):
+        js = self._js()
+        block = re.search(r"const AGENT_MODES = \{(.*?)\n\};", js, re.S)
+        self.assertIsNotNone(block, "AGENT_MODES not found in agent.js")
+        offered = set(re.findall(r'(\w+):\s*\{', block.group(1)))
+        self.assertEqual(offered, set(config._MODES))
+
+    def test_the_payload_carries_the_chosen_mode(self):
+        self.assertRegex(self._js(), r"mode:\s*F\.mode")
+
+    def test_supervised_is_the_default_so_unattended_is_asked_for(self):
+        self.assertRegex(self._js(), r'F\.mode\s*=\s*"supervised"')
+
+    def test_the_unattended_default_follows_the_mode(self):
+        # The choice is shown in both modes -- "what happens if nobody
+        # answers" matters in a supervised run too, for the operator who
+        # steps away -- but its default differs, the same rule config.py
+        # applies. Hiding it would recreate the original fault: a setting
+        # that silently does not apply.
+        js = self._js()
+        self.assertRegex(js, r'UNATTENDED_DEFAULT\s*=\s*\{')
+        block = re.search(r"const UNATTENDED_DEFAULT = \{(.*?)\};", js, re.S)
+        self.assertIsNotNone(block)
+        pairs = dict(re.findall(r'(\w+):\s*"(\w+)"', block.group(1)))
+        self.assertEqual(pairs, {"supervised": "pause", "auto": "decide"})

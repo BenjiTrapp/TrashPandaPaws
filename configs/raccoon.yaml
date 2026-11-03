@@ -238,9 +238,14 @@ agent:
     risk_profile: "normal"
     # Phase 5 (exploitation) is off; Wifi phases follow beacon capabilities.
     phases: [1, 2, 3, 4]
-    # What to do when a gated action needs an operator and none is present:
+    # What to do when a gated action needs an operator and none answers:
     # decide (expected-value arbiter) | skip | pause
-    unattended_behavior: "decide"
+    # The default depends on the mode. Supervised runs pause, because there
+    # the operator is the arbiter and stepping away must not quietly hand
+    # that to the expected-value check. Full Automated defaults to decide,
+    # which is what makes it unattended. This block documents the
+    # supervised default; set it explicitly to override either.
+    unattended_behavior: "pause"
     max_runtime_seconds: 7200
     max_tokens_total: 500000
     # Beacon check-in interval during a run, and the one put back afterwards.

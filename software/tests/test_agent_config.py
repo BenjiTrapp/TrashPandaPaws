@@ -648,8 +648,12 @@ class TestCampaignForm(unittest.TestCase):
             config.CampaignConfig.from_form(["scope_allow"], tier="full")
 
     def test_defaults_match_the_form_in_the_spec(self):
+        # Section 17.2 is the Full Automated form, so the mode is named:
+        # unattended_behavior defaults by mode, and "decide autonomously" is
+        # that form's default rather than every form's.
         c = config.CampaignConfig.from_form(
-            {"scope_allow": ["10.0.1.0/24"], "beacons": ["a"]}, tier="full")
+            {"scope_allow": ["10.0.1.0/24"], "beacons": ["a"],
+             "mode": "auto"}, tier="full")
         self.assertEqual(c.max_runtime_seconds, 7200)
         self.assertEqual(c.max_tokens_total, 500_000)
         self.assertEqual(c.campaign_interval, 15)
@@ -864,9 +868,14 @@ class TestOpsecProfilesAreNotSafetySwitches(unittest.TestCase):
                              profile)
 
     def test_no_profile_changes_the_approval_behaviour(self):
-        for profile in config.OPSEC_PROFILES:
-            self.assertEqual(self._campaign(profile).unattended_behavior,
-                             "decide", profile)
+        # The property, not a literal: every profile must agree, whatever
+        # the value is. Pinning "decide" made this test about the default
+        # rather than about the profiles, and it vetoed a correct change to
+        # that default while a profile that moved it to "skip" would still
+        # have passed.
+        seen = {profile: self._campaign(profile).unattended_behavior
+                for profile in config.OPSEC_PROFILES}
+        self.assertEqual(len(set(seen.values())), 1, seen)
 
     def test_no_profile_changes_the_risk_numbers(self):
         normal = config.RISK_PROFILES["normal"]
@@ -935,3 +944,38 @@ class TestOpsecWarningsSayWhatIsNotDelivered(unittest.TestCase):
 
     def test_normal_with_a_hosted_model_is_silent(self):
         self.assertEqual(self._warnings("anthropic", "normal"), [])
+
+
+class TestTheDefaultForAnUnansweredKnock(unittest.TestCase):
+    """A supervised run nobody configured must not approve on a timeout.
+
+    Design section 10.7 gives the timeout its own default: suspend the
+    campaign. Section 17.2 gives the Full Automated form a different one,
+    "decide autonomously", which is that form's business. One field, two
+    defaults, chosen by the mode -- because in supervised mode the operator
+    is the arbiter, and promoting the expected-value check to arbiter
+    because somebody stepped away is not a default anyone asked for.
+    """
+
+    def _cfg(self, **payload):
+        payload.setdefault("beacons", ["raccoon-fox"])
+        payload.setdefault("scope_allow", ["10.0.1.0/24"])
+        return config.CampaignConfig.from_form(payload, tier="full")
+
+    def test_supervised_defaults_to_pausing(self):
+        self.assertEqual(self._cfg(mode="supervised").unattended_behavior,
+                         "pause")
+
+    def test_the_mode_default_is_supervised_and_so_is_its_default(self):
+        self.assertEqual(self._cfg().unattended_behavior, "pause")
+
+    def test_full_automated_defaults_to_deciding(self):
+        self.assertEqual(self._cfg(mode="auto").unattended_behavior, "decide")
+
+    def test_an_explicit_choice_wins_in_either_mode(self):
+        for mode in ("supervised", "auto"):
+            for choice in ("decide", "skip", "pause"):
+                self.assertEqual(
+                    self._cfg(mode=mode,
+                              unattended_behavior=choice).unattended_behavior,
+                    choice, (mode, choice))

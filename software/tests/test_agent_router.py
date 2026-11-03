@@ -393,7 +393,12 @@ class TestPathSelection(IsolatedAsyncioTestCase):
         self.assertTrue(c2.nothing_ran())
 
     async def test_a_known_beacon_still_asks(self):
-        r, c2 = _router(mode="supervised")
+        # "skip" names the configuration, so the unanswered knock resolves
+        # to a refusal and the reason is checkable. The property is the
+        # approval row -- that the gate was consulted at all; the outcome
+        # of nobody answering is a separate question, and it used to be
+        # fixed at "refuse" whatever the run asked for.
+        r, c2 = _router(mode="supervised", unattended="skip")
         res = await r.run_command("lsassy -u a -p b 10.0.1.5",
                                   beacon_id="raccoon-fox")
         self.assertIn("gate", res.blocked_reason.lower())

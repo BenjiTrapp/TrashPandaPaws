@@ -960,8 +960,29 @@ function onStop(){
 // suite rather than producing a form that shows one thing and submits
 // another.
 
-const FORM_SECTIONS = ["Target beacons", "Scope", "Phases", "Risk profile",
-                       "Approvals", "Budget", "Model", "Schedule", "OpSec"];
+const FORM_SECTIONS = ["Mode", "Target beacons", "Scope", "Phases",
+                       "Risk profile", "Approvals", "Budget", "Model",
+                       "Schedule", "OpSec"];
+
+// Spec 17.1 is the supervised mode -- the operator watches and answers each
+// knock in the drawer -- and 17.2 is Full Automated. Both are modes of the
+// same campaign, so both are startable from the same form. This used to
+// send a hardcoded "auto", which meant the knock card of 17.1 could not be
+// reached from the GUI at all.
+const AGENT_MODES = {
+  supervised: {label: "Automated Attack",
+               help: "the agent works, you watch, and every gated action " +
+                     "asks you in the drawer. You can keep using the " +
+                     "terminal alongside it."},
+  auto: {label: "Full Automated",
+         help: "configured now and then left alone: no knock reaches you, " +
+               "and the expected-value check answers in your place."},
+};
+
+// One field, two defaults, chosen by the mode -- the same rule config.py
+// applies, for the same reason: in a supervised run the operator is the
+// arbiter, so stepping away must not quietly promote the EV check.
+const UNATTENDED_DEFAULT = {supervised: "pause", auto: "decide"};
 
 const DEFAULT_PHASES_ON = {
   1: true, 2: true, 3: true, 4: true,
@@ -1053,6 +1074,7 @@ const F = {
   allow: [],            // scope tags
   deny: [],
   phases: {},
+  mode: "supervised",   // unattended operation is asked for, never assumed
   risk: "normal",
   nums: {},
   dirty: {},            // one flag per number: a typed value survives a preset
@@ -1072,6 +1094,7 @@ function cidrLooksValid(text){
 }
 
 function resetForm(){
+  F.mode = "supervised";
   F.chosen = {};
   F.allow = [];
   F.deny = [];
@@ -1079,7 +1102,8 @@ function resetForm(){
   F.risk = "normal";
   F.nums = Object.assign({}, RISK_PRESETS.normal);
   F.dirty = {};
-  F.unattended = "decide";
+  F.unattended = UNATTENDED_DEFAULT[F.mode];
+  F.unattendedTouched = false;
   F.budget = {};
   BUDGET_FIELDS.forEach(function(b){ F.budget[b.key] = b.def; });
   F.opsec = "normal";
@@ -1145,9 +1169,7 @@ function agentCollectForm(){
     risk_profile: F.risk,
     unattended_behavior: F.unattended,
     opsec_profile: F.opsec,
-    // Without this the service treats the run as supervised and the
-    // unattended behaviour chosen above would never apply.
-    mode: "auto",
+    mode: F.mode,
   };
   RISK_FIELDS.forEach(function(f){ out[f] = Number(F.nums[f]); });
   BUDGET_FIELDS.forEach(function(b){ out[b.key] = Number(F.budget[b.key]); });
@@ -1167,7 +1189,8 @@ function formProblem(){
 
 function unleashSummary(){
   const form = agentCollectForm();
-  return "Start an unattended campaign against " + form.beacons.length +
+  return "Start a " + AGENT_MODES[F.mode].label + " campaign against " +
+         form.beacons.length +
          " beacon(s): " + form.beacons.join(", ") +
          "\n\nscope: " + form.scope_allow.join(", ") +
          (form.scope_deny.length ? "\nexcluded: " + form.scope_deny.join(", ") : "") +
@@ -1248,6 +1271,24 @@ function renderForm(){
   const S = {};
   FORM_SECTIONS.forEach(function(name){ S[name] = null; });
 
+  // ── Mode ──
+  S["Mode"] = section("Mode",
+    h("div", {},
+      h("div", {class: "ai-choice"}, Object.keys(AGENT_MODES).map(function(name){
+        return h("label", {class: "ai-opt", title: AGENT_MODES[name].help},
+          h("input", {type: "radio", name: "ai-mode", checked: F.mode === name,
+                      onchange: function(){
+                        F.mode = name;
+                        // Only while untouched, the same rule the risk
+                        // numbers follow: switching modes should offer the
+                        // sensible default without discarding a choice.
+                        if(!F.unattendedTouched) F.unattended = UNATTENDED_DEFAULT[name];
+                        renderForm();
+                      }}),
+          h("span", {text: AGENT_MODES[name].label}));
+      })),
+      h("p", {class: "ai-note", text: AGENT_MODES[F.mode].help})));
+
   // ── Target beacons ──
   let body;
   if(F.error){
@@ -1324,10 +1365,19 @@ function renderForm(){
         return h("label", {class: "ai-opt", title: UNATTENDED_HELP[b]},
           h("input", {type: "radio", name: "ai-unattended",
                       checked: F.unattended === b,
-                      onchange: function(){ F.unattended = b; renderForm(); }}),
+                      onchange: function(){
+                        F.unattended = b;
+                        F.unattendedTouched = true;
+                        renderForm();
+                      }}),
           h("span", {text: b}));
       })),
-      h("p", {class: "ai-note", text: UNATTENDED_HELP[F.unattended]}),
+      h("p", {class: "ai-note",
+              text: (F.mode === "supervised"
+                     ? "If you do not answer a knock within the service's " +
+                       "approval timeout: "
+                     : "No operator is present, so for every gated action: ")
+                    + UNATTENDED_HELP[F.unattended]}),
       h("div", {class: "ai-hard"},
         h("strong", {text: "Never permitted, not configurable:"}),
         h("ul", {class: "ai-hard-list"}, blocks.items.map(function(a){

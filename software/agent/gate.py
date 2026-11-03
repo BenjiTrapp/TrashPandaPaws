@@ -232,12 +232,19 @@ class Gate:
         fut.set_result(allowed)
         return True
 
-    def _expire(self, approval_id, fut):
-        """Close an unanswered wait; return the answer if one got there first."""
+    def _expire(self, approval_id, fut, *, decide=True):
+        """Close an unanswered wait; return the answer if one got there first.
+
+        `decide` off leaves the row pending for the caller to settle. The
+        timeout path needs that: "pause" must leave the knock open so the
+        operator can still answer it after resuming, and "decide" needs an
+        undecided row for the expected-value arbiter to write.
+        """
         if self._waiting.pop(approval_id, None) is fut:
             fut.cancel()
-            queries.decide_approval(
-                self._conn, approval_id, _REFUSED, "timeout")
+            if decide:
+                queries.decide_approval(
+                    self._conn, approval_id, _REFUSED, "timeout")
             return None
         # answer() took it between the timer firing and this running; its
         # row is already written, so report its outcome, not a timeout.
@@ -278,7 +285,7 @@ class Gate:
 
         if self.mode == "auto":
             return self._decide_by_ev(approval_id, numbers)
-        return await self._ask_operator(approval_id, numbers)
+        return await self._ask_operator(approval_id, numbers, classification)
 
     def _skip(self, classification):
         """Refuse without evaluating, but on the record.
@@ -353,7 +360,31 @@ class Gate:
                        % self.p_detect_prior)
         return GateDecision(allowed, reason, "ev", ev, decisive)
 
-    async def _ask_operator(self, approval_id, numbers):
+    def _unanswered(self, approval_id, numbers, classification):
+        """Settle a knock the operator did not answer.
+
+        The row is still pending here; this is what settles it. "pause"
+        leaves it that way on purpose — the campaign suspends and the knock
+        is waiting when the operator comes back, which is the difference
+        between one suspension and a run that refuses the same action over
+        and over. That is what happened live: three identical refusals for
+        exploit_known_poc, 300 seconds apart.
+        """
+        behaviour = self.unattended_behavior
+        if behaviour == "pause":
+            raise GatePauseRequested(
+                getattr(classification, "action_key", "a gated action"))
+        if behaviour == "decide":
+            return self._decide_by_ev(approval_id, numbers)
+        # "skip": refused, and recorded as a timeout because that is why it
+        # was decided without anyone.
+        queries.decide_approval(self._conn, approval_id, _REFUSED, "timeout")
+        return GateDecision(
+            False, "no operator answer within %ss, and this run skips "
+            "gated actions nobody answers" % self.approval_timeout,
+            "timeout", numbers["ev"])
+
+    async def _ask_operator(self, approval_id, numbers, classification=None):
         ev = numbers["ev"]
         fut = asyncio.get_running_loop().create_future()
         self._waiting[approval_id] = fut
@@ -365,11 +396,14 @@ class Gate:
             allowed = await asyncio.wait_for(
                 asyncio.shield(fut), self.approval_timeout)
         except asyncio.TimeoutError:
-            allowed = self._expire(approval_id, fut)
+            # Design section 10.7 lists the timeout as its own case, with
+            # the behaviour taken from the configuration. It can only
+            # happen here: Full Automated decides at once and never waits.
+            # An operator who has not answered for the whole timeout is,
+            # for this purpose, not attending.
+            allowed = self._expire(approval_id, fut, decide=False)
             if allowed is None:
-                return GateDecision(
-                    False, "no operator answer within %ss; refused"
-                    % self.approval_timeout, "timeout", ev)
+                return self._unanswered(approval_id, numbers, classification)
         except asyncio.CancelledError:
             # A request nobody is waiting on any more must not stay
             # answerable: an approval would be recorded as granted for an

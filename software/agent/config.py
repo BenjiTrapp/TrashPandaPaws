@@ -504,6 +504,17 @@ _MODES = ("supervised", "auto")
 _UNATTENDED = ("decide", "skip", "pause")
 
 
+def _wants_auto(payload) -> bool:
+    """Whether this form asked for Full Automated.
+
+    Read before the mode is resolved, because the default for
+    unattended_behavior depends on it. A blank or absent mode is supervised,
+    the same rule the mode field itself applies.
+    """
+    raw = payload.get("mode")
+    return (not _blank(raw)) and str(raw).strip().lower() == "auto"
+
+
 @dataclass
 class CampaignConfig:
     beacons: List[str]
@@ -582,8 +593,16 @@ class CampaignConfig:
                                 opsec_base["online_lookups"]),
             limit_scan_rate=pick("limit_scan_rate", _to_bool,
                                  opsec_base["limit_scan_rate"]),
-            unattended_behavior=pick("unattended_behavior",
-                                     _enum(*_UNATTENDED), "decide"),
+            # Two defaults for one field, chosen by the mode. Design
+            # section 10.7 gives the timeout its own default -- suspend the
+            # campaign -- while section 17.2 gives the Full Automated form
+            # "decide autonomously", which is that form's business. In
+            # supervised mode the operator is the arbiter, so promoting the
+            # expected-value check to arbiter because somebody stepped away
+            # would be a default nobody asked for.
+            unattended_behavior=pick(
+                "unattended_behavior", _enum(*_UNATTENDED),
+                "decide" if _wants_auto(payload) else "pause"),
             max_runtime_seconds=pick("max_runtime_seconds",
                                      _bounded(_to_float, 0, low_open=True),
                                      7200.0),
