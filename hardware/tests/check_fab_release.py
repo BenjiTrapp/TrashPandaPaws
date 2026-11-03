@@ -623,18 +623,23 @@ MDI_GROUPS = {"MDI0": "AB", "MDI1": "AB", "MDI2": "CD", "MDI3": "CD"}
 # +1V0 escape are the named exception of ruling BF (first-build check:
 # fabrication-note.md); the others were found by the review (Minor) and are
 # geometry the U3 placement forces at its pins.
+# Ruling BQ's second cut changed no copper but moved the segment ends the
+# 0.01 mm sampling starts from: four reaches read 0.001-0.005 mm longer and
+# were updated by hand (RX_N 0.201 -> 0.206, RSET 0.200 -> 0.203, MDI1_P
+# 0.110 -> 0.113, +3V3 0.040 -> 0.041); no gap got smaller.
 AU_OVERHANGS = {
     # (net, net): (least gap mm, reach past the edge mm)
-    ("+1V0", "USB3_RX_N"): (0.228, 0.201),     # BF exception: pin 14
+    ("+1V0", "USB3_RX_N"): (0.228, 0.206),     # BF exception: pin 14
     ("+1V0", "USB3_TX_P"): (0.250, 0.120),     # BF exception: pin 14
-    ("+1V0", "+3V3"): (0.289, 0.040),
-    ("+1V0", "MDI1_P"): (0.262, 0.110),
+    ("+1V0", "+3V3"): (0.289, 0.041),
+    ("+1V0", "MDI1_P"): (0.262, 0.113),
     ("+1V0", "MDI2_N"): (0.262, 0.120),
-    ("+1V0", "RSET"): (0.250, 0.200),
+    ("+1V0", "RSET"): (0.250, 0.203),
     ("+1V0", "XTAL1"): (0.297, 0.020),
     ("+1V0", "XTAL2"): (0.297, 0.020),
     ("+3V3", "DVDD10_UPS"): (0.225, 0.143),
 }
+AU_CUT_OUT = 0.25     # ruling BQ: route_pcb.AU_CUT_OUT, the second cut past the edge
 AU_POWER_NETS = {"GND", "+5V", "+3V3", "+1V0", "SW_1V0"}   # the Power class, as route_grid.POWER
 _SEGMENT = re.compile(r"\n\t\(segment\n\t\t\(start ([-0-9.]+) ([-0-9.]+)\)\n\t\t\(end ([-0-9.]+) ([-0-9.]+)\)"
                       r"\n\t\t\(width ([0-9.]+)\)\n\t\t\(layer \"F.Cu\"\)\n\t\t\(net \"([^\"]*)\"\)")
@@ -685,6 +690,13 @@ def u3_area_edge_problems(pcb_text=_LOAD, step=0.01):
         dy = max(A[1] - max(a[1], b[1]), 0, min(a[1], b[1]) - A[3])
         if math.hypot(dx, dy) <= w / 2:
             touching.append((net, a, b, w))
+            # ruling BQ: a segment that touches the area carries ruling AU over
+            # its whole length, so it must end at the second cut
+            far = max(outside_by(a), outside_by(b))
+            if far > AU_CUT_OUT + w / 2 + 0.002:
+                problems.append(f"{net} segment {a} -> {b} touches {U3_ESCAPE_AREA} and runs {far:.3f} mm "
+                                f"past its edge: ruling AU's 0.2 mm reaches that far (cut it "
+                                f"{AU_CUT_OUT} mm + half its width past the edge, ruling BQ)")
     found = {}
     for na, a, b, wa in touching:
         k = max(1, int(math.hypot(b[0] - a[0], b[1] - a[1]) / step))
@@ -1868,6 +1880,16 @@ class U3EscapeRuleStaysAtItsArea(unittest.TestCase):
                '\t\t(width 0.2)\n\t\t(layer "F.Cu")\n\t\t(net "ETH_LED0")\n\t)\n')
         problems = u3_area_edge_problems(pcb[:pcb.rstrip().rindex(")")] + seg + ")\n")
         self.assertTrue(any("runs across the edge" in p for p in problems), problems)
+
+    def test_a_segment_that_ends_on_the_edge_and_runs_on_is_reported(self):
+        # the reviewer's case (ruling BQ): a segment that only touches the edge
+        pcb = PCB.read_text(encoding="utf-8")
+        _, _, pts = _rule_area(pcb, U3_ESCAPE_AREA)
+        x0, y0 = min(p[0] for p in pts), min(p[1] for p in pts)
+        seg = (f'\t(segment\n\t\t(start {x0 + 0.5:g} {y0:g})\n\t\t(end {x0 + 0.5:g} {y0 - 1.9:g})\n'
+               '\t\t(width 0.15)\n\t\t(layer "F.Cu")\n\t\t(net "ETH_LED0")\n\t)\n')
+        problems = u3_area_edge_problems(pcb[:pcb.rstrip().rindex(")")] + seg + ")\n")
+        self.assertTrue(any("ruling BQ" in p and "ETH_LED0" in p for p in problems), problems)
 
     def test_an_unlisted_or_grown_overhang_is_reported(self):
         saved = dict(AU_OVERHANGS)

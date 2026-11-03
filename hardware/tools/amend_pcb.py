@@ -28,9 +28,12 @@ Amendments, in the order they were made:
   c9         ruling BK: C9 to B.Cu at the via of U3 pins 39 / 40.
   pin3_via   review 1: pin 3's +1V0 via 0.56 mm, centred between MDI1_P and
              MDI0_N, so In1's hole keeps 0.1 mm from both.
+  split_area_out
+             ruling BQ: tracks cut again 0.25 mm (+ half their width) past
+             the edge of U3's escape area, which bounds ruling AU's reach.
 
 Run them in this order (review 1: coupling decoupling via_gaps antipads
-split_area; review 2: rx c9 pin3_via).
+split_area; review 2: rx c9 pin3_via; review 3: split_area_out).
 
 An amendment that finds nothing to do says so and changes nothing. The zones
 are refilled before the board is saved.
@@ -48,7 +51,8 @@ import route_pcb as rp  # noqa: E402
 AMENDMENTS = {"pad_vias": rp.stage_pad_vias, "coupling": rp.stage_coupling,
               "decoupling": rp.stage_decoupling, "via_gaps": rp.stage_via_gaps,
               "antipads": rp.stage_antipads, "split_area": rp.stage_split_area,
-              "rx": rp.stage_rx, "c9": rp.stage_c9, "pin3_via": rp.stage_pin3_via}
+              "rx": rp.stage_rx, "c9": rp.stage_c9, "pin3_via": rp.stage_pin3_via,
+              "split_area_out": rp.stage_split_area_out}
 
 
 def main():

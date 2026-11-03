@@ -943,11 +943,12 @@ U3_AREA = (20.55, 19.55, 27.45, 26.45)       # the "U3_escape" rule area (gen_pc
 def split_at_area(points, area=U3_AREA):
     """Insert the points where a polyline crosses the edge of U3's escape area,
     so that no segment is both inside and outside it: ruling AU's 0.2 mm then
-    applies only to the part that is in the area (ruling BF). KiCad's
-    insideArea() is true when any copper of a segment touches the area, so the
-    segment beyond the cut still carries AU, but only where its round end
-    reaches into the area: at most half its width past the edge. au_overhangs()
-    measures what lies there."""
+    applies only to the part that is in the area (ruling BF). This cut alone
+    does NOT bound the rule's reach (ruling BQ): KiCad's insideArea() is true
+    when any copper of a segment touches the area, so a segment that ends on
+    the edge carries AU over its whole length, however long. Stage
+    split_area_out cuts a second time AU_CUT_OUT past the edge, which is what
+    bounds it. au_overhangs() measures where AU is used outside the area."""
     def inside(q):
         return area[0] <= q[0] <= area[2] and area[1] <= q[1] <= area[3]
     out = [points[0]]
@@ -1167,6 +1168,39 @@ def stage_split_area(r):
         route_net(board, net, pts, w, pcbnew.F_Cu)
         cut += 1
     r.area_cuts = cut
+    return cut
+
+
+# Ruling BQ: the second cut, this far past the edge of U3's escape area (plus
+# half the track's width, so that the round end of the segment beyond it
+# stays out of the area). The segment between the two cuts touches the area
+# and keeps ruling AU's 0.2 mm; the one beyond it gets the class clearance.
+# So AU reaches at most AU_CUT_OUT + half a width past the edge. 0.25 is the
+# least on a 0.05 mm step that holds what AU_OVERHANGS lists (reach up to
+# 0.201 mm); 0.1 / 0.15 / 0.2 leave 10 / 4 / 3 DRC errors at those places.
+AU_CUT_OUT = 0.25
+
+
+def stage_split_area_out(r):
+    """Ruling BQ: cut every F.Cu track at the edge of U3's escape area and
+    again AU_CUT_OUT + half its width past it (the copper is unchanged).
+    Returns the number of tracks cut."""
+    board = r.board
+    A = U3_AREA
+    cut = 0
+    for t in list(board.GetTracks()):
+        if t.Type() != pcbnew.PCB_TRACE_T or t.GetLayer() != pcbnew.F_Cu:
+            continue
+        a, b = xy(t.GetStart()), xy(t.GetEnd())
+        net, w = t.GetNetname(), pcbnew.ToMM(t.GetWidth())
+        g = AU_CUT_OUT + w / 2
+        pts = split_at_area(split_at_area([a, b]), area=(A[0] - g, A[1] - g, A[2] + g, A[3] + g))
+        if len(pts) == 2:
+            continue
+        board.Delete(t)
+        route_net(board, net, pts, w, pcbnew.F_Cu)
+        cut += 1
+    r.area_out_cuts = cut
     return cut
 
 
@@ -1556,6 +1590,7 @@ STAGES = [
     ("rx", stage_rx),
     ("c9", stage_c9),
     ("pin3_via", stage_pin3_via),
+    ("split_area_out", stage_split_area_out),
 ]
 
 

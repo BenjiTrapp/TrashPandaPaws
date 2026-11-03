@@ -43,10 +43,15 @@
 # already may, and no board-wide rule is weakened. Tracks are not members of a
 # footprint, so the scope is geometric: the rule area "U3_escape" (gen_pcb.py,
 # a square 3.45mm from U3's centre, which takes in the pads and the 1.0mm
-# necks) on F.Cu. insideArea() is true when any part of the track lies in the
-# area, so a track segment that starts in it keeps the 0.2mm along its whole
-# length: escapes are drawn as short segments, so this reaches no further than
-# the first segment out of the area.
+# necks) on F.Cu. insideArea() is true when any copper of a segment touches
+# the area, round end included, so a segment that starts in it, or merely ends
+# on its edge, keeps the 0.2mm along its whole length. Cutting tracks at the
+# edge does not bound that (ruling BQ). tools/route_pcb.py stage
+# split_area_out cuts every F.Cu track a second time 0.25mm plus half its
+# width past the edge: only the short piece between the two cuts still
+# touches the area, so the rule reaches at most about 0.35mm past the edge,
+# and tests/check_fab_release.py (AU_OVERHANGS, U3EscapeRuleStaysAtItsArea)
+# fails on a segment that would carry it further.
 (rule "track to track at the U3 escape"
 	(condition "A.Type == 'Track' && B.Type == 'Track' && A.insideArea('U3_escape') && B.insideArea('U3_escape')")
 	(constraint clearance (min 0.2mm)))
