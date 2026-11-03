@@ -110,6 +110,11 @@ test_empty_part_number_is_reported_with_reference_and_value (__main__.MpnCoverag
 test_placeholder_part_numbers_count_as_missing (__main__.MpnCoverageCanFail) ... ok
 test_row_to_be_fitted_with_quantity_zero_is_reported (__main__.MpnCoverageCanFail) ... ok
 test_unknown_populate_value_is_reported (__main__.MpnCoverageCanFail) ... ok
+test_analyzer_json_records_repository_relative_sources (__main__.NoOperatorPathIsCommitted) ... ok
+test_check_netlist_prints_a_repository_relative_path (__main__.NoOperatorPathIsCommitted) ... ok
+test_no_tracked_file_contains_an_absolute_user_path (__main__.NoOperatorPathIsCommitted) ... ok
+test_the_tool_refuses_a_path_that_is_not_this_repository (__main__.NoOperatorPathIsCommitted) ... ok
+test_the_tool_rewrites_the_repository_prefix_and_nothing_else (__main__.NoOperatorPathIsCommitted) ... ok
 test_archiving_decision_is_recorded_as_ruling_e (__main__.OrderingStatesEveryRuledRequirement) ... ok
 test_bottom_side_hand_parts_are_named_and_the_job_is_not_double_sided_smt (__main__.OrderingStatesEveryRuledRequirement) ... ok
 test_controlled_impedance_with_targets_and_the_mask_pass_question_first (__main__.OrderingStatesEveryRuledRequirement) ... ok
@@ -207,6 +212,6 @@ test_populate_must_be_a_boolean (__main__.VbusGuardCannotBeSilenced) ... ok
 test_unreadable_value_on_the_rail_raises (__main__.VbusGuardCannotBeSilenced) ... ok
 
 ----------------------------------------------------------------------
-Ran 207 tests in 57.931s
+Ran 212 tests in 49.420s
 
 OK

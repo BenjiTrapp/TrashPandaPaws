@@ -3697,5 +3697,90 @@ class U3ThermalIsNotLeftSilent(unittest.TestCase):
         self.assertRegex(section, r"(?i)first build|first-build")
 
 
+RELATIVIZE = HARDWARE / "tools" / "relativize_paths.py"
+REPO_ROOT = HARDWARE.parent
+
+
+def _relativize_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("relativize_paths", RELATIVIZE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class NoOperatorPathIsCommitted(unittest.TestCase):
+    """Task 12 hygiene: committed analyzer output carried the operator's
+    absolute home directory (a username in the repository, and a different file
+    on every machine). No tracked file outside the third-party vendor/kicad-happy
+    may contain an absolute user-directory path; the analyzer JSONs record
+    repository-relative sources; and the tool that makes them so can fail."""
+
+    def tracked_files(self):
+        result = subprocess.run(["git", "ls-files", "-z"], cwd=REPO_ROOT, capture_output=True)
+        self.assertEqual(result.returncode, 0, "git ls-files failed")
+        names = [n for n in result.stdout.decode().split("\0") if n]
+        return [n for n in names if not n.startswith("vendor/kicad-happy/")]
+
+    def test_no_tracked_file_contains_an_absolute_user_path(self):
+        pattern = _relativize_module().HOME_PATH
+        found = {}
+        for name in self.tracked_files():
+            path = REPO_ROOT / name
+            if not path.is_file():                     # a submodule or a deleted-but-staged entry
+                continue
+            hits = sorted(set(m.decode("utf-8", "replace")
+                              for m in re.findall(pattern.pattern.encode(), path.read_bytes())))
+            if hits:
+                found[name] = hits
+        self.assertEqual(found, {}, "absolute user paths are committed (run hardware/tools/relativize_paths.py)")
+
+    def test_analyzer_json_records_repository_relative_sources(self):
+        files = sorted((HARDWARE / "review").glob("*/schematic.json")) + sorted((HARDWARE / "review").glob("*/pcb.json"))
+        self.assertGreaterEqual(len(files), 8)
+        for path in files:
+            inputs = json.loads(path.read_text())["inputs"]
+            names = list(inputs["source_files"]) + list(inputs["source_hashes"])
+            self.assertTrue(names, path)
+            for name in names:
+                self.assertFalse(Path(name).is_absolute(), f"{path.relative_to(REPO_ROOT)}: {name}")
+                self.assertTrue((REPO_ROOT / name).exists(), f"{path.relative_to(REPO_ROOT)}: {name} is not a file of this repository")
+
+    def test_the_tool_rewrites_the_repository_prefix_and_nothing_else(self):
+        tool = _relativize_module()
+        original = json.dumps({
+            "inputs": {"source_files": [f"{REPO_ROOT}/hardware/kicad/raccoon-tap.kicad_pcb"],
+                       "source_hashes": {f"{REPO_ROOT}/hardware/kicad/raccoon-tap.kicad_pcb": "ab" * 32}},
+            "measurement": 12.34,
+        }, indent=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "x.json"
+            target.write_text(original)
+            self.assertNotEqual(subprocess.run([sys.executable, str(RELATIVIZE), "--check", str(target)],
+                                               capture_output=True).returncode, 0)
+            self.assertEqual(target.read_text(), original, "--check must not write")
+            self.assertEqual(subprocess.run([sys.executable, str(RELATIVIZE), str(target)],
+                                            capture_output=True).returncode, 0)
+            rewritten = target.read_text()
+        self.assertEqual(rewritten, original.replace(f"{REPO_ROOT}/", ""))
+        self.assertEqual(json.loads(rewritten)["measurement"], 12.34)
+        self.assertEqual(tool.relativize(rewritten), rewritten, "must be idempotent")
+
+    def test_the_tool_refuses_a_path_that_is_not_this_repository(self):
+        foreign = "/" + "Users" + "/someone/other-checkout/hardware/kicad/x.kicad_pcb"
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "x.json"
+            target.write_text(json.dumps({"source_files": [foreign]}))
+            result = subprocess.run([sys.executable, str(RELATIVIZE), str(target)], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("someone", result.stdout)
+
+    def test_check_netlist_prints_a_repository_relative_path(self):
+        result = subprocess.run([sys.executable, str(HARDWARE / "tests" / "check_netlist.py")],
+                                capture_output=True, text=True, cwd="/")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Netlist: hardware/netlist.yaml\n", result.stdout)
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False).result.wasSuccessful() else 1)

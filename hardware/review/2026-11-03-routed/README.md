@@ -32,7 +32,7 @@ for shorts and unconnected items.
 | `check_netlist.py` | exit 0, 0 warnings | `check_netlist.out` |
 | `check_kicad.py` (incl. `check_pcb_connectivity(pcb, netlist, report)`, ruling N) | exit 0 | `check_kicad.out` |
 | `test_check_kicad.py` | 27 tests OK | |
-| `check_fab_release.py` | **207 tests OK** (133 at the first run of task 10; the rest were added by the per-net caps, the release-set and assembly checks of task 11 and the fix rounds) | `check_fab_release.out` |
+| `check_fab_release.py` | **212 tests OK** (133 at the first run of task 10; the rest were added by the per-net caps, the release-set and assembly checks of task 11, the fix rounds, and the five no-absolute-path tests of the task 12 hygiene fix) | `check_fab_release.out` |
 | `tools/rebuild_check.py` | 1136 of 1136 items identical (tracks, vias, footprints, zones, silkscreen text) | `run_design_checks.out` |
 | `run_design_checks.sh` | all of the above | `run_design_checks.out` |
 
@@ -145,11 +145,7 @@ swept up the documentation ones; each row there says how, and which stay.
 ```sh
 hardware/tests/run_design_checks.sh            # the gate
 KH=/opt/homebrew/bin/python3.12 S=vendor/kicad-happy/skills R=hardware/review/2026-11-03-routed
-$KH $S/kicad/scripts/analyze_schematic.py hardware/kicad/raccoon-tap.kicad_sch --output $R/schematic.json
-$KH $S/kicad/scripts/analyze_pcb.py hardware/kicad/raccoon-tap.kicad_pcb --full --schematic $R/schematic.json --stage pre_fab --output $R/pcb.json
-$KH $S/kicad/scripts/cross_analysis.py -s $R/schematic.json -p $R/pcb.json --output $R/cross.json
-$KH $S/emc/scripts/analyze_emc.py -s $R/schematic.json -p $R/pcb.json --output $R/emc.json
-$KH $S/kicad/scripts/analyze_thermal.py -s $R/schematic.json -p $R/pcb.json --output $R/thermal.json
+KH=$KH hardware/tools/run_kicad_happy.sh $R pre_fab   # the five analyzers, then repository-relative paths
 $KH $S/kicad/scripts/fab_release_gate.py -s $R/schematic.json -p $R/pcb.json -t $R/thermal.json -e $R/emc.json --strict --text
 python3 $R/mutation_evidence.py
 ```

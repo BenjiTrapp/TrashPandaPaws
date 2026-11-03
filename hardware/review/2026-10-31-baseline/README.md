@@ -15,10 +15,17 @@ Measured design state (SHA-256 of the analysed files, also embedded in
 
 Repository HEAD when measured: `488a952`.
 
-The committed `schematic.json` and `pcb.json` (and the same files in the later
-review directories) contain absolute `/Users/<operator>/...` paths, written by the
-analyzers. They are the analyzers' output, committed unedited; the paths mean
-nothing on another machine.
+The analyzers write the absolute path of the file they were given into
+`inputs.source_files` and as the keys of `inputs.source_hashes`. As first
+committed, `schematic.json` and `pcb.json` (and the same files in the later
+review directories) therefore carried the operator's home directory. They now
+carry the repository-relative form (`hardware/kicad/raccoon-tap.kicad_pcb`):
+`hardware/tools/relativize_paths.py` removed the repository-root prefix and
+nothing else (18 occurrences in 10 files; every number, finding and hash is
+byte-identical), and `hardware/tools/run_kicad_happy.sh` runs the analyzers
+and applies it, so a run on another machine yields the same files. The
+commands below are the analyzers' own; use the script for anything that is to
+be committed.
 
 **How later runs compare against this baseline.** By finding category and rule
 id (for example `RT-001`, `DC-003`, `PM-002`), not by the aggregate EMC score of
