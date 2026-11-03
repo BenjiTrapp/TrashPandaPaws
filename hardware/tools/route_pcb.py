@@ -288,7 +288,8 @@ RX_Y_N = 17.5
 RX_Y_P = RX_Y_N + 0.375
 # RX_P climbs to its horizontal on the line x + y = RX_P_DIAG, 1.0 mm from the
 # crossing's north GND via (19.1, 18.3) measured square to the line (0.7 is
-# the least that keeps 0.3 mm of copper).
+# the least that keeps 0.3 mm of copper). Stage "rx" (ruling BK) re-lays RX
+# coupled and moves that via to (19.1, 18.49), south of both RX lines.
 RX_P_DIAG = 38.4
 
 
@@ -433,7 +434,8 @@ def stage_mdi2(r):
 # goes down at U9 (x 12.2) and comes up in the band between RX_P and U3's
 # pads; D_N is the north track. On B.Cu it is coupled at the class pitch from
 # x 20.25 west, at y 19.2 / 19.57 across the In2 gap at x 18.8 to 19.4,
-# between the crossing's GND vias (19.1, 18.3) and (17.6, 20.6).
+# between the crossing's GND vias (19.1, 18.3) and (17.6, 20.6) (since rulings
+# BI and BK at (19.1, 18.49) and (17.565, 20.6)).
 USB2_VIA_U9 = {"USB2_D_N": (12.2, 16.2), "USB2_D_P": (12.2, 17.1)}
 USB2_VIA_U3 = {"USB2_D_N": (20.8, 18.65), "USB2_D_P": (21.5, 19.0)}
 USB2_FCU_Y = {"USB2_D_N": 18.33, "USB2_D_P": 18.7}     # their runs west from the pins
@@ -1405,6 +1407,133 @@ def stage_antipads(r):
     return moves
 
 
+# Ruling BK: the AR flank via north of the USB 2.0 crossing stood between
+# RX_N and RX_P. It moves 0.19 mm south, into the band between RX_P (F.Cu)
+# and USB2_D_N (B.Cu), and RX is laid coupled with route_pair from J3's fan
+# out to U8 and again from U8's pad 6 to U3. RX_N runs 0.095 mm further north
+# than before from U8's channel to x 21, so that the via keeps 0.3 mm from
+# RX_P on F.Cu and from D- on B.Cu.
+AR_FLANK_NORTH_OLD, AR_FLANK_NORTH = (19.1, 18.3), (19.1, 18.49)
+RX_Y_N_CH = 17.405           # RX_N in U8's channel and on to x 21
+
+
+def stage_rx(r):
+    board, P = r.board, r.P
+    for net in ("USB3_RX_P", "USB3_RX_N"):
+        rip(board, net)
+        r.lengths.pop(net, None)
+        r.stubs.pop(net, None)
+    via = next(t for t in board.GetTracks() if t.Type() == pcbnew.PCB_VIA_T and t.GetNetname() == "GND"
+               and math.hypot(xy(t.GetPosition())[0] - AR_FLANK_NORTH_OLD[0],
+                              xy(t.GetPosition())[1] - AR_FLANK_NORTH_OLD[1]) < 1e-3)
+    via.SetPosition(vec(*AR_FLANK_NORTH))
+    r.vias.append(("GND", *AR_FLANK_NORTH, "AR crossing, north of the USB 2.0 pair (moved, ruling BK)"))
+
+    half = PITCH / 2
+    d = half / math.sqrt(2)                     # a 45-degree line's offset, per axis
+    j8, j9 = P("J3", 8), P("J3", 9)
+    u4, u6 = P("U8", 4), P("U8", 6)
+    p15, p16 = P("U3", 15), P("U3", 16)
+    y_p_u8 = 19.07                              # P under U8's south pad row (ruling AS)
+    yc_w = 21.0                                 # the pair's centre from J3's fan out
+    k_n = u4[0] + RX_Y_N_CH                     # N's climb to the channel: x + y = k_n
+    k_c = k_n + 2 * d                           # the pair's centre on that climb
+    x_up = k_c - yc_w                           # where the centre starts to climb
+    k_p = k_c + 2 * d
+    x_pj = k_p - y_p_u8                         # where P reaches its level under U8
+    # out of J3's fan as soon as both lines clear J3 pin 1's +5V via and its In1 hole
+    v5 = (6.5, 21.0)
+    x_j = v5[0] + 1.1                           # both 45-degree legs pass the via 0.91 mm off: its In1 hole 0.11 clear
+    centre = [(x_j, yc_w), (x_up, yc_w), (x_pj - d, y_p_u8 - d)]
+    lp, ln, _ = route_pair(board, "USB3_RX_P", "USB3_RX_N", centre, p_left=False,
+                           head_p=[(j9[0] + 0.9, j9[1]), (x_j - (j9[1] - yc_w - half), j9[1])],
+                           head_n=[(j8[0] + 0.9, j8[1]), (x_j - (yc_w - half - j8[1]), j8[1])],
+                           tail_p=[(u6[0], y_p_u8)], tail_n=[(u4[0], RX_Y_N_CH)])
+    r.lengths["USB3_RX_P"] = r.lengths.get("USB3_RX_P", 0) + lp
+    r.lengths["USB3_RX_N"] = r.lengths.get("USB3_RX_N", 0) + ln
+    r.net("USB3_RX_N", [(u4[0], RX_Y_N_CH), u4], USB_W, stub=True)
+    r.net("USB3_RX_P", [(u6[0], y_p_u8), u6], USB_W, stub=True)
+
+    # east of U8: P climbs from its pad at 45 degrees to N's side
+    y_pe = RX_Y_N_CH + PITCH
+    x_pe = u6[0] + (y_p_u8 - y_pe)
+    yc_e = RX_Y_N + half                       # east of x 21 at the first layout's height (C16's pads)
+    x_step = 21.0
+    centre = [(x_pe, RX_Y_N_CH + half), (x_step, RX_Y_N_CH + half),
+              (x_step + (yc_e - RX_Y_N_CH - half), yc_e), (p16[0] - 0.2, yc_e)]
+    yp_e = yc_e + half
+    lp, ln, _ = route_pair(board, "USB3_RX_P", "USB3_RX_N", centre, p_left=False,
+                           head_p=[(u6[0], y_p_u8)], head_n=[(u4[0], RX_Y_N_CH)],
+                           tail_p=[(p16[0], yp_e), (p16[0], U3_AREA[1]), (p16[0], p16[1] - NECK_LEN)],
+                           tail_n=[(p15[0], RX_Y_N), (p15[0], U3_AREA[1]), (p15[0], p15[1] - NECK_LEN)])
+    r.lengths["USB3_RX_P"] += lp
+    r.lengths["USB3_RX_N"] += ln
+    r.net("USB3_RX_P", [(p16[0], p16[1] - NECK_LEN), p16], NECK_W)
+    r.net("USB3_RX_N", [(p15[0], p15[1] - NECK_LEN), p15], NECK_W)
+
+
+def move_via(r, net, old, new, diameter=None):
+    """Move the via of `net` at `old` to `new` (and set its diameter), taking
+    the ends of its own net's tracks along."""
+    board = r.board
+    v = next(t for t in board.GetTracks() if t.Type() == pcbnew.PCB_VIA_T and t.GetNetname() == net
+             and math.hypot(xy(t.GetPosition())[0] - old[0], xy(t.GetPosition())[1] - old[1]) < 1e-3)
+    for t in board.GetTracks():
+        if t.Type() == pcbnew.PCB_TRACE_T and t.GetNetname() == net:
+            if math.hypot(xy(t.GetStart())[0] - old[0], xy(t.GetStart())[1] - old[1]) < 1e-3:
+                t.SetStart(vec(*new))
+            if math.hypot(xy(t.GetEnd())[0] - old[0], xy(t.GetEnd())[1] - old[1]) < 1e-3:
+                t.SetEnd(vec(*new))
+    v.SetPosition(vec(*new))
+    if diameter:
+        v.SetWidth(mm(diameter))
+    r.vias = [(q[0], new[0], new[1], q[3]) if q[0] == net and abs(q[1] - old[0]) < 1e-3 and abs(q[2] - old[1]) < 1e-3
+              else q for q in r.vias]
+    return v
+
+
+def rip_tracks_at(board, net, point):
+    """Remove the tracks of `net` that end at `point`."""
+    for t in list(board.GetTracks()):
+        if t.Type() == pcbnew.PCB_TRACE_T and t.GetNetname() == net and any(
+                math.hypot(q[0] - point[0], q[1] - point[1]) < 1e-3 for q in (xy(t.GetStart()), xy(t.GetEnd()))):
+            board.Delete(t)
+
+
+# Ruling BK: C9 (pins 39 / 40, +3V3) sat 5.93 mm away on C11's pads. It goes
+# to B.Cu directly at the pins' via, west of it under U3's south edge, GND pad
+# on the B.Cu pour; R11 and R14 are on F.Cu and do not stand in the way.
+C9_VIA = (26.79, 25.75)
+
+
+def stage_c9(r):
+    board = r.board
+    fp = board.FindFootprintByReference("C9")
+    if not fp.IsFlipped():
+        rip_tracks_at(board, "+3V3", r.P("C9", 1))         # from C11.1
+        rip_tracks_at(board, "GND", r.P("C9", 2))          # from C11 / C9's GND via, which C11 keeps
+    vx, vy = C9_VIA
+    assert any(t.Type() == pcbnew.PCB_VIA_T and t.GetNetname() == "+3V3" and
+               math.hypot(xy(t.GetPosition())[0] - vx, xy(t.GetPosition())[1] - vy) < 1e-3
+               for t in board.GetTracks()), "pins 39 / 40's +3V3 via moved"
+    pad1 = (round(vx - 0.69, 3), vy)          # via r + 0.11 + half the pad (ruling BI)
+    _place_on_bottom(board, "C9", pad1, (-1, 0))
+    r.net("+3V3", [(vx, vy), pad1], 0.3, B)
+    r.P = Pads(board)
+
+
+# Review 1: pin 3's +1V0 via sits between MDI1_P (y 23.595) and MDI0_N
+# (y 25.155), 1.56 mm apart, one track width short of room for a 0.6 mm via
+# and In1's hole round it with 0.1 mm to spare on both sides. It becomes the
+# board's one 0.56 / 0.3 mm via (0.13 mm ring, the board's minimum) centred
+# between the two: 0.11 mm on each side.
+PIN3_VIA_OLD, PIN3_VIA, PIN3_VIA_D = (28.31, 24.377), (28.31, 24.375), 0.56
+
+
+def stage_pin3_via(r):
+    move_via(r, "+1V0", PIN3_VIA_OLD, PIN3_VIA, PIN3_VIA_D)
+
+
 STAGES = [
     ("usb3_tx", stage_usb3_tx),
     ("usb3_rx", stage_usb3_rx),
@@ -1424,6 +1553,9 @@ STAGES = [
     ("via_gaps", stage_via_gaps),
     ("antipads", stage_antipads),
     ("split_area", stage_split_area),
+    ("rx", stage_rx),
+    ("c9", stage_c9),
+    ("pin3_via", stage_pin3_via),
 ]
 
 
@@ -1475,7 +1607,7 @@ def reference_gaps(board, step=0.05):
 
 
 CROSSING_X = (18.8, 19.4)        # the In2 gap the USB 2.0 stretch crosses
-AR_FLANK_VIAS = [(19.1, 18.3), (17.6, 20.6)]
+AR_FLANK_VIAS = [(19.1, 18.49), (17.565, 20.6)]   # north one moved by ruling BK, south by BI
 
 
 def ar_return(board):

@@ -880,7 +880,7 @@ components:
     footprint: "Capacitor_SMD:C_0402_1005Metric"
     manufacturer: Yageo
     mpn: CC0402KRX7R9BB104
-    description: "+3V3 decoupling at U3 AVDD33 (39, 40)"
+    description: "+3V3 decoupling at U3 AVDD33 (39, 40), on B.Cu at the pins' via (ruling BK)"
     source: >
       Package stays 0402: spec 5.1 exempts the decoupling capacitors directly
       at U3 and the crystal load capacitors from the 0402 -> 0603 raise,

@@ -163,7 +163,7 @@ PLACEMENT = {
     # laid
     "C27": (-8.0, 40.0, 0),
     "C11": (19.2, 25.95, 180),   # pins 26 / 33 (+3V3), on the +3V3 plane south-west of U3
-    "C9":  (19.2, 27.0, 180),    # pins 39 / 40 (+3V3), the same
+    "C9":  (19.2, 27.0, 180),    # pins 39 / 40 (+3V3); route_pcb.py stage "c9" moves it to B.Cu at the pins' via (ruling BK)
     # --- J2 side ------------------------------------------------------------
     "C21": (34.4, 18.0, 180),    # centre-tap bypass, top side, in the 5 mm gap west of pin 6 (the MDI0/1 pairs come in from the east, MDI2/3 at y 19.9 and below); the jack's courtyard keeps it 3.3 mm from the pin
     "C25": (41.6, 29.9, 0),      # shield to GND, by the jack's shield post
@@ -238,7 +238,7 @@ HOLE_KEEPOUT_R = (3.02, 3.9)
 # (1.5 mm west). The two end vias are the nearest places that keep 0.3 mm from
 # the F.Cu routes of hardware/review/2026-10-31-placement/scratch_route_check.py.
 USB2_RETURN_VIAS = [
-    (19.1, 18.3),     # crossing, north of the pair (between RX_N and RX_P on F.Cu)
+    (19.1, 18.3),     # crossing, north of the pair; route_pcb.py stage "rx" moves it to (19.1, 18.49), south of RX (ruling BK)
     (17.6, 20.6),     # crossing, south of the pair (west of C8)
     (12.1, 18.95),    # U9 end, south of the signal vias
 ]

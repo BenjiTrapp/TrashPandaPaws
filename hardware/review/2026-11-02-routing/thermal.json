@@ -8,7 +8,7 @@
     ],
     "source_hashes": {
       "hardware/review/2026-11-02-routing/schematic.json": "1c6a50b1eb729e785993f79ce6aa9be4c9d5f78952d29274b27e75ab73a30e71",
-      "hardware/review/2026-11-02-routing/pcb.json": "2e2023de98f9337e9fc1493db62620a07194a07c4cb9a1471f5fda9207495cba"
+      "hardware/review/2026-11-02-routing/pcb.json": "615b4ccc7d6fe66fadb08e22263ecc44d5a3488c3ef8d448ea592dab1ebcc9bc"
     },
     "run_id": "20261103T081736Z-28407d",
     "config_hash": null,
@@ -21,7 +21,7 @@
       },
       "pcb": {
         "path": "hardware/review/2026-11-02-routing/pcb.json",
-        "sha256": "2e2023de98f9337e9fc1493db62620a07194a07c4cb9a1471f5fda9207495cba",
+        "sha256": "615b4ccc7d6fe66fadb08e22263ecc44d5a3488c3ef8d448ea592dab1ebcc9bc",
         "schema_version": "1.4.0",
         "run_id": "20261103T081736Z-28407d"
       }

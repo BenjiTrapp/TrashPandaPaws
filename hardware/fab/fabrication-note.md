@@ -7,10 +7,19 @@ Assembly split: PCBWay reflows **U3 and Y1** only; every other part is soldered
 by hand with an iron and flux. A via that is open in a pad of a hand-soldered
 part draws solder out of the joint, so none is left open (ruling BA).
 
-Two parts sit on the **bottom side**, both hand-soldered: C14 and C27 (0402,
-100 nF), directly at the vias of U3 pins 37 and 19 (ruling BH). The PCBWay
+Three parts sit on the **bottom side**, all hand-soldered: C14, C27 and C9
+(0402, 100 nF), directly at the vias of U3 pins 37, 19 and 39 / 40 (rulings
+BH, BK). The PCBWay
 order is for one-sided assembly of U3 and Y1 on top; the bottom needs no
 stencil.
+
+## Via sizes
+
+Every via is 0.6 / 0.3 mm (pad / drill) but two: J3 pin 1's +5V via, 0.8 /
+0.4 mm (current), and U3 pin 3's +1V0 via at (28.31, 24.375) mm, **0.56 / 0.3
+mm** (0.13 mm annular ring, the board's minimum): it sits between two MDI
+pairs 1.56 mm apart and the smaller pad keeps In1's hole round it 0.11 mm from
+both.
 
 ## Vias tented from the back (B.Mask covers them)
 

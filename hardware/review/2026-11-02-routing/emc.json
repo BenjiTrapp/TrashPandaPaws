@@ -8,7 +8,7 @@
     ],
     "source_hashes": {
       "hardware/review/2026-11-02-routing/schematic.json": "1c6a50b1eb729e785993f79ce6aa9be4c9d5f78952d29274b27e75ab73a30e71",
-      "hardware/review/2026-11-02-routing/pcb.json": "2e2023de98f9337e9fc1493db62620a07194a07c4cb9a1471f5fda9207495cba"
+      "hardware/review/2026-11-02-routing/pcb.json": "615b4ccc7d6fe66fadb08e22263ecc44d5a3488c3ef8d448ea592dab1ebcc9bc"
     },
     "run_id": "20261103T081736Z-28407d",
     "config_hash": null,
@@ -21,7 +21,7 @@
       },
       "pcb": {
         "path": "hardware/review/2026-11-02-routing/pcb.json",
-        "sha256": "2e2023de98f9337e9fc1493db62620a07194a07c4cb9a1471f5fda9207495cba",
+        "sha256": "615b4ccc7d6fe66fadb08e22263ecc44d5a3488c3ef8d448ea592dab1ebcc9bc",
         "schema_version": "1.4.0",
         "run_id": "20261103T081736Z-28407d"
       }
@@ -33,12 +33,12 @@
     "experimental_fields": []
   },
   "summary": {
-    "total_findings": 49,
+    "total_findings": 50,
     "categories_checked": 8,
-    "active": 49,
+    "active": 50,
     "suppressed": 0,
     "by_severity": {
-      "error": 12,
+      "error": 13,
       "warning": 33,
       "info": 4
     },
@@ -109,6 +109,38 @@
         "layout"
       ],
       "finding_id": "emc:GP-001:mdi_ct"
+    },
+    {
+      "category": "ground_plane",
+      "severity": "error",
+      "rule_id": "GP-001",
+      "confidence": "heuristic",
+      "title": "Signal has partial reference plane gap",
+      "description": "Net USB2_D_N has 90% reference plane coverage over 24.8mm of routing. Return current must detour around the gap, creating a loop antenna.",
+      "components": [],
+      "nets": [
+        "USB2_D_N"
+      ],
+      "recommendation": "Route this signal to avoid ground plane gaps, or fill the void. If a split is intentional, add a bridge capacitor across the gap.",
+      "detector": "emc_ground_plane",
+      "summary": "Signal has partial reference plane gap",
+      "pins": [],
+      "evidence_source": "heuristic_rule",
+      "report_context": {
+        "section": "Ground Plane",
+        "impact": "",
+        "standard_ref": ""
+      },
+      "signal_net": "USB2_D_N",
+      "coverage_pct": 89.5,
+      "trace_mm": 24.8,
+      "is_high_speed_or_clock": true,
+      "suppressed": false,
+      "suppression_reason": "",
+      "stages": [
+        "layout"
+      ],
+      "finding_id": "emc:GP-001:usb2_d_n"
     },
     {
       "category": "ground_plane",
@@ -1525,12 +1557,13 @@
   "per_net_scores": [
     {
       "net": "USB2_D_N",
-      "score": 70.0,
-      "finding_count": 4,
+      "score": 64.0,
+      "finding_count": 5,
       "rules": [
         "DP-001",
         "DP-003",
         "DP-004",
+        "GP-001",
         "RP-001"
       ]
     },
@@ -1902,10 +1935,10 @@
   },
   "category_summary": {
     "ground_plane": {
-      "count": 8,
+      "count": 9,
       "max_severity": "error",
       "severities": {
-        "error": 3,
+        "error": 4,
         "warning": 5,
         "info": 0
       },
@@ -1996,17 +2029,17 @@
       25000000.0
     ]
   },
-  "elapsed_s": 0.007,
+  "elapsed_s": 0.008,
   "audience_summary": {
     "designer": {
-      "total_findings": 49,
+      "total_findings": 50,
       "by_severity": {
-        "error": 12,
+        "error": 13,
         "warning": 33,
         "info": 4
       },
       "by_category": {
-        "ground_plane": 8,
+        "ground_plane": 9,
         "decoupling": 3,
         "io_filtering": 3,
         "clock_routing": 3,
@@ -2079,6 +2112,38 @@
             "layout"
           ],
           "finding_id": "emc:GP-001:mdi_ct"
+        },
+        {
+          "category": "ground_plane",
+          "severity": "error",
+          "rule_id": "GP-001",
+          "confidence": "heuristic",
+          "title": "Signal has partial reference plane gap",
+          "description": "Net USB2_D_N has 90% reference plane coverage over 24.8mm of routing. Return current must detour around the gap, creating a loop antenna.",
+          "components": [],
+          "nets": [
+            "USB2_D_N"
+          ],
+          "recommendation": "Route this signal to avoid ground plane gaps, or fill the void. If a split is intentional, add a bridge capacitor across the gap.",
+          "detector": "emc_ground_plane",
+          "summary": "Signal has partial reference plane gap",
+          "pins": [],
+          "evidence_source": "heuristic_rule",
+          "report_context": {
+            "section": "Ground Plane",
+            "impact": "",
+            "standard_ref": ""
+          },
+          "signal_net": "USB2_D_N",
+          "coverage_pct": 89.5,
+          "trace_mm": 24.8,
+          "is_high_speed_or_clock": true,
+          "suppressed": false,
+          "suppression_reason": "",
+          "stages": [
+            "layout"
+          ],
+          "finding_id": "emc:GP-001:usb2_d_n"
         },
         {
           "category": "ground_plane",
@@ -2290,41 +2355,13 @@
             "layout"
           ],
           "finding_id": "emc:RP-001:usb2_d_n"
-        },
-        {
-          "category": "return_path",
-          "severity": "error",
-          "rule_id": "RP-001",
-          "confidence": "deterministic",
-          "title": "Missing stitching via at layer transition: USB2_D_P",
-          "description": "Net USB2_D_P has 2 layer transition(s) across B.Cu, F.Cu. 2 transition(s) have no ground stitching via within 1.0mm. The return current must find an alternate path, creating a loop antenna.",
-          "components": [],
-          "nets": [
-            "USB2_D_P"
-          ],
-          "recommendation": "Add a ground stitching via within 1.0mm of each signal via. Place the ground via adjacent to the signal via on the same pad cluster.",
-          "detector": "emc_return_path",
-          "summary": "Missing stitching via at layer transition: USB2_D_P",
-          "pins": [],
-          "evidence_source": "topology",
-          "report_context": {
-            "section": "Return Path",
-            "impact": "",
-            "standard_ref": ""
-          },
-          "suppressed": false,
-          "suppression_reason": "",
-          "stages": [
-            "layout"
-          ],
-          "finding_id": "emc:RP-001:usb2_d_p"
         }
       ]
     },
     "reviewer": {
-      "total_findings": 45,
+      "total_findings": 46,
       "by_category": {
-        "ground_plane": 8,
+        "ground_plane": 9,
         "decoupling": 3,
         "io_filtering": 3,
         "clock_routing": 3,
@@ -2344,6 +2381,13 @@
           "rule_id": "GP-001",
           "severity": "error",
           "summary": "Signal has significant reference plane gap",
+          "recommendation": "Route this signal to avoid ground plane gaps, or fill the void. If a split is intentional, add a bridge capacitor across the gap.",
+          "category": "ground_plane"
+        },
+        {
+          "rule_id": "GP-001",
+          "severity": "error",
+          "summary": "Signal has partial reference plane gap",
           "recommendation": "Route this signal to avoid ground plane gaps, or fill the void. If a split is intentional, add a bridge capacitor across the gap.",
           "category": "ground_plane"
         },
@@ -2652,7 +2696,7 @@
     },
     "manager": {
       "risk_level": "high",
-      "blocker_count": 12,
+      "blocker_count": 13,
       "warning_count": 33,
       "stage_readiness": {
         "schematic": "pass",
@@ -2660,21 +2704,21 @@
         "pre_fab": "needs_work",
         "bring_up": "pass"
       },
-      "one_liner": "12 errors, 33 warnings across 7 categories. Layout, pre-fab stages have blockers."
+      "one_liner": "13 errors, 33 warnings across 7 categories. Layout, pre-fab stages have blockers."
     }
   },
   "trust_summary": {
-    "total_findings": 49,
+    "total_findings": 50,
     "trust_level": "mixed",
     "by_confidence": {
       "deterministic": 34,
-      "heuristic": 15,
+      "heuristic": 16,
       "datasheet_backed": 0
     },
     "by_evidence_source": {
       "datasheet": 0,
       "topology": 34,
-      "heuristic_rule": 15,
+      "heuristic_rule": 16,
       "symbol_footprint": 0,
       "bom": 0,
       "geometry": 0,

@@ -23,5 +23,11 @@ area. `tools/scan_board.py` reports via-in-pad gaps, area-edge segments, where
 ruling AU still reaches past the edge, the coupled length of every pair and the
 In1 antipad margins. The files here are re-taken after it.
 
+Review 2 (2026-11-03, ruling BK): `tools/amend_pcb.py rx c9 pin3_via` moved the
+AR flank via north of the USB 2.0 crossing from between RX_N and RX_P to
+(19.1, 18.49), south of both, re-laid RX coupled with `route_pair`, put C9 on
+B.Cu at the via of U3 pins 39 / 40, and made pin 3's +1V0 via 0.56 mm so In1's
+hole round it keeps 0.1 mm from MDI1_P and MDI0_N. Files re-taken after it.
+
 The routing report (order, EMC after each pair, lengths, vias, decoupling
 distances) is in the task 9 report of the release run.
