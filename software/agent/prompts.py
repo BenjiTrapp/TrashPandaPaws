@@ -374,7 +374,8 @@ def _beacon_verb_section() -> str:
     return "\n".join(lines)
 
 
-def executor(caps, scope, tier, platforms=None) -> str:
+def executor(caps, scope, tier, caps_by_beacon=None,
+             os_by_beacon=None) -> str:
     caps = list(caps or [])
     lines = [
         "You are an executor in an authorised penetration-testing campaign. "
@@ -399,18 +400,20 @@ def executor(caps, scope, tier, platforms=None) -> str:
         _scan_section(),
         _beacon_verb_section(),
     ]
-    meanings = _meaning_lines(caps)
-    if meanings:
-        lines.append("What your beacon can do:\n" + "\n".join(meanings))
-    named = [p for p in (_platform_name(x) for x in (platforms or [])) if p]
-    if named:
-        # Stated so the task is not spent establishing it. Every beacon the
-        # executor may use is listed, because one line would be a lie in a
-        # mixed fleet.
+    if caps_by_beacon:
+        # The same table the orchestrator gets, from the same function: the
+        # id, the platform and the capabilities are one description of one
+        # fleet. The executor needs the id because run_command takes a
+        # beacon_id, and with nothing to go on it invented one out of the
+        # capability words -- "batch-posix-smbloot" -- which made every
+        # beacon-path command fail and pushed it onto server_side instead.
+        lines.append(capability_section(caps_by_beacon, os_by_beacon))
         lines.append(
-            "Platform. Your beacons report: %s. Use commands that exist "
-            "there and do not spend turns working out which system you are "
-            "on." % ", ".join(sorted(set(named))))
+            "Pass one of those ids as run_command's beacon_id. Use the "
+            "commands that exist on that beacon's platform, and do not "
+            "spend turns working out which system you are on. A command "
+            "with server_side instead runs on the C2 server, which is a "
+            "different host with a different platform.")
     lines.append(
         "End your final answer with exactly this block:\n"
         "TASK: <the task name you were given>\n"

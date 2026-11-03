@@ -1670,3 +1670,41 @@ class TestTheTargetPlatformReachesTheModel(_Case):
         await camp.wait()
         self.assertEqual(camp._platforms, {"raccoon-fox": ""})
         self.assertNotIn("Platform.", client.calls[1]["system"])
+
+
+class TestTheExecutorIsGivenTheBeaconItMayUse(_Case):
+    """The id run_command needs has to reach the executor's own prompt.
+
+    Live, it did not, and the executor invented one from the capability
+    words: beacon_id "batch-posix-smbloot", refused as an unknown beacon,
+    every beacon-path command lost. Relying on the orchestrator to name the
+    beacon in each task description is not enough -- nothing requires it,
+    and in that run none of the three descriptions did.
+    """
+
+    def _script(self):
+        return _Script([
+            mock.calls(("dispatch_task", {"task_name": "look",
+                                          "task_description": "look around"})),
+            mock.text("TASK: look\nSTATUS: success\nFINDINGS: none\n"
+                      "ERRORS: none"),
+            mock.text("done")])
+
+    async def test_the_executor_prompt_names_the_beacon(self):
+        conn, c2 = _env()
+        c2.agents["raccoon-fox"]["os"] = "Linux 6.1.0"
+        client = self._script()
+        camp = _campaign(conn, c2, client)
+        await camp.start()
+        await camp.wait()
+        # calls[1] is the executor the orchestrator dispatched.
+        self.assertIn("raccoon-fox", client.calls[1]["system"])
+
+    async def test_the_executors_platform_belongs_to_that_beacon(self):
+        conn, c2 = _env()
+        c2.agents["raccoon-fox"]["os"] = "Linux 6.1.0"
+        client = self._script()
+        camp = _campaign(conn, c2, client)
+        await camp.start()
+        await camp.wait()
+        self.assertIn("raccoon-fox (Linux 6.1.0)", client.calls[1]["system"])

@@ -626,7 +626,8 @@ class Campaign:
             result = await llm_loop.run(
                 _Guard(self, pausable=False),
                 system=prompts.executor(caps, self._cfg, tier,
-                                        platforms=list(self._platforms.values())),
+                                        caps_by_beacon=self._caps,
+                                        os_by_beacon=self._platforms),
                 prompt="Task name: %s\n\n%s" % (name, description),
                 tools=self._watch(tools),
                 max_turns=self._limits["executor_turns"],

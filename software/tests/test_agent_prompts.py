@@ -313,14 +313,18 @@ class TestThePromptNamesTheTargetPlatform(unittest.TestCase):
 
     def test_the_executor_is_told_what_it_is_standing_on(self):
         p = prompts.executor(["posix"], scope=_scope(), tier="full",
-                             platforms=["Darwin 25.5.0"])
+                             caps_by_beacon={"raccoon-fox": ["posix"]},
+                             os_by_beacon={"raccoon-fox": "Darwin 25.5.0"})
         self.assertIn("Darwin 25.5.0", p)
 
     def test_the_executor_sees_every_platform_it_may_reach(self):
         # An executor may use any of the campaign's beacons, so one
         # platform line would be a lie in a mixed fleet.
         p = prompts.executor(["posix"], scope=_scope(), tier="full",
-                             platforms=["Darwin 25.5.0", "Linux 6.1.0"])
+                             caps_by_beacon={"fox": ["posix"],
+                                             "pi": ["posix"]},
+                             os_by_beacon={"fox": "Darwin 25.5.0",
+                                           "pi": "Linux 6.1.0"})
         self.assertIn("Darwin 25.5.0", p)
         self.assertIn("Linux 6.1.0", p)
 
@@ -413,3 +417,62 @@ class TestTheCostOfARateLimitedScanIsStated(unittest.TestCase):
         from software.agent.executor import server_tool
         section = prompts._scan_section()
         self.assertIn(str(server_tool._TOOL_TIMEOUTS["nmap"]), section)
+
+
+class TestTheExecutorKnowsWhichBeaconsExist(unittest.TestCase):
+    """run_command needs a beacon_id and nothing told the executor any.
+
+    From the live run against the VM. The executor sent
+
+        {"command": "shell ip neigh show", "beacon_id": "batch-posix-smbloot"}
+        blocked_reason: "unknown beacon 'batch-posix-smbloot'"
+
+    -- it had built an id out of the capability words it was shown, because
+    those were the only beacon-ish strings in its prompt. Every beacon-path
+    command then failed, so it fell back to server_side, and `route -n` ran
+    on the macOS C2 host with Linux syntax. One cause, both symptoms.
+
+    It worked in an earlier run only by luck: the orchestrator is told to
+    put the targets in the task description, and nothing makes it name the
+    beacon. None of the three descriptions in this run did.
+
+    The beacons are rendered with capability_section, the same table the
+    orchestrator gets, so the id, the platform and the capabilities are one
+    description in one place rather than three parameters that can disagree.
+    """
+
+    CAPS = {"raccoon-fox": ["batch", "posix"]}
+    OSES = {"raccoon-fox": "Linux 7.0.0-34-generic"}
+
+    def _executor(self, caps_by_beacon=None, os_by_beacon=None):
+        return prompts.executor(
+            ["batch", "posix"], scope=_scope(), tier="full",
+            caps_by_beacon=self.CAPS if caps_by_beacon is None
+            else caps_by_beacon,
+            os_by_beacon=self.OSES if os_by_beacon is None else os_by_beacon)
+
+    def test_the_beacon_id_is_named(self):
+        self.assertIn("raccoon-fox", self._executor())
+
+    def test_the_platform_sits_with_the_id_it_belongs_to(self):
+        # Two beacons, two platforms: a flat list of platforms cannot say
+        # which is which, and the executor has to choose a beacon.
+        text = prompts.executor(
+            ["batch"], scope=_scope(), tier="full",
+            caps_by_beacon={"fox": ["batch"], "pi": ["batch"]},
+            os_by_beacon={"fox": "Linux 6.1", "pi": "Darwin 25.5"})
+        self.assertRegex(text, r"fox \(Linux 6\.1\)")
+        self.assertRegex(text, r"pi \(Darwin 25\.5\)")
+
+    def test_the_executor_is_told_to_use_one_of_those_ids(self):
+        self.assertIn("beacon_id", self._executor())
+
+    def test_no_beacons_is_not_a_crash(self):
+        text = prompts.executor(["batch"], scope=_scope(), tier="full")
+        self.assertIn("executor", text.lower())
+
+    def test_the_capability_meanings_are_not_printed_twice(self):
+        # capability_section already explains each capability, so the old
+        # "What your beacon can do" block would repeat it.
+        text = self._executor()
+        self.assertEqual(text.count("accepts several tasks in one check-in"), 1)
