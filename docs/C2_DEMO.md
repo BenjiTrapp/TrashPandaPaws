@@ -32,6 +32,9 @@
 17. [Server Log & Notifications](#17-server-log--notifications)
 18. [Full Attack Flow](#18-full-attack-flow)
 19. [Command Reference](#19-command-reference)
+20. [Automated Attack — configuring a campaign](#20-automated-attack--configuring-a-campaign)
+21. [Automated Attack — watching one run](#21-automated-attack--watching-one-run)
+22. [Automated Attack — the approval gate](#22-automated-attack--the-approval-gate)
 
 ---
 
@@ -1087,3 +1090,119 @@ sequenceDiagram
 |---------|-------------|
 | `reconfig` | Push new C2 profile config (triggered via GUI) |
 | `lsjson` | JSON directory listing (used by File Browser) |
+
+---
+
+## 20. Automated Attack — configuring a campaign
+
+The **Automated Attack** button sits in the agent toolbar. With no agent
+service running it is rendered greyed out with the reason in its tooltip —
+not hidden, so the feature is discoverable even when it is unavailable.
+
+The form's first choice decides what the rest of it means.
+
+![Mode](screenshots/31_agent_mode.png)
+
+| Mode | Who answers a gated action |
+|---|---|
+| **Automated Attack** | you, in the drawer, while the terminal stays usable |
+| **Full Automated** | the expected-value check, and every decision is logged |
+
+Then the phases. Four are pre-selected; exploitation is deliberately not,
+and the wifi phases are greyed out unless a selected beacon reports a
+monitor-capable adapter.
+
+![Phases](screenshots/32_agent_phases.png)
+
+These labels are the same strings the model is told — one table in
+`software/agent/prompts.py`, compared by a test — so unticking a box
+switches off the activity it names.
+
+OpSec last, because it is the one an operator should not be able to miss:
+
+![OpSec](screenshots/33_agent_opsec.png)
+
+`yolo` lifts the scan rate limits **and nothing else**. The eight
+irreversible actions stay blocked and the approval gate stays in place in
+every profile.
+
+The form also shows the never-permitted list with each entry's reason,
+generated from the same table the gate enforces, and refuses to submit
+while the scope is empty or a range is malformed — checked locally as a
+convenience, and re-checked by the server with the real parser, which is
+the authority.
+
+---
+
+## 21. Automated Attack — watching one run
+
+Three regions, each with one job: the agent stream across the full width,
+the operator terminal underneath it, and the drawer on the right for the
+things that must not scroll away.
+
+![Drawer](screenshots/34_agent_drawer.png)
+
+This is a real run against a Linux beacon in a lab subnet: phase 5 of 5,
+score 145, no detections against a budget of 3, six of seven tasks done,
+21 findings, 237k of 600k tokens, 23 of 45 minutes.
+
+A stream line opens its full record — the arguments the model chose, the
+raw output, and the command that actually ran if the limiter rewrote it.
+That last one matters: a request for all 65535 ports is narrowed to nmap's
+thousand most common, because at the forced `-T2 --max-rate 50` the full
+range cannot finish inside nmap's own limit, and the model is told what ran
+rather than what it asked for.
+
+The chain this run went through:
+
+```
+phase 3   nmap --top-ports 1000   → 2121 open
+          nmap -sV                → vsFTPd 2.3.4
+phase 4   lookup_cve              → CVE-2011-2523, CVSS 9.8 CRITICAL
+phase 5   exploit_known_poc       → the gate asks
+```
+
+The terminal underneath stays yours throughout. What you type goes out at
+the next check-in regardless of how long the agent's plan is — an operator
+waiting behind an agent is an anti-goal of the design, and an end-to-end
+test asserts it with five agent tasks queued ahead of one operator command.
+
+---
+
+## 22. Automated Attack — the approval gate
+
+Phase 5 is exploitation, and exploitation is gated. In **Automated Attack**
+the question comes to the drawer:
+
+![Knock card](screenshots/30_agent_knock_card.png)
+
+Two reasons, because the decision is made from them:
+
+| | |
+|---|---|
+| **Why it asks** | the classifier's reason — "exploitation against a confirmed service version" |
+| **Why the numbers say so** | `200 × 0.40 − 33 × 0.30 = +70.1 (threshold 0.0)`, and how many detections have happened so far |
+
+`200` is the value of what the action unlocks. `33` is the risk
+coefficient — what it costs the *run* to be noticed once, which is a
+different thing from the 100 points a detection costs in the score. The
+card says when the model's own success estimate is the only thing lifting
+an action over the line.
+
+Deciding happens here; the stream carries one log line. Clicking **Deny**
+in this run recorded:
+
+```
+id=1  exploit_known_poc  refused  by operator
+```
+
+A second request went unanswered, and because the run was configured to
+pause rather than decide without its operator, the campaign suspended with
+that knock still open for a return. Supervised runs default to pausing for
+exactly that reason: in a supervised run the operator is the arbiter, and
+stepping away should not quietly promote the expected-value check.
+
+> **Configuration guide:** [`AGENT.md`](AGENT.md) — providers and capability
+> tiers, risk and OpSec profiles with measured numbers, the scope rules that
+> surprise people, budgets, what is logged, and the traps worth knowing
+> before the first run.
