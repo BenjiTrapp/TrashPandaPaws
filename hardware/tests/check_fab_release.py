@@ -2101,10 +2101,11 @@ class PairCouplingHoldsTheRulings(unittest.TestCase):
             self.assertGreaterEqual(gap(net), least, net)
 
     def test_every_region_is_in_use(self):
-        used = {key for row in self.summary.values() for key in row["regions"]}
         for region in COUPLING_REGIONS:
-            self.assertIn((region["name"], region["cap_mm"], region["basis"]), used,
-                          f"{region['name']} for {region['nets']} holds nothing: remove it")
+            key = (region["name"], region["cap_mm"], region["basis"])
+            used = {n for n, row in self.summary.items()
+                    if re.fullmatch(region["nets"], n) and key in row["regions"]}
+            self.assertTrue(used, f"{region['name']} for {region['nets']} holds nothing: remove it")
 
     def test_every_as_built_region_is_argued_in_the_accepted_findings(self):
         text = " ".join(ACCEPTED_FINDINGS.read_text(encoding="utf-8").split())
@@ -2122,9 +2123,64 @@ class PairCouplingHoldsTheRulings(unittest.TestCase):
             else:
                 self.assertTrue(region["basis"].startswith(RATCHET), region)
 
+    def test_no_ratchet_cap_is_shared_by_two_nets(self):
+        self.assertEqual(shared_ratchet_problems(), [])
+
+    def test_the_per_net_ratchets_sit_close_above_their_net(self):
+        # ruling BY: the cap is the net's own measurement plus a small margin
+        for region in COUPLING_REGIONS:
+            if region["kind"] != "ratchet" or not region["name"].startswith(("TX cap", "U8", "J3")):
+                continue
+            key = (region["name"], region["cap_mm"], region["basis"])
+            held = self.summary[region["nets"]]["regions"][key]
+            self.assertGreaterEqual(region["cap_mm"], held, region)
+            self.assertLessEqual(region["cap_mm"] - held, 0.15, region)
+
     def test_the_floor_is_below_what_the_board_has(self):
         for net, row in self.summary.items():
             self.assertLess(coupled_floor(net), row["window"] / row["length"], net)
+
+
+class SharedRatchetCapCanFail(unittest.TestCase):
+    """The guard for ruling BY has to fire on the defect it is there for."""
+
+    @staticmethod
+    def _planted(kind, nets):
+        return COUPLING_REGIONS + ({"name": "planted", "nets": nets, "box": (0, 1, 0, 1), "cap_mm": 1.0,
+                                    "kind": kind, "basis": RATCHET},)
+
+    def test_a_ratchet_for_both_legs_of_a_pair_is_refused(self):
+        for nets in (r"USB3_TX_CONN_[PN]", r"USB3_RX_.", "USB3_RX_P|USB3_RX_N", r"MDI0_[PN]", r".*"):
+            problems = shared_ratchet_problems(self._planted("ratchet", nets))
+            self.assertEqual(len(problems), 1, (nets, problems))
+            self.assertIn("planted", problems[0])
+
+    def test_a_ratchet_that_matches_no_pair_net_is_refused(self):
+        self.assertEqual(len(shared_ratchet_problems(self._planted("ratchet", "USB3_RX_X"))), 1)
+
+    def test_a_granted_cap_may_span_nets(self):
+        self.assertEqual(shared_ratchet_problems(self._planted("granted", r"USB3_TX_CONN_[PN]")), [])
+
+    def test_the_shared_caps_ruling_by_split_are_refused(self):
+        for nets in (r"USB3_TX(_CONN)?_[PN]", r"USB3_RX_[PN]", r"USB3_TX_CONN_[PN]"):
+            self.assertTrue(shared_ratchet_problems(self._planted("ratchet", nets)), nets)
+
+
+    def test_tx_conn_n_cannot_degrade_into_the_room_the_shared_cap_left(self):
+        # the defect ruling BY names: N measures 6.68 mm in the straddle, under a pair-wide 8.0 it
+        # could grow by 1.3 mm unseen. Add 1.0 mm of N's own out-of-window path to the straddle.
+        probe = copy.deepcopy(committed_probe("--coupling"))
+        net = "USB3_TX_CONN_N"
+        straddle = next(smp for smp in probe["coupling"][net]
+                        if _region_of(net, smp[0], smp[1], smp[5], probe["pads"]) is not None
+                        and _region_of(net, smp[0], smp[1], smp[5], probe["pads"])["name"] == "U8 straddle")
+        x, y, _, width, _, layer = straddle
+        probe["coupling"][net].append((x, y, 1.0, width, 1.0, layer))   # a gap of 1 mm: far out of the window
+        held = sum(v for (name, _, _), v in coupling_summary(probe)[net]["regions"].items()
+                   if name == "U8 straddle")
+        self.assertLess(held, 8.0, "the plant must stay under the old shared cap or it proves nothing")
+        problems = [m for m in pair_coupling_problems(probe) if m.startswith(net + ":")]
+        self.assertTrue(any("U8 straddle" in m and "more than its cap of 6.79" in m for m in problems), problems)
 
 
 class PairCouplingCanFail(unittest.TestCase):
@@ -2151,7 +2207,7 @@ class PairCouplingCanFail(unittest.TestCase):
         self.assertTrue(any(m.startswith("USB3_RX_N:") and "no region" in m for m in problems), problems)
 
     def test_a_region_cannot_grow_past_its_cap(self):
-        # U8's straddle: AS granted about 5 mm, the cap is 6; push RX_P further out of the window
+        # U8's straddle: AS granted about 5 mm, RX_P's own cap is 5.41; push RX_P further out of the window
         problems = self.problems_after("shift", "USB3_RX_P", 0, 0.5, 11.3, 13.6)
         self.assertTrue(any(m.startswith("USB3_RX_P:") and "U8 straddle" in m for m in problems), problems)
 
@@ -2161,7 +2217,7 @@ class PairCouplingCanFail(unittest.TestCase):
 
     def test_the_floor_follows_from_the_caps(self):
         self.assertAlmostEqual(coupled_floor("USB3_RX_P"),
-                               1 - (NECK_MAX_LENGTH_MM + 6.0 + 2.0 + UNREGIONED_SLACK_MM) / 23.1)
+                               1 - (NECK_MAX_LENGTH_MM + 5.41 + 2.0 + UNREGIONED_SLACK_MM) / 23.1)
 
 
 class BoardNamesItself(unittest.TestCase):
@@ -2445,38 +2501,58 @@ UNREGIONED_SLACK_MM = 0.3
 #            with RATCHET and the region is argued in
 #            hardware/review/2026-11-03-routed/accepted-findings.md.
 RATCHET = "as-built ratchet, not verified against a requirement"
-_RX = r"USB3_RX_[PN]"
-_TXC = r"USB3_TX_CONN_[PN]"
 _MDI_REGION = {"name": "J2 pin lead-in", "box": (33.5, 45.5, 11.0, 25.0), "layer": "F.Cu", "kind": "ratchet",
                "basis": RATCHET + "; rulings AM / AQ route it planar and quantify nothing"}
 COUPLING_REGIONS = (
     # U3's pads: the neck, at most 1.0 mm from the pad centre (rulings AG, AI)
     {"name": "U3 neck", "nets": r"(USB3_(TX|RX)_[PN]|USB2_D_[PN]|MDI\d_[PN])", "near": (("U3",), NECK_MAX_LENGTH_MM),
      "cap_mm": NECK_MAX_LENGTH_MM, "kind": "granted", "basis": "ruling AG/AI (neck at most 1.0 mm from the pad centre)"},
+    # Ruling BY: caps are per NET, not per pair. A cap shared by both legs is only as
+    # tight as the longer one, so the shorter leg could degrade up to it unseen
+    # (TX_CONN_N measures 6.68 mm under a pair-wide 8.0). Every ratchet below
+    # therefore names one net and carries that net's own measured path length in
+    # the region plus a margin of 0.1 mm, rounded up to 0.01 mm. 0.1 mm is twice
+    # COUPLING_STEP, the resolution of the measurement, so sampling cannot trip it,
+    # and small enough that a real change in the routing does. A split never
+    # loosens a cap: where 0.1 mm over the measurement is more than the figure the
+    # shared cap had (TX_CONN_N in the capacitor landing, RX in the J3 fan-out),
+    # the old figure stays and the margin is the smaller one that leaves. The
+    # lengths: hardware/review/2026-11-03-routed/accepted-findings.md, A6.
     # TX: the 45 degree fan-out to the two AC capacitors. Ruling BE and the
     # stackup note say about 1 mm; no ruling gives a cap.
-    {"name": "TX capacitor landing", "nets": r"USB3_TX(_CONN)?_[PN]", "near": (("C22", "C23"), 1.6),
-     "cap_mm": 1.4, "kind": "ratchet", "basis": RATCHET + "; ruling BE named a fan-out of about 1 mm, no cap"},
-    # U8's straddle. Ruling AS: about 5 mm per pair, as extent; the 1.0 mm on top is the
-    # implementer's allowance for path against extent, not granted.
-    {"name": "U8 straddle", "nets": _RX, "box": (12.0, 19.0, 0, 40), "layer": "F.Cu",
-     "cap_mm": 6.0, "kind": "ratchet",
-     "basis": RATCHET + "; ruling AS granted about 5 mm of extent, the 1.0 mm of path allowance is not granted"},
+    *({"name": "TX capacitor landing", "nets": net, "near": (("C22", "C23"), 1.6), "cap_mm": cap,
+       "kind": "ratchet", "basis": RATCHET + "; ruling BE named a fan-out of about 1 mm, no cap"}
+      for net, cap in (("USB3_TX_P", 0.94), ("USB3_TX_N", 1.26),
+                       ("USB3_TX_CONN_P", 0.20), ("USB3_TX_CONN_N", 1.40))),
+    # U8's straddle. Ruling AS: about 5 mm per pair, as extent; the path against
+    # extent on top is the implementer's allowance, not granted.
+    *({"name": "U8 straddle", "nets": net, "box": (12.0, 19.0, 0, 40), "layer": "F.Cu", "cap_mm": cap,
+       "kind": "ratchet",
+       "basis": RATCHET + "; ruling AS granted about 5 mm of extent, the allowance for path is not granted"}
+      for net, cap in (("USB3_RX_P", 5.41), ("USB3_RX_N", 5.62))),
     # Ruling BV: 8.0 mm of PATH for TX_CONN's straddle. A granted concession under
     # reservation, not an engineering target: forced by U8's SOT-23-6 pad rows,
     # TX has no EMC iterations left. Verified by the SuperSpeed first-build check
     # (hardware/fab/fabrication-note.md); if the link proves marginal U8's
-    # package is the first thing to change.
-    {"name": "U8 straddle", "nets": _TXC, "box": (12.0, 19.0, 0, 40), "layer": "F.Cu",
+    # package is the first thing to change. BV's 8.0 mm is the figure for the leg
+    # that needs it: TX_CONN_P, 7.995 mm. It stays exactly as granted and is not
+    # re-derived. TX_CONN_N measures 6.68 mm and BV gave it nothing, so ruling BY
+    # holds N to its own as-built ratchet below, not to the 8.0.
+    {"name": "U8 straddle", "nets": "USB3_TX_CONN_P", "box": (12.0, 19.0, 0, 40), "layer": "F.Cu",
      "cap_mm": 8.0, "kind": "granted",
      "basis": "ruling BV (8.0 mm of path; granted concession, not an engineering target)"},
+    {"name": "U8 straddle", "nets": "USB3_TX_CONN_N", "box": (12.0, 19.0, 0, 40), "layer": "F.Cu",
+     "cap_mm": 6.79, "kind": "ratchet",
+     "basis": RATCHET + "; ruling BV's 8.0 mm is for TX_CONN_P, ruling BY holds N to its own length"},
     # J3: its +5V pin sits between the RX pins and the pairs fan out to its 2 mm pitch
-    {"name": "J3 fan-out", "nets": _RX, "box": (4.5, 9.0, 0, 40), "layer": "F.Cu",
-     "cap_mm": 2.0, "kind": "ratchet",
-     "basis": RATCHET + "; ruling BN granted 1.5 mm, the 0.5 mm of path allowance is not granted"},
-    {"name": "J3 fan-out", "nets": _TXC, "box": (4.5, 9.0, 0, 40), "layer": "F.Cu",
-     "cap_mm": 2.7, "kind": "ratchet",
-     "basis": RATCHET + "; the 2.5 mm is the task 9 re-review's measurement, ruling BE gave no figure"},
+    *({"name": "J3 fan-out", "nets": net, "box": (4.5, 9.0, 0, 40), "layer": "F.Cu", "cap_mm": cap,
+       "kind": "ratchet",
+       "basis": RATCHET + "; ruling BN granted 1.5 mm, the 0.5 mm of path allowance is not granted"}
+      for net, cap in (("USB3_RX_P", 2.0), ("USB3_RX_N", 2.0))),
+    *({"name": "J3 fan-out", "nets": net, "box": (4.5, 9.0, 0, 40), "layer": "F.Cu", "cap_mm": cap,
+       "kind": "ratchet",
+       "basis": RATCHET + "; the 2.5 mm is the task 9 re-review's measurement, ruling BE gave no figure"}
+      for net, cap in (("USB3_TX_CONN_P", 2.55), ("USB3_TX_CONN_N", 2.70))),
     # USB 2.0: the D+/D- crossover between J3 and U9 (task 8, the U9 channel)
     {"name": "USB 2.0 J3 to U9 crossover", "nets": "USB2_D_N", "box": (4.5, 12.6, 0, 40),
      "cap_mm": 11.0, "kind": "ratchet", "basis": RATCHET},
@@ -2496,6 +2572,22 @@ COUPLING_REGIONS = (
         ("MDI0_N", 5.5), ("MDI0_P", 4.5), ("MDI1_N", 4.2), ("MDI1_P", 3.1),
         ("MDI2_N", 7.0), ("MDI2_P", 5.0), ("MDI3_N", 4.3), ("MDI3_P", 2.3))),
 )
+def shared_ratchet_problems(regions=None):
+    """Ruling BY: a ratchet cap is per net. One message per ratchet region whose
+    `nets` pattern does not match exactly one pair net: a cap shared by both
+    legs is only as tight as the longer one. Granted caps are a ruling's figure
+    and may span nets."""
+    problems = []
+    for region in COUPLING_REGIONS if regions is None else regions:
+        if region["kind"] != "ratchet":
+            continue
+        matched = [n for n in BOARD_PAIR_NETS if re.fullmatch(region["nets"], n)]
+        if len(matched) != 1:
+            problems.append(f"ratchet {region['name']!r} with nets {region['nets']!r} matches "
+                            f"{len(matched)} pair nets {matched}, not exactly one (ruling BY)")
+    return problems
+
+
 # Each pair's length as committed, to turn the caps into a floor on the share
 # of the pair that stays inside the window.
 NOMINAL_LENGTH_MM = {

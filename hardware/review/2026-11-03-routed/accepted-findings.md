@@ -29,7 +29,10 @@ the window (6.2 mm of straight-line extent, task 9 re-review M3). Ruling AS
 granted "about 5 mm" as extent; ruling BV (which corrects BS's 6.5 mm) sets the
 TX_CONN cap at **8.0 mm of path length**, because the conductor length, not
 the extent, makes the discontinuity. The cap in `COUPLING_REGIONS` is 8.0 mm
-for both nets, `kind: granted`, and the margin on TX_CONN_P is 0.01 mm.
+for TX_CONN_P, `kind: granted`, and the margin on TX_CONN_P is 0.01 mm. The 8.0
+mm is the figure for the leg that needs it. TX_CONN_N measures 6.68 mm and BV
+granted it nothing, so under ruling BY it has its own as-built ratchet of 6.79
+mm (A6), not a share of the 8.0.
 
 **This is a granted concession under reservation, not an engineering target.**
 The straddle is forced by U8's SOT-23-6 pad rows, and TX has no EMC iterations
@@ -44,10 +47,9 @@ USB 2.0; it is also in `hardware/fab/fabrication-note.md`). **If the link
 proves marginal, U8's package is the first thing to change** (a part whose pad
 rows do not force the pair apart), not the pair routing.
 
-RX at the same place: 5.31 / 5.52 mm of path against a ratchet cap of 6.0 mm
-(ruling AS granted about 5 mm of extent; the 1.0 mm on top is the
-implementer's allowance for path against extent and is not granted, so it is a
-ratchet, A6).
+RX at the same place: 5.31 / 5.52 mm of path against per-net ratchet caps of
+5.41 / 5.62 mm (ruling AS granted about 5 mm of extent; the allowance for path
+against extent is the implementer's and is not granted, so it is a ratchet, A6).
 
 ### A2 U8 channel spacing between TX and RX is 0.505 mm, not 0.8 mm
 
@@ -109,20 +111,46 @@ J2 pin hole: 1.06 mm of 12.4 mm is 91 %.
 ### A6 Every cap names its ruling or is a ratchet (ruling BW)
 
 `COUPLING_REGIONS` has two kinds. **Granted**, with the ruling named: `U3 neck`
-(AG / AI, 1.0 mm from the pad centre), `U8 straddle` for TX_CONN (BV, 8.0 mm).
+(AG / AI, 1.0 mm from the pad centre), `U8 straddle` for TX_CONN_P (BV, 8.0 mm).
 **Ratchet**, each stating "as-built ratchet, not verified against a
 requirement" in the code and argued here; a cap only stops the board getting
 worse:
 
 | Region | Cap | Why it is a ratchet |
 |---|---|---|
-| `TX capacitor landing` | 1.4 mm | ruling BE named a fan-out of about 1 mm and no cap; measured 0.83-1.32 |
-| `U8 straddle` (RX) | 6.0 mm | AS granted about 5 mm of extent; the 1.0 mm is the implementer's path allowance |
-| `J3 fan-out` (RX) | 2.0 mm | BN granted 1.5 mm; the 0.5 mm is allowance |
-| `J3 fan-out` (TX_CONN) | 2.7 mm | the 2.5 mm is the task 9 re-review's measurement; BE gave no figure |
+| `TX capacitor landing` | per net, below | ruling BE named a fan-out of about 1 mm and no cap |
+| `U8 straddle` (RX) | per net, below | AS granted about 5 mm of extent; the allowance for path is the implementer's |
+| `U8 straddle` (TX_CONN_N) | 6.79 mm | BV's 8.0 mm is for TX_CONN_P; N measures 6.68 and was granted nothing |
+| `J3 fan-out` (RX) | per net, below | BN granted 1.5 mm; the 0.5 mm is allowance |
+| `J3 fan-out` (TX_CONN) | per net, below | the 2.5 mm is the task 9 re-review's measurement; BE gave no figure |
 | `USB 2.0 layer change at U3` | 1.2 / 1.0 mm | AR allows the layer change, not a length; measured 0.93 / 0.74 |
 | `USB 2.0 J3 to U9 crossover`, `USB 2.0 skew meander` | 11.0 / 4.6, 5.0 mm | A3 |
 | `J2 pin lead-in` | per net | A4 |
+
+**Caps are per net, not per pair (ruling BY).** A cap shared by both legs is only
+as tight as the longer one: TX_CONN_N, at 6.68 mm, could have degraded by 1.3 mm
+under the pair-wide 8.0 mm unseen. Each ratchet below names one net and is that
+net's own measured path length in the region plus 0.1 mm, rounded up to 0.01 mm
+(0.1 mm is twice the 0.05 mm sampling step; where that would loosen the cap the
+shared figure had, the old figure stays). A test refuses any ratchet whose `nets`
+pattern matches more than one pair net. Measured on the committed board:
+
+| Region | Net | Measured | Cap |
+|---|---|---|---|
+| `TX capacitor landing` | USB3_TX_P | 0.835 | 0.94 |
+| | USB3_TX_N | 1.156 | 1.26 |
+| | USB3_TX_CONN_P | 0.100 | 0.20 |
+| | USB3_TX_CONN_N | 1.320 | 1.40 (kept; +0.1 would be 1.42) |
+| `U8 straddle` | USB3_RX_P | 5.308 | 5.41 |
+| | USB3_RX_N | 5.515 | 5.62 |
+| | USB3_TX_CONN_N | 6.685 | 6.79 |
+| | USB3_TX_CONN_P | 7.995 | 8.0, granted (BV), unchanged |
+| `J3 fan-out` | USB3_RX_P, USB3_RX_N | 1.938 each | 2.0 (kept; +0.1 would be 2.04) |
+| | USB3_TX_CONN_P | 2.450 | 2.55 |
+| | USB3_TX_CONN_N | 2.600 | 2.70 |
+
+The USB 2.0 and MDI regions were already per net and are unchanged (their
+margins, 0.2-0.4 mm, are larger than 0.1 mm; not tightened in this round).
 
 The floors on the share inside the window follow from these caps, so the floor
 on RX and on every USB 2.0 and MDI net is a ratchet too; on TX_CONN it follows
