@@ -46,7 +46,10 @@ from the file names (LCSC, Oneyac, Elecfans) and, for [DS14b], from the
 watermark "CONFIDENTIAL for Haoliyuan Electronic(shenzhen) Co.,Ltd", and the
 cover reads "(CONFIDENTIAL: Development Partners Only)". They are
 **third-party copies of a restricted Realtek document**, not files Realtek
-published itself. Realtek does not publish this datasheet.
+published itself. That Realtek does not publish this datasheet on its own site
+is **not established here**: no search of Realtek's site is recorded, so it is
+an inference from the "Development Partners Only" marking on the cover, not a
+finding.
 
 Without the URLs, a future reader cannot trace the files back to where they
 were downloaded. They can still check the content:
@@ -55,7 +58,10 @@ were downloaded. They can still check the content:
   cover;
 - the revision (cover and revision history: 1.4, 2018/03/16);
 - the package: the QFN-40 drawing in Figure 1, marked `RTL8153B`;
-- the MD5 sums in the table above;
+- the MD5 sums in the table above (the repository's `.gitattributes` marks
+  `*.pdf` binary so Git applies no text conversion; there is no control run
+  without that file, so it is not shown that the attribute is what protects the
+  PDFs, as Git's own binary detection would probably also have);
 - the crosscheck, which reproduces the whole pin map from the PDFs and
   compares it with `netlist.yaml`.
 
@@ -105,8 +111,20 @@ affects only one of them.
    `--selftest` feeds it seven deliberately corrupted inputs: a pin moved in
    one PDF, a pin moved the same way in all PDFs, a lost row, a lost wrapped
    continuation line, a stray extra symbol, two netlist pins swapped, and a
-   netlist pin 42. It requires every one of them to fail. All seven do (see
-   `.superpowers/sdd/2026-10-31-raccoon-tap-fab-release/task-3-report.md`).
+   netlist pin 42. It requires every one of them to fail. All seven do; rerun
+   `python3 hardware/datasheets/crosscheck_u3_pinout.py --selftest` to see each
+   mutation reported as caught and `selftest: PASS` (checked again for the
+   release, task 12). The output was originally recorded in a working-notes file
+   that is not part of the repository's permanent record.
+
+   The Table 11 step is the most layout-dependent part of the script: it finds
+   the table by its heading and reads each row as a pin number followed by
+   `LED<n>` or `-`. A different PDF layout would make it find nothing, which
+   fails the run rather than passing it (it fails closed), but it is a regex on
+   `pdftotext` output, not a table parser.
+   The task brief called for `extract_datasheet.py` with a quality score; that
+   tool was replaced by this script and `pdftotext -raw`, so there is no
+   `extracted/*.json` and no extraction quality score for these PDFs.
 2. **Figure 1, read by eye.** I rendered the page and read pins 1–40 off the
    package drawing. They match the tables for every pin. Figure 1 does not
    number the exposed pad, so pin 41 rests on Table 8 alone.

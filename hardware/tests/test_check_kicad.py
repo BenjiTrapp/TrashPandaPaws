@@ -179,6 +179,7 @@ class KiCad10NetEncodingRejectsDefects(unittest.TestCase):
     def test_zone_on_unknown_net_fails(self):
         text = self.text.replace('(zone\n\t\t(net "GND")',
                                  '(zone\n\t\t(net "BOGUS")', 1)
+        self.assertNotEqual(text, self.text)   # the mutation text pattern must still match the board
         report = run_nets(text, self.netlist)
         self.assertIn(f"all {zone_count(text)} zone(s) carry a netlist net name",
                       labels(report))

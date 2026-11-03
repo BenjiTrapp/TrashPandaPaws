@@ -248,8 +248,9 @@ crosstalk or return paths:
 * The footprint is `raccoon:SOT-23-6_SP3019_LittelfuseLand`, Littelfuse's own
   land pattern (datasheet page 5): pads 0.60 x 0.85 mm at 0.95 mm pitch, 3.33 mm
   overall (the drawing prints the span as "0.33", a digit cut off; read as 3.33,
-  the only reading that fits the package table's 2.60 to 3.00 mm lead span with
-  0.85 mm pads). KiCad's own SOT-23-6 leaves a 0.95 mm channel, which two lines
+  the reading adopted because it is consistent with the package table's 2.60 to
+  3.00 mm lead span with 0.85 mm pads; no other source for the figure was
+  found, and other readings were not excluded by measurement). KiCad's own SOT-23-6 leaves a 0.95 mm channel, which two lines
   of different pairs do not fit; this leaves 1.63 mm. It was checked against the
   drawing by the reviewer.
 * C22 and C23 are vertical at 1.05 mm pitch, not the 0.82 mm of the note: the

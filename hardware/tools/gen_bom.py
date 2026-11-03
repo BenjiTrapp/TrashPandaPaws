@@ -13,7 +13,9 @@ DNP is explicit. A component with `populate: false` is never grouped with a
 part that is fitted, and its row says so in four places that an assembler
 cannot all miss: Populate = DNP, Quantity = 0, the "Part Number" cell is EMPTY
 (a buyer working down that column cannot order it), and the part to use if it
-is ever fitted is named in "Part If Fitted". DNP rows come last. Parts with
+is ever fitted is named in "Part If Fitted". DNP rows come last. A part PCBWay places (it carries an `assembly:` mapping) has
+its Description start with "PLACED BY PCBWAY"; it stays in this file as the
+record of the whole board. Parts with
 `bom: false` (test pads, cut-open solder jumpers) are not parts and are left
 out. Rules in tools/fitting.py.
 
@@ -108,11 +110,12 @@ def build_rows(netlist):
                str(comp.get("tolerance", "")),
                str(comp.get("package", "")),
                str(comp.get("manufacturer", "")),
-               str(comp.get("mpn", "")))
+               str(comp.get("mpn", "")),
+               comp.get("assembly") is not None)
         groups[key].append(ref)
 
     rows = []
-    for (populated, value, tolerance, package, manufacturer, mpn), refs in groups.items():
+    for (populated, value, tolerance, package, manufacturer, mpn, assembled), refs in groups.items():
         refs.sort(key=ref_key)
         sample = components[refs[0]]
         # One description if they agree. If not, list the distinct ones (at
@@ -126,6 +129,9 @@ def build_rows(netlist):
         description = " | ".join(distinct[:3])
         if len(distinct) > 3:
             description += f" | and {len(distinct) - 3} more"
+        if assembled:
+            # A hand-solderer working down this file must not try to fit it
+            description = "PLACED BY PCBWAY, not hand-soldered (assembly BOM). " + description
         rows.append({
             "Reference": collapse(refs),
             "Quantity": len(refs) if populated else 0,

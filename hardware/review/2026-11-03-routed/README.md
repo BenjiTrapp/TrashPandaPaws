@@ -1,7 +1,13 @@
 # raccoon-tap — verification of the routed board (task 10, 2026-11-03)
 
-The chain that decides whether the board may be ordered, run on commit
-`192cf12` plus this task's changes. Nothing was ordered.
+The chain that decides whether the board may be ordered, first run on commit
+`192cf12` plus task 10's changes. Nothing was ordered. **Refreshed in task 12:**
+`check_fab_release.out`, `run_design_checks.out`, `check_kicad.out`,
+`check_netlist.out` and `mutation-evidence.txt` were re-generated after the
+per-net coupling caps (ruling BY) and the later fix rounds made the task 10
+copies stale; the counts below are the re-generated ones. The kicad-happy JSONs
+and `drc.rpt` / `erc.rpt` were not re-run (the board file is unchanged since
+task 10's measurement; its hash is the one above).
 
 Design files analysed (SHA-256):
 
@@ -26,7 +32,7 @@ for shorts and unconnected items.
 | `check_netlist.py` | exit 0, 0 warnings | `check_netlist.out` |
 | `check_kicad.py` (incl. `check_pcb_connectivity(pcb, netlist, report)`, ruling N) | exit 0 | `check_kicad.out` |
 | `test_check_kicad.py` | 27 tests OK | |
-| `check_fab_release.py` | **133 tests OK** (109 before; 24 new, see below) | `check_fab_release.out` |
+| `check_fab_release.py` | **207 tests OK** (133 at the first run of task 10; the rest were added by the per-net caps, the release-set and assembly checks of task 11 and the fix rounds) | `check_fab_release.out` |
 | `tools/rebuild_check.py` | 1136 of 1136 items identical (tracks, vias, footprints, zones, silkscreen text) | `run_design_checks.out` |
 | `run_design_checks.sh` | all of the above | `run_design_checks.out` |
 
@@ -54,13 +60,21 @@ test file. They need pcbnew; without it they **error**, they do not skip.
 
 `mutation_evidence.py` / `mutation-evidence.txt` show both failing. On the
 **real** boards from git: 732475b (the board review 1 of task 9 found at TX 0 %
-coupled, RX 28 %, USB 2.0 over D+'s antipad) fails with 27 coupling and 17 In1
-messages; 584ece4 (RX still 28 %) fails with 10; b13cff9 (ruling BK) passes. On
+coupled, RX 28 %, USB 2.0 over D+'s antipad) fails with 27 coupling and 212 In1
+messages, of which **17** are the defect it is cited for (USB2_D_N over D+'s
+via hole) and 195 are that older board's own layer-change vias at positions the
+current exceptions do not list (position drift: not evidence of the defect, and
+the script now says so in its output. This README used to cite "17 In1
+messages" for 732475b; the raw count rose to 212 after task 10, which the ledger
+attributes to this position drift, and the split above is by the message's net
+and hole net, computed by `mutation_evidence.py`); 584ece4 (RX still 28 %) fails with 10; b13cff9 (ruling BK) passes. On
 planted defects: a 0.45 mm shift of RX_N leaves it 15 % inside the window; a
 hole in In1 under each of the 16 pair nets is found on every one; a +3V3 via
 0.52 mm beside RX_P (touching nothing) is found by its antipad; removing the AR
 flank via fails ruling AR. With both judging functions replaced by
-`lambda: []` all 10 mutation tests fail (24 failing assertions with sub-tests).
+`lambda: []` all 10 mutation tests failed (24 failing assertions with sub-tests)
+at the time of task 10; that experiment is not scripted and was **not repeated**
+in task 12.
 
 ## kicad-happy, supplementary
 
@@ -121,9 +135,10 @@ ledger has the history of each fix):
 ## Deferred minors
 
 `deferred-minors.md` collects the 35 deferred lines of tasks 1-8 and the minors
-of the task 9 reviews for the whole-branch review, with a disposition each.
-Two need a decision: the U8 ESD-rating citation (S1) and the crystal drive-level
-arithmetic (S2).
+of the task 9 reviews with a disposition each. Task 12 resolved the two that
+needed a decision (the U8 ESD-rating citation, S1, and the crystal drive-level
+arithmetic, S2) and swept up the documentation ones; each row there says how.
+The full account is in the task 12 report.
 
 ## Reproducing
 

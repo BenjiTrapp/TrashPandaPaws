@@ -258,7 +258,9 @@ satisfies [RTL-DS] table 23, but confirm ±30 ppm on the order confirmation.
 ## Hand-soldering the rest
 
 `hardware/bom.csv` is the operator's BOM: every line except U3 and Y1, which
-the machine fits. R12 and C24 are DNP (column Populate): leave the pads empty.
+the machine fits (those two lines are in the file too, as the record of the whole
+board, and their description starts with "PLACED BY PCBWAY"; do not order or
+solder them from it). R12 and C24 are DNP (column Populate): leave the pads empty.
 The three bottom-side parts C9, C14, C27 are lines of the 100 nF row. U8 pin 2's
 via and the rest of the assembly notes are in `fabrication-note.md`; its first-
 build checks (SuperSpeed link, thermals of U3) come after the first board is up.

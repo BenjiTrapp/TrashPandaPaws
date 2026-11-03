@@ -16,6 +16,14 @@
 #   KIPY       KiCad's Python (pcbnew); default is the macOS app bundle
 #   KICAD_CLI  kicad-cli; default is the one on PATH, else the app bundle
 #
+#   KICAD_CLI=/opt/homebrew/bin/kicad-cli bash hardware/tests/run_design_checks.sh
+#
+# DO NOT put /opt/homebrew/bin at the front of PATH to get kicad-cli: it
+# shadows /usr/bin/python3 with a Homebrew Python that has no PyYAML, and four
+# of the seven checks (check_netlist, check_kicad, test_check_kicad,
+# check_fab_release) then fail for reasons that have nothing to do with the
+# board. Name kicad-cli through KICAD_CLI instead and leave PATH alone.
+#
 # Exit 0 only if every check passed. Takes about 2 minutes (the rebuild is a third).
 
 set -uo pipefail

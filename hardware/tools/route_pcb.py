@@ -1271,6 +1271,19 @@ def stage_decoupling(r):
 # tented from the back) is the listed exception.
 PAD_VIA_GAP = 0.1
 PAD_VIA_EXCEPTIONS = [("U8", "2")]
+# HAZARD (ruling CH), for whoever unfreezes and re-routes this board: this is a
+# fourth, hand-kept statement of "which parts are machine-assembled". The real
+# source is the `assembly:` marks in hardware/netlist.yaml, which the export
+# path (tools/export_fab.py assembled_refs(), tools/gen_bom.py) already reads.
+# If the partial-assembly set ever changes there and this tuple is not changed
+# with it, the via-to-pad gap rule above is applied to the wrong parts. The
+# dangerous direction: a part dropped from the assembly marks (now hand-
+# soldered) but still listed here stays EXEMPT from the rule, so a via left open
+# in its pad would solder badly and nothing here would say so; the other
+# direction (a newly marked part missing here) is merely over-strict. Nothing
+# checks that the two agree. It has no effect today (the
+# board is frozen and U3 and Y1 are the marked parts); derive it from the
+# netlist before using this script again.
 REFLOWED = ("U3", "Y1")
 
 

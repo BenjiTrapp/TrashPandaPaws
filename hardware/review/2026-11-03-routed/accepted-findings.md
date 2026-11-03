@@ -22,7 +22,7 @@ stops it getting worse.
 
 ## A. Coupling and In1 reference (ruling BJ)
 
-### A1 U8 straddle: TX_CONN has a granted concession of 8.0 mm of path (ruling BV)
+### A1 U8 straddle: USB3_TX_CONN_P has a granted concession of 8.0 mm of path (ruling BV, read by ruling CD)
 
 Region `U8 straddle`. **TX_CONN: 7.99 mm (P) and 6.68 mm (N) of path** outside
 the window (6.2 mm of straight-line extent, task 9 re-review M3). Ruling AS
@@ -78,7 +78,9 @@ speed. First-build check: plug into a USB 2.0-only port, `lsusb -t` must show
 ### A4 MDI: the lead-in to J2's pin columns is outside the window for 2–6.6 mm per net
 
 Region `J2 pin lead-in`: MDI0 5.25 / 4.15 mm (N / P), MDI1 3.94 / 2.84,
-MDI2 6.61 / 4.59, MDI3 4.00 / 1.97. In the window overall: MDI0 83 / 86 %,
+MDI2 6.61 / 4.59, MDI3 4.00 / 1.97 (measured). The ratchet caps in
+`COUPLING_REGIONS`, per net (N / P): MDI0 5.5 / 4.5 mm, MDI1 4.2 / 3.1,
+MDI2 7.0 / 5.0, MDI3 4.3 / 2.3. In the window overall: MDI0 83 / 86 %,
 MDI1 84 / 88 %, MDI2 50 / 58 %, MDI3 70 / 80 %. As-built: rulings AM / AQ chose
 the planar route under the jack and none quantifies the spread of the pair onto
 two pins 2.5 mm apart. Accepted with ruling AX's reasoning: 1000BASE-T runs at
@@ -151,6 +153,16 @@ pattern matches more than one pair net. Measured on the committed board:
 
 The USB 2.0 and MDI regions were already per net and are unchanged (their
 margins, 0.2-0.4 mm, are larger than 0.1 mm; not tightened in this round).
+
+Two things this section does not hide. (1) `U3 neck` is one granted cap of
+1.0 mm applied to 16 pair nets (`nets` is a regex over all of them). It is the
+same shape as the shared cap ruling BY objects to, and is kept because the
+grant (rulings AG / AI) is itself a single figure for every pad of U3, not a
+measurement per net; a net could therefore use up to 1.0 mm unseen even if it
+measures less today. (2) The 0.2 to 0.4 mm of slack on the USB 2.0 and MDI
+ratchets is left in place (ruling CC): a larger margin than the 0.1 mm of the
+SuperSpeed caps, so those nets could degrade by that much without a failure.
+Since the board is frozen this matters only if it is re-routed.
 
 The floors on the share inside the window follow from these caps, so the floor
 on RX and on every USB 2.0 and MDI net is a ratchet too; on TX_CONN it follows
@@ -296,8 +308,13 @@ current (the datasheets give no maximum):
 | U6 SY8089AAAC | 0.51 A at 1.0 V, η 0.8 assumed | 0.13 W (limit 0.6 W) | 170 °C/W | 47 °C | 78 K |
 
 U4's 34 K is enough on a bench and thin in a closed case; the note already says
-so. U3 (RTL8153B, about 0.4 W at typical) is not assessed by anything: measure
-its package temperature on the first build.
+so. U3 (RTL8153B, about 0.4 W at typical) was not assessed by kicad-happy or by
+this review. Task 11 added an **estimate** to `fab/fabrication-note.md` ("U3
+thermal"): 12 to 18 K of rise, which rests on an **ASSUMED theta-JA of 30 to
+45 K/W that the datasheet does not give and that has no source in this
+repository**. It is an estimate, not an assessment. Measure the package
+temperature on the first build (`OPEN_QUESTIONS.md`, "To measure on the first
+build"; investigate at a rise of 30 K or more).
 
 ### B14 Cross-analysis: `RP-002` and `PS-002` × 2 (errors), `PS-002` info
 

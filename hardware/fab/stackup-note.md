@@ -53,9 +53,11 @@ geometry below is centred on the as-built value instead.
 PCBWay's footer for the entry: "Thickness after lamination: 1.51mm, tolerance:
 ±10%." and "Finished PCB Thickness: 1.61mm, tolerance: ±10%."
 
-Why this entry: among the 4-layer, 1.6MM entries in the page as fetched, only
-entries 1 to 3 have 1OZ outer and 1OZ inner copper, which is what the board
-specifies; they differ only in the assumed inner-layer residual copper ratio
+Why this entry: among the 4-layer, 1.6MM entries excerpted from the page as
+fetched (entries 1 to 3), all three have 1OZ outer and 1OZ inner copper, which
+is what the board specifies. The page lists 112 entries and only 1 to 3 were
+excerpted, so this note does not show that no other entry has 1OZ/1OZ.
+Entries 1 to 3 differ only in the assumed inner-layer residual copper ratio
 (70 %, 50 %, 30 %). Entry 1 carries PCBWay's own footnote: "Inner layer
 Residual copper ratio > 60%, it is suitable to choose a lamination structure
 with 70% inner layer Residual copper ratio." (excerpt `[2]`). This note reads
@@ -226,7 +228,7 @@ classes:
   USB3: {target_ohm: 90.0, width_mm: 0.20, gap_mm: 0.17, clearance_mm: 0.2}
   MDI: {target_ohm: 100.0, width_mm: 0.18, gap_mm: 0.21, clearance_mm: 0.2}
 task9:
-  # U3 pads: neck no wider and no longer than this, measured from the pad (see
+  # U3 pads: neck no wider and no longer than this, measured from the pad centre (ruling AI; see
   # "Constraints for task 9"); the check fails if these limits are loosened
   neck_max_width_mm: 0.15
   neck_max_length_mm: 1.0
@@ -383,14 +385,18 @@ optional.
      where the geometry allows it. It was measured on the scratch board
      (`scratch_drc_check.py`): at full width it brings the closest distance
      from 0.1750 to 0.1807 mm only, still under 0.2 mm, so with these widths
-     it does not replace the neck; it shortens the neck that is needed.
+     it does not replace the neck. Whether it would shorten the neck that is
+     needed was not measured (the scratch run was made without a neck from the
+     outer end), so "may shorten" is the most that can be said.
    * Measured, the same scratch pads are clean (0 trace-to-pad violations)
      with a 0.15 mm neck of 1.0 mm and with one of 0.5 mm, each stepping to full
      width. 1.0 mm is the cap, not a target: use the shortest neck that clears.
    * What it costs, from the same formula as everywhere else in this note:
      two 0.15 mm traces at the 0.25 mm gap the pad pitch leaves give 119.9 ohm
      bare, 111.9 ohm as built, against 90 ohm (USB3) and 100 ohm (MDI), over at
-     most 1.0 mm. The effect of that step at 5 Gbit/s is not modelled; a
+     most 1.0 mm. That is about 24 % above the USB3 target and about 12 %
+     above the MDI target, i.e. outside the +/-10 % window for both classes
+     (111.9 / 90 = 1.243; 111.9 / 100 = 1.119). The effect of that step at 5 Gbit/s is not modelled; a
      0.15 mm trace is 5.9 mil, above the 5 mil of PCBWay's table row 15.
 2. **Route every pair with the differential-pair router.** All seven pairs are
    named so that KiCad pairs them (`USB2_D_P/N`, `USB3_RX_P/N`, `USB3_TX_P/N`,
@@ -491,7 +497,11 @@ before anything is ordered; none has been asked yet.
    them to calculate 90 ohm and 100 ohm differential for this stackup (entry 1,
    70 % residual copper, 0.1855 mm prepreg) with their solder mask on, and
    say how many mask passes they print (two passes with a thin prepreg
-   leave the window, see the combined corners). The net classes are centred on the
+   leave the window, see the combined corners; three or more passes are
+   covered only by PCBWay's sentence that "after printing three times or more,
+   the impedance value no longer changes", which gives no value, and their
+   table covers one and two passes only, so the answer must include the
+   three-or-more case). The net classes are centred on the
    calculator's value minus PCBWay's "typically, one pass" 8 ohm; if their
    figure differs, change `mask_offset_ohm` in the block above and
    `PCBWAY_MASK_OFFSET_OHM` in `check_fab_release.py` together and

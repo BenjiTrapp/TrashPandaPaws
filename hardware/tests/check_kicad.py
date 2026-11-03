@@ -22,9 +22,9 @@ that made the files unusable in the first place, so they cannot creep back in:
   * Component values must agree between the schematic and the BOM.
   * Balanced parentheses in both KiCad files.
 
-Exit code 0 = all checks pass, 1 = at least one failure.
-Known, deliberately-accepted gaps are listed in KNOWN_GAPS and reported as
-warnings rather than failures.
+Exit code 0 = all checks pass, 1 = at least one failure. Every check is a
+failure; there is no list of accepted gaps. (Report.warn exists and is counted
+in the summary, but nothing calls it today.)
 
 Usage:
     python3 check_kicad.py [-v]
@@ -48,8 +48,7 @@ NETLIST = HARDWARE / "netlist.yaml"                      # source of truth
 # Power symbols the generator adds; they are not real components.
 POWER_PREFIXES = ("#PWR",)
 
-# Parts of the PoE front end intentionally absent from the PCB while the
-# architecture decision in OPEN_QUESTIONS.md item 0 is open.
+
 def parse_sexp(text):
     tokens = re.findall(r'\(|\)|"(?:[^"\\]|\\.)*"|[^\s()]+', text)
 

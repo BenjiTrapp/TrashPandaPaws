@@ -221,16 +221,20 @@ def main(argv=None):
     with tempfile.TemporaryDirectory() as build:
         build = Path(build) / "gerber"
         try:
-            manifest = export_set(build, chk.drc_report_problems)
+            refs = assembled_refs()       # parsed once; the three outputs below share it
+            manifest = export_set(build, chk.drc_report_problems, refs=refs)
             cpl = Path(build).parent / "cpl.csv"
-            write_cpl(cpl)
+            write_cpl(cpl, refs=refs)
             import gen_bom
             import yaml
             bom = Path(build).parent / "assembly-bom.csv"
             placed = [r["Reference Designator"] for r in gen_bom.write_assembly_bom(
                 yaml.safe_load(NETLIST.read_text()), bom)]
-            if tuple(placed) != assembled_refs():      # one source: cannot differ
-                raise ExportFailed(f"assembly BOM {placed} and CPL {list(assembled_refs())} disagree")
+            # Both lists come from netlist.yaml's `assembly:` marks, so this can fire only if
+            # gen_bom.build_assembly_rows and gen_bom.assembly_refs ever diverge in code; it is a
+            # cheap tripwire for that, not an independent check of the BOM against the CPL.
+            if tuple(placed) != refs:
+                raise ExportFailed(f"assembly BOM {placed} and CPL {list(refs)} disagree")
         except (ExportFailed, ValueError) as e:
             print(f"export_fab: {e}", file=sys.stderr)
             return 2

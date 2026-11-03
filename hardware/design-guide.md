@@ -1,4 +1,18 @@
-# Raccoon HAT — Circuit Design Guide
+# Raccoon HAT — Circuit Design Guide (LEGACY, v1, abandoned design)
+
+> [!CAUTION]
+> **This guide describes `raccoon-hat`, the abandoned first design: a 2-layer,
+> 65 × 56 mm Raspberry Pi HAT with its own Power-over-Ethernet stage. Do not
+> build from it.** The released board is `raccoon-tap` (4 layers, 58 × 36 mm,
+> USB-powered, no PoE stage). Its source of truth is
+> [`netlist.yaml`](netlist.yaml), not this file. The guide is kept as the
+> record of the v1 design; several of its sections were corrected in place when
+> the RTL8153B pinout was verified (§2.1, task 3), and those corrections are the
+> parts still worth reading. Everything else (the PoE front end, the 2-layer
+> stackup, the 65 × 56 mm outline, the "REGOUT must be wired" note, which the
+> external buck of OPEN_QUESTIONS item 3f makes moot) is v1 and does not apply
+> to `raccoon-tap`. Surface finish of the released board is ENIG (ruling CA,
+> `fab/ORDERING.md`).
 
 > [!WARNING]
 > **Concept stage — not manufacturable as written.** A design audit on
@@ -407,7 +421,7 @@ Directly connects to the SI3402-B PoE PD controller.
 - 4× M2.5 mounting holes at Pi standard positions
 - Board thickness: 1.6mm
 - Copper: 1oz (35μm) both layers
-- Surface finish: HASL or ENIG
+- Surface finish: HASL or ENIG for this v1 board (never decided; the released `raccoon-tap` uses ENIG, ruling CA)
 
 ### Layer Stackup (2-layer)
 - **F.Cu** — Signal routing, component pads

@@ -8,6 +8,7 @@ written.
     python3 hardware/review/2026-11-03-routed/mutation_evidence.py
 """
 
+import re
 import subprocess
 import sys
 import tempfile
@@ -48,11 +49,21 @@ def show_history(tmp):
         probe = c.run_probe(board, "--coupling", "--in1")
         coupling, in1 = c.pair_coupling_problems(probe), c.in1_continuity_problems(probe)
         summary = c.coupling_summary(probe)
+        # A message names the net it was found on and the via whose hole it is inside. "Cross" =
+        # one net over ANOTHER net's via hole (USB2_D_N over D+'s antipad, the defect task 9
+        # review 1 found). The rest are a net's OWN layer-change via at a position the current
+        # exception does not list (the old board's vias sit elsewhere than the committed
+        # board's): that count is position drift, not evidence of the defect, and is not cited.
+        cross = [m for m in in1 if (h := re.match(r"(\S+): no In1 ground at .* round (\S+) via via", m))
+                 and h.group(1) != h.group(2)]
         print(f"\n== {rev}: {what} ==")
-        print(f"  coupling problems {len(coupling)}, In1 problems {len(in1)}; share of each SuperSpeed net inside "
+        split = (f" (of which {len(cross)} are one pair net over another net's via hole; the other "
+                 f"{len(in1) - len(cross)} are a net's own layer-change via off the listed positions, "
+                 f"position drift, not the defect)") if in1 else ""
+        print(f"  coupling problems {len(coupling)}, In1 problems {len(in1)}{split}; share of each SuperSpeed net inside "
               f"the impedance window: " + ", ".join(f"{n[5:]} {100 * r['window'] / r['length']:.0f} %"
                                                     for n, r in summary.items() if n.startswith("USB3")))
-        for m in coupling[:4] + in1[:2]:
+        for m in coupling[:4] + cross[:2]:
             print("   ", m)
 
 

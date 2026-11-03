@@ -1,10 +1,10 @@
 == committed board, coupling ==
-  USB3_TX_P        68 % in the window,  65 % at the designed gap, floor 40 %, in no region 0.00 mm
-  USB3_TX_N        62 % in the window,  60 % at the designed gap, floor 41 %, in no region 0.00 mm
-  USB3_TX_CONN_P   52 % in the window,  50 % at the designed gap, floor 43 %, in no region 0.00 mm
-  USB3_TX_CONN_N   52 % in the window,  50 % at the designed gap, floor 44 %, in no region 0.00 mm
-  USB3_RX_P        66 % in the window,  65 % at the designed gap, floor 60 %, in no region 0.00 mm
-  USB3_RX_N        66 % in the window,  63 % at the designed gap, floor 61 %, in no region 0.25 mm
+  USB3_TX_P        68 % in the window,  65 % at the designed gap, floor 50 %, in no region 0.00 mm
+  USB3_TX_N        62 % in the window,  60 % at the designed gap, floor 44 %, in no region 0.00 mm
+  USB3_TX_CONN_P   52 % in the window,  50 % at the designed gap, floor 49 %, in no region 0.00 mm
+  USB3_TX_CONN_N   52 % in the window,  50 % at the designed gap, floor 50 %, in no region 0.00 mm
+  USB3_RX_P        66 % in the window,  65 % at the designed gap, floor 62 %, in no region 0.00 mm
+  USB3_RX_N        66 % in the window,  63 % at the designed gap, floor 63 %, in no region 0.25 mm
   USB2_D_P         54 % in the window,  49 % at the designed gap, floor 44 %, in no region 0.00 mm
   USB2_D_N         51 % in the window,  44 % at the designed gap, floor 46 %, in no region 0.00 mm
   MDI0_P           86 % in the window,  86 % at the designed gap, floor 83 %, in no region 0.00 mm
@@ -20,39 +20,39 @@
   problems: []
 
 == 732475b: task 9 as reviewed: the board of review 1 (TX 0 % coupled, RX 28 %, USB 2.0 over D+'s antipad) ==
-  coupling problems 26, In1 problems 212; share of each SuperSpeed net inside the impedance window: TX_P 10 %, TX_N 10 %, TX_CONN_P 35 %, TX_CONN_N 36 %, RX_P 39 %, RX_N 39 %
-    USB3_TX_P: 1.59 mm outside the impedance window in 'TX capacitor landing', more than its cap of 1.4 mm (as-built ratchet, not verified against a requirement; ruling BE named a fan-out of about 1 mm, no cap)
+  coupling problems 27, In1 problems 212 (of which 17 are one pair net over another net's via hole; the other 195 are a net's own layer-change via off the listed positions, position drift, not the defect); share of each SuperSpeed net inside the impedance window: TX_P 10 %, TX_N 10 %, TX_CONN_P 35 %, TX_CONN_N 36 %, RX_P 39 %, RX_N 39 %
+    USB3_TX_P: 1.59 mm outside the impedance window in 'TX capacitor landing', more than its cap of 0.94 mm (as-built ratchet, not verified against a requirement; ruling BE named a fan-out of about 1 mm, no cap)
     USB3_TX_P: 1.84 mm outside the impedance window in no region any ruling grants (slack 0.3 mm)
-    USB3_TX_P: 10 % of its length inside the impedance window, below the floor of 40 % the granted regions leave
-    USB3_TX_P: 1 % of its length at the designed gap, below the floor of 35 %
-    USB2_D_N: no In1 ground at (20.738, 18.57), inside the hole round USB2_D_N via via at (20.8, 18.65); that is not an allowed exception
-    USB2_D_N: no In1 ground at (20.752, 18.556), inside the hole round USB2_D_N via via at (20.8, 18.65); that is not an allowed exception
+    USB3_TX_P: 10 % of its length inside the impedance window, below the floor of 50 % the granted regions leave
+    USB3_TX_P: 1 % of its length at the designed gap, below the floor of 45 %
+    USB2_D_N: no In1 ground at (21.36, 18.43), inside the hole round USB2_D_P via via at (21.5, 19.0); that is not an allowed exception
+    USB2_D_N: no In1 ground at (21.38, 18.43), inside the hole round USB2_D_P via via at (21.5, 19.0); that is not an allowed exception
 
 == 584ece4: after fix round 1 (TX coupled, RX still 28 %) ==
   coupling problems 10, In1 problems 0; share of each SuperSpeed net inside the impedance window: TX_P 68 %, TX_N 62 %, TX_CONN_P 52 %, TX_CONN_N 52 %, RX_P 39 %, RX_N 39 %
-    USB3_RX_P: 8.58 mm outside the impedance window in 'U8 straddle', more than its cap of 6.0 mm (as-built ratchet, not verified against a requirement; ruling AS granted about 5 mm of extent, the 1.0 mm of path allowance is not granted)
+    USB3_RX_P: 8.58 mm outside the impedance window in 'U8 straddle', more than its cap of 5.41 mm (as-built ratchet, not verified against a requirement; ruling AS granted about 5 mm of extent, the allowance for path is not granted)
     USB3_RX_P: 2.50 mm outside the impedance window in 'J3 fan-out', more than its cap of 2.0 mm (as-built ratchet, not verified against a requirement; ruling BN granted 1.5 mm, the 0.5 mm of path allowance is not granted)
     USB3_RX_P: 2.29 mm outside the impedance window in no region any ruling grants (slack 0.3 mm)
-    USB3_RX_P: 39 % of its length inside the impedance window, below the floor of 60 % the granted regions leave
+    USB3_RX_P: 39 % of its length inside the impedance window, below the floor of 62 % the granted regions leave
 
 == b13cff9: after fix round 2 (ruling BK: RX 56 / 54 %) ==
   coupling problems 0, In1 problems 0; share of each SuperSpeed net inside the impedance window: TX_P 68 %, TX_N 62 %, TX_CONN_P 52 %, TX_CONN_N 52 %, RX_P 66 %, RX_N 66 %
 
 == defect: RX_N 0.45 mm further from RX_P along x 7.5 to 24.5 (task 9 review 1 found RX 28 % coupled) ==
-  USB3_RX_N        15 % in the window,  10 % at the designed gap, floor 61 %, in no region 8.49 mm
+  USB3_RX_N        15 % in the window,  10 % at the designed gap, floor 63 %, in no region 8.49 mm
     USB3_RX_N: 3.33 mm outside the impedance window in 'J3 fan-out', more than its cap of 2.0 mm (as-built ratchet, not verified against a requirement; ruling BN granted 1.5 mm, the 0.5 mm of path allowance is not granted)
-    USB3_RX_N: 7.95 mm outside the impedance window in 'U8 straddle', more than its cap of 6.0 mm (as-built ratchet, not verified against a requirement; ruling AS granted about 5 mm of extent, the 1.0 mm of path allowance is not granted)
+    USB3_RX_N: 7.95 mm outside the impedance window in 'U8 straddle', more than its cap of 5.62 mm (as-built ratchet, not verified against a requirement; ruling AS granted about 5 mm of extent, the allowance for path is not granted)
     USB3_RX_N: 8.49 mm outside the impedance window in no region any ruling grants (slack 0.3 mm)
-    USB3_RX_N: 15 % of its length inside the impedance window, below the floor of 61 % the granted regions leave
-    USB3_RX_N: 10 % of its length at the designed gap, below the floor of 56 %
+    USB3_RX_N: 15 % of its length inside the impedance window, below the floor of 63 % the granted regions leave
+    USB3_RX_N: 10 % of its length at the designed gap, below the floor of 58 %
 
 == defect: TX_P 0.30 mm further from TX_N along its whole run ==
-  USB3_TX_P         0 % in the window,   0 % at the designed gap, floor 40 %, in no region 1.87 mm
+  USB3_TX_P         0 % in the window,   0 % at the designed gap, floor 50 %, in no region 1.87 mm
     USB3_TX_P: 1.11 mm outside the impedance window in 'U3 neck', more than its cap of 1.0 mm (ruling AG/AI (neck at most 1.0 mm from the pad centre))
-    USB3_TX_P: 1.48 mm outside the impedance window in 'TX capacitor landing', more than its cap of 1.4 mm (as-built ratchet, not verified against a requirement; ruling BE named a fan-out of about 1 mm, no cap)
+    USB3_TX_P: 1.48 mm outside the impedance window in 'TX capacitor landing', more than its cap of 0.94 mm (as-built ratchet, not verified against a requirement; ruling BE named a fan-out of about 1 mm, no cap)
     USB3_TX_P: 1.87 mm outside the impedance window in no region any ruling grants (slack 0.3 mm)
-    USB3_TX_P: 0 % of its length inside the impedance window, below the floor of 40 % the granted regions leave
-    USB3_TX_P: 0 % of its length at the designed gap, below the floor of 35 %
+    USB3_TX_P: 0 % of its length inside the impedance window, below the floor of 50 % the granted regions leave
+    USB3_TX_P: 0 % of its length at the designed gap, below the floor of 45 %
 
 == defect: MDI1_N 0.30 mm further from MDI1_P along its whole run ==
   MDI1_N           23 % in the window,  22 % at the designed gap, floor 81 %, in no region 12.39 mm

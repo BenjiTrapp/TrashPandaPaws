@@ -31,6 +31,12 @@ board is routed, geometry lives in the board and connectivity in
 netlist.yaml: a net change goes into netlist.yaml and reaches the board via
 the schematic (Update PCB from Schematic), never via this script.
 
+BEFORE UNFREEZING (ruling CH): tools/route_pcb.py keeps a hand-written
+REFLOWED = ("U3", "Y1") for its via-to-pad gap rule; the real source of "which
+parts PCBWay assembles" is the `assembly:` marks in hardware/netlist.yaml. A
+re-route after changing those marks applies that rule to the wrong parts unless
+REFLOWED is changed too. Read the HAZARD comment above it first.
+
 SUPERSEDED (kept as the record of the earlier decision; section 6.3 of the
 spec explains why it was reversed): "What this deliberately does NOT do:
 route anything. The seven differential pairs need KiCad's interactive

@@ -4,8 +4,9 @@
 # official Raspberry Pi PoE+ HAT; this board is only the USB 3.0 -> Gigabit
 # Ethernet tap and draws its power from the USB port it plugs into.
 #
-# This file is the source of truth. tools/gen_schematic.py generates
-# kicad/raccoon-hat.kicad_sch from it. Every pin number carries a provenance
+# This file is the source of truth for connectivity. tools/gen_schematic.py
+# generates kicad/raccoon-tap.kicad_sch from it. (kicad/raccoon-hat.* is the
+# abandoned PoE HAT design and is not generated from this file.) Every pin number carries a provenance
 # note; nothing here is inferred.
 #
 # Sources:
@@ -82,9 +83,15 @@
 #             hardware/datasheets/TI_SLYT118_Powering-from-USB_2005.pdf
 #             (md5 c1c8541851b79dc95dbd220f56ced0ca). Table 1: maximum input
 #             capacitor 10 uF, maximum inrush 50 uC, low-power current 100 mA.
-#             SECONDARY source for the USB 2.0 section 7.2.4.1 wording ("if
-#             more bypass capacitance is required ... some form of VBUS surge
-#             current limiting"); the USB-IF text itself was not read here.
+#             SLYT118 itself says (verbatim): "Larger capacitors can be used if
+#             inrush limiting is provided." It does NOT contain the words
+#             "some form of VBUS surge current limiting"; those are the USB 2.0
+#             specification section 7.2.4.1 ("If more bypass capacitance is
+#             required in the device, then the device must incorporate some
+#             form of VBUS surge current limiting"), seen here only in
+#             third-party copies of that text (a studfile.net mirror of the
+#             spec, page 21, and a forum post); the USB-IF text itself was not
+#             read.
 #   [SY8089]  Silergy Application Note AN_SY8089/A rev 0.9A (2013-01-06),
 #             hardware/datasheets/SY8089_silergy_AN_rev0.9A_via-lcsc.pdf
 #             (md5 7c45f31bd305a2bc06e60e6a38ffcc56), downloaded from LCSC
@@ -106,8 +113,8 @@ meta:
   revision: "2.1-draft"
   architecture: "Option A - USB-powered GbE tap, PoE via Pi PoE+ HAT"
   date: "2026-11-01"
-  routed: false
-  erc_clean: false
+  routed: true       # task 9; geometry lives in kicad/raccoon-tap.kicad_pcb, frozen, tools/gen_pcb.py refuses a routed board
+  erc_clean: true    # kicad-cli sch erc --severity-all: 0 violations, re-run by hardware/tests/run_design_checks.sh
 
 # ---------------------------------------------------------------------------
 # Stackup
@@ -541,16 +548,26 @@ components:
         MEASURE, do not guess. Drive level is P = I_rms^2 * ESR, where I_rms is
         the current through the crystal; the amplitude at the pin is not the
         drive level, but it gives the current:
-          I_rms = 2 * pi * f * V_rms * (C0 + CL)   (standard crystal-drive
-          formula, applied here with f = 25 MHz, C0 = 3 pF, CL_total about 21 pF
-          including stray; not from the datasheets)
+          I_rms = 2 * pi * f * V_rms * (C0 + C_node)   (standard crystal-drive
+          formula, applied here with f = 25 MHz and C0 = 3 pF [ABM8]; C_node,
+          the capacitance the measured voltage drives, is an ASSUMPTION, see
+          below; the formula is not from the datasheets)
         Measure V p-p at CKXTAL1 (crystal side) with a probe of 1 pF or less
         (a normal 10:1 probe adds 10-15 pF and detunes it), V_rms = Vpp/(2*sqrt 2)
-        for a sine. Worst case ESR 50 ohm ([ABM8] table 1). Worked numbers:
-        100 uW at 50 ohm is I = 1.41 mA, V_rms = 0.43 V, so about 1.2 V p-p;
-        0.3 mW would be about 2.1 V p-p. A current probe round the crystal lead
-        gives I directly and avoids the formula if one is available.
-        RULE: Vpp at CKXTAL1 <= ~1.2 V with R14 = 0R: leave as is. Above it,
+        for a sine. Worst case ESR 50 ohm ([ABM8] table 1). Worked numbers
+        (task 12 correction; an earlier text said 1.2 V p-p and 2.1 V p-p,
+        which are the values for C_node = 21 pF, i.e. without C0, and did not
+        follow from the formula as stated): 100 uW at 50 ohm is I = 1.41 mA.
+          C_node = 24 pF (C0 3 + CL_total about 21): V_rms 0.375 V, 1.06 V p-p
+          C_node = 31 pF (C0 3 + 27 pF C19 + 4 pF stray, the shunt
+                   capacitance at the CKXTAL1 node itself): 0.82 V p-p
+        and for 0.3 mW (the chip's limit, 2.45 mA): 1.84 V p-p and 1.42 V p-p
+        respectively. Which C_node is right was not settled; both are
+        assumptions built on Cstray = 4 pF. A current probe round the crystal
+        lead gives I directly and avoids the formula and the question.
+        RULE: Vpp at CKXTAL1 <= ~0.8 V with R14 = 0R: leave as is. The lower
+        of the two figures is used so that an error falls on the safe side
+        (trimming earlier than needed costs nothing). Above it,
         fit a larger R14 until it is under; the value is found on the bench,
         none is sourced here. If the amplitude then drops so far that start-up
         becomes unreliable (check cold start 20 times), replace the crystal with
@@ -651,12 +668,19 @@ components:
         measurement on the first build.
       feed_forward: >
         A DNP pad, C24, is provided across R5 (output to FB) for a feed-forward
-        capacitor. No value is given because none is sourced: this file records
-        no [SY8089] figure for it and the SY8089 datasheet is not in
-        hardware/datasheets to check, and a number picked now would be a guess
-        that looks like a spec. It costs one empty 0603 pad and allows trimming
-        transient response or output ripple on the first build with a scope
-        rather than a respin. Leave empty until a measurement says otherwise.
+        capacitor. [SY8089] (committed in hardware/datasheets) gives one
+        figure: its load-transient paragraph says that "adding a 22pF ceramic
+        cap in parallel with R1 may further speed up the load transient
+        responses" and recommends it for large load-step applications; its
+        typical-application circuit shows 22 pF across the upper divider
+        resistor (R1 there, R5 here). That is the only sourced value. It is
+        NOT the 10 pF that C24's 'Part If Fitted' names (an unsourced stocked
+        starting point, see C24); if this pad is ever populated, 22 pF is the
+        figure to try first and the BOM's 10 pF should be reconciled with it.
+        Whether this load needs it is not known (the 1.0 V rail's load step is
+        not published), so it stays empty until a measurement says otherwise.
+        The pad costs one empty 0603 and allows trimming transient response or
+        output ripple on the first build with a scope rather than a respin.
       layout: >
         Datasheet: keep CIN, L, R1 and R2 close to the IC, and keep the trace
         from the divider to FB short and away from the switch node.
@@ -1180,8 +1204,9 @@ components:
       Pad only, no value. See U6 design_notes.feed_forward. Wired across R5:
       one side on +1V0_REG (output), the other on FB. DO NOT FIT unless a
       measurement says so: populate is false and the BOM lists it with
-      Quantity 0. No design value exists, so 'Part If Fitted' is only a
-      stocked starting point: a 10 pF C0G 0603, Yageo CC0603JRNPO9BN100. The
+      Quantity 0. [SY8089] suggests 22 pF here (see feed_forward); the
+      'Part If Fitted' below is 10 pF, which is not that figure and has no
+      source, only a stocked starting point: a 10 pF C0G 0603, Yageo CC0603JRNPO9BN100. The
       pad takes any 0603 value; pick it on the bench. Part: [SOURCING].
     pins: {1: {name: A, type: passive}, 2: {name: B, type: passive}}
 
@@ -1302,8 +1327,17 @@ components:
     source: >
       [SP3019] (committed, md5 54393f11...; see the header): 4 channels, 0.3
       pF typ I/O-to-GND at 3 GHz (page 2 electrical characteristics; no
-      maximum published), 0.18 pF I/O-to-I/O, 5 V stand-off, +/-10 kV contact
-      / +/-15 kV air IEC 61000-4-2, SOT23-6L leaded and hand-solderable. PIN
+      maximum published), 0.18 pF I/O-to-I/O, 5 V stand-off, IEC 61000-4-2
+      '+22 kV / -10 kV' contact and '+22 kV / -10 kV' air (page 1 features
+      and page 2 'ESD Withstand Voltage', column Min, note 1 'guaranteed by
+      design and/or component characterization'; asymmetric: the negative
+      polarity is 10 kV, in air as well as contact), SOT23-6L leaded and
+      hand-solderable. NOTE: an earlier revision of this entry said '+/-10 kV
+      contact / +/-15 kV air', which the PDF does not say. Against [TI-ESD]
+      3.2/4.2, which recommends 8 kV contact / 15 kV air: contact is met in
+      both polarities (-10 kV >= 8 kV), air is met for positive strikes
+      (+22 kV) but the rated -10 kV air is BELOW the recommended 15 kV; this
+      is a datasheet reading, nothing here has been tested on the bench. PIN
       MAP from page 1: the pinout drawing (top view, pins 1 2 3 along the
       bottom, 6 5 4 along the top, pin 1 dot at the bottom left) and the
       functional block diagram, which attaches the four I/O to PIN 1, PIN 3,
@@ -1829,10 +1863,11 @@ design_notes:
     DECIDED 2026-11-01 (task 6), REWORKED after review. PROBLEM: the +5V net
     carried 21.2 uF (C1 10 + C2 0.1 + C3 10 + C5 1 + C18 0.1) directly on the
     connector. [SLYT118] table 1: the USB limit is 10 uF at the connector with
-    at most 50 uC of inrush; USB 2.0 7.2.4.1 (as quoted via [SLYT118] and
-    electrongen.blogspot.com; the USB-IF text itself was not read here): a
-    device that needs more bypass capacitance 'must incorporate some form of
-    VBUS surge current limiting'. 21.2 uF is twice the limit with nothing
+    at most 50 uC of inrush, and [SLYT118] says larger capacitors can be used
+    if inrush limiting is provided. USB 2.0 7.2.4.1 (third-party copies of the
+    text, not SLYT118; the USB-IF text itself was not read here): a device
+    that needs more bypass capacitance 'must incorporate some form of VBUS
+    surge current limiting'. 21.2 uF is twice the limit with nothing
     limiting the current.
 
     FIX, two parts. (a) Less capacitance on raw VBUS: C1 10 uF -> 1 uF, now
@@ -1938,7 +1973,14 @@ design_notes:
     DigiKey, while aggregator sites still list stock as 'active'. SP3019 is
     the Littelfuse replacement and is better on capacitance.
 
-    U8 PIN MAP, PROVENANCE: [SP3019] (committed) page 1, pinout drawing and functional block diagram: I/O on pins 1, 3, 4, 6, GND on pin 2, pin 5 not connected; pin 1 is the dotted corner at the bottom left of the top view, the same numbering as KiCad's SOT-23-6 footprint (pads 1-3 along one side, 4-6 back along the other). Task 8 must still check the placed footprint's pad 1 against that drawing. LAYOUT (for tasks 8 and 9). U9 is flow-through: D+ enters pad 1 and leaves
+    U8 PIN MAP, PROVENANCE: [SP3019] (committed) page 1, pinout drawing and
+    functional block diagram: I/O on pins 1, 3, 4, 6, GND on pin 2, pin 5 not
+    connected; pin 1 is the dotted corner at the bottom left of the top view,
+    the same numbering as KiCad's SOT-23-6 footprint (pads 1-3 along one side,
+    4-6 back along the other). Task 8 checked the placed footprint's pad 1
+    against that drawing (see U8 source).
+
+    LAYOUT (for tasks 8 and 9). U9 is flow-through: D+ enters pad 1 and leaves
     pad 6, D- enters 3 and leaves 4. U8 is NOT flow-through, each line has one
     pin: take each line through its pad (trace in and out of the same pad, no
     side stub), TX pair on pins 1 and 3 with GND (pin 2) between, RX pair on

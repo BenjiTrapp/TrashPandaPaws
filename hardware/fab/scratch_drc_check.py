@@ -13,6 +13,13 @@ Run it with the interpreter from the KiCad bundle (it imports pcbnew):
 
 Exit status 0 when every case behaves as expected.
 
+Limits of what a pass means: the escape cases count only trace-to-PAD
+violations (see escape_violations), not a neck's distance to other tracks. That
+is not checked here; on the routed board the neck regions are bounded by the
+rule area and by `AU_OVERHANGS` in tests/check_fab_release.py. This script
+tested the DRC rule file at task 7, before routing existed; it is not part of
+the gate.
+
 The traces are laid below the board outline (y 125 mm and further), clear of
 every part. U3's own pads are used for the last case.
 """

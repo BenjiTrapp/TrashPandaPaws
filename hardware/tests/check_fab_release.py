@@ -1982,14 +1982,24 @@ class PairsKeepTheirIn1Reference(unittest.TestCase):
         self.assertEqual(in1_continuity_problems(self.probe), [])
 
     def test_every_named_exception_is_in_use(self):
+        # Per rule AND per listed position: a rule with two positions whose second one nothing
+        # uses any more is a loophole kept for nothing, and a per-rule count would not see it.
         used = set()
         for net, entry in self.probe["in1"]["nets"].items():
             for gap in entry["gaps"]:
                 if gap["hole"]:
                     rule = _exception_for(net, gap)
-                    used.add(rule["name"] if rule else None)
-        self.assertEqual(used, {r["name"] for r in IN1_EXCEPTIONS},
-                         "an exception nothing uses is a loophole kept for nothing")
+                    if rule is None:
+                        used.add((None, None))
+                    elif "at" not in rule:
+                        used.add((rule["name"], None))
+                    else:
+                        for i, (x, y) in enumerate(rule["at"]):
+                            if math.hypot(x - gap["hole"]["at"][0], y - gap["hole"]["at"][1]) <= 0.05:
+                                used.add((rule["name"], i))
+        expected = {(r["name"], i) for r in IN1_EXCEPTIONS
+                    for i in (range(len(r["at"])) if "at" in r else (None,))}
+        self.assertEqual(used, expected, "an exception position nothing uses is a loophole kept for nothing")
 
     def test_every_pair_was_walked_along_its_whole_length(self):
         for net in BOARD_PAIR_NETS:
@@ -2114,6 +2124,12 @@ class PairCouplingHoldsTheRulings(unittest.TestCase):
                 self.assertTrue(region["basis"].startswith(RATCHET), region)
                 self.assertIn(region["name"], text,
                               f"{region['name']} is a ratchet and has no entry in {ACCEPTED_FINDINGS.name}")
+                # the cap table in A6 is kept by hand: the figure itself has to appear in the text
+                # (as 0.94, or 2.0 / 2, or in a "1.2 / 1.0" pair), not only the region's name
+                cap = region["cap_mm"]
+                spellings = {f"{cap:.2f}", f"{cap:.1f}", f"{cap:g}"}
+                self.assertTrue(any(re.search(rf"(?<![\d.]){re.escape(t)}(?![\d])", text) for t in spellings),
+                                f"{region['name']} ({region['nets']}): cap {cap} mm is not in {ACCEPTED_FINDINGS.name}")
 
     def test_every_cap_names_its_ruling_or_says_it_is_a_ratchet(self):
         for region in COUPLING_REGIONS:
@@ -2165,6 +2181,10 @@ class SharedRatchetCapCanFail(unittest.TestCase):
         for nets in (r"USB3_TX(_CONN)?_[PN]", r"USB3_RX_[PN]", r"USB3_TX_CONN_[PN]"):
             self.assertTrue(shared_ratchet_problems(self._planted("ratchet", nets)), nets)
 
+
+class TxConnNHasItsOwnCap(unittest.TestCase):
+    """The defect ruling BY names, planted on the committed board's measurements: TX_CONN_N
+    must be held to its own length in the U8 straddle, not to the pair-wide 8.0 mm."""
 
     def test_tx_conn_n_cannot_degrade_into_the_room_the_shared_cap_left(self):
         # the defect ruling BY names: N measures 6.68 mm in the straddle, under a pair-wide 8.0 it
@@ -2530,7 +2550,8 @@ COUPLING_REGIONS = (
        "kind": "ratchet",
        "basis": RATCHET + "; ruling AS granted about 5 mm of extent, the allowance for path is not granted"}
       for net, cap in (("USB3_RX_P", 5.41), ("USB3_RX_N", 5.62))),
-    # Ruling BV: 8.0 mm of PATH for TX_CONN's straddle. A granted concession under
+    # Ruling BV, as ruling CD reads it: 8.0 mm of PATH for USB3_TX_CONN_P's
+    # straddle alone (not the pair). A granted concession under
     # reservation, not an engineering target: forced by U8's SOT-23-6 pad rows,
     # TX has no EMC iterations left. Verified by the SuperSpeed first-build check
     # (hardware/fab/fabrication-note.md); if the link proves marginal U8's
@@ -3195,7 +3216,11 @@ class PasteIsOpenOnlyForTheAssembledParts(unittest.TestCase):
     def test_u3_and_y1_have_their_openings(self):
         counts, _ = gerber_component_openings(self.paste())
         self.assertEqual(counts["Y1"], 4)           # four pads
-        self.assertGreaterEqual(counts["U3"], 40)   # 40 pads and the exposed pad's segments
+        # 49 flashes: 40 pads plus the 9 openings of the exposed pad (pin 41). The count is of
+        # every flash, region or draw line the file attributes to U3; the file has only D03
+        # flashes, so an exact figure makes the test fail if a pad loses its opening, which
+        # a lower bound of 40 would not.
+        self.assertEqual(counts["U3"], 49)
 
     def test_the_full_paste_layer_of_the_board_would_not_pass(self):
         # the control: the board's own F.Paste has openings on other components, so the test
