@@ -344,7 +344,7 @@ stream carries one log line.
 
 | Setting | What happens |
 |---|---|
-| `pause` | the campaign suspends and the knock stays open for your return |
+| `pause` | the campaign suspends and the knock stays on the record for your return |
 | `skip` | refused and recorded; nothing is evaluated |
 | `decide` | the expected-value check answers, and its decision is logged |
 
@@ -461,6 +461,12 @@ was told and said.
 - **`agent.defaults` in `configs/raccoon.yaml` is reference only.** It
   documents what the form is pre-filled with; it is not read at runtime. A
   test keeps the two in step.
+- **Answering a knock while the run is paused is not wired.** The request is
+  recorded and the drawer shows it, but nothing is awaiting the answer while
+  the campaign is suspended, so the buttons resolve nothing. Resuming
+  re-reaches the action — with `pause` still configured it suspends again,
+  so switch the behaviour to `decide` or `skip` before resuming, or stop the
+  run. The record is complete either way.
 
 ---
 

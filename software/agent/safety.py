@@ -98,6 +98,21 @@ _READERS = ("grep", "egrep", "fgrep", "rgrep", "man", "cat", "less", "more",
 # separator into `-f:`, which a prefix match reads as awk's script flag and
 # escalates a log grep to a refusal. A flag whose value is attached must not
 # match, so those entries are anchored with $.
+# Programs that read with one operand and write to the second, with the
+# flags that carry a value of their own. The value flags are the point: a
+# number is only an operand when no flag claimed it, so `xxd -l 64 /dev/sda`
+# reads 64 bytes of a device while `xxd /tmp/hex /dev/sda` overwrites it.
+# Same shape as the per-program number tables the scope checker keeps, and
+# for the same reason -- a flag's meaning is per program, not global.
+#
+# Kept apart from _DESTINATION_LAST, which is about commands that are
+# writes however they are invoked; these become one only once a second
+# operand appears.
+_WRITES_ITS_LAST_OPERAND = {
+    "xxd": ("-l", "-len", "-s", "-seek", "-c", "-cols", "-g", "-groupsize",
+            "-o"),
+}
+
 _CONDITIONAL_READERS = {
     "find": (r"^-exec(?:dir)?$", r"^-delete$", r"^-ok$", r"^-fprint", r"^-fls"),
     # `-f` may carry its value attached, so the anchor admits a path start
@@ -114,10 +129,37 @@ _COMMAND_INTRODUCERS = _WRAPPERS + (
     "shell", "cmd", "powershell", "pwsh")
 
 
+def _bare_operands(tokens, value_flags=()):
+    """Tokens that are neither a flag nor a flag's value."""
+    out = []
+    skip = False
+    for token in tokens:
+        if skip:
+            skip = False
+            continue
+        if token.startswith("-"):
+            skip = token in value_flags
+            continue
+        if "=" in token.split("/", 1)[0]:
+            continue
+        out.append(token)
+    return out
+
+
 def _is_reader(program, tokens):
     """True if the program only reads, given how it was invoked."""
     if program in _READERS:
         return True
+    # A program whose last operand is where it writes reads only while it
+    # has one. xxd is the case that taught this: `-r` chooses the encoding,
+    # not the direction, so a reader exemption keyed on the flag let
+    # `xxd /tmp/hex /dev/sda` destroy a device at tier 3 -- and the reader
+    # shortcut is what stopped the write predicate and _KNOWN_DESTROYERS
+    # from ever seeing it. The rule is the operand count.
+    value_flags = _WRITES_ITS_LAST_OPERAND.get(program)
+    if value_flags is not None:
+        if len(_bare_operands(tokens, value_flags)) > 1:
+            return False
     acting = _CONDITIONAL_READERS.get(program)
     if acting is None:
         return False

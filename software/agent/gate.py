@@ -271,17 +271,34 @@ class Gate:
             return GateDecision(
                 False, "unrecognised tier %r; refused" % (tier,), "hard", None)
 
-        if self.mode == "auto":
-            if self.unattended_behavior == "pause":
-                raise GatePauseRequested(classification.action_key)
-            if self.unattended_behavior == "skip":
-                return self._skip(classification)
+        if self.mode == "auto" and self.unattended_behavior == "skip":
+            return self._skip(classification)
 
         numbers = self._evaluate(classification, p_success_override)
         approval_id = queries.create_approval(
             self._conn, self._run_id, classification.action_key,
             json.dumps(classification._asdict(), default=str),
             json.dumps(numbers, default=str))
+
+        if self.mode == "auto" and self.unattended_behavior == "pause":
+            # The row is written and left pending on purpose, which is why
+            # this moved below create_approval: the campaign suspends and
+            # the knock has to be waiting when the operator returns. Raising
+            # first left pending() empty, so the drawer had no card to
+            # render and no approval_id to answer, and resuming re-reached
+            # the action and paused again -- the same loop the supervised
+            # timeout was fixed to avoid. It also lost the request from
+            # `approvals` entirely, against section 10.7.
+            #
+            # The numbers are computed before the raise so the card can
+            # show the EV it is supposed to show.
+            #
+            # No future is registered, and that is the honest state: nobody
+            # is awaiting an answer, because the campaign is suspended. The
+            # row is the record and the card; answering it while paused is
+            # not wired, and resuming re-reaches the action. AGENT.md says
+            # so under known limits rather than leaving it to be found.
+            raise GatePauseRequested(classification.action_key)
 
         if self.mode == "auto":
             return self._decide_by_ev(approval_id, numbers)

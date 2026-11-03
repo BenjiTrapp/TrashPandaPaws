@@ -1444,5 +1444,48 @@ class TestTheHostLocalListHoldsNoWrapper(unittest.TestCase):
                                             "runas", "pkexec"}
         self.assertEqual(sorted(wrappers & set(safety._HOST_LOCAL_TOOLS)), [])
 
+
+
+class TestXxdWritesWithOrWithoutTheRevertFlag(unittest.TestCase):
+    """xxd's second operand is its output file in both directions.
+
+    `-r` chooses the encoding, not the direction of the write, so a reader
+    exemption keyed on `-r` let the other spelling destroy a device at
+    tier 3:
+
+        xxd -r /tmp/hex /dev/sda   tier 1  disk_wipe
+        xxd    /tmp/hex /dev/sda   tier 3  -- also writes /dev/sda
+
+    xxd is in _KNOWN_DESTROYERS and never reached it, because _is_reader
+    returned True first and that shortcut bypasses the write predicate.
+    The suite pinned only the `-r` spelling, which is the "second way to
+    ask" pattern it otherwise catches well.
+
+    The rule is the operand count, not the flag: one bare operand reads,
+    two write the second one.
+    """
+
+    def _tier(self, command):
+        return safety.classify(command, "dropbox", lambda n: False,
+                               True).tier
+
+    def test_a_write_to_a_device_is_tier_one_either_way(self):
+        for command in ("xxd -r /tmp/hex /dev/sda",
+                        "xxd /tmp/hex /dev/sda",
+                        "xxd -p /tmp/hex /dev/nvme0n1",
+                        "sudo xxd /tmp/hex /dev/disk0"):
+            self.assertEqual(self._tier(command), safety.TIER_HARD, command)
+
+    def test_reading_one_file_is_still_free(self):
+        for command in ("xxd /etc/passwd", "xxd -r /tmp/hex",
+                        "xxd -l 64 /dev/sda", "xxd -p /etc/hosts"):
+            self.assertEqual(self._tier(command), safety.TIER_FREE, command)
+
+    def test_a_write_to_an_ordinary_path_is_not_a_device_wipe(self):
+        # Two operands where the second is not a device: no longer a
+        # reader, but nothing destroys a disk either.
+        self.assertEqual(self._tier("xxd /tmp/in /tmp/out"),
+                         safety.TIER_FREE)
+
 if __name__ == "__main__":
     unittest.main()

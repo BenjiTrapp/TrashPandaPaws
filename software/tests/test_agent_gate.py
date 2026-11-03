@@ -861,12 +861,20 @@ class TestUnattendedBehaviour(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(gate.GatePauseRequested):
             await _gate(conn, rid, unattended_behavior="pause").request(_cls())
 
-    async def test_pause_leaves_no_answerable_row(self):
+    async def test_pause_records_the_request_and_leaves_it_undecided(self):
+        # This test used to assert `_rows(conn) == []`, which pinned the
+        # implementation rather than the requirement: section 10.7 says
+        # every request lands in `approvals`, and section 17.1 renders the
+        # knock from that row. With no row the drawer had nothing to show
+        # and the request vanished from the audit trail. Pausing is not
+        # deciding, so the row stays undecided.
         conn, rid = _fresh_run()
         g = _gate(conn, rid, unattended_behavior="pause")
         with self.assertRaises(gate.GatePauseRequested):
             await g.request(_cls())
-        self.assertEqual(_rows(conn), [])
+        rows = _rows(conn)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["decision"])
 
 
 # ── Construction ──
@@ -961,6 +969,65 @@ class TestAnUnansweredKnockFollowsTheConfiguration(
             d = await g.request(_cls(tier=safety.TIER_HARD))
             self.assertFalse(d.allowed, behaviour)
             self.assertEqual(d.decided_by, "hard", behaviour)
+
+
+
+class TestAPausedRunLeavesSomethingToAnswer(unittest.IsolatedAsyncioTestCase):
+    """Pausing must leave the knock on the record, not vanish with it.
+
+    In auto mode `request()` raised GatePauseRequested before writing the
+    approval row, so `pending()` was empty, the drawer had no card to
+    render and no approval_id to POST back, and resuming re-reached the
+    action and paused again -- the same loop the supervised-timeout path
+    was fixed to avoid, where it deliberately leaves the row pending.
+
+    It also contradicted section 10.7: every request and every decision
+    lands in `approvals`. `_skip` was corrected for exactly this reason
+    already; pause was the remaining inconsistency.
+    """
+
+    async def _paused(self, mode, **kw):
+        conn, rid = _fresh_run()
+        g = _gate(conn, rid, mode=mode, unattended_behavior="pause",
+                  approval_timeout=0.05, **kw)
+        with self.assertRaises(gate.GatePauseRequested):
+            await g.request(_cls())
+        return conn, g
+
+    async def test_auto_mode_records_the_request_before_pausing(self):
+        conn, g = await self._paused("auto")
+        rows = _rows(conn)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["decision"])
+
+    async def test_the_paused_request_is_answerable(self):
+        conn, g = await self._paused("auto")
+        pending = g.pending()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["action"], _cls().action_key)
+
+    async def test_the_card_has_the_numbers_it_needs(self):
+        # Section 17.1: the drawer shows both reasons and the EV. A row
+        # without them renders an empty card.
+        conn, g = await self._paused("auto")
+        row = _rows(conn)[0]
+        self.assertTrue(row["ev_json"])
+        self.assertIn("ev", json.loads(row["ev_json"]))
+
+    async def test_answering_a_paused_knock_is_not_wired_and_says_so(self):
+        # Stated rather than pretended. Nobody awaits the answer while the
+        # campaign is suspended, so answer() reports that it resolved
+        # nothing instead of recording a decision that releases no one.
+        conn, g = await self._paused("auto")
+        approval_id = g.pending()[0]["id"]
+        self.assertFalse(g.answer(approval_id, True))
+        self.assertIsNone(_rows(conn)[0]["decision"])
+
+    async def test_a_supervised_timeout_already_did_this_and_still_does(self):
+        conn, g = await self._paused("supervised")
+        self.assertEqual(len(_rows(conn)), 1)
+        self.assertIsNone(_rows(conn)[0]["decision"])
+        self.assertEqual(len(g.pending()), 1)
 
 if __name__ == "__main__":
     unittest.main()
