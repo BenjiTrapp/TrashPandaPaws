@@ -25,10 +25,13 @@ Library:
 The plan (STAGES) follows the order of the routing brief: SuperSpeed TX and
 RX, MDI0 to MDI3, USB 2.0 (the pairs, coordinates written here), the buck's hot
 loop, U3's supply and low-speed escapes (written here, rulings AU / AY), the
-low-speed nets, the rails, and every GND pad to a via. The last three are
+low-speed nets, the rails, every GND pad to a via, and last (ruling BA) no
+open via in a pad of a hand-soldered part. The low-speed, rail and GND stages are
 searched connection by connection on a 0.05 mm grid by tools/route_grid.py
 round what is already laid, at the project's clearances; each call names the
 connection, its width and where it may end. kicad-cli's DRC is the judge.
+Stages added after the board was routed are applied to it in place by
+tools/amend_pcb.py (the PCB is frozen; gen_pcb.py refuses a routed board).
 
     KIPY=/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/3.9/bin/python3
     $KIPY hardware/tools/route_pcb.py --in <placed board> --out <board> [--stages a,b,...]
@@ -835,6 +838,89 @@ def stage_gnd(r):
     return g
 
 
+# Ruling BA: no open via in or touching a pad of a hand-soldered part (all but
+# U3 and Y1, which PCBWay reflows). The stages above laid three such vias; this
+# last stage takes each out of its pad where the copper allows, and tents from
+# the back (as under U3's pad) the one that cannot move. It is also what
+# tools/amend_pcb.py applies to the routed board.
+PAD_VIAS = [
+    ("+5V", ("U9", 5), "island"),       # partly in U9's VBUS pad
+    ("GND", ("U8", 2), "via"),          # fully in U8's GND pad
+    ("GND", ("C4", 2), "via"),          # touching C4's GND pad
+]
+
+
+def _vias_in_pad(board, net, ref, pad):
+    P = Pads(board)
+    fp = board.FindFootprintByReference(ref)
+    p = next(q for q in fp.Pads() if q.GetNumber() == str(pad))
+    found = []
+    for t in board.GetTracks():
+        if t.Type() == pcbnew.PCB_VIA_T and t.GetNetname() == net:
+            x, y = xy(t.GetPosition())
+            r = pcbnew.ToMM(t.GetWidth(pcbnew.F_Cu)) / 2
+            bb = p.GetBoundingBox()
+            (x0, y0), (x1, y1) = xy(bb.GetOrigin()), xy(bb.GetEnd())
+            dx = max(x0 - x, 0, x - x1)
+            dy = max(y0 - y, 0, y - y1)
+            if math.hypot(dx, dy) <= r + 0.001:
+                found.append(t)
+    return found
+
+
+def stage_pad_vias(r):
+    board = r.board
+    report = []
+    for net, (ref, pad), kind in PAD_VIAS:
+        old = _vias_in_pad(board, net, ref, pad)
+        if not old:
+            report.append((ref, pad, "no via in or at the pad"))
+            continue
+        # tracks that ended on the old via end on the pad's side anyway: the
+        # only ones laid are C4.2's stub, which the new connection replaces
+        gone = [xy(v.GetPosition()) for v in old]
+        for v in old:
+            vx, vy = xy(v.GetPosition())
+            for t in list(board.GetTracks()):
+                if t.Type() == pcbnew.PCB_TRACE_T and t.GetNetname() == net:
+                    a, b = xy(t.GetStart()), xy(t.GetEnd())
+                    if math.hypot(a[0] - vx, a[1] - vy) < 0.01 or math.hypot(b[0] - vx, b[1] - vy) < 0.01:
+                        board.Delete(t)
+            board.Delete(v)
+        r.vias = [q for q in r.vias if not any(
+            abs(q[1] - gx) < 0.01 and abs(q[2] - gy) < 0.01 for gx, gy in gone)]
+        if (ref, pad) == ("U9", 5):
+            # The pad's only open side is east, where the USB 2.0 return via
+            # of stage_usb2 sat 0.65 mm off: that via steps 0.46 mm further
+            # out (1.35 mm from D+'s via instead of 0.92), and VBUS's via takes
+            # the place just past the pad's end, inside the +5V island.
+            for t in list(board.GetTracks()):
+                if t.Type() == pcbnew.PCB_VIA_T and t.GetNetname() == "GND":
+                    vx, vy = xy(t.GetPosition())
+                    if abs(vx - 12.4) < 0.01 and abs(vy - 18.0) < 0.01:
+                        board.Delete(t)
+            r.vias = [q for q in r.vias if not (q[0] == "GND" and abs(q[1] - 12.4) < 0.01 and abs(q[2] - 18.0) < 0.01)]
+            r.via("GND", 12.7, 18.35, "USB 2.0 return near U9's vias, 1.35 mm from D+'s (ruling BA moved it)")
+            x, y = r.P(ref, pad)
+            route_net(board, net, [(x, y), (11.75, y)], 0.3)
+            r.via(net, 11.75, y, "U9 VBUS into the +5V island, just past the pad's end (ruling BA)")
+            report.append((ref, pad, "moved off the pad (just past its east end)"))
+            continue
+        g = Grid(r)
+        res = g.connect(net, (ref, pad), island=(kind == "island"), any_via=(kind == "via"),
+                        copper=(kind == "via"), width=0.3 if net != "+5V" else 0.3, allow_b=False,
+                        margin=2.5, why=f"{ref}.{pad} {net}, via out of the pad (ruling BA)")
+        if res is None:
+            x, y = r.P(ref, pad)
+            via = add_via(board, net, x, y)
+            via.SetBackTentingMode(pcbnew.TENTING_MODE_TENTED)
+            r.vias.append((net, x, y, f"{ref}.{pad} {net} in the pad, tented from the back (ruling BA)"))
+            report.append((ref, pad, "in the pad, tented from the back: no room off the pad"))
+        else:
+            report.append((ref, pad, "moved off the pad"))
+    r.pad_vias = report
+
+
 STAGES = [
     ("usb3_tx", stage_usb3_tx),
     ("usb3_rx", stage_usb3_rx),
@@ -848,6 +934,7 @@ STAGES = [
     ("lowspeed", stage_lowspeed),
     ("supplies", stage_supplies),
     ("gnd", stage_gnd),
+    ("pad_vias", stage_pad_vias),
 ]
 
 
@@ -1089,6 +1176,8 @@ def main():
         for p in problems:
             print("PROBLEM:", p)
         status |= 1 if problems else 0
+    for ref, pad, what in getattr(r, "pad_vias", []):
+        print(f"ruling BA: {ref}.{pad}: {what}")
     if "supplies_u3" in args.stages:
         print("decoupling, cap pad 1 to the nearest pad centre of its U3 pin(s), mm:")
         for ref, pins, d in decoupling_distances(board):

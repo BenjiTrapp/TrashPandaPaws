@@ -205,14 +205,16 @@ PCB Design: [`hardware/kicad/`](hardware/kicad/) (Schematic + PCB, KiCad 10)
 > build today.
 
 <details>
-<summary><strong>PCB Layout</strong> (click to expand)</summary>
+<summary><strong>PCB Layout</strong> (click to expand; shows the Raccoon Tap board, not the HAT)</summary>
 <br>
 <p align="center">
-  <img src="static/pcb_boardKiCad.png" alt="Raccoon HAT v1.0 PCB Layout (KiCad)" width="800">
+  <img src="static/pcb_boardKiCad.png" alt="Raccoon Tap rev 2.1-draft PCB layout in KiCad: 58x36 mm 4-layer board, routed, front copper and silkscreen over the back GND pour; USB 3.0 plug left, RTL8153B centre, RJ45 MagJack right" width="800">
 </p>
+<p align="center"><em>Raccoon Tap (rev 2.1-draft), routed layout: front copper (red), back copper with its GND pour (blue), silkscreen. USB 3.0 plug J3 on the left, RTL8153B U3 in the centre, RJ45 MagJack J2 on the right.</em></p>
 <p align="center">
-  <img src="static/pcb_board_KiCad.png" alt="Raccoon HAT v1.0 PCB 3D Render" width="800">
+  <img src="static/pcb_board_KiCad.png" alt="Raccoon Tap rev 2.1-draft PCB 3D render from KiCad, top side; the USB plug and the RJ45 jack have no 3D models and show as their pads only" width="800">
 </p>
+<p align="center"><em>Raccoon Tap (rev 2.1-draft), KiCad 3D render of the top side. J2 (RJ45 MagJack) and J3 (USB 3.0 plug) have no 3D models in the library and appear as their footprints only.</em></p>
 
 65×56mm 2-layer board with SI3402-B PoE PD, TPS54302 DC-DC, RTL8153B USB-GbE,
 AP2112K LDO, W25Q16 SPI Flash, RJ45 downstream jack, USB-A 3.0 to Pi,

@@ -4,7 +4,8 @@ Board: `hardware/kicad/raccoon-tap.kicad_pcb`, 4 layers, 1.6 mm, 1 oz outer
 copper. Layer use: `F.Cu` signals, `In1.Cu` solid GND, `In2.Cu` power, `B.Cu`
 signals plus a GND pour (`netlist.yaml` `stackup`).
 
-This note is attached to the order (task 11). Every number below has a source
+This note is attached to the order (task 11), together with
+`fabrication-note.md` (tented vias, assembly split). Every number below has a source
 or is marked as derived. The PCBWay passages it relies on are quoted verbatim
 in `pcbway-source-excerpts.txt` next to this file, as sections `[1]` to `[4]`
 (fetched 2026-11-02; the full pages are **not** committed, see Open items).

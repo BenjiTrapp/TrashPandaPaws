@@ -8,9 +8,9 @@
     ],
     "source_hashes": {
       "hardware/review/2026-11-02-routing/schematic.json": "abb3659e037c2eed960ca0781bf211d9bb3059557fd7753d7b26881030614abc",
-      "hardware/review/2026-11-02-routing/pcb.json": "20343e2f23fbb12fb1d80458f92edc80add3471d2ac89f374987e3bec64a2823"
+      "hardware/review/2026-11-02-routing/pcb.json": "fb827c1cb9c9290b696397ad3ab96bfb4fe413ebf2684eb16070d050519c02c2"
     },
-    "run_id": "20261102T170237Z-f63cc7",
+    "run_id": "20261103T073547Z-04acb0",
     "config_hash": null,
     "upstream_artifacts": {
       "schematic": {
@@ -21,9 +21,9 @@
       },
       "pcb": {
         "path": "hardware/review/2026-11-02-routing/pcb.json",
-        "sha256": "20343e2f23fbb12fb1d80458f92edc80add3471d2ac89f374987e3bec64a2823",
+        "sha256": "fb827c1cb9c9290b696397ad3ab96bfb4fe413ebf2684eb16070d050519c02c2",
         "schema_version": "1.4.0",
-        "run_id": "20261102T170237Z-f63cc7"
+        "run_id": "20261103T073547Z-04acb0"
       }
     }
   },
@@ -199,6 +199,6 @@
   },
   "capability_mode_ref": {
     "source": "analysis/capability_mode.json",
-    "run_id": "20261102T170237Z-f63cc7"
+    "run_id": "20261103T073547Z-04acb0"
   }
 }

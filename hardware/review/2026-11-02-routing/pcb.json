@@ -16,10 +16,10 @@
       "In1.Cu",
       "In2.Cu"
     ],
-    "track_segments": 858,
+    "track_segments": 859,
     "via_count": 125,
     "zone_count": 18,
-    "total_track_length_mm": 752.38,
+    "total_track_length_mm": 753.5,
     "board_width_mm": 58.0,
     "board_height_mm": 36.0,
     "board_area_mm2": 2088.0,
@@ -3828,20 +3828,20 @@
     }
   ],
   "tracks": {
-    "segment_count": 858,
+    "segment_count": 859,
     "arc_count": 0,
     "width_distribution": {
       "0.2": 511,
       "0.15": 97,
-      "0.3": 118,
-      "0.5": 60,
+      "0.3": 120,
+      "0.5": 59,
       "0.6": 7,
       "0.4": 21,
       "0.8": 1,
       "0.18": 43
     },
     "layer_distribution": {
-      "F.Cu": 706,
+      "F.Cu": 707,
       "B.Cu": 152
     },
     "segments": [
@@ -5529,15 +5529,6 @@
         "net": 12
       },
       {
-        "x1": 119.45,
-        "y1": 84.9,
-        "x2": 118.65,
-        "y2": 84.9,
-        "width": 0.5,
-        "layer": "F.Cu",
-        "net": 12
-      },
-      {
         "x1": 130.08,
         "y1": 104.4,
         "x2": 130.9,
@@ -5551,6 +5542,15 @@
         "y1": 100.4,
         "x2": 117.85,
         "y2": 100.5,
+        "width": 0.3,
+        "layer": "F.Cu",
+        "net": 12
+      },
+      {
+        "x1": 119.45,
+        "y1": 84.9,
+        "x2": 118.55,
+        "y2": 84.9,
         "width": 0.3,
         "layer": "F.Cu",
         "net": 12
@@ -5921,6 +5921,15 @@
         "x2": 109.1,
         "y2": 106.15,
         "width": 0.5,
+        "layer": "F.Cu",
+        "net": 5
+      },
+      {
+        "x1": 110.7375,
+        "y1": 98.0,
+        "x2": 111.75,
+        "y2": 98.0,
+        "width": 0.3,
         "layer": "F.Cu",
         "net": 5
       },
@@ -11596,78 +11605,6 @@
       },
       "via_in_pad": [
         {
-          "component": "U3",
-          "pad": "",
-          "via_x": 122.9,
-          "via_y": 104.1,
-          "via_drill": 0.3,
-          "same_net": false,
-          "via_type": "through"
-        },
-        {
-          "component": "U3",
-          "pad": "",
-          "via_x": 124.0,
-          "via_y": 104.1,
-          "via_drill": 0.3,
-          "same_net": false,
-          "via_type": "through"
-        },
-        {
-          "component": "U3",
-          "pad": "",
-          "via_x": 125.1,
-          "via_y": 101.9,
-          "via_drill": 0.3,
-          "same_net": false,
-          "via_type": "through"
-        },
-        {
-          "component": "U3",
-          "pad": "",
-          "via_x": 122.9,
-          "via_y": 103.0,
-          "via_drill": 0.3,
-          "same_net": false,
-          "via_type": "through"
-        },
-        {
-          "component": "U3",
-          "pad": "",
-          "via_x": 124.0,
-          "via_y": 103.0,
-          "via_drill": 0.3,
-          "same_net": false,
-          "via_type": "through"
-        },
-        {
-          "component": "U3",
-          "pad": "",
-          "via_x": 122.9,
-          "via_y": 101.9,
-          "via_drill": 0.3,
-          "same_net": false,
-          "via_type": "through"
-        },
-        {
-          "component": "U3",
-          "pad": "",
-          "via_x": 125.1,
-          "via_y": 103.0,
-          "via_drill": 0.3,
-          "same_net": false,
-          "via_type": "through"
-        },
-        {
-          "component": "U3",
-          "pad": "",
-          "via_x": 125.1,
-          "via_y": 104.1,
-          "via_drill": 0.3,
-          "same_net": false,
-          "via_type": "through"
-        },
-        {
           "component": "U8",
           "pad": "2",
           "via_x": 115.6,
@@ -11679,19 +11616,82 @@
         {
           "component": "U3",
           "pad": "",
+          "via_x": 122.9,
+          "via_y": 104.1,
+          "via_drill": 0.3,
+          "same_net": false,
+          "via_type": "through"
+        },
+        {
+          "component": "U3",
+          "pad": "",
           "via_x": 124.0,
+          "via_y": 104.1,
+          "via_drill": 0.3,
+          "same_net": false,
+          "via_type": "through"
+        },
+        {
+          "component": "U3",
+          "pad": "",
+          "via_x": 125.1,
           "via_y": 101.9,
           "via_drill": 0.3,
           "same_net": false,
           "via_type": "through"
         },
         {
-          "component": "U9",
-          "pad": "5",
-          "via_x": 111.237,
-          "via_y": 98.0,
+          "component": "U3",
+          "pad": "",
+          "via_x": 122.9,
+          "via_y": 103.0,
           "via_drill": 0.3,
-          "same_net": true,
+          "same_net": false,
+          "via_type": "through"
+        },
+        {
+          "component": "U3",
+          "pad": "",
+          "via_x": 124.0,
+          "via_y": 103.0,
+          "via_drill": 0.3,
+          "same_net": false,
+          "via_type": "through"
+        },
+        {
+          "component": "U3",
+          "pad": "",
+          "via_x": 122.9,
+          "via_y": 101.9,
+          "via_drill": 0.3,
+          "same_net": false,
+          "via_type": "through"
+        },
+        {
+          "component": "U3",
+          "pad": "",
+          "via_x": 125.1,
+          "via_y": 103.0,
+          "via_drill": 0.3,
+          "same_net": false,
+          "via_type": "through"
+        },
+        {
+          "component": "U3",
+          "pad": "",
+          "via_x": 125.1,
+          "via_y": 104.1,
+          "via_drill": 0.3,
+          "same_net": false,
+          "via_type": "through"
+        },
+        {
+          "component": "U3",
+          "pad": "",
+          "via_x": 124.0,
+          "via_y": 101.9,
+          "via_drill": 0.3,
+          "same_net": false,
           "via_type": "through"
         }
       ],
@@ -11791,6 +11791,19 @@
         ]
       },
       {
+        "x": 115.6,
+        "y": 95.86,
+        "size": 0.6,
+        "drill": 0.3,
+        "net": 12,
+        "type": "through",
+        "layers": [
+          "F.Cu",
+          "B.Cu"
+        ],
+        "tenting": []
+      },
+      {
         "x": 120.0,
         "y": 81.2,
         "size": 0.6,
@@ -11851,18 +11864,6 @@
           "B.Cu"
         ],
         "tenting": []
-      },
-      {
-        "x": 118.65,
-        "y": 84.9,
-        "size": 0.6,
-        "drill": 0.3,
-        "net": 12,
-        "type": "through",
-        "layers": [
-          "F.Cu",
-          "B.Cu"
-        ]
       },
       {
         "x": 105.0,
@@ -11986,6 +11987,18 @@
           "B.Cu"
         ],
         "tenting": []
+      },
+      {
+        "x": 112.7,
+        "y": 98.35,
+        "size": 0.6,
+        "drill": 0.3,
+        "net": 12,
+        "type": "through",
+        "layers": [
+          "F.Cu",
+          "B.Cu"
+        ]
       },
       {
         "x": 105.0,
@@ -12351,18 +12364,6 @@
         ]
       },
       {
-        "x": 112.4,
-        "y": 98.0,
-        "size": 0.6,
-        "drill": 0.3,
-        "net": 12,
-        "type": "through",
-        "layers": [
-          "F.Cu",
-          "B.Cu"
-        ]
-      },
-      {
         "x": 145.0,
         "y": 81.2,
         "size": 0.6,
@@ -12401,18 +12402,6 @@
       {
         "x": 114.5,
         "y": 112.8,
-        "size": 0.6,
-        "drill": 0.3,
-        "net": 12,
-        "type": "through",
-        "layers": [
-          "F.Cu",
-          "B.Cu"
-        ]
-      },
-      {
-        "x": 115.6,
-        "y": 95.86,
         "size": 0.6,
         "drill": 0.3,
         "net": 12,
@@ -12519,6 +12508,18 @@
         ]
       },
       {
+        "x": 118.55,
+        "y": 84.9,
+        "size": 0.6,
+        "drill": 0.3,
+        "net": 12,
+        "type": "through",
+        "layers": [
+          "F.Cu",
+          "B.Cu"
+        ]
+      },
+      {
         "x": 106.7,
         "y": 108.6,
         "size": 0.6,
@@ -12580,18 +12581,6 @@
         ]
       },
       {
-        "x": 111.2375,
-        "y": 98.0,
-        "size": 0.6,
-        "drill": 0.3,
-        "net": 5,
-        "type": "through",
-        "layers": [
-          "F.Cu",
-          "B.Cu"
-        ]
-      },
-      {
         "x": 109.1,
         "y": 106.15,
         "size": 0.6,
@@ -12630,6 +12619,18 @@
       {
         "x": 110.85,
         "y": 109.45,
+        "size": 0.6,
+        "drill": 0.3,
+        "net": 5,
+        "type": "through",
+        "layers": [
+          "F.Cu",
+          "B.Cu"
+        ]
+      },
+      {
+        "x": 111.75,
+        "y": 98.0,
         "size": 0.6,
         "drill": 0.3,
         "net": 5,
@@ -13576,7 +13577,7 @@
         157.7,
         115.7
       ],
-      "filled_area_mm2": 1724.31,
+      "filled_area_mm2": 1724.44,
       "fill_region_count": 2,
       "filled_bbox": [
         100.501,
@@ -13605,7 +13606,7 @@
         157.7,
         115.7
       ],
-      "filled_area_mm2": 1819.28,
+      "filled_area_mm2": 1819.41,
       "fill_region_count": 1,
       "filled_bbox": [
         100.501,
@@ -13750,7 +13751,7 @@
         118.8,
         114.6
       ],
-      "filled_area_mm2": 192.82,
+      "filled_area_mm2": 192.37,
       "fill_region_count": 1,
       "filled_bbox": [
         112.4,
@@ -13758,7 +13759,7 @@
         118.8,
         114.6
       ],
-      "fill_ratio": 0.897
+      "fill_ratio": 0.895
     },
     {
       "net": 5,
@@ -13779,7 +13780,7 @@
         111.8,
         114.6
       ],
-      "filled_area_mm2": 91.39,
+      "filled_area_mm2": 91.4,
       "fill_region_count": 1,
       "filled_bbox": [
         106.4,
@@ -15522,12 +15523,12 @@
     {
       "net": "GND",
       "net_number": 12,
-      "total_length_mm": 38.078,
+      "total_length_mm": 38.178,
       "segment_count": 47,
       "via_count": 67,
       "layers": {
         "F.Cu": {
-          "length_mm": 38.078,
+          "length_mm": 38.178,
           "segments": 47
         }
       },
@@ -15570,12 +15571,6 @@
         },
         {
           "layer": "F.Cu",
-          "length_mm": 0.8,
-          "width_mm": 0.5,
-          "impedance_ohm": 87.3
-        },
-        {
-          "layer": "F.Cu",
           "length_mm": 0.82,
           "width_mm": 0.15,
           "impedance_ohm": 115.6
@@ -15583,6 +15578,12 @@
         {
           "layer": "F.Cu",
           "length_mm": 0.141,
+          "width_mm": 0.3,
+          "impedance_ohm": 99.7
+        },
+        {
+          "layer": "F.Cu",
+          "length_mm": 0.9,
           "width_mm": 0.3,
           "impedance_ohm": 99.7
         },
@@ -20172,13 +20173,13 @@
     {
       "net": "+5V",
       "net_number": 5,
-      "total_length_mm": 5.731,
-      "segment_count": 6,
+      "total_length_mm": 6.744,
+      "segment_count": 7,
       "via_count": 7,
       "layers": {
         "F.Cu": {
-          "length_mm": 5.731,
-          "segments": 6
+          "length_mm": 6.744,
+          "segments": 7
         }
       },
       "trace_segments": [
@@ -20199,6 +20200,12 @@
           "length_mm": 0.85,
           "width_mm": 0.5,
           "impedance_ohm": 87.3
+        },
+        {
+          "layer": "F.Cu",
+          "length_mm": 1.013,
+          "width_mm": 0.3,
+          "impedance_ohm": 99.7
         },
         {
           "layer": "F.Cu",
@@ -20242,14 +20249,14 @@
           ]
         },
         {
-          "drill_mm": 0.3,
+          "drill_mm": 0.4,
           "layers": [
             "F.Cu",
             "B.Cu"
           ]
         },
         {
-          "drill_mm": 0.4,
+          "drill_mm": 0.3,
           "layers": [
             "F.Cu",
             "B.Cu"
@@ -21195,11 +21202,12 @@
     },
     {
       "net": "+5V",
-      "track_count": 6,
-      "total_length_mm": 5.73,
-      "min_width_mm": 0.5,
+      "track_count": 7,
+      "total_length_mm": 6.74,
+      "min_width_mm": 0.3,
       "max_width_mm": 0.6,
       "widths_used": [
+        0.3,
         0.5,
         0.6
       ]
@@ -21220,7 +21228,7 @@
     {
       "net": "GND",
       "track_count": 47,
-      "total_length_mm": 38.08,
+      "total_length_mm": 38.18,
       "min_width_mm": 0.15,
       "max_width_mm": 0.5,
       "widths_used": [
@@ -22863,44 +22871,25 @@
       ]
     },
     "+5V": {
-      "islands": 2,
+      "islands": 1,
       "components": {
-        "C1:1": 1,
-        "C2:1": 1,
-        "J3:1": 1,
-        "TP2:1": 1,
-        "U7:1": 1,
-        "U7:3": 1,
+        "C1:1": 0,
+        "C2:1": 0,
+        "J3:1": 0,
+        "TP2:1": 0,
+        "U7:1": 0,
+        "U7:3": 0,
         "U9:5": 0,
-        "via_69": 1,
-        "via_70": 1,
-        "via_71": 1,
-        "via_72": 1,
-        "via_73": 1,
-        "via_74": 1,
-        "via_75": 1
+        "via_69": 0,
+        "via_70": 0,
+        "via_71": 0,
+        "via_72": 0,
+        "via_73": 0,
+        "via_74": 0,
+        "via_75": 0
       },
-      "gaps": [
-        {
-          "layer": "F.Cu",
-          "bbox": [
-            110.74,
-            98.0,
-            110.74,
-            98.0
-          ],
-          "between_islands": [
-            0,
-            1
-          ]
-        }
-      ],
-      "disconnected_pads": [
-        [
-          "C1:1",
-          "U9:5"
-        ]
-      ]
+      "gaps": [],
+      "disconnected_pads": []
     },
     "LS_CT": {
       "islands": 1,
@@ -24627,16 +24616,17 @@
     {
       "net": "+5V",
       "net_number": 5,
-      "min_track_width_mm": 0.5,
+      "min_track_width_mm": 0.3,
       "max_track_width_mm": 0.6,
       "track_widths_used": [
+        0.3,
         0.5,
         0.6
       ],
       "copper_layers": [
         "F.Cu"
       ],
-      "segment_count": 6,
+      "segment_count": 7,
       "via_count": 7,
       "via_drill_sizes_mm": [
         0.3,
@@ -24647,7 +24637,7 @@
           "layers": [
             "In2.Cu"
           ],
-          "filled_area_mm2": 91.39,
+          "filled_area_mm2": 91.4,
           "min_thickness": 0.2
         }
       ],
@@ -24657,8 +24647,8 @@
       "severity": "info",
       "confidence": "deterministic",
       "evidence_source": "topology",
-      "summary": "Power net +5V: 0.5mm min trace",
-      "description": "Power/ground net +5V: min trace 0.5mm, max 0.6mm, 6 segments.",
+      "summary": "Power net +5V: 0.3mm min trace",
+      "description": "Power/ground net +5V: min trace 0.3mm, max 0.6mm, 7 segments.",
       "components": [],
       "nets": [
         "+5V"
@@ -24708,7 +24698,7 @@
           "layers": [
             "In2.Cu"
           ],
-          "filled_area_mm2": 192.82,
+          "filled_area_mm2": 192.37,
           "min_thickness": 0.2
         }
       ],
@@ -24767,14 +24757,14 @@
           "layers": [
             "B.Cu"
           ],
-          "filled_area_mm2": 1724.31,
+          "filled_area_mm2": 1724.44,
           "min_thickness": 0.2
         },
         {
           "layers": [
             "In1.Cu"
           ],
-          "filled_area_mm2": 1819.28,
+          "filled_area_mm2": 1819.41,
           "min_thickness": 0.2
         }
       ],
@@ -26165,52 +26155,20 @@
         "layout"
       ],
       "finding_id": "pcb:VP-001:u8"
-    },
-    {
-      "component": "U9",
-      "pad": "5",
-      "via_x": 111.24,
-      "via_y": 98.0,
-      "tented": false,
-      "detector": "analyze_via_in_pad",
-      "rule_id": "VP-001",
-      "category": "dfm",
-      "severity": "warning",
-      "confidence": "heuristic",
-      "evidence_source": "topology",
-      "summary": "Via in pad: U9:5 (untented)",
-      "description": "Via at (111.24, 98.0) inside SMD pad U9:5. Not tented \u2014 solder may wick through.",
-      "components": [
-        "U9"
-      ],
-      "nets": [
-        "+5V"
-      ],
-      "pins": [],
-      "recommendation": "Fill and cap via in U9:5 or tent with solder mask.",
-      "report_context": {
-        "section": "DFM",
-        "impact": "Solder wicking risk",
-        "standard_ref": ""
-      },
-      "stages": [
-        "layout"
-      ],
-      "finding_id": "pcb:VP-001:u9"
     }
   ],
   "assessments": [],
   "trust_summary": {
-    "total_findings": 66,
+    "total_findings": 65,
     "trust_level": "mixed",
     "by_confidence": {
       "deterministic": 51,
-      "heuristic": 15,
+      "heuristic": 14,
       "datasheet_backed": 0
     },
     "by_evidence_source": {
       "datasheet": 0,
-      "topology": 65,
+      "topology": 64,
       "heuristic_rule": 0,
       "symbol_footprint": 0,
       "bom": 0,
@@ -26220,10 +26178,10 @@
     "provenance_coverage_pct": 0.0
   },
   "summary": {
-    "total_findings": 66,
+    "total_findings": 65,
     "by_severity": {
       "error": 14,
-      "warning": 20,
+      "warning": 19,
       "info": 32
     }
   },
@@ -26232,9 +26190,9 @@
       "hardware/kicad/raccoon-tap.kicad_pcb"
     ],
     "source_hashes": {
-      "hardware/kicad/raccoon-tap.kicad_pcb": "4ccc4aa6a0e0cd5177f8e3f5c07f5e718dff36201a115efb2dbad21835d40d29"
+      "hardware/kicad/raccoon-tap.kicad_pcb": "acf6566901738ef34bbe129f16a9d38dd50494cdbe54419858d4dfe004d46789"
     },
-    "run_id": "20261102T170237Z-f63cc7",
+    "run_id": "20261103T073547Z-04acb0",
     "config_hash": null,
     "upstream_artifacts": {}
   },
@@ -26275,10 +26233,10 @@
   },
   "audience_summary": {
     "designer": {
-      "total_findings": 66,
+      "total_findings": 65,
       "by_severity": {
         "error": 14,
-        "warning": 20,
+        "warning": 19,
         "info": 32
       },
       "by_category": {
@@ -26286,7 +26244,7 @@
         "copper_integrity": 1,
         "placement": 17,
         "assembly": 1,
-        "dfm": 16,
+        "dfm": 15,
         "testability": 1,
         "thermal": 6
       },
@@ -26564,12 +26522,12 @@
       ]
     },
     "reviewer": {
-      "total_findings": 34,
+      "total_findings": 33,
       "by_category": {
         "current_capacity": 16,
         "placement": 15,
         "testability": 1,
-        "dfm": 2
+        "dfm": 1
       },
       "top_issues": [
         {
@@ -26802,31 +26760,24 @@
           "summary": "Via in pad: U8:2 (untented)",
           "recommendation": "Fill and cap via in U8:2 or tent with solder mask.",
           "category": "dfm"
-        },
-        {
-          "rule_id": "VP-001",
-          "severity": "warning",
-          "summary": "Via in pad: U9:5 (untented)",
-          "recommendation": "Fill and cap via in U9:5 or tent with solder mask.",
-          "category": "dfm"
         }
       ]
     },
     "manager": {
       "risk_level": "high",
       "blocker_count": 14,
-      "warning_count": 20,
+      "warning_count": 19,
       "stage_readiness": {
         "schematic": "pass",
         "layout": "needs_work",
         "pre_fab": "needs_review",
         "bring_up": "pass"
       },
-      "one_liner": "14 errors, 20 warnings across 4 categories. Layout stage has blockers."
+      "one_liner": "14 errors, 19 warnings across 4 categories. Layout stage has blockers."
     }
   },
   "capability_mode_ref": {
     "source": "analysis/capability_mode.json",
-    "run_id": "20261102T170237Z-f63cc7"
+    "run_id": "20261103T073547Z-04acb0"
   }
 }
