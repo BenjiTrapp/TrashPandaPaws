@@ -506,6 +506,14 @@ class _Service:
 
 def _beacon(agent) -> Dict[str, Any]:
     out = {key: agent.get(key) for key in _BEACON_FIELDS}
+    # The C2 record carries two identifiers and only one of them works:
+    # `agent_id` ("raccoon-bandit") is what /api/agents/<id>/task addresses,
+    # while `id` is the raw beacon hash. Exposing the hash meant the form
+    # offered a beacon that no campaign could then reach — "beacon ... is not
+    # known to the C2" on the first dispatch. Every test faked a C2 with one
+    # consistent id, so nothing caught it until it ran.
+    out["id"] = agent.get("agent_id") or agent.get("id")
+    out["beacon_id"] = agent.get("id")
     reported = agent.get("caps")
     out["caps"] = list(reported) if isinstance(reported, list) else []
     return out

@@ -1049,3 +1049,43 @@ class TestWithATokenTheTokenIsTheAuthority(_ServiceCase):
             "/status", headers={"X-Agent-Token": self.TOKEN,
                                 "Host": "agent.internal:8099"})
         self.assertEqual(resp.status, 200)
+
+
+class TestABeaconIsOfferedUnderTheIdThatWorks(_ServiceCase):
+    """The C2 record carries two identifiers and only one is addressable.
+
+    `agent_id` ("raccoon-bandit") is what /api/agents/<id>/task reaches;
+    `id` is the raw beacon hash. The form offered the hash, so a campaign
+    started from it failed on its first dispatch with "beacon ... is not
+    known to the C2". Found by running it: every test here faked a C2 whose
+    two ids were the same string, which is exactly why none of them caught
+    it.
+    """
+
+    REAL = {"agent_id": "raccoon-bandit", "id": "3948e54c95459fd4",
+            "hostname": "box.local", "os": "Darwin", "arch": "arm64",
+            "user": "u", "status": "online", "interval": 3,
+            "uplink_iface": None, "caps": ["batch", "dropbox"]}
+
+    async def get_application(self):
+        self.rig = _rig()
+        # Keyed the way the real C2 keys it: by the addressable name, with
+        # the raw hash sitting in the record under `id`.
+        self.rig.c2.agents.clear()
+        self.rig.c2.agents["raccoon-bandit"] = dict(self.REAL)
+        return self.rig.app
+
+    async def test_the_offered_id_is_the_addressable_one(self):
+        body = await (await self.get("/beacons")).json()
+        self.assertEqual(body["beacons"][0]["id"], "raccoon-bandit")
+
+    async def test_the_raw_beacon_hash_is_still_reported_separately(self):
+        body = await (await self.get("/beacons")).json()
+        self.assertEqual(body["beacons"][0]["beacon_id"], "3948e54c95459fd4")
+
+    async def test_a_record_with_only_one_id_still_works(self):
+        # An older C2, or a record restored from a state file.
+        self.rig.c2.agents.clear()
+        self.rig.c2.agents["only-this"] = {"id": "only-this", "caps": []}
+        body = await (await self.get("/beacons")).json()
+        self.assertEqual(body["beacons"][0]["id"], "only-this")
