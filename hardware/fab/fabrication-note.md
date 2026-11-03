@@ -50,3 +50,47 @@ board default, tented on both sides.
 | `lsusb -t` shows the adapter at 5000M; `iperf3` bidirectional for 30 min at 940 Mb/s; `dmesg` free of xHCI link errors and of a fall-back to USB 2.0 | ruling BF: pin 14's +1V0 escape runs 0.229 mm from USB3_RX_N and 0.250 mm from USB3_TX_P for up to 0.21 / 0.12 mm past the edge of U3's escape area, under the class clearance of 0.3 mm (`AU_OVERHANGS` in `tests/check_fab_release.py`) |
 | link stability and error counters at 1000 Mb/s under load | ruling AX: MDI1 and MDI2 at 0.22 mm |
 | `lsusb -t` at 5000M, `iperf3` bidirectional 30 min at 940 Mb/s, no xHCI link errors (same check as above) | ruling BV: the verification of the **granted concession** of 8.0 mm of path for TX_CONN's straddle at U8 (a concession under reservation, not an engineering target; `COUPLING_REGIONS` in `tests/check_fab_release.py`). **If the link proves marginal, change U8's package first** |
+| U3 case temperature: IR thermometer or a thermocouple taped to the top of the package, `iperf3` bidirectional for 30 min at 940 Mb/s, room at about 25 C; expected rise 10 to 20 K; **investigate at 30 K or more** | task 11, U3 thermal (below): the estimate rests on an assumed theta-JA |
+
+## U3 thermal
+
+Written in task 11 because nothing else assessed U3: kicad-happy checks only U4,
+and task 10 computed U4 (34 K reserve) and U6 (about 78 K) by hand. U3 is the
+most heavily loaded part on the board.
+
+**Power.** [RTL-DS] table 26, 1000 Mb/s with heavy network traffic, typical
+(the datasheet gives no maximum): Icc5 0.5 mA, Icc33 70 mA, Icc10 170 mA.
+P = 5 V x 0.5 mA + 3.3 V x 70 mA + 1.0 V x 170 mA = 0.0025 + 0.231 + 0.170 =
+**0.40 W**, dissipated in the chip (what the pins draw is what the die turns
+into heat, apart from the signal power it sends into the cable).
+
+**Limits.** [RTL-DS] table 21 (recommended operating conditions) and table 25:
+ambient 0 to 70 C, maximum junction temperature **125 C**. The datasheet gives **no theta-JA
+and no theta-JC** (searched the committed copy for theta, "C/W", "thermal" and
+"dissipation": no hit).
+
+**Assumed theta-JA: 30 to 45 K/W**. This is an assumption with no source in the
+repository: it is the range usual for a 5 x 5 mm QFN-40 whose exposed pad is soldered
+to an internal ground plane through a via array. Here the pad is 3.6 x 3.6 mm
+with 9 vias of 0.3 mm drill (3 x 3 on 1.1 mm) into a solid `In1.Cu` GND plane,
+on a board of 58 x 36 mm with an `In2.Cu` plane as well.
+
+| Dissipation | Rise (30 to 45 K/W) | Junction at 25 C ambient | Junction at 70 C ambient (datasheet limit) | Reserve to 125 C at 70 C |
+|---|---|---|---|---|
+| 0.40 W (typical, table 26) | 12 to 18 K | 37 to 43 C | 82 to 88 C | 37 to 43 K |
+| 0.81 W (2 x typical) | 24 to 36 K | 49 to 61 C | 94 to 106 C | 19 to 31 K |
+| 1.21 W (3 x typical, the envelope `netlist.yaml` sizes the rails with) | 36 to 54 K | 61 to 79 C | 106 to 124 C | 1 to 19 K |
+
+At the typical load U3 is comfortable even at the 70 C ambient limit. At the
+rail-sizing envelope of 3 x typical the pessimistic end has no reserve; that
+envelope is a current budget for the regulators, not a credible power for a PHY
+that is already at line rate in the typical column, but the table does not hide
+it. **The result is an estimate, not an assessment of this board**: it stands or
+falls with the assumed theta-JA, which only a measurement settles. It is
+therefore a first-build check (last row of the table above): the top of the
+package should come out 10 to 20 K above room temperature after 30 minutes at
+940 Mb/s (the case-to-junction difference is small, so the case is within a few
+kelvin of the junction); 30 K or more means theta-JA or the power is well
+outside the assumption (at 70 C ambient that would put the junction at about
+100 C or more). The enclosure's own ambient is not known and is not
+estimated here.

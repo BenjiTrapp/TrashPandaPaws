@@ -1,0 +1,58 @@
+** Drc report for raccoon-tap.kicad_pcb **
+** Created on 2026-11-03T12:31:08 **
+** Report includes: Errors, Warnings, Exclusions **
+
+** Found 10 DRC violations **
+[silk_overlap]: Silkscreen clearance
+    Rule: Einschränkungen aus Platinenkonfiguration zum Bestückungsdruck; warning
+    @(134.5406 mm, 97.4900 mm): Abschnitt von C21 auf F.Silkscreen
+    @(134.6000 mm, 98.0000 mm): Referenzfeld von J2
+[silk_overlap]: Silkscreen clearance
+    Rule: Einschränkungen aus Platinenkonfiguration zum Bestückungsdruck; warning
+    @(108.4406 mm, 109.1100 mm): Abschnitt von C2 auf F.Silkscreen
+    @(108.3000 mm, 109.5520 mm): Referenzfeld von TP2
+[silk_overlap]: Silkscreen clearance
+    Rule: Einschränkungen aus Platinenkonfiguration zum Bestückungsdruck; warning
+    @(117.5406 mm, 108.7100 mm): Abschnitt von C6 auf F.Silkscreen
+    @(117.1000 mm, 109.0000 mm): Referenzfeld von U4
+[silk_over_copper]: Silkscreen clipped by solder mask
+    Local override; warning
+    @(136.4000 mm, 105.9750 mm): Rechteck von J2 auf F.Silkscreen
+    @(144.2500 mm, 105.8750 mm): Durchsteckpad SH1 [SHIELD] von J2
+[silk_over_copper]: Silkscreen clipped by solder mask
+    Local override; warning
+    @(136.4000 mm, 105.9750 mm): Rechteck von J2 auf F.Silkscreen
+    @(144.2500 mm, 90.1250 mm): Durchsteckpad SH2 [SHIELD] von J2
+[silk_over_copper]: Silkscreen clipped by solder mask
+    Local override; warning
+    @(134.6000 mm, 98.0000 mm): Referenzfeld von J2
+    @(133.6250 mm, 98.0000 mm): Pad 2 [GND] von C21 auf F.Cu
+[silk_over_copper]: Silkscreen clipped by solder mask
+    Local override; warning
+    @(134.6000 mm, 98.0000 mm): Referenzfeld von J2
+    @(135.1750 mm, 98.0000 mm): Pad 1 [MDI_CT] von C21 auf F.Cu
+[silk_over_copper]: Silkscreen clipped by solder mask
+    Local override; warning
+    @(108.3000 mm, 109.5520 mm): Referenzfeld von TP2
+    @(109.0750 mm, 108.6000 mm): Pad 1 [+5V] von C2 auf F.Cu
+[silk_over_copper]: Silkscreen clipped by solder mask
+    Local override; warning
+    @(108.3000 mm, 109.5520 mm): Referenzfeld von TP2
+    @(107.5250 mm, 108.6000 mm): Pad 2 [GND] von C2 auf F.Cu
+[silk_over_copper]: Silkscreen clipped by solder mask
+    Local override; warning
+    @(117.1000 mm, 109.0000 mm): Referenzfeld von U4
+    @(116.6250 mm, 108.2000 mm): Pad 2 [GND] von C6 auf F.Cu
+
+** Found 0 unconnected pads **
+
+** Found 0 Footprint errors **
+
+** Ignored checks **
+    - Footprint has no courtyard defined
+    - Track endpoint not centered on via
+    - Tuning profile track geometries
+    - Footprint doesn't match symbol's footprint filters
+    - Footprint component type doesn't match footprint pads
+
+** End of Report **

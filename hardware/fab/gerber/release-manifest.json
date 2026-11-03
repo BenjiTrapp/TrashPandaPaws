@@ -1,0 +1,31 @@
+{
+  "about": "Written by hardware/tools/export_fab.py. The gerber set binds to the SHA-256 of the board, rules and project files below; tests/check_fab_release.py (check_gerber_freshness) compares them.",
+  "files": {
+    "raccoon-tap-B_Cu.gbl": "3ae259168cfadd3572fe1fede55820a700ed59a339f398b220ef53f1a1865b70",
+    "raccoon-tap-B_Mask.gbs": "a4a5575984d440615f70e0c3bbc6a39f46ca09e6fddba61574595456992c3415",
+    "raccoon-tap-B_Silkscreen.gbo": "7f356f1a95189c160d509980c7853bfe55d5939f9bb9bc061d654dff303e45e1",
+    "raccoon-tap-Edge_Cuts.gm1": "f216f0909ce89edfd28c915ed1e5627dd1b7b930634bc0082c936c0f0a6e9fef",
+    "raccoon-tap-F_Cu.gtl": "2250fc1b852cfb8c98771f752ed27263172269de98803655a0f7a3bbe04e5e5e",
+    "raccoon-tap-F_Mask.gts": "a65530e2b4641700bac64b4748b65eb4af772887a021e5d93b11337e014060e3",
+    "raccoon-tap-F_Paste.gtp": "b68db42c024d0deab083ae5c4aa3f92f6dc5da211e23f572927e8111e65ade3f",
+    "raccoon-tap-F_Silkscreen.gto": "8eec4708c58047ccb6fd8969946a0af26f20c561bf53793828b3e67572b7fc08",
+    "raccoon-tap-GND.g1": "eaa59be21afc07b639320e6b754c2d0ecdeaffb5859b742a4379f0e76bfe8591",
+    "raccoon-tap-NPTH-drl_map.pdf": "dd6607202d19ffa4f597b2e4b854cc5b3ee8da9be6abefd47ca248ae5d005852",
+    "raccoon-tap-NPTH.drl": "3b354c1d18049e09cf4137a5b04de2b46d7b853e8a1413bcaf12b562219d8320",
+    "raccoon-tap-PTH-drl_map.pdf": "139fd3e76fe600ba800516538b6044923ff05ad827f1e440d76e0f30ff55c894",
+    "raccoon-tap-PTH.drl": "4d34ec636512a8652ddb2e6168d889e963fe7ff924e02a72bf752f2afe6f79af",
+    "raccoon-tap-Power.g2": "b98868a5f66443228a109970f81aae554141d9d6d7183f6bdd0470ffe3a4715a",
+    "raccoon-tap-drc.rpt": "69a60ebcd7f4cfbaf21e03cf6cf1e308542c66117b4d83b088e8d4175f69b750",
+    "raccoon-tap-job.gbrjob": "3efae6cdcf38f851efca05125bb5c6fb8d227534b43f34efb709a1fdf2392946"
+  },
+  "inputs": {
+    "board": "0f309dab5a1cfcf0e0f163f1aa0cdc70a7fec1a031040b2d25a5e4372c9f9d25",
+    "project": "a8f25aa459e7220736f0539ceaacb03a799c73a1fa1d2e327c3295c6812fa8d9",
+    "rules": "ff80b90adb646a086176eb3ab602c79c6407151fc540a09f57ef0a9f6649735f"
+  },
+  "kicad": "10.0.6",
+  "paste_openings_only_for": [
+    "U3",
+    "Y1"
+  ]
+}

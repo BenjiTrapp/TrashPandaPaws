@@ -64,6 +64,18 @@ DRC cannot see, measured on the committed board under KiCad's Python
   hardware/review/2026-11-03-routed/mutation_evidence.py runs them on the real
   boards of task 9 that carried the defects.
 
+Added in task 11 (the PCBWay package in hardware/fab/):
+
+  * check_gerber_freshness: the gerber set binds to the SHA-256 of the board, its
+    rules and its project file through release-manifest.json, every file is what
+    the manifest says, and the DRC report beside it is clean; a fresh export of
+    the board must reproduce the committed files. Mutation tests damage a copy.
+  * cpl_pin1_problems: the CPL rotation is derived from pad 1 in the copper
+    gerber and the footprint's silkscreen pin-1 marking, never from the
+    placement table; the paste layer opens only U3 and Y1; the assembly BOM has
+    exactly those two; ORDERING.md states every ruled requirement and its numbers
+    agree with the board; the release set is not git-ignored (ruling E).
+
 Usage:
     python3 check_fab_release.py [-v]
 """
@@ -2592,6 +2604,664 @@ def pair_coupling_problems(probe, targets=None):
             problems.append(f"{net}: {100 * at_gap:.0f} % of its length at the designed gap, below "
                             f"the floor of {100 * floor_gap:.0f} %")
     return problems
+
+
+# ---------------------------------------------------------------------------
+# Task 11, review focus 4: a gerber set must not come from a board other than
+# the one in the repository, and not from a board that failed DRC.
+#
+# A stale set looks exactly like a valid one: same file names, same layers,
+# plausible sizes. File times do not tell them apart either (git does not keep
+# them, a re-saved but unchanged board is newer without being different), so
+# the set carries a manifest written by tools/export_fab.py, which binds the
+# files to the SHA-256 of the board, its rules file and its project file, and
+# to the DRC report made from that same board. The check compares the manifest
+# with the files on disk and the files with the manifest.
+# ---------------------------------------------------------------------------
+
+import hashlib
+import os
+
+FAB = HARDWARE / "fab"
+GERBER_DIR = FAB / "gerber"
+MANIFEST_NAME = "release-manifest.json"
+DRC_REPORT_NAME = "raccoon-tap-drc.rpt"
+EXPORT_FAB = HARDWARE / "tools" / "export_fab.py"
+ASSEMBLED_REFS = ("U3", "Y1")
+
+# What PCBWay needs to build and to assemble this board; the file name ends
+# in one of these (kicad-cli's Protel extensions).
+REQUIRED_GERBER_SUFFIXES = {
+    "F_Cu.gtl": "top copper", "GND.g1": "In1 (GND)", "Power.g2": "In2 (power)",
+    "B_Cu.gbl": "bottom copper", "F_Mask.gts": "top solder mask",
+    "B_Mask.gbs": "bottom solder mask", "F_Silkscreen.gto": "top silkscreen",
+    "B_Silkscreen.gbo": "bottom silkscreen", "F_Paste.gtp": "top paste (U3 and Y1 only)",
+    "Edge_Cuts.gm1": "board outline",
+    "PTH.drl": "plated drill file", "NPTH.drl": "non-plated drill file",
+}
+
+
+def sha256_of(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def drc_report_problems(text, board_name="raccoon-tap.kicad_pcb"):
+    """Why a KiCad DRC report does not show a clean board: not for this board,
+    not run with every severity, any error, any unconnected pad or footprint
+    error, or a report that is not a report."""
+    problems = []
+    head = text.splitlines()[0] if text.strip() else ""
+    if f"Drc report for {board_name}" not in head:
+        problems.append(f"the DRC report is not for {board_name}: {head[:80]!r}")
+    if "Report includes: Errors, Warnings" not in text:
+        problems.append("the DRC report was not made with --severity-all (no 'Errors, Warnings' line)")
+    if "** End of Report **" not in text:
+        problems.append("the DRC report is cut off (no 'End of Report')")
+    errors = len(re.findall(r";\s*error\s*$", text, re.M))
+    if errors:
+        problems.append(f"the DRC report has {errors} error(s)")
+    sections = dict((k, int(n)) for n, k in
+                    re.findall(r"\*\* Found (\d+) (DRC violations|unconnected pads|Footprint errors) \*\*", text))
+    for needed in ("unconnected pads", "Footprint errors"):
+        if needed not in sections:
+            problems.append(f"the DRC report has no '{needed}' section")
+        elif sections[needed]:
+            problems.append(f"the DRC report has {sections[needed]} {needed}")
+    return problems
+
+
+def check_gerber_freshness(pcb=PCB, gerber_dir=GERBER_DIR, dru=DRU, pro=PRO):
+    """One message per reason the gerber set in `gerber_dir` may not be sent
+    to a fab: it does not exist, it was made from another board (or other DRC
+    rules) than the ones given, a file was replaced after the export, a layer
+    is missing or a stray file is there, or the DRC report beside it is not
+    clean. An empty list means the set is the export of this board and the
+    board passed DRC."""
+    gerber_dir = Path(gerber_dir)
+    manifest_path = gerber_dir / MANIFEST_NAME
+    if not manifest_path.is_file():
+        return [f"no gerber set: {manifest_path} does not exist "
+                f"(run hardware/tools/export_fab.py)"]
+    problems = []
+    manifest = json.loads(manifest_path.read_text())
+    for label, path in (("board", pcb), ("rules", dru), ("project", pro)):
+        recorded = manifest.get("inputs", {}).get(label)
+        now = sha256_of(path)
+        if recorded != now:
+            problems.append(
+                f"stale gerber set: it was exported from a {label} file with SHA-256 "
+                f"{str(recorded)[:12]}, the file now is {now[:12]} ({Path(path).name})")
+    files = manifest.get("files", {})
+    on_disk = {p.name for p in gerber_dir.iterdir() if p.is_file()} - {MANIFEST_NAME}
+    for name in sorted(on_disk - set(files)):
+        problems.append(f"{name} is in the gerber folder but not in the manifest")
+    for name, digest in sorted(files.items()):
+        path = gerber_dir / name
+        if not path.is_file():
+            problems.append(f"{name} is in the manifest but missing")
+        elif sha256_of(path) != digest:
+            problems.append(f"{name} was changed after the export (SHA-256 differs from the manifest)")
+    for suffix, what in REQUIRED_GERBER_SUFFIXES.items():
+        if not any(n.endswith(suffix) for n in files):
+            problems.append(f"no file for {what} (*{suffix})")
+    report = gerber_dir / DRC_REPORT_NAME
+    if DRC_REPORT_NAME not in files or not report.is_file():
+        problems.append(f"no DRC report {DRC_REPORT_NAME} beside the set")
+    else:
+        problems += drc_report_problems(report.read_text(), Path(pcb).name)
+    return problems
+
+
+class GerberSetIsCurrent(unittest.TestCase):
+
+    def test_gerbers_are_newer_than_the_pcb_and_drc_was_clean(self):
+        self.assertEqual(check_gerber_freshness(), [])
+
+
+def _copy_set(directory):
+    """A scratch copy of the committed gerber set, for the tests that damage it."""
+    target = Path(directory) / "gerber"
+    shutil.copytree(GERBER_DIR, target)
+    return target
+
+
+class GerberFreshnessCanFail(unittest.TestCase):
+    """The check above is only worth having if it fails on a stale or tainted
+    set. Each test damages a copy of the committed set in one way (the board and
+    the set in the repository are never touched) and demands a message that
+    names that way; the control is the undamaged copy, which must pass."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.set = _copy_set(self.tmp.name)
+
+    def problems(self, pcb=PCB):
+        return check_gerber_freshness(pcb=pcb, gerber_dir=self.set)
+
+    def rewrite_manifest(self, fn):
+        path = self.set / MANIFEST_NAME
+        manifest = json.loads(path.read_text())
+        fn(manifest)
+        path.write_text(json.dumps(manifest))
+
+    def test_control_the_undamaged_copy_passes(self):
+        self.assertEqual(self.problems(), [])
+
+    def test_a_board_changed_after_the_export_makes_the_set_stale(self):
+        board = Path(self.tmp.name) / "raccoon-tap.kicad_pcb"
+        board.write_text(PCB.read_text() + "\n")     # one byte: a re-saved board with other content
+        problems = self.problems(pcb=board)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("stale gerber set", problems[0])
+        self.assertIn("board", problems[0])
+
+    def test_changed_drc_rules_make_the_set_stale(self):
+        rules = Path(self.tmp.name) / "r.kicad_dru"
+        rules.write_text(DRU.read_text() + "\n")
+        problems = check_gerber_freshness(gerber_dir=self.set, dru=rules)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("rules", problems[0])
+
+    def test_an_error_in_the_drc_report_is_refused(self):
+        report = self.set / DRC_REPORT_NAME
+        text = report.read_text().replace("warning\n", "error\n", 1)
+        report.write_text(text)
+        self.rewrite_manifest(lambda m: m["files"].update({DRC_REPORT_NAME: sha256_of(report)}))
+        problems = self.problems()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("error", problems[0])
+
+    def test_unconnected_pads_in_the_drc_report_are_refused(self):
+        report = self.set / DRC_REPORT_NAME
+        report.write_text(report.read_text().replace("Found 0 unconnected pads", "Found 3 unconnected pads"))
+        self.rewrite_manifest(lambda m: m["files"].update({DRC_REPORT_NAME: sha256_of(report)}))
+        self.assertEqual([m for m in self.problems() if "unconnected" in m][:1],
+                         ["the DRC report has 3 unconnected pads"])
+
+    def test_a_drc_report_of_another_board_is_refused(self):
+        report = self.set / DRC_REPORT_NAME
+        report.write_text(report.read_text().replace("raccoon-tap.kicad_pcb", "raccoon-hat.kicad_pcb", 1))
+        self.rewrite_manifest(lambda m: m["files"].update({DRC_REPORT_NAME: sha256_of(report)}))
+        self.assertTrue(any("not for raccoon-tap.kicad_pcb" in m for m in self.problems()))
+
+    def test_a_missing_drc_report_is_refused(self):
+        (self.set / DRC_REPORT_NAME).unlink()
+        self.assertTrue(any(DRC_REPORT_NAME in m for m in self.problems()))
+
+    def test_a_gerber_replaced_after_the_export_is_found(self):
+        path = self.set / "raccoon-tap-F_Cu.gtl"
+        path.write_text(path.read_text() + "G04 edited*\n")
+        problems = self.problems()
+        self.assertEqual(problems, ["raccoon-tap-F_Cu.gtl was changed after the export "
+                                    "(SHA-256 differs from the manifest)"])
+
+    def test_a_missing_layer_is_found(self):
+        (self.set / "raccoon-tap-B_Mask.gbs").unlink()
+        self.rewrite_manifest(lambda m: m["files"].pop("raccoon-tap-B_Mask.gbs"))
+        self.assertEqual(self.problems(), ["no file for bottom solder mask (*B_Mask.gbs)"])
+
+    def test_a_stray_file_from_an_earlier_export_is_found(self):
+        (self.set / "raccoon-tap-F_Cu_old.gtl").write_text("G04 old*\n")
+        self.assertEqual(self.problems(),
+                         ["raccoon-tap-F_Cu_old.gtl is in the gerber folder but not in the manifest"])
+
+    def test_no_set_at_all_is_refused(self):
+        self.assertEqual(len(check_gerber_freshness(gerber_dir=Path(self.tmp.name) / "nothing")), 1)
+
+    def test_file_times_are_not_what_decides(self):
+        # a clone has arbitrary times; the check must neither need them nor be fooled by them
+        later = PCB.stat().st_mtime + 1000
+        for path in self.set.iterdir():
+            os.utime(path, (later, later))
+        self.assertEqual(self.problems(), [])
+        board = Path(self.tmp.name) / "raccoon-tap.kicad_pcb"
+        board.write_text(PCB.read_text() + "\n")
+        os.utime(board, (later - 500, later - 500))   # board OLDER than the gerbers, yet different
+        self.assertIn("stale gerber set", self.problems(pcb=board)[0])
+
+
+def _normalised(path):
+    """A gerber or drill file without the lines that carry the time of the export."""
+    keep = []
+    for line in Path(path).read_text().splitlines():
+        if re.search(r"CreationDate|Created by KiCad|DRILL file|TF\.GenerationSoftware", line):
+            continue
+        keep.append(line)
+    return "\n".join(keep)
+
+
+def load_export_fab():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("export_fab", EXPORT_FAB)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class GerberSetIsTheExportOfTheBoard(unittest.TestCase):
+    """The manifest says which board the set came from; this exports the board
+    again, now, and compares the content. It catches a manifest written by
+    hand over files that were not made from this board."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.export = load_export_fab()
+        cls.fresh = Path(cls.tmp.name) / "gerber"
+        cls.manifest = cls.export.export_set(cls.fresh, drc_report_problems)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_every_gerber_and_drill_file_is_what_a_new_export_gives(self):
+        committed = json.loads((GERBER_DIR / MANIFEST_NAME).read_text())
+        compared = 0
+        for name in committed["files"]:
+            if name.endswith((".pdf", ".rpt", ".gbrjob")):
+                continue          # time stamps inside, no geometry (the DRC verdict is below)
+            self.assertEqual(_normalised(GERBER_DIR / name), _normalised(self.fresh / name), name)
+            compared += 1
+        self.assertGreaterEqual(compared, 11)
+        self.assertEqual(set(committed["files"]), set(self.manifest["files"]))
+
+    def test_the_new_drc_report_is_clean_and_so_is_the_committed_one(self):
+        self.assertEqual(drc_report_problems((self.fresh / DRC_REPORT_NAME).read_text()), [])
+        self.assertEqual(drc_report_problems((GERBER_DIR / DRC_REPORT_NAME).read_text()), [])
+
+    def test_the_export_refuses_a_board_that_fails_drc(self):
+        # a scratch board with a track laid across two pads of different nets
+        mutated = Path(self.tmp.name) / "bad"
+        mutated.mkdir()
+        for name in ("raccoon-tap.kicad_pro", "raccoon-tap.kicad_dru"):
+            shutil.copy(HARDWARE / "kicad" / name, mutated / name)
+        text = PCB.read_text()
+        short = ('\n\t(segment\n\t\t(start 124 103)\n\t\t(end 124 111)\n\t\t(width 0.2)\n'
+                 '\t\t(layer "F.Cu")\n\t\t(net "GND")\n\t\t(uuid "00000000-0000-0000-0000-000000000011")\n\t)\n')
+        (mutated / "raccoon-tap.kicad_pcb").write_text(text.rstrip()[:-1] + short + ")\n")
+        target = Path(self.tmp.name) / "refused"
+        with self.assertRaises(self.export.ExportFailed) as ctx:
+            self.export.export_set(target, drc_report_problems, board=mutated / "raccoon-tap.kicad_pcb",
+                                   dru=mutated / "raccoon-tap.kicad_dru", pro=mutated / "raccoon-tap.kicad_pro")
+        self.assertIn("does not pass DRC", str(ctx.exception))
+        self.assertEqual(sorted(p.name for p in target.glob("*.g*")), [])   # no gerber was written
+
+
+def gerber_flashes(text):
+    """[(x, y)] in mm of every flash (D03) in a gerber with the 4.6 coordinate format."""
+    return [(int(x) / 1e6, int(y) / 1e6)
+            for x, y in re.findall(r"^X(-?\d+)Y(-?\d+)D03\*", text, re.M)]
+
+
+def gerber_pad_positions(text, ref):
+    """{pad number: (x, y)} in mm of the first flash after each `%TO.P,<ref>,<pad>`
+    attribute of a copper gerber."""
+    out = {}
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(rf"%TO\.P,{re.escape(ref)},([^,*]+)", line)
+        if not m or m.group(1) in out:
+            continue
+        for follow in lines[i + 1:i + 8]:
+            f = re.match(r"^X(-?\d+)Y(-?\d+)D03\*", follow)
+            if f:
+                out[m.group(1)] = (int(f.group(1)) / 1e6, int(f.group(2)) / 1e6)
+                break
+    return out
+
+
+def footprint_block(pcb_text, ref):
+    for block in re.split(r"\n\t\(footprint ", pcb_text)[1:]:
+        if re.search(r'\(property "Reference" "%s"' % re.escape(ref), block):
+            return block
+    raise KeyError(ref)
+
+
+def footprint_local_pad(block, number):
+    """Position (x, y) of pad `number` in the footprint's own frame, KiCad's Y down."""
+    m = re.search(r'\n\t\t\(pad "%s" \w+ \w+\s+\(at ([-0-9.]+) ([-0-9.]+)' % re.escape(number), block)
+    return float(m.group(1)), float(m.group(2))
+
+
+def footprint_silk_marker(block):
+    """The pin-1 marking of a footprint in its own frame (Y down): the centre of
+    the polygon on F.SilkS if there is one, else the corner where two silkscreen
+    lines meet (the L-shaped mark of the crystal)."""
+    for poly in re.findall(r"\n\t\t\(fp_poly\n(.*?)\n\t\t\)", block, re.S):
+        if '(layer "F.SilkS")' in poly:
+            pts = [(float(a), float(b)) for a, b in re.findall(r"\(xy ([-0-9.]+) ([-0-9.]+)\)", poly)]
+            return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+    ends = []
+    for line in re.findall(r"\n\t\t\(fp_line\n(.*?)\n\t\t\)", block, re.S):
+        if '(layer "F.SilkS")' in line:
+            a = re.search(r"\(start ([-0-9.]+) ([-0-9.]+)\)", line).groups()
+            b = re.search(r"\(end ([-0-9.]+) ([-0-9.]+)\)", line).groups()
+            ends += [tuple(map(float, a)), tuple(map(float, b))]
+    shared = [p for p in set(ends) if ends.count(p) >= 2]
+    if len(shared) != 1:
+        raise ValueError(f"no single pin-1 marking found ({len(shared)} candidates)")
+    return shared[0]
+
+
+def _rotate_up(x, y, degrees):
+    """Rotate (x, y), Y up, counter-clockwise by `degrees`."""
+    a = math.radians(degrees)
+    return x * math.cos(a) - y * math.sin(a), x * math.sin(a) + y * math.cos(a)
+
+
+def cpl_pin1_problems(rows, pcb_text, copper_gerber_text, tolerance_deg=0.5):
+    """For every CPL row: the rotation that carries the footprint's own pin-1
+    position onto the pin-1 pad that the copper gerber really has, and the
+    marking on the silkscreen next to that pad.
+
+    The CPL rotation is KiCad's orientation, counter-clockwise, Y up, with the
+    footprint in its library pose at 0 degrees (that is what the pad
+    coordinates in the board file are: the library pose). So the angle from the
+    centre to the pad-1 flash in the gerber, less the angle of the library pad 1,
+    is the rotation the part has been given. The gerber is what the fab will
+    see; the board-file angle is not used."""
+    problems = []
+    for row in rows:
+        ref = row["Designator"]
+        block = footprint_block(pcb_text, ref)
+        centre = (float(row["Mid X"]), float(row["Mid Y"]))
+        rotation = float(row["Rotation"])
+        pads = gerber_pad_positions(copper_gerber_text, ref)
+        if "1" not in pads:
+            problems.append(f"{ref}: pad 1 is not in the copper gerber")
+            continue
+        lx, ly = footprint_local_pad(block, "1")
+        library = (lx, -ly)
+        actual = (pads["1"][0] - centre[0], pads["1"][1] - centre[1])
+        derived = (math.degrees(math.atan2(actual[1], actual[0]))
+                   - math.degrees(math.atan2(library[1], library[0]))) % 360
+        if abs(((derived - rotation + 180) % 360) - 180) > tolerance_deg:
+            problems.append(f"{ref}: the CPL says {rotation:g} degrees, the pin-1 pad in the "
+                            f"gerber says {derived:g}")
+        if abs(math.hypot(*actual) - math.hypot(*library)) > 0.01:
+            problems.append(f"{ref}: the CPL centre is not the footprint centre (pad 1 is "
+                            f"{math.hypot(*actual):.3f} mm from it in the gerber, "
+                            f"{math.hypot(*library):.3f} mm in the library)")
+        mx, my = footprint_silk_marker(block)
+        rx, ry = _rotate_up(mx, -my, rotation)
+        marker = (centre[0] + rx, centre[1] + ry)
+        by_distance = sorted((math.dist(marker, pos), number) for number, pos in pads.items())
+        if by_distance[0][1] != "1":
+            problems.append(f"{ref}: the pin-1 marking lands next to pad {by_distance[0][1]}, not pad 1")
+    return problems
+
+
+def read_cpl(path=None):
+    with open(path or FAB / "raccoon-tap-cpl.csv", newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+class CplRotationIsVerifiedAgainstPinOne(unittest.TestCase):
+    """A QFN-40 turned the wrong way is a dead board. The rotation in the CPL
+    is not taken from the placement table: it is derived from where the gerber
+    has pad 1 and where the footprint's silkscreen marks pin 1."""
+
+    def test_the_cpl_has_u3_and_y1_and_nothing_else_on_the_top_side(self):
+        rows = read_cpl()
+        self.assertEqual([r["Designator"] for r in rows], list(ASSEMBLED_REFS))
+        self.assertEqual({r["Layer"] for r in rows}, {"Top"})
+        self.assertEqual(list(rows[0]), ["Designator", "Val", "Package", "Mid X", "Mid Y", "Rotation", "Layer"])
+
+    def test_rotation_and_pin_one_marking_agree_with_the_gerber(self):
+        copper = (GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text()
+        self.assertEqual(cpl_pin1_problems(read_cpl(), PCB.read_text(), copper), [])
+
+    def test_u3_is_turned_180_degrees_pin_1_at_the_lower_right(self):
+        u3 = {r["Designator"]: r for r in read_cpl()}["U3"]
+        self.assertEqual(float(u3["Rotation"]) % 360, 180)
+        pads = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")
+        cx, cy = float(u3["Mid X"]), float(u3["Mid Y"])
+        self.assertGreater(pads["1"][0], cx)      # right of the centre
+        self.assertLess(pads["1"][1], cy)         # below it (Y is up in the gerber)
+        self.assertAlmostEqual(pads["1"][0] - cx, 2.4375, places=4)
+        self.assertAlmostEqual(pads["1"][1] - cy, -1.8, places=4)
+
+    def test_position_is_the_footprint_position_in_gerber_coordinates(self):
+        text = PCB.read_text()
+        for row in read_cpl():
+            x, y = re.search(r"\n\t\t\(at ([-0-9.]+) ([-0-9.]+)", footprint_block(text, row["Designator"])).groups()
+            self.assertEqual((float(row["Mid X"]), float(row["Mid Y"])), (float(x), -float(y)))
+
+    def test_a_cpl_with_the_wrong_rotation_is_caught(self):
+        copper = (GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text()
+        for wrong in ("0", "90", "270"):
+            rows = read_cpl()
+            rows[0]["Rotation"] = wrong
+            problems = cpl_pin1_problems(rows, PCB.read_text(), copper)
+            self.assertTrue(any(m.startswith("U3: the CPL says") for m in problems), (wrong, problems))
+            self.assertTrue(any("marking lands next to pad" in m for m in problems), (wrong, problems))
+
+    def test_a_cpl_with_a_mirrored_y_is_caught(self):
+        copper = (GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text()
+        rows = read_cpl()
+        rows[0]["Mid Y"] = str(-float(rows[0]["Mid Y"]))
+        self.assertTrue(cpl_pin1_problems(rows, PCB.read_text(), copper))
+
+    def test_y1_turned_180_degrees_would_be_harmless_but_90_is_not(self):
+        # the ABM8 has no fixed pin-1 mark (its datasheet: the chamfer "could be located on
+        # pin #1, 3, or 4"); pads 1 and 3 are the two crystal terminals and 2 and 4 are GND, so
+        # a half turn swaps terminals with terminals; a quarter turn puts a terminal on GND
+        text = PCB.read_text()
+        block = footprint_block(text, "Y1")
+        pads = {n: footprint_local_pad(block, n) for n in "1234"}
+        nets = dict(re.findall(r'\(pad "([1-4])" smd roundrect.*?\(net "([^"]+)"\)', block, re.S))
+        self.assertEqual(nets["2"], "GND")
+        self.assertEqual(nets["4"], "GND")
+        self.assertNotIn(nets["1"], ("GND",))
+        self.assertNotIn(nets["3"], ("GND",))
+        half = {n: (-x, -y) for n, (x, y) in pads.items()}
+        self.assertEqual({half[n] == pads[m] for n, m in (("1", "3"), ("2", "4"))}, {True})
+        quarter = {n: (-y, x) for n, (x, y) in pads.items()}
+        self.assertNotEqual(quarter["1"], pads["3"])
+        self.assertNotIn(quarter["1"], pads.values())
+
+
+class PasteIsOpenOnlyForTheAssembledParts(unittest.TestCase):
+
+    def pad_boxes(self, margin=1.2):
+        text = PCB.read_text()
+        boxes = []
+        for ref in ASSEMBLED_REFS:
+            block = footprint_block(text, ref)
+            x, y = map(float, re.search(r"\n\t\t\(at ([-0-9.]+) ([-0-9.]+)", block).groups())
+            pads = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), ref)
+            xs, ys = [p[0] for p in pads.values()], [p[1] for p in pads.values()]
+            boxes.append((min(xs) - margin, max(xs) + margin, min(ys) - margin, max(ys) + margin))
+        return boxes
+
+    def inside(self, point, boxes):
+        return any(x0 <= point[0] <= x1 and y0 <= point[1] <= y1 for x0, x1, y0, y1 in boxes)
+
+    def test_every_paste_opening_lies_on_u3_or_y1(self):
+        flashes = gerber_flashes((GERBER_DIR / "raccoon-tap-F_Paste.gtp").read_text())
+        boxes = self.pad_boxes()
+        self.assertGreaterEqual(len(flashes), 40 + 4)      # U3's 40 pads, Y1's 4, and the exposed pad
+        outside = [f for f in flashes if not self.inside(f, boxes)]
+        self.assertEqual(outside, [])
+
+    def test_the_full_paste_layer_of_the_board_would_not_pass(self):
+        # the control: the board's own F.Paste has openings elsewhere, so the test above can fail
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["kicad-cli", "pcb", "export", "gerbers", "--layers", "F.Paste",
+                            "--output", tmp, str(PCB)], check=True, capture_output=True)
+            flashes = gerber_flashes((Path(tmp) / "raccoon-tap-F_Paste.gtp").read_text())
+        boxes = self.pad_boxes()
+        self.assertGreater(len([f for f in flashes if not self.inside(f, boxes)]), 50)
+
+    def test_there_is_no_bottom_paste_layer_and_no_bottom_part_is_assembled(self):
+        names = json.loads((GERBER_DIR / MANIFEST_NAME).read_text())["files"]
+        self.assertFalse([n for n in names if n.endswith(("B_Paste.gbp",))])
+
+
+ASSEMBLY_BOM = FAB / "raccoon-tap-assembly-bom.csv"
+ORDERING = FAB / "ORDERING.md"
+
+
+class AssemblyBomIsTheTwoMachinePlacedParts(unittest.TestCase):
+
+    def rows(self):
+        with open(ASSEMBLY_BOM, newline="") as fh:
+            return list(csv.DictReader(fh))
+
+    def test_only_u3_and_y1_are_in_it(self):
+        self.assertEqual([r["Reference Designator"] for r in self.rows()], list(ASSEMBLED_REFS))
+        self.assertEqual([r["Quantity Per Part Number"] for r in self.rows()], ["1", "1"])
+
+    def test_part_numbers_are_those_of_the_hand_solder_bom(self):
+        main = {r["Reference"]: r for r in load_bom()}
+        for row in self.rows():
+            ref = row["Reference Designator"]
+            self.assertEqual(row["Manufacturers Part Number"], main[ref]["Part Number"])
+            self.assertEqual(row["Manufacturers Name"], main[ref]["Manufacturer"])
+
+    def test_u3_names_lcsc_c2802072_and_y1_names_a_distributor(self):
+        by_ref = {r["Reference Designator"]: r for r in self.rows()}
+        self.assertEqual(by_ref["U3"]["Distributors Part Number"], "C2802072")
+        self.assertIn("LCSC", by_ref["U3"]["Distributor"])
+        self.assertTrue(by_ref["Y1"]["Distributor"])
+
+    def test_no_hand_soldered_part_is_in_it(self):
+        main = {r["Reference"] for r in load_bom()}
+        self.assertTrue(set(ASSEMBLED_REFS) <= main)
+        refs = {r["Reference Designator"] for r in self.rows()}
+        self.assertEqual(refs, set(ASSEMBLED_REFS))
+
+
+def board_vias(pcb_text):
+    """[(size, drill, back_tented)] of every via of the board."""
+    out = []
+    for block in re.findall(r"\n\t\(via\n(.*?)\n\t\)", pcb_text, re.S):
+        size = float(re.search(r"\(size ([0-9.]+)\)", block).group(1))
+        drill = float(re.search(r"\(drill ([0-9.]+)\)", block).group(1))
+        back = re.search(r"\(tenting\s+\(front (\w+)\)\s+\(back (\w+)\)", block)
+        out.append((size, drill, back.group(2) if back else None))
+    return out
+
+
+class OrderingStatesEveryRuledRequirement(unittest.TestCase):
+    """ORDERING.md is what a human reads before paying. Each ruled requirement
+    is a row here; the numbers that come from the board are compared with the
+    board, so the text cannot drift from the design."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = ORDERING.read_text()
+        cls.flat = re.sub(r"\s+", " ", cls.text)       # a sentence may wrap
+
+    def assertStated(self, pattern, what):
+        self.assertRegex(self.flat, pattern, f"ORDERING.md does not state: {what}")
+
+    def test_partial_assembly_of_exactly_u3_and_y1(self):
+        self.assertStated(r"(?i)partial assembly.{0,80}U3.{0,40}Y1", "partial assembly of U3 and Y1 (rulings Y, AC)")
+        self.assertStated(r"(?i)every other (part|position)", "everything else is fitted by the operator")
+
+    def test_three_via_sizes_match_the_board(self):
+        vias = board_vias(PCB.read_text())
+        sizes = {}
+        for size, drill, _ in vias:
+            sizes[(size, drill)] = sizes.get((size, drill), 0) + 1
+        self.assertEqual(sorted(sizes), [(0.56, 0.3), (0.6, 0.3), (0.8, 0.4)])
+        for (size, drill), count in sizes.items():
+            self.assertStated(rf"\|\s*{size:g} / {drill:g}\s*\|\s*{count}\s*\|",
+                              f"{count} vias of {size:g} / {drill:g} mm")
+        self.assertStated(r"(?i)minimum", "that 0.56 / 0.30 mm is the board's minimum via (ruling BP)")
+
+    def test_tented_vias_match_the_board(self):
+        vias = board_vias(PCB.read_text())
+        tented_back = [v for v in vias if v[2] == "yes"]
+        self.assertEqual(len(tented_back), 10)       # U3's nine and U8 pin 2's
+        self.assertStated(r"(?i)tented.{0,40}(back|bottom)", "vias tented from the back")
+        self.assertStated(r"(?i)nine.{0,60}U3|U3.{0,60}nine|9.{0,40}U3", "U3's nine thermal vias")
+        self.assertStated(r"U8.{0,40}pin 2", "U8 pin 2's via")
+
+    def test_resin_filling_is_a_priced_option_not_a_decision(self):
+        self.assertStated(r"(?i)resin", "resin-filled vias")
+        self.assertStated(r"(?i)(not decided|operator decides|decision for the operator)", "that the operator decides (ruling BD)")
+        self.assertStated(r"(?i)price", "that PCBWay's price for it is to be obtained")
+
+    def test_bottom_side_hand_parts_are_named_and_the_job_is_not_double_sided_smt(self):
+        for ref in ("C9", "C14", "C27"):
+            self.assertStated(rf"\b{ref}\b", f"{ref} on the bottom side (ruling BL)")
+        self.assertStated(r"(?i)not a double-sided", "that this is not double-sided SMT")
+        bottom = re.findall(r'\(footprint "[^"]+"\n\t\t\(layer "B\.Cu"\)', PCB.read_text())
+        self.assertEqual(len(bottom), 3)
+
+    def test_controlled_impedance_with_targets_and_the_mask_pass_question_first(self):
+        self.assertStated(r"90\s*(ohm|Ω)", "90 ohm differential")
+        self.assertStated(r"100\s*(ohm|Ω)", "100 ohm differential")
+        self.assertStated(r"(?i)stackup-note\.md", "the stackup note is attached")
+        mask_passes = r"(?i)passes of (the )?solder\s+mask|mask\s+passes"
+        questions = self.text.split("## Questions for PCBWay", 1)[1]
+        first = questions.split("\n2. ", 1)[0]
+        self.assertRegex(first, r"(?s)^.*\n1\. ")
+        self.assertRegex(re.sub(r"\s+", " ", first), mask_passes)          # Question 1 asks it
+        self.assertStated(r"(?i)two passes", "what two passes do to the tolerance")
+
+    def test_u3_sourcing_names_lcsc_and_what_only_a_quote_can_answer(self):
+        self.assertStated(r"C2802072", "LCSC C2802072")
+        self.assertStated(r"(?i)Mouser.{0,60}DigiKey|DigiKey.{0,60}Mouser", "that Mouser and DigiKey list nothing")
+        self.assertStated(r"(?i)consign", "the consignment fallback")
+        self.assertStated(r"(?i)X-ray", "X-ray of the QFN")
+
+    def test_ruling_u_wuerth_datasheet_is_an_open_item_for_the_human(self):
+        self.assertStated(r"692112030100", "the Würth part number")
+        self.assertStated(r"(?i)403", "HTTP 403")
+        self.assertStated(r"(?i)by hand", "that the human downloads it")
+        self.assertStated(r"(?i)USB 3\.0 (specification|Specification)", "the USB 3.0 specification as the citation")
+
+    def test_archiving_decision_is_recorded_as_ruling_e(self):
+        self.assertStated(r"(?i)ruling E", "ruling E")
+        self.assertStated(r"(?i)versioned", "that the release set is versioned")
+
+    def test_it_names_the_board_it_was_written_for(self):
+        self.assertIn(sha256_of(PCB), self.text)
+        self.assertEqual(json.loads((GERBER_DIR / MANIFEST_NAME).read_text())["inputs"]["board"],
+                         sha256_of(PCB))
+
+    def test_the_files_it_lists_exist(self):
+        for name in re.findall(r"`((?:gerber/)?raccoon-tap[-\w.]*\.(?:gtl|g1|g2|gbl|gts|gbs|gto|gbo|gm1|drl|gtp|gbrjob|csv))`",
+                               self.text):
+            self.assertTrue((FAB / name).is_file() or (GERBER_DIR / name.split("/")[-1]).is_file(), name)
+
+    def test_nothing_was_ordered(self):
+        self.assertStated(r"(?i)nothing (has been|was) (ordered|uploaded)", "that nothing was ordered or uploaded")
+
+
+class ReleaseSetIsVersioned(unittest.TestCase):
+    """Ruling E: hardware/fab/gerber/ is covered by no ignore rule, on purpose."""
+
+    def test_no_file_of_the_set_is_ignored_by_git(self):
+        names = [GERBER_DIR / n for n in json.loads((GERBER_DIR / MANIFEST_NAME).read_text())["files"]]
+        names += [GERBER_DIR / MANIFEST_NAME, FAB / "raccoon-tap-cpl.csv", ASSEMBLY_BOM, ORDERING]
+        for path in names:
+            result = subprocess.run(["git", "check-ignore", "-q", str(path)], cwd=HARDWARE,
+                                    capture_output=True)
+            self.assertEqual(result.returncode, 1, f"{path.name} is ignored by git (exit {result.returncode})")
+
+    def test_control_the_old_gerber_folder_is_ignored(self):
+        result = subprocess.run(["git", "check-ignore", "-q", "gerber/x.gbr"], cwd=HARDWARE,
+                                capture_output=True)
+        self.assertEqual(result.returncode, 0)
+
+
+class U3ThermalIsNotLeftSilent(unittest.TestCase):
+    """kicad-happy assessed only U4; task 10 computed U4 and U6 by hand. U3 is
+    the most heavily loaded part, so the fabrication note carries its estimate
+    and the measurement that decides it."""
+
+    def test_the_fabrication_note_has_an_estimate_and_a_first_build_measurement(self):
+        text = (FAB / "fabrication-note.md").read_text()
+        self.assertRegex(text, r"(?m)^## U3 thermal")
+        section = text.split("## U3 thermal", 1)[1].split("\n## ", 1)[0]
+        self.assertRegex(section, r"125")                        # the datasheet's junction limit
+        self.assertRegex(section, r"(?i)assum")                  # theta-JA is an assumption, said so
+        self.assertRegex(section, r"(?i)first build|first-build")
 
 
 if __name__ == "__main__":
