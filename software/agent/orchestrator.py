@@ -40,6 +40,7 @@ Usage:
 """
 
 import asyncio
+import copy
 import dataclasses
 import functools
 import json
@@ -103,6 +104,32 @@ def _clip(text, limit=_TEXT_MAX) -> str:
     text = str(text)
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
+
+# How many stream events a campaign keeps. Capped because every tool call
+# emits one and a campaign runs for hours; the durable record is the
+# database, and the GUI shows only the newest few hundred anyway.
+_STREAM_MAX = 2000
+
+# What a polled event carries. The full detail — the model's arguments and
+# the command's raw output — is fetched per event when a line is opened,
+# because the stream is polled every 1.5 seconds and a scan's output is
+# measured in kilobytes.
+_DETAIL_PREVIEW = 400
+
+
+def _clipped_event(entry) -> Dict[str, Any]:
+    detail = {}
+    for key, value in entry["detail"].items():
+        if isinstance(value, str) and len(value) > _DETAIL_PREVIEW:
+            detail[key] = value[:_DETAIL_PREVIEW - 1] + "\u2026"
+            detail["_clipped"] = True
+        elif isinstance(value, (dict, list)):
+            # Shapes stay out of the poll: `full` says there is more to read.
+            detail[key] = "<%s>" % type(value).__name__
+            detail["_clipped"] = True
+        else:
+            detail[key] = value
+    return dict(entry, detail=detail)
 
 def _now() -> str:
     # The store's own spelling (queries._iso), so a timestamp in the stream
@@ -218,6 +245,11 @@ class Campaign:
         self._task = None  # type: Optional[asyncio.Task]
         self._state = "idle"
         self._events = []  # type: List[Dict[str, Any]]
+        # Counted separately from the list length: the list is capped, and
+        # `since` is an absolute sequence number the GUI holds across polls.
+        # Indexing by position would start replaying old events the moment
+        # the first one is dropped.
+        self._seq = 0
 
         # Created in start(), inside the running loop: on Python 3.9 both
         # bind to whichever loop is current when they are constructed.
@@ -623,13 +655,32 @@ class Campaign:
             "budgets": {
                 "tokens": {"used": 0, "limit": self._cfg.max_tokens_total},
                 "runtime_seconds": {"elapsed": 0.0,
-                                    "limit": self._cfg.max_runtime_seconds}},
-            "stream_length": len(self._events)}
+                                    "limit": self._cfg.max_runtime_seconds},
+                # A count on its own does not say how close the run is to
+                # being stopped, and this budget is a hard abort.
+                "detections": {"used": 0,
+                               "limit": self._cfg.detection_budget}},
+            # The drawer shows the scope while the campaign runs, so the
+            # operator can see what it is allowed to touch without reopening
+            # the form.
+            "scope": {"allow": list(self._cfg.scope_allow),
+                      "deny": list(self._cfg.scope_deny)},
+            "phases": sorted(self._cfg.phases),
+            "risk_profile": self._cfg.risk_profile,
+            "opsec_profile": self._cfg.opsec_profile,
+            "tasks": {"total": 0, "completed": 0, "failed": 0},
+            "findings": 0,
+            "stream_length": self._seq}
         if self.run_id is not None:
             summary = queries.get_run_summary(self._conn, self.run_id)
             out["phase"] = summary["phase"]
             out["score"] = summary["total_score"]
             out["detections"] = summary["detection_count"]
+            out["budgets"]["detections"]["used"] = summary["detection_count"]
+            out["tasks"] = {"total": summary["task_count"],
+                            "completed": summary["completed_task_count"],
+                            "failed": summary["failed_task_count"]}
+            out["findings"] = summary["finding_count"]
             out["budgets"]["tokens"]["used"] = self._tokens_used()
             out["budgets"]["runtime_seconds"]["elapsed"] = round(
                 self._elapsed(), 3)
@@ -642,12 +693,30 @@ class Campaign:
         what is new. Copies, so a caller cannot edit the record it reads.
         """
         start = since if isinstance(since, int) and since > 0 else 0
-        return [dict(e, detail=dict(e["detail"])) for e in self._events[start:]]
+        # Filtered on seq, not sliced by position: the list is capped, so a
+        # position is not a stable reference. The detail is clipped here —
+        # it is polled every 1.5 seconds and a scan's raw output is large.
+        # `event(seq)` serves the full one when a line is actually opened.
+        return [_clipped_event(e) for e in self._events if e["seq"] > start]
+
+    def event(self, seq: int) -> Optional[Dict[str, Any]]:
+        """One event with its detail unclipped, or None if it has aged out."""
+        for entry in self._events:
+            if entry["seq"] == seq:
+                return dict(entry, detail=copy.deepcopy(entry["detail"]))
+        return None
 
     def _emit(self, kind, text, **detail) -> None:
+        self._seq += 1
         self._events.append({
-            "seq": len(self._events) + 1, "ts": _now(), "kind": kind,
+            "seq": self._seq, "ts": _now(), "kind": kind,
             "text": _clip(text), "detail": detail})
+        # A campaign runs for hours and every tool call emits, so the list is
+        # capped rather than left to grow. The GUI keeps only the newest
+        # MAX_LINES anyway; what is lost is scrollback, and the database
+        # holds the durable record.
+        if len(self._events) > _STREAM_MAX:
+            del self._events[:len(self._events) - _STREAM_MAX]
 
     def _watch(self, tools: List[llm_loop.Tool]) -> List[llm_loop.Tool]:
         """The tools, each reporting its outcome to the stream."""
@@ -665,24 +734,35 @@ class Campaign:
         return watched
 
     def _note_tool(self, name, arguments, result) -> None:
+        # Every event carries the call that produced it: the tool's name, the
+        # arguments the model chose and the result it got back. The detail
+        # panel is supposed to show exactly that (spec §17.1), and it had
+        # nothing to show while only a summary line was recorded. The poll
+        # clips all of it — see _clipped_event — and `event(seq)` serves the
+        # full record when a line is opened.
+        full = {"tool": name, "arguments": arguments, "result": result}
         if isinstance(result, dict) and "error" in result:
-            self._emit("error", "%s: %s" % (name, result["error"]), tool=name)
+            self._emit("error", "%s: %s" % (name, result["error"]), **full)
         elif name == "set_phase" and isinstance(result, dict):
             self._emit("phase", "phase %s" % result.get("phase"),
-                       phase=result.get("phase"))
+                       phase=result.get("phase"), **full)
         elif name == "log_score" and isinstance(result, dict):
             action = result.get("action")
             self._emit("detection" if action == "detection" else "score",
                        "%s (%+d)" % (action, result.get("points", 0)),
-                       action=action, points=result.get("points"))
+                       action=action, points=result.get("points"), **full)
         elif name in ("log_discovery", "remember_finding"):
             self._emit("finding", "%s %s" % (
                 arguments.get("finding_type"), arguments.get("host") or ""),
-                tool=name)
+                **full)
         elif name == "run_command" and isinstance(result, dict):
             self._emit("info", "run_command: %s" % arguments.get("command"),
                        success=result.get("success"),
-                       blocked_reason=result.get("blocked_reason"))
+                       blocked_reason=result.get("blocked_reason"), **full)
+        else:
+            # Everything else still gets a line, so the panel can open any
+            # call rather than the five that happened to be special-cased.
+            self._emit("info", name, **full)
 
     # ── Record ──
 

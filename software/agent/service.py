@@ -9,6 +9,7 @@ sit at the root:
     POST /campaign                       start one; {"run_id"}
     GET  /campaign/<id>                  Campaign.status()
     GET  /campaign/<id>/stream?since=N   {"events": [...], "next": N}
+    GET  /campaign/<id>/event/<seq>      one event, detail unclipped
     GET  /campaign/<id>/approvals        requests waiting for the operator
     POST /campaign/<id>/approve          {"approval_id", "allowed"}
     POST /campaign/<id>/pause | resume | stop
@@ -349,6 +350,28 @@ class _Service:
         return _json({"events": events,
                       "next": events[-1]["seq"] if events else max(since, 0)})
 
+    async def event(self, request):
+        """One stream event with its detail unclipped.
+
+        Separate from the stream because the stream is polled every 1.5
+        seconds: the arguments the model chose and a command's raw output
+        belong to the line the operator actually opened, not to every poll.
+        """
+        campaign = self._find(request)
+        if campaign is None:
+            return _error(404, "no such campaign")
+        try:
+            seq = int(request.match_info["seq"])
+        except (KeyError, ValueError):
+            return _error(400, "seq must be a whole number")
+        entry = campaign.event(seq)
+        if entry is None:
+            # Either never existed or aged out of the capped buffer; the
+            # operator should be told which, since one is their mistake.
+            return _error(404, "no such event, or it is no longer held",
+                          stream_length=campaign.status().get("stream_length"))
+        return _json(entry)
+
     async def approvals(self, request):
         campaign = self._find(request)
         if campaign is None:
@@ -571,6 +594,7 @@ def make_app(cfg, conn, c2, manager, *,
         web.post("/campaign", service.start_campaign),
         web.get(r"/campaign/{run_id:\d+}", service.campaign_status),
         web.get(r"/campaign/{run_id:\d+}/stream", service.stream),
+        web.get(r"/campaign/{run_id:\d+}/event/{seq:\d+}", service.event),
         web.get(r"/campaign/{run_id:\d+}/approvals", service.approvals),
         web.post(r"/campaign/{run_id:\d+}/approve", service.approve),
         web.post(r"/campaign/{run_id:\d+}/pause", service.pause),

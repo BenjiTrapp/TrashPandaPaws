@@ -709,6 +709,48 @@ function agentRenderStream(events){
   if(stick) body.scrollTop = body.scrollHeight;
 }
 
+async function fillEventDetail(body, e){
+  const r = A.rid == null ? {ok: false, status: 0, data: null}
+                          : await aiCall("campaign/" + A.rid + "/event/" + e.seq);
+  body.innerHTML = "";
+  const full = r.ok && r.data && r.data.detail ? r.data.detail : null;
+  const detail = full || e.detail || {};
+  if(detail.tool){
+    body.appendChild(h("h4", {text: "Tool"}));
+    body.appendChild(h("pre", {text: String(detail.tool)}));
+  }
+  if(detail.arguments !== undefined){
+    body.appendChild(h("h4", {text: "Arguments the model chose"}));
+    body.appendChild(h("pre", {text: asText(detail.arguments)}));
+  }
+  if(detail.result !== undefined){
+    body.appendChild(h("h4", {text: "Raw output"}));
+    body.appendChild(h("pre", {text: asText(detail.result)}));
+  }
+  const rest = {};
+  Object.keys(detail).forEach(function(k){
+    if(["tool", "arguments", "result", "_clipped"].indexOf(k) < 0) rest[k] = detail[k];
+  });
+  if(Object.keys(rest).length){
+    body.appendChild(h("h4", {text: "Detail"}));
+    body.appendChild(h("pre", {text: JSON.stringify(rest, null, 2)}));
+  }
+  if(!full){
+    // Says which it was: an event that aged out of the capped buffer is a
+    // different thing from a service that could not be reached.
+    body.appendChild(h("p", {class: "ai-note",
+      text: r.status === 404
+        ? "The full record is no longer held: the stream keeps a bounded number of events."
+        : "The full record could not be fetched (" + reasonOf(r) + "); showing the polled summary."}));
+  }
+}
+
+function asText(value){
+  if(typeof value === "string") return value;
+  try { return JSON.stringify(value, null, 2); }
+  catch(err){ return String(value); }
+}
+
 function openItemDetail(item){
   const ok = openInPanel(item.who === "op" ? "Operator command" : "Agent \u00B7 " + item.e.kind, function(root){
     if(item.who === "op"){
@@ -725,12 +767,12 @@ function openItemDetail(item){
     root.appendChild(kv([["seq", String(e.seq)], ["time", e.ts || ""], ["kind", e.kind || ""]]));
     root.appendChild(h("h4", {text: "Text"}));
     root.appendChild(h("pre", {text: e.text || ""}));
-    root.appendChild(h("h4", {text: "Detail"}));
-    root.appendChild(h("pre", {text: JSON.stringify(e.detail || {}, null, 2)}));
-    // Honest about what the service sends: the stream carries a clipped
-    // summary and a few fields, not the transcript.
-    root.appendChild(h("div", {class: "ai-note",
-      text: "The stream carries this summary only. Full tool arguments, raw tool output and the model exchange are not exposed by the agent service yet."}));
+    // The poll carries a clipped summary, so the full record is fetched for
+    // the one line that was opened. Shown as a placeholder first: the panel
+    // should not sit blank while the request is out.
+    const body = h("div", {}, h("p", {class: "ai-note", text: "Loading the full record..."}));
+    root.appendChild(body);
+    fillEventDetail(body, e);
   });
   if(!ok) notify("info", item.who === "op" ? "Operator command" : "Agent " + item.e.kind,
                  item.who === "op" ? item.h.cmd : item.e.text, 6000);
@@ -758,11 +800,28 @@ function agentRenderDrawer(status){
   const runHot = run.limit && run.elapsed / run.limit > 0.8;
   const rows = d.querySelector(".ai-rows");
   rows.textContent = "";
+  const det = (c.budgets && c.budgets.detections) || {};
+  const tasks = c.tasks || {};
+  const scope = c.scope || {};
+  // Detections against their limit, not as a bare count: that budget is a
+  // hard abort, so the number only means something beside its ceiling.
+  const detText = det.limit == null
+    ? (c.detections == null ? "-" : String(c.detections))
+    : (det.used || 0) + " / " + det.limit;
+  const detHot = det.limit ? (det.used || 0) >= det.limit - 1 : c.detections > 0;
   [["Phase", c.phase == null ? "-" : phase + " / " + max, false],
    ["Score", c.score == null ? "-" : String(c.score), false],
-   ["Detections", c.detections == null ? "-" : String(c.detections), c.detections > 0],
+   ["Detections", detText, detHot],
+   ["Tasks", tasks.total == null ? "-"
+      : tasks.completed + " done, " + tasks.failed + " failed of " + tasks.total,
+    tasks.failed > 0],
+   ["Findings", c.findings == null ? "-" : String(c.findings), false],
    ["Tokens", fmtTokens(tok.used) + " / " + fmtTokens(tok.limit), tokHot],
    ["Runtime", fmtDuration(run.elapsed) + " / " + fmtDuration(run.limit), runHot],
+   ["Risk", c.risk_profile || "-", false],
+   ["OpSec", c.opsec_profile || "-", c.opsec_profile === "yolo"],
+   ["Scope", (scope.allow || []).join(", ") || "-", false],
+   ["Excluded", (scope.deny || []).join(", ") || "none", false],
   ].forEach(function(r){
     rows.appendChild(h("dt", {text: r[0]}));
     rows.appendChild(h("dd", {class: r[2] ? "warn" : null, text: r[1]}));

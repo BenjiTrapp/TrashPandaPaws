@@ -26,6 +26,8 @@ from unittest import IsolatedAsyncioTestCase
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+from software.agent import orchestrator
+from software.agent import config
 from software.agent import c2client, config, gate, orchestrator, safety
 from software.agent.control import ControlSignal
 from software.agent.executor import router
@@ -1456,3 +1458,157 @@ class TestManager(_Case):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAnEventCarriesTheCallThatMadeIt(_Case):
+    """The detail panel is meant to show the arguments and the raw output.
+
+    It had nothing to show: only a summary line was recorded, so spec
+    §17.1's "full tool arguments, raw output, the associated model
+    interaction" was unbuildable. The full record now lives on the event,
+    the poll clips it, and `event(seq)` serves it whole.
+    """
+
+    async def _run(self, calls):
+        conn, c2 = _env()
+        camp = _campaign(conn, c2, mock.MockClient(calls))
+        await camp.start()
+        await camp.wait()
+        return camp
+
+    async def test_the_poll_carries_the_tool_name_and_a_preview(self):
+        camp = await self._run([
+            mock.calls(("log_score", {"action": "host_discovered"})),
+            mock.text("done")])
+        scored = [e for e in camp.stream() if e["kind"] == "score"]
+        self.assertTrue(scored)
+        self.assertEqual(scored[0]["detail"]["tool"], "log_score")
+
+    async def test_the_poll_does_not_ship_whole_structures(self):
+        # Polled every 1.5 seconds, so arguments and results are summarised
+        # rather than sent in full.
+        camp = await self._run([
+            mock.calls(("log_score", {"action": "host_discovered"})),
+            mock.text("done")])
+        detail = camp.stream()[-1]["detail"]
+        for key in ("arguments", "result"):
+            if key in detail:
+                self.assertIsInstance(detail[key], str)
+                self.assertTrue(detail[key].startswith("<"), detail[key])
+
+    async def test_event_returns_the_arguments_and_the_result_whole(self):
+        camp = await self._run([
+            mock.calls(("log_score", {"action": "host_discovered"})),
+            mock.text("done")])
+        seq = [e["seq"] for e in camp.stream() if e["kind"] == "score"][0]
+        full = camp.event(seq)
+        self.assertEqual(full["detail"]["arguments"],
+                         {"action": "host_discovered"})
+        self.assertIsInstance(full["detail"]["result"], dict)
+        self.assertEqual(full["detail"]["tool"], "log_score")
+
+    async def test_event_is_a_copy_so_a_caller_cannot_edit_the_record(self):
+        camp = await self._run([
+            mock.calls(("log_score", {"action": "host_discovered"})),
+            mock.text("done")])
+        seq = [e["seq"] for e in camp.stream() if e["kind"] == "score"][0]
+        camp.event(seq)["detail"]["arguments"]["action"] = "edited"
+        self.assertEqual(camp.event(seq)["detail"]["arguments"]["action"],
+                         "host_discovered")
+
+    async def test_an_unknown_sequence_number_is_none(self):
+        camp = await self._run([mock.text("done")])
+        self.assertIsNone(camp.event(99999))
+
+    async def test_every_tool_call_gets_a_line(self):
+        # Previously only five tool names were special-cased, so the panel
+        # could not open anything else.
+        camp = await self._run([
+            mock.calls(("get_score_context", {})),
+            mock.text("done")])
+        tools = [e["detail"].get("tool") for e in camp.stream()]
+        self.assertIn("get_score_context", tools)
+
+
+class TestTheStreamIsCapped(_Case):
+    """A campaign runs for hours and every tool call emits an event."""
+
+    async def test_sequence_numbers_stay_absolute_when_events_are_dropped(self):
+        # The GUI holds `since` across polls, so a dropped event must not
+        # make an old sequence number point at a new event.
+        conn, c2 = _env()
+        camp = _campaign(conn, c2, mock.MockClient([mock.text("done")]))
+        await camp.start()
+        await camp.wait()
+        for i in range(orchestrator._STREAM_MAX + 50):
+            camp._emit("info", "line %d" % i)
+        events = camp.stream()
+        self.assertLessEqual(len(events), orchestrator._STREAM_MAX)
+        seqs = [e["seq"] for e in events]
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertEqual(len(set(seqs)), len(seqs))
+        self.assertGreater(seqs[0], 1, "the oldest events should have gone")
+
+    async def test_stream_length_keeps_counting_past_the_cap(self):
+        conn, c2 = _env()
+        camp = _campaign(conn, c2, mock.MockClient([mock.text("done")]))
+        await camp.start()
+        await camp.wait()
+        before = camp.status()["stream_length"]
+        for i in range(orchestrator._STREAM_MAX + 10):
+            camp._emit("info", "line %d" % i)
+        self.assertEqual(camp.status()["stream_length"],
+                         before + orchestrator._STREAM_MAX + 10)
+
+    async def test_since_past_the_cap_returns_nothing_rather_than_replaying(self):
+        conn, c2 = _env()
+        camp = _campaign(conn, c2, mock.MockClient([mock.text("done")]))
+        await camp.start()
+        await camp.wait()
+        for i in range(10):
+            camp._emit("info", "line %d" % i)
+        last = camp.status()["stream_length"]
+        self.assertEqual(camp.stream(since=last), [])
+
+
+class TestStatusCarriesWhatTheDrawerShows(_Case):
+    """Scope, the detection budget and task counts were missing.
+
+    The drawer had rows with nothing to put in them. All of it was already
+    in the campaign's own configuration or in get_run_summary.
+    """
+
+    async def _status(self):
+        conn, c2 = _env()
+        camp = _campaign(conn, c2, mock.MockClient([
+            mock.calls(("dispatch_task", {"task_name": "t",
+                                          "task_description": "d"})),
+            mock.text("done"), mock.text("TASK: t\nSTATUS: success")]))
+        await camp.start()
+        await camp.wait()
+        return camp.status()
+
+    async def test_the_scope_is_reported(self):
+        scope = (await self._status())["scope"]
+        self.assertEqual(scope["allow"], ["10.0.1.0/24"])
+        self.assertIn("deny", scope)
+
+    async def test_the_detection_budget_is_reported_with_its_limit(self):
+        # A count alone does not say how close the run is to being stopped,
+        # and this budget is a hard abort.
+        budget = (await self._status())["budgets"]["detections"]
+        self.assertIn("used", budget)
+        self.assertEqual(budget["limit"], config.RISK_PROFILES["normal"]
+                         ["detection_budget"])
+
+    async def test_task_counts_are_reported(self):
+        tasks = (await self._status())["tasks"]
+        self.assertEqual(tasks["total"], 1)
+        self.assertEqual(tasks["completed"], 1)
+        self.assertEqual(tasks["failed"], 0)
+
+    async def test_the_chosen_profiles_are_reported(self):
+        status = await self._status()
+        self.assertEqual(status["risk_profile"], "normal")
+        self.assertEqual(status["opsec_profile"], "normal")
+        self.assertEqual(status["phases"], [1, 2, 3, 4])

@@ -386,3 +386,45 @@ class TestAccentColours(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDrawerAndDetailUseTheNewFields(unittest.TestCase):
+    """The two gaps the GUI could not fill, now that the data exists.
+
+    The drawer had rows with nothing behind them, and the detail panel said
+    outright that the arguments and raw output were not exposed. Both were
+    data gaps in the orchestrator and the service, not in the GUI.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = AGENT_JS.read_text()
+
+    def test_the_detail_panel_fetches_the_full_event(self):
+        self.assertRegex(self.js, r"campaign/\"\s*\+\s*A\.rid\s*\+\s*\"/event/")
+        self.assertIn("function fillEventDetail", self.js)
+
+    def test_the_panel_no_longer_claims_the_data_is_unavailable(self):
+        self.assertNotIn("not exposed by the agent service", self.js)
+
+    def test_the_panel_names_arguments_and_raw_output(self):
+        self.assertIn("Arguments the model chose", self.js)
+        self.assertIn("Raw output", self.js)
+
+    def test_an_aged_out_event_is_distinguished_from_an_unreachable_one(self):
+        # One is the stream's bounded buffer, the other is a broken service,
+        # and they call for different reactions.
+        self.assertRegex(self.js, r"no longer held")
+        self.assertRegex(self.js, r"could not be fetched")
+
+    def test_the_drawer_shows_detections_against_their_limit(self):
+        self.assertRegex(self.js, r"budgets\s*&&\s*c\.budgets\.detections")
+        self.assertRegex(self.js, r"det\.used.*det\.limit")
+
+    def test_the_drawer_shows_tasks_findings_and_the_scope(self):
+        for label in ('"Tasks"', '"Findings"', '"Scope"', '"Excluded"',
+                      '"Risk"', '"OpSec"'):
+            self.assertIn(label, self.js)
+
+    def test_yolo_is_marked_hot_in_the_drawer(self):
+        self.assertRegex(self.js, r'c\.opsec_profile\s*===\s*"yolo"')
