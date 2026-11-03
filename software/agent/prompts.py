@@ -164,6 +164,14 @@ def _forced_flags(program):
 
 
 def _scan_section():
+    # The duration is stated because the rate limit turns a port range into
+    # one, and the model was choosing ranges without it: live, `nmap -p-`
+    # under --max-rate 50 is about 22 minutes, and it asked for it with a
+    # 300-second timeout, got partial output, and asked again. The built-in
+    # timeout is read back from the executor's table rather than written
+    # here, so a change there cannot leave this quoting an old number.
+    from software.agent.executor import server_tool
+    nmap_timeout = server_tool._TOOL_TIMEOUTS["nmap"]
     return "\n".join([
         "Scan rate limits. These are applied to every scan whether you ask or "
         "not, and asking for faster has no effect:",
@@ -172,6 +180,12 @@ def _scan_section():
         "- netdiscover: %s" % _forced_flags("netdiscover"),
         "Scan hosts one at a time rather than running service detection "
         "across a whole /24 in one command.",
+        "What the rate costs in time. At these rates a scan of all 65535 "
+        "ports (-p-) takes roughly 20 minutes and will not finish inside "
+        "the %d-second limit nmap runs under, so it comes back as a partial "
+        "result. Name the ports you care about instead, and leave the "
+        "timeout alone unless you have a reason: each program has a "
+        "built-in limit chosen for it." % nmap_timeout,
     ])
 
 
@@ -236,40 +250,65 @@ def _tier_section(phases, wifi_on):
 _WIFI_PHASES = (6, 7, 8)
 
 
+# The short name of each phase, and the single source for both renderings:
+# the prose the model is given below, and the checkbox label the operator
+# ticks in the GUI. They were separate, and they disagreed -- the GUI called
+# phase 3 "Credential access" and phase 4 "Lateral movement", activities
+# this agent has no phases for, while the model was told 3 is port and
+# service enumeration and 4 is OS and vulnerability fingerprinting. The
+# phase list is the operator's main control over what the agent may do, so a
+# label naming the wrong activity is not a cosmetic fault. Names follow the
+# design, section 12.
+PHASE_NAMES = {
+    1: "Wire Intel",
+    2: "Orientation and Discovery",
+    3: "Port and Service Enumeration",
+    4: "OS and Vulnerability Fingerprinting",
+    5: "Exploitation",
+    6: "Wifi Survey",
+    7: "Wifi Capture",
+    8: "Wifi Crack",
+}
+
+
+def _phase(number, body) -> str:
+    return "Phase %d - %s: %s" % (number, PHASE_NAMES[number], body)
+
+
 def _phase_section(caps_by_beacon, phases):
     caps = set(c for cs in caps_by_beacon.values() for c in cs or [])
     lines = []
     if 1 in phases and "sniffer" in caps:
-        lines.append("Phase 1 - Wire Intel: read what the capture on the "
-                     "bridge already holds (hosts, protocols and any "
-                     "plaintext credentials) before sending a single packet "
-                     "of your own. It is the quietest source there is.")
+        lines.append(_phase(1, "read what the capture on the bridge "
+                            "already holds (hosts, protocols and any "
+                            "plaintext credentials) before sending a single "
+                            "packet of your own. It is the quietest source "
+                            "there is."))
     if 2 in phases:
-        lines.append("Phase 2 - Orientation and Discovery: establish "
-                     "interfaces, neighbours and the live hosts inside the "
-                     "scope, with passive and low-rate methods first.")
+        lines.append(_phase(2, "establish interfaces, neighbours and the "
+                            "live hosts inside the scope, with passive and "
+                            "low-rate methods first."))
     if 3 in phases:
-        lines.append("Phase 3 - Port and Service Enumeration: find open ports "
-                     "and identify the services on hosts already found.")
+        lines.append(_phase(3, "find open ports and identify the services "
+                            "on hosts already found."))
     if 4 in phases:
-        lines.append("Phase 4 - OS and Vulnerability Fingerprinting: "
-                     "fingerprint operating systems, and look up known "
-                     "vulnerabilities for the versions you identified (the "
-                     "executor's lookup_cve).")
+        lines.append(_phase(4, "fingerprint operating systems, and look up "
+                            "known vulnerabilities for the versions you "
+                            "identified (the executor's lookup_cve)."))
     if 5 in phases:
-        lines.append("Phase 5 - Exploitation: only against a confirmed "
-                     "service version with a known exploit, and only as far "
-                     "as the approval gate allows.")
+        lines.append(_phase(5, "only against a confirmed service version "
+                            "with a known exploit, and only as far as the "
+                            "approval gate allows."))
     if "wifi:monitor" in caps:
         if 6 in phases:
-            lines.append("Phase 6 - Wifi Survey: list the access points and "
-                         "clients in range.")
+            lines.append(_phase(6, "list the access points and clients in "
+                                "range."))
         if 7 in phases:
-            lines.append("Phase 7 - Wifi Capture: capture handshakes and "
-                         "PMKIDs. Deauthentication is gated.")
+            lines.append(_phase(7, "capture handshakes and PMKIDs. "
+                                "Deauthentication is gated."))
         if 8 in phases:
-            lines.append("Phase 8 - Wifi Crack: recover keys from what was "
-                         "captured.")
+            lines.append(_phase(8, "recover keys from what was "
+                                "captured."))
         if any(p in phases for p in _WIFI_PHASES):
             lines.append("Never dispatch wifi tasks in parallel: there is one "
                          "adapter, and it is a single physical resource.")
@@ -348,12 +387,16 @@ def executor(caps, scope, tier, platforms=None) -> str:
         "If the task cannot be done inside the scope, say so under ERRORS and "
         "stop.",
         "Commands. Give run_command one plain command at a time, with no "
-        "shell syntax. Scans are slowed to %s for nmap whatever you ask. "
-        "If a result carries blocked_reason, the command was refused: read "
-        "the reason and change the command, or report it, and never send the "
-        "same one again. Some actions pass an approval gate that can refuse "
-        "them, and a refusal is not a fault. Record each finding with "
-        "log_discovery as you go." % _forced_flags("nmap"),
+        "shell syntax. If a result carries blocked_reason, the command was "
+        "refused: read the reason and change the command, or report it, and "
+        "never send the same one again. Some actions pass an approval gate "
+        "that can refuse them, and a refusal is not a fault. Record each "
+        "finding with log_discovery as you go.",
+        # The executor writes the commands, so it gets the rate limits in
+        # full rather than the one-line summary it had: the summary named
+        # the flags without saying what they cost in time, which is the
+        # part it was getting wrong.
+        _scan_section(),
         _beacon_verb_section(),
     ]
     meanings = _meaning_lines(caps)

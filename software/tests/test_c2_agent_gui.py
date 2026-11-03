@@ -19,7 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from software.agent import config
+from software.agent import config, prompts
 from software.c2.server import ServerCrypto, create_app
 from software.tests.test_c2_server import (
     TEST_TOKEN,
@@ -428,3 +428,41 @@ class TestDrawerAndDetailUseTheNewFields(unittest.TestCase):
 
     def test_yolo_is_marked_hot_in_the_drawer(self):
         self.assertRegex(self.js, r'c\.opsec_profile\s*===\s*"yolo"')
+
+
+class TestThePhaseLabelsMatchThePhases(unittest.TestCase):
+    """The checkbox the operator ticks must name what the model is told.
+
+    Found while reading both sides against the design (spec section 12).
+    The GUI had invented its own phase names -- "Credential access" for 3,
+    "Lateral movement" for 4 -- and nothing compared them to anything. The
+    prompt tells the model that phase 3 is Port and Service Enumeration and
+    phase 4 is OS and Vulnerability Fingerprinting, which is what the spec
+    specifies.
+
+    So the phase list, which is the operator's main control over what the
+    agent may do, was describing activities this agent has no phases for.
+    An operator unticking 3 to keep the agent away from credentials was in
+    fact switching off port scanning.
+    """
+
+    def _js_phase_names(self):
+        js = AGENT_JS.read_text()
+        block = re.search(r"const PHASE_NAMES = \{(.*?)\}", js, re.S)
+        self.assertIsNotNone(block, "PHASE_NAMES not found in agent.js")
+        return {int(n): label
+                for n, label in re.findall(r'(\d+)\s*:\s*"([^"]+)"',
+                                           block.group(1))}
+
+    def test_every_phase_the_gui_offers_has_a_name(self):
+        self.assertEqual(sorted(self._js_phase_names()), list(range(1, 9)))
+
+    def test_the_gui_labels_are_the_names_the_prompt_uses(self):
+        self.assertEqual(self._js_phase_names(), dict(prompts.PHASE_NAMES))
+
+    def test_the_prompt_titles_are_built_from_the_same_table(self):
+        # Otherwise the table could be corrected and the prose left behind.
+        text = prompts._phase_section({"b": ["sniffer", "wifi:monitor"]},
+                                      set(range(1, 9)))
+        for number, name in prompts.PHASE_NAMES.items():
+            self.assertIn("Phase %d - %s" % (number, name), text)

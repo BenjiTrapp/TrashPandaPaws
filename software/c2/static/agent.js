@@ -970,9 +970,13 @@ const DEFAULT_PHASES_ON = {
 };
 
 const PHASE_NAMES = {
-  1: "Discovery", 2: "Enumeration", 3: "Credential access",
-  4: "Lateral movement", 5: "Exploitation",
-  6: "Wifi recon", 7: "Wifi capture", 8: "Wifi cracking",
+  // These must match software/agent/prompts.py PHASE_NAMES: the label the
+  // operator ticks has to name the activity the model is told to perform.
+  // A test compares the two tables.
+  1: "Wire Intel", 2: "Orientation and Discovery",
+  3: "Port and Service Enumeration", 4: "OS and Vulnerability Fingerprinting",
+  5: "Exploitation",
+  6: "Wifi Survey", 7: "Wifi Capture", 8: "Wifi Crack",
 };
 
 const WIFI_PHASES = [6, 7, 8];

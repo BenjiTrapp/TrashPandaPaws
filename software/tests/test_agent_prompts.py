@@ -383,3 +383,33 @@ class TestTheBeaconCommandLanguageIsStated(unittest.TestCase):
         p = prompts.orchestrator({"raccoon-fox": ["batch"]}, _scope(),
                                  {1, 2}, "full")
         self.assertNotIn("arptable", p)
+
+
+class TestTheCostOfARateLimitedScanIsStated(unittest.TestCase):
+    """A rate limit turns a port range into a duration, and nothing said so.
+
+    From the live run: the model asked for `nmap -p- 127.0.0.1` with
+    `timeout: 300`. The limiter made that `nmap -T2 --max-rate 50 -p-`,
+    which is 65535 ports at 50 packets a second -- about 22 minutes. It
+    timed out at 300s with partial output and `success: false`, and the
+    model asked again.
+
+    Two facts the system had and the model did not: the built-in per-program
+    timeout (900s for nmap, better informed than any guess the model makes),
+    and what the enforced rate means for a full-port scan.
+    """
+
+    def test_the_scan_section_says_what_a_full_port_scan_costs(self):
+        section = prompts._scan_section()
+        self.assertIn("-p-", section)
+
+    def test_the_executor_is_told_not_to_guess_a_timeout(self):
+        p = prompts.executor(["batch"], scope=_scope(), tier="full")
+        self.assertIn("timeout", p)
+
+    def test_the_built_in_nmap_timeout_is_named_from_the_real_table(self):
+        # Read back from the executor, not written twice: a change there
+        # must not leave the prompt quoting an old number.
+        from software.agent.executor import server_tool
+        section = prompts._scan_section()
+        self.assertIn(str(server_tool._TOOL_TIMEOUTS["nmap"]), section)
