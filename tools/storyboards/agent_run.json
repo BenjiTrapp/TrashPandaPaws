@@ -1,0 +1,131 @@
+[
+  {
+    "note": "Setup, not a frame. Toasts removed, the side panel widened -- the form is long and 420px would wrap every line -- and confirm() stubbed, because the Unleash button asks for confirmation and headless Chrome would block on the dialog forever.",
+    "hold": 0.1,
+    "shoot": false,
+    "settle": 0.8,
+    "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); const st = document.createElement('style'); st.textContent = '.side-panel{width:66% !important;max-width:66% !important}'; document.head.appendChild(st); window.confirm = () => true; true"
+  },
+  {
+    "hold": 3.0,
+    "js": "selectAgent('{{BEACON_ID}}')",
+    "caption": "One beacon checked in — and Automated Attack is live, top right",
+    "wait": ".ai-btn:not([disabled])",
+    "settle": 1.5
+  },
+  {
+    "hold": 4.0,
+    "js": "document.querySelector('.ai-btn').click()",
+    "caption": "The campaign form — Mode decides who answers the knocks",
+    "wait": "#ai-form .ai-sec h4",
+    "settle": 1.8
+  },
+  {
+    "hold": 4.0,
+    "js": "const i = document.querySelector('#ai-form .ai-tags input'); i.value = '127.0.0.0/8'; i.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); true",
+    "caption": "Scope is fail-closed — an empty scope authorises nothing",
+    "wait": "#ai-form .ai-tag",
+    "settle": 1.4
+  },
+  {
+    "hold": 4.0,
+    "js": "const h4 = [...document.querySelectorAll('#ai-form h4')].find(e => e.textContent.trim() === 'Phases'); h4.scrollIntoView({block: 'start'}); true",
+    "caption": "Phases — eight of them, and the model cannot reach past its tier",
+    "settle": 1.2
+  },
+  {
+    "note": "Phase 5 is off by default, and without it the campaign can never propose a tier-2 action -- which is the whole point of the knock further down. Found by capturing the run without it and getting no card.",
+    "hold": 4.0,
+    "js": "const row = [...document.querySelectorAll('#ai-form .ai-phase')].find(e => /^5 /.test(e.textContent.trim())); row.querySelector('input').click(); true",
+    "caption": "Phase 5 ticked — exploitation, which is where the gate earns its keep",
+    "wait": "#ai-form .ai-phase input:checked",
+    "settle": 1.2
+  },
+  {
+    "hold": 4.0,
+    "js": "const h4 = [...document.querySelectorAll('#ai-form h4')].find(e => e.textContent.trim() === 'Risk profile'); h4.scrollIntoView({block: 'start'}); true",
+    "caption": "Risk profile — the numbers the expected-value gate weighs",
+    "settle": 1.2
+  },
+  {
+    "hold": 4.0,
+    "js": "const h4 = [...document.querySelectorAll('#ai-form h4')].find(e => e.textContent.trim() === 'OpSec'); h4.scrollIntoView({block: 'start'}); true",
+    "caption": "OpSec — quiet, normal or yolo; yolo lifts scan rate limits only",
+    "settle": 1.2
+  },
+  {
+    "hold": 4.5,
+    "js": "const b = [...document.querySelectorAll('#ai-form button')].find(e => /Unleash/.test(e.textContent)); b.scrollIntoView({block: 'center'}); true",
+    "caption": "Unleash — tier-1 actions stay blocked whatever is chosen here",
+    "settle": 1.2
+  },
+  {
+    "hold": 3.0,
+    "js": "const b = [...document.querySelectorAll('#ai-form button')].find(e => /Unleash/.test(e.textContent)); b.click(); true",
+    "caption": "The campaign is running — phase 2, enumerating the host",
+    "wait": ".ai-pane, .ai-drawer",
+    "timeout": 60,
+    "settle": 2.5
+  },
+  {
+    "note": "The form stays open behind the stream once the campaign starts, and it covers the lower half of every frame after this. Closing it is what an operator does next anyway.",
+    "hold": 0.1,
+    "shoot": false,
+    "settle": 0.8,
+    "js": "closePanel(); true"
+  },
+  {
+    "hold": 3.5,
+    "caption": "Every command the model asks for, in the beacon's own language",
+    "wait": "document.querySelector('.ai-pane-body') && /uname/.test(document.querySelector('.ai-pane-body').textContent)",
+    "timeout": 120,
+    "settle": 1.5,
+    "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); true"
+  },
+  {
+    "hold": 3.5,
+    "caption": "Read-only enumeration is tier 3 — issued without asking anyone",
+    "wait": "document.querySelector('.ai-pane-body') && /netstat/.test(document.querySelector('.ai-pane-body').textContent)",
+    "timeout": 120,
+    "settle": 1.5,
+    "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); true"
+  },
+  {
+    "hold": 4.0,
+    "caption": "A real nmap, rewritten by the OpSec profile to -T2 --max-rate 50",
+    "wait": "document.querySelector('.ai-pane-body') && /nmap/.test(document.querySelector('.ai-pane-body').textContent)",
+    "timeout": 180,
+    "settle": 1.5,
+    "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); true"
+  },
+  {
+    "hold": 4.0,
+    "caption": "The service version, checked against CVE and exploit data",
+    "wait": "document.querySelector('.ai-pane-body') && /searchsploit/.test(document.querySelector('.ai-pane-body').textContent)",
+    "timeout": 180,
+    "settle": 1.5,
+    "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); true"
+  },
+  {
+    "note": "The knock card itself, and nothing broader. The first attempt waited on '[class*=knock]', which matches .ai-d-knocks -- the container, always present -- so the wait never blocked and the next five frames captioned a card that was not on screen.",
+    "hold": 8.0,
+    "caption": "Phase 5 proposes exploitation — tier 2, so the operator is asked, with the arithmetic shown",
+    "wait": ".ai-knock",
+    "timeout": 240,
+    "settle": 2.0
+  },
+  {
+    "hold": 5.0,
+    "js": "const b = document.querySelector('.ai-knock button.deny'); b.click(); true",
+    "caption": "Denied — refused by operator, and the run carries on without it",
+    "wait": "!document.querySelector('.ai-knock')",
+    "timeout": 60,
+    "settle": 2.0
+  },
+  {
+    "hold": 5.5,
+    "js": "const d = document.querySelector('.ai-drawer'); if (d) d.scrollIntoView({block: 'start'}); true",
+    "caption": "The drawer — phase, tokens spent, approvals, every decision logged",
+    "settle": 2.0
+  }
+]

@@ -50,12 +50,20 @@ CAPTION_ID = "capture-caption"
 SHELL_SELECTOR = "#app"
 CAPTION_HEIGHT = 52
 
-_FIELDS = {"hold", "js", "caption", "wait", "settle", "note", "shoot"}
+_FIELDS = {"hold", "js", "caption", "wait", "settle", "note", "shoot",
+           "timeout"}
 
 # Long enough for the GUI's own fetches to land. It fills itself from
 # several requests, and a step that shoots too early catches a spinner --
 # which is why most steps also name something to wait for.
 DEFAULT_SETTLE = 0.9
+
+# A campaign takes about a minute to reach its exploitation phase, and the
+# 20s this used to inherit expired before the frame meant to show the knock
+# card -- so the capture carried on and shot the stream again under a
+# caption claiming a card that was not on screen. Per-step, because most
+# steps should fail fast when a selector is wrong.
+DEFAULT_TIMEOUT = 30.0
 
 
 class Step(NamedTuple):
@@ -64,6 +72,7 @@ class Step(NamedTuple):
     caption: Optional[str]
     wait: Optional[str]
     settle: float
+    timeout: float
     # A step that acts on the page without being photographed: dismissing
     # the connect toasts, widening a panel, closing what the last step
     # opened. The first version had no such thing, so the toast-dismissing
@@ -101,6 +110,7 @@ def parse(storyboard):
         steps.append(Step(hold=hold, js=raw.get("js"),
                           caption=raw.get("caption"), wait=raw.get("wait"),
                           settle=float(raw.get("settle", DEFAULT_SETTLE)),
+                          timeout=float(raw.get("timeout", DEFAULT_TIMEOUT)),
                           shoot=bool(raw.get("shoot", True))))
     return steps
 
@@ -157,14 +167,33 @@ def caption_js(text):
            "shell": shell, "h": CAPTION_HEIGHT})
 
 
+_WRAP_PREFIX = "(function(){ "
+
+
+def step_js(snippet):
+    """A step's JavaScript, in a scope of its own.
+
+    Every step is evaluated in the page's global scope, where a top-level
+    `const` creates a binding that outlives the evaluation -- so two steps
+    each declaring `const h4` threw "already declared" on the second,
+    reported only as "Uncaught", four frames into a run that had already
+    launched a campaign. Wrapping makes a step a self-contained snippet,
+    which is what a storyboard reads like.
+    """
+    if snippet.startswith(_WRAP_PREFIX):
+        return snippet
+    return _WRAP_PREFIX + snippet + " })()"
+
+
 async def _run_step(cdp, step):
     if step.js:
-        await cdp.eval(step.js)
+        await cdp.eval(step_js(step.js))
     if step.wait:
         expression = step.wait
         if not expression.strip().startswith(("document", "window", "!", "(")):
             expression = "document.querySelector(%s)" % json.dumps(expression)
-        await wait_for(cdp, expression, what=step.wait)
+        await wait_for(cdp, expression, what=step.wait,
+                       timeout=step.timeout)
     await asyncio.sleep(step.settle)
     await cdp.eval(caption_js(step.caption))
     # A beat after the caption so its own paint has landed.

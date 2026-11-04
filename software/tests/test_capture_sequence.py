@@ -85,6 +85,19 @@ class TestAStoryboardIsReadStrictly(unittest.TestCase):
                          (3.0, "showLootViewer()", "Loot Vault",
                           ".loot-row", 1.2))
 
+    def test_a_step_can_wait_longer_than_the_default(self):
+        # A campaign takes about a minute to reach its exploitation phase,
+        # and the default 20s wait expired before the frame that is meant
+        # to show the knock card -- so the capture went on and shot the
+        # stream again with a caption claiming a card that was not there.
+        steps = capture_sequence.parse([
+            {"hold": 3.0, "wait": ".ai-knock", "timeout": 180}])
+        self.assertEqual(steps[0].timeout, 180)
+
+    def test_the_default_timeout_is_stated_not_implied(self):
+        steps = capture_sequence.parse([{"hold": 1.0, "wait": ".x"}])
+        self.assertEqual(steps[0].timeout, capture_sequence.DEFAULT_TIMEOUT)
+
     def test_an_empty_storyboard_is_refused(self):
         with self.assertRaises(ValueError):
             capture_sequence.parse([])
@@ -197,6 +210,46 @@ class TestTheManifestIsWhatMakeGifReads(unittest.TestCase):
         steps = capture_sequence.parse([{"hold": 1.0}, {"hold": 1.0}])
         with self.assertRaises(ValueError):
             capture_sequence.write_manifest(self.dir, ["0000.png"], steps)
+
+
+class TestEachStepsJavaScriptGetsItsOwnScope(unittest.TestCase):
+    """Two steps declaring the same `const` broke the second one.
+
+    Every step is evaluated in the page's global scope, where a top-level
+    `const` creates a binding that outlives the evaluation. So a
+    storyboard whose steps each did
+
+        const h4 = [...].find(...); h4.scrollIntoView(...)
+
+    threw "Identifier 'h4' has already been declared" on the second one --
+    reported only as "Uncaught", four frames into a run that had already
+    launched a campaign.
+
+    Wrapping each step in a function means a step is a self-contained
+    snippet, which is what a storyboard reads like.
+    """
+
+    def test_a_snippet_is_wrapped_so_its_declarations_are_local(self):
+        wrapped = capture_sequence.step_js("const x = 1; x")
+        self.assertIn("const x = 1", wrapped)
+        self.assertTrue(wrapped.startswith("("), wrapped[:40])
+
+    def test_the_same_declaration_twice_is_two_separate_scopes(self):
+        first = capture_sequence.step_js("const h4 = 1; true")
+        second = capture_sequence.step_js("const h4 = 2; true")
+        # Nothing shared to collide over: each is its own function body.
+        self.assertNotEqual(first, second)
+        for wrapped in (first, second):
+            self.assertIn("function", wrapped)
+
+    def test_a_bare_expression_still_works(self):
+        # Most steps are a single call, not a block.
+        wrapped = capture_sequence.step_js("showProcs()")
+        self.assertIn("showProcs()", wrapped)
+
+    def test_nothing_is_wrapped_twice(self):
+        once = capture_sequence.step_js("showProcs()")
+        self.assertEqual(capture_sequence.step_js(once), once)
 
 
 class TestTheCaptionIsPutOnThePageItself(unittest.TestCase):

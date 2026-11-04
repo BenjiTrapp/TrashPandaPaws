@@ -826,3 +826,56 @@ class TestAVersionIsNotATarget(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAPortSettingIsAPortNotAnAddress(unittest.TestCase):
+    """`msfconsole -x "... set RPORT 2121; run"` was refused on the port.
+
+    A bare number anywhere reads as an address, so every Metasploit
+    invocation against a non-default port was refused -- and the reason
+    tells the model to attach the number to its flag (`-p22`), which is
+    advice msf's `set NAME VALUE` syntax cannot follow. Found by running
+    a campaign: phase 5 proposed the exploit, the scope refused it before
+    the gate ever saw it, and the run completed with no approval recorded
+    at all.
+
+    Narrow on purpose, and not a fail-open: only a bare one-to-five digit
+    number is affected, and a bare number was never a checkable target --
+    it was refused, not verified. An address after the same keyword is
+    still read as an address, which the RHOSTS tests below pin.
+    """
+
+    def _why(self, command, allow=("127.0.0.0/8",)):
+        return scope.Scope(allow=list(allow), deny=[]).check(
+            command, lambda n: None, require_target=False)
+
+    def test_a_port_setting_is_allowed(self):
+        for command in (
+                'msfconsole -q -x "use exploit/unix/ftp/vsftpd_234_backdoor; '
+                'set RHOSTS 127.0.0.1; set RPORT 2121; run"',
+                'msfconsole -x "set LPORT 4444; set RHOSTS 127.0.0.1; run"',
+                'msfconsole -x "set SRVPORT 8080; set RHOSTS 127.0.0.1; run"'):
+            self.assertIsNone(self._why(command), command)
+
+    def test_the_host_setting_is_still_checked(self):
+        # The whole point: exempting the port must not exempt the target.
+        reason = self._why(
+            'msfconsole -x "set RHOSTS 10.9.9.9; set RPORT 2121; run"')
+        self.assertIsNotNone(reason)
+        self.assertIn("10.9.9.9", reason)
+
+    def test_an_address_after_a_port_keyword_is_not_waved_through(self):
+        # `RPORT 10.9.9.9` is nonsense, but it must not become a way to
+        # name a host the scope never looks at.
+        reason = self._why('msfconsole -x "set RPORT 10.9.9.9; run"')
+        self.assertIsNotNone(reason)
+        self.assertIn("10.9.9.9", reason)
+
+    def test_a_bare_number_elsewhere_is_still_refused(self):
+        # The exemption is keyed on the preceding keyword, not on numbers
+        # in general.
+        self.assertIsNotNone(self._why("nmap 2121"))
+        self.assertIsNotNone(self._why('msfconsole -x "set FOO 2121; run"'))
+
+    def test_a_port_out_of_range_is_still_refused(self):
+        self.assertIsNotNone(self._why('msfconsole -x "set RPORT 99999; run"'))

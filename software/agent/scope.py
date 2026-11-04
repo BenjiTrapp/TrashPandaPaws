@@ -160,6 +160,23 @@ _NUMBER_FIRST = frozenset(("timeout", "nice", "sleep", "head", "tail"))
 # `nc host 80`: the second positional word is the port. The first stays a target,
 # so `nc 80` is still refused.
 _PORT_AFTER_HOST = frozenset(("nc", "ncat", "netcat", "telnet"))
+
+# Settings whose value is a port, named rather than flagged. Metasploit's
+# `set NAME VALUE` syntax cannot attach a number to its name the way a flag
+# can, so `msfconsole -x "... set RPORT 2121; run"` had the port refused as
+# an unverifiable address -- which made every module against a non-default
+# port unreachable. Found by running a campaign: phase 5 proposed the
+# exploit, the scope refused it before the gate saw it, and the run finished
+# with no approval recorded at all.
+#
+# Narrow, and not a fail-open: only a bare one-to-five digit number in range
+# is skipped, and a bare number was never a checkable target -- it was
+# refused, not verified. An address after the same keyword is still read as
+# an address, so `set RHOSTS 10.9.9.9` and even `set RPORT 10.9.9.9` are
+# checked as before.
+_PORT_SETTINGS = frozenset((
+    "rport", "lport", "srvport", "sport", "dport", "port",
+))
 _ASSIGNMENT = re.compile(r"\w+=", re.ASCII)
 _DURATION = re.compile(r"\d+(?:\.\d+)?[smhd]?", re.ASCII)
 # A file descriptor glued to a redirect (2>&1, 1>out) at the start of a word.
@@ -371,6 +388,8 @@ def _scan(command) -> Tuple[List[str], List[str], List[str]]:
     # seen while looking; num_open: its leading number is still to come.
     looking, prog, prefix, num_open, options_ended = True, "", "", False, False
     positionals, output_pending = 0, False
+    # The last word named a port setting, so a bare number now is its value.
+    port_setting = False
     for word in words:
         if not word:
             continue
@@ -378,6 +397,7 @@ def _scan(command) -> Tuple[List[str], List[str], List[str]]:
             at_start, skip_next, after_flag = True, ">" in word, False
             looking, prog, prefix, num_open, options_ended = True, "", "", False, False
             positionals, output_pending = 0, False
+            port_setting = False
             if "<" in word:
                 unknown.append(word)
             continue
@@ -440,6 +460,11 @@ def _scan(command) -> Tuple[List[str], List[str], List[str]]:
                     if (positionals == 2 and _PORT.fullmatch(word)
                             and 0 < int(word) <= 65535):
                         continue
+        if (port_setting and _PORT.fullmatch(word)
+                and 0 < int(word) <= 65535):
+            port_setting = False
+            continue
+        port_setting = word.lower() in _PORT_SETTINGS
         if not looking and prog in _PROGRAMS_WITHOUT_TARGETS:
             # Its operands are search terms, not hosts.
             continue
