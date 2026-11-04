@@ -325,5 +325,50 @@ CMD=("$PYTHON" "$SERVER_PY" "--host" "$HOST" "--port" "$PORT" "--token" "$TOKEN"
 [[ -n "$CERT" ]]       && CMD+=("--cert" "$CERT")
 [[ -n "$CERTKEY" ]]    && CMD+=("--certkey" "$CERTKEY")
 
+# ── Optional: the autonomous agent service ──
+#
+# A question, never a default. The C2 has to start exactly the way it does
+# today for someone who has no model configured, and this whole block is
+# skipped unless it is answered yes or AGENT_START is already set.
+#
+# The agent runs as a separate process (design section 7) so that a model
+# that stalls cannot hold up beacon handling. It binds loopback; the C2
+# reads AGENT_URL to find it.
+AGENT_START="${AGENT_START:-}"
+AGENT_BIND_HOST="${AGENT_BIND_HOST:-127.0.0.1}"
+AGENT_BIND_PORT="${AGENT_BIND_PORT:-8099}"
+
+if [[ -z "$AGENT_START" && -t 0 ]]; then
+    echo ""
+    echo -ne "${Y}  [?]${N} ${W}Start the autonomous agent service as well?${N} ${D}[y/N]${N} "
+    read -r ANSWER
+    [[ "$ANSWER" =~ ^[yYjJ] ]] && AGENT_START="1"
+fi
+
+AGENT_PID=""
+if [[ -n "$AGENT_START" ]]; then
+    REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+    export AGENT_URL="http://${AGENT_BIND_HOST}:${AGENT_BIND_PORT}"
+    # The agent authenticates to the C2 with the operator token, so it gets
+    # the one this launcher just decided on rather than a second copy that
+    # could drift.
+    export RACCOON_TOKEN="$TOKEN"
+    export AGENT_C2_URL="${PROTO}://127.0.0.1:${PORT}"
+    if [[ -z "${AGENT_PROVIDER:-}" || -z "${AGENT_MODEL:-}" ]]; then
+        echo -e "${Y}  [!]${N} ${W}Agent${N}         ${Y}AGENT_PROVIDER and AGENT_MODEL are not set;${N}"
+        echo -e "      ${D}the service starts and reports itself unavailable in the GUI.${N}"
+    fi
+    echo -e "${C}  [*]${N} ${W}Starting agent${N} ${D}${AGENT_URL}${N}"
+    ( cd "$REPO_ROOT" && "$PYTHON" -m software.agent \
+        --bind-host "$AGENT_BIND_HOST" --bind-port "$AGENT_BIND_PORT" \
+        >> "$SCRIPT_DIR/agent.log" 2>&1 ) &
+    AGENT_PID=$!
+    # Stopped with the server, so Ctrl+C does not leave it holding the port
+    # and a lowered beacon interval behind.
+    trap '[[ -n "$AGENT_PID" ]] && kill "$AGENT_PID" 2>/dev/null || true' EXIT INT TERM
+    echo -e "${G}  [✓]${N} ${W}Agent${N}         ${D}pid $AGENT_PID, log $SCRIPT_DIR/agent.log${N}"
+    echo ""
+fi
+
 # ── Launch ──
 exec "${CMD[@]}"

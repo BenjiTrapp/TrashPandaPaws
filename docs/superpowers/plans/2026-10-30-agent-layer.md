@@ -466,7 +466,7 @@ git commit -m "feat(agent): add safety classification, scan limits and risk tabl
 - Produces:
   - `Scope` — Klasse, `Scope(allow: List[str], deny: List[str])`
   - `scope.extract_targets(command: str) -> Tuple[List[str], List[str]]` — `(erkannte_ziele, nicht_auflösbare_argumente)`
-  - `Scope.check(command: str, resolve_host: Callable[[str], Optional[str]]) -> Optional[str]` — Ablehnungsgrund oder `None`
+  - `Scope.check(command: str, resolve_host: Callable[[str], Union[None, str, Sequence[str]]]) -> Optional[str]` — Ablehnungsgrund oder `None`. **Korrigiert 2026-11-02:** der Resolver darf mehrere Adressen liefern, weil jeder Dual-Stack-Name auf A *und* AAAA auflöst; `Optional[str]` machte Hostnamen als Ziel unbenutzbar, `nmap localhost` eingeschlossen. Jede gelieferte Adresse muss im Scope liegen — eine außerhalb lehnt den ganzen Namen ab, also bleibt es fail-closed.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -560,7 +560,7 @@ Expected: FAIL mit `ModuleNotFoundError`
 
 Der Kern ist die Extraktion. Vorgehen: Befehlszeile an Leerzeichen trennen, jedes Argument zusätzlich an Kommas trennen, umgebende eckige Klammern entfernen. Für jedes Token in dieser Reihenfolge prüfen: `ipaddress.ip_address`, `ipaddress.ip_network(strict=False)`, die zwei Bereichsformen per Regex, dann Hostname-Muster `^[a-zA-Z0-9._-]+$` mit mindestens einem Punkt oder einem Treffer in `findings`. Tokens, die mit `-` beginnen, sind Flags und werden übersprungen — **mit einer Ausnahme:** `-iL`, `--target-file`, `--targets` und `-` machen die Prüfung sofort unauflösbar, ebenso ein Argument, das auf `.txt`, `.lst` oder `.list` endet.
 
-`check` löst Hostnamen über `resolve_host` auf, wandelt alle erkannten Ziele in `ip_network`-Objekte (Bereiche über `ipaddress.summarize_address_range`), und verlangt für jedes: in mindestens einem Allow-Netz **enthalten** (`subnet_of`) und in keinem Deny-Netz überlappend. Nicht auflösbare Argumente führen immer zur Ablehnung mit dem Hinweis, Ziele einzeln zu benennen.
+`check` löst Hostnamen über `resolve_host` auf — eine Adresse oder mehrere, und jede davon muss die Prüfung bestehen —, wandelt alle erkannten Ziele in `ip_network`-Objekte (Bereiche über `ipaddress.summarize_address_range`), und verlangt für jedes: in mindestens einem Allow-Netz **enthalten** (`subnet_of`) und in keinem Deny-Netz überlappend. Nicht auflösbare Argumente führen immer zur Ablehnung mit dem Hinweis, Ziele einzeln zu benennen.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -797,7 +797,7 @@ git commit -m "feat(agent): add approval gate with EV arbiter and detection trac
 - Produces:
   - `ToolSpec` — `NamedTuple` mit `name: str`, `description: str`, `parameters: dict`
   - `ToolCall` — `NamedTuple` mit `id: str`, `name: str`, `arguments: dict`
-  - `Completion` — `NamedTuple` mit `text: str`, `tool_calls: List[ToolCall]`, `input_tokens: int`, `output_tokens: int`, `stop_reason: str`
+  - `Completion` — `NamedTuple` mit `text: str`, `tool_calls: List[ToolCall]`, `input_tokens: int`, `output_tokens: int`, `total_tokens: int`, `stop_reason: str`
   - `LlmClient` — abstrakte Basis mit `await complete(system: str, messages: List[dict], tools: List[ToolSpec], max_tokens: int, temperature: float) -> Completion`, Attributen `provider: str`, `model: str`, `supports_tools: bool`
   - `provider.create_client(cfg) -> LlmClient` — `cfg` hat `provider`, `api_key`, `model`, `base_url`
   - `provider.capability_tier(model: str, provider_name: str) -> str` — `"full"`, `"reduced"` oder `"minimal"`
@@ -950,8 +950,15 @@ class TestTruncation(unittest.TestCase):
         self.assertIn("OUTPUT TRUNCATED", out)
 
     def test_truncation_counts_characters_not_bytes(self):
-        """Nicht-ASCII darf nicht mitten in ein Zeichen schneiden."""
-        src = "ü" * 3000
+        """Nicht-ASCII darf nicht mitten in ein Zeichen schneiden.
+
+        6000, nicht 3000: 3000 Zeichen liegen *unter* dem 4000er-Limit, also
+        wird gar nicht gekürzt und `assertTrue(trunc)` schlägt fehl. Die
+        naheliegende "Reparatur" wäre, in Bytes zu messen — `ü` sind zwei —
+        was die Zusicherung erfüllt, den Testnamen aber zur Lüge macht und
+        mitten in ein Zeichen schneidet. Zeichen slicen, nie `encode()`.
+        """
+        src = "ü" * 6000
         out, trunc = loop.truncate(src, 4000)
         self.assertTrue(trunc)
         self.assertEqual(out.count("ü"), 4000)
@@ -1156,7 +1163,7 @@ git commit -m "feat(agent): add tool-calling loop with text-protocol fallback"
   - `config.load(argv=None, yaml_path=None, env=None) -> AgentConfig`
   - `config.RISK_PROFILES: Dict[str, dict]`
   - `CampaignConfig.from_form(payload: dict, *, tier: str) -> CampaignConfig` — wendet Profil und Stufen-Obergrenze an
-  - `config.available() -> Tuple[bool, str]` — `(verfügbar, grund)` für `/api/ai/status`
+  - `AgentConfig.available() -> Tuple[bool, str]` — `(verfügbar, grund)` für `/api/ai/status`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1327,7 +1334,7 @@ git commit -m "feat(agent): add configuration cascade and risk profiles"
   - `await queue_task(agent_id, cmd, args="", data="", timeout=300, lane="agent") -> str` — liefert die Task-ID
   - `await get_task_result(task_id) -> Optional[dict]` — `None` solange `status == "pending"`
   - `await await_task(task_id, *, timeout, poll_interval=2.0, is_alive=None) -> dict` — pollt bis Ergebnis
-  - `await exec_server_tool(argv: List[str], *, tool, timeout) -> str` — liefert die `run_id`
+  - `await exec_server_tool(argv: List[str], *, tool, timeout, origin="agent") -> str` — liefert die `run_id`
   - `await get_server_tool_result(run_id) -> Optional[dict]`
   - `await await_server_tool(run_id, *, timeout, poll_interval=2.0) -> dict`
   - `await set_beacon_interval(agent_id, seconds, jitter) -> None`
@@ -1392,6 +1399,13 @@ class TestServerTools(IsolatedAsyncioTestCase):
         await c.exec_server_tool(["nmap", "-sV", "10.0.1.5"], tool="nmap", timeout=900)
         self.assertIn("argv", fake.last_json)
         self.assertNotIn("cmd", fake.last_json)
+
+    async def test_exec_marks_the_run_as_agent_origin(self):
+        """Sonst landet Agent-Ausgabe im Operator-Panel."""
+        fake = FakeC2(post_response={"run_id": "r1"})
+        c = c2client.C2Client("http://c2", "tok", session=fake)
+        await c.exec_server_tool(["nmap", "-sV", "10.0.1.5"], tool="nmap", timeout=900)
+        self.assertEqual(fake.last_json["origin"], "agent")
 
     async def test_string_command_is_refused_by_type(self):
         c = c2client.C2Client("http://c2", "tok", session=FakeC2())
@@ -1651,7 +1665,7 @@ Statt `queue.pop(0)` eine Auswahl, die Operator-Tasks bevorzugt. `BATCH_MAX = 8`
 
 - [ ] **Step 5: Store capabilities in `_handle_register` (`server.py:1753-1806`)**
 
-`agents[agent_id]["caps"] = payload.get("caps") or []`. Unbekannte Felder im Payload werden wie bisher ignoriert, damit ein neuer Beacon gegen einen alten Server funktioniert.
+`agents[agent_id]["caps"] = payload.get("caps") or []` und `agents[agent_id]["uplink_iface"] = payload.get("uplink_iface")`. Unbekannte Felder im Payload werden wie bisher ignoriert, damit ein neuer Beacon gegen einen alten Server funktioniert.
 
 - [ ] **Step 6: Replace `server_exec_state` with `tool_runs` (`server.py:481-523`)**
 
@@ -1699,6 +1713,7 @@ git commit -m "feat(c2): add task lanes, batching, isolated tool runs and the AI
 - Consumes: `{"tasks": [...]}` aus Task 9
 - Produces: `caps`-Feld im Register- und Beacon-Payload
   - `Beacon._detect_caps() -> List[str]`
+  - `Beacon._detect_uplink_iface() -> Optional[str]` — das Interface, das die Default-Route trägt
   - `Beacon._process_tasking_batch(tasking: dict) -> None`
 
 - [ ] **Step 1: Write the failing tests**
@@ -1754,6 +1769,23 @@ class TestCapsInPayload(unittest.TestCase):
         caps = _beacon()._system_info()["caps"]
         self.assertTrue(all(isinstance(c, str) for c in caps))
 
+    def test_system_info_carries_the_uplink_interface(self):
+        """Die Safety-Schicht braucht es, um Monitor-Mode auf dem Uplink zu sperren."""
+        self.assertIn("uplink_iface", _beacon()._system_info())
+
+class TestUplinkDetection(unittest.TestCase):
+    def test_default_route_interface_is_reported(self):
+        with _fake_default_route("eth0"):
+            self.assertEqual(_beacon()._detect_uplink_iface(), "eth0")
+
+    def test_bridge_interface_is_reported_when_it_carries_the_route(self):
+        with _fake_default_route("br0"):
+            self.assertEqual(_beacon()._detect_uplink_iface(), "br0")
+
+    def test_missing_default_route_yields_none_without_raising(self):
+        with _fake_default_route(None):
+            self.assertIsNone(_beacon()._detect_uplink_iface())
+
 class TestBatchProcessing(unittest.TestCase):
     def test_single_task_dict_still_processed(self):
         """Status quo: alter Server, einzelnes Task-Dict."""
@@ -1808,7 +1840,9 @@ Die gesamte Erkennung läuft in einem `try/except Exception`, das eine Teilliste
 
 - [ ] **Step 4: Add `caps` to `_system_info` (`beacon.py:1439`)**
 
-`"caps": self._detect_caps()` ins Dict. Damit erscheint es automatisch im Register- **und** Beacon-Payload, weil beide `_system_info` nutzen (`beacon.py:1571`, `1841`, `1960`). Die Erkennung wird einmal im Konstruktor berechnet und gecacht, damit nicht bei jedem Check-in das sysfs gelesen wird.
+`"caps": self._detect_caps()` und `"uplink_iface": self._detect_uplink_iface()` ins Dict. Damit erscheinen sie automatisch im Register- **und** Beacon-Payload, weil beide `_system_info` nutzen (`beacon.py:1571`, `1841`, `1960`). Beide Erkennungen werden einmal im Konstruktor berechnet und gecacht, damit nicht bei jedem Check-in das sysfs und die Routing-Tabelle gelesen werden.
+
+`_detect_uplink_iface` liest die Default-Route — unter Linux aus `/proc/net/route` (Ziel `00000000`), unter Windows über `route print`, mit `None` als Rückfall. Kein Werfen; die Safety-Schicht behandelt `None` als „kein Uplink bekannt" und sperrt dann **alle** Monitor-Mode-Umschaltungen, weil sie nicht ausschließen kann, den eigenen Kanal zu kappen.
 
 - [ ] **Step 5: Implement `Beacon._process_tasking_batch` and call it from `_beacon_loop`**
 
@@ -1849,7 +1883,7 @@ git commit -m "feat(beacon): advertise capabilities and process task batches"
 - Consumes: `safety.classify`, `safety.enforce_scan_limits`, `safety.TIER_*` (Task 2); `Scope.check` (Task 3); `Gate.request`, `gate.scan_for_detection`, `Gate.note_detection` (Task 4); `C2Client` (Task 8); `loop.truncate` (Task 6)
 - Produces:
   - `ActionResult` — `NamedTuple` mit `success: bool`, `output: str`, `exit_code: int`, `truncated: bool`, `path: str`, `blocked_reason: Optional[str]`
-  - `Router(c2, gate, scope, *, conn, run_id, beacon_ids, caps_by_beacon, phase5_enabled, truncate_chars, campaign_tokens)`
+  - `Router(c2, gate, scope, *, conn, run_id, beacon_ids, caps_by_beacon, uplink_by_beacon, phase5_enabled, truncate_chars)` — `gate` ist danach als `Router.gate` erreichbar
   - `await Router.run_command(command: str, *, beacon_id=None, server_side=False, timeout=None, p_success_override=None) -> ActionResult`
   - `Router.target_kind(beacon_id) -> str`
   - `beacon.run_on_beacon(c2, beacon_id, command, *, timeout) -> ActionResult`
@@ -1999,6 +2033,8 @@ Die Reihenfolge ist die eigentliche Festlegung und muss genau so sein:
 Scope vor Klassifikation, weil ein Ziel außerhalb des Scopes auch dann abgelehnt wird, wenn die Aktion harmlos ist. Gate nach der Klassifikation, weil es die Risikowerte braucht.
 
 `target_kind` liefert `"dropbox"`, wenn die Caps des Beacons `"sniffer"` enthalten, sonst `"beacon"`; für serverseitige Läufe `"server"`. Das steuert, welche Stufe-1-Muster greifen (Bridge und NAC-Bypass nur auf der Drop-Box).
+
+`is_uplink_iface` wird als Closure über `uplink_by_beacon` gebaut: der Beacon meldet sein Uplink-Interface (Task 10), der C2 legt es am Agent-Datensatz ab (Task 9), und der Router vergleicht den Namen daraus. **Ist für einen Beacon kein Uplink bekannt, gilt jedes Interface als Uplink** — dann sperrt die Safety-Schicht jede Monitor-Mode-Umschaltung, weil sie nicht ausschließen kann, den eigenen Kanal zu kappen.
 
 `host_was_responsive` für `scan_for_detection` wird aus `findings` abgeleitet: existiert ein früherer Fund zum Zielhost, gilt er als vorher erreichbar.
 
@@ -2641,6 +2677,7 @@ git commit -m "feat(agent): add campaign orchestrator with pause, budgets and or
 - Consumes: `CampaignManager`, `restore_orphans` (Task 13); `config.load`, `config.available`, `CampaignConfig.from_form` (Task 7); `provider.create_client`, `capability_tier` (Task 5); `db.open_store` (Task 1)
 - Produces:
   - `service.make_app(cfg, conn, c2, manager) -> aiohttp.web.Application`
+  - `await service.on_startup(cfg, conn, c2, manager) -> None` — Waisen-Erholung, fängt jede Ausnahme
   - `GET /status` → `{"available", "reason", "tier", "provider", "model", "campaigns": [...]}`
   - `GET /beacons` → Flotte mit Capabilities, für das Formular
   - `POST /campaign` → `{"run_id"}` oder `400`/`503`
@@ -2845,7 +2882,7 @@ class TestGuiDegradation(ServerTestBase):
     """Spec §19.2: ohne Agent-Dienst bleibt das GUI bedienbar."""
     def test_index_still_renders_without_agent_service(self):
         html = self.client.get("/").get_data(as_text=True)
-        self.assertIn("{{TOKEN}}".replace("{{TOKEN}}", TEST_TOKEN), html)
+        self.assertIn(TEST_TOKEN, html)
         self.assertIn("Raccoon C2", html)
 
     def test_button_is_not_hardcoded_in_the_html_literal(self):

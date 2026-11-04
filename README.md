@@ -8,7 +8,7 @@
   <a href="https://github.com/BenjiTrapp/TrashPandaPaws"><img src="https://img.shields.io/badge/GitHub-TrashPandaPaws-181717?logo=github" alt="GitHub"></a>
   <img src="https://img.shields.io/badge/platform-Raspberry%20Pi%204%20%7C%20CM4-c51a4a?logo=raspberrypi&logoColor=white" alt="Platform">
   <img src="https://img.shields.io/badge/OS-ParrotOS%20ARM64-00e5ff?logo=linux&logoColor=white" alt="OS">
-  <a href="docs/C2_DEMO.md"><img src="https://img.shields.io/badge/C2%20Demo-23%20screenshots-blueviolet" alt="C2 Demo"></a>
+  <a href="docs/C2_DEMO.md"><img src="https://img.shields.io/badge/C2%20Demo-28%20screenshots-blueviolet" alt="C2 Demo"></a>
   <img src="https://img.shields.io/badge/transport-HTTPS%20%7C%20DNS%20%7C%20SMB%20%7C%20QUIC-blue" alt="Transports">
   <img src="https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen" alt="No Dependencies">
   <img src="https://img.shields.io/badge/license-use%20responsibly-red" alt="License">
@@ -795,7 +795,44 @@ Responder).
 
 </details>
 
-> **Full walkthrough:** [`docs/C2_DEMO.md`](docs/C2_DEMO.md) — 20 sections covering every feature, command reference, Mermaid diagrams, and a full attack flow sequence diagram.
+> **Full walkthrough:** [`docs/C2_DEMO.md`](docs/C2_DEMO.md) — 22 sections covering every feature, command reference, Mermaid diagrams, and a full attack flow sequence diagram.
+
+### C2: Automated Attack (autonomous agent)
+
+An optional LLM-driven mode **inside** the operator GUI. The agent plans and
+runs a campaign against beacons you select, inside a scope you authorise,
+while you keep using the terminal beside it. Every action is recorded, and
+the ones that could cost the drop-box or the cover come to you as a
+question.
+
+<p align="center">
+  <img src="docs/screenshots/30_agent_knock_card.png" alt="The agent asking before an exploitation attempt" width="420">
+</p>
+
+<p align="center"><em>The agent asks before exploiting: the classifier's reason, the arbiter's arithmetic, and the decision left to the operator</em></p>
+
+| | |
+|---|---|
+| **Two modes** | *Automated Attack* — you watch and answer each gated action. *Full Automated* — configured, then left alone, with an expected-value check deciding in your place. The gate is in both; only the decider changes. |
+| **Never permitted** | Eight irreversible actions are refused in every mode and cannot be approved by anyone: beacon lifecycle, power, networking, firewall, disk, and anything touching the bridge or the cover. |
+| **Scope** | Fail-closed. A target that cannot be positively matched to an allowed range is refused — including a range that merely overlaps a denied address. |
+| **Phases** | Wire Intel → Orientation → Port/Service Enum → OS/Vuln Fingerprint → Exploitation. The quietest source first; exploitation off by default. |
+| **Providers** | Anthropic, Amazon Bedrock, OpenRouter, OpenCode Zen, or a local server (Ollama, LM Studio, llama.cpp). No vendor SDK is installed. |
+| **Nothing changes without it** | The C2 and the beacon run exactly as they do today with no model configured. A test suite asserts it rather than a sentence promising it. |
+
+```bash
+export RACCOON_TOKEN=...          # must be fixed, not the random per-start one
+export AGENT_PROVIDER=anthropic
+export AGENT_MODEL=claude-sonnet-4-5
+export AGENT_API_KEY=...
+cd software/c2 && docker compose up --build
+```
+
+> **Configuration guide:** [`docs/AGENT.md`](docs/AGENT.md) — providers and
+> capability tiers, risk and OpSec profiles with measured numbers, the scope
+> rules that surprise people, what the approval gate does and does not
+> allow, budgets, what is logged, and a troubleshooting table of the traps
+> that actually cost time.
 
 ### 802.1X NAC Bypass
 

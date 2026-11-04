@@ -128,6 +128,7 @@ def main():
                 "proxy": c2_cfg.get("proxy", {}),
                 "https": fallback_cfg.get("https", {}),
                 "dns": fallback_cfg.get("dns", {}),
+                "dropbox": True,
             }
         }
         python_beacon = Beacon(fallback_as_config)

@@ -75,6 +75,10 @@ c2:
 
   # ── Primary: Sliver Beacon (Go binary, compiled for linux/arm64) ──
   sliver:
+    # Exclusive with the autonomous agent (see `agent:` at the end of this
+    # file): a Sliver-managed box never checks in to the Raccoon server, so
+    # with this true the agent reports itself unavailable. Set false to run the
+    # Python beacon the agent drives.
     enabled: true
     implant_path: "/opt/raccoon/bin/implant"
     # Optional: staging URL to download implant on first boot
@@ -172,3 +176,84 @@ logging:
   backup_count: 3
   console_level: "INFO"
   file_level: "DEBUG"
+
+# ── Autonomous agent ──
+# Optional LLM-driven campaign service (software/agent/). Off by default; the
+# drop-box and the C2 behave exactly as before without it.
+#
+# Each setting resolves on its own: command line, then this file, then an
+# environment variable (AGENT_<SETTING>), then a built-in default. An empty
+# value here counts as unset, so it falls through to the environment.
+#
+# The agent is mutually exclusive with c2.sliver.enabled: a Sliver-managed
+# drop-box runs the Sliver implant and never checks in to the Raccoon server,
+# so the agent would face an empty beacon list. With sliver.enabled: true the
+# agent reports itself unavailable (/api/ai/status says why) instead of
+# starting. Set c2.sliver.enabled to false to drive the Python beacon.
+agent:
+  enabled: false
+
+  # ── LLM ──
+  # Secrets never go in this file, because this file is in git. The API key
+  # comes from AGENT_API_KEY, or from the file named below, which must be
+  # readable by its owner only (chmod 600) or the agent refuses to start. The
+  # C2 and agent tokens come from RACCOON_TOKEN and RACCOON_AGENT_TOKEN.
+  llm:
+    # anthropic | bedrock | openrouter | opencode | local
+    #
+    # bedrock reads AWS_BEARER_TOKEN_BEDROCK if no key is configured, and its
+    # endpoint follows AWS_REGION; the model id carries its own region prefix
+    # (eu., us.), so an EU id against a US endpoint fails at the first call.
+    provider: ""
+    # Required for every provider; there is no default that would not go stale.
+    model: ""
+    # Only for opencode (no built-in endpoint) or to point at another server.
+    base_url: ""
+    # e.g. /etc/raccoon/agent.key, outside the repository
+    api_key_file: ""
+    # off  = token counts, latency and status only
+    # full = also store prompt and response text (may contain scan results)
+    llm_log_level: "off"
+
+  # ── Service ──
+  # Loopback only: the C2 proxies to it, and nothing else should reach it.
+  service:
+    bind_host: "127.0.0.1"
+    bind_port: 8099
+
+  # ── C2 the agent drives ──
+  c2:
+    url: "https://127.0.0.1:8443"
+    # The C2 certificate is self-signed.
+    verify_tls: false
+
+  limits:
+    max_concurrent_executors: 4
+    # Seconds to wait for an operator's answer in supervised mode.
+    approval_timeout: 300
+
+  # ── Campaign defaults ──
+  # What the campaign form is pre-filled with. Not read at runtime: the form
+  # posts its values back and CampaignConfig.from_form falls back to the same
+  # numbers, which a test keeps in step with this block. Risk numbers (EV
+  # threshold, P(detect), detection budget, risk coefficient) come from
+  # risk_profile: passive | normal | aggressive.
+  defaults:
+    risk_profile: "normal"
+    # Phase 5 (exploitation) is off; Wifi phases follow beacon capabilities.
+    phases: [1, 2, 3, 4]
+    # What to do when a gated action needs an operator and none answers:
+    # decide (expected-value arbiter) | skip | pause
+    # The default depends on the mode. Supervised runs pause, because there
+    # the operator is the arbiter and stepping away must not quietly hand
+    # that to the expected-value check. Full Automated defaults to decide,
+    # which is what makes it unattended. This block documents the
+    # supervised default; set it explicitly to override either.
+    unattended_behavior: "pause"
+    max_runtime_seconds: 7200
+    max_tokens_total: 500000
+    # Beacon check-in interval during a run, and the one put back afterwards.
+    campaign_interval: 15
+    restore_interval: 300
+    # supervised = operator approves each gated action; auto = unattended.
+    mode: "supervised"

@@ -11,9 +11,25 @@ services:
       - DISPLAY=${DISPLAY:-:0}
       - RACCOON_PORT=8443
       - RACCOON_HOST=0.0.0.0
+      # Where the agent service listens. Loopback, because both containers
+      # share the host network: there is no compose network to resolve a
+      # service name on, since network_mode: host is required for Responder
+      # and the relay tooling.
+      - AGENT_URL=${AGENT_URL:-http://127.0.0.1:8099}
+      # Shared with the agent below. Empty means the agent service accepts
+      # only connections from this machine and nothing else -- which is
+      # what loopback already gives it, so leaving it empty is a sane local
+      # default and setting it is what an off-box agent needs.
+      - RACCOON_AGENT_TOKEN=${RACCOON_AGENT_TOKEN:-}
+      # ── RACCOON_TOKEN must be set if the agent is used ──
+      # Left unset, the C2 invents a random operator token at every start.
+      # The agent authenticates with that token, so it then gets 401 on
+      # every call and the GUI reports the agent as unavailable -- or, worse,
+      # a campaign starts and sees zero beacons. Neither failure points at
+      # the cause. Set it to a fixed value here or in the environment.
+      - RACCOON_TOKEN=${RACCOON_TOKEN:-}
       # - RACCOON_KEY=<base64-aes-256-key>
       # - RACCOON_DERIVE_KEY=https://c2.example.com/api/v1/beacon:c2.example.com
-      # - RACCOON_TOKEN=<fixed-operator-token>
       # - RACCOON_SSL=1
       # - RACCOON_CERT=/data/raccoon-c2/cert.pem
       # - RACCOON_CERTKEY=/data/raccoon-c2/key.pem
@@ -21,5 +37,50 @@ services:
       - NET_RAW
       - NET_ADMIN
 
+  # ── The agent service ──
+  #
+  # Optional. The C2 runs without it and says so in the GUI: the "Automated
+  # Attack" button is rendered greyed out with the reason, rather than
+  # hidden, so an operator can tell the feature exists and why it is not
+  # available. Neither service declares depends_on, in either direction --
+  # the C2 must come up without the agent, and the agent must survive a C2
+  # that is not there yet.
+  agent:
+    build:
+      # The repository root, so the image can see software/agent. The C2
+      # above uses this directory as its context and could not.
+      context: ../..
+      dockerfile: software/agent/Dockerfile
+    container_name: raccoon-agent
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      # The run history, findings, approvals and salience memory. Kept
+      # across restarts: the service marks unfinished runs aborted on the
+      # way up, and that record is the audit trail.
+      - raccoon-agent-data:/data/raccoon-agent
+    environment:
+      # Loopback only. This API starts campaigns and runs commands; it has
+      # no business being reachable from the network, and no port is
+      # published for it.
+      - AGENT_BIND_HOST=127.0.0.1
+      - AGENT_BIND_PORT=8099
+      - AGENT_DB_PATH=/data/raccoon-agent/agent.db
+      - AGENT_C2_URL=${AGENT_C2_URL:-http://127.0.0.1:8443}
+      # Same value as the C2's above; that is the point of it.
+      - RACCOON_TOKEN=${RACCOON_TOKEN:-}
+      - RACCOON_AGENT_TOKEN=${RACCOON_AGENT_TOKEN:-}
+      # anthropic | openrouter | opencode | local | bedrock
+      - AGENT_PROVIDER=${AGENT_PROVIDER:-}
+      - AGENT_MODEL=${AGENT_MODEL:-}
+      # Never a literal here. Put it in a .env file that is not committed,
+      # or export it before `docker compose up`; this repository has a
+      # pre-commit hook that refuses credential material in a diff.
+      # AGENT_API_KEY_FILE is the alternative and takes a path to a file
+      # readable by its owner only.
+      - AGENT_API_KEY=${AGENT_API_KEY:-}
+      - AGENT_API_KEY_FILE=${AGENT_API_KEY_FILE:-}
+
 volumes:
   raccoon-data:
+  raccoon-agent-data:

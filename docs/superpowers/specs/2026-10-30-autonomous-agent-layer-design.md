@@ -470,14 +470,23 @@ Das Gate feuert im `router`, **nicht** als LLM-Tool. `request_approval` existier
 
 **`safety.py` enthält eine statische Tabelle** `aktion → (klasse, punkte, p_erfolg_prior, p_detect_prior, phase)`. Beispielzeilen:
 
-| Aktion | Klasse | Punkte | P(erfolg) | P(detect) |
-|---|---|---|---|---|
-| LSASS-Dump | credential_access | 50 | 0.50 | 0.70 |
-| Responder (poison) | credential_access | 50 | 0.60 | 0.55 |
-| NTLM-Relay | lateral | 75 | 0.40 | 0.50 |
-| `persist` installieren | persistence | 0 | 0.90 | 0.25 |
-| Deauth | wifi | 30 | 0.70 | 0.40 |
-| Exploit mit bekanntem PoC | exploitation | 25 | 0.60 | 0.30 |
+> **Korrigiert durch `2026-11-02-ev-calibration-amendment.md`.** Die
+> Punktespalte ist der Wert des Ergebnisses, das die Aktion **freischaltet**,
+> nicht ein Score-Etikett für die Aktion selbst — `punkte × P(erfolg)` ist ein
+> Erwartungswert. Nur das unmittelbare Ergebnis zählt; jede Folgeaktion
+> durchläuft ihre eigene EV-Bewertung. Ein reiner Wegbereiter trägt den Wert
+> dessen, was er erreichbar macht oder erhält.
+
+| Aktion | Klasse | schaltet frei | Punkte | P(erfolg) | P(detect) |
+|---|---|---|---|---|---|
+| Exploit mit bekanntem PoC | exploitation | `rce_achieved` | 200 | 0.60 | 0.30 |
+| Remote-Ausführung | lateral | `successful_login` | 75 | 0.80 | 0.60 |
+| `persist` installieren | persistence | erhält einen `successful_login` | 75 | 0.90 | 0.25 |
+| NTLM-Relay | lateral | `successful_login` über Relay | 75 | 0.40 | 0.50 |
+| LSASS-Dump | credential_access | `credential_captured` | 50 | 0.50 | 0.70 |
+| Responder (poison) | credential_access | `credential_captured` | 50 | 0.60 | 0.55 |
+| Interface-Moduswechsel | lifecycle | ermöglicht die Wifi-Kette | 30 | 0.90 | 0.20 |
+| Deauth | wifi | `handshake_captured` | 30 | 0.70 | 0.40 |
 
 Das LLM darf über Tool-Argumente **Korrekturen vorschlagen** (etwa eine höhere Erfolgswahrscheinlichkeit, wenn `check_exploit` einen Remote-Exploit gefunden hat). Diese Vorschläge werden **geklammert** auf ±0.2 um den Prior und protokolliert. Eugenes CVSS-Tabelle bleibt im Preamble als Richtlinie für die **Planung** des Modells — sie ist nicht die Rechengrundlage des Gates.
 
@@ -519,10 +528,21 @@ Jede Anfrage und jede Entscheidung landet in `approvals`, mit `decided_by` = `"o
 ### 10.8 EV-Gating
 
 ```
-EV = (punkte × P(erfolg)) − (100 × P(entdeckung)_effektiv)
+EV = (wert_des_ergebnisses × P(erfolg)) − (R × P(entdeckung)_effektiv)
+R = 33     # Vorbelegung, eigener Konfigurationswert
 ```
 
-Durchführung nur bei `EV > schwelle`. Punktetabelle (identisch zur Scoring-Tabelle):
+Durchführung nur bei `EV > schwelle`.
+
+> **Korrigiert durch `2026-11-02-ev-calibration-amendment.md`.** `R` ist
+> **nicht** die Score-Strafe. Die `−100` unten ist, was eine Detection in der
+> Wertung kostet; `R` bepreist, was es dem *Lauf* kostet, einmal aufzufallen —
+> und das ist kein Totalverlust, denn das Detection-Budget ist 3, eine
+> Detection verbraucht also etwa ein Drittel der Toleranz. Daher ≈ 100/3.
+> Einstellbar statt aus dem Budget abgeleitet, damit eine Budgetänderung die
+> Aggressivität nicht stillschweigend mitverschiebt. Die Punktetabelle
+> darunter ist die Wertung und bleibt unverändert; sie ist zugleich die
+> Quelle der Freischaltungswerte in Abschnitt 10.5. Punktetabelle (identisch zur Scoring-Tabelle):
 
 | Aktion | Punkte | | Aktion | Punkte |
 |---|---|---|---|---|
@@ -740,7 +760,7 @@ Bestätigt am Mockup. Jede Region hat eine eigene Aufgabe:
 │ ○bat     │ ◆ AGENT · PHASE 3/5     [Agent|Alles] ⏸      │ Score        185   │
 │          │ › dispatch_parallel_tasks ×2                 │ Detections   1/3   │
 │ Campaign │ › remember_finding 10.0.1.5 [service] SMB    │ Tasks      14/22   │
-│ ◆sweep   │ › EV: 25×0.60 − 100×0.12 = +3.0 → proceed    │ Tokens   41k/500k  │
+│ ◆sweep   │ › EV: 200×0.60 − 33×0.30 = +110 → proceed    │ Tokens   41k/500k  │
 │  11m     │ › ⚠ Detection — reset von 10.0.1.20  −100    │ Laufzeit   11m/2h  │
 │          │ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌ ziehbar ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  │ SCOPE              │
 │          │ OP $ smbloot 10.0.1.5 svc_backup … shares    │ ✔ 10.0.1.0/24      │
@@ -749,7 +769,7 @@ Bestätigt am Mockup. Jede Region hat eine eigene Aufgabe:
 │          │                                              │ ⚠ ANKLOPFEN 1/1    │
 │          │                                              │ LSASS auf …1.20    │
 │          │                                              │ OpSec: hoch        │
-│          │                                              │ EV: −45            │
+│          │                                              │ EV: −3             │
 │          │                                              │ [Erlauben][Nein]   │
 └──────────┴──────────────────────────────────────────────┴────────────────────┘
 ```
@@ -771,7 +791,7 @@ Bestätigt am Mockup. Alle fünf markierten Entscheidungen wurden abgenommen.
 | **Ziel-Beacons** | Mehrfachauswahl aus der Flotte | keine Automatik für neu eincheckende Beacons |
 | **Scope** | CIDR-Allowlist und -Denylist | leer, muss gefüllt werden |
 | **Phasen** | 1–5 einzeln, 6–8 Wifi fähigkeitsabhängig | 1–4 an, **5 aus**, Wifi nach Capability |
-| **Risikoprofil** | Preset Passiv/Normal/Aggressiv, setzt EV-Schwelle, P(entdeckung)-Startwert, Detection-Budget — einzeln überschreibbar | Normal: Schwelle 0, P 0.15, Budget 3 |
+| **Risikoprofil** | Preset Passiv/Normal/Aggressiv, setzt EV-Schwelle, P(entdeckung)-Startwert, Detection-Budget, Risikokoeffizient `R` — einzeln überschreibbar | Normal: Schwelle 0, P 0.15, Budget 3, R 33 · Passiv: +20 / 0.25 / 2 / 50 · Aggressiv: −15 / 0.10 / 4 / 25 |
 | **Anklopfen ohne Operator** | *Autonom entscheiden* / *Überspringen* / *Pausieren* | Autonom entscheiden |
 | **Budget & Abbruch** | max. Laufzeit, max. Tokens, Beacon-Intervall während der Kampagne | 2 h, 500k, 15 s |
 | **Modell** | Anbieter, Modell, angezeigte Fähigkeitsstufe | aus der Konfiguration |

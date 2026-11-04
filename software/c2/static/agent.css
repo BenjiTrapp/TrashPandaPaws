@@ -1,0 +1,211 @@
+/* Agent layer: stream (top), drawer (right), and the toolbar button.
+   Loaded after the main GUI's inline <style>, so it inherits that :root
+   (--bg, --surface, --red, --green, --yellow, --orange, --text, --text2,
+   --border, --mono, --sans). Only the two origin accents are new: --ai is the
+   existing orange under a name that says what it marks, --op is the operator's. */
+:root{--ai:var(--orange);--op:#33ccff}
+
+/* Toolbar button. Injected by agent.js; absent if that file is. */
+.toolbar button.ai-btn{
+  margin-left:auto;color:var(--ai);border-color:rgba(255,102,0,0.45);
+  background:rgba(255,102,0,0.08);font-weight:600;
+}
+.toolbar button.ai-btn:hover{background:rgba(255,102,0,0.2);border-color:var(--ai);color:var(--ai)}
+.toolbar button.ai-btn.live{border-color:var(--ai);box-shadow:0 0 8px rgba(255,102,0,0.35)}
+.ai-btn .ai-dot{width:7px;height:7px;border-radius:50%;background:var(--text2)}
+.ai-btn.live .ai-dot{background:var(--ai);box-shadow:0 0 6px var(--ai);animation:pulse 1.5s infinite}
+/* Clickable on purpose: a click is how the operator re-checks after starting the service. */
+.toolbar button.ai-btn.disabled{
+  color:var(--text2);border-color:rgba(255,255,255,0.08);background:rgba(255,255,255,0.03);
+  font-weight:400;cursor:help;opacity:0.7;
+}
+.toolbar button.ai-btn.disabled:hover{color:var(--text);border-color:var(--border)}
+.ai-btn .ai-warn-n{font-size:10px;color:var(--yellow)}
+
+/* ① Stream */
+.ai-pane{
+  display:flex;flex-direction:column;flex-shrink:0;height:var(--ai-pane-h,190px);min-height:34px;
+  margin-top:6px;background:rgba(0,0,0,0.6);border:1px solid rgba(255,102,0,0.35);
+  border-radius:8px;overflow:hidden;
+}
+.ai-pane-head{
+  display:flex;align-items:center;gap:8px;padding:5px 10px;flex-shrink:0;
+  background:rgba(255,102,0,0.07);border-bottom:1px solid rgba(255,102,0,0.2);
+  font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ai);
+}
+.ai-pane-head .ai-title{font-weight:700;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ai-pane-head button{
+  background:none;border:1px solid transparent;color:var(--text2);cursor:pointer;
+  font-size:12px;padding:1px 7px;border-radius:3px;font-family:var(--sans);
+}
+.ai-pane-head button:hover{color:var(--ai);border-color:rgba(255,102,0,0.4)}
+.ai-pane-head button.on{color:var(--ai);border-color:rgba(255,102,0,0.4);background:rgba(255,102,0,0.12)}
+.ai-toggle{display:flex;gap:2px}
+.ai-pane-body{flex:1;overflow-y:auto;min-height:0;padding:6px 10px;font-family:var(--mono);font-size:12px;line-height:1.55}
+.ai-pane-body::-webkit-scrollbar{width:6px}
+.ai-pane-body::-webkit-scrollbar-thumb{background:var(--red-dim);border-radius:3px}
+.ai-empty{color:var(--text2);font-style:italic}
+/* The whole line is the click target for the detail panel. */
+.ai-line{display:flex;gap:8px;align-items:baseline;cursor:pointer;padding:0 4px;border-radius:3px;color:var(--text)}
+.ai-line:hover{background:rgba(255,255,255,0.05)}
+.ai-line .ai-ts{color:var(--text2);flex-shrink:0;font-size:11px}
+.ai-line .ai-text{min-width:0;overflow-wrap:anywhere}
+.ai-line.k-error .ai-text,.ai-line.k-detection .ai-text{color:#ff6666}
+.ai-line.k-ev .ai-text,.ai-line.k-approval .ai-text{color:var(--yellow)}
+.ai-line.k-finding .ai-text{color:var(--green)}
+.ai-line.k-phase .ai-text{color:var(--ai);font-weight:700}
+.ai-line.k-info .ai-text,.ai-line.k-score .ai-text{color:var(--text)}
+.ai-line.op .ai-text{color:var(--op)}
+.ai-badge{
+  flex-shrink:0;font-size:9px;font-weight:700;padding:0 5px;border-radius:3px;line-height:1.5;
+  color:var(--ai);border:1px solid var(--ai);background:rgba(255,102,0,0.1);
+}
+.ai-badge.op{color:var(--op);border-color:var(--op);background:rgba(51,204,255,0.1)}
+.ai-grip{
+  height:7px;flex-shrink:0;cursor:row-resize;margin-bottom:2px;display:flex;
+  align-items:center;justify-content:center;
+}
+.ai-grip::after{content:'';width:48px;height:2px;border-radius:1px;background:rgba(255,102,0,0.3);transition:background 0.15s}
+.ai-grip:hover::after,.ai-grip.active::after{background:var(--ai)}
+.ai-pane-collapsed{height:auto!important}
+.ai-pane-collapsed .ai-pane-body{display:none}
+.ai-pane-collapsed .ai-pane-head{border-bottom:none}
+.ai-pane-collapsed+.ai-grip{display:none}
+
+/* ③ Drawer */
+.ai-drawer{
+  width:270px;min-width:230px;flex-shrink:0;overflow-y:auto;padding:12px 14px;
+  background:var(--surface);border-left:1px solid rgba(255,102,0,0.3);
+  font-size:12px;display:flex;flex-direction:column;gap:12px;
+}
+.ai-drawer::-webkit-scrollbar{width:6px}
+.ai-drawer::-webkit-scrollbar-thumb{background:var(--red-dim);border-radius:3px}
+.ai-drawer h3{font-size:13px;color:var(--ai);display:flex;align-items:center;gap:6px;word-break:break-all}
+.ai-state{font-size:10px;font-weight:700;text-transform:uppercase;padding:0 6px;border-radius:3px;border:1px solid var(--text2);color:var(--text2)}
+.ai-state.running{color:var(--green);border-color:var(--green-dim)}
+.ai-state.paused{color:var(--yellow);border-color:var(--yellow)}
+.ai-state.failed,.ai-state.aborted{color:#ff6666;border-color:#cc3333}
+.ai-gauge{height:6px;border-radius:3px;background:rgba(255,255,255,0.08);overflow:hidden}
+.ai-gauge>i{display:block;height:100%;background:var(--ai);width:0;transition:width 0.4s}
+.ai-gauge.hot>i{background:var(--red)}
+.ai-rows{display:grid;grid-template-columns:auto 1fr;gap:4px 10px}
+.ai-rows dt{color:var(--text2)}
+.ai-rows dd{text-align:right;font-family:var(--mono);color:var(--text)}
+.ai-rows dd.warn{color:#ff6666}
+.ai-knock button,.ai-lost button,.ai-btn-inline{
+  flex:1;padding:5px 8px;border-radius:5px;cursor:pointer;font-size:12px;font-family:var(--sans);
+  background:rgba(255,255,255,0.04);color:var(--text);border:1px solid rgba(255,255,255,0.12);
+}
+.ai-lost button:hover,.ai-btn-inline:hover{border-color:var(--ai);color:var(--ai)}
+.ai-btn-inline{flex:none!important;margin-left:6px;padding:1px 8px!important}
+
+/* The warnings nothing else surfaces (config.opsec_warnings). */
+.ai-warns{
+  border:1px solid rgba(255,204,0,0.4);background:rgba(255,204,0,0.07);border-radius:6px;
+  padding:7px 9px;color:var(--yellow);font-size:11px;line-height:1.45;
+}
+.ai-warns b{display:block;margin-bottom:2px;font-size:10px;text-transform:uppercase;letter-spacing:0.06em}
+.ai-warns li{margin-left:14px}
+
+/* Anklopfen: pinned, never scrolls away. */
+.ai-knock{
+  border:1px solid var(--ai);background:rgba(255,102,0,0.08);border-radius:6px;padding:9px 10px;
+  box-shadow:0 0 10px rgba(255,102,0,0.2);display:flex;flex-direction:column;gap:6px;
+}
+.ai-knock .ai-knock-head{display:flex;justify-content:space-between;color:var(--ai);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:0.05em}
+.ai-knock .ai-action{font-family:var(--mono);font-size:13px;color:var(--text);word-break:break-all}
+.ai-knock .ai-why{color:var(--text);line-height:1.45}
+.ai-knock .ai-why small{display:block;color:var(--text2);font-size:10px;text-transform:uppercase;letter-spacing:0.05em}
+.ai-knock .ai-ev{font-family:var(--mono);font-size:12px;color:var(--yellow)}
+.ai-knock .ai-ev.neg b{color:#ff6666}
+.ai-knock .ai-ev.pos b{color:var(--green)}
+.ai-knock .ai-ev b{font-size:15px}
+.ai-knock .ai-ans{display:flex;gap:6px;margin-top:2px}
+.ai-knock button.allow{border-color:var(--green-dim);color:var(--green)}
+.ai-knock button.allow:hover{background:rgba(51,255,51,0.12);border-color:var(--green)}
+.ai-knock button.deny{border-color:#cc3333;color:#ff6666}
+.ai-knock button.deny:hover{background:rgba(255,26,26,0.15);border-color:var(--red)}
+.ai-knock button:disabled{opacity:0.45;cursor:default}
+
+/* Poll failure: said once, with a way back. */
+.ai-lost{
+  border:1px solid #cc3333;background:rgba(255,26,26,0.08);border-radius:6px;padding:8px 10px;
+  color:#ff9999;font-size:11px;line-height:1.45;display:flex;flex-direction:column;gap:6px;
+}
+.ai-lost.retrying{border-color:var(--yellow);background:rgba(255,204,0,0.06);color:var(--yellow)}
+
+/* Detail panel content (inside the existing side panel). */
+.ai-detail h4{font-size:11px;text-transform:uppercase;letter-spacing:0.06em;color:var(--ai);margin:10px 0 3px}
+.ai-detail h4:first-child{margin-top:0}
+.ai-detail pre{white-space:pre-wrap;word-break:break-all;color:var(--text);font-size:12px}
+.ai-detail .ai-note{color:var(--text2);font-style:italic}
+.ai-detail dl{display:grid;grid-template-columns:auto 1fr;gap:3px 10px}
+.ai-detail dt{color:var(--text2)}
+
+/* ── The full-auto configuration form ──
+   Inherits the palette from the main GUI's :root; nothing is redefined here,
+   so a colour changed there follows through. */
+
+.ai-form{display:flex;flex-direction:column;gap:14px;font-size:12px}
+.ai-sec{border:1px solid var(--border);border-radius:6px;padding:10px 12px;
+        background:var(--surface2)}
+.ai-sec h4{margin:0 0 6px;font-size:11px;text-transform:uppercase;
+           letter-spacing:0.06em;color:var(--orange)}
+.ai-note{margin:4px 0 0;color:var(--text2);font-size:11px;line-height:1.45}
+.ai-bad{margin:4px 0 0;color:var(--red);font-size:11px}
+
+.ai-list{display:flex;flex-direction:column;gap:4px}
+.ai-row{display:flex;align-items:center;gap:8px;padding:3px 0}
+.ai-row-id{font-family:var(--mono);color:var(--text)}
+.ai-row-meta{color:var(--text2);font-size:11px}
+.ai-caps{margin-left:auto;font-family:var(--mono);font-size:10px;
+         color:var(--op, #33ccff)}
+
+.ai-tags{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:4px 0}
+.ai-tags-label{color:var(--text2);font-size:11px;min-width:120px}
+.ai-tags input[type="text"]{flex:1;min-width:140px;background:var(--bg);
+  color:var(--text);border:1px solid var(--border);border-radius:4px;
+  padding:4px 7px;font-family:var(--mono);font-size:11px}
+.ai-tag{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;
+  border:1px solid var(--border);border-radius:10px;font-family:var(--mono);
+  font-size:11px;color:var(--text)}
+.ai-tag button{background:none;border:0;color:var(--text2);cursor:pointer;
+  padding:0;font-size:11px;line-height:1}
+.ai-tag.bad{border-color:var(--red);color:var(--red)}
+.ai-tag.bad button{color:var(--red)}
+
+.ai-phases{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px}
+.ai-phase{display:flex;align-items:center;gap:7px;padding:3px 0}
+.ai-phase.locked{opacity:0.45;cursor:not-allowed}
+
+.ai-choice{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:6px}
+.ai-opt{display:flex;align-items:center;gap:5px}
+.ai-nums{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.ai-num{display:flex;flex-direction:column;gap:3px}
+.ai-num span{color:var(--text2);font-size:11px}
+.ai-num input{background:var(--bg);color:var(--text);border:1px solid var(--border);
+  border-radius:4px;padding:4px 7px;font-family:var(--mono);font-size:11px}
+.ai-num.touched input{border-color:var(--orange)}
+
+.ai-hard{margin-top:8px;padding:8px 10px;border:1px solid var(--red-dim);
+  border-radius:5px;background:rgba(255,26,26,0.06)}
+.ai-hard strong{color:var(--red)}
+.ai-warn{margin-top:8px;padding:8px 10px;border:1px solid var(--yellow);
+  border-radius:5px;background:rgba(255,204,0,0.07)}
+.ai-warn p{margin:0 0 4px;color:var(--yellow);font-size:11px;line-height:1.45}
+.ai-warn p:last-child{margin-bottom:0}
+
+.ai-presets{display:flex;gap:8px;align-items:center}
+.ai-presets select,.ai-presets button{background:var(--surface);color:var(--text);
+  border:1px solid var(--border);border-radius:4px;padding:4px 9px;font-size:11px;
+  cursor:pointer}
+
+.ai-submit{display:flex;flex-direction:column;gap:6px}
+.ai-unleash{align-self:flex-start;padding:7px 16px;border-radius:5px;
+  border:1px solid var(--orange);background:rgba(255,102,0,0.12);
+  color:var(--orange);font-size:12px;font-weight:600;cursor:pointer}
+.ai-unleash:disabled{opacity:0.45;cursor:not-allowed;border-color:var(--border);
+  color:var(--text2);background:rgba(255,255,255,0.03)}
+.ai-hard-list{margin:5px 0 0;padding-left:18px;list-style:disc}
+.ai-hard-list li{margin:2px 0;line-height:1.4}
+.ai-hard-list code{font-family:var(--mono);color:var(--red)}
