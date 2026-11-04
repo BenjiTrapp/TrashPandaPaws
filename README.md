@@ -8,7 +8,7 @@
   <a href="https://github.com/BenjiTrapp/TrashPandaPaws"><img src="https://img.shields.io/badge/GitHub-TrashPandaPaws-181717?logo=github" alt="GitHub"></a>
   <img src="https://img.shields.io/badge/platform-Raspberry%20Pi%204%20%7C%20CM4-c51a4a?logo=raspberrypi&logoColor=white" alt="Platform">
   <img src="https://img.shields.io/badge/OS-ParrotOS%20ARM64-00e5ff?logo=linux&logoColor=white" alt="OS">
-  <a href="docs/C2_DEMO.md"><img src="https://img.shields.io/badge/C2%20Demo-28%20screenshots-blueviolet" alt="C2 Demo"></a>
+  <a href="docs/C2_DEMO.md"><img src="https://img.shields.io/badge/C2%20Demo-30%20stills%20%2B%202%20GIFs-blueviolet" alt="C2 Demo"></a>
   <img src="https://img.shields.io/badge/transport-HTTPS%20%7C%20DNS%20%7C%20SMB%20%7C%20QUIC-blue" alt="Transports">
   <img src="https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen" alt="No Dependencies">
   <img src="https://img.shields.io/badge/license-use%20responsibly-red" alt="License">
@@ -18,7 +18,12 @@ Red Team network hardware implant built on a Raspberry Pi 4 with a custom PCB HA
 running **ParrotOS** (ARM64). Designed for authorized penetration testing engagements.
 
 <p align="center">
-  <img src="docs/screenshots/01_dashboard.png" alt="Raccoon C2 Operator GUI" width="800">
+  <img src="docs/screenshots/c2_tour.gif" alt="Raccoon C2 operator GUI, every feature in turn" width="820">
+</p>
+
+<p align="center">
+  <sub>Every feature of the team server, captured from a running C2 with a real beacon
+  checked in &mdash; see <a href="docs/C2_DEMO.md">the demo tour</a> for the detail.</sub>
 </p>
 
 ## Overview
@@ -798,6 +803,17 @@ Responder).
 > **Full walkthrough:** [`docs/C2_DEMO.md`](docs/C2_DEMO.md) — 22 sections covering every feature, command reference, Mermaid diagrams, and a full attack flow sequence diagram.
 
 ### C2: Automated Attack (autonomous agent)
+
+<p align="center">
+  <img src="docs/screenshots/agent_run.gif" alt="An agent campaign, from the form to a refused knock" width="820">
+</p>
+
+<p align="center">
+  <sub>A campaign that actually ran: the <code>approvals</code> row behind this reads
+  <code>exploit_known_poc / refused / operator</code>, and the knock card shows the
+  arithmetic that produced it.</sub>
+</p>
+
 
 An optional LLM-driven mode **inside** the operator GUI. The agent plans and
 runs a campaign against beacons you select, inside a scope you authorise,

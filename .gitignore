@@ -37,3 +37,6 @@ fp-info-cache
 
 # openchamber screenshots and scratch
 .openchamber/
+
+# macOS finder metadata
+.DS_Store
