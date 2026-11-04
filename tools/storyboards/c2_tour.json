@@ -11,14 +11,16 @@
     "caption": "Operator dashboard — the fleet, checked in and live",
     "wait": ".agent-item, .agent-card, #agents",
     "settle": 1.2,
-    "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); true"
+    "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); true",
+    "name": "01_dashboard"
   },
   {
     "hold": 4.0,
     "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); showBeaconGen()",
     "caption": "Beacon generator — protocol, proxy, NTLM, obfuscation layers",
     "wait": ".bgen-protocols, .bgen-proto, .bgen-result",
-    "settle": 1.6
+    "settle": 1.6,
+    "name": "02_beacon_generator"
   },
   {
     "hold": 0.1,
@@ -31,35 +33,40 @@
     "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); selectAgent('{{BEACON_ID}}')",
     "caption": "A beacon selected — interactive terminal and quick actions",
     "wait": "#terminal",
-    "settle": 1.6
+    "settle": 1.6,
+    "name": "04_terminal"
   },
   {
     "hold": 4.0,
     "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); showProcs()",
     "caption": "Process list from the host, with security tooling flagged",
     "wait": "document.querySelector('.side-panel.open') && !document.querySelector('.side-panel .t-pending')",
-    "settle": 1.4
+    "settle": 1.4,
+    "name": "06_procs"
   },
   {
     "hold": 3.5,
     "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); closePanel(); runAvEnum()",
     "caption": "AV and EDR enumeration — what is watching on that host",
     "wait": ".loot-overlay .loot-panel",
-    "settle": 1.6
+    "settle": 1.6,
+    "name": "07_avedr"
   },
   {
     "hold": 3.5,
     "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); document.querySelectorAll('.loot-overlay').forEach(e => e.remove()); closePanel(); showNetstat()",
     "caption": "Netstat — the host's own connections and listening ports",
     "wait": "document.querySelector('.side-panel.open') && !document.querySelector('.side-panel .t-pending')",
-    "settle": 1.4
+    "settle": 1.4,
+    "name": "08_netstat"
   },
   {
     "hold": 3.5,
     "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); closePanel(); openFileBrowser('/')",
     "caption": "File browser — walk the host, download, upload, send to loot",
     "wait": "document.querySelector('.side-panel.open') && !document.querySelector('.side-panel .t-pending')",
-    "settle": 1.6
+    "settle": 1.6,
+    "name": "05_file_browser"
   },
   {
     "note": "Loot something before the vault is shown. Empty, the panel says 'No loot collected yet', which demonstrates the absence of the feature rather than the feature.",
@@ -73,102 +80,117 @@
     "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); closePanel(); showBeaconConfig()",
     "caption": "Beacon config — sleep, jitter and profile, reconfigured live",
     "wait": "document.querySelector('.side-panel.open') && !document.querySelector('.side-panel .t-pending')",
-    "settle": 1.4
+    "settle": 1.4,
+    "name": "13_beacon_config"
   },
   {
     "hold": 3.5,
     "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); closePanel(); showPivotMap()",
     "caption": "Pivot map — beacons, routes and discovered hosts as a graph",
     "wait": ".side-panel.open svg, .side-panel.open canvas",
-    "settle": 2.0
+    "settle": 2.0,
+    "name": "09_pivot_map"
   },
   {
     "hold": 3.5,
     "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); showNxcMenu(document.querySelector('[onclick*=\"showNxcMenu\"]'))",
     "caption": "NetExec, from the map — SMB, LDAP, WinRM and MSSQL",
     "wait": ".nxc-menu",
-    "settle": 1.3
+    "settle": 1.3,
+    "name": "16_nxc"
   },
   {
     "hold": 3.5,
     "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); document.querySelectorAll('.nxc-menu').forEach(e => e.remove()); closePanel(); showImpacketMenu(document.querySelector('[onclick*=\"showImpacketMenu\"]'))",
     "caption": "Impacket — secretsdump, psexec, wmiexec and the rest",
     "wait": ".nxc-menu",
-    "settle": 1.3
+    "settle": 1.3,
+    "name": "15_impacket"
   },
   {
     "hold": 3.5,
     "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); document.querySelectorAll('.nxc-menu').forEach(e => e.remove()); showRdpDialog()",
     "caption": "RDP and VNC — open a session against a discovered host",
     "wait": ".loot-overlay .loot-panel",
-    "settle": 1.4
+    "settle": 1.4,
+    "name": "22_rdp_vnc"
   },
   {
     "hold": 3.5,
     "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); document.querySelectorAll('.loot-overlay').forEach(e => e.remove()); showResponderDialog()",
     "caption": "Responder — LLMNR, NBT-NS and MDNS poisoning, with capture",
     "wait": ".loot-overlay .loot-panel",
-    "settle": 1.4
+    "settle": 1.4,
+    "name": "17_responder"
   },
   {
     "hold": 3.5,
     "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); document.querySelectorAll('.loot-overlay').forEach(e => e.remove()); showRelayKingDialog()",
     "caption": "RelayKing — NTLM relay chains against discovered targets",
     "wait": ".loot-overlay .loot-panel",
-    "settle": 1.4
+    "settle": 1.4,
+    "name": "18_relayking"
   },
   {
     "hold": 4.5,
     "js": "const t = document.getElementById('terminal'); if (t) t.textContent = ''; document.querySelectorAll('.toast').forEach(e => e.remove()); document.querySelectorAll('.loot-overlay').forEach(e => e.remove()); showC2ProfileEditor()",
     "caption": "Malleable C2 profile editor — highlighting, linter, tutorial",
     "wait": ".c2pe-panel textarea",
-    "settle": 1.8
+    "settle": 1.8,
+    "name": "10_profile_editor"
   },
   {
     "hold": 3.5,
     "js": "const t = document.getElementById('terminal'); if (t) t.textContent = ''; document.querySelectorAll('.toast').forEach(e => e.remove()); c2peLint()",
     "caption": "The linter checks a profile before it ever reaches a beacon",
-    "settle": 1.4
+    "settle": 1.4,
+    "name": "14_profile_lint"
   },
   {
     "hold": 3.5,
     "js": "const t = document.getElementById('terminal'); if (t) t.textContent = ''; document.querySelectorAll('.toast').forEach(e => e.remove()); showC2Library()",
     "caption": "Profile library — known-good malleable profiles to start from",
     "wait": ".c2pe-lib-overlay .c2pe-lib-panel",
-    "settle": 1.4
+    "settle": 1.4,
+    "name": "11_profile_library"
   },
   {
     "hold": 3.5,
     "js": "const t = document.getElementById('terminal'); if (t) t.textContent = ''; document.querySelectorAll('.toast').forEach(e => e.remove()); document.querySelectorAll('.c2pe-lib-overlay, .c2pe-overlay').forEach(e => e.remove()); showBurpImport()",
     "caption": "Burp Suite import — turn a captured request into a profile",
     "wait": ".burp-overlay #burp-req",
-    "settle": 1.5
+    "settle": 1.5,
+    "name": "12_burp_import"
   },
   {
     "hold": 3.5,
     "js": "const t = document.getElementById('terminal'); if (t) t.textContent = ''; document.querySelectorAll('.toast').forEach(e => e.remove()); document.querySelectorAll('.burp-overlay').forEach(e => e.remove()); showLootViewer()",
     "caption": "Loot vault — everything collected, per beacon, downloadable",
     "wait": ".loot-overlay",
-    "settle": 1.4
+    "settle": 1.4,
+    "name": "19_loot_vault"
   },
   {
     "hold": 4.0,
     "js": "const t = document.getElementById('terminal'); if (t) t.textContent = ''; document.querySelectorAll('.toast').forEach(e => e.remove()); document.querySelectorAll('.loot-overlay').forEach(e => e.remove()); showServerLog()",
     "caption": "Server log — every registration, task and result, timestamped",
     "wait": "#srvlog-drawer.open",
-    "settle": 1.6
+    "settle": 1.6,
+    "name": "20_server_log"
   },
   {
     "hold": 4.0,
     "js": "const t = document.getElementById('terminal'); if (t) t.textContent = ''; document.querySelectorAll('.toast').forEach(e => e.remove()); closeSrvLog(); closePanel(); showHelp()",
     "caption": "Command reference — all 26 beacon verbs, in the GUI",
     "wait": ".side-panel.open",
-    "settle": 1.4
+    "settle": 1.4,
+    "name": "23_command_reference"
   },
   {
     "hold": 4.5,
     "js": "const t = document.getElementById('terminal'); if (t) t.textContent = ''; document.querySelectorAll('.toast').forEach(e => e.remove()); closePanel()",
     "caption": "And the mode all of this feeds: Automated Attack, top right",
-    "settle": 1.4
+    "settle": 1.4,
+    "name": "24_automated_attack_button"
   }
 ]

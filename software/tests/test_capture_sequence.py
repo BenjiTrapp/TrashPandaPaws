@@ -94,6 +94,50 @@ class TestAStoryboardIsReadStrictly(unittest.TestCase):
             {"hold": 3.0, "wait": ".ai-knock", "timeout": 180}])
         self.assertEqual(steps[0].timeout, 180)
 
+    def test_a_step_can_name_the_file_it_writes(self):
+        # The same screens serve as the documentation's stills, where a
+        # frame called 0007.png is useless: the prose references
+        # `06_procs.png` by name.
+        steps = capture_sequence.parse([
+            {"hold": 1.0, "name": "06_procs"}])
+        self.assertEqual(steps[0].name, "06_procs")
+
+    def test_an_unnamed_step_is_numbered(self):
+        steps = capture_sequence.parse([{"hold": 1.0}])
+        self.assertIsNone(steps[0].name)
+
+    def test_a_name_with_a_path_separator_is_refused(self):
+        # It would write outside the output directory.
+        for bad in ("../escape", "a/b", "a\\b"):
+            with self.assertRaises(ValueError, msg=bad):
+                capture_sequence.parse([{"hold": 1.0, "name": bad}])
+
+    def test_captions_can_be_suppressed_for_the_same_storyboard(self):
+        # The tour and the documentation's stills are the same screens.
+        # A second storyboard for the stills would be the same content
+        # written twice, and the two would drift -- which is the mistake
+        # this project's branch review found in two flag tables. One
+        # storyboard, captions off for the stills.
+        steps = capture_sequence.parse(
+            [{"hold": 2.0, "caption": "Dashboard", "name": "01_dashboard"}],
+            captions=False)
+        self.assertIsNone(steps[0].caption)
+        self.assertEqual(steps[0].name, "01_dashboard")
+        self.assertEqual(steps[0].hold, 2.0)
+
+    def test_captions_are_kept_by_default(self):
+        steps = capture_sequence.parse(
+            [{"hold": 2.0, "caption": "Dashboard"}])
+        self.assertEqual(steps[0].caption, "Dashboard")
+
+    def test_two_steps_cannot_share_a_name(self):
+        # The second would silently overwrite the first, and the tour
+        # would come up a frame short with no error.
+        with self.assertRaises(ValueError) as caught:
+            capture_sequence.parse([{"hold": 1.0, "name": "same"},
+                                    {"hold": 1.0, "name": "same"}])
+        self.assertIn("same", str(caught.exception))
+
     def test_the_default_timeout_is_stated_not_implied(self):
         steps = capture_sequence.parse([{"hold": 1.0, "wait": ".x"}])
         self.assertEqual(steps[0].timeout, capture_sequence.DEFAULT_TIMEOUT)

@@ -51,7 +51,7 @@ SHELL_SELECTOR = "#app"
 CAPTION_HEIGHT = 52
 
 _FIELDS = {"hold", "js", "caption", "wait", "settle", "note", "shoot",
-           "timeout"}
+           "timeout", "name"}
 
 # Long enough for the GUI's own fetches to land. It fills itself from
 # several requests, and a step that shoots too early catches a spinner --
@@ -73,6 +73,10 @@ class Step(NamedTuple):
     wait: Optional[str]
     settle: float
     timeout: float
+    # The file to write, without the extension. The same screens serve as
+    # the documentation's stills, where `0007.png` is useless because the
+    # prose references `06_procs.png` by name.
+    name: Optional[str]
     # A step that acts on the page without being photographed: dismissing
     # the connect toasts, widening a panel, closing what the last step
     # opened. The first version had no such thing, so the toast-dismissing
@@ -84,8 +88,13 @@ class Step(NamedTuple):
 # Delimited, not guessed. The first version matched any run of capitals,
 # so captions mentioning SMB, LDAP, NTLM and MSSQL were read as unfilled
 # placeholders and the capture refused to start before taking a frame.
-def parse(storyboard):
+def parse(storyboard, captions=True):
     """Validate a storyboard strictly and return its steps.
+
+    `captions=False` drops them: the tour and the documentation's stills
+    are the same screens, and a second storyboard for the stills would be
+    the same content written twice -- which is the mistake this project's
+    branch review found in two duplicated flag tables.
 
     Strictly because it is written by hand and read once, hours before
     anyone looks at the result: a misspelled key that is quietly ignored
@@ -95,6 +104,7 @@ def parse(storyboard):
     if not storyboard:
         raise ValueError("the storyboard has no steps")
     steps = []
+    seen = {}
     for index, raw in enumerate(storyboard, 1):
         unknown = sorted(set(raw) - _FIELDS)
         if unknown:
@@ -107,8 +117,21 @@ def parse(storyboard):
             raise ValueError("step %d has a hold of %r; a frame has to be "
                              "on screen for some length of time"
                              % (index, raw["hold"]))
-        steps.append(Step(hold=hold, js=raw.get("js"),
-                          caption=raw.get("caption"), wait=raw.get("wait"),
+        name = raw.get("name")
+        if name is not None:
+            if "/" in name or "\\" in name or name.startswith("."):
+                raise ValueError("step %d has a name that would write "
+                                 "outside the output directory: %r"
+                                 % (index, name))
+            if name in seen:
+                # The second would silently overwrite the first, and the
+                # result would be a frame short with no error anywhere.
+                raise ValueError("steps %d and %d share the name %r"
+                                 % (seen[name], index, name))
+            seen[name] = index
+        steps.append(Step(hold=hold, js=raw.get("js"), name=name,
+                          caption=raw.get("caption") if captions else None,
+                          wait=raw.get("wait"),
                           settle=float(raw.get("settle", DEFAULT_SETTLE)),
                           timeout=float(raw.get("timeout", DEFAULT_TIMEOUT)),
                           shoot=bool(raw.get("shoot", True))))
@@ -205,7 +228,7 @@ async def run(args):
 
     values = dict(pair.split("=", 1) for pair in args.set or [])
     text = fill(pathlib.Path(args.storyboard).read_text(), values)
-    steps = parse(json.loads(text))
+    steps = parse(json.loads(text), captions=not args.no_captions)
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -240,7 +263,8 @@ async def run(args):
                         print("  (setup)   %s" % (step.js or "")[:60])
                         sys.stdout.flush()
                         continue
-                    name = "%04d.png" % len(names)
+                    name = (step.name + ".png") if step.name \
+                        else "%04d.png" % len(names)
                     await shoot(cdp, str(out_dir / name), scale=args.scale)
                     names.append(name)
                     print("  %s  %-44s %.1fs"
@@ -292,6 +316,8 @@ def main(argv=None):
     parser.add_argument("--chrome")
     parser.add_argument("--set", action="append", metavar="NAME=VALUE",
                         help="fill a placeholder in the storyboard")
+    parser.add_argument("--no-captions", action="store_true",
+                        help="shoot the same screens without the caption bar")
     args = parser.parse_args(argv)
     return asyncio.run(run(args))
 

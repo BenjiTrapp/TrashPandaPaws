@@ -9,6 +9,7 @@
 #   tools/capture_figures.sh            both figures
 #   tools/capture_figures.sh tour       just the C2 tour
 #   tools/capture_figures.sh agent      just the agent campaign
+#   tools/capture_figures.sh stills     the same screens as PNG stills
 #
 # Why a script rather than a note: the order matters and two of the
 # mistakes cost a capture run each.
@@ -122,6 +123,25 @@ if [ "$WHICH" = "both" ] || [ "$WHICH" = "tour" ]; then
   build c2_tour tools/storyboards/c2_tour.json
   cleanup
   sleep 1
+fi
+
+if [ "$WHICH" = "stills" ]; then
+  # The same storyboard without the caption bar, written under the names
+  # docs/C2_DEMO.md already references. Most of the stills it had were
+  # window grabs -- Chrome's tab strip, the address bar reading
+  # localhost:8443 -- which is what tools/capture_gui.py exists to avoid,
+  # and none of them had the Automated Attack button because they predate
+  # it. One storyboard rather than two, so the two cannot drift.
+  echo "== stills =="
+  start_stack
+  rm -rf "$WORK/stills"
+  python3 tools/capture_sequence.py \
+      --url "http://127.0.0.1:$C2_PORT/" \
+      --storyboard tools/storyboards/c2_tour.json \
+      --out-dir "$WORK/stills" --set "BEACON_ID=$BEACON" \
+      --no-captions --width 1440 --height 900 --scale 2
+  echo "  wrote $(ls "$WORK/stills"/*.png | wc -l | tr -d ' ') stills to $WORK/stills"
+  echo "  review them, then copy the ones you want into docs/screenshots/"
 fi
 
 if [ "$WHICH" = "both" ] || [ "$WHICH" = "agent" ]; then

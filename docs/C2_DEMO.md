@@ -11,6 +11,29 @@
 
 ---
 
+## The whole thing, in two figures
+
+Both were captured from a running stack by `tools/capture_figures.sh`: a C2
+with a real beacon checked in from the capture host, the real agent service,
+the real safety tiers and the real expected-value gate. Nothing is mocked up
+and nothing is a drawing. The campaign in the second figure is one that
+actually ran -- its `approvals` row reads `exploit_known_poc / refused /
+operator`, and the knock card on screen shows the arithmetic that produced
+that number.
+
+Every feature of the team server, one screen at a time:
+
+![C2 tour](screenshots/c2_tour.gif)
+
+And the Automated Attack mode, from the empty form to a refused knock:
+
+![An agent campaign](screenshots/agent_run.gif)
+
+They loop, so they start again on their own. The sections below are the same
+screens, still, with the detail the captions cannot carry.
+
+---
+
 ## Table of Contents
 
 1. [Operator Dashboard](#1-operator-dashboard)
@@ -1025,6 +1048,8 @@ sequenceDiagram
 ---
 
 ## 19. Command Reference
+
+![Command reference](screenshots/23_command_reference.png)
 
 ### File Operations
 

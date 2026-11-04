@@ -824,8 +824,6 @@ class TestAVersionIsNotATarget(unittest.TestCase):
         # The exemption is per program, not a general amnesty for numbers.
         self.assertIsNotNone(self._why("nmap 10.9.9.9"))
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestAPortSettingIsAPortNotAnAddress(unittest.TestCase):
@@ -879,3 +877,6 @@ class TestAPortSettingIsAPortNotAnAddress(unittest.TestCase):
 
     def test_a_port_out_of_range_is_still_refused(self):
         self.assertIsNotNone(self._why('msfconsole -x "set RPORT 99999; run"'))
+
+if __name__ == "__main__":
+    unittest.main()
