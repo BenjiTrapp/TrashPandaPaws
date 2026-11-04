@@ -104,7 +104,8 @@ def _router(gate_allows=True, caps=None, beacon_output="ok", beacon_exit=0,
             beacon_dies=False, c2_down=False, detection_budget=3,
             truncate_chars=4000, uplinks=None, phase5_enabled=True,
             allow=("10.0.1.0/24",), deny=(), unattended="decide",
-            beacon_ids=("raccoon-fox", "raccoon-pi"), mode="auto"):
+            beacon_ids=("raccoon-fox", "raccoon-pi"), mode="auto",
+            limit_scan_rate=True):
     conn = db.open_store(":memory:")
     run_id = queries.create_run(conn, "campaign", None, "auto", "{}")
     g = gate.Gate(
@@ -120,7 +121,8 @@ def _router(gate_allows=True, caps=None, beacon_output="ok", beacon_exit=0,
         caps_by_beacon=caps if caps is not None else {
             "raccoon-fox": ["batch"], "raccoon-pi": ["batch", "dropbox"]},
         uplink_by_beacon=uplinks if uplinks is not None else {},
-        phase5_enabled=phase5_enabled, truncate_chars=truncate_chars)
+        phase5_enabled=phase5_enabled, truncate_chars=truncate_chars,
+        limit_scan_rate=limit_scan_rate)
     return r, c2
 
 
@@ -1112,6 +1114,80 @@ class TestATargetIsRequiredUnlessSomethingElseAnswers(IsolatedAsyncioTestCase):
                                   beacon_id="raccoon-fox")
         self.assertIn("target", (res.blocked_reason or "").lower())
         self.assertEqual(_approvals(r), 0)
+
+
+
+class TestYoloChangesTheRateAndNothingElse(IsolatedAsyncioTestCase):
+    """The comment on _limit_scan_rate promised a test; there was none here.
+
+    Invariant 3 was covered at the config layer and at the orchestrator
+    layer, and it holds here by construction because the rewrite is
+    computed after the classification and the gate. "By construction" is
+    the kind of claim that stops being true quietly, and the comment said
+    "a test pins that", so now one does.
+    """
+
+    async def test_the_rate_limit_is_the_only_thing_yolo_lifts(self):
+        loud, c2_loud = _router(limit_scan_rate=False)
+        res = await loud.run_command("nmap -sV -p- 10.0.1.5", server_side=True)
+        self.assertTrue(res.success)
+        argv = c2_loud.exec_calls[-1]["argv"]
+        self.assertIn("-p-", argv)
+        self.assertNotIn("--max-rate", argv)
+
+    async def test_a_tier_one_action_is_refused_with_the_rate_limit_off(self):
+        loud, c2_loud = _router(limit_scan_rate=False)
+        res = await loud.run_command("shutdown -h now", beacon_id="raccoon-fox")
+        self.assertIsNotNone(res.blocked_reason)
+        self.assertTrue(c2_loud.nothing_ran())
+
+    async def test_the_gate_still_answers_with_the_rate_limit_off(self):
+        loud, c2_loud = _router(limit_scan_rate=False, gate_allows=False)
+        res = await loud.run_command("lsassy -u a -p b 10.0.1.5",
+                                     server_side=True)
+        self.assertIsNotNone(res.blocked_reason)
+        self.assertEqual(_approvals(loud), 1)
+        self.assertTrue(c2_loud.nothing_ran())
+
+    async def test_the_scope_still_refuses_with_the_rate_limit_off(self):
+        loud, c2_loud = _router(limit_scan_rate=False)
+        res = await loud.run_command("nmap 10.9.9.9", server_side=True)
+        self.assertIsNotNone(res.blocked_reason)
+        self.assertTrue(c2_loud.nothing_ran())
+
+
+class TestTheWrapperTablesDoNotDriftWhereTheyOverlap(unittest.TestCase):
+    """safety and scope each keep a wrapper table; the overlap must agree.
+
+    The review called these "one concept implemented twice". They are not:
+    safety._WRAPPER_VALUE_FLAGS is about *wrappers* -- timeout, env, sudo,
+    the programs that precede another one -- while scope._PROGRAM_FLAGS is
+    about *programs whose flags carry a value*, nmap -p and ping -c. They
+    overlap on the handful of names that are both, and that overlap had
+    drifted: safety's `env` listed -c/--chdir where GNU env's flag is -C,
+    and scope's listed -C without -s/--split-string.
+
+    So this pins the overlap rather than demanding the tables be equal,
+    which they should not be. Same precedent as _WHOLE_FLAGS, which is
+    already pinned against scope._TARGET_FLAG_PREFIXES.
+    """
+
+    def test_the_names_in_both_tables_carry_the_same_value_flags(self):
+        shared = set(safety._WRAPPER_VALUE_FLAGS) & set(scope._PROGRAM_FLAGS)
+        self.assertTrue(shared, "the two tables no longer overlap at all; "
+                                "if that is deliberate, delete this test")
+        for name in sorted(shared):
+            self.assertEqual(
+                sorted(safety._WRAPPER_VALUE_FLAGS[name]),
+                sorted(scope._PROGRAM_FLAGS[name]),
+                "%s: the two tables disagree about its value flags" % name)
+
+    def test_the_privilege_wrappers_agree(self):
+        # The same literal was written twice, and pkexec was in one of
+        # them only -- which was Critical 1.
+        for name in ("sudo", "doas", "runas", "pkexec"):
+            self.assertIn(name, safety._WRAPPER_VALUE_FLAGS, name)
+            self.assertIn("-u", safety._WRAPPER_VALUE_FLAGS[name], name)
 
 if __name__ == "__main__":
     unittest.main()

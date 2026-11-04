@@ -102,6 +102,21 @@ _NUMERIC_FLAGS = (
     "--retries", "--threads", "-t", "--timeout", "--wait", "--connect-timeout",
     "--delay", "--jitter")
 _PRIVILEGE_VALUE_FLAGS = ("-u", "-U", "--user", "-g", "--group")
+# Programs none of whose operands is a host. Their arguments are search
+# terms, package names or versions, so reading them as targets refuses the
+# command on its own input: a live run asked for `searchsploit dnsmasq 2.90`
+# and `searchsploit vsftpd 2.3.4` and had the version refused as an
+# address, which blocked the phase that looks CVEs up.
+#
+# Kept small and specific. This exempts a program from target scanning
+# entirely, so a program that takes hosts *and* free text does not belong
+# here -- it belongs in _PROGRAM_FLAGS with its value flags named.
+_PROGRAMS_WITHOUT_TARGETS = frozenset((
+    "searchsploit", "apropos", "whatis", "man", "which", "whereis",
+    "apt", "apt-get", "apt-cache", "dpkg", "rpm", "yum", "dnf", "brew",
+    "pip", "pip3", "gem", "npm",
+))
+
 _PROGRAM_FLAGS = {
     "nmap": _NUMERIC_FLAGS,
     "masscan": _NUMERIC_FLAGS,
@@ -113,6 +128,7 @@ _PROGRAM_FLAGS = {
     "ncat": ("-w", "-i", "-q", "-p"),
     "ssh": ("-p",),
     "sleep": (),
+    "searchsploit": (),
     "head": ("-n", "-c", "--lines", "--bytes"),
     "tail": ("-n", "-c", "--lines", "--bytes"),
     # Prefixes: their own flags that take a separate value. Guessing from the
@@ -121,9 +137,9 @@ _PROGRAM_FLAGS = {
     "nice": ("-n", "--adjustment"),
     "ionice": ("-c", "-n", "--class", "--classdata"),
     "stdbuf": ("-i", "-o", "-e", "--input", "--output", "--error"),
-    "env": ("-u", "--unset", "-C", "--chdir"),
-    "xargs": ("-n", "-i", "-p", "-d", "-s", "-l", "--max-args", "--max-procs",
-              "--delimiter", "--max-lines"),
+    "env": ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"),
+    "xargs": ("-a", "--arg-file", "-d", "--delimiter", "-E", "-I", "-L",
+              "-n", "--max-args", "-P", "--max-procs", "-s", "--max-chars"),
     "watch": ("-n", "--interval"),
     "time": ("-f", "-o", "--format", "--output"),
     "sudo": _PRIVILEGE_VALUE_FLAGS,
@@ -279,9 +295,21 @@ def _drop_valid_v6(match) -> str:
     return ""
 
 
+# `//host/share` and `\\host\share`. A share has no spelling that does not
+# name its host, so refusing the whole word as unverifiable made every SMB
+# invocation unreachable -- and told the model to "name each target
+# individually as an IP address", which is advice it cannot follow. Both
+# forms are split here the way the :// branch splits a URL.
+_SHARE = re.compile(r"^//([^/]+)(?:/.*)?$")
+_UNC = re.compile(r"(?<!\S)\\\\([^\\\s]+)\\")
+
+
 def _scan_value(value: str, found, unknown, bare, after_flag: bool = False) -> None:
     value_in = value
-    if "://" in value:
+    share = _SHARE.match(value)
+    if share:
+        value = share.group(1)
+    elif "://" in value:
         try:
             host = urlsplit(value).hostname
         except ValueError:
@@ -331,7 +359,11 @@ def _scan(command) -> Tuple[List[str], List[str], List[str]]:
     if not isinstance(command, str):
         return found, ["<non-string command>"], bare
     try:
-        words = _tokenise(_REDIRECT_FD.sub("", command))
+        # `\\host\share` -> `//host/share` before tokenising, which folds
+        # backslashes away and would leave `\10.0.1.5share`. Anchored on
+        # whitespace so `DOMAIN\user` is untouched.
+        normalised = _UNC.sub(r"//\1/", _REDIRECT_FD.sub("", command))
+        words = _tokenise(normalised)
     except ValueError:
         return found, [command[:_CLIP]], bare
     at_start, skip_next, after_flag = True, False, False
@@ -408,6 +440,17 @@ def _scan(command) -> Tuple[List[str], List[str], List[str]]:
                     if (positionals == 2 and _PORT.fullmatch(word)
                             and 0 < int(word) <= 65535):
                         continue
+        if not looking and prog in _PROGRAMS_WITHOUT_TARGETS:
+            # Its operands are search terms, not hosts.
+            continue
+        share = _SHARE.match(word)
+        if share:
+            # `//host/share` names its host and nothing else the scope can
+            # judge. Read before the dynamic-text screen on purpose: a
+            # share is routinely called ADMIN$ or C$, and the `$` was being
+            # read as a variable reference, which refused every SMB
+            # invocation on its share name.
+            word = share.group(1)
         if not word.isascii() or _is_dynamic(word):
             unknown.append(word)
         elif word == "-":

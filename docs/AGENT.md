@@ -296,7 +296,12 @@ Things that surprise people, all of them deliberate:
   passes; `nmap -c 4` does not, because `-c` takes a number for ping and not
   for nmap. A program the table does not know gets only the scanner list,
   and a bare number is then read as a target and refused. The fix is to
-  attach the number to the flag: `-c4`.
+  attach the number to the flag: `-c4`. A handful of programs take free
+  text rather than hosts -- `searchsploit`, `apt`, `pip`, `man` -- and none
+  of their operands is read as a target at all.
+- **A share names its host.** `//10.0.1.5/share` and `\\10.0.1.5\share`
+  are both judged on the host part, so SMB tooling is addressable; the
+  share name itself is not a target, `ADMIN$` included.
 
 An observation is not an action. The agent records hosts it sees in command
 output even when they are outside the scope — that is what "everything

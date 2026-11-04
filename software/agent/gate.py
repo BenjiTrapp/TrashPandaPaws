@@ -40,7 +40,8 @@ class GateDecision(NamedTuple):
     # only one that writes no row — a tier-3 action has nothing to ask and
     # would flood the table. "hard" and "skip" write a row that is already
     # decided: audited, yet unanswerable, because pending() filters on
-    # decision IS NULL and answer() finds no future for it.
+    # decision IS NULL and answer() finds no future for it. That was true of
+    # "skip" and aspirational for "hard" until _refuse_hard existed.
     decided_by: str
     ev: Optional[float]
     # The verdict between allowed and refused: allowed, but only because the
@@ -262,14 +263,15 @@ class Gate:
         # has nothing to ask. Tier is compared for equality against the three
         # known values so that anything else is refused, not waved through.
         if tier == safety.TIER_FREE:
+            # Nothing to ask, and a row per free command would flood the
+            # table. This is the one tier that writes none.
             return GateDecision(True, "no approval needed", "free", None)
         if tier == safety.TIER_HARD:
-            return GateDecision(
-                False, classification.reason or "irreversible action",
-                "hard", None)
+            return self._refuse_hard(
+                classification, classification.reason or "irreversible action")
         if tier != safety.TIER_KNOCK:
-            return GateDecision(
-                False, "unrecognised tier %r; refused" % (tier,), "hard", None)
+            return self._refuse_hard(
+                classification, "unrecognised tier %r; refused" % (tier,))
 
         if self.mode == "auto" and self.unattended_behavior == "skip":
             return self._skip(classification)
@@ -303,6 +305,27 @@ class Gate:
         if self.mode == "auto":
             return self._decide_by_ev(approval_id, numbers)
         return await self._ask_operator(approval_id, numbers, classification)
+
+    def _refuse_hard(self, classification, reason):
+        """Refuse an irreversible action, on the record and unanswerable.
+
+        Section 10.7 says every request and every decision lands in
+        `approvals`; this used to write none, so an irreversible action
+        that was asked for and refused left no trace there. The schema
+        permits decided_by='hard' and nothing produced it.
+
+        The old argument for writing nothing was that "a row is an
+        invitation to answer". It is not: pending() filters on
+        `decision IS NULL`, so a row written already-decided is audited and
+        unanswerable -- which is what _skip below had already relied on.
+        No EV is computed, because nothing was weighed: the tier decided.
+        """
+        approval_id = queries.create_approval(
+            self._conn, self._run_id, classification.action_key,
+            json.dumps(classification._asdict(), default=str),
+            json.dumps({"refused_outright": True, "reason": reason}))
+        queries.decide_approval(self._conn, approval_id, _REFUSED, "hard")
+        return GateDecision(False, reason, "hard", None)
 
     def _skip(self, classification):
         """Refuse without evaluating, but on the record.

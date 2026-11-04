@@ -752,5 +752,77 @@ class TestScopeConstruction(unittest.TestCase):
         self.assertIsNotNone(s.check("nmap 10.0.1.6", _none))
 
 
+
+
+class TestAShareIsAHostFollowedByAPath(unittest.TestCase):
+    """`//host/share` names a host; it has no spelling that does not.
+
+    _ADDRESSY matched the `10.0.1` inside `//10.0.1.5/share` before the
+    host/path handling got a chance, so every SMB invocation was refused as
+    unverifiable -- with advice the model could not follow, because the
+    reason says "name each target individually as an IP address" and a
+    share has no such form. smbclient and smbloot are both in the shipped
+    arsenal. Fail-closed, so not a safety hole, but a capability the agent
+    could not reach and a refusal it could not act on.
+
+    The `://` branch already does exactly this for URLs. This is the same
+    split for the two share spellings.
+    """
+
+    def _why(self, command):
+        return _scope().check(command, lambda n: None, require_target=True)
+
+    def test_an_in_scope_share_is_allowed(self):
+        for command in ("smbclient //10.0.1.5/share -U a",
+                        r"smbclient \\10.0.1.5\share -U a",
+                        "smbloot //10.0.1.5/C$ u p ls",
+                        "mount -t cifs //10.0.1.5/share /mnt"):
+            self.assertIsNone(self._why(command), command)
+
+    def test_an_out_of_scope_share_is_refused_on_its_host(self):
+        for command in ("smbclient //10.9.9.9/share -U a",
+                        r"smbclient \\10.9.9.9\share"):
+            reason = self._why(command)
+            self.assertIsNotNone(reason, command)
+            self.assertIn("10.9.9.9", reason, command)
+
+    def test_the_share_name_is_not_read_as_a_target(self):
+        # `C$` and `ADMIN$` must not become bare hostnames to resolve.
+        self.assertIsNone(self._why("smbclient //10.0.1.5/ADMIN$ -U a"))
+
+    def test_a_hostname_share_still_needs_a_finding(self):
+        # Same rule as any other name: a host is a target once something
+        # ties it to an address in scope.
+        reason = self._why("smbclient //fileserver.corp/share")
+        self.assertIsNotNone(reason)
+
+
+class TestAVersionIsNotATarget(unittest.TestCase):
+    """`searchsploit dnsmasq 2.90` searches a local database.
+
+    `2.90` and `2.3.4` look addressy enough to be read as targets, so the
+    CVE-lookup phase refused its own commands -- observed in a live run,
+    where the agent asked for `searchsploit dnsmasq 2.90` and
+    `searchsploit vsftpd 2.3.4`. The deferred note called this "number
+    arguments are known per program, not per flag"; the per-program table
+    exists, and searchsploit was not in it.
+
+    It takes free text, not hosts, so none of its operands are targets.
+    """
+
+    def _why(self, command):
+        return _scope().check(command, lambda n: None, require_target=False)
+
+    def test_a_version_argument_is_not_a_target(self):
+        for command in ("searchsploit dnsmasq 2.90",
+                        "searchsploit vsftpd 2.3.4",
+                        "searchsploit --json --cve CVE-2011-2523",
+                        "searchsploit apache 2.4.49"):
+            self.assertIsNone(self._why(command), command)
+
+    def test_a_scanner_still_reads_its_operands_as_targets(self):
+        # The exemption is per program, not a general amnesty for numbers.
+        self.assertIsNotNone(self._why("nmap 10.9.9.9"))
+
 if __name__ == "__main__":
     unittest.main()

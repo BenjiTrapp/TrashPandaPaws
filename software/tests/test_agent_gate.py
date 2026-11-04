@@ -90,23 +90,34 @@ class TestTierRouting(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(d.allowed)
         self.assertEqual(d.decided_by, "hard")
 
-    async def test_tier_one_creates_no_approval_row(self):
+    async def test_tier_one_is_recorded_as_already_refused(self):
+        # This asserted `_rows(conn) == []`, which was the implementation.
+        # Section 10.7 asks for the opposite: every request lands in
+        # `approvals`. Already-decided is what keeps it unanswerable, and
+        # the next test pins that half.
         for mode in ("auto", "supervised"):
             conn, rid = _fresh_run()
             await _gate(conn, rid, mode=mode).request(
                 _cls(tier=safety.TIER_HARD))
-            self.assertEqual(_rows(conn), [], mode)
+            rows = _rows(conn)
+            self.assertEqual(len(rows), 1, mode)
+            self.assertEqual((rows[0]["decision"], rows[0]["decided_by"]),
+                             ("refused", "hard"), mode)
 
     async def test_tier_one_cannot_be_approved_by_operator(self):
         conn, rid = _fresh_run()
         g = _gate(conn, rid, mode="supervised")
         d = await g.request(_cls(tier=safety.TIER_HARD))
         self.assertFalse(d.allowed)
+        # The row exists and is audited; what makes it unanswerable is that
+        # it is already decided, so pending() does not list it and answer()
+        # finds no future for it. The id is the real one from the table,
+        # not a guess, because the row now exists to be guessed at.
         self.assertEqual(g.pending(), [])
-        # No row exists, so no id can be answered — in particular not the
-        # first id the table would have handed out.
+        approval_id = _rows(conn)[0]["id"]
+        self.assertFalse(g.answer(approval_id, True))
         self.assertFalse(g.answer(1, True))
-        self.assertEqual(_rows(conn), [])
+        self.assertEqual(_rows(conn)[0]["decision"], "refused")
 
     async def test_tier_one_is_refused_whatever_the_ev_or_the_override(self):
         conn, rid = _fresh_run()
@@ -131,13 +142,15 @@ class TestTierRouting(unittest.IsolatedAsyncioTestCase):
         d = await _gate(conn, rid).request(_cls(tier=safety.TIER_HARD))
         self.assertIn("LSASS access", d.reason)
 
-    async def test_unrecognised_tier_fails_closed_without_a_row(self):
+    async def test_unrecognised_tier_fails_closed_and_is_recorded(self):
         for tier in (0, 4, None, "2"):
             conn, rid = _fresh_run()
             d = await _gate(conn, rid).request(_cls(tier=tier))
             self.assertFalse(d.allowed, tier)
             self.assertEqual(d.decided_by, "hard", tier)
-            self.assertEqual(_rows(conn), [], tier)
+            rows = _rows(conn)
+            self.assertEqual(len(rows), 1, tier)
+            self.assertEqual(rows[0]["decision"], "refused", tier)
 
 
 # ── EV arbiter ──
@@ -1028,6 +1041,62 @@ class TestAPausedRunLeavesSomethingToAnswer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(_rows(conn)), 1)
         self.assertIsNone(_rows(conn)[0]["decision"])
         self.assertEqual(len(g.pending()), 1)
+
+
+
+class TestATierOneRefusalIsOnTheRecord(unittest.IsolatedAsyncioTestCase):
+    """Section 10.7: every request and every decision lands in `approvals`.
+
+    Tier 1 wrote no row, so an irreversible action that was asked for and
+    refused left no trace there at all -- it survived only in
+    `llm_interactions`, and only at log level `full`. The schema permits
+    `decided_by='hard'` and commit 3f03bf4 was titled for it, so the schema
+    expected a row nothing produced.
+
+    The argument in the code for writing none was that "a row is an
+    invitation to answer". It is not: `pending()` filters on
+    `decision IS NULL`, so an already-decided row is audited and
+    unanswerable, which is exactly what `_skip` had already relied on.
+    These tests assert that property -- unanswerable -- rather than the
+    absence of a row, which is what the old ones pinned.
+    """
+
+    async def _refused(self, tier=None):
+        conn, rid = _fresh_run()
+        g = _gate(conn, rid, mode="supervised", unattended_behavior="skip")
+        d = await g.request(_cls(tier=tier or safety.TIER_HARD))
+        return conn, g, d
+
+    async def test_the_refusal_is_recorded_as_already_decided(self):
+        conn, g, d = await self._refused()
+        rows = _rows(conn)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["decision"], rows[0]["decided_by"]),
+                         ("refused", "hard"))
+
+    async def test_the_recorded_refusal_cannot_be_answered(self):
+        conn, g, d = await self._refused()
+        self.assertEqual(g.pending(), [])
+        self.assertFalse(g.answer(_rows(conn)[0]["id"], True))
+        self.assertEqual(_rows(conn)[0]["decision"], "refused")
+
+    async def test_the_decision_still_says_hard(self):
+        conn, g, d = await self._refused()
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.decided_by, "hard")
+
+    async def test_an_unrecognised_tier_is_recorded_the_same_way(self):
+        conn, g, d = await self._refused(tier=99)
+        self.assertEqual(d.decided_by, "hard")
+        self.assertEqual(_rows(conn)[0]["decided_by"], "hard")
+
+    async def test_a_free_action_still_writes_nothing(self):
+        # Tier 3 has nothing to ask and would flood the table.
+        conn, rid = _fresh_run()
+        g = _gate(conn, rid)
+        d = await g.request(_cls(tier=safety.TIER_FREE))
+        self.assertTrue(d.allowed)
+        self.assertEqual(_rows(conn), [])
 
 if __name__ == "__main__":
     unittest.main()

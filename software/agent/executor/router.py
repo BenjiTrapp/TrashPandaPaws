@@ -351,7 +351,12 @@ class Router:
         try:
             screened = await self._screen(command, beacon_id, server_side,
                                           p_success_override)
-        except GatePauseRequested:
+        except ControlSignal:
+            # The category, not one member of it. GatePauseRequested was
+            # named here and RouterAborted is its sibling -- currently
+            # raised outside this try, so the narrow form happened to be
+            # enough. control.py exists so that this does not depend on
+            # where a signal is raised from.
             raise
         except Exception as exc:
             # A check that crashes has not approved anything.

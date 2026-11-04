@@ -1487,5 +1487,110 @@ class TestXxdWritesWithOrWithoutTheRevertFlag(unittest.TestCase):
         self.assertEqual(self._tier("xxd /tmp/in /tmp/out"),
                          safety.TIER_FREE)
 
+
+
+class TestASleepWithAUnitIsReadNotGuessed(unittest.TestCase):
+    """`sleep 30s` was a tier-1 refusal with an untrue reason.
+
+    float("30s") raises, the except arm returned sleep_too_long, and its
+    reason reads "a sleep this long takes the beacon out of reach for
+    hours" -- which is false for thirty seconds, and the model has no way
+    to read it and comply. Fail-closed, so harmless, but a refusal nobody
+    can act on is a refusal that will be retried.
+    """
+
+    def _c(self, command):
+        return safety.classify(command, "dropbox", lambda n: False, True)
+
+    def test_a_short_sleep_with_a_unit_is_free(self):
+        for command in ("sleep 30s", "sleep 1m", "sleep 0.5s", "sleep 90s",
+                        "sleep 2m"):
+            self.assertEqual(self._c(command).tier, safety.TIER_FREE, command)
+
+    def test_a_long_sleep_with_a_unit_is_still_refused(self):
+        for command in ("sleep 5h", "sleep 400m", "sleep 2d", "sleep 99999s"):
+            c = self._c(command)
+            self.assertEqual(c.tier, safety.TIER_HARD, command)
+            self.assertEqual(c.action_key, "sleep_too_long", command)
+
+    def test_something_unparseable_says_what_it_wants(self):
+        # Still refused -- fail-closed -- but with a reason that can be
+        # acted on instead of one that is untrue.
+        c = self._c("sleep soon")
+        self.assertEqual(c.tier, safety.TIER_HARD)
+        self.assertIn("seconds", (c.reason or "").lower())
+
+    def test_the_plain_forms_are_unchanged(self):
+        self.assertEqual(self._c("sleep 30").tier, safety.TIER_FREE)
+        self.assertEqual(self._c("sleep 99999").action_key, "sleep_too_long")
+
+
+class TestARepeatedFlagIsReadAtItsOwnPosition(unittest.TestCase):
+    """`nmap -p 80 -p - 10.0.1.5` kept the all-ports request.
+
+    next_token looked the flag's value up with list.index, which finds the
+    *first* token of that value rather than the one being examined. With
+    `-p` given twice, the second one's value was read from the first, so
+    `-p -` survived the narrowing and produced exactly the 22-minute
+    timeout the cap exists to prevent.
+    """
+
+    def test_the_second_occurrence_is_the_one_capped(self):
+        out = safety.enforce_scan_limits("nmap -p 80 -p - 10.0.1.5")
+        self.assertIn("--top-ports", out)
+        self.assertNotIn("-p -", out)
+
+    def test_a_repeated_narrow_flag_is_left_alone(self):
+        out = safety.enforce_scan_limits("nmap -p 80 -p 443 10.0.1.5")
+        self.assertNotIn("--top-ports", out)
+        self.assertIn("-p 80", out)
+        self.assertIn("-p 443", out)
+
+    def test_the_cap_appears_once_however_many_times_it_was_asked(self):
+        out = safety.enforce_scan_limits("nmap -p - -p - 10.0.1.5")
+        self.assertEqual(out.count("--top-ports"), 1)
+
+
+class TestXargsFlagsDoNotHideTheProgram(unittest.TestCase):
+    """A wrapper's flag table is load-bearing in both directions.
+
+    Found by the drift test between safety's and scope's tables. xargs had
+    `--replace` listed as taking a separate value -- it does not, GNU
+    xargs takes it attached -- so the token after it was skipped and the
+    program went with it. And `-I`, which genuinely does take one, was in
+    neither table, so its replacement string landed in command position.
+    Both are Critical 1's shape: the program hidden, the rate limit gone,
+    and `require_target` relying on a program it cannot see.
+
+        xargs --replace nmap -sV -p- 10.0.1.5   scan=False, unlimited
+        xargs -I {} nmap -sV -p- 10.0.1.5       scan=False, unlimited
+    """
+
+    SPELLINGS = (
+        "xargs nmap -sV -p- 10.0.1.5",
+        "xargs -n 1 nmap -sV -p- 10.0.1.5",
+        "xargs -I {} nmap -sV -p- 10.0.1.5",
+        "xargs --replace nmap -sV -p- 10.0.1.5",
+        "xargs -i nmap -sV -p- 10.0.1.5",
+        "xargs -L 1 nmap -sV -p- 10.0.1.5",
+        "xargs -a /tmp/list nmap -sV -p- 10.0.1.5",
+        "xargs -d , -P 4 nmap -sV -p- 10.0.1.5",
+    )
+
+    def test_the_scanner_is_found_behind_every_spelling(self):
+        for command in self.SPELLINGS:
+            self.assertTrue(safety.is_scan(command), command)
+
+    def test_the_rate_limit_and_the_cap_survive_every_spelling(self):
+        for command in self.SPELLINGS:
+            limited = safety.enforce_scan_limits(command)
+            self.assertIn("--max-rate 50", limited, command)
+            self.assertIn("--top-ports", limited, command)
+            self.assertNotIn("-p-", limited, command)
+
+    def test_an_attached_replacement_string_is_not_a_program(self):
+        # `-I{}` carries its value, so nothing after it may be skipped.
+        self.assertTrue(safety.is_scan("xargs -I{} nmap -p- 10.0.1.5"))
+
 if __name__ == "__main__":
     unittest.main()

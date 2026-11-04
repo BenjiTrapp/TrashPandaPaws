@@ -198,9 +198,16 @@ _WRAPPER_VALUE_FLAGS = {
     "nice": ("-n", "--adjustment"),
     "ionice": ("-c", "-n", "--class", "--classdata"),
     "stdbuf": ("-i", "-o", "-e", "--input", "--output", "--error"),
-    "env": ("-u", "--unset", "-s", "--split-string", "-c", "--chdir"),
-    "xargs": ("-n", "-i", "-p", "-d", "-s", "-l", "--max-args",
-              "--replace", "--max-procs", "--delimiter", "--max-lines"),
+    # GNU env's real flags: -u NAME, -C DIR, -S STRING. Lowercase -c and
+    # -s were written here and worked only because the text is lowercased
+    # before matching, which also meant this table and scope's disagreed.
+    "env": ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"),
+    # GNU xargs, and only the flags that take a *separate* value. -i, -l
+    # and --replace take theirs attached if at all, and listing them here
+    # skipped the token after them -- which was the program. -I, which does
+    # take one, was missing, so its replacement string became the program.
+    "xargs": ("-a", "--arg-file", "-d", "--delimiter", "-E", "-I", "-L",
+              "-n", "--max-args", "-P", "--max-procs", "-s", "--max-chars"),
     "watch": ("-n", "--interval"),
     "time": ("-f", "-o", "--format", "--output"),
     "sudo": _PRIVILEGE_VALUE_FLAGS,
@@ -893,6 +900,22 @@ _RULES_KNOCK = [(p, k) for p, k in _RULES if RISK_TABLE[k].tier == TIER_KNOCK]
 _EXPLOIT_RULE = next(p for p, k in _RULES if k == "exploit_known_poc")
 
 
+# Rules appended at runtime, computed once per change to _RULES rather than
+# once per classify(). Only the test suite appends any, so the work was
+# wasted on every real call; keyed on the list's length because that is what
+# appending changes, and _RULES is append-only by construction.
+_RUNTIME_CACHE = {"length": None, "rules": []}
+
+
+def _runtime_rules():
+    if _RUNTIME_CACHE["length"] != len(_RULES):
+        frozen = {id(p) for p, _ in _RULES_HARD} | {id(p) for p, _ in _RULES_KNOCK}
+        _RUNTIME_CACHE["rules"] = [(p, k) for p, k in _RULES
+                                   if id(p) not in frozen]
+        _RUNTIME_CACHE["length"] = len(_RULES)
+    return _RUNTIME_CACHE["rules"]
+
+
 # ── Classification ──
 
 
@@ -905,14 +928,40 @@ def _forms(command):
     return (squashed, pathed)
 
 
+# coreutils sleep accepts a unit suffix. Without reading it, `sleep 30s`
+# raised on float() and fell into the tier-1 refusal whose reason is "a
+# sleep this long takes the beacon out of reach for hours" -- untrue of
+# thirty seconds, and nothing the model could read and comply with.
+_SLEEP_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+_SLEEP_UNPARSEABLE = _row(
+    TIER_HARD, "sleep_too_long", "lifecycle",
+    "the sleep duration could not be read; give it in whole seconds, "
+    "optionally with an s, m, h or d suffix")
+
+
+def _sleep_seconds(word):
+    """Seconds in a coreutils duration, or None if it cannot be read."""
+    if not word:
+        return None
+    unit = _SLEEP_UNITS.get(word[-1].lower())
+    number = word[:-1] if unit else word
+    try:
+        value = float(number)
+    except ValueError:
+        return None
+    return value * (unit or 1)
+
+
 def _classify_sleep(effective):
     parts = effective.split()
     if len(parts) < 2:
-        return RISK_TABLE["sleep_too_long"]
-    try:
-        seconds = float(parts[1])
-    except ValueError:
-        return RISK_TABLE["sleep_too_long"]
+        return _SLEEP_UNPARSEABLE
+    seconds = _sleep_seconds(parts[1])
+    if seconds is None:
+        # Still refused -- fail-closed -- but with a reason that says what
+        # would be accepted instead of one that is false.
+        return _SLEEP_UNPARSEABLE
     # Written as a positive test so that nan and inf both fall through to the
     # refusal rather than comparing their way past it.
     if seconds < _SLEEP_LIMIT_SECONDS:
@@ -1015,8 +1064,7 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
     # ordering guarantee holds for them too — deferred three rounds, closed
     # now because "only the suite does this" is a reason to keep it cheap,
     # not a reason to leave the ordering wrong.
-    frozen = set(id(p) for p, _ in _RULES_HARD) | set(id(p) for p, _ in _RULES_KNOCK)
-    runtime = [(p, k) for p, k in _RULES if id(p) not in frozen]
+    runtime = _runtime_rules()
 
     for pattern, key in runtime:
         row = RISK_TABLE.get(key)
@@ -1331,12 +1379,16 @@ def enforce_scan_limits(command):
     skip_next = False
     capped = False
 
-    def next_token(all_tokens, scanner_index, current):
-        following = all_tokens[scanner_index + 1:]
-        position = following.index(current)
-        return following[position + 1] if position + 1 < len(following) else ""
+    def next_token(all_tokens, position):
+        """The token after `position`, by index rather than by value.
 
-    for token in tokens[index + 1:]:
+        list.index was finding the *first* token of that value, so with
+        `-p` given twice the second one's value was read from the first and
+        `nmap -p 80 -p - 10.0.1.5` kept its all-ports request.
+        """
+        return all_tokens[position + 1] if position + 1 < len(all_tokens) else ""
+
+    for offset, token in enumerate(tokens[index + 1:], start=index + 1):
         if skip_next:
             skip_next = False
             continue
@@ -1351,7 +1403,7 @@ def enforce_scan_limits(command):
             # however many ways the request was spelled; that is what keeps
             # the rewrite idempotent.
             if _ALL_PORTS_BARE.match(lowered):
-                if _is_all_ports(next_token(tokens, index, token)):
+                if _is_all_ports(next_token(tokens, offset)):
                     skip_next = True
                     capped = True
                     continue
