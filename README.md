@@ -48,6 +48,7 @@ or an HP network printer to blend into enterprise infrastructure.
 | **Egress Proxy** | Auto-discovery (env, registry, PAC/WPAD) plus pure-stdlib NTLMv2 proxy authentication via loopback relay |
 | **Persistence** | 5 independent autorun layers (systemd, crontab, rc.local, udev, watchdog timer) with PID lock dedup |
 | **SMBLoot** | Pure-Python SMB2 browser for remote share enumeration, file read, and download — no impacket on target |
+| **Automated Attack** | Optional LLM agent mode inside the operator GUI: eight-phase campaigns, a gate where eight irreversible actions are refused outright and eleven are asked about every time, fail-closed scope, and every decision recorded |
 
 ## Architecture
 
