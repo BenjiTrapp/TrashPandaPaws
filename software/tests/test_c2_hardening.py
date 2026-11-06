@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -26,6 +27,7 @@ from collections import namedtuple
 from pathlib import Path, PurePosixPath
 from unittest.mock import MagicMock, patch
 
+from cryptography.exceptions import InvalidTag
 from werkzeug.serving import WSGIRequestHandler, make_server
 
 from software.c2 import beacon as beacon_mod
@@ -2003,6 +2005,389 @@ class TestCaptureCleanup(unittest.TestCase):
             self.assertTrue(any(re.search(pattern.replace("$", r"\$"), l)
                                 for l in launches),
                             "%r matches no launch" % pattern)
+
+
+@contextlib.contextmanager
+def _ran_main(env, *argv, data_dir=None, setup=None):
+    """Run main() to completion with `env` as the only RACCOON_* variables.
+
+    Yields the exit code ("served" if it ran through), what it printed, the
+    data directory, the arguments create_app received and which of the two
+    secret variables were still in the process environment afterwards. The
+    directory is removed when the block ends, so look inside it there.
+    """
+    made = {}
+    real_create_app = server_mod.create_app
+
+    def recording_create_app(*args, **kwargs):
+        made["operator_token"] = args[1]
+        made["crypto"] = args[0]
+        return real_create_app(*args, **kwargs)
+
+    out, err = io.StringIO(), io.StringIO()
+    result = {"code": "served", "out": out, "err": err, "made": made}
+    own = data_dir is None
+    data_dir = tempfile.mkdtemp() if own else data_dir
+    result["data_dir"] = Path(data_dir)
+    try:
+        if setup:
+            setup(Path(data_dir))
+        with patch.dict(os.environ), \
+                patch.object(server_mod, "make_server",
+                             side_effect=lambda *a, **k: _FakeListener([], *a, **k)), \
+                patch.object(server_mod, "create_app",
+                             side_effect=recording_create_app), \
+                patch.object(server_mod, "_load_state"), \
+                patch.object(server_mod, "_setup_file_logging"), \
+                patch.object(server_mod, "_log_event"), \
+                patch.object(server_mod.logging, "basicConfig"), \
+                patch("sys.argv", ["server.py", "--data-dir", data_dir] + list(argv)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            for name in ("RACCOON_KEY", "RACCOON_TOKEN"):
+                os.environ.pop(name, None)
+            os.environ.update(env)
+            try:
+                server_mod.main()
+            except SystemExit as exc:
+                result["code"] = exc.code
+            result["left_in_environment"] = {
+                n for n in ("RACCOON_KEY", "RACCOON_TOKEN") if n in os.environ}
+        result["out"], result["err"] = out.getvalue(), err.getvalue()
+        yield result
+    finally:
+        if own:
+            shutil.rmtree(data_dir, ignore_errors=True)
+
+
+_SECRET_FLAGS = r"(?:key|token|password|passwd|secret|api-key|apikey)"
+# A secret-bearing flag, then a variable: `--key "$K"`, `"--key" "$K"`,
+# `--key=$K`, and PowerShell's `"--key", $Key`. The flag must end where it
+# ends -- `--certkey` and `--key-file` name paths, not secrets -- and what
+# follows must be a `$`, so a usage line (`--key <b64>`), a case pattern
+# (`--key) KEY=...`) and a comment do not match.
+_SECRET_ARGUMENT = re.compile(
+    r"""(?<![\w-])--""" + _SECRET_FLAGS + r"""(?![\w-])["']?\s*[=,]?\s*["']?\$""")
+
+
+def _secret_arguments(text):
+    """(line number, line) for each line that hands a secret over as an
+    argument. Whole-line comments and PowerShell's `<# ... #>` block are
+    skipped; nothing else is, so an echo that merely mentions a flag next to
+    a variable would be reported -- and should be reworded."""
+    found = []
+    in_block = False
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip().lstrip("\ufeff")
+        if stripped.startswith("<#"):
+            in_block = True
+        if in_block:
+            in_block = "#>" not in stripped
+            continue
+        if stripped.startswith("#"):
+            continue
+        if _SECRET_ARGUMENT.search(line):
+            found.append((number, line.strip()))
+    return found
+
+
+_C2_DIR = _REPO / "software" / "c2"
+_SECRET_CARRIERS = (
+    _C2_DIR / "start_server.sh",
+    _C2_DIR / "start_server.ps1",
+    _C2_DIR / "docker-entrypoint.sh",
+    _C2_DIR / "test_add_agent.sh",
+    _C2_DIR / "test_add_agent.ps1",
+)
+
+
+class TestSecretsStayOffTheCommandLine(unittest.TestCase):
+    """Finding H8: `ps` and /proc/<pid>/cmdline are readable by every user.
+
+    The server's token and key are read from the environment as well as the
+    flags, and nothing that starts the server puts them in its argument list.
+    Precedence is the one software/agent/config.py already uses: the flag
+    wins, then the environment.
+    """
+
+    KEY = key_b64(random_key())
+    OTHER_KEY = key_b64(random_key())
+    TOKEN = "Qm7vX2kLp9RtHs4NwZb5"
+    FLAG_TOKEN = "Bd3yC8zFg6JaUe1VxTq0"
+
+    def _assert_not_echoed(self, value, text):
+        self.assertNotIn(value, text)
+        for i in range(len(value) - 7):
+            self.assertNotIn(value[i:i + 8], text)
+
+    def _roundtrips(self, crypto, key_b64_text):
+        probe = {"probe": 1}
+        other = server_mod.ServerCrypto(base64.b64decode(key_b64_text))
+        try:
+            return other.decrypt(crypto.encrypt(probe)) == probe
+        except InvalidTag:
+            return False
+
+    # ── The server reads the environment ──
+
+    def test_token_can_be_supplied_by_environment(self):
+        with _ran_main({"RACCOON_KEY": self.KEY, "RACCOON_TOKEN": self.TOKEN}) as ran:
+            self.assertEqual(ran["code"], "served", ran["err"])
+            self.assertEqual(ran["made"]["operator_token"], self.TOKEN)
+
+    def test_key_can_be_supplied_by_environment(self):
+        with _ran_main({"RACCOON_KEY": self.KEY}) as ran:
+            self.assertEqual(ran["code"], "served", ran["err"])
+            self.assertTrue(self._roundtrips(ran["made"]["crypto"], self.KEY))
+
+    def test_the_flag_beats_the_environment(self):
+        env = {"RACCOON_KEY": self.OTHER_KEY, "RACCOON_TOKEN": self.TOKEN}
+        with _ran_main(env, "--key", self.KEY, "--token", self.FLAG_TOKEN) as ran:
+            self.assertEqual(ran["code"], "served", ran["err"])
+            self.assertEqual(ran["made"]["operator_token"], self.FLAG_TOKEN)
+            self.assertTrue(self._roundtrips(ran["made"]["crypto"], self.KEY))
+            self.assertFalse(self._roundtrips(ran["made"]["crypto"], self.OTHER_KEY))
+
+    def test_the_flag_wins_even_when_the_environment_key_is_bad(self):
+        with _ran_main({"RACCOON_KEY": "not*base64*at*all"}, "--key", self.KEY) as ran:
+            self.assertEqual(ran["code"], "served", ran["err"])
+
+    def test_a_blank_variable_is_not_a_value(self):
+        # Compose passes `RACCOON_TOKEN=${RACCOON_TOKEN:-}`: empty, not absent.
+        with _ran_main({"RACCOON_KEY": "   "}) as ran:
+            self.assertIsInstance(ran["code"], int)
+            self.assertNotEqual(ran["code"], 0)
+        with _ran_main({"RACCOON_KEY": self.KEY, "RACCOON_TOKEN": "  "}) as ran:
+            self.assertEqual(ran["code"], "served", ran["err"])
+            self.assertGreaterEqual(len(ran["made"]["operator_token"]), 16)
+
+    def test_with_neither_the_refusal_names_both_ways_to_supply_a_key(self):
+        with _ran_main({}) as ran:
+            self.assertIsInstance(ran["code"], int)
+            self.assertNotEqual(ran["code"], 0)
+            self.assertIn("--key", ran["err"])
+            self.assertIn("RACCOON_KEY", ran["err"])
+
+    def test_a_bad_environment_key_is_refused_by_name_and_never_echoed(self):
+        for value in (key_b64(os.urandom(24)), "Zq7Xw9Pk!" + key_b64(os.urandom(12))):
+            with self.subTest(length=len(value)):
+                with _ran_main({"RACCOON_KEY": value}) as ran:
+                    self.assertIsInstance(ran["code"], int)
+                    self.assertNotEqual(ran["code"], 0)
+                    self.assertIn("RACCOON_KEY", ran["err"])
+                    self._assert_not_echoed(value, ran["err"])
+
+    def test_help_states_the_precedence_and_the_reason(self):
+        out = io.StringIO()
+        with patch("sys.argv", ["server.py", "--help"]), \
+                contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit):
+                server_mod.main()
+        text = " ".join(out.getvalue().split())
+        for variable in ("RACCOON_KEY", "RACCOON_TOKEN"):
+            self.assertRegex(text, variable + r"[;,.][^.]*(wins|takes precedence)",
+                             variable)
+        self.assertIn("ps", text)
+
+    def test_the_secrets_do_not_pass_on_to_the_tools_the_server_starts(self):
+        # nxc, impacket and the rest inherit the server's environment.
+        env = {"RACCOON_KEY": self.KEY, "RACCOON_TOKEN": self.TOKEN}
+        with _ran_main(env) as ran:
+            self.assertEqual(ran["code"], "served", ran["err"])
+            self.assertEqual(ran["left_in_environment"], set())
+
+    # ── The token stays discoverable: in a file, by path ──
+
+    def _token_file(self, ran):
+        return ran["data_dir"] / server_mod._TOKEN_FILE
+
+    def test_the_token_is_kept_in_a_file_only_its_owner_can_read(self):
+        old = os.umask(0)  # a permissive umask must not widen the file
+        self.addCleanup(os.umask, old)
+        with patch("os.chmod", side_effect=AssertionError("created, then chmod-ed")), \
+                patch("os.fchmod", side_effect=AssertionError("created, then chmod-ed"),
+                      create=True):
+            with _ran_main({"RACCOON_KEY": self.KEY, "RACCOON_TOKEN": self.TOKEN}) as ran:
+                path = self._token_file(ran)
+                self.assertEqual(ran["code"], "served", ran["err"])
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(path.read_text().strip(), self.TOKEN)
+
+    def test_a_generated_token_can_be_found_in_the_file(self):
+        with _ran_main({"RACCOON_KEY": self.KEY}) as ran:
+            self.assertEqual(self._token_file(ran).read_text().strip(),
+                             ran["made"]["operator_token"])
+
+    def test_the_banner_names_the_file_and_neither_secret(self):
+        env = {"RACCOON_KEY": self.KEY}
+        with _ran_main(env, "--token", self.FLAG_TOKEN) as ran:
+            self.assertIn(str(self._token_file(ran)), ran["out"])
+            self.assertIn("Token:", ran["out"])
+            self._assert_not_echoed(self.FLAG_TOKEN, ran["out"] + ran["err"])
+            self._assert_not_echoed(self.KEY, ran["out"] + ran["err"])
+        with _ran_main(env) as ran:
+            generated = ran["made"]["operator_token"]
+            self._assert_not_echoed(generated, ran["out"] + ran["err"])
+
+    def test_a_looser_file_left_by_an_earlier_run_is_replaced(self):
+        def leave_one(data_dir):
+            path = data_dir / server_mod._TOKEN_FILE
+            path.write_text("stale-token")
+            path.chmod(0o644)
+        with _ran_main({"RACCOON_KEY": self.KEY, "RACCOON_TOKEN": self.TOKEN},
+                       setup=leave_one) as ran:
+            path = self._token_file(ran)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(path.read_text().strip(), self.TOKEN)
+
+    def test_a_link_put_in_its_place_is_not_followed(self):
+        victim = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, victim, ignore_errors=True)
+        target = victim / "precious"
+        target.write_text("untouched")
+
+        def plant(data_dir):
+            (data_dir / server_mod._TOKEN_FILE).symlink_to(target)
+        with _ran_main({"RACCOON_KEY": self.KEY, "RACCOON_TOKEN": self.TOKEN},
+                       setup=plant) as ran:
+            self.assertEqual(target.read_text(), "untouched")
+            path = self._token_file(ran)
+            self.assertFalse(path.is_symlink())
+            self.assertEqual(path.read_text().strip(), self.TOKEN)
+
+    def test_a_file_that_cannot_be_written_stops_the_server_naming_only_the_path(self):
+        def block(data_dir):
+            (data_dir / server_mod._TOKEN_FILE).mkdir()
+            (data_dir / server_mod._TOKEN_FILE / "occupied").write_text("x")
+        with _ran_main({"RACCOON_KEY": self.KEY, "RACCOON_TOKEN": self.TOKEN},
+                       setup=block) as ran:
+            self.assertIsInstance(ran["code"], int)
+            self.assertNotEqual(ran["code"], 0)
+            self.assertIn(str(self._token_file(ran)), ran["err"])
+            self._assert_not_echoed(self.TOKEN, ran["err"] + ran["out"])
+
+    # ── Nothing that starts the server puts a secret in its arguments ──
+
+    def test_no_launcher_passes_a_secret_as_an_argument(self):
+        for path in _SECRET_CARRIERS:
+            with self.subTest(file=path.name):
+                self.assertTrue(path.is_file(), path)
+                self.assertEqual(_secret_arguments(path.read_text(encoding="utf-8")), [])
+
+    def test_the_scan_is_precise(self):
+        # A scanner that cried wolf would be deleted, one that missed a form
+        # would be worse: both directions are pinned.
+        leaks = [
+            'CMD+=("--key" "$KEY")',
+            '[ -n "$RACCOON_KEY" ]   && CMD+=(--key "$RACCOON_KEY")',
+            "[ -n \"$T\" ] && CMD+=(--token \"$T\")",
+            '"--token" "$TOKEN")',
+            "python3 server.py --token $TOKEN",
+            "python3 server.py --token=${TOKEN}",
+            '$PyArgs += "--key", $Key',
+            '"--host", $Host_, "--key", $Key, "--interval", $Interval',
+            "--password '$PW'",
+        ]
+        quiet = [
+            '--key)        KEY="$2"; KEY_ORIGIN="passed with --key"; shift 2;;',
+            'echo "Usage: $0 [--key <b64>] [--token <str>] [--certkey <file>]"',
+            'echo -e "  ${D}Pass --key <base64>, or run interactively${N}"',
+            "# CMD+=(--key \"$KEY\")  is what this used to be",
+            "    # --token $TOKEN",
+            '[[ -n "$CERTKEY" ]]    && CMD+=("--certkey" "$CERTKEY")',
+            'CMD+=("--key-file" "$KEYFILE")',
+            'CMD+=("--cert" "$CERT")',
+            'parser.add_argument("--token", help="Fixed operator token")',
+        ]
+        for line in leaks:
+            with self.subTest(leak=line):
+                self.assertEqual(len(_secret_arguments(line)), 1)
+        for line in quiet:
+            with self.subTest(quiet=line):
+                self.assertEqual(_secret_arguments(line), [])
+        block = "<#\n.EXAMPLE\n    .\\x.ps1 --key $Key\n#>\nparam()\n"
+        self.assertEqual(_secret_arguments(block), [])
+
+    # ── Nothing prints a whole secret ──
+
+    def _echo_lines(self, text):
+        return [line for line in text.splitlines()
+                if re.match(r"\s*(echo|Write-Host|print)\b", line)]
+
+    def test_launchers_do_not_echo_a_full_key(self):
+        shown = {"start_server.sh": (r"\$\{?ENC_KEY_B64\b", r":0:(\d+)"),
+                 "start_server.ps1": (r"\$EncKeyB64\b", r"Substring\(0,\s*(\d+)\)")}
+        for name, (full, sliced) in shown.items():
+            text = (_C2_DIR / name).read_text(encoding="utf-8")
+            with self.subTest(file=name):
+                self.assertRegex(text, r"(?i)key_?preview")
+                for line in self._echo_lines(text):
+                    self.assertNotRegex(line, full + r"(?!\w)(?!\.Substring)(?!:0:)")
+                lengths = [int(n) for n in re.findall(sliced, text)]
+                self.assertTrue(lengths, "no truncation found")
+                self.assertLessEqual(max(lengths), 8)
+
+    def test_the_test_agent_launchers_show_no_more_of_the_key(self):
+        sh = (_C2_DIR / "test_add_agent.sh").read_text(encoding="utf-8")
+        ps = (_C2_DIR / "test_add_agent.ps1").read_text(encoding="utf-8")
+        shown = [int(n) for n in re.findall(r"KEY:0:(\d+)", sh)]
+        shown += [int(n) for n in re.findall(r"Substring\(0,\s*(\d+)\)", ps)]
+        self.assertTrue(shown)
+        self.assertLessEqual(max(shown), 8)
+
+    def test_launchers_print_the_token_file_and_never_the_token(self):
+        for name, token in (("start_server.sh", r"\$\{?TOKEN\b"),
+                            ("start_server.ps1", r"\$Token\b")):
+            text = (_C2_DIR / name).read_text(encoding="utf-8")
+            with self.subTest(file=name):
+                self.assertIn(server_mod._TOKEN_FILE, text)
+                for line in self._echo_lines(text):
+                    self.assertNotRegex(line, token, line)
+
+    # ── What replaces the arguments ──
+
+    def test_the_container_entrypoint_does_not_convert_the_environment_to_argv(self):
+        text = (_C2_DIR / "docker-entrypoint.sh").read_text(encoding="utf-8")
+        self.assertNotIn("RACCOON_KEY", re.sub(r"(?m)^\s*#.*$", "", text))
+        self.assertNotIn("RACCOON_TOKEN", re.sub(r"(?m)^\s*#.*$", "", text))
+        self.assertIn("exec", text)
+
+    def test_the_shell_launchers_hand_the_secrets_over_in_the_environment(self):
+        text = (_C2_DIR / "start_server.sh").read_text(encoding="utf-8")
+        self.assertRegex(text, r'RACCOON_KEY="\$KEY"\s+RACCOON_TOKEN="\$TOKEN"\s+exec ')
+        # ...and read them back when the operator exported them instead.
+        self.assertIn('${RACCOON_KEY:-}', text)
+        self.assertIn('${RACCOON_TOKEN:-}', text)
+        self.assertRegex(text, r'--data-dir"?\s+"?\$DATA_DIR')
+
+    def test_the_powershell_launcher_hands_the_secrets_over_in_the_environment(self):
+        text = (_C2_DIR / "start_server.ps1").read_text(encoding="utf-8")
+        self.assertRegex(text, r"\$env:RACCOON_KEY\s*=\s*\$Key")
+        self.assertRegex(text, r"\$env:RACCOON_TOKEN\s*=\s*\$Token")
+        self.assertIn("--data-dir", text)
+        self.assertLess(text.index("$env:RACCOON_KEY = $Key"),
+                        text.index("& $Python @PyArgs"))
+
+    def test_the_launchers_and_the_server_agree_on_the_data_directory(self):
+        sh = (_C2_DIR / "start_server.sh").read_text(encoding="utf-8")
+        ps = (_C2_DIR / "start_server.ps1").read_text(encoding="utf-8")
+        self.assertRegex(sh, r'DATA_DIR="\$HOME/\.raccoon-c2"')
+        self.assertRegex(ps, r'\$DataDir\s*=\s*Join-Path \$env:USERPROFILE "\.raccoon-c2"')
+        self.assertIn('Path.home() / ".raccoon-c2"',
+                      (_C2_DIR / "server.py").read_text(encoding="utf-8"))
+
+    def test_the_test_agent_reads_the_key_from_the_environment_too(self):
+        script = str(_C2_DIR / "test_add_agent.py")
+        env = {k: v for k, v in os.environ.items() if k != "RACCOON_KEY"}
+        bad = subprocess.run([sys.executable, script], env=env, timeout=30,
+                             capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("RACCOON_KEY", bad.stdout)
+        env["RACCOON_KEY"] = "not*base64*at*all"
+        bad = subprocess.run([sys.executable, script], env=env, timeout=30,
+                             capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("RACCOON_KEY is not valid base64", bad.stdout)
+        self.assertNotIn("not*base64", bad.stdout + bad.stderr)
 
 
 # New test classes belong above this guard; never append below it.

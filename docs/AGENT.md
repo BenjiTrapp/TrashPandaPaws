@@ -86,7 +86,7 @@ there yet.
 
 ```bash
 # Terminal 1 — the C2. It asks whether to start the agent as well.
-./software/c2/start_server.sh --token "$RACCOON_TOKEN"
+./software/c2/start_server.sh      # reads RACCOON_TOKEN (and RACCOON_KEY) from the environment
 
 # Or terminal 2, by hand:
 RACCOON_TOKEN="$RACCOON_TOKEN" python3 -m software.agent \
@@ -621,7 +621,7 @@ have to be distinguishable.
 | **Agent unavailable**, reason mentions Sliver | `c2.sliver.enabled: true`. See the top of this page. |
 | **Agent unavailable**, "no LLM provider configured" | `AGENT_PROVIDER` / `AGENT_MODEL` unset. |
 | **401 on every agent call**, or the GUI shows it unavailable with no reason | `RACCOON_TOKEN` is not fixed, so the C2 invented one at startup. Set it for both. |
-| **The GUI asks for the token again after a restart** | The token it had was rejected and dropped. With `RACCOON_TOKEN` unset the C2 invents a new one at every start; enter the new `Token:` from the banner, or fix the variable. |
+| **The GUI asks for the token again after a restart** | The token it had was rejected and dropped. With `RACCOON_TOKEN` unset the C2 invents a new one at every start; read the new token from the file the banner's `Token:` line names, or fix the variable. |
 | **Campaign starts and finds zero beacons** | Same as above, or the beacon registered under a different encryption key. |
 | **Beacon never appears at all** | Key mismatch. The server's `--key` and the beacon's `encryption_key` must be the same base64 value; nothing is derived from the callback URL, so the URL is not the cause. A mismatch is *silent* — registration is simply never accepted. |
 | **Commands come back `Unknown command: <program>`** | A beacon command starts with a beacon **verb**. `shell arp -a`, not `arp -a`. The prompt states this; if you see it, the beacon is probably running an older build. |

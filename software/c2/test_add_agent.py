@@ -6,9 +6,11 @@ Used by test_add_agent.sh / test_add_agent.ps1.
 Usage:
   python test_add_agent.py --host 127.0.0.1 --port 8443 --key <b64>
   python test_add_agent.py --key <b64>   # --key is required; the server's key
+  RACCOON_KEY=<b64> python test_add_agent.py   # same, and out of ps
 """
 
 import argparse
+import os
 import signal
 import sys
 import time
@@ -24,7 +26,10 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Server IP (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8443, help="Server port (default: 8443)")
     parser.add_argument("--key", default="",
-                        help="Base64 AES-256-GCM key (required; the server's)")
+                        help="Base64 AES-256-GCM key (required; the server's). "
+                             "Falls back to $RACCOON_KEY; the flag wins when "
+                             "both are set. Prefer the variable: the command "
+                             "line is visible to every user in ps.")
     parser.add_argument("--interval", type=int, default=5, help="Beacon interval in seconds (default: 5)")
     parser.add_argument("--jitter", type=int, default=10, help="Jitter percent (default: 10)")
     parser.add_argument("--ssl", action="store_true", help="Use HTTPS")
@@ -35,9 +40,14 @@ def main():
 
     # The key is validated by the beacon itself, which names the problem
     # and never the value; this only turns its refusal into a clean exit.
-    enc_key = args.key
+    # Flag first, then the environment, as the server reads it.
+    if args.key.strip():
+        enc_key, source = args.key, "--key"
+    else:
+        enc_key = os.environ.get("RACCOON_KEY", "")
+        source = "RACCOON_KEY" if enc_key.strip() else "--key (or RACCOON_KEY)"
     try:
-        decode_key(enc_key)
+        decode_key(enc_key, source)
     except ValueError as exc:
         refusal = str(exc)
     else:

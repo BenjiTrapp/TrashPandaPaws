@@ -49,10 +49,11 @@ CMD=(python3 /opt/raccoon-c2/server.py
     --data-dir "$DATA"
 )
 
-# No key, no start: the server refuses and says how to make one. There is no
-# default and nothing is derived, so an unset RACCOON_KEY ends here.
-[ -n "$RACCOON_KEY" ]        && CMD+=(--key "$RACCOON_KEY")
-[ -n "$RACCOON_TOKEN" ]      && CMD+=(--token "$RACCOON_TOKEN")
+# RACCOON_KEY and RACCOON_TOKEN are deliberately not turned into arguments:
+# the server reads them from the environment it inherits, and an argument is
+# visible to every user in ps -- on the host too, which shares its PID
+# namespace with its containers. With no key the server refuses and says how
+# to make one; there is no default and nothing is derived.
 [ -n "$RACCOON_SSL" ]        && CMD+=(--ssl)
 [ -n "$RACCOON_CERT" ]       && CMD+=(--cert "$RACCOON_CERT")
 [ -n "$RACCOON_CERTKEY" ]    && CMD+=(--certkey "$RACCOON_CERTKEY")

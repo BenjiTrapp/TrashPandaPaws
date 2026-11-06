@@ -23,6 +23,9 @@ PORT="${PORT:-8443}"
 HOST="${HOST:-0.0.0.0}"
 OPERATOR_PORT="${OPERATOR_PORT:-8444}"
 OPERATOR_HOST="${OPERATOR_HOST:-127.0.0.1}"
+# The data directory the server is given; it keeps the operator token in
+# $DATA_DIR/operator-token (mode 0600) and this launcher names the path.
+DATA_DIR="$HOME/.raccoon-c2"
 KEY=""
 KEY_ORIGIN=""
 TOKEN=""
@@ -47,10 +50,22 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: $0 [--port 8443] [--host 0.0.0.0] [--operator-port 8444] [--operator-host 127.0.0.1] [--key <b64>] [--token <str>] [--ssl] [--cert <file>] [--certkey <file>] [-i|--interactive]"
             echo "  --host/--port: the beacon socket. --operator-host/--operator-port: the GUI and API."
+            echo "  The key and token may instead come from RACCOON_KEY and RACCOON_TOKEN; a flag wins over its"
+            echo "  variable. Prefer the variables: arguments are visible to every user in ps. The server is"
+            echo "  handed both in its environment, never on its command line."
             exit 0;;
         *) echo "Unknown option: $1"; exit 1;;
     esac
 done
+
+# Flag first, then the environment (the order the server and agent/config.py use).
+if [[ -z "$KEY" && -n "${RACCOON_KEY:-}" ]]; then
+    KEY="$RACCOON_KEY"
+    KEY_ORIGIN="from RACCOON_KEY"
+fi
+if [[ -z "$TOKEN" && -n "${RACCOON_TOKEN:-}" ]]; then
+    TOKEN="$RACCOON_TOKEN"
+fi
 
 # ── Banner ──
 clear 2>/dev/null || true
@@ -266,7 +281,12 @@ fi
 ENC_KEY_B64="$KEY"
 KEY_TYPE="${KEY_ORIGIN} (AES-256-GCM)"
 
-ENC_KEY_PREVIEW="${ENC_KEY_B64:0:32}..."
+# Enough to tell two keys apart, nowhere near enough to help guess one.
+ENC_KEY_PREVIEW="${ENC_KEY_B64:0:6}..."
+TOKEN_FILE="$DATA_DIR/operator-token"
+# Shown as ~/..., which is what fits in the box.
+TILDE='~'
+TOKEN_FILE_SHOWN="${TOKEN_FILE/#$HOME/$TILDE}"
 
 echo ""
 echo -e "${D}  ┌──────────────────────────────────────────────────────┐${N}"
@@ -291,18 +311,18 @@ echo -e "${D}  │${N}  ${C}Encryption${N}   ${KEY_COLOR}${KEY_TYPE}${N}$(printf
 
 echo -e "${D}  │${N}                                                      ${D}│${N}"
 echo -e "${D}  ├──────────────────────────────────────────────────────┤${N}"
-echo -e "${D}  │${N}  ${Y}Operator Token (for GUI login):${N}                      ${D}│${N}"
+echo -e "${D}  │${N}  ${Y}Operator Token (for GUI login), in this file:${N}        ${D}│${N}"
 echo -e "${D}  │${N}                                                      ${D}│${N}"
-PAD_T=$((52 - ${#TOKEN}))
+PAD_T=$((52 - ${#TOKEN_FILE_SHOWN}))
 [[ $PAD_T -lt 0 ]] && PAD_T=0
-echo -e "${D}  │${N}  ${G}${TOKEN}${N}$(printf '%*s' $PAD_T '')${D}│${N}"
+echo -e "${D}  │${N}  ${G}${TOKEN_FILE_SHOWN}${N}$(printf '%*s' $PAD_T '')${D}│${N}"
 echo -e "${D}  │${N}                                                      ${D}│${N}"
 echo -e "${D}  ├──────────────────────────────────────────────────────┤${N}"
-echo -e "${D}  │${N}  ${Y}Encryption Key (for agent registration):${N}             ${D}│${N}"
+echo -e "${D}  │${N}  ${Y}Encryption Key (agents need the whole of it):${N}        ${D}│${N}"
 echo -e "${D}  │${N}                                                      ${D}│${N}"
-PAD_E=$((52 - ${#ENC_KEY_B64}))
+PAD_E=$((52 - ${#ENC_KEY_PREVIEW}))
 [[ $PAD_E -lt 0 ]] && PAD_E=0
-echo -e "${D}  │${N}  ${C}${ENC_KEY_B64}${N}$(printf '%*s' $PAD_E '')${D}│${N}"
+echo -e "${D}  │${N}  ${C}${ENC_KEY_PREVIEW}${N}$(printf '%*s' $PAD_E '')${D}│${N}"
 echo -e "${D}  │${N}                                                      ${D}│${N}"
 echo -e "${D}  └──────────────────────────────────────────────────────┘${N}"
 echo ""
@@ -315,10 +335,11 @@ echo -e "${D}  Press Ctrl+C to stop the server${N}"
 echo ""
 
 # ── Build command ──
+# The key and token are not in it: arguments are readable by every user in
+# ps and /proc/<pid>/cmdline. They go in the environment at launch, below.
 CMD=("$PYTHON" "$SERVER_PY" "--host" "$HOST" "--port" "$PORT"
      "--operator-host" "$OPERATOR_HOST" "--operator-port" "$OPERATOR_PORT"
-     "--token" "$TOKEN")
-CMD+=("--key" "$KEY")
+     "--data-dir" "$DATA_DIR")
 [[ -n "$SSL" ]]        && CMD+=("--ssl")
 [[ -n "$CERT" ]]       && CMD+=("--cert" "$CERT")
 [[ -n "$CERTKEY" ]]    && CMD+=("--certkey" "$CERTKEY")
@@ -370,4 +391,5 @@ if [[ -n "$AGENT_START" ]]; then
 fi
 
 # ── Launch ──
-exec "${CMD[@]}"
+# Only the server gets the key: the agent above never needed it.
+RACCOON_KEY="$KEY" RACCOON_TOKEN="$TOKEN" exec "${CMD[@]}"

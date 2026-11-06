@@ -10,6 +10,10 @@
     .\start_server.ps1 -Key "base64key==" -Token "my-secret-token"
     .\start_server.ps1 -NoPrompt
 .NOTES
+    -Key and -Token may instead come from $env:RACCOON_KEY and $env:RACCOON_TOKEN;
+    a parameter wins over its variable. Prefer the variables: a command line is
+    visible to every user. The server is handed both in its environment, never
+    on its command line. The token is kept in ~\.raccoon-c2\operator-token.
     -Host_/-Port are the beacon socket, reachable from the network.
     -OperatorHost/-OperatorPort are the GUI and API, loopback by default;
     an -OperatorPort equal to -Port serves both on one socket.
@@ -30,6 +34,9 @@ param(
 $ErrorActionPreference = "Continue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ServerPy = Join-Path $ScriptDir "server.py"
+# The data directory the server is given; it keeps the operator token in
+# operator-token there and this launcher names the path.
+$DataDir = Join-Path $env:USERPROFILE ".raccoon-c2"
 
 # -- Banner --
 Clear-Host
@@ -198,8 +205,15 @@ if ($nxcVer) {
 $Proto = "http"
 if ($SSL) { $Proto = "https" }
 
+# Parameter first, then the environment (the order the server and agent/config.py use).
 $KeyOrigin = ""
-if ($Key) { $KeyOrigin = "passed with -Key" }
+if ($Key) {
+    $KeyOrigin = "passed with -Key"
+} elseif ($env:RACCOON_KEY -and $env:RACCOON_KEY.Trim()) {
+    $Key = $env:RACCOON_KEY
+    $KeyOrigin = "from RACCOON_KEY"
+}
+if (-not $Token -and $env:RACCOON_TOKEN) { $Token = $env:RACCOON_TOKEN }
 
 if (-not $NoPrompt -and -not $Key) {
     Write-Host ""
@@ -304,6 +318,12 @@ $KeyType = "$KeyOrigin (AES-256-GCM)"
 $KeyColor = "Green"
 
 $EncKeyB64 = $EncKeyB64.Trim()
+# Enough to tell two keys apart, nowhere near enough to help guess one.
+$EncKeyPreview = $EncKeyB64
+if ($EncKeyB64.Length -gt 6) { $EncKeyPreview = $EncKeyB64.Substring(0, 6) + "..." }
+$TokenFile = Join-Path $DataDir "operator-token"
+# Shown as ~\..., which is what fits in the box.
+$TokenFileShown = $TokenFile.Replace($env:USERPROFILE, "~")
 
 # -- Display config --
 Write-Host ""
@@ -330,20 +350,20 @@ Write-Host "│" -ForegroundColor DarkGray
 Write-Host "  │                                                      │" -ForegroundColor DarkGray
 Write-Host "  ├──────────────────────────────────────────────────────┤" -ForegroundColor DarkGray
 Write-Host "  │" -ForegroundColor DarkGray -NoNewline
-Write-Host "  Operator Token (for GUI login):                      " -ForegroundColor Yellow -NoNewline
+Write-Host "  Operator Token (for GUI login), in this file:        " -ForegroundColor Yellow -NoNewline
 Write-Host "│" -ForegroundColor DarkGray
 Write-Host "  │                                                      │" -ForegroundColor DarkGray
 Write-Host "  │" -ForegroundColor DarkGray -NoNewline
-Write-Host "  $($Token.PadRight(52))" -ForegroundColor Green -NoNewline
+Write-Host "  $($TokenFileShown.PadRight(52))" -ForegroundColor Green -NoNewline
 Write-Host "│" -ForegroundColor DarkGray
 Write-Host "  │                                                      │" -ForegroundColor DarkGray
 Write-Host "  ├──────────────────────────────────────────────────────┤" -ForegroundColor DarkGray
 Write-Host "  │" -ForegroundColor DarkGray -NoNewline
-Write-Host "  Encryption Key (for agent registration):             " -ForegroundColor Yellow -NoNewline
+Write-Host "  Encryption Key (agents need the whole of it):        " -ForegroundColor Yellow -NoNewline
 Write-Host "│" -ForegroundColor DarkGray
 Write-Host "  │                                                      │" -ForegroundColor DarkGray
 Write-Host "  │" -ForegroundColor DarkGray -NoNewline
-Write-Host "  $($EncKeyB64.PadRight(52))" -ForegroundColor Cyan -NoNewline
+Write-Host "  $($EncKeyPreview.PadRight(52))" -ForegroundColor Cyan -NoNewline
 Write-Host "│" -ForegroundColor DarkGray
 Write-Host "  │                                                      │" -ForegroundColor DarkGray
 Write-Host "  └──────────────────────────────────────────────────────┘" -ForegroundColor DarkGray
@@ -357,13 +377,16 @@ Write-Host "  Press Ctrl+C to stop the server" -ForegroundColor DarkGray
 Write-Host ""
 
 # -- Build command --
+# The key and token are not in it: a command line is readable by other users.
+# They go in the environment at launch, below.
 $PyArgs = @($ServerPy, "--host", $Host_, "--port", $Port,
             "--operator-host", $OperatorHost, "--operator-port", $OperatorPort,
-            "--token", $Token)
-$PyArgs += "--key", $Key
+            "--data-dir", $DataDir)
 if ($SSL)      { $PyArgs += "--ssl" }
 if ($Cert)     { $PyArgs += "--cert", $Cert }
 if ($CertKey)  { $PyArgs += "--certkey", $CertKey }
 
 # -- Launch --
+$env:RACCOON_KEY = $Key
+$env:RACCOON_TOKEN = $Token
 & $Python @PyArgs

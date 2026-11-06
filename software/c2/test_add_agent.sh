@@ -19,7 +19,7 @@ N='\033[0m'
 # ── Defaults ──
 HOST="127.0.0.1"
 PORT="8443"
-KEY=""
+KEY="${RACCOON_KEY:-}"
 INTERVAL="5"
 JITTER="10"
 USE_SSL=""
@@ -36,7 +36,9 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: $0 [--host 127.0.0.1] [--port 8443] [--key <b64>] [--interval 5] [--jitter 10] [--ssl]"
             echo ""
-            echo "If --key is omitted, you will be prompted for it. A key is required."
+            echo "The key may instead come from RACCOON_KEY; --key wins when both are set. Prefer the"
+            echo "variable: arguments are visible to every user in ps. If neither is set you are"
+            echo "prompted for it. A key is required."
             exit 0;;
         *) echo "Unknown option: $1"; exit 1;;
     esac
@@ -100,7 +102,7 @@ echo -e "${W}  Agent Configuration${N}"
 echo -e "${D}  ─────────────────────────────────────────────${N}"
 echo -e "  ${C}Server${N}     ${W}${PROTO}://${HOST}:${PORT}${N}"
 echo -e "  ${C}Interval${N}   ${W}${INTERVAL}s${N} ${D}(jitter ${JITTER}%)${N}"
-echo -e "  ${C}Key${N}        ${W}${KEY:0:24}...${N}"
+echo -e "  ${C}Key${N}        ${W}${KEY:0:6}...${N}"
 echo -e "${D}  ─────────────────────────────────────────────${N}"
 echo ""
 echo -e "${G}  [▶]${N} ${W}Starting beacon...${N}"
@@ -113,9 +115,10 @@ cd "$REPO_ROOT"
 CMD=("$PYTHON" "$SCRIPT_DIR/test_add_agent.py"
      "--host" "$HOST"
      "--port" "$PORT"
-     "--key" "$KEY"
      "--interval" "$INTERVAL"
      "--jitter" "$JITTER")
 [[ -n "$USE_SSL" ]] && CMD+=("--ssl")
 
-exec "${CMD[@]}"
+# The key goes in the environment, not the arguments: ps shows those to
+# every user.
+RACCOON_KEY="$KEY" exec "${CMD[@]}"

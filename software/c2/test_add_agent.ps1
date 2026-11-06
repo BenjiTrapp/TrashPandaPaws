@@ -8,6 +8,10 @@
     .\test_add_agent.ps1
     .\test_add_agent.ps1 -Host_ 192.168.1.100 -Port 443 -SSL
     .\test_add_agent.ps1 -Key "base64key=="
+.NOTES
+    -Key may instead come from $env:RACCOON_KEY; the parameter wins when both
+    are set. Prefer the variable: a command line is visible to every user.
+    The agent is handed the key in its environment, never on its command line.
 #>
 param(
     [string]$Host_ = "127.0.0.1",
@@ -61,6 +65,8 @@ $Proto = "http"
 if ($SSL) { $Proto = "https" }
 $Callback = "${Proto}://${Host_}:${Port}/api/v1/beacon"
 
+if (-not $Key -and $env:RACCOON_KEY) { $Key = $env:RACCOON_KEY }
+
 if (-not $Key) {
     Write-Host ""
     Write-Host "  ---------------------------------------------" -ForegroundColor DarkGray
@@ -88,7 +94,7 @@ if (-not $Key) {
 
 # -- Display config --
 $KeyPreview = $Key
-if ($Key.Length -gt 24) { $KeyPreview = $Key.Substring(0, 24) + "..." }
+if ($Key.Length -gt 6) { $KeyPreview = $Key.Substring(0, 6) + "..." }
 
 Write-Host ""
 Write-Host "  ---------------------------------------------" -ForegroundColor DarkGray
@@ -111,7 +117,10 @@ Write-Host ""
 # -- Launch --
 Set-Location $RepoRoot
 
-$PyArgs = @($AgentPy, "--host", $Host_, "--port", $Port, "--key", $Key, "--interval", $Interval, "--jitter", $Jitter)
+$PyArgs = @($AgentPy, "--host", $Host_, "--port", $Port, "--interval", $Interval, "--jitter", $Jitter)
 if ($SSL) { $PyArgs += "--ssl" }
 
+# The key goes in the environment, not the arguments: a command line is
+# readable by other users.
+$env:RACCOON_KEY = $Key
 & $Python @PyArgs

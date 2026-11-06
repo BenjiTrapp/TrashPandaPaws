@@ -579,8 +579,9 @@ over SSH first: `ssh -L 8444:127.0.0.1:8444 <user>@<c2-host>`, then open
 back on one socket.
 
 **Signing in:** the page is served without the operator token and asks for it
-once -- the `Token:` line of the startup banner, or `RACCOON_TOKEN`. It is kept
-in that tab's `sessionStorage` and sent as an `Authorization` header, never in a
+once. The `Token:` line of the startup banner names the file it is kept in,
+`operator-token` in the data directory (mode `0600`); the banner never prints
+the token itself. It is kept in that tab's `sessionStorage` and sent as an `Authorization` header, never in a
 URL, so it stays out of browser history, `Referer` headers and proxy logs.
 Closing the tab forgets it; a token the server rejects is forgotten at once and
 asked for again.
@@ -753,7 +754,11 @@ beacon needs the same value as `encryption_key`, each exactly 32 bytes once
 decoded. There is no default and nothing is derived from the callback URL, so a
 server started without a key refuses to run. Make one with
 `python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"`
-(`start_server.sh` can generate one for you). The server uses the
+(`start_server.sh` can generate one for you). Give it to the server in
+`RACCOON_KEY` rather than `--key`, and the operator token in `RACCOON_TOKEN`
+rather than `--token`: a command line is visible to every user on the machine
+in `ps`, an environment is not. The flags still work, and win over the
+variables when both are set. The server uses the
 `cryptography` library while the beacon calls OpenSSL via `ctypes`. Both implementations interoperate seamlessly.
 
 #### Quick Start (Native)
@@ -767,6 +772,11 @@ cd software/c2
 cd software\c2
 .\start_server.ps1
 ```
+
+Both launchers take `RACCOON_KEY` and `RACCOON_TOKEN` from the environment (a
+`--key`/`--token` argument wins over its variable) and hand them to the server
+in its environment, not its arguments. The operator token is kept in
+`~/.raccoon-c2/operator-token` (mode `0600`) and the launcher prints that path.
 
 The launcher checks and installs dependencies automatically (`flask`,
 `cryptography`, `impacket`, `ldap3`, `netexec`, `lsassy`), then prompts for
@@ -806,8 +816,8 @@ Responder).
 | `RACCOON_HOST` | `0.0.0.0` | Beacon listen address (the agent socket) |
 | `RACCOON_OPERATOR_PORT` | `8444` | Operator GUI and API listen port |
 | `RACCOON_OPERATOR_HOST` | `127.0.0.1` | Operator GUI and API listen address; loopback, so reach it with `ssh -L 8444:127.0.0.1:8444 <user>@<c2-host>` |
-| `RACCOON_KEY` | **required** | AES-256-GCM key (base64, 32 bytes); the container exits without it |
-| `RACCOON_TOKEN` | (random) | Operator token for GUI auth |
+| `RACCOON_KEY` | **required** | AES-256-GCM key (base64, 32 bytes); the container exits without it. Read by the server directly, never put on its command line |
+| `RACCOON_TOKEN` | (random) | Operator token for GUI auth, read the same way. Whatever it is, the server keeps it in `operator-token` in `RACCOON_DATA` (mode `0600`) |
 | `RACCOON_SSL` | (none) | Enable TLS (set to `1`) |
 | `RACCOON_CERT` | (none) | Path to TLS certificate |
 | `RACCOON_CERTKEY` | (none) | Path to TLS private key |

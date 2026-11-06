@@ -7,10 +7,14 @@ embedded operator GUI with TrashPandaPaws aesthetic.
 
 Usage:
   python server.py --port 443 --ssl
-  python server.py --port 8443 --key <base64-key>
+  RACCOON_KEY=<base64-key> python server.py --port 8443
 
 A key is required; there is no default and none is derived. Make one with:
   python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+
+The key and the operator token are read from RACCOON_KEY and RACCOON_TOKEN, or
+given as --key and --token, which win. Prefer the variables: the command line
+is visible to every user in ps. The token is kept in <data dir>/operator-token.
 """
 
 import argparse
@@ -3146,7 +3150,7 @@ header .info{font-size:11px;color:var(--text2)}
 <div id="token-gate">
   <div class="tg-box">
     <h2>&#128274; Operator token</h2>
-    <p>Printed by the server at startup as <code>Token:</code>. Kept in this tab only, and sent as a header, never in a URL.</p>
+    <p>The server's startup banner names the file it is in, on the <code>Token:</code> line. Kept in this tab only, and sent as a header, never in a URL.</p>
     <div id="tg-error">That token was rejected. Enter it again.</div>
     <input id="tg-input" type="password" aria-label="Operator token" autocomplete="off" spellcheck="false" placeholder="operator token"
       onkeydown="if(event.key==='Enter') submitToken()">
@@ -7683,6 +7687,43 @@ if(storedToken()){
 
 # ── CLI ──
 
+# Where the operator token is kept so the operator can read it without it
+# ever being on a command line or in a log: <data dir>/operator-token, 0600.
+_TOKEN_FILE = "operator-token"
+
+
+def _from_environment(name: str) -> Optional[str]:
+    """The variable's value, or None when it is unset or blank.
+
+    Removed from the environment as it is read, so the nxc, impacket and
+    other tools this server starts do not inherit the secret.
+    """
+    value = os.environ.pop(name, None)
+    return value.strip() if value and value.strip() else None
+
+
+def _write_operator_token(data_dir: Path, token: str) -> Path:
+    """Keep `token` in <data_dir>/operator-token, readable by its owner only.
+
+    Created at 0600 rather than created and then chmod-ed, so it is never
+    readable by anyone else, not even briefly. A file from an earlier run is
+    removed first, because open() applies the mode only to a file it creates
+    and would leave an older, looser one as it was; O_EXCL then also refuses
+    a link planted in its place. Raises OSError naming the path, never the
+    token.
+    """
+    path = data_dir / _TOKEN_FILE
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(token + "\n")
+    return path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Raccoon C2 Team Server",
@@ -7698,11 +7739,20 @@ def main():
     parser.add_argument("--operator-port", type=int, default=8444,
                         help="Operator GUI and API listen port; equal to "
                              "--port serves both on one socket")
-    parser.add_argument("--key", help="Base64-encoded 32-byte AES-GCM key (required)")
+    parser.add_argument(
+        "--key",
+        help="Base64-encoded 32-byte AES-GCM key (required). Falls back to "
+             "$RACCOON_KEY; the flag wins when both are set. Prefer the "
+             "variable: the command line is visible to every user in ps.")
     parser.add_argument("--ssl", action="store_true", help="Enable HTTPS (self-signed)")
     parser.add_argument("--cert", help="SSL certificate file")
     parser.add_argument("--certkey", help="SSL private key file")
-    parser.add_argument("--token", help="Fixed operator token (default: random)")
+    parser.add_argument(
+        "--token",
+        help="Fixed operator token (default: random). Falls back to "
+             "$RACCOON_TOKEN; the flag wins when both are set. Prefer the "
+             "variable: the command line is visible to every user in ps. "
+             "Either way the token is kept in <data-dir>/operator-token.")
     parser.add_argument(
         "--data-dir", default=str(Path.home() / ".raccoon-c2"),
         help="Data directory for state persistence",
@@ -7719,8 +7769,17 @@ def main():
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     )
 
+    # Flag first, then the environment: the order agent/config.py uses.
+    env_key = _from_environment("RACCOON_KEY")
+    env_token = _from_environment("RACCOON_TOKEN")
+    if args.key and args.key.strip():
+        key_text, key_source = args.key, "--key"
+    elif env_key:
+        key_text, key_source = env_key, "RACCOON_KEY"
+    else:
+        key_text, key_source = None, "--key (or RACCOON_KEY)"
     try:
-        key = decode_key(args.key, "--key")
+        key = decode_key(key_text, key_source)
     except ValueError as exc:
         refusal = str(exc)
     else:
@@ -7730,9 +7789,14 @@ def main():
 
     crypto = ServerCrypto(key)
 
-    operator_token = args.token or secrets.token_urlsafe(24)
+    operator_token = args.token or env_token or secrets.token_urlsafe(24)
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        token_path = _write_operator_token(data_dir, operator_token)
+    except OSError as exc:
+        parser.error("cannot write the operator token to %s (%s)"
+                     % (data_dir / _TOKEN_FILE, exc.strerror))
 
     _load_state(data_dir)
     _setup_file_logging(data_dir)
@@ -7782,9 +7846,9 @@ def main():
         f"  Raccoon C2 Team Server\n"
         f"{'=' * 60}\n"
         f"{network}"
-        f"  Token:    {operator_token}\n"
+        f"  Token:    in {token_path} (the GUI asks for it)\n"
         f"  Data:     {data_dir}\n"
-        "  Key:      supplied with --key\n"
+        f"  Key:      supplied with {key_source}\n"
         f"{'=' * 60}\n"
     )
     try:
