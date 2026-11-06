@@ -39,9 +39,15 @@ COLOURS="${GIF_COLOURS:-64}"
 
 mkdir -p "$WORK"
 
+# Substring matches, not -x: -x needs the pattern to be the whole command
+# line, and every launch below carries further arguments, so -x never matched
+# and a stale stack kept the ports -- a capture then measures a foreign
+# process. Nor do the patterns start at "python3": a framework Python on
+# macOS lists itself as .../Python.app/.../Python, so "python3 tools/..."
+# is not in its command line either.
 cleanup() {
-  pkill -x -f "python3 tools/demo_env.py --operator-port $C2_PORT" 2>/dev/null || true
-  pkill -x -f "python3 tools/scripted_model.py --port $MODEL_PORT" 2>/dev/null || true
+  pkill -f "tools/demo_env.py --operator-port $C2_PORT " 2>/dev/null || true
+  pkill -f "tools/scripted_model.py --port $MODEL_PORT " 2>/dev/null || true
   pkill -f "software.agent .*--bind-port $AGENT_PORT" 2>/dev/null || true
 }
 trap cleanup EXIT

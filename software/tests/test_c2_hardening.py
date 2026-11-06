@@ -1953,6 +1953,34 @@ class TestTokenIsNotServed(unittest.TestCase):
                           first, board)
 
 
+class TestCaptureCleanup(unittest.TestCase):
+    """capture_figures.sh must be able to stop the stack it started.
+
+    `pkill -x -f` needs the pattern to equal the whole command line, and every
+    launch carries arguments past the pattern, so cleanup matched nothing and
+    a stale stack kept the ports: the next capture measured a foreign process.
+    Nor may a pattern start at "python3": a framework Python on macOS lists
+    itself by its full path, measured on the machine the figures are built on.
+    """
+
+    def test_every_cleanup_pattern_matches_its_launch(self):
+        script = (_REPO / "tools" / "capture_figures.sh").read_text()
+        self.assertFalse("pkill -x" in script, "cleanup still uses pkill -x")
+        # Each launch as the shell would run it: continuations joined, quotes
+        # dropped, the variables named rather than expanded.
+        launches = [re.sub(r"\s+", " ", l).replace('"', "") for l in
+                    re.sub(r"\\\n\s*", " ", script).splitlines()
+                    if "nohup python3" in l]
+        patterns = re.findall(r'pkill -f "([^"]+)"', script)
+        self.assertEqual(len(patterns), 3, patterns)
+        for pattern in patterns:
+            self.assertFalse(pattern.startswith("python3 "),
+                             "%r cannot match a macOS framework Python" % pattern)
+            self.assertTrue(any(re.search(pattern.replace("$", r"\$"), l)
+                                for l in launches),
+                            "%r matches no launch" % pattern)
+
+
 # New test classes belong above this guard; never append below it.
 if __name__ == "__main__":
     unittest.main()
