@@ -1348,6 +1348,77 @@ class TestKeyMustBeSupplied(unittest.TestCase):
                 with self.subTest(path=path.name, phrase=phrase):
                     self.assertNotIn(phrase, text)
 
+    # ── The installer says so before it enables anything ──
+
+    _PREFLIGHT = _REPO / "services" / "check_beacon_key.sh"
+
+    def _preflight(self, config_text=None, python=None, name="raccoon.yaml"):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / name
+            if config_text is not None:
+                path.write_text(config_text)
+            env = dict(os.environ, RACCOON_ROOT=str(_REPO),
+                       RACCOON_PYTHON=python or sys.executable,
+                       RACCOON_CONFIG=str(path))
+            done = subprocess.run(["bash", str(self._PREFLIGHT)], env=env,
+                                  capture_output=True, text=True, timeout=60)
+        return done.returncode, done.stdout + done.stderr
+
+    def test_preflight_warns_when_the_beacon_would_be_refused(self):
+        bad = "invalid-key-not-base64-" + key_b64(os.urandom(12))
+        for key in ("", bad, key_b64(os.urandom(33))):
+            with self.subTest(key=len(key)):
+                code, out = self._preflight(
+                    "c2:\n  enabled: true\n  encryption_key: \"%s\"\n"
+                    "  fallback:\n    enabled: true\n" % key)
+                self.assertEqual(code, 1, out)
+                self.assertIn("c2.encryption_key", out)
+                self.assertIn(_GENERATOR, out)
+                self.assertIn("beacon.log", out)
+                if key:
+                    self._assert_not_echoed(key, out)
+
+    def test_preflight_is_quiet_for_a_good_key_or_a_config_with_no_beacon(self):
+        good = ("c2:\n  enabled: true\n  encryption_key: \"%s\"\n"
+                "  fallback:\n    enabled: true\n" % key_b64(random_key()))
+        no_beacon = ("c2:\n  enabled: true\n  encryption_key: \"\"\n"
+                     "  fallback:\n    enabled: false\n")
+        for text in (good, no_beacon):
+            code, out = self._preflight(text)
+            self.assertEqual((code, out), (0, ""))
+
+    def test_preflight_says_when_it_could_not_check_and_never_quotes_the_file(self):
+        secret = key_b64(os.urandom(32))
+        code, out = self._preflight(
+            "c2: [unclosed\n  encryption_key: %s\n" % secret)
+        self.assertEqual(code, 2, out)
+        self._assert_not_echoed(secret, out)
+        code, out = self._preflight(None, name="absent.yaml")
+        self.assertEqual(code, 2, out)
+        self.assertIn("Could not check", out)
+
+    def test_install_runs_the_preflight_first_and_warns_instead_of_stopping(self):
+        text = (_REPO / "services" / "install.sh").read_text()
+        check = text.index("check_beacon_key.sh")
+        self.assertLess(check, text.index("systemctl enable"))
+        self.assertLess(check, text.index("cp \"${SCRIPT_DIR}/raccoon-implant.service\""))
+        # A failed check is recorded, not fatal: `set -e` must not end the install.
+        self.assertRegex(text, r"check_beacon_key\.sh\" \|\| KEY_CHECK=\$\?")
+        self.assertIn("encryption_key", text[text.index("\"$KEY_CHECK\" -ne 0"):])
+
+    def test_the_quick_starts_say_to_set_a_key_before_the_first_run(self):
+        readme = (_REPO / "README.md").read_text()
+        lite = readme[readme.index("**Quick Start (Lite):**"):]
+        lite = lite[:lite.index("sudo reboot")]
+        self.assertLess(lite.index("c2.encryption_key"),
+                        lite.index("services/install.sh"))
+        manual = readme[readme.index("#### Option B: Manual setup"):]
+        manual = manual[:manual.index("### Beacon Persistence")]
+        self.assertIn("c2.encryption_key", manual)
+        docker = readme[readme.index("#### Quick Start (Docker)"):]
+        docker = docker[:docker.index("docker compose up -d")]
+        self.assertIn("RACCOON_KEY", docker)
+
     # ── Shipped config ──
 
     def test_shipped_config_does_not_claim_a_derived_key(self):

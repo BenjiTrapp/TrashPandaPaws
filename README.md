@@ -178,7 +178,10 @@ graph LR
 # 2. Boot the Pi and connect the USB Ethernet adapter
 sudo ./software/setup/bootstrap.sh
 sudo ./software/setup/configure_bridge.sh
-sudo ./services/install.sh
+# Before installing: set c2.encryption_key in /opt/raccoon/configs/raccoon.yaml
+# (sudo) to the key your team server runs with (--key). Make one with:
+#   python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+sudo ./services/install.sh        # warns if the key is missing or invalid
 
 # 3. Connect UniFi switch uplink to target network, Pi to port 2, target device to port 3
 sudo reboot
@@ -424,6 +427,15 @@ sudo ./software/setup/configure_bridge.sh # bridge eth0 <-> eth1
 sudo ./services/install.sh               # systemd + beacon persistence
 sudo reboot                              # activates MAC spoof + bridge + beacon autorun
 ```
+
+**Set `c2.encryption_key` first.** The implant has no default key and derives
+none: with `c2.fallback.enabled` on and no valid key in
+`/opt/raccoon/configs/raccoon.yaml` (edit with `sudo`), it refuses to start, and
+`raccoon-beacon` shows only "activating (auto-restart)" because that unit's
+output goes to `/opt/raccoon/logs/beacon.log`. Use the same base64 key as the
+team server's `--key`; make one with
+`python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"`.
+`install.sh` checks this and warns before it enables anything.
 
 After reboot the C2 beacon starts automatically via 5 independent persistence layers. No manual `systemctl start` is needed.
 
@@ -748,6 +760,11 @@ host, port, encryption key, and operator token.
 ```bash
 cd software/c2
 
+# A key is required: the container exits at start without one. Make one with
+#   python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+# and give the same value to the beacons' c2.encryption_key.
+export RACCOON_KEY=<base64-key>
+
 # Build and run
 docker compose up -d
 
@@ -971,7 +988,10 @@ remote_access:
 
 ### Configuration
 
-Edit [`configs/raccoon.yaml`](configs/raccoon.yaml) before deployment.
+Edit [`configs/raccoon.yaml`](configs/raccoon.yaml) before deployment. Set
+`c2.encryption_key` first: it has no default, and the implant will not start
+without a valid one while `c2.fallback.enabled` is on (see *Set `c2.encryption_key`
+first* above).
 
 #### Cover Identity
 
