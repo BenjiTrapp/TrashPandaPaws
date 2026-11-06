@@ -13,6 +13,7 @@ drift. It asserts that every key and every number is *present*, not that the
 surrounding sentences are unchanged -- the prose is free, the facts are not.
 """
 
+import argparse
 import inspect
 import json
 import os
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -38,6 +40,7 @@ from software.c2.sliver import SliverManager  # noqa: E402
 
 AGENT_DOC = REPO / "docs" / "AGENT.md"
 DEMO_DOC = REPO / "docs" / "C2_DEMO.md"
+REDIRECTOR_DOC = REPO / "docs" / "REDIRECTOR.md"
 README = REPO / "README.md"
 
 
@@ -699,6 +702,116 @@ class TestTheKnownLimitsRecordTheOpenFindings(_DocCase):
         self.assertEqual(
             len(_OPEN_FINDINGS["Minor, deferred"]) + _DEFERRED_MERGED,
             _DEFERRED_FINDINGS, "the merge count and the entry count differ")
+
+
+class _ParserReached(Exception):
+    def __init__(self, parser):
+        Exception.__init__(self)
+        self.parser = parser
+
+
+def _server_parser():
+    """The argument parser main() builds, without main() going any further.
+
+    main() builds its parser and parses in one function, and it is the first
+    thing the function does. Stopping at parse_args hands back the real
+    parser -- every option and default exactly as the server would see them --
+    before a key is read, a directory made or a socket opened. create_app is
+    patched to fail as well, so that if main() is ever reordered to do
+    something before it parses, the test fails instead of serving.
+    """
+    def stop(self, *args, **kwargs):
+        raise _ParserReached(self)
+
+    went_on = AssertionError("main() went past its argument parser")
+    with patch.object(argparse.ArgumentParser, "parse_args", stop), \
+            patch.object(c2_server, "create_app", side_effect=went_on):
+        try:
+            c2_server.main()
+        except _ParserReached as reached:
+            return reached.parser
+    raise AssertionError("main() returned without parsing its arguments")
+
+
+def _fenced(text, *languages):
+    """The bodies of the fenced code blocks tagged with one of `languages`."""
+    return [body for lang, body in re.findall(r"^```(\w*)\n(.*?)^```", text,
+                                              re.M | re.S)
+            if lang in languages]
+
+
+class TestTheRedirectorPageMatchesTheServer(unittest.TestCase):
+    """docs/REDIRECTOR.md hands a reader configuration to paste. Its flags and
+    ports were once read off the parser by hand; these read them again."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = REDIRECTOR_DOC.read_text()
+        cls.options = _server_parser()._option_string_actions
+
+    def default(self, flag):
+        if flag not in self.options:
+            self.fail("the server's parser has no %s, which the page's "
+                      "proxy targets are checked against" % flag)
+        return self.options[flag].default
+
+    def test_the_page_exists_and_the_readme_links_it(self):
+        self.assertTrue(REDIRECTOR_DOC.is_file(), "docs/REDIRECTOR.md is gone")
+        # A markdown link, not the bare path: the path also appears in prose.
+        self.assertTrue(
+            re.search(r"\]\((?:\./)?docs/REDIRECTOR\.md(?:#[^)]*)?\)",
+                      README.read_text()),
+            "README.md does not link docs/REDIRECTOR.md")
+
+    def _proxy_targets(self):
+        """(directive, target) for each proxy_pass in an nginx block and each
+        reverse_proxy in a Caddy block. Anchored to the start of a line, so
+        prose that mentions `proxy_pass` is not a target."""
+        found = []
+        for body in _fenced(self.text, "nginx"):
+            found += [("proxy_pass", t) for t in re.findall(
+                r"^\s*proxy_pass\s+(\S+?);?\s*$", body, re.M)]
+        for body in _fenced(self.text, "caddyfile", "caddy"):
+            found += [("reverse_proxy", t) for t in re.findall(
+                r"^\s*reverse_proxy\s+(\S+)", body, re.M)]
+        return found
+
+    def test_every_proxy_target_is_the_agent_port_and_none_is_the_operators(self):
+        agent = self.default("--port")
+        operator = self.default("--operator-port")
+        self.assertNotEqual(agent, operator,
+                            "the two sockets share a default port, so the "
+                            "page cannot tell a proxy target from the GUI")
+        targets = self._proxy_targets()
+        for directive in ("proxy_pass", "reverse_proxy"):
+            self.assertTrue(any(d == directive for d, _ in targets),
+                            "no %s target found in the page" % directive)
+        for directive, target in targets:
+            port = re.search(r":(\d+)$", target)
+            self.assertIsNotNone(port, "%s %s names no port" %
+                                 (directive, target))
+            self.assertNotEqual(int(port.group(1)), operator,
+                                "%s %s points at the operator interface"
+                                % (directive, target))
+            self.assertEqual(int(port.group(1)), agent,
+                             "%s %s is not the agent socket's default port"
+                             % (directive, target))
+
+    def test_every_flag_the_page_names_is_an_option_of_the_server(self):
+        # Prose, shell and table; not the nginx and Caddy blocks, which are
+        # another program's syntax and may contain a double dash of their own.
+        # A flag follows whitespace, a backtick, a bracket or a quote, so the
+        # "--" that punctuates a sentence (followed by a space) and one inside
+        # a word or a path do not count.
+        prose = self.text
+        for body in _fenced(prose, "nginx", "caddyfile", "caddy"):
+            prose = prose.replace(body, "")
+        flags = set(re.findall(r"(?<![^\s`(\['\"])(--[a-z][a-z0-9-]*)", prose))
+        self.assertTrue(flags, "no flag found in the page")
+        for flag in sorted(flags):
+            self.assertTrue(flag in self.options,
+                            "the page names %s; the server's parser has no "
+                            "such option" % flag)
 
 
 if __name__ == "__main__":
