@@ -16,7 +16,8 @@ machine: the beacon reports this host, which is the point.
 """
 
 import argparse
-import hashlib
+import base64
+import os
 import pathlib
 import sys
 import tempfile
@@ -29,25 +30,29 @@ from software.c2.beacon import Beacon
 from software.c2.server import ServerCrypto, agents, create_app
 
 
-def derive_key(port, token):
-    """The key the server holds for a beacon calling back on `port`.
+def random_key() -> bytes:
+    """A fresh AES-256-GCM key, minted once and handed to both ends.
 
-    It is derived from the callback URL, and a mismatch is not reported:
-    the registration is simply never accepted and the fleet stays empty.
-    That cost this project an afternoon once, so it is derived in one
-    place and used for both ends. The digest is bytes, not hex -- AESGCM
-    takes a buffer.
+    A key mismatch is not reported: the registration is simply never
+    accepted and the fleet stays empty. That cost this project an afternoon
+    once, so the key is made in one place and the same bytes go to the
+    server and, through key_b64, to the beacon. It is bytes, not hex --
+    AESGCM takes a buffer.
     """
-    return hashlib.sha256(
-        ("http://127.0.0.1:%d/api/v1/beacon:" % port).encode()).digest()
+    return os.urandom(32)
 
 
-def beacon_config(port, interval=2):
+def key_b64(key: bytes) -> str:
+    """The form the beacon's `encryption_key` and the server's --key take."""
+    return base64.b64encode(key).decode()
+
+
+def beacon_config(port, key, interval=2):
     return {
         "c2": {
             "beacon_interval_seconds": interval,
             "jitter_percent": 0,
-            "encryption_key": "",
+            "encryption_key": key_b64(key),
             "proxy": {"mode": "none"},
             "https": {
                 "enabled": True,
@@ -64,11 +69,12 @@ class DemoEnv:
         self.port = port
         self.token = token
         self.data_dir = pathlib.Path(data_dir or tempfile.mkdtemp())
+        self.key = random_key()
         self.beacon = None
         self.beacon_id = None
 
     def start_server(self):
-        self.app = create_app(ServerCrypto(derive_key(self.port, self.token)),
+        self.app = create_app(ServerCrypto(self.key),
                               self.token, self.data_dir)
         self.thread = threading.Thread(
             target=self.app.run,
@@ -91,7 +97,7 @@ class DemoEnv:
         return True
 
     def start_beacon(self):
-        self.beacon = Beacon(beacon_config(self.port))
+        self.beacon = Beacon(beacon_config(self.port, self.key))
         self.beacon.start()
         self._wait(lambda: bool(agents), "the beacon to register")
         record = list(agents.values())[0]

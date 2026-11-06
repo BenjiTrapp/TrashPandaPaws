@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 from software.c2 import beacon as beacon_mod
 from software.c2 import server as server_mod
 from software.c2.beacon import Beacon
+from tools.demo_env import key_b64, random_key
 
 
 PLAINTEXT_TASKING = {"tasks": [{"cmd": "shell", "args": "id"}]}
@@ -35,7 +36,7 @@ def _config(**transport):
     c2 = {
         "beacon_interval_seconds": 10,
         "jitter_percent": 20,
-        "encryption_key": "",
+        "encryption_key": key_b64(random_key()),
         "proxy": {"mode": "none"},
         "https": {"enabled": False},
         "dns": {"enabled": False},

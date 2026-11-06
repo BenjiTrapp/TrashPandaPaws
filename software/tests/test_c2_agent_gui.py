@@ -22,9 +22,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from software.agent import config, prompts
 from software.c2.server import ServerCrypto, create_app
 from software.tests.test_c2_server import (
+    KEY,
     TEST_TOKEN,
     ServerTestBase as _Harness,
-    _derive_key,
     _reset_server_state,
 )
 
@@ -42,7 +42,7 @@ class ServerTestBase(_Harness):
     @classmethod
     def setUpClass(cls):
         _reset_server_state()
-        cls.crypto = ServerCrypto(_derive_key())
+        cls.crypto = ServerCrypto(KEY)
         cls.data_dir = Path(tempfile.mkdtemp())
         cls.app = create_app(cls.crypto, TEST_TOKEN, cls.data_dir)
         cls.app.config["TESTING"] = True

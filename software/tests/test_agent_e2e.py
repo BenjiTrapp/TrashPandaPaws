@@ -39,28 +39,18 @@ from software.agent.store import db, queries  # noqa: E402
 from software.c2.beacon import Beacon  # noqa: E402
 from software.c2.server import ServerCrypto, create_app  # noqa: E402
 from software.tests.test_c2_server import (  # noqa: E402
-    DNS_DOMAIN, TEST_TOKEN, _beacon_config, _pick_port, _reset_server_state)
+    KEY, TEST_TOKEN, _beacon_config, _pick_port, _reset_server_state)
 
 # A free port, not a fixed one, and for the same reason test_c2_server stopped
 # using 19999: the Flask thread is a daemon and never releases the port, so a
 # second process re-running either suite cannot bind it, and the failure reads
 # as "the beacon did not register" rather than as a port conflict.
 PORT = _pick_port()
+# KEY is imported, not minted here: a mismatched key does not produce an
+# error -- the beacon's registration is simply never accepted and the fleet
+# stays empty. That silence cost this suite its first run, so the server
+# below and _beacon_config take the same bytes from one place.
 
-
-def _key_for_port(port: int) -> bytes:
-    """The key the server must hold for a beacon calling back on `port`.
-
-    Derived here rather than imported: test_c2_server's _derive_key hardcodes
-    its own port, and a mismatched key does not produce an error -- the
-    beacon's registration is simply never accepted and the fleet stays empty.
-    That silence cost this suite its first run, and it is the same trap the
-    live runs hit.
-    """
-    import hashlib
-    return hashlib.sha256(
-        ("http://127.0.0.1:%d/api/v1/beacon:%s" % (port, DNS_DOMAIN)).encode()
-    ).digest()
 
 _CAMPAIGN_INTERVAL = 1
 # Small on purpose, and not the shipped 300. One beacon is shared by every
@@ -91,7 +81,7 @@ class _LiveEnv:
     def start_server(self):
         _reset_server_state()
         self.data_dir = Path(tempfile.mkdtemp())
-        self.app = create_app(ServerCrypto(_key_for_port(PORT)), TEST_TOKEN,
+        self.app = create_app(ServerCrypto(KEY), TEST_TOKEN,
                               self.data_dir)
         self.app.config["TESTING"] = True
         self.thread = threading.Thread(
