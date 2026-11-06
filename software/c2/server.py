@@ -35,6 +35,12 @@ from typing import Optional
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from flask import Flask, request, jsonify, send_file, send_from_directory, Response
 
+try:
+    from software.c2.beacon import decode_key
+except ImportError:
+    # The container ships server.py and beacon.py side by side, not as a package.
+    from beacon import decode_key
+
 logger = logging.getLogger("raccoon.c2.server")
 server_log = logging.getLogger("raccoon.c2.events")
 agent_log = logging.getLogger("raccoon.c2.agents")
@@ -73,42 +79,6 @@ def _decoy_fields(n: int) -> dict:
 
 
 # ── Crypto (mirrors beacon._encrypt / _decrypt) ──
-
-KEY_GENERATOR = ('python3 -c "import os,base64; '
-                 'print(base64.b64encode(os.urandom(32)).decode())"')
-
-
-def decode_key(value) -> bytes:
-    """The AES-256-GCM key in `value`, or a ValueError naming what is wrong.
-
-    The two failures are told apart -- not base64, and base64 of the wrong
-    length -- and neither message carries the value or any part of it: these
-    land in terminals and logs. Raised outside the except block so the
-    decoder's own error is not chained on.
-    """
-    text = value.strip() if isinstance(value, str) else ""
-    problem = None
-    key = b""
-    if not text:
-        problem = ("a key is required: pass --key <base64 32-byte key>. "
-                   "There is no default and none is derived. "
-                   "Generate one with: %s" % KEY_GENERATOR)
-    else:
-        try:
-            key = base64.b64decode(text, validate=True)
-        except ValueError:
-            problem = ("--key is not valid base64. Generate a key with: %s"
-                       % KEY_GENERATOR)
-        else:
-            if len(key) != 32:
-                problem = ("--key decodes to %d bytes; AES-256-GCM needs "
-                           "exactly 32. Generate a key with: %s"
-                           % (len(key), KEY_GENERATOR))
-    if problem:
-        raise ValueError(problem)
-    return key
-
-
 
 class ServerCrypto:
     def __init__(self, key: bytes):
@@ -7621,7 +7591,7 @@ def main():
     )
 
     try:
-        key = decode_key(args.key)
+        key = decode_key(args.key, "--key")
     except ValueError as exc:
         refusal = str(exc)
     else:

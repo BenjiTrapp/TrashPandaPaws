@@ -1104,7 +1104,14 @@ class TestKeyMustBeSupplied(unittest.TestCase):
     """
 
     def _assert_not_echoed(self, value, text):
-        self.assertNotIn(value[:8], text, "a prefix of the key was echoed")
+        # The whole value, then every 8-character window of it: a fixed prefix,
+        # middle or tail slice leaves blind spots, and a leak of any part of
+        # a key is a leak.
+        self.assertNotIn(value, text, "the whole key was echoed")
+        for i in range(len(value) - 7):
+            self.assertNotIn(value[i:i + 8], text,
+                             "characters %d-%d of the key were echoed"
+                             % (i, i + 8))
 
     # ── Server ──
 
@@ -1123,12 +1130,15 @@ class TestKeyMustBeSupplied(unittest.TestCase):
         self.assertNotIn("bytes", err.replace(_GENERATOR, ""))
 
     def test_server_refuses_a_key_of_the_wrong_length(self):
-        code, err = _server_main("--key", key_b64(os.urandom(16)))
-        self.assertIsInstance(code, int)
-        self.assertNotEqual(code, 0)
-        self.assertIn("16 bytes", err)
-        self.assertIn("exactly 32", err)
-        self.assertNotIn("not valid base64", err)
+        # Both sides of the boundary: 31 and 33, not only the short side.
+        for size in (16, 31, 33, 64):
+            with self.subTest(size=size):
+                code, err = _server_main("--key", key_b64(os.urandom(size)))
+                self.assertIsInstance(code, int)
+                self.assertNotEqual(code, 0)
+                self.assertIn("%d bytes" % size, err)
+                self.assertIn("exactly 32", err)
+                self.assertNotIn("not valid base64", err)
 
     def test_server_accepts_a_32_byte_key(self):
         code, err = _server_main("--key", key_b64(random_key()))
@@ -1136,8 +1146,9 @@ class TestKeyMustBeSupplied(unittest.TestCase):
 
     def test_the_refusal_names_neither_the_key_nor_a_prefix_of_it(self):
         short = key_b64(os.urandom(24))
+        long = key_b64(os.urandom(33))
         malformed = "Zq7Xw9Pk!" + key_b64(os.urandom(12))
-        for value in (short, malformed):
+        for value in (short, long, malformed):
             with self.subTest(side="server", value_kind=len(value)):
                 code, err = _server_main("--key", value)
                 self.assertIsInstance(code, int)
@@ -1186,11 +1197,51 @@ class TestKeyMustBeSupplied(unittest.TestCase):
                 self.assertIn("encryption_key", str(caught.exception))
                 self.assertIn(_GENERATOR, str(caught.exception))
 
-    def test_beacon_refuses_a_malformed_or_short_key(self):
+    def test_beacon_refuses_a_malformed_or_wrong_length_key(self):
         with self.assertRaisesRegex(ValueError, "not valid base64"):
             Beacon(_config(encryption_key="not*base64*at*all"))
-        with self.assertRaisesRegex(ValueError, "16 bytes.*exactly 32"):
-            Beacon(_config(encryption_key=key_b64(os.urandom(16))))
+        for size in (16, 31, 33, 64):
+            with self.subTest(size=size):
+                with self.assertRaisesRegex(
+                        ValueError, "%d bytes.*exactly 32" % size):
+                    Beacon(_config(encryption_key=key_b64(os.urandom(size))))
+
+    def test_the_server_and_beacon_share_one_decoder(self):
+        # Not a copy kept in step by a test: the same function, so whitespace,
+        # strict base64 and the length rule cannot drift apart.
+        self.assertIs(server_mod.decode_key, beacon_mod.decode_key)
+
+    def test_decode_key_outcomes(self):
+        good = os.urandom(32)
+        cases = [
+            ("empty", "", "required"),
+            ("whitespace", "  \n\t ", "required"),
+            ("none", None, "required"),
+            ("not base64", "not*base64*at*all", "base64"),
+            ("stray newline inside", key_b64(good)[:10] + "\n" + key_b64(good)[10:],
+             "base64"),
+            ("unpadded", key_b64(good).rstrip("="), "base64"),
+            ("16 bytes", key_b64(os.urandom(16)), "length"),
+            ("31 bytes", key_b64(os.urandom(31)), "length"),
+            ("33 bytes", key_b64(os.urandom(33)), "length"),
+            ("32 bytes", key_b64(good), good),
+            ("32 bytes, newline-padded", "\n" + key_b64(good) + "\n", good),
+        ]
+        for name, value, expected in cases:
+            with self.subTest(case=name):
+                if isinstance(expected, bytes):
+                    self.assertEqual(beacon_mod.decode_key(value), expected)
+                    continue
+                with self.assertRaises(ValueError) as caught:
+                    beacon_mod.decode_key(value)
+                message = str(caught.exception)
+                if expected == "required":
+                    self.assertIn("is required", message)
+                elif expected == "base64":
+                    self.assertIn("not valid base64", message)
+                else:
+                    self.assertIn("exactly 32", message)
+                    self.assertNotIn("base64.", message.replace(_GENERATOR, ""))
 
     def test_beacon_uses_the_key_it_is_given(self):
         key = random_key()
@@ -1313,7 +1364,6 @@ class TestKeyMustBeSupplied(unittest.TestCase):
         self.assertNotRegex(block.lower(), r"deriv|deterministic")
         self.assertIn(_GENERATOR, block)
         self.assertEqual(beacon_mod.KEY_GENERATOR, _GENERATOR)
-        self.assertEqual(server_mod.KEY_GENERATOR, _GENERATOR)
 
 
 # New test classes belong above this guard; never append below it.

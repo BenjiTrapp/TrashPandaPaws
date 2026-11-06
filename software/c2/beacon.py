@@ -46,7 +46,8 @@ KEY_GENERATOR = ('python3 -c "import os,base64; '
 def decode_key(value, field: str = "encryption_key") -> bytes:
     """The AES-256-GCM key in `value`, or a ValueError naming what is wrong.
 
-    There is no derivation and no default: a key that both ends can compute
+    Shared by the beacon, the team server and the launchers, so the rule and
+    the wording cannot drift between them. There is no derivation and no default: a key that both ends can compute
     from the callback URL is a key anyone who sees one message can compute.
     The messages name the field and the problem and never the value or any
     part of it, and are raised outside the except block so the decoder's
@@ -56,9 +57,8 @@ def decode_key(value, field: str = "encryption_key") -> bytes:
     problem = None
     key = b""
     if not text:
-        problem = ("%s is required: the beacon has no default key and will "
-                   "not derive one. Generate one with: %s"
-                   % (field, KEY_GENERATOR))
+        problem = ("%s is required: there is no default key and none is "
+                   "derived. Generate one with: %s" % (field, KEY_GENERATOR))
     else:
         try:
             key = base64.b64decode(text, validate=True)
