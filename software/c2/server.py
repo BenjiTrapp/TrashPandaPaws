@@ -355,7 +355,10 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
 
     @app.route("/")
     def index():
-        return _OPERATOR_HTML.replace("{{TOKEN}}", operator_token)
+        # Served empty, never filled in: this route has no authentication,
+        # so whatever lands here is handed to anyone who can load the page.
+        # The page asks for the token and keeps it in sessionStorage.
+        return _OPERATOR_HTML.replace("{{TOKEN}}", "")
 
     # ── Operator API ──
 
@@ -3080,6 +3083,16 @@ header .info{font-size:11px;color:var(--text2)}
 .bflow-or{display:flex;align-items:center;gap:0;width:100%;padding:2px 0}
 .bflow-or-line{flex:1;height:1px;background:rgba(255,255,255,0.08)}
 .bflow-or-badge{font-size:8px;color:var(--text2);padding:1px 8px;border:1px solid rgba(255,255,255,0.08);border-radius:8px;text-transform:uppercase;letter-spacing:0.04em}
+
+/* Token prompt */
+#token-gate{position:fixed;inset:0;z-index:200;display:none;align-items:center;justify-content:center;background:rgba(7,9,16,0.92)}
+#token-gate.open{display:flex}
+.tg-box{width:360px;padding:22px 24px;background:var(--surface);border:1px solid var(--border);border-radius:8px;display:flex;flex-direction:column;gap:10px}
+.tg-box h2{font-size:15px;color:var(--red);letter-spacing:0.04em}
+.tg-box p{font-size:12px;color:var(--text2);line-height:1.5}
+.tg-box input{padding:8px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;font-family:var(--mono);font-size:12px}
+.tg-box button{padding:7px 12px;background:var(--red-dim);color:#fff;border:0;border-radius:4px;font-weight:600;cursor:pointer}
+#tg-error{color:#ff6666;font-size:12px;display:none}
 </style>
 <link rel="stylesheet" href="/static/agent.css">
 </head>
@@ -3131,6 +3144,16 @@ header .info{font-size:11px;color:var(--text2)}
   </div>
 </div>
 <div class="toast-container" id="toast-container"></div>
+<div id="token-gate">
+  <div class="tg-box">
+    <h2>&#128274; Operator token</h2>
+    <p>Printed by the server at startup as <code>Token:</code>. Kept in this tab only, and sent as a header, never in a URL.</p>
+    <div id="tg-error">That token was rejected. Enter it again.</div>
+    <input id="tg-input" type="password" aria-label="Operator token" autocomplete="off" spellcheck="false" placeholder="operator token"
+      onkeydown="if(event.key==='Enter') submitToken()">
+    <button type="button" onclick="submitToken()">Unlock</button>
+  </div>
+</div>
 <div class="srvlog-drawer" id="srvlog-drawer">
   <div class="srvlog-header">
     <span>&#128220; Server Log</span>
@@ -3142,7 +3165,7 @@ header .info{font-size:11px;color:var(--text2)}
 
 <script>
 const TOKEN = "{{TOKEN}}";
-const H = {"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"};
+const TOKEN_KEY = "raccoon_token";
 let selectedAgent = null;
 let pollTimer = null;
 let cmdHistory = [];
@@ -3217,8 +3240,44 @@ document.addEventListener("click", e => {
   if(panel && panel.classList.contains("open") && !wrap) panel.classList.remove("open");
 });
 
+// The operator token lives only in this tab's sessionStorage: the page is
+// served without it, and it is sent as a header, never put in a URL.
+function storedToken(){
+  return sessionStorage.getItem(TOKEN_KEY) || "";
+}
+
+function H(){
+  return {"Authorization":"Bearer "+storedToken(),"Content-Type":"application/json"};
+}
+
+function askForToken(rejected){
+  const gate = document.getElementById("token-gate");
+  // Only ever shown, never hidden here: a poll that finds no token must not
+  // wipe the notice that the last one was rejected.
+  if(rejected) document.getElementById("tg-error").style.display = "block";
+  if(gate.classList.contains("open")) return;
+  gate.classList.add("open");
+  document.getElementById("tg-input").focus();
+}
+
+function submitToken(){
+  const value = document.getElementById("tg-input").value.trim();
+  if(!value) return;
+  sessionStorage.setItem(TOKEN_KEY, value);
+  location.reload();
+}
+
+// A rejected token is dropped, not retried: kept, it would survive a reload
+// and every poll would fail silently against it.
+function tokenRejected(){
+  sessionStorage.removeItem(TOKEN_KEY);
+  askForToken(true);
+}
+
 async function api(path, opts){
-  const r = await fetch(path, {headers:H, ...opts});
+  if(!storedToken()){ askForToken(false); throw new Error("no operator token"); }
+  const r = await fetch(path, {headers:H(), ...opts});
+  if(r.status === 401){ tokenRejected(); throw new Error("operator token rejected"); }
   return r.json();
 }
 
@@ -6043,7 +6102,8 @@ async function showLootViewer(){
 
 async function lootSave(url, filename){
   try {
-    const r = await fetch(url, {headers:H});
+    const r = await fetch(url, {headers:H()});
+    if(r.status === 401){ tokenRejected(); return; }
     if(!r.ok){ toast("warn","Loot","Download failed: "+r.status,3000); return; }
     const blob = await r.blob();
     const a = document.createElement("a");
@@ -7605,10 +7665,14 @@ function copyToClipboard(text, label){
   });
 }
 
-setInterval(refreshAgents, 3000);
-setInterval(checkTaskResults, 2500);
-refreshAgents();
-toast("info","Server Online","Listening for beacon connections<br>Beacon traffic accepted on any POST path",6000);
+if(storedToken()){
+  setInterval(refreshAgents, 3000);
+  setInterval(checkTaskResults, 2500);
+  refreshAgents();
+  toast("info","Server Online","Listening for beacon connections<br>Beacon traffic accepted on any POST path",6000);
+} else {
+  askForToken(false);
+}
 </script>
 <script src="/static/agent.js" defer></script>
 </body>

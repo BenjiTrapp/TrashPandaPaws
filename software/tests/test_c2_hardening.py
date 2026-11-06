@@ -1770,6 +1770,189 @@ class TestCallbackDefault(unittest.TestCase):
         self.assertEqual(json.loads(out.stdout), [c[4] for c in cases])
 
 
+class TestTokenIsNotServed(unittest.TestCase):
+    """Finding C1, credential half: `GET /` no longer carries the token.
+
+    The page used to have the operator token substituted into it, on a
+    route with no authentication, so anyone who could load the interface
+    held the credential for every other route. The page now asks for the
+    token once and keeps it in sessionStorage under `raccoon_token`.
+
+    Review focus: the route walk enumerates the app's own rules, so a route
+    added later that hands the token out is caught without editing a list.
+    """
+
+    TOKEN = "SECRET-OPERATOR-TOKEN-xyz123"
+    KEY = "raccoon_token"
+
+    def setUp(self):
+        self.data_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.data_dir, ignore_errors=True)
+        self.app = server_mod.create_app(server_mod.ServerCrypto(random_key()),
+                                         self.TOKEN, self.data_dir)
+        self.client = self.app.test_client()
+
+    @staticmethod
+    def _js_function(name):
+        found = re.search(r"\n(?:async )?function %s\(.*?\n\}\n" % name,
+                          server_mod._OPERATOR_HTML, re.S)
+        assert found, "%s is gone from the interface" % name
+        return found.group(0)
+
+    def _run_node(self, stored, status):
+        """Run the page's own api() against a stub fetch answering `status`."""
+        key = re.search(r'\nconst TOKEN_KEY = "[^"]*";\n',
+                        server_mod._OPERATOR_HTML)
+        self.assertIsNotNone(key, "TOKEN_KEY is gone from the interface")
+        harness = (
+            "const store = %s;\n"
+            "const sessionStorage = {getItem: k => k in store ? store[k] : null,"
+            " setItem: (k, v) => { store[k] = String(v); },"
+            " removeItem: k => { delete store[k]; }};\n"
+            "const asked = []; function askForToken(r){ asked.push(r); }\n"
+            "const sent = [];\n"
+            "async function fetch(p, o){ sent.push(o.headers.Authorization);"
+            " return {status: %d, ok: %s, json: async () => ({})}; }\n"
+            % (json.dumps(stored), status, "true" if status < 400 else "false"))
+        script = harness + key.group(0) + "".join(
+            self._js_function(n) for n in ("storedToken", "H", "tokenRejected",
+                                           "api")) + (
+            "(async () => { const threw = [];\n"
+            " for (let i = 0; i < 2; i++) {\n"
+            "  try { await api('/api/agents'); threw.push(false); }"
+            "  catch (e) { threw.push(true); } }\n"
+            " console.log(JSON.stringify({stored: sessionStorage.getItem(%s),"
+            " asked, sent, threw})); })();\n" % json.dumps(self.KEY))
+        out = subprocess.run(["node", "-e", script], capture_output=True,
+                             text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout)
+
+    def test_get_root_does_not_contain_the_operator_token(self):
+        # The regression test for the whole audit. Assert the token string
+        # is absent from the body, not merely that {{TOKEN}} was replaced.
+        resp = self.client.get("/")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_data(as_text=True)
+        self.assertFalse(self.TOKEN in body, "GET / serves the operator token")
+        self.assertFalse("{{TOKEN}}" in body, "the placeholder was served as-is")
+
+    def test_get_root_still_serves_the_application(self):
+        body = self.client.get("/").get_data(as_text=True)
+        self.assertIn('id="agent-list"', body)
+        self.assertIn("async function api(path, opts){", body)
+        self.assertIn('<script src="/static/agent.js" defer></script>', body)
+
+    def test_no_route_returns_the_token_without_authentication(self):
+        # Walk every rule, call it unauthenticated, assert the token is in
+        # no response body. This catches a future re-introduction anywhere.
+        adapter = self.app.url_map.bind("localhost")
+        visited = set()
+        for rule in self.app.url_map.iter_rules():
+            for method in sorted(rule.methods - {"HEAD", "OPTIONS"}):
+                path = adapter.build(rule.endpoint,
+                                     {a: "1" for a in rule.arguments},
+                                     method=method)
+                resp = self.client.open(path, method=method)
+                where = "%s %s (%s)" % (method, path, rule.endpoint)
+                self.assertFalse(self.TOKEN.encode() in resp.get_data(),
+                                 "token in the body of " + where)
+                for name, value in resp.headers.items():
+                    self.assertNotIn(self.TOKEN, value, where + " " + name)
+                visited.add(rule.endpoint)
+        # Not vacuous: the page, the API and the beacon catch-all were walked.
+        self.assertTrue({"index", "api_agents", "api_server_config",
+                         "beacon_handler"} <= visited, visited)
+
+    def test_the_page_prompts_when_no_token_is_stored(self):
+        html = server_mod._OPERATOR_HTML
+        self.assertTrue('const TOKEN_KEY = "%s";' % self.KEY in html,
+                        "the page does not name its storage key")
+        self.assertIn("sessionStorage.getItem(TOKEN_KEY)",
+                      self._js_function("storedToken"))
+        gate = re.search(r'<div id="token-gate"[\s\S]*?\n</div>\n', html)
+        self.assertIsNotNone(gate, "no token prompt in the page")
+        self.assertIn('type="password"', gate.group(0))
+        # Startup polls only with a token; without one it asks instead.
+        self.assertIsNotNone(re.search(
+            r"\nif\(storedToken\(\)\)\{\n  setInterval\(refreshAgents, 3000\);"
+            r"[\s\S]{0,400}?\n\} else \{\n  askForToken\(false\);\n\}\n", html),
+            "startup does not branch on the stored token")
+        self.assertEqual(html.count("setInterval(refreshAgents"), 1)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_with_nothing_stored_no_request_is_sent(self):
+        result = self._run_node({}, 200)
+        self.assertEqual(result["sent"], [])
+        self.assertEqual(result["asked"], [False, False])
+        self.assertEqual(result["threw"], [True, True])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_stored_token_is_read_at_call_time(self):
+        result = self._run_node({self.KEY: "right"}, 200)
+        self.assertEqual(result["sent"], ["Bearer right", "Bearer right"])
+        self.assertEqual(result["stored"], "right")
+        self.assertEqual(result["asked"], [])
+
+    def test_a_wrong_token_is_reported_and_not_retained(self):
+        # Source-level: assert the 401 path clears sessionStorage, so a bad
+        # token does not survive a reload into a silent retry loop.
+        rejected = self._js_function("tokenRejected")
+        self.assertIn("sessionStorage.removeItem(TOKEN_KEY)", rejected)
+        self.assertIn("askForToken(true)", rejected)
+        for fn in ("api", "lootSave"):
+            self.assertRegex(self._js_function(fn),
+                             r"status === 401\)[^\n]*tokenRejected\(\)", fn)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_wrong_token_is_cleared_and_not_retried(self):
+        result = self._run_node({self.KEY: "wrong"}, 401)
+        self.assertIsNone(result["stored"])
+        self.assertEqual(result["asked"], [True, False])
+        # One request with the bad token, then none: no silent retry loop.
+        self.assertEqual(result["sent"], ["Bearer wrong"])
+        self.assertEqual(result["threw"], [True, True])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_rejected_notice_survives_the_next_poll(self):
+        # Found by looking: a poll after the rejection asks again with
+        # rejected=false, and once hid the notice it had just shown.
+        script = (
+            "const els = {'token-gate': {classList: {s: new Set(),"
+            " add(c){ this.s.add(c); }, contains(c){ return this.s.has(c); }}},"
+            " 'tg-error': {style: {display: ''}}, 'tg-input': {focus(){}}};\n"
+            "const document = {getElementById: id => els[id]};\n"
+            + self._js_function("askForToken") +
+            "askForToken(true); askForToken(false);\n"
+            "console.log(JSON.stringify([els['tg-error'].style.display,"
+            " els['token-gate'].classList.contains('open')]));\n")
+        out = subprocess.run(["node", "-e", script], capture_output=True,
+                             text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), ["block", True])
+
+    def test_the_token_is_never_placed_in_a_url(self):
+        # Option (b) was rejected; assert no location/search/?t= handling
+        # crept in.
+        sources = {
+            "the page": server_mod._OPERATOR_HTML,
+            "agent.js": (_REPO / "software" / "c2" / "static" / "agent.js").read_text(),
+            "capture_figures.sh": (_REPO / "tools" / "capture_figures.sh").read_text(),
+        }
+        for board in ("c2_tour.json", "agent_run.json"):
+            sources[board] = (_REPO / "tools" / "storyboards" / board).read_text()
+        for where, text in sources.items():
+            for needle in ("location.search", "location.hash", "location.href",
+                           "URLSearchParams", "pushState", "replaceState",
+                           "?t=", "&t=", "token=", "<form"):
+                self.assertNotIn(needle, text, "%s in %s" % (needle, where))
+        # The storyboards hand the token over the way the page keeps it.
+        for board in ("c2_tour.json", "agent_run.json"):
+            first = json.loads(sources[board])[0]["js"]
+            self.assertIn("sessionStorage.setItem('%s', '{{TOKEN}}')" % self.KEY,
+                          first, board)
+
+
 # New test classes belong above this guard; never append below it.
 if __name__ == "__main__":
     unittest.main()

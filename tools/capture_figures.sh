@@ -123,7 +123,7 @@ build() {           # name, storyboard
   python3 tools/capture_sequence.py \
       --url "http://127.0.0.1:$C2_PORT/" \
       --storyboard "$board" --out-dir "$WORK/$name" \
-      --set "BEACON_ID=$BEACON" \
+      --set "BEACON_ID=$BEACON" --set "TOKEN=$TOKEN" \
       --width 1440 --height 900 --scale 2
   python3 tools/make_gif.py --manifest "$WORK/$name/frames.txt" \
       --out "docs/screenshots/$name.gif" --width "$WIDTH" --colours "$COLOURS"
@@ -150,7 +150,7 @@ if [ "$WHICH" = "stills" ]; then
   python3 tools/capture_sequence.py \
       --url "http://127.0.0.1:$C2_PORT/" \
       --storyboard tools/storyboards/c2_tour.json \
-      --out-dir "$WORK/stills" --set "BEACON_ID=$BEACON" \
+      --out-dir "$WORK/stills" --set "BEACON_ID=$BEACON" --set "TOKEN=$TOKEN" \
       --no-captions --width 1440 --height 900 --scale 2
   echo "  wrote $(ls "$WORK/stills"/*.png | wc -l | tr -d ' ') stills to $WORK/stills"
   echo "  review them, then copy the ones you want into docs/screenshots/"

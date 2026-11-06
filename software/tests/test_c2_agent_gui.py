@@ -89,7 +89,9 @@ class TestGuiDegradation(ServerTestBase):
 
     def test_index_still_renders_without_agent_service(self):
         html = self.client.get("/").get_data(as_text=True)
-        self.assertIn(TEST_TOKEN, html)
+        # The page renders -- and without the token, which it used to carry
+        # on this unauthenticated route (finding C1).
+        self.assertNotIn(TEST_TOKEN, html)
         self.assertIn("Raccoon C2", html)
 
     def test_status_endpoint_answers_503_without_a_service(self):

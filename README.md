@@ -578,6 +578,13 @@ over SSH first: `ssh -L 8444:127.0.0.1:8444 <user>@<c2-host>`, then open
 `http://localhost:8444`. Setting `--operator-port` equal to `--port` puts both
 back on one socket.
 
+**Signing in:** the page is served without the operator token and asks for it
+once -- the `Token:` line of the startup banner, or `RACCOON_TOKEN`. It is kept
+in that tab's `sessionStorage` and sent as an `Authorization` header, never in a
+URL, so it stays out of browser history, `Referer` headers and proxy logs.
+Closing the tab forgets it; a token the server rejects is forgotten at once and
+asked for again.
+
 **GUI Features:**
 
 | Feature | Description |

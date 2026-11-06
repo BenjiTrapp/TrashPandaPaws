@@ -69,6 +69,10 @@ only on loopback; the beacon socket (`0.0.0.0:8443`) answers beacons and
 nothing else. From another machine, forward it first:
 `ssh -L 8444:127.0.0.1:8444 <user>@<c2-host>`, then open `http://localhost:8444`.
 
+The page asks for the operator token first -- the `Token:` line the server
+prints at startup. It is kept in the tab's `sessionStorage`, sent as a header
+and never put in a URL; a rejected token is dropped and asked for again.
+
 The main view after login. All connected agents are listed in the left sidebar with real-time status indicators, while the right side provides the command terminal and side panels.
 
 ![Dashboard](screenshots/01_dashboard.png)

@@ -394,5 +394,26 @@ class TestTheReadmeCountsTheDemoSections(unittest.TestCase):
         numbers = [int(n) for n in re.findall(r"^## (\d+)\. ", demo, re.M)]
         self.assertEqual(numbers, list(range(1, len(numbers) + 1)))
 
+
+class TestTheDocsSayHowToSignIn(unittest.TestCase):
+    """The page no longer carries the operator token; it asks for it.
+
+    A reader who opens the GUI meets a prompt, so the two pages that tell
+    them how to open it say what to enter and where it is kept -- and
+    neither may suggest the rejected alternative, a token in the URL.
+    """
+
+    def test_both_pages_say_where_the_token_is_kept(self):
+        for doc in (README, DEMO_DOC):
+            text = doc.read_text()
+            self.assertIn("sessionStorage", text, doc.name)
+            self.assertIn("`Token:`", text, doc.name)
+
+    def test_no_page_puts_the_token_in_a_url(self):
+        for doc in (README, DEMO_DOC, AGENT_DOC):
+            text = doc.read_text()
+            for needle in ("?t=", "&t=", "token="):
+                self.assertNotIn(needle, text, "%s in %s" % (needle, doc.name))
+
 if __name__ == "__main__":
     unittest.main()
