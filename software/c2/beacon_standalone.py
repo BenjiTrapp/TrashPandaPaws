@@ -88,6 +88,14 @@ def main():
         remove_pid()
         sys.exit(0)
 
+    from software.c2.beacon import beacon_key_problem
+    problem = beacon_key_problem(config)
+    if problem:
+        logger.error("Refusing to start: %s", problem)
+        print("Refusing to start: " + problem, file=sys.stderr)
+        remove_pid()
+        sys.exit(1)
+
     running = True
 
     def shutdown(sig, frame):

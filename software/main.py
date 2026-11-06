@@ -49,9 +49,27 @@ def load_config(path: str = None) -> dict:
     for p in candidates:
         if p and Path(p).exists():
             with open(p) as f:
-                return yaml.safe_load(f)
+                config = yaml.safe_load(f)
+            _require_beacon_key(config)
+            return config
     print("No config file found", file=sys.stderr)
     sys.exit(1)
+
+
+def _require_beacon_key(config) -> None:
+    """Refuse to start when the Python beacon could run with no usable key.
+
+    Done here, before the sniffer and the cover are brought up: a failure
+    at the point the beacon is built would leave a half-started process,
+    and skipping only the beacon would leave a drop-box that is alive and
+    never calls back. Only a config that can build the beacon is asked for
+    a key.
+    """
+    from software.c2.beacon import beacon_key_problem
+    problem = beacon_key_problem(config)
+    if problem:
+        print("Refusing to start: " + problem, file=sys.stderr)
+        sys.exit(1)
 
 
 def _check_agent_beacon_conflict(config) -> None:

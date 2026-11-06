@@ -4,7 +4,10 @@ Regression tests for the security-audit remediation of the C2 beacon and
 team server.
 """
 
+import ast
 import base64
+import contextlib
+import io
 import json
 import os
 import re
@@ -12,6 +15,8 @@ import shlex
 import shutil
 import socket
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from collections import namedtuple
@@ -1059,6 +1064,241 @@ class TestInstallerReader(unittest.TestCase):
             _unit_reach("[Service]\nUser=nobody\nExecStart=/bin/true\n"))
         self.assertIsNone(_unit_reach("[Unit]\nUser=root\n[Service]\n"
                                       "User=pi\nExecStart=/bin/true\n"))
+
+
+_GENERATOR = ('python3 -c "import os,base64; '
+              'print(base64.b64encode(os.urandom(32)).decode())"')
+
+
+class _ReachedCreateApp(Exception):
+    """main() got past the key check and would have gone on to serve."""
+
+
+def _server_main(*argv):
+    """Run the server's main() as far as the key check; return
+    (exit code, stderr). The code is "served" if main() got past the check,
+    which is what a refusal must never do."""
+    err = io.StringIO()
+    code = None
+    with tempfile.TemporaryDirectory() as data_dir, \
+            patch.object(server_mod, "create_app",
+                         side_effect=_ReachedCreateApp), \
+            patch.object(server_mod, "_load_state"), \
+            patch.object(server_mod, "_setup_file_logging"), \
+            patch("sys.argv", ["server.py", "--data-dir", data_dir] + list(argv)), \
+            contextlib.redirect_stderr(err):
+        try:
+            server_mod.main()
+        except _ReachedCreateApp:
+            code = "served"
+        except SystemExit as exc:
+            code = exc.code
+    return code, err.getvalue()
+
+
+class TestKeyMustBeSupplied(unittest.TestCase):
+    """Findings C2 and C3: no key derived from public inputs, no fixed default.
+
+    Review focus: every refusal names the problem and never the value -- not
+    the key, not a prefix of it -- because these messages land in logs.
+    """
+
+    def _assert_not_echoed(self, value, text):
+        self.assertNotIn(value[:8], text, "a prefix of the key was echoed")
+
+    # ── Server ──
+
+    def test_server_refuses_to_start_without_a_key(self):
+        code, err = _server_main()
+        self.assertIsInstance(code, int)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--key", err)
+        self.assertIn(_GENERATOR, err)
+
+    def test_server_refuses_a_malformed_base64_key(self):
+        code, err = _server_main("--key", "not*base64*at*all")
+        self.assertIsInstance(code, int)
+        self.assertNotEqual(code, 0)
+        self.assertIn("not valid base64", err)
+        self.assertNotIn("bytes", err.replace(_GENERATOR, ""))
+
+    def test_server_refuses_a_key_of_the_wrong_length(self):
+        code, err = _server_main("--key", key_b64(os.urandom(16)))
+        self.assertIsInstance(code, int)
+        self.assertNotEqual(code, 0)
+        self.assertIn("16 bytes", err)
+        self.assertIn("exactly 32", err)
+        self.assertNotIn("not valid base64", err)
+
+    def test_server_accepts_a_32_byte_key(self):
+        code, err = _server_main("--key", key_b64(random_key()))
+        self.assertEqual(code, "served", err)
+
+    def test_the_refusal_names_neither_the_key_nor_a_prefix_of_it(self):
+        short = key_b64(os.urandom(24))
+        malformed = "Zq7Xw9Pk!" + key_b64(os.urandom(12))
+        for value in (short, malformed):
+            with self.subTest(side="server", value_kind=len(value)):
+                code, err = _server_main("--key", value)
+                self.assertIsInstance(code, int)
+                self._assert_not_echoed(value, err)
+            with self.subTest(side="beacon", value_kind=len(value)):
+                with self.assertRaises(ValueError) as caught:
+                    Beacon(_config(encryption_key=value))
+                self._assert_not_echoed(value, str(caught.exception))
+                # Not smuggled out through the exception chain either.
+                self.assertIsNone(caught.exception.__context__)
+
+    def _sha256_callers(self, path):
+        tree = ast.parse(Path(path).read_text())
+        callers = set()
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "sha256"):
+                    callers.add(fn.name)
+        return callers
+
+    def test_no_sha256_of_a_url_remains_in_the_server(self):
+        source = Path(server_mod.__file__).read_text()
+        self.assertEqual(self._sha256_callers(server_mod.__file__), set())
+        self.assertNotIn("derive-key", source)
+        self.assertNotIn("derive_key", source)
+
+    def test_no_sha256_of_a_url_remains_in_the_beacon(self):
+        # The one hash left names the implant; it never touches the key.
+        self.assertEqual(self._sha256_callers(beacon_mod.__file__),
+                         {"_generate_id"})
+
+    # ── Beacon ──
+
+    def test_beacon_refuses_an_empty_encryption_key(self):
+        missing = _config()
+        del missing["c2"]["encryption_key"]
+        for config in (_config(encryption_key=""),
+                       _config(encryption_key="   "), missing):
+            with self.subTest(config=config["c2"].get("encryption_key")):
+                with self.assertRaises(ValueError) as caught:
+                    Beacon(config)
+                self.assertIn("encryption_key", str(caught.exception))
+                self.assertIn(_GENERATOR, str(caught.exception))
+
+    def test_beacon_refuses_a_malformed_or_short_key(self):
+        with self.assertRaisesRegex(ValueError, "not valid base64"):
+            Beacon(_config(encryption_key="not*base64*at*all"))
+        with self.assertRaisesRegex(ValueError, "16 bytes.*exactly 32"):
+            Beacon(_config(encryption_key=key_b64(os.urandom(16))))
+
+    def test_beacon_uses_the_key_it_is_given(self):
+        key = random_key()
+        self.assertEqual(Beacon(_config(encryption_key=key_b64(key)))._key,
+                         key)
+
+    # ── Implant config: refused at load, only when a beacon will be built ──
+
+    def _implant_config(self, key, fallback=True, sliver=False):
+        return {"c2": {"enabled": True, "encryption_key": key,
+                       "sliver": {"enabled": sliver},
+                       "fallback": {"enabled": fallback}}}
+
+    def _load_implant_config(self, config):
+        import yaml
+        from software import main as implant_main
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "raccoon.yaml"
+            path.write_text(yaml.safe_dump(config))
+            with contextlib.redirect_stderr(err):
+                try:
+                    return implant_main.load_config(str(path)), None, ""
+                except SystemExit as exc:
+                    return None, exc.code, err.getvalue()
+
+    def test_implant_refuses_a_fallback_beacon_without_a_key(self):
+        short = key_b64(os.urandom(8))
+        for key in ("", "not*base64*at*all", short):
+            with self.subTest(key=len(key)):
+                loaded, code, err = self._load_implant_config(
+                    self._implant_config(key))
+                self.assertIsNone(loaded)
+                self.assertNotIn(code, (None, 0))
+                self.assertIn("c2.encryption_key", err)
+                self.assertIn(_GENERATOR, err)
+                if key:
+                    self._assert_not_echoed(key, err)
+
+    def test_a_config_that_builds_no_beacon_needs_no_key(self):
+        # Sliver-only, or C2 off: nothing would ever use the key.
+        sliver_only = self._implant_config("", fallback=False, sliver=True)
+        c2_off = self._implant_config("")
+        c2_off["c2"]["enabled"] = False
+        for config in (sliver_only, c2_off):
+            loaded, code, err = self._load_implant_config(config)
+            self.assertEqual(loaded, config, err)
+
+    def test_implant_loads_a_config_with_a_valid_key(self):
+        config = self._implant_config(key_b64(random_key()), sliver=True)
+        loaded, code, err = self._load_implant_config(config)
+        self.assertEqual(loaded, config, err)
+
+    def test_standalone_beacon_refuses_before_building_anything(self):
+        import yaml
+        from software.c2 import beacon_standalone
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "raccoon.yaml"
+            path.write_text(yaml.safe_dump(self._implant_config("")))
+            with patch.object(beacon_standalone, "CONFIG_PATHS", [str(path)]), \
+                    patch.object(beacon_standalone, "already_running",
+                                 return_value=False), \
+                    patch.object(beacon_standalone, "setup_logging"), \
+                    patch.object(beacon_standalone, "write_pid"), \
+                    patch.object(beacon_standalone, "remove_pid") as removed, \
+                    patch.object(beacon_mod, "Beacon",
+                                 side_effect=AssertionError("beacon built")), \
+                    contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as caught:
+                    beacon_standalone.main()
+        self.assertNotIn(caught.exception.code, (None, 0))
+        self.assertIn("c2.encryption_key", err.getvalue())
+        removed.assert_called_once_with()
+
+    def test_smbloot_still_builds_its_local_beacon(self):
+        # smbloot never talks to a C2; it must not trip over the key rule.
+        # In a subprocess because smbloot puts software/c2 on sys.path and
+        # imports its own copy of `beacon`, which this process must not see.
+        script = (
+            "import sys\n"
+            "sys.argv = ['smbloot.py', '127.0.0.1', 'u', 'p', 'shares']\n"
+            "sys.path.insert(0, 'software/c2')\n"
+            "import smbloot\n"
+            "smbloot.Beacon._exec_smbloot = lambda self, args: 'no shares'\n"
+            "smbloot.main()\n")
+        done = subprocess.run([sys.executable, "-c", script], cwd=str(_REPO),
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("no shares", done.stdout)
+
+    # ── Shipped config ──
+
+    def test_shipped_config_does_not_claim_a_derived_key(self):
+        # raccoon.yaml's comment currently promises the derivation.
+        lines = (_REPO / "configs" / "raccoon.yaml").read_text().splitlines()
+        at = next(i for i, line in enumerate(lines)
+                  if line.strip().startswith("encryption_key:"))
+        comment = []
+        for line in reversed(lines[:at]):
+            if not line.strip().startswith("#"):
+                break
+            comment.append(line)
+        block = "\n".join(comment)
+        self.assertNotRegex(block.lower(), r"deriv|deterministic")
+        self.assertIn(_GENERATOR, block)
+        self.assertEqual(beacon_mod.KEY_GENERATOR, _GENERATOR)
+        self.assertEqual(server_mod.KEY_GENERATOR, _GENERATOR)
 
 
 # New test classes belong above this guard; never append below it.

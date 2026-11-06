@@ -8,12 +8,13 @@ embedded operator GUI with TrashPandaPaws aesthetic.
 Usage:
   python server.py --port 443 --ssl
   python server.py --port 8443 --key <base64-key>
-  python server.py --derive-key "https://c2.example.com/api/v1/beacon:c2.example.com"
+
+A key is required; there is no default and none is derived. Make one with:
+  python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
 """
 
 import argparse
 import base64
-import hashlib
 import http.client
 import json
 import logging
@@ -72,6 +73,41 @@ def _decoy_fields(n: int) -> dict:
 
 
 # ── Crypto (mirrors beacon._encrypt / _decrypt) ──
+
+KEY_GENERATOR = ('python3 -c "import os,base64; '
+                 'print(base64.b64encode(os.urandom(32)).decode())"')
+
+
+def decode_key(value) -> bytes:
+    """The AES-256-GCM key in `value`, or a ValueError naming what is wrong.
+
+    The two failures are told apart -- not base64, and base64 of the wrong
+    length -- and neither message carries the value or any part of it: these
+    land in terminals and logs. Raised outside the except block so the
+    decoder's own error is not chained on.
+    """
+    text = value.strip() if isinstance(value, str) else ""
+    problem = None
+    key = b""
+    if not text:
+        problem = ("a key is required: pass --key <base64 32-byte key>. "
+                   "There is no default and none is derived. "
+                   "Generate one with: %s" % KEY_GENERATOR)
+    else:
+        try:
+            key = base64.b64decode(text, validate=True)
+        except ValueError:
+            problem = ("--key is not valid base64. Generate a key with: %s"
+                       % KEY_GENERATOR)
+        else:
+            if len(key) != 32:
+                problem = ("--key decodes to %d bytes; AES-256-GCM needs "
+                           "exactly 32. Generate a key with: %s"
+                           % (len(key), KEY_GENERATOR))
+    if problem:
+        raise ValueError(problem)
+    return key
+
 
 
 class ServerCrypto:
@@ -441,7 +477,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             "port": _server_config.get("port", 8443),
             "ssl": _server_config.get("ssl", False),
             "cert": _server_config.get("cert", ""),
-            "key_type": _server_config.get("key_type", "default"),
+            "key_type": _server_config.get("key_type", "explicit"),
             "enc_key": key_b64,
             "operator_token": operator_token,
             "data_dir": str(data_dir),
@@ -7481,9 +7517,7 @@ async function loadSettings(){
     const cfg = await api("/api/server/config");
     const proto = cfg.ssl ? "https" : "http";
     const listen = proto+"://"+cfg.host+":"+cfg.port;
-    const keyStatus = cfg.key_type === "default"
-      ? '<span class="cfg-value warn">DEFAULT (insecure!)</span>'
-      : '<span class="cfg-value ok">'+esc(cfg.key_type)+'</span>';
+    const keyStatus = '<span class="cfg-value ok">'+esc(cfg.key_type)+'</span>';
     const sslStatus = cfg.ssl
       ? '<span class="cfg-value secure">&#128274; Enabled'+(cfg.cert?' ('+esc(cfg.cert)+')':' (self-signed)')+'</span>'
       : '<span class="cfg-value warn">&#128275; Disabled</span>';
@@ -7570,11 +7604,7 @@ def main():
     )
     parser.add_argument("--host", default="0.0.0.0", help="Listen address")
     parser.add_argument("--port", type=int, default=8443, help="Listen port")
-    parser.add_argument("--key", help="Base64-encoded 32-byte AES-GCM key")
-    parser.add_argument(
-        "--derive-key",
-        help="Derive key from 'callback_url:dns_domain' (must match beacon config)",
-    )
+    parser.add_argument("--key", help="Base64-encoded 32-byte AES-GCM key (required)")
     parser.add_argument("--ssl", action="store_true", help="Enable HTTPS (self-signed)")
     parser.add_argument("--cert", help="SSL certificate file")
     parser.add_argument("--certkey", help="SSL private key file")
@@ -7590,15 +7620,14 @@ def main():
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     )
 
-    if args.key:
-        key = base64.b64decode(args.key)
-    elif args.derive_key:
-        parts = args.derive_key
-        key = hashlib.sha256(parts.encode()).digest()
+    try:
+        key = decode_key(args.key)
+    except ValueError as exc:
+        refusal = str(exc)
     else:
-        key = hashlib.sha256(b":").digest()
-        logger.warning("No encryption key specified — using default derived key")
-        logger.warning("Use --key or --derive-key for production")
+        refusal = None
+    if refusal:
+        parser.error(refusal)
 
     crypto = ServerCrypto(key)
 
@@ -7616,7 +7645,7 @@ def main():
         "port": args.port,
         "ssl": args.ssl,
         "cert": args.cert or "",
-        "key_type": "explicit" if args.key else ("derived" if args.derive_key else "default"),
+        "key_type": "explicit",
         "start_time": time.time(),
     }
     app = create_app(crypto, operator_token, data_dir, server_config=srv_config)
@@ -7628,7 +7657,7 @@ def main():
         f"  Listen:   {'https' if args.ssl else 'http'}://{args.host}:{args.port}\n"
         f"  Token:    {operator_token}\n"
         f"  Data:     {data_dir}\n"
-        f"  Key:      {'explicit' if args.key else 'derived' if args.derive_key else 'DEFAULT (insecure!)'}\n"
+        "  Key:      supplied with --key\n"
         f"{'=' * 60}\n"
     )
     try:
