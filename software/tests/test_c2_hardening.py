@@ -597,10 +597,28 @@ _SHELL_PREFIXES = {"if", "elif", "then", "else", "do", "while", "until", "!",
                    "{", "sudo", "command", "exec", "time"}
 
 _Chown = namedtuple("_Chown", "owner recursive contents path source")
+_Reach = namedtuple("_Reach", "paths trees")
+
+
+def _command_start(words):
+    """Drop what precedes a command: keywords, sudo, a ``name()`` header."""
+    while words:
+        if words[0] in _SHELL_PREFIXES:
+            words = words[1:]
+        elif words[1:2] == ["()"] or words[1:3] == ["(", ")"]:
+            words = words[2:] if words[1] == "()" else words[3:]
+        else:
+            break
+    return words
 
 
 def _shell_commands(text):
-    """Each simple command in a shell script as a list of unquoted words."""
+    """Each simple command in a shell script as a list of unquoted words.
+
+    This recognises the spellings bootstrap.sh uses; it is not a general
+    shell parser (``find -exec chown``, ``xargs chown``, ``/bin/chown``,
+    ``C=chown; $C`` and ``install -o`` are invisible to it).
+    """
     commands = []
     for line in re.sub(r"\\\n", " ", text).splitlines():
         lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
@@ -612,9 +630,9 @@ def _shell_commands(text):
         command = []
         for word in words + [";"]:
             if word not in _SHELL_SEPARATORS:
-                if command or word not in _SHELL_PREFIXES:
-                    command.append(word)
+                command.append(word)
                 continue
+            command = _command_start(command)
             if command:
                 commands.append(command)
             command = []
@@ -681,6 +699,19 @@ def _installer_chowns(script):
     return variables, chowns
 
 
+def _installer_chmods(script, variables):
+    """{path: mode} for the last chmod that named each path."""
+    modes = {}
+    for words in _shell_commands(script):
+        if words[0] != "chmod":
+            continue
+        operands = [w for w in words[1:] if not re.fullmatch(r"--?[A-Za-z-]*", w)]
+        for operand in operands[1:]:
+            for path in _expand_braces(_expand_variables(operand, variables)):
+                modes[str(PurePosixPath(path))] = operands[0]
+    return modes
+
+
 def _owner_of(chowns, path):
     """Who owns ``path`` once the script has run; untouched means root."""
     path = PurePosixPath(path)
@@ -706,26 +737,78 @@ def _handed_away(chowns, path):
     return any(_owner_of(chowns, p) == "user" for p in [path, *path.parents])
 
 
-def _root_units(unit_dir):
-    """{unit name: [paths its Exec* lines run]} for units running as root.
+def _tree_handed_away(chowns, tree):
+    """True when ``tree``, or anything inside it, ends up user-owned."""
+    tree = PurePosixPath(tree)
+    if _handed_away(chowns, tree):
+        return True
+    for c in chowns:
+        affected = c.path / "*" if c.contents else c.path
+        if (c.owner == "user" and tree in affected.parents
+                and _owner_of(chowns, affected) == "user"):
+            return True
+    return False
 
+
+def _unit_reach(text):
+    """What root executes or reads for a systemd unit; None if not root.
+
+    ``paths`` need only be unowned by the user themselves and their parent
+    directories: the interpreter, its arguments, the working directory, the
+    PYTHONPATH entries, and the module a ``-m`` line imports. ``trees`` are
+    code root imports wholesale, so nothing inside them may be user-owned
+    either: each ``-m`` package, and the virtualenv a ``bin/python`` is in.
     systemd runs a system unit as root unless it names another User=.
     """
+    user, workdir, pythonpath, execs, section = "root", None, [], [], None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line
+        elif section == "[Service]" and "=" in line:
+            key, _, value = line.partition("=")
+            value = value.strip()
+            if key == "User":
+                user = value
+            elif key == "WorkingDirectory":
+                workdir = value.lstrip("-")
+            elif key == "Environment":
+                for assignment in shlex.split(value):
+                    name, _, entries = assignment.partition("=")
+                    if name == "PYTHONPATH":
+                        pythonpath += [e for e in entries.split(":") if e]
+            elif key.startswith("Exec") and value:
+                execs.append(shlex.split(value.lstrip("@-:+!")))
+    if user not in ("root", "0"):
+        return None
+    roots = [r for r in [workdir] + pythonpath if r and r.startswith("/")]
+    paths, trees = set(PurePosixPath(r) for r in roots), set()
+    for words in execs:
+        if not words:
+            continue
+        exe, args = PurePosixPath(words[0]), words[1:]
+        paths.add(exe)
+        if re.fullmatch(r"python[\d.]*", exe.name) and exe.parent.name == "bin":
+            trees.add(exe.parent.parent)
+        paths.update(PurePosixPath(a) for a in args if a.startswith("/"))
+        for flag, module in zip(args, args[1:]):
+            if flag == "-m":
+                parts = module.split(".")
+                for root in roots:
+                    base = PurePosixPath(root)
+                    trees.add(base / parts[0])
+                    paths.add(base.joinpath(*parts))
+                    paths.add(base.joinpath(*parts).with_suffix(".py"))
+    return _Reach(sorted(str(p) for p in paths), sorted(str(t) for t in trees))
+
+
+def _root_units(unit_dir):
+    """{unit name: _Reach} for each unit under ``unit_dir`` that runs as root."""
     units = {}
     for unit in sorted(Path(unit_dir).glob("*.service")):
-        user, executed, section = "root", [], None
-        for line in unit.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("[") and line.endswith("]"):
-                section = line
-            elif section == "[Service]" and "=" in line:
-                key, _, value = line.partition("=")
-                if key == "User":
-                    user = value.strip()
-                elif key.startswith("Exec") and value.strip():
-                    executed.append(value.strip().lstrip("@-:+!").split()[0])
-        if user in ("root", "0"):
-            units[unit.name] = executed
+        reach = _unit_reach(unit.read_text())
+        if reach is not None:
+            units[unit.name] = reach
     return units
 
 
@@ -738,25 +821,22 @@ class TestInstallerOwnership(unittest.TestCase):
     """
 
     def setUp(self):
-        self.variables, self.chowns = _installer_chowns(_BOOTSTRAP.read_text())
+        self.script = _BOOTSTRAP.read_text()
+        self.variables, self.chowns = _installer_chowns(self.script)
         self.install_dir = self.variables.get("INSTALL_DIR")
+
+    def _given_away_by(self):
+        return "; ".join(c.source for c in self.chowns if c.owner == "user")
 
     def test_install_dir_is_not_handed_to_the_invoking_user(self):
         self.assertEqual(self.install_dir, "/opt/raccoon")
         self.assertFalse(
             _handed_away(self.chowns, self.install_dir),
             "bootstrap.sh gives the install directory to an unprivileged "
-            "account: " + "; ".join(c.source for c in self.chowns
-                                    if c.owner == "user"))
+            "account: " + self._given_away_by())
 
     def test_the_two_data_dirs_are_still_user_owned(self):
-        chmods = {}
-        for words in _shell_commands(_BOOTSTRAP.read_text()):
-            if words[0] == "chmod" and len(words) >= 3:
-                for target in words[2:]:
-                    for path in _expand_braces(
-                            _expand_variables(target, self.variables)):
-                        chmods[path] = words[1]
+        chmods = _installer_chmods(self.script, self.variables)
         for name in ("captures", "logs"):
             path = "%s/%s" % (self.install_dir, name)
             with self.subTest(directory=path):
@@ -764,21 +844,220 @@ class TestInstallerOwnership(unittest.TestCase):
                 self.assertIn(chmods.get(path), ("700", "0700", "u=rwx,go="))
 
     def test_every_unit_running_as_root_executes_a_root_owned_path(self):
+        """Not just the interpreter: the package, working dir and config too."""
         units = _root_units(_UNIT_DIR)
         self.assertTrue(units, "no unit running as root found in %s"
                         % _UNIT_DIR)
-        for name, executed in units.items():
-            self.assertTrue(executed, "%s has no Exec line" % name)
-            for path in executed:
-                with self.subTest(unit=name, executes=path):
+        for name, reach in units.items():
+            self.assertTrue(reach.paths, "%s reaches no path" % name)
+            checks = ([(p, _handed_away) for p in reach.paths]
+                      + [(t, _tree_handed_away) for t in reach.trees])
+            for path, handed_away in checks:
+                with self.subTest(unit=name, reaches=path):
                     self.assertTrue(path.startswith("/"))
                     self.assertFalse(
-                        _handed_away(self.chowns, path),
-                        "%s runs %s as root, but bootstrap.sh gives it or a "
-                        "directory above it to an unprivileged account: %s"
-                        % (name, path, "; ".join(
-                            c.source for c in self.chowns
-                            if c.owner == "user")))
+                        handed_away(self.chowns, path),
+                        "%s makes root execute or read %s, but bootstrap.sh "
+                        "gives it, a directory above it, or something in it "
+                        "to an unprivileged account: %s"
+                        % (name, path, self._given_away_by()))
+
+
+_READER_HEADER = 'INSTALL_DIR="/opt/raccoon"\nACTUAL_USER="${SUDO_USER:-$USER}"\n'
+_FIXED_PERMISSIONS = (
+    'chown -R root:root "${INSTALL_DIR}"\n'
+    'chown "${ACTUAL_USER}:${ACTUAL_USER}" "${INSTALL_DIR}/captures" '
+    '"${INSTALL_DIR}/logs"\n')
+
+# (label, installer text, "path" or "tree", target, handed to the user?)
+_HAND_OVER_CASES = [
+    ("the original line",
+     'chown -R "${ACTUAL_USER}:${ACTUAL_USER}" "${INSTALL_DIR}"',
+     "path", "/opt/raccoon", True),
+    ("sudo prefix", 'sudo chown -R "$SUDO_USER" /opt/raccoon',
+     "path", "/opt/raccoon", True),
+    ("trailing slash", 'chown -R "$SUDO_USER" /opt/raccoon/',
+     "path", "/opt/raccoon", True),
+    ("trailing dot", 'chown -R "$SUDO_USER" /opt/raccoon/.',
+     "path", "/opt/raccoon", True),
+    ("--from option", 'chown -R --from=root "$SUDO_USER" /opt/raccoon',
+     "path", "/opt/raccoon", True),
+    ("flag after the operands", 'chown "$ACTUAL_USER:$ACTUAL_USER" $INSTALL_DIR -R',
+     "path", "/opt/raccoon", True),
+    ("long and bundled flags",
+     'chown --recursive $SUDO_USER /opt/raccoon\nchown -hR pi /opt/raccoon',
+     "path", "/opt/raccoon", True),
+    ("not recursive", 'chown "${ACTUAL_USER}" "${INSTALL_DIR}"',
+     "path", "/opt/raccoon", True),
+    ("a parent directory", 'chown -R "$ACTUAL_USER" /opt',
+     "path", "/opt/raccoon", True),
+    ("default expansion", 'chown -R "${SUDO_USER:-$USER}" "$INSTALL_DIR"',
+     "path", "/opt/raccoon", True),
+    ("one-line function", 'fix() { chown -R "$ACTUAL_USER" "$INSTALL_DIR"; }',
+     "path", "/opt/raccoon", True),
+    ("multi-line function",
+     'fix() {\n    chown -R "$ACTUAL_USER" "$INSTALL_DIR"\n}\nfix',
+     "path", "/opt/raccoon", True),
+    ("inside if/then/fi",
+     'if true; then chown -R "$ACTUAL_USER" "$INSTALL_DIR"; fi',
+     "path", "/opt/raccoon", True),
+    ("after &&", '[ -d x ] && chown -R "$ACTUAL_USER" "$INSTALL_DIR"',
+     "path", "/opt/raccoon", True),
+    ("continued over lines",
+     'chown -R \\\n    "$ACTUAL_USER" \\\n    "$INSTALL_DIR"',
+     "path", "/opt/raccoon", True),
+    ("after a root chown",
+     'chown -R root:root /opt/raccoon\nchown -R "$ACTUAL_USER" /opt/raccoon',
+     "path", "/opt/raccoon", True),
+    ("the venv alone reaches the interpreter",
+     'chown -R "$ACTUAL_USER" "${INSTALL_DIR}/venv"',
+     "path", "/opt/raccoon/venv/bin/python", True),
+    ("the venv alone is not the install dir",
+     'chown -R "$ACTUAL_USER" "${INSTALL_DIR}/venv"',
+     "path", "/opt/raccoon", False),
+    ("the config dir reaches the config",
+     'chown -R "$ACTUAL_USER" "${INSTALL_DIR}/configs"',
+     "path", "/opt/raccoon/configs/raccoon.yaml", True),
+    ("the software package",
+     'chown -R "$ACTUAL_USER" "${INSTALL_DIR}/software"',
+     "tree", "/opt/raccoon/software", True),
+    ("the software package, spelled out",
+     'chown -R "$ACTUAL_USER" /opt/raccoon/software',
+     "tree", "/opt/raccoon/software", True),
+    ("one subpackage",
+     'chown -R "$ACTUAL_USER" "${INSTALL_DIR}/software/c2"',
+     "tree", "/opt/raccoon/software", True),
+    ("one module",
+     'chown "$ACTUAL_USER" "${INSTALL_DIR}/software/main.py"',
+     "tree", "/opt/raccoon/software", True),
+    ("the contents of the install dir",
+     'chown -R "$ACTUAL_USER" "${INSTALL_DIR}"/*',
+     "tree", "/opt/raccoon/software", True),
+    ("the contents of the install dir leave the dir itself",
+     'chown -R "$ACTUAL_USER" "${INSTALL_DIR}"/*',
+     "path", "/opt/raccoon", False),
+    ("the virtualenv's libraries",
+     'chown -R "$ACTUAL_USER" "${INSTALL_DIR}/venv/lib"',
+     "tree", "/opt/raccoon/venv", True),
+    ("the fix keeps the install dir", _FIXED_PERMISSIONS,
+     "path", "/opt/raccoon", False),
+    ("the fix keeps the interpreter", _FIXED_PERMISSIONS,
+     "path", "/opt/raccoon/venv/bin/python", False),
+    ("the fix keeps the config", _FIXED_PERMISSIONS,
+     "path", "/opt/raccoon/configs/raccoon.yaml", False),
+    ("the fix keeps the package", _FIXED_PERMISSIONS,
+     "tree", "/opt/raccoon/software", False),
+    ("the fix keeps the virtualenv", _FIXED_PERMISSIONS,
+     "tree", "/opt/raccoon/venv", False),
+    ("the data dirs alone", 'chown -R "$ACTUAL_USER" "${INSTALL_DIR}"/{captures,logs}',
+     "path", "/opt/raccoon", False),
+    ("a later root chown undoes it",
+     'chown -R "$ACTUAL_USER" "$INSTALL_DIR"\nchown -R root:root "$INSTALL_DIR"',
+     "tree", "/opt/raccoon/software", False),
+    ("a group-only chown", 'chown -R :staff /opt/raccoon',
+     "path", "/opt/raccoon", False),
+    ("a comment", '# chown -R "$ACTUAL_USER" "$INSTALL_DIR"',
+     "path", "/opt/raccoon", False),
+    ("a word in an echo", 'echo chown -R "$ACTUAL_USER" "$INSTALL_DIR"',
+     "path", "/opt/raccoon", False),
+    ("a chown of something else", 'chown -R "$ACTUAL_USER" /home/pi/.ssh',
+     "path", "/opt/raccoon", False),
+]
+
+# (label, installer text, path, who owns it afterwards)
+_OWNER_CASES = [
+    ("the fix hands over captures", _FIXED_PERMISSIONS,
+     "/opt/raccoon/captures", "user"),
+    ("the fix hands over logs", _FIXED_PERMISSIONS,
+     "/opt/raccoon/logs", "user"),
+    ("the fix leaves the install dir to root", _FIXED_PERMISSIONS,
+     "/opt/raccoon", "root"),
+    ("only the install dir is root's",
+     'chown -R root:root "$INSTALL_DIR"', "/opt/raccoon/captures", "root"),
+    ("the recursive form reaches the data dirs",
+     'chown -R "$ACTUAL_USER" "$INSTALL_DIR"', "/opt/raccoon/logs", "user"),
+]
+
+
+class TestInstallerReader(unittest.TestCase):
+    """The helpers behind TestInstallerOwnership, pinned against spellings.
+
+    A reader that misses a spelling makes the ownership tests pass on a
+    script that should fail them, so each case states what it must see.
+    """
+
+    def _chowns(self, snippet):
+        return _installer_chowns(_READER_HEADER + snippet)[1]
+
+    def test_a_chown_is_seen_in_every_spelling(self):
+        for label, snippet, kind, target, expected in _HAND_OVER_CASES:
+            with self.subTest(label):
+                check = _tree_handed_away if kind == "tree" else _handed_away
+                self.assertEqual(check(self._chowns(snippet), target), expected)
+
+    def test_the_owner_after_the_script_follows_the_order_of_the_commands(self):
+        for label, snippet, path, expected in _OWNER_CASES:
+            with self.subTest(label):
+                self.assertEqual(_owner_of(self._chowns(snippet), path), expected)
+
+    def test_an_unresolvable_chown_target_is_an_error_not_a_pass(self):
+        for target in ('"$SOMEWHERE"', '"$(mktemp -d)"', 'relative/dir'):
+            with self.subTest(target):
+                with self.assertRaises(AssertionError):
+                    self._chowns('chown -R "$ACTUAL_USER" ' + target)
+
+    def test_a_chmod_names_its_targets_and_not_its_options_or_mode(self):
+        cases = [
+            ('chmod 700 "${INSTALL_DIR}/captures"', {"/opt/raccoon/captures": "700"}),
+            ('chmod -R 700 "${INSTALL_DIR}"/{captures,logs}',
+             {"/opt/raccoon/captures": "700", "/opt/raccoon/logs": "700"}),
+            ('chmod --recursive 0700 /opt/raccoon/logs/',
+             {"/opt/raccoon/logs": "0700"}),
+            ('chmod 700 "$INSTALL_DIR/a" "$INSTALL_DIR/b"\nchmod 755 "$INSTALL_DIR/b"',
+             {"/opt/raccoon/a": "700", "/opt/raccoon/b": "755"}),
+        ]
+        for snippet, expected in cases:
+            with self.subTest(snippet):
+                script = _READER_HEADER + snippet
+                variables, _ = _installer_chowns(script)
+                self.assertEqual(_installer_chmods(script, variables), expected)
+
+    def test_a_units_reach_covers_what_root_runs_and_reads(self):
+        implant = (
+            "[Service]\nUser=root\nWorkingDirectory=/opt/raccoon\n"
+            "ExecStartPre=/bin/sleep 30\n"
+            "ExecStart=/opt/raccoon/venv/bin/python -m software.main "
+            "-c /opt/raccoon/configs/raccoon.yaml\n"
+            'Environment="PYTHONPATH=/opt/raccoon"\n'
+            'Environment="PATH=/opt/raccoon/venv/bin:/usr/bin"\n')
+        reach = _unit_reach(implant)
+        self.assertEqual(reach.trees,
+                         ["/opt/raccoon/software", "/opt/raccoon/venv"])
+        for path in ("/opt/raccoon", "/bin/sleep",
+                     "/opt/raccoon/venv/bin/python",
+                     "/opt/raccoon/configs/raccoon.yaml",
+                     "/opt/raccoon/software/main",
+                     "/opt/raccoon/software/main.py"):
+            self.assertIn(path, reach.paths)
+        self.assertNotIn("30", reach.paths)
+
+    def test_a_dotted_module_reaches_its_top_level_package(self):
+        reach = _unit_reach(
+            "[Service]\nWorkingDirectory=/srv/app\n"
+            'Environment="PYTHONPATH=/srv/lib:/srv/app"\n'
+            "ExecStart=/usr/bin/python3 -m pkg.sub.tool\n")
+        self.assertEqual(reach.trees, ["/srv/app/pkg", "/srv/lib/pkg",
+                                       "/usr"])
+        self.assertIn("/srv/lib/pkg/sub/tool.py", reach.paths)
+
+    def test_a_unit_runs_as_root_unless_it_names_another_user(self):
+        self.assertIsNotNone(_unit_reach("[Service]\nExecStart=/bin/true\n"))
+        self.assertIsNotNone(
+            _unit_reach("[Service]\nUser=0\nExecStart=/bin/true\n"))
+        self.assertIsNone(
+            _unit_reach("[Service]\nUser=nobody\nExecStart=/bin/true\n"))
+        self.assertIsNone(_unit_reach("[Unit]\nUser=root\n[Service]\n"
+                                      "User=pi\nExecStart=/bin/true\n"))
 
 
 # New test classes belong above this guard; never append below it.
