@@ -1183,5 +1183,60 @@ class TestTheReportIsServedAsMarkdown(_ServiceCase):
         self.assertIn("executed-live", body)
         self.assertIn("2121/tcp open ftp", body)
 
+
+class TestFinishedRunsAreStillListed(_ServiceCase):
+    """Found by trying to screenshot the report button.
+
+    /status listed only unfinished campaigns, which is right for the
+    manager's own view: a finished run has nothing to pause or stop. But
+    the report button hangs off that list, so the deliverable was
+    unreachable for exactly the runs that have one -- a finished campaign
+    is precisely when an operator wants it.
+    """
+
+    async def get_application(self):
+        self.rig = _rig()
+        return self.rig.app
+
+    async def test_a_completed_run_appears(self):
+        rid = queries.create_run(self.rig.conn, "campaign", None, "auto", "{}")
+        queries.set_run_status(self.rig.conn, rid, "completed")
+        body = await (await self.get("/status")).json()
+        ids = [r["run_id"] for r in body.get("recent", [])]
+        self.assertIn(rid, ids)
+
+    async def test_it_carries_its_status_so_the_gui_can_say_so(self):
+        rid = queries.create_run(self.rig.conn, "campaign", None, "auto", "{}")
+        queries.set_run_status(self.rig.conn, rid, "aborted")
+        body = await (await self.get("/status")).json()
+        row = [r for r in body["recent"] if r["run_id"] == rid][0]
+        self.assertEqual(row["status"], "aborted")
+
+    async def test_an_unfinished_run_is_not_in_both_lists(self):
+        # It would render twice in the panel, with two Report buttons.
+        rid = queries.create_run(self.rig.conn, "campaign", None, "auto", "{}")
+        body = await (await self.get("/status")).json()
+        recent = [r["run_id"] for r in body.get("recent", [])]
+        self.assertNotIn(rid, recent)
+
+    async def test_the_list_is_bounded(self):
+        for _ in range(40):
+            rid = queries.create_run(self.rig.conn, "campaign", None, "auto",
+                                     "{}")
+            queries.set_run_status(self.rig.conn, rid, "completed")
+        body = await (await self.get("/status")).json()
+        self.assertLessEqual(len(body["recent"]), 10)
+
+    async def test_the_newest_come_first(self):
+        ids = []
+        for _ in range(3):
+            rid = queries.create_run(self.rig.conn, "campaign", None, "auto",
+                                     "{}")
+            queries.set_run_status(self.rig.conn, rid, "completed")
+            ids.append(rid)
+        body = await (await self.get("/status")).json()
+        listed = [r["run_id"] for r in body["recent"]]
+        self.assertEqual(listed[0], ids[-1])
+
 if __name__ == "__main__":
     unittest.main()

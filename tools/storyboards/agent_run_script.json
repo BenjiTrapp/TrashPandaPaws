@@ -29,7 +29,9 @@
           "arguments": {
             "host": "127.0.0.1",
             "finding_type": "service",
-            "data": "vsftpd 2.3.4 answering on 2121 — a version with a known backdoor"
+            "data": "vsftpd 2.3.4 answering on 2121 — a version with a known backdoor",
+            "evidence": "2121/tcp open  ftp     vsftpd 2.3.4",
+            "proof_basis": "executed-live"
           }
         }
       ]
@@ -123,7 +125,9 @@
           "arguments": {
             "host": "127.0.0.1",
             "finding_type": "host",
-            "data": "Darwin on arm64, user context is unprivileged, several loopback listeners"
+            "data": "Darwin on arm64, user context is unprivileged, several loopback listeners",
+            "evidence": "Darwin Hackepeter-2.local 25.5.0 Darwin Kernel Version 25.5.0 arm64\nuid=501(derbenji) gid=20(staff)",
+            "proof_basis": "executed-live"
           }
         }
       ]
@@ -160,6 +164,20 @@
           "arguments": {
             "command": "searchsploit vsftpd 2.3.4",
             "server_side": true
+          }
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "name": "log_discovery",
+          "arguments": {
+            "host": "127.0.0.1",
+            "finding_type": "vuln",
+            "data": "CVE-2011-2523 in vsftpd 2.3.4, CVSS 9.8 — read from the banner, not triggered",
+            "evidence": "vsftpd 2.3.4 — CVE-2011-2523 (CVSS 9.8)\nexploit/unix/ftp/vsftpd_234_backdoor",
+            "proof_basis": "inferred"
           }
         }
       ]

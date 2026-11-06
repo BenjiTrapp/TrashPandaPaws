@@ -528,5 +528,73 @@ class TestTheFormOffersBothAgentModes(unittest.TestCase):
         pairs = dict(re.findall(r'(\w+):\s*"(\w+)"', block.group(1)))
         self.assertEqual(pairs, {"supervised": "pause", "auto": "decide"})
 
+
+class TestTheReportIsReachableFromTheGui(unittest.TestCase):
+    """A deliverable nobody can find is not a deliverable.
+
+    The report is served at /campaign/<id>/report, and until this the
+    only way to it was knowing the URL. An operator finishing a campaign
+    should be one click from the thing they hand over.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = AGENT_JS.read_text()
+
+    def test_the_panel_offers_a_report_for_each_campaign(self):
+        self.assertIn("/report", self.js)
+        self.assertRegex(self.js, r'text:\s*"Report"')
+
+    def test_it_goes_through_the_one_choke_point(self):
+        # Two earlier versions of this test were wrong in opposite ways.
+        # The first demanded the token in the URL so window.open would
+        # work -- the worse design, since a token in a URL lands in the
+        # browser's history and in every access log it passes. The second
+        # looked for "headers" inside downloadReport, which is where the
+        # header *was* before it went through aiCall. The property is
+        # neither: the report uses the single function that builds an
+        # /api/ai URL and attaches the operator header, which
+        # test_ai_calls_go_through_one_choke_point already guards.
+        self.assertRegex(self.js, r"function downloadReport")
+        body = re.search(r"async function downloadReport[\s\S]{0,900}",
+                         self.js).group(0)
+        self.assertIn("aiCall(", body)
+        self.assertNotIn("fetch(", body)
+
+    def test_the_token_is_never_put_in_the_report_url(self):
+        body = re.search(r"function downloadReport[\s\S]{0,900}", self.js)
+        self.assertIsNotNone(body)
+        self.assertNotIn("token=", body.group(0))
+
+    def test_a_failure_says_so_instead_of_silently_doing_nothing(self):
+        # A button that does nothing on a 404 or a dead service teaches
+        # the operator not to trust it.
+        self.assertRegex(self.js,
+                         r"downloadReport[\s\S]{0,900}notify")
+
+
+class TestTheFallbackChainIsVisible(unittest.TestCase):
+    """A chain nobody can see is a chain nobody trusts.
+
+    The status panel showed one model. With a chain configured, the
+    operator had no way to know a second provider existed or which one
+    was serving -- and the moment that matters is the moment a campaign
+    is running on the fallback.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = AGENT_JS.read_text()
+
+    def test_the_panel_lists_the_chain(self):
+        self.assertRegex(self.js, r"s\.fallbacks")
+
+    def test_it_says_what_the_chain_is_for(self):
+        # A bare list of provider names reads as a configuration dump.
+        self.assertRegex(self.js, r"fallback|if the first")
+
+    def test_a_single_provider_is_not_dressed_up_as_a_chain(self):
+        self.assertRegex(self.js, r"fallbacks[\s\S]{0,200}length")
+
 if __name__ == "__main__":
     unittest.main()

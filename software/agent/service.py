@@ -230,6 +230,12 @@ class _Service:
             # anything holding the operator token.
             "fallbacks": [{"provider": link.provider, "model": link.model}
                           for link in (self.cfg.fallbacks or ())],
+            # Finished runs too, which _campaigns deliberately omits: it
+            # answers for what the manager can still pause or stop. The
+            # report hangs off this list, so without them the deliverable
+            # was unreachable for exactly the runs that have one -- found
+            # by trying to photograph the button.
+            "recent": self._recent_runs(),
             "db_ready": self._db_ready(),
             "opsec_warnings": self._opsec_by_profile(),
             # The never-permitted actions, generated rather than typed. A
@@ -268,6 +274,39 @@ class _Service:
     def _run_exists(self, run_id) -> bool:
         return self.conn.execute(
             "SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is not None
+
+    # Enough to reach the last engagement's reports, few enough that the
+    # panel stays a panel.
+    RECENT_RUNS = 10
+
+    def _recent_runs(self):
+        """The most recently finished runs, newest first."""
+        running = {entry["run_id"] for entry in self.manager.active()}
+        out = []
+        try:
+            rows = self.conn.execute(
+                "SELECT id, status, phase, started_at, completed_at FROM runs "
+                "WHERE completed_at IS NOT NULL "
+                "ORDER BY id DESC LIMIT ?",
+                (self.RECENT_RUNS * 2,)).fetchall()
+        except sqlite3.Error:
+            # /status is what an operator reads when something is wrong,
+            # including a store that cannot be read. db_ready already
+            # reports that; this must not raise before it gets the chance.
+            return []
+        for row in rows:
+            if row["id"] in running:
+                # It would render twice in the panel, with two report
+                # buttons: a run can be finished in the store and still
+                # held by the manager for a moment.
+                continue
+            out.append({"run_id": row["id"], "status": row["status"],
+                        "phase": row["phase"],
+                        "started_at": row["started_at"],
+                        "completed_at": row["completed_at"]})
+            if len(out) >= self.RECENT_RUNS:
+                break
+        return out
 
     def _db_ready(self) -> bool:
         try:

@@ -175,10 +175,21 @@ function isTerminal(status){ return TERMINAL.indexOf(status) >= 0; }
 // final) told apart from 503 ("not there right now", worth retrying).
 
 async function aiCall(path, opts){
+  // The one place that builds an /api/ai URL and attaches the operator
+  // header, which a test pins: one place to guard is one place to get
+  // right. `asText` is for the report, which is Markdown rather than
+  // JSON -- the body type changes, the choke point does not.
+  const o = Object.assign({}, opts || {});
+  const asText = !!o.asText;
+  delete o.asText;
   try {
-    const r = await fetch("/api/ai/" + path, Object.assign({headers: H}, opts || {}));
+    const r = await fetch("/api/ai/" + path, Object.assign({headers: H}, o));
     let data = null;
-    try { data = await r.json(); } catch(e){ data = null; }
+    if(asText){
+      try { data = await r.text(); } catch(e){ data = null; }
+    } else {
+      try { data = await r.json(); } catch(e){ data = null; }
+    }
     return {ok: r.ok, status: r.status, data: data};
   } catch(e){
     return {ok: false, status: 0, data: null};
@@ -290,6 +301,32 @@ function kv(rows){
   return dl;
 }
 
+async function downloadReport(rid){
+  // Fetched with the operator header rather than opened as a URL: a token
+  // in a URL lands in the browser's history and in every access log the
+  // request passes. The service sends it as an attachment, so it is handed
+  // to the browser as a blob with the filename it asked for.
+  const r = await aiCall("campaign/" + rid + "/report", {asText: true});
+  if(!r.ok){
+    notify("error", "Report unavailable",
+           r.status === 404 ? "Run " + rid + " is not in the agent's store."
+                            : reasonOf(r),
+           7000);
+    return;
+  }
+  const text = r.data || "";
+  const url = URL.createObjectURL(new Blob([text], {type: "text/markdown"}));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "campaign-" + rid + "-report.md";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Revoked on the next tick: Safari has not finished reading it when
+  // click() returns.
+  setTimeout(function(){ URL.revokeObjectURL(url); }, 2000);
+}
+
 function agentOpenPanel(){
   const shown = openInPanel("Automated Attack", function(root){
     const s = A.status || {};
@@ -301,6 +338,20 @@ function agentOpenPanel(){
         ["capability tier", (s.tier || "?") + (s.max_phase ? " (up to phase " + s.max_phase + ")" : "")],
         ["database", s.db_ready === false ? "not ready" : "ready"],
       ]));
+      // A chain nobody can see is a chain nobody trusts, and the moment
+      // it matters is the moment a campaign is running on the fallback
+      // and the token counts are filed under a model this panel would
+      // otherwise still show as the only one.
+      const chain = Array.isArray(s.fallbacks) ? s.fallbacks : [];
+      if(chain.length){
+        root.appendChild(h("h4", {text: "Fallback providers"}));
+        root.appendChild(h("div", {class: "ai-note",
+          text: "Tried in this order if the first cannot serve — out of "
+              + "credit, revoked key, rate-limited or down."}));
+        root.appendChild(h("ol", {}, chain.map(function(f){
+          return h("li", {text: (f.provider || "?") + " / " + (f.model || "?")});
+        })));
+      }
     } else {
       root.appendChild(h("pre", {text: "Unavailable: " + A.reason}));
       root.appendChild(h("div", {class: "ai-note", text: "Start the agent service and click the button again."}));
@@ -322,8 +373,28 @@ function agentOpenPanel(){
           + ", score " + (c.score == null ? "-" : c.score) + " ",
         A.rid === c.run_id && !A.ended ? h("span", {class: "ai-note", text: "(shown)"})
           : h("button", {class: "ai-btn-inline", type: "button", text: "Show",
-              onclick: function(){ startWatching(c.run_id); }})));
+              onclick: function(){ startWatching(c.run_id); }}),
+        " ",
+        h("button", {class: "ai-btn-inline", type: "button", text: "Report",
+                     title: "Download this campaign's report as Markdown",
+                     onclick: guard(function(){ downloadReport(c.run_id); })})));
     });
+    // Finished runs, which the campaign list above deliberately omits --
+    // it answers for what can still be paused or stopped. Their reports
+    // are the reason they are here: a finished campaign is exactly when
+    // the operator wants the deliverable.
+    const past = Array.isArray(s.recent) ? s.recent : [];
+    if(past.length){
+      root.appendChild(h("h4", {text: "Finished"}));
+      past.forEach(function(c){
+        root.appendChild(h("div", {},
+          "#" + c.run_id + " " + (c.status || "?")
+            + (c.phase == null ? "" : ", reached phase " + c.phase) + " ",
+          h("button", {class: "ai-btn-inline", type: "button", text: "Report",
+                       title: "Download this campaign's report as Markdown",
+                       onclick: guard(function(){ downloadReport(c.run_id); })})));
+      });
+    }
   });
   // No agent open means no side panel; say it where the operator is looking.
   if(!shown){

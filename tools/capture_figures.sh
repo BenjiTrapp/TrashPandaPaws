@@ -64,6 +64,18 @@ out = "".join(lines)
 for key, value in (("campaign_interval", 3), ("restore_interval", 3)):
     out, n = re.subn(r"(\n\s*%s:\s*)\d+" % key, r"\g<1>%d" % value, out, count=1)
     assert n == 1, key
+
+# A fallback link, so the status panel has a chain to show. `local` needs no
+# key, which is also the honest example: a model on the box itself cannot be
+# rate-limited and cannot have its key revoked, which makes it the sensible
+# last link. It is never reached here -- the scripted primary always answers.
+out, n = re.subn(r"(\n    provider: )",
+                 "\n    fallbacks:\n"
+                 "      - provider: local\n"
+                 "        model: qwen2.5-coder\n"
+                 "        base_url: http://127.0.0.1:11434/v1\n"
+                 r"\g<1>", out, count=1)
+assert n == 1, "fallbacks"
 pathlib.Path(sys.argv[1]).write_text(out)
 print("  config: sliver off, intervals 3s -> %s" % sys.argv[1])
 PY

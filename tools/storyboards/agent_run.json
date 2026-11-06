@@ -127,5 +127,23 @@
     "js": "const d = document.querySelector('.ai-drawer'); if (d) d.scrollIntoView({block: 'start'}); true",
     "caption": "The drawer — phase, tokens spent, approvals, every decision logged",
     "settle": 2.0
+  },
+  {
+    "note": "The status panel, reached from the same button once a campaign is being followed. It names the fallback chain, which nothing else in the GUI does.",
+    "hold": 5.0,
+    "js": "document.querySelectorAll('.toast').forEach(e => e.remove()); document.querySelector('.ai-btn').click(); true",
+    "caption": "The service panel — model, tier, and the fallback chain behind it",
+    "wait": "#ai-detail dl",
+    "timeout": 30,
+    "settle": 2.4
+  },
+  {
+    "note": "The report is fetched through aiCall and handed to the browser as a blob, so a headless capture cannot show the saved file. What it can show is the button that produces it, which is the thing an operator has to find.",
+    "hold": 5.5,
+    "js": "const d = document.getElementById('ai-detail'); if (d) d.scrollTop = d.scrollHeight; true",
+    "caption": "One click from the campaign to its deliverable — Report",
+    "wait": "#ai-detail button",
+    "timeout": 30,
+    "settle": 1.2
   }
 ]
