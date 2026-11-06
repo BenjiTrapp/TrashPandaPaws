@@ -6,6 +6,7 @@ team server.
 
 import base64
 import json
+import os
 import re
 import shutil
 import socket
@@ -373,6 +374,177 @@ class TestGuiEscaping(unittest.TestCase):
         self.assertEqual(agent["interval"], 30)
         self.assertIsInstance(agent["interval"], int)
         self.assertEqual(self._list_agents(client).status_code, 200)
+
+
+class TestLootWriteIsContained(unittest.TestCase):
+    """A file an agent sends lands inside the directory meant for it.
+
+    Everything runs under one temporary root that holds the data directory and
+    a sibling directory standing in for "anywhere else on the host". Escapes
+    are detected by walking that root, never by trusting a return value.
+    """
+
+    TOKEN = "test-operator-token"
+    SUBS = (("loot", True), ("downloads", False))
+
+    def setUp(self):
+        server_mod.agents.clear()
+        server_mod.task_queues.clear()
+        server_mod.history.clear()
+        self.addCleanup(server_mod.agents.clear)
+        self.addCleanup(server_mod.task_queues.clear)
+        self.addCleanup(server_mod.history.clear)
+
+        self.root = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.data_dir = self.root / "data"
+        self.data_dir.mkdir()
+        self.elsewhere = self.root / "elsewhere"
+        self.elsewhere.mkdir()
+
+        self.crypto = server_mod.ServerCrypto(b"k" * 32)
+        app = server_mod.create_app(self.crypto, self.TOKEN, self.data_dir)
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+
+    def _post(self, payload):
+        return self.client.post("/api/v1/beacon",
+                                data=json.dumps(self.crypto.wrap(payload)),
+                                content_type="application/json")
+
+    def _register(self):
+        resp = self._post({"action": "register", "id": "implant-1",
+                           "hostname": "h", "user": "u"})
+        return self.crypto.unwrap(resp.get_json())["agent_id"]
+
+    def _send_file(self, agent_id, loot, filename="note.txt", body=b"payload"):
+        return self._post({
+            "action": "result", "task_id": "t1", "agent_id": agent_id,
+            "status": "ok", "output": "",
+            "data": {"data": base64.b64encode(body).decode(),
+                     "filename": filename, "loot": loot},
+        })
+
+    def _written_files(self):
+        """Every file under the temp root, except the server's own state."""
+        found = []
+        for dirpath, _dirs, files in os.walk(self.root):
+            for name in files:
+                path = Path(dirpath) / name
+                if path != self.data_dir / "state.json":
+                    found.append(path)
+        return found
+
+    def _assert_nothing_written(self):
+        self.assertEqual(self._written_files(), [])
+
+    def _assert_no_agent_directories(self):
+        for sub, _loot in self.SUBS:
+            base = self.data_dir / sub
+            self.assertEqual(list(base.iterdir()) if base.exists() else [], [])
+
+    def test_absolute_agent_id_cannot_escape_the_loot_dir(self):
+        self._register()
+        for _sub, loot in self.SUBS:
+            self._send_file(str(self.elsewhere), loot)
+        self.assertEqual(list(self.elsewhere.iterdir()), [])
+        self._assert_nothing_written()
+
+    def test_dotdot_agent_id_cannot_escape(self):
+        self._register()
+        for agent_id in ("../../elsewhere", "..", "../..",
+                         "../downloads", "./../../elsewhere"):
+            for _sub, loot in self.SUBS:
+                with self.subTest(agent_id=agent_id, loot=loot):
+                    self._send_file(agent_id, loot)
+        self.assertEqual(list(self.elsewhere.iterdir()), [])
+        self._assert_nothing_written()
+
+    def test_empty_agent_id_writes_nothing(self):
+        self._register()
+        for agent_id in ("", None, ".", 0):
+            for _sub, loot in self.SUBS:
+                with self.subTest(agent_id=agent_id, loot=loot):
+                    self._send_file(agent_id, loot)
+        self._assert_nothing_written()
+
+    def test_unregistered_agent_creates_no_directory(self):
+        self._register()
+        for _sub, loot in self.SUBS:
+            self._send_file("raccoon-never-registered", loot)
+        self._assert_nothing_written()
+        self._assert_no_agent_directories()
+        self.assertFalse(
+            (self.data_dir / "loot" / "raccoon-never-registered").exists())
+        self.assertFalse(
+            (self.data_dir / "downloads" / "raccoon-never-registered").exists())
+
+    def test_a_registry_entry_that_is_itself_hostile_is_still_contained(self):
+        # Registered or not, the resolved directory must sit under the base:
+        # state.json is loaded into `agents`, so the registry is not a
+        # guarantee on its own.
+        for hostile in ("../../elsewhere", str(self.elsewhere), ".."):
+            server_mod.agents[hostile] = {"agent_id": hostile, "id": "x"}
+            for _sub, loot in self.SUBS:
+                with self.subTest(agent_id=hostile, loot=loot):
+                    self._send_file(hostile, loot)
+        self.assertEqual(list(self.elsewhere.iterdir()), [])
+        self._assert_nothing_written()
+
+    def test_an_agent_directory_that_is_a_symlink_out_is_not_followed(self):
+        agent_id = self._register()
+        for sub, loot in self.SUBS:
+            (self.data_dir / sub).mkdir(exist_ok=True)
+            os.symlink(self.elsewhere, self.data_dir / sub / agent_id)
+            self._send_file(agent_id, loot)
+        self.assertEqual(list(self.elsewhere.iterdir()), [])
+
+    def test_filename_with_separators_is_flattened(self):
+        agent_id = self._register()
+        hostile = ["../../elsewhere/pwn", "/etc/passwd", "a/b/c.txt",
+                   "..\\..\\elsewhere\\pwn", "../", "..", "", "x\x00y.txt",
+                   "sp ace;`id`$(x).txt"]
+        for filename in hostile:
+            for _sub, loot in self.SUBS:
+                with self.subTest(filename=filename, loot=loot):
+                    self._send_file(agent_id, loot, filename=filename)
+        self.assertEqual(list(self.elsewhere.iterdir()), [])
+        files = self._written_files()
+        self.assertTrue(files)
+        for sub, _loot in self.SUBS:
+            agent_dir = self.data_dir / sub / agent_id
+            self.assertTrue(agent_dir.is_dir())
+            # flat: only plain files directly in the agent directory
+            self.assertEqual([p for p in agent_dir.iterdir()
+                              if not p.is_file()], [])
+        for path in files:
+            self.assertIn(path.parent, (self.data_dir / "loot" / agent_id,
+                                        self.data_dir / "downloads" / agent_id))
+            self.assertRegex(path.name, r"^[A-Za-z0-9._-]+$")
+
+    def test_a_registered_agent_still_receives_its_loot(self):
+        agent_id = self._register()
+        for sub, loot in self.SUBS:
+            resp = self._send_file(agent_id, loot, filename="creds.txt",
+                                   body=b"secret-" + sub.encode())
+            self.assertEqual(resp.status_code, 200)
+            written = list((self.data_dir / sub / agent_id).iterdir())
+            self.assertEqual(len(written), 1)
+            self.assertTrue(written[0].name.endswith("_creds.txt"))
+            self.assertEqual(written[0].read_bytes(),
+                             b"secret-" + sub.encode())
+        self.assertEqual(len(self._written_files()), 2)
+
+    def test_a_rejected_write_answers_exactly_like_an_accepted_one(self):
+        agent_id = self._register()
+        accepted = self._send_file(agent_id, True)
+        rejected = self._send_file(str(self.elsewhere), True)
+        unknown = self._send_file("raccoon-never-registered", True)
+        for resp in (accepted, rejected, unknown):
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(self.crypto.unwrap(resp.get_json()),
+                             {"ack": True})
+        self.assertEqual(len(self._written_files()), 1)
 
 
 # New test classes belong above this guard; never append below it.

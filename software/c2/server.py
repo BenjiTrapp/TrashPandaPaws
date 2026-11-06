@@ -2105,18 +2105,56 @@ def _handle_result(payload: dict, crypto: ServerCrypto, data_dir: Path):
     if data and data.get("data"):
         is_loot = data.get("loot", False)
         sub = "loot" if is_loot else "downloads"
-        dl_dir = data_dir / sub / agent_id
-        dl_dir.mkdir(parents=True, exist_ok=True)
-        filename = data.get("filename", f"{task_id}.bin")
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        safe_name = f"{ts}_{filename}"
-        (dl_dir / safe_name).write_bytes(base64.b64decode(data["data"]))
-        logger.info("%s saved: %s/%s", sub.title(), agent_id, safe_name)
-        category = "LOOT" if is_loot else "DOWNLOAD"
-        _log_event(category, f"file={safe_name} saved to {dl_dir / safe_name}",
-                   agent_id=agent_id)
+        # A refused write is answered exactly like an accepted one: this
+        # route must not let a prober tell the two apart.
+        dl_dir = _agent_file_dir(data_dir, sub, agent_id)
+        if dl_dir is None:
+            logger.warning("Refused %s write for unknown or unsafe agent %r",
+                           sub, agent_id)
+        else:
+            dl_dir.mkdir(parents=True, exist_ok=True)
+            filename = _flat_filename(data.get("filename") or f"{task_id}.bin")
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            stored_name = f"{ts}_{filename}"
+            (dl_dir / stored_name).write_bytes(base64.b64decode(data["data"]))
+            logger.info("%s saved: %s/%s", sub.title(), agent_id, stored_name)
+            category = "LOOT" if is_loot else "DOWNLOAD"
+            _log_event(category,
+                       f"file={stored_name} saved to {dl_dir / stored_name}",
+                       agent_id=agent_id)
 
     return jsonify(crypto.wrap({"ack": True}))
+
+
+def _agent_file_dir(data_dir: Path, sub: str, agent_id) -> Optional[Path]:
+    """The directory an agent's files go in, or None if it may not have one.
+
+    Agent IDs are server-generated and held in ``agents``; the one in a result
+    is whatever the sender wrote, so only a registered one is accepted. The
+    containment check runs on the *resolved* path: an absolute component
+    discards the base in ``base / x``, and ``..`` and symlinks only show their
+    effect after resolution. The directory must be exactly one level under
+    ``data_dir/sub`` and carry the agent's own name.
+    """
+    if not isinstance(agent_id, str) or agent_id not in agents:
+        return None
+    base = (data_dir / sub).resolve()
+    candidate = (base / agent_id).resolve()
+    if candidate.parent != base or candidate.name != agent_id:
+        return None
+    return candidate
+
+
+def _flat_filename(raw) -> str:
+    """An agent-supplied file name reduced to a basename of plain characters.
+
+    Everything up to the last path separator (either kind) is dropped, any
+    character outside ``[A-Za-z0-9._-]`` becomes ``_``, and leading dots go so
+    the result is never ``.`` or ``..`` or hidden.
+    """
+    name = re.split(r"[\\/]", str(raw))[-1]
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name).lstrip(".")
+    return name[:100] or "file.bin"
 
 
 # ── Operator HTML (embedded) ──
