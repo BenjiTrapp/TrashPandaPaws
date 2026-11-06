@@ -64,6 +64,11 @@ screens, still, with the detail the captions cannot carry.
 
 ## 1. Operator Dashboard
 
+The GUI is served on its own socket, `http://127.0.0.1:8444` by default, and
+only on loopback; the beacon socket (`0.0.0.0:8443`) answers beacons and
+nothing else. From another machine, forward it first:
+`ssh -L 8444:127.0.0.1:8444 <user>@<c2-host>`, then open `http://localhost:8444`.
+
 The main view after login. All connected agents are listed in the left sidebar with real-time status indicators, while the right side provides the command terminal and side panels.
 
 ![Dashboard](screenshots/01_dashboard.png)

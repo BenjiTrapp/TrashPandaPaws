@@ -91,7 +91,7 @@ there yet.
 # Or terminal 2, by hand:
 RACCOON_TOKEN="$RACCOON_TOKEN" python3 -m software.agent \
     --provider anthropic --model claude-sonnet-4-5 \
-    --c2-url http://127.0.0.1:8443
+    --c2-url http://127.0.0.1:8444
 ```
 
 No vendor SDK is needed. Every provider speaks JSON over HTTPS through
@@ -103,7 +103,7 @@ additions.
 ### Checking it took
 
 ```bash
-curl -s localhost:8443/api/ai/status -H "Authorization: Bearer $RACCOON_TOKEN"
+curl -s localhost:8444/api/ai/status -H "Authorization: Bearer $RACCOON_TOKEN"
 ```
 
 `available: true` means a campaign can start. `available: false` always

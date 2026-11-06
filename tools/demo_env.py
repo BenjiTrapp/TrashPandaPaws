@@ -26,6 +26,8 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+from werkzeug.serving import make_server
+
 from software.c2.beacon import Beacon
 from software.c2.server import ServerCrypto, agents, create_app
 
@@ -65,8 +67,18 @@ def beacon_config(port, key, interval=2):
 
 
 class DemoEnv:
-    def __init__(self, port, token, data_dir=None):
+    """The C2 on two sockets, as `server.py` runs it.
+
+    `port` is the operator socket -- the GUI and the API, and what the
+    capture tools open. `beacon_port` is the agent socket, the only one the
+    beacon is pointed at; 0 picks a free port, read back once bound. With
+    the two apart the socket policy is live, so the figures show the GUI as
+    it is actually reached, not a single-socket arrangement nobody runs.
+    """
+
+    def __init__(self, port, token, data_dir=None, beacon_port=0):
         self.port = port
+        self.beacon_port = beacon_port
         self.token = token
         self.data_dir = pathlib.Path(data_dir or tempfile.mkdtemp())
         self.key = random_key()
@@ -74,14 +86,20 @@ class DemoEnv:
         self.beacon_id = None
 
     def start_server(self):
-        self.app = create_app(ServerCrypto(self.key),
-                              self.token, self.data_dir)
-        self.thread = threading.Thread(
-            target=self.app.run,
-            kwargs={"host": "127.0.0.1", "port": self.port,
-                    "use_reloader": False, "threaded": True},
-            daemon=True)
-        self.thread.start()
+        operator = make_server("127.0.0.1", self.port, None, threaded=True)
+        agent = make_server("127.0.0.1", self.beacon_port, None, threaded=True)
+        self.port = operator.server_port
+        self.beacon_port = agent.server_port
+        self.app = create_app(
+            ServerCrypto(self.key), self.token, self.data_dir,
+            server_config={"host": "127.0.0.1", "port": self.beacon_port,
+                           "operator_host": "127.0.0.1",
+                           "operator_port": self.port},
+            operator_port=self.port)
+        self.servers = (operator, agent)
+        for srv in self.servers:
+            srv.app = self.app
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
         self._wait(self._answers, "the C2 to accept connections")
 
     def _answers(self):
@@ -97,7 +115,7 @@ class DemoEnv:
         return True
 
     def start_beacon(self):
-        self.beacon = Beacon(beacon_config(self.port, self.key))
+        self.beacon = Beacon(beacon_config(self.beacon_port, self.key))
         self.beacon.start()
         self._wait(lambda: bool(agents), "the beacon to register")
         record = list(agents.values())[0]
@@ -118,14 +136,18 @@ class DemoEnv:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--port", type=int, default=18500)
+    parser.add_argument("--port", type=int, default=18500,
+                        help="operator socket: the GUI and the API")
+    parser.add_argument("--beacon-port", type=int, default=0,
+                        help="agent socket (default: any free port)")
     parser.add_argument("--token", default="demo-operator-token")
     parser.add_argument("--data-dir")
     args = parser.parse_args(argv)
 
-    env = DemoEnv(args.port, args.token, args.data_dir)
+    env = DemoEnv(args.port, args.token, args.data_dir, args.beacon_port)
     env.start_server()
     print("c2 http://127.0.0.1:%d  token %s" % (env.port, env.token))
+    print("beacons http://127.0.0.1:%d" % env.beacon_port)
     env.start_beacon()
     print("beacon %s" % env.beacon_id)
     print("data %s" % env.data_dir)

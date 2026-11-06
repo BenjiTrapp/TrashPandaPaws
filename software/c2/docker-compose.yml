@@ -9,8 +9,14 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     environment:
       - DISPLAY=${DISPLAY:-:0}
+      # The beacon socket: what implants call back to, on every interface.
       - RACCOON_PORT=8443
       - RACCOON_HOST=0.0.0.0
+      # The operator GUI and API, on their own socket and loopback only, so
+      # nothing that can reach the beacon socket can reach the GUI. From
+      # another machine: ssh -L 8444:127.0.0.1:8444 <user>@<this-host>.
+      - RACCOON_OPERATOR_PORT=${RACCOON_OPERATOR_PORT:-8444}
+      - RACCOON_OPERATOR_HOST=${RACCOON_OPERATOR_HOST:-127.0.0.1}
       # Where the agent service listens. Loopback, because both containers
       # share the host network: there is no compose network to resolve a
       # service name on, since network_mode: host is required for Responder
@@ -71,7 +77,8 @@ services:
       - AGENT_BIND_HOST=127.0.0.1
       - AGENT_BIND_PORT=8099
       - AGENT_DB_PATH=/data/raccoon-agent/agent.db
-      - AGENT_C2_URL=${AGENT_C2_URL:-http://127.0.0.1:8443}
+      # The operator socket: the agent drives the operator API.
+      - AGENT_C2_URL=${AGENT_C2_URL:-http://127.0.0.1:8444}
       # Same value as the C2's above; that is the point of it.
       - RACCOON_TOKEN=${RACCOON_TOKEN:-}
       - RACCOON_AGENT_TOKEN=${RACCOON_AGENT_TOKEN:-}

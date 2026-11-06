@@ -129,7 +129,7 @@ def _bounded(convert: Callable, low=None, high=None,
 LOG_LEVELS = ("off", "full")
 
 _DEFAULT_DB_PATH = "/data/raccoon-c2/agent.db"
-_DEFAULT_C2_URL = "https://127.0.0.1:8443"
+_DEFAULT_C2_URL = "https://127.0.0.1:8444"
 _DEFAULT_BIND_HOST = "127.0.0.1"
 _DEFAULT_BIND_PORT = 8099
 _DEFAULT_MAX_EXECUTORS = 4

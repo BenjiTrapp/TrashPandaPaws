@@ -9,10 +9,16 @@
     .\start_server.ps1 -Port 443 -SSL
     .\start_server.ps1 -Key "base64key==" -Token "my-secret-token"
     .\start_server.ps1 -NoPrompt
+.NOTES
+    -Host_/-Port are the beacon socket, reachable from the network.
+    -OperatorHost/-OperatorPort are the GUI and API, loopback by default;
+    an -OperatorPort equal to -Port serves both on one socket.
 #>
 param(
     [int]$Port = 8443,
     [string]$Host_ = "0.0.0.0",
+    [int]$OperatorPort = 8444,
+    [string]$OperatorHost = "127.0.0.1",
     [string]$Key = "",
     [string]$Token = "",
     [switch]$SSL,
@@ -202,13 +208,13 @@ if (-not $NoPrompt -and -not $Key) {
     Write-Host "  ─────────────────────────────────────────────" -ForegroundColor DarkGray
     Write-Host ""
 
-    Write-Host "  Listen host " -ForegroundColor Cyan -NoNewline
+    Write-Host "  Beacon listen host " -ForegroundColor Cyan -NoNewline
     Write-Host "[$Host_]" -ForegroundColor DarkGray -NoNewline
     Write-Host ": " -ForegroundColor White -NoNewline
     $Input_ = Read-Host
     if ($Input_) { $Host_ = $Input_ }
 
-    Write-Host "  Listen port " -ForegroundColor Cyan -NoNewline
+    Write-Host "  Beacon listen port " -ForegroundColor Cyan -NoNewline
     Write-Host "[$Port]" -ForegroundColor DarkGray -NoNewline
     Write-Host ": " -ForegroundColor White -NoNewline
     $Input_ = Read-Host
@@ -307,9 +313,9 @@ Write-Host "  ├─────────────────────
 Write-Host "  │                                                      │" -ForegroundColor DarkGray
 
 $ListenStr = "${Proto}://${Host_}:${Port}"
-$GuiStr = "${Proto}://localhost:${Port}"
+$GuiStr = "${Proto}://${OperatorHost}:${OperatorPort}"
 Write-Host "  │" -ForegroundColor DarkGray -NoNewline
-Write-Host "  Listen       " -ForegroundColor Cyan -NoNewline
+Write-Host "  Beacons      " -ForegroundColor Cyan -NoNewline
 Write-Host $ListenStr.PadRight(38) -ForegroundColor White -NoNewline
 Write-Host "│" -ForegroundColor DarkGray
 Write-Host "  │" -ForegroundColor DarkGray -NoNewline
@@ -342,11 +348,18 @@ Write-Host "│" -ForegroundColor DarkGray
 Write-Host "  │                                                      │" -ForegroundColor DarkGray
 Write-Host "  └──────────────────────────────────────────────────────┘" -ForegroundColor DarkGray
 Write-Host ""
+if ($OperatorPort -ne $Port -and ($OperatorHost -like "127.*" -or $OperatorHost -eq "localhost" -or $OperatorHost -eq "::1")) {
+    Write-Host "  The GUI is loopback only. From another machine:" -ForegroundColor DarkGray
+    Write-Host "  ssh -L ${OperatorPort}:${OperatorHost}:${OperatorPort} <user>@<this-host>, then open ${Proto}://localhost:${OperatorPort}" -ForegroundColor DarkGray
+    Write-Host ""
+}
 Write-Host "  Press Ctrl+C to stop the server" -ForegroundColor DarkGray
 Write-Host ""
 
 # -- Build command --
-$PyArgs = @($ServerPy, "--host", $Host_, "--port", $Port, "--token", $Token)
+$PyArgs = @($ServerPy, "--host", $Host_, "--port", $Port,
+            "--operator-host", $OperatorHost, "--operator-port", $OperatorPort,
+            "--token", $Token)
 $PyArgs += "--key", $Key
 if ($SSL)      { $PyArgs += "--ssl" }
 if ($Cert)     { $PyArgs += "--cert", $Cert }

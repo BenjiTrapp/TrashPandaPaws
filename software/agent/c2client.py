@@ -30,7 +30,7 @@ is written to that shape and does not support the old one):
 Usage:
     from software.agent import c2client
 
-    c2 = c2client.C2Client("https://c2.local:8443", token)
+    c2 = c2client.C2Client("https://c2.local:8444", token)
     task_id = await c2.queue_task("raccoon-fox", "shell", "id")
     result = await c2.await_task(task_id, timeout=120)
 """

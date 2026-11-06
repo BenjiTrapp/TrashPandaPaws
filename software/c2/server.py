@@ -34,6 +34,7 @@ from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from flask import Flask, request, jsonify, send_file, send_from_directory, Response
+from werkzeug.serving import generate_adhoc_ssl_context, make_server
 
 try:
     from software.c2.beacon import decode_key
@@ -283,10 +284,40 @@ def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
 
 
 def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
-               server_config: Optional[dict] = None) -> Flask:
+               server_config: Optional[dict] = None,
+               operator_port: Optional[int] = None) -> Flask:
     app = Flask(__name__)
     static_dir = Path(__file__).parent / "static"
     _server_config = server_config or {}
+
+    # ── Socket policy ──
+    #
+    # The operator interface and the beacon endpoint are served on separate
+    # sockets, and a request is judged by the socket it arrived on. Not by
+    # its path: beacon_handler is the catch-all POST /<path:path>, on
+    # purpose, so a C2 profile can send beacons anywhere -- no prefix tells
+    # the two audiences apart. werkzeug reports each listener's own port in
+    # SERVER_PORT, so that is the discriminator.
+    #
+    # A request on the operator port may reach anything. A request on any
+    # other socket may reach only beacon_handler, and is otherwise given the
+    # catch-all's own cover answer, so a refusal is indistinguishable from
+    # it -- a 403 or a 404 would tell a prober what is listening.
+    #
+    # operator_port=None means no split is configured and the policy allows
+    # everything: one socket serves both, exactly as before. The test client
+    # goes through no socket at all, so denying when the socket is unknown
+    # would break every test and every single-socket deployment at once.
+    if operator_port is not None:
+        _operator_port = str(operator_port)
+
+        @app.before_request
+        def _socket_policy():
+            if request.environ.get("SERVER_PORT") == _operator_port:
+                return None
+            if request.endpoint == "beacon_handler":
+                return None
+            return _fake_response()
 
     # ── Operator auth ──
 
@@ -445,6 +476,10 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         return jsonify({
             "host": _server_config.get("host", "0.0.0.0"),
             "port": _server_config.get("port", 8443),
+            "operator_host": _server_config.get(
+                "operator_host", _server_config.get("host", "0.0.0.0")),
+            "operator_port": _server_config.get(
+                "operator_port", _server_config.get("port", 8443)),
             "ssl": _server_config.get("ssl", False),
             "cert": _server_config.get("cert", ""),
             "key_type": _server_config.get("key_type", "explicit"),
@@ -7496,9 +7531,9 @@ async function loadSettings(){
     body.innerHTML = `
       <div class="cfg-section">
         <div class="cfg-section-title">&#127760; Network</div>
-        <div class="cfg-row"><span class="cfg-label">Listen</span><span class="cfg-value">${esc(listen)}</span></div>
+        <div class="cfg-row"><span class="cfg-label">Beacons</span><span class="cfg-value">${esc(listen)}</span></div>
         <div class="cfg-row"><span class="cfg-label">SSL/TLS</span>${sslStatus}</div>
-        <div class="cfg-row"><span class="cfg-label">GUI</span><span class="cfg-value">${esc(proto+"://localhost:"+cfg.port)}</span></div>
+        <div class="cfg-row"><span class="cfg-label">GUI</span><span class="cfg-value">${esc(proto+"://"+(cfg.operator_host==="0.0.0.0"?"localhost":cfg.operator_host)+":"+cfg.operator_port)}</span></div>
       </div>
       <div class="cfg-section">
         <div class="cfg-section-title">&#128274; Security</div>
@@ -7572,8 +7607,16 @@ def main():
         description="Raccoon C2 Team Server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--host", default="0.0.0.0", help="Listen address")
-    parser.add_argument("--port", type=int, default=8443, help="Listen port")
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="Beacon listen address (the agent socket)")
+    parser.add_argument("--port", type=int, default=8443,
+                        help="Beacon listen port (the agent socket)")
+    parser.add_argument("--operator-host", default="127.0.0.1",
+                        help="Operator GUI and API listen address "
+                             "(default: loopback only)")
+    parser.add_argument("--operator-port", type=int, default=8444,
+                        help="Operator GUI and API listen port; equal to "
+                             "--port serves both on one socket")
     parser.add_argument("--key", help="Base64-encoded 32-byte AES-GCM key (required)")
     parser.add_argument("--ssl", action="store_true", help="Enable HTTPS (self-signed)")
     parser.add_argument("--cert", help="SSL certificate file")
@@ -7607,24 +7650,52 @@ def main():
 
     _load_state(data_dir)
     _setup_file_logging(data_dir)
-    _log_event("STARTUP", f"Server starting on {'https' if args.ssl else 'http'}://"
-               f"{args.host}:{args.port}")
+    proto = "https" if args.ssl else "http"
+    # Equal ports mean one socket for both audiences, as before this split
+    # existed: it binds --host, and the policy is left inert.
+    split = args.operator_port != args.port
+    operator_host = args.operator_host if split else args.host
+    listeners = [(args.host, args.port)]
+    if split:
+        listeners.append((operator_host, args.operator_port))
+    _log_event("STARTUP", "Server starting on " + ", ".join(
+        f"{proto}://{host}:{port}" for host, port in listeners))
 
     srv_config = {
         "host": args.host,
         "port": args.port,
+        "operator_host": operator_host,
+        "operator_port": args.operator_port,
         "ssl": args.ssl,
         "cert": args.cert or "",
         "key_type": "explicit",
         "start_time": time.time(),
     }
-    app = create_app(crypto, operator_token, data_dir, server_config=srv_config)
+    app = create_app(crypto, operator_token, data_dir, server_config=srv_config,
+                     operator_port=args.operator_port if split else None)
 
+    if not split:
+        network = (f"  Listen:   {proto}://{args.host}:{args.port}"
+                   "  (beacons and GUI on one socket)\n")
+    elif _is_loopback(operator_host):
+        network = (
+            f"  Beacons:  {proto}://{args.host}:{args.port}\n"
+            f"  GUI:      {proto}://{operator_host}:{args.operator_port}"
+            "  (loopback only)\n"
+            f"  Remote:   ssh -L {args.operator_port}:{operator_host}:"
+            f"{args.operator_port} <user>@<this-host>\n"
+            f"            then open {proto}://localhost:{args.operator_port}\n"
+        )
+    else:
+        network = (
+            f"  Beacons:  {proto}://{args.host}:{args.port}\n"
+            f"  GUI:      {proto}://{operator_host}:{args.operator_port}\n"
+        )
     banner = (
         f"\n{'=' * 60}\n"
         f"  Raccoon C2 Team Server\n"
         f"{'=' * 60}\n"
-        f"  Listen:   {'https' if args.ssl else 'http'}://{args.host}:{args.port}\n"
+        f"{network}"
         f"  Token:    {operator_token}\n"
         f"  Data:     {data_dir}\n"
         "  Key:      supplied with --key\n"
@@ -7645,17 +7716,21 @@ def main():
                 ssl_ctx.keylog_filename = keylog
                 logger.info("TLS keylog → %s", keylog)
         else:
-            ssl_ctx = "adhoc"
+            # Made once, so both sockets present the same certificate.
+            ssl_ctx = generate_adhoc_ssl_context()
             logger.info("Using self-signed certificate (install pyopenssl: pip install pyopenssl)")
 
-    app.run(
-        host=args.host,
-        port=args.port,
-        ssl_context=ssl_ctx,
-        debug=False,
-        threaded=True,
-    )
+    # One app object behind every socket: the agents, tasks and loot are
+    # module state, and the policy in create_app tells the sockets apart.
+    servers = [make_server(host, port, app, threaded=True, ssl_context=ssl_ctx)
+               for host, port in listeners]
+    for extra in servers[1:]:
+        threading.Thread(target=extra.serve_forever, daemon=True).start()
+    servers[0].serve_forever()
 
+
+def _is_loopback(host: str) -> bool:
+    return host == "localhost" or host == "::1" or host.startswith("127.")
 
 if __name__ == "__main__":
     main()

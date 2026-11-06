@@ -225,7 +225,7 @@ agent:
 
   # ── C2 the agent drives ──
   c2:
-    url: "https://127.0.0.1:8443"
+    url: "https://127.0.0.1:8444"
     # The C2 certificate is self-signed.
     verify_tls: false
 

@@ -544,7 +544,7 @@ interactive terminal, and integrates offensive tooling for post-exploitation.
 ```mermaid
 graph LR
     subgraph "Operator"
-        BROWSER["Browser<br/>GUI on :8443"]
+        BROWSER["Browser<br/>GUI on 127.0.0.1:8444"]
     end
 
     subgraph "Raccoon C2 Team Server"
@@ -558,7 +558,7 @@ graph LR
     end
 
     BROWSER -->|"Bearer Token<br/>HTTPS"| FLASK
-    FLASK <-->|"AES-256-GCM<br/>encrypted tasking"| B1
+    FLASK <-->|"AES-256-GCM<br/>encrypted tasking<br/>on :8443"| B1
     FLASK <-->|"AES-256-GCM"| B2
     FLASK --- TOOLS
 
@@ -567,6 +567,16 @@ graph LR
     style B1 fill:#fa0,stroke:#333,color:#000
     style B2 fill:#fa0,stroke:#333,color:#000
 ```
+
+**Two sockets:** the server listens twice over one application. Beacons call
+back to `--host`/`--port` (`0.0.0.0:8443` by default), and that socket answers
+nothing but beacon traffic -- the GUI and the `/api/*` routes are not served
+there, whatever the path or token. The operator GUI and API are on
+`--operator-host`/`--operator-port`, `127.0.0.1:8444` by default, so open
+`http://127.0.0.1:8444` on the server itself, or from another machine forward it
+over SSH first: `ssh -L 8444:127.0.0.1:8444 <user>@<c2-host>`, then open
+`http://localhost:8444`. Setting `--operator-port` equal to `--port` puts both
+back on one socket.
 
 **GUI Features:**
 
@@ -753,7 +763,10 @@ cd software\c2
 
 The launcher checks and installs dependencies automatically (`flask`,
 `cryptography`, `impacket`, `ldap3`, `netexec`, `lsassy`), then prompts for
-host, port, encryption key, and operator token.
+host, port, encryption key, and operator token. The host and port it asks for
+are the beacon socket; the GUI is at `http://127.0.0.1:8444`, loopback only
+(`--operator-host`/`--operator-port` to change it, an SSH tunnel to reach it
+from elsewhere).
 
 #### Quick Start (Docker)
 
@@ -782,8 +795,10 @@ Responder).
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `RACCOON_PORT` | `8443` | Listen port |
-| `RACCOON_HOST` | `0.0.0.0` | Listen address |
+| `RACCOON_PORT` | `8443` | Beacon listen port (the agent socket) |
+| `RACCOON_HOST` | `0.0.0.0` | Beacon listen address (the agent socket) |
+| `RACCOON_OPERATOR_PORT` | `8444` | Operator GUI and API listen port |
+| `RACCOON_OPERATOR_HOST` | `127.0.0.1` | Operator GUI and API listen address; loopback, so reach it with `ssh -L 8444:127.0.0.1:8444 <user>@<c2-host>` |
 | `RACCOON_KEY` | **required** | AES-256-GCM key (base64, 32 bytes); the container exits without it |
 | `RACCOON_TOKEN` | (random) | Operator token for GUI auth |
 | `RACCOON_SSL` | (none) | Enable TLS (set to `1`) |

@@ -32,13 +32,20 @@ echo -e "${G}  [✓]${N} ${W}RelayKing${N}     ${D}$(python3 /opt/RelayKing/rela
 echo -e "${G}  [✓]${N} ${W}Responder${N}     ${D}$(python3 /opt/Responder/Responder.py --version 2>/dev/null || echo 'installed')${N}"
 echo ""
 
+# RACCOON_HOST/PORT: the beacon socket. RACCOON_OPERATOR_HOST/PORT: the GUI
+# and API, loopback by default -- with network_mode: host that is the host's
+# loopback, so the GUI is reached on this machine or over an SSH tunnel.
 PORT="${RACCOON_PORT:-8443}"
 HOST="${RACCOON_HOST:-0.0.0.0}"
+OPERATOR_PORT="${RACCOON_OPERATOR_PORT:-8444}"
+OPERATOR_HOST="${RACCOON_OPERATOR_HOST:-127.0.0.1}"
 DATA="${RACCOON_DATA:-/data/raccoon-c2}"
 
 CMD=(python3 /opt/raccoon-c2/server.py
     --host "$HOST"
     --port "$PORT"
+    --operator-host "$OPERATOR_HOST"
+    --operator-port "$OPERATOR_PORT"
     --data-dir "$DATA"
 )
 
@@ -54,7 +61,8 @@ CMD=(python3 /opt/raccoon-c2/server.py
 CMD+=("$@")
 
 echo -e "${D}  ┌──────────────────────────────────────────────┐${N}"
-echo -e "${D}  │${N}  ${C}Listen${N}   ${W}http://${HOST}:${PORT}${N}"
+echo -e "${D}  │${N}  ${C}Beacons${N}  ${W}http://${HOST}:${PORT}${N}"
+echo -e "${D}  │${N}  ${C}GUI${N}      ${W}http://${OPERATOR_HOST}:${OPERATOR_PORT}${N}"
 echo -e "${D}  │${N}  ${C}Data${N}     ${W}${DATA}${N}"
 echo -e "${D}  │${N}  ${C}Tools${N}    ${W}impacket nxc lsassy relayking responder nmap${N}"
 echo -e "${D}  └──────────────────────────────────────────────┘${N}"

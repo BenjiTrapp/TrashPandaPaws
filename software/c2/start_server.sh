@@ -17,8 +17,12 @@ D='\033[0;90m'    # Dim
 N='\033[0m'       # Reset
 
 # ── Defaults ──
+# HOST/PORT are the beacon socket and stay reachable from the network;
+# the operator GUI and API get their own socket, loopback by default.
 PORT="${PORT:-8443}"
 HOST="${HOST:-0.0.0.0}"
+OPERATOR_PORT="${OPERATOR_PORT:-8444}"
+OPERATOR_HOST="${OPERATOR_HOST:-127.0.0.1}"
 KEY=""
 KEY_ORIGIN=""
 TOKEN=""
@@ -32,6 +36,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)       PORT="$2"; shift 2;;
         --host)       HOST="$2"; shift 2;;
+        --operator-port) OPERATOR_PORT="$2"; shift 2;;
+        --operator-host) OPERATOR_HOST="$2"; shift 2;;
         --key)        KEY="$2"; KEY_ORIGIN="passed with --key"; shift 2;;
         --token)      TOKEN="$2"; shift 2;;
         --ssl)        SSL="--ssl"; shift;;
@@ -39,7 +45,8 @@ while [[ $# -gt 0 ]]; do
         --certkey)    CERTKEY="$2"; shift 2;;
         --interactive|-i) INTERACTIVE="1"; shift;;
         -h|--help)
-            echo "Usage: $0 [--port 8443] [--host 0.0.0.0] [--key <b64>] [--token <str>] [--ssl] [--cert <file>] [--certkey <file>] [-i|--interactive]"
+            echo "Usage: $0 [--port 8443] [--host 0.0.0.0] [--operator-port 8444] [--operator-host 127.0.0.1] [--key <b64>] [--token <str>] [--ssl] [--cert <file>] [--certkey <file>] [-i|--interactive]"
+            echo "  --host/--port: the beacon socket. --operator-host/--operator-port: the GUI and API."
             exit 0;;
         *) echo "Unknown option: $1"; exit 1;;
     esac
@@ -178,11 +185,11 @@ if [[ -n "$INTERACTIVE" ]] || { [[ -z "$KEY" ]] && [[ -t 0 ]]; }; then
     echo -e "${D}  ─────────────────────────────────────────────${N}"
     echo ""
 
-    echo -ne "  ${C}Listen host${N} ${D}[${HOST}]${N}: "
+    echo -ne "  ${C}Beacon listen host${N} ${D}[${HOST}]${N}: "
     read -r INPUT
     [[ -n "$INPUT" ]] && HOST="$INPUT"
 
-    echo -ne "  ${C}Listen port${N} ${D}[${PORT}]${N}: "
+    echo -ne "  ${C}Beacon listen port${N} ${D}[${PORT}]${N}: "
     read -r INPUT
     [[ -n "$INPUT" ]] && PORT="$INPUT"
 
@@ -268,13 +275,13 @@ echo -e "${D}  ├────────────────────�
 echo -e "${D}  │${N}                                                      ${D}│${N}"
 
 LISTEN_STR="${PROTO}://${HOST}:${PORT}"
-GUI_STR="${PROTO}://localhost:${PORT}"
+GUI_STR="${PROTO}://${OPERATOR_HOST}:${OPERATOR_PORT}"
 PAD_L=$((38 - ${#LISTEN_STR}))
 PAD_G=$((38 - ${#GUI_STR}))
 [[ $PAD_L -lt 0 ]] && PAD_L=0
 [[ $PAD_G -lt 0 ]] && PAD_G=0
 
-echo -e "${D}  │${N}  ${C}Listen${N}       ${W}${LISTEN_STR}${N}$(printf '%*s' $PAD_L '')${D}│${N}"
+echo -e "${D}  │${N}  ${C}Beacons${N}      ${W}${LISTEN_STR}${N}$(printf '%*s' $PAD_L '')${D}│${N}"
 echo -e "${D}  │${N}  ${C}GUI${N}          ${W}${GUI_STR}${N}$(printf '%*s' $PAD_G '')${D}│${N}"
 
 PAD_K=$((38 - ${#KEY_TYPE}))
@@ -299,11 +306,18 @@ echo -e "${D}  │${N}  ${C}${ENC_KEY_B64}${N}$(printf '%*s' $PAD_E '')${D}│${
 echo -e "${D}  │${N}                                                      ${D}│${N}"
 echo -e "${D}  └──────────────────────────────────────────────────────┘${N}"
 echo ""
+if [[ "$OPERATOR_PORT" != "$PORT" && ( "$OPERATOR_HOST" == 127.* || "$OPERATOR_HOST" == "localhost" || "$OPERATOR_HOST" == "::1" ) ]]; then
+    echo -e "${D}  The GUI is loopback only. From another machine:${N}"
+    echo -e "${D}  ssh -L ${OPERATOR_PORT}:${OPERATOR_HOST}:${OPERATOR_PORT} <user>@<this-host>, then open ${PROTO}://localhost:${OPERATOR_PORT}${N}"
+    echo ""
+fi
 echo -e "${D}  Press Ctrl+C to stop the server${N}"
 echo ""
 
 # ── Build command ──
-CMD=("$PYTHON" "$SERVER_PY" "--host" "$HOST" "--port" "$PORT" "--token" "$TOKEN")
+CMD=("$PYTHON" "$SERVER_PY" "--host" "$HOST" "--port" "$PORT"
+     "--operator-host" "$OPERATOR_HOST" "--operator-port" "$OPERATOR_PORT"
+     "--token" "$TOKEN")
 CMD+=("--key" "$KEY")
 [[ -n "$SSL" ]]        && CMD+=("--ssl")
 [[ -n "$CERT" ]]       && CMD+=("--cert" "$CERT")
@@ -337,7 +351,8 @@ if [[ -n "$AGENT_START" ]]; then
     # the one this launcher just decided on rather than a second copy that
     # could drift.
     export RACCOON_TOKEN="$TOKEN"
-    export AGENT_C2_URL="${PROTO}://127.0.0.1:${PORT}"
+    # The operator socket: the agent drives the operator API.
+    export AGENT_C2_URL="${PROTO}://127.0.0.1:${OPERATOR_PORT}"
     if [[ -z "${AGENT_PROVIDER:-}" || -z "${AGENT_MODEL:-}" ]]; then
         echo -e "${Y}  [!]${N} ${W}Agent${N}         ${Y}AGENT_PROVIDER and AGENT_MODEL are not set;${N}"
         echo -e "      ${D}the service starts and reports itself unavailable in the GUI.${N}"

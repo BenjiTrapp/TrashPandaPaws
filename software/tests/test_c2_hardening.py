@@ -18,10 +18,15 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from collections import namedtuple
 from pathlib import Path, PurePosixPath
 from unittest.mock import MagicMock, patch
+
+from werkzeug.serving import make_server
 
 from software.c2 import beacon as beacon_mod
 from software.c2 import server as server_mod
@@ -1435,6 +1440,234 @@ class TestKeyMustBeSupplied(unittest.TestCase):
         self.assertNotRegex(block.lower(), r"deriv|deterministic")
         self.assertIn(_GENERATOR, block)
         self.assertEqual(beacon_mod.KEY_GENERATOR, _GENERATOR)
+
+
+def _http(method, port, path, body=None, headers=None):
+    """One request over a real socket; (status, content type, body bytes).
+
+    Not the test client: the policy under test keys on the socket a request
+    arrived on, and the test client goes through no socket at all.
+    """
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path),
+                                 data=data, method=method,
+                                 headers=dict(headers or {}))
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.headers.get("Content-Type"), resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers.get("Content-Type"), exc.read()
+
+
+class _FakeListener:
+    def __init__(self, calls, host, port, app, **kwargs):
+        calls.append({"host": host, "port": port, "app": app, **kwargs})
+        self.server_port = port
+
+    def serve_forever(self):
+        pass
+
+    def shutdown(self):
+        pass
+
+
+def _main_listeners(*argv):
+    """Run main() with make_server replaced; return (listeners, create_app
+    keyword arguments). Nothing binds and nothing blocks."""
+    calls = []
+    made = {}
+    real_create_app = server_mod.create_app
+
+    def recording_create_app(*args, **kwargs):
+        made.update(kwargs)
+        return real_create_app(*args, **kwargs)
+
+    with tempfile.TemporaryDirectory() as data_dir, \
+            patch.object(server_mod, "make_server",
+                         side_effect=lambda *a, **k: _FakeListener(calls, *a, **k)), \
+            patch.object(server_mod, "create_app",
+                         side_effect=recording_create_app), \
+            patch.object(server_mod, "_load_state"), \
+            patch.object(server_mod, "_setup_file_logging"), \
+            patch.object(server_mod, "_log_event"), \
+            patch.object(server_mod.logging, "basicConfig"), \
+            patch("sys.argv", ["server.py", "--data-dir", data_dir,
+                               "--key", key_b64(random_key())] + list(argv)), \
+            contextlib.redirect_stdout(io.StringIO()):
+        server_mod.main()
+    return calls, made
+
+
+class TestSocketPolicy(unittest.TestCase):
+    """Finding C1, structural half: the operator interface and the agent
+    endpoint no longer share a socket.
+
+    Review focus: with no operator port configured the policy must allow
+    everything -- every other test in this suite uses the test client, which
+    has no socket to tell apart.
+    """
+
+    TOKEN = "socket-policy-operator-token"
+
+    def setUp(self):
+        self.saved_agents = dict(server_mod.agents)
+        server_mod.agents.clear()
+        self.addCleanup(self._restore_agents)
+        self.data_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.data_dir, ignore_errors=True)
+        self.crypto = server_mod.ServerCrypto(random_key())
+
+    def _restore_agents(self):
+        server_mod.agents.clear()
+        server_mod.agents.update(self.saved_agents)
+
+    def _split(self):
+        """Two real listeners over one app, the operator port configured.
+
+        Called by the tests that need sockets rather than from setUp, so the
+        tests that need none run without them.
+        """
+        # Ephemeral ports, read back after binding: never a hardcoded number,
+        # which once measured a foreign process and reported the opposite of
+        # the truth. The app needs the operator port before it exists, so the
+        # listeners are bound first and handed the app afterwards.
+        self.operator = make_server("127.0.0.1", 0, None, threaded=True)
+        self.addCleanup(self.operator.server_close)
+        self.agent = make_server("127.0.0.1", 0, None, threaded=True)
+        self.addCleanup(self.agent.server_close)
+        self.op_port = self.operator.server_port
+        self.agent_port = self.agent.server_port
+        app = server_mod.create_app(self.crypto, self.TOKEN, self.data_dir,
+                                    operator_port=self.op_port)
+        for srv in (self.operator, self.agent):
+            srv.app = app
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.addCleanup(srv.shutdown)
+
+    def _auth(self):
+        return {"Authorization": "Bearer %s" % self.TOKEN}
+
+    def _register(self, port):
+        payload = {"action": "register", "id": "socket-policy-impl",
+                   "hostname": "box", "os": "Linux", "arch": "aarch64",
+                   "user": "pi", "pid": 7, "interval": 10, "uptime": 1}
+        status, _, body = _http("POST", port, "/api/v1/register",
+                                self.crypto.wrap(payload))
+        return status, self.crypto.unwrap(json.loads(body))
+
+    def _cover(self):
+        # The catch-all's answer to a body it cannot read: the response any
+        # prober already gets, and the one a refusal has to match.
+        return _http("POST", self.agent_port, "/", {"not": "a beacon"})
+
+    # ── The agent socket ──
+
+    def test_agent_socket_refuses_the_operator_page(self):
+        self._split()
+        status, ctype, body = _http("GET", self.agent_port, "/")
+        self.assertNotIn(b"<html", body.lower())
+        self.assertNotIn(self.TOKEN.encode(), body)
+        self.assertEqual((status, ctype, body), self._cover())
+
+    def test_agent_socket_refuses_the_operator_api_even_with_a_valid_token(self):
+        self._split()
+        for method, path in (("GET", "/api/agents"),
+                             ("GET", "/api/server/config"),
+                             ("POST", "/api/server/exec"),
+                             ("POST", "/api/server/token")):
+            with self.subTest(method=method, path=path):
+                body = {} if method == "POST" else None
+                got = _http(method, self.agent_port, path, body, self._auth())
+                self.assertEqual(got, self._cover())
+
+    def test_agent_socket_serves_a_beacon_checkin(self):
+        self._split()
+        status, reply = self._register(self.agent_port)
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(reply, "the registration was not answered")
+        self.assertTrue(reply["success"])
+        self.assertEqual(len(server_mod.agents), 1)
+
+    # ── The operator socket ──
+
+    def test_operator_socket_serves_the_page_and_the_api(self):
+        self._split()
+        status, _, body = _http("GET", self.op_port, "/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"<html", body.lower())
+        status, _, body = _http("GET", self.op_port, "/api/agents",
+                                headers=self._auth())
+        self.assertEqual(status, 200)
+        self.assertIsInstance(json.loads(body), list)
+        status, _, _ = _http("GET", self.op_port, "/api/agents")
+        self.assertEqual(status, 401, "the token is still required")
+
+    def test_operator_socket_still_serves_a_beacon_checkin(self):
+        # Local beacons in the demo reach the operator socket; that stays.
+        self._split()
+        status, reply = self._register(self.op_port)
+        self.assertEqual(status, 200)
+        self.assertTrue(reply["success"])
+        self.assertEqual(len(server_mod.agents), 1)
+
+    # ── The inert default ──
+
+    def test_the_split_is_inert_when_no_operator_port_is_configured(self):
+        # app.test_client() does not go through a socket, so SERVER_PORT is
+        # not meaningful. Assert a default-constructed app serves GET / and
+        # the API -- otherwise this task breaks every existing test.
+        app = server_mod.create_app(self.crypto, self.TOKEN, self.data_dir)
+        client = app.test_client()
+        page = client.get("/")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(b"<html", page.data.lower())
+        api = client.get("/api/agents", headers=self._auth())
+        self.assertEqual(api.status_code, 200)
+        # The catch-all takes POST on every path, so another method there is
+        # a 405 today -- and stays one, not the cover a split app answers.
+        self.assertEqual(client.get("/no/such/page").status_code, 405)
+
+    def test_refusal_on_the_agent_socket_is_indistinguishable_from_the_cover(self):
+        self._split()
+        # Must reuse _fake_response(), not a 403 that fingerprints the C2:
+        # an unrouted path and a wrong method included, which would
+        # otherwise answer 404 and 405.
+        cover = self._cover()
+        self.assertEqual(cover[0], 200)
+        for method, path in (("GET", "/"), ("GET", "/no/such/page"),
+                             ("GET", "/api/v1/beacon"), ("GET", "/logo.png"),
+                             ("GET", "/static/agent.js"),
+                             ("OPTIONS", "/"), ("DELETE", "/api/agents")):
+            with self.subTest(method=method, path=path):
+                self.assertEqual(_http(method, self.agent_port, path), cover)
+
+    # ── Where main() binds ──
+
+    def test_operator_socket_binds_loopback_by_default(self):
+        listeners, made = _main_listeners()
+        bound = sorted((c["host"], c["port"]) for c in listeners)
+        self.assertEqual(bound, [("0.0.0.0", 8443), ("127.0.0.1", 8444)])
+        self.assertEqual(made.get("operator_port"), 8444)
+        for c in listeners:
+            self.assertTrue(c.get("threaded"))
+            self.assertIs(c["app"], listeners[0]["app"], "one app, two sockets")
+
+    def test_agent_socket_binds_the_configured_interface(self):
+        listeners, made = _main_listeners("--host", "10.9.8.7", "--port", "9443",
+                                          "--operator-host", "127.0.0.2",
+                                          "--operator-port", "9444")
+        bound = sorted((c["host"], c["port"]) for c in listeners)
+        self.assertEqual(bound, [("10.9.8.7", 9443), ("127.0.0.2", 9444)])
+        self.assertEqual(made.get("operator_port"), 9444)
+
+    def test_one_socket_and_no_policy_when_the_ports_are_equal(self):
+        listeners, made = _main_listeners("--host", "0.0.0.0", "--port", "8443",
+                                          "--operator-port", "8443")
+        self.assertEqual([(c["host"], c["port"]) for c in listeners],
+                         [("0.0.0.0", 8443)])
+        self.assertIsNone(made.get("operator_port"))
 
 
 # New test classes belong above this guard; never append below it.
