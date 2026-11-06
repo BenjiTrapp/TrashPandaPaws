@@ -496,8 +496,20 @@ class TestLootWriteIsContained(unittest.TestCase):
         for sub, loot in self.SUBS:
             (self.data_dir / sub).mkdir(exist_ok=True)
             os.symlink(self.elsewhere, self.data_dir / sub / agent_id)
-            self._send_file(agent_id, loot)
+            resp = self._send_file(agent_id, loot)
+            self.assertEqual(self.crypto.unwrap(resp.get_json()),
+                             {"ack": True})
+        # Both halves: nothing landed behind the link, and nothing landed
+        # anywhere else either (a fallback directory, a flattened copy).
         self.assertEqual(list(self.elsewhere.iterdir()), [])
+        self._assert_nothing_written()
+        for sub, _loot in self.SUBS:
+            link = self.data_dir / sub / agent_id
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(os.listdir(link), [])
+            self.assertEqual(os.listdir(self.data_dir / sub), [agent_id])
+        self.assertEqual(sorted(os.listdir(self.data_dir)),
+                         ["downloads", "loot", "state.json"])
 
     def test_filename_with_separators_is_flattened(self):
         agent_id = self._register()
@@ -534,6 +546,33 @@ class TestLootWriteIsContained(unittest.TestCase):
             self.assertEqual(written[0].read_bytes(),
                              b"secret-" + sub.encode())
         self.assertEqual(len(self._written_files()), 2)
+
+    def test_undecodable_data_answers_the_same_for_known_and_unknown_agents(self):
+        # A registered id must not be distinguishable from an unregistered
+        # one by sending data that cannot be decoded.
+        known = self._register()
+        for garbage in ("A", "abcde", 12345, ["x"], {"k": "v"}):
+            for _sub, loot in self.SUBS:
+                responses = []
+                for agent_id in (known, "raccoon-never-registered"):
+                    resp = self._post({
+                        "action": "result", "task_id": "t1",
+                        "agent_id": agent_id, "status": "ok", "output": "",
+                        "data": {"data": garbage, "filename": "f.txt",
+                                 "loot": loot},
+                    })
+                    responses.append(resp)
+                with self.subTest(garbage=garbage, loot=loot):
+                    for resp in responses:
+                        self.assertEqual(resp.status_code, 200)
+                        self.assertEqual(self.crypto.unwrap(resp.get_json()),
+                                         {"ack": True})
+                        # the unkeyed catch-all body is the other shape
+                        self.assertNotEqual(resp.get_json(),
+                                            {"status": "ok",
+                                             "version": "2.1.0"})
+        self._assert_nothing_written()
+        self._assert_no_agent_directories()
 
     def test_a_rejected_write_answers_exactly_like_an_accepted_one(self):
         agent_id = self._register()
