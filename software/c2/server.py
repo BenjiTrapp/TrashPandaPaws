@@ -7752,7 +7752,8 @@ def main():
         help="Fixed operator token (default: random). Falls back to "
              "$RACCOON_TOKEN; the flag wins when both are set. Prefer the "
              "variable: the command line is visible to every user in ps. "
-             "Either way the token is kept in <data-dir>/operator-token.")
+             "Either way the token is kept in <data-dir>/operator-token, "
+             "and stays there after the server exits.")
     parser.add_argument(
         "--data-dir", default=str(Path.home() / ".raccoon-c2"),
         help="Data directory for state persistence",
@@ -7796,7 +7797,8 @@ def main():
         token_path = _write_operator_token(data_dir, operator_token)
     except OSError as exc:
         parser.error("cannot write the operator token to %s (%s)"
-                     % (data_dir / _TOKEN_FILE, exc.strerror))
+                     % (data_dir / _TOKEN_FILE,
+                        exc.strerror or type(exc).__name__))
 
     _load_state(data_dir)
     _setup_file_logging(data_dir)

@@ -27,6 +27,14 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $ScriptDir)
 $AgentPy = Join-Path $ScriptDir "test_add_agent.py"
 
+# A key or token typed at a prompt must not be left in the scrollback.
+function Read-Secret {
+    $secure = Read-Host -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+
 # -- Banner --
 Clear-Host
 Write-Host ""
@@ -79,7 +87,7 @@ if (-not $Key) {
     Write-Host "  Key " -ForegroundColor Yellow -NoNewline
     Write-Host "(base64)" -ForegroundColor DarkGray -NoNewline
     Write-Host ": " -ForegroundColor White -NoNewline
-    $Key = Read-Host
+    $Key = Read-Secret
 
     if (-not $Key) {
         Write-Host "  [x] " -ForegroundColor Red -NoNewline
@@ -122,5 +130,11 @@ if ($SSL) { $PyArgs += "--ssl" }
 
 # The key goes in the environment, not the arguments: a command line is
 # readable by other users.
-$env:RACCOON_KEY = $Key
-& $Python @PyArgs
+# The script runs in the operator's own session; put back whatever was there.
+$PriorKey = $env:RACCOON_KEY
+try {
+    $env:RACCOON_KEY = $Key
+    & $Python @PyArgs
+} finally {
+    if ($null -eq $PriorKey) { Remove-Item Env:RACCOON_KEY -ErrorAction SilentlyContinue } else { $env:RACCOON_KEY = $PriorKey }
+}

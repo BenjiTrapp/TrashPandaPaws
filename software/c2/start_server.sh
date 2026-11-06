@@ -241,7 +241,8 @@ print(base64.b64encode(k).decode())
         2)
             echo ""
             echo -ne "  ${Y}Key${N} ${D}(base64 AES-256-GCM, 32 bytes)${N}${W}: ${N}"
-            read -r INPUT
+            read -rs INPUT
+            echo ""
             if [[ -n "$INPUT" ]]; then
                 KEY="$INPUT"
                 KEY_ORIGIN="entered by hand"
@@ -256,7 +257,8 @@ print(base64.b64encode(k).decode())
 
     echo ""
     echo -ne "  ${C}Operator token${N} ${D}[random]${N}: "
-    read -r INPUT
+    read -rs INPUT
+    echo ""
     [[ -n "$INPUT" ]] && TOKEN="$INPUT"
 
     echo ""
@@ -391,5 +393,7 @@ if [[ -n "$AGENT_START" ]]; then
 fi
 
 # ── Launch ──
-# Only the server gets the key: the agent above never needed it.
+# The key is set for the server alone here. The agent above was started
+# earlier, from whatever environment the operator left; this launcher never
+# gave it the key.
 RACCOON_KEY="$KEY" RACCOON_TOKEN="$TOKEN" exec "${CMD[@]}"

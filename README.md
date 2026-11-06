@@ -581,7 +581,10 @@ back on one socket.
 **Signing in:** the page is served without the operator token and asks for it
 once. The `Token:` line of the startup banner names the file it is kept in,
 `operator-token` in the data directory (mode `0600`); the banner never prints
-the token itself. It is kept in that tab's `sessionStorage` and sent as an `Authorization` header, never in a
+the token itself. The file is rewritten at every start, whether the token was
+generated or supplied, and is not removed on exit: delete it if you do not want
+a copy left on disk. Once entered, the token is kept in that tab's
+`sessionStorage` and sent as an `Authorization` header, never in a
 URL, so it stays out of browser history, `Referer` headers and proxy logs.
 Closing the tab forgets it; a token the server rejects is forgotten at once and
 asked for again.

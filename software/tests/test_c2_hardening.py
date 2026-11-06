@@ -2060,34 +2060,50 @@ def _ran_main(env, *argv, data_dir=None, setup=None):
 
 
 _SECRET_FLAGS = r"(?:key|token|password|passwd|secret|api-key|apikey)"
+# Whatever may sit between a flag and its value: blanks and line breaks, a
+# shell backslash or a PowerShell backtick continuation.
+_GAP = r"""(?:\s|\\|`)*"""
 # A secret-bearing flag, then a variable: `--key "$K"`, `"--key" "$K"`,
-# `--key=$K`, and PowerShell's `"--key", $Key`. The flag must end where it
-# ends -- `--certkey` and `--key-file` name paths, not secrets -- and what
-# follows must be a `$`, so a usage line (`--key <b64>`), a case pattern
-# (`--key) KEY=...`) and a comment do not match.
+# `--key=$K`, PowerShell's `"--key", $Key`, and any of those with the value
+# on the next line. The flag must end where it ends -- `--certkey` and
+# `--key-file` name paths, not secrets -- and what follows must be a `$`, so
+# a usage line (`--key <b64>`), a case pattern (`--key) KEY=...`) and a
+# comment do not match.
 _SECRET_ARGUMENT = re.compile(
-    r"""(?<![\w-])--""" + _SECRET_FLAGS + r"""(?![\w-])["']?\s*[=,]?\s*["']?\$""")
+    r"""(?<![\w-])--""" + _SECRET_FLAGS + r"""(?![\w-])["']?""" + _GAP
+    + r"""[=,]?""" + _GAP + r"""["']?\$""")
 
 
-def _secret_arguments(text):
-    """(line number, line) for each line that hands a secret over as an
-    argument. Whole-line comments and PowerShell's `<# ... #>` block are
-    skipped; nothing else is, so an echo that merely mentions a flag next to
-    a variable would be reported -- and should be reworded."""
-    found = []
+def _without_comments(text):
+    """`text` with whole-line comments and PowerShell's `<# ... #>` block
+    blanked, so the line numbers that remain are still the file's."""
+    kept = []
     in_block = False
-    for number, line in enumerate(text.splitlines(), 1):
+    for line in text.splitlines():
         stripped = line.strip().lstrip("\ufeff")
         if stripped.startswith("<#"):
             in_block = True
         if in_block:
             in_block = "#>" not in stripped
-            continue
-        if stripped.startswith("#"):
-            continue
-        if _SECRET_ARGUMENT.search(line):
-            found.append((number, line.strip()))
-    return found
+            kept.append("")
+        elif stripped.startswith("#"):
+            kept.append("")
+        else:
+            kept.append(line)
+    return "\n".join(kept)
+
+
+def _secret_arguments(text):
+    """(line number, line) for each place that hands a secret over as an
+    argument. The whole text is searched, not line by line, so a flag and its
+    variable on separate lines are still one argument. Nothing but whole-line
+    comments is skipped: an echo that ends on a flag with a variable on the
+    next line would be reported -- and should be reworded."""
+    clean = _without_comments(text)
+    lines = clean.splitlines()
+    return [(clean.count("\n", 0, m.start()) + 1,
+             lines[clean.count("\n", 0, m.start())].strip())
+            for m in _SECRET_ARGUMENT.finditer(clean)]
 
 
 _C2_DIR = _REPO / "software" / "c2"
@@ -2307,6 +2323,45 @@ class TestSecretsStayOffTheCommandLine(unittest.TestCase):
         block = "<#\n.EXAMPLE\n    .\\x.ps1 --key $Key\n#>\nparam()\n"
         self.assertEqual(_secret_arguments(block), [])
 
+    def test_the_scan_follows_a_flag_onto_the_next_line(self):
+        split = [
+            'CMD+=(--key\n    "$KEY")',
+            'CMD+=("--token"\n     "$TOKEN")',
+            'CMD=(python3 server.py \\\n    --token \\\n    "$TOKEN")',
+            '$PyArgs = @($ServerPy,\n    "--key",\n    $Key)',
+            '$PyArgs = @($ServerPy, "--key" `\n    , $Key)',
+            'CMD+=(--key\n    # held back for later\n    "$KEY")',
+        ]
+        for text in split:
+            with self.subTest(split=text):
+                found = _secret_arguments(text)
+                self.assertEqual(len(found), 1)
+                self.assertIn("--", found[0][1], "reported on the flag's line")
+        # The report names the flag's line, not the value's.
+        self.assertEqual(_secret_arguments("a\nb\nCMD+=(--key\n\"$K\")")[0][0], 3)
+
+    def test_the_wider_scan_still_ignores_what_is_not_a_secret_argument(self):
+        quiet = [
+            '--key)        KEY="$2"; KEY_ORIGIN="passed with --key"; shift 2;;',
+            '--token)      TOKEN="$2"; shift 2;;',
+            'echo "Usage: $0 [--key <b64>] [--token <str>] [--certkey <file>]"',
+            'echo -e "  ${D}Pass --key <base64>, or run interactively${N}"',
+            "# CMD+=(--key \"$KEY\")  is what this used to be",
+            "    # --token $TOKEN",
+            '[[ -n "$CERTKEY" ]]    && CMD+=("--certkey" "$CERTKEY")',
+            'CMD+=("--key-file" "$KEYFILE")',
+            'CMD+=("--cert" "$CERT")',
+            'parser.add_argument("--token", help="Fixed operator token")',
+            'echo "  --key wins over RACCOON_KEY"',
+        ]
+        for line in quiet:
+            with self.subTest(quiet=line):
+                self.assertEqual(_secret_arguments(line), [])
+        # Joined, as the whole-text search sees a file: neighbouring lines
+        # must not combine into a finding.
+        self.assertEqual(_secret_arguments("\n".join(quiet)), [])
+        self.assertEqual(_secret_arguments("\n".join(quiet * 2)), [])
+
     # ── Nothing prints a whole secret ──
 
     def _echo_lines(self, text):
@@ -2343,6 +2398,63 @@ class TestSecretsStayOffTheCommandLine(unittest.TestCase):
                 for line in self._echo_lines(text):
                     self.assertNotRegex(line, token, line)
 
+    # ── Typing a secret does not show it ──
+
+    @staticmethod
+    def _prompts_before_reads(text, reader, shell=False):
+        """(prompt text, reading line) for each line that reads input.
+
+        The prompt is the line above it in a shell script; in PowerShell it
+        is the run of Write-Host lines above, back to the last blank one.
+        """
+        lines = text.splitlines()
+        found = []
+        for i, line in enumerate(lines):
+            if not re.search(reader, line):
+                continue
+            prompt = []
+            for before in reversed(lines[:i]):
+                if not before.strip():
+                    continue
+                if shell:
+                    prompt.append(before)
+                    break
+                if before.strip() == 'Write-Host ""' or "Write-Host" not in before:
+                    break
+                prompt.append(before)
+            found.append((" ".join(prompt), line.strip()))
+        return found
+
+    def test_a_typed_key_or_token_is_not_echoed_by_the_shell_launchers(self):
+        for name in ("start_server.sh", "test_add_agent.sh"):
+            text = (_C2_DIR / name).read_text(encoding="utf-8")
+            reads = self._prompts_before_reads(text, r"^\s*read\b", shell=True)
+            secret = [(p, r) for p, r in reads
+                      if re.search(r"(?i)\bkey\b|operator token", p)]
+            with self.subTest(file=name):
+                self.assertTrue(secret, "found no key or token prompt")
+                for prompt, read in secret:
+                    self.assertRegex(read, r"read\s+-\w*s\w*\s",
+                                     "reads a secret with the terminal echoing it")
+                # Silent reading leaves the cursor on the prompt's line.
+                for number, line in enumerate(text.splitlines()):
+                    if any(line.strip() == r for _, r in secret):
+                        self.assertIn("echo", text.splitlines()[number + 1], line)
+
+    def test_a_typed_key_or_token_is_not_echoed_by_the_powershell_launchers(self):
+        for name in ("start_server.ps1", "test_add_agent.ps1"):
+            text = (_C2_DIR / name).read_text(encoding="utf-8")
+            reads = self._prompts_before_reads(text, r"Read-(Host|Secret)")
+            secret = [(p, r) for p, r in reads
+                      if re.search(r"(?i)\bkey\b|operator token", p)]
+            with self.subTest(file=name):
+                self.assertTrue(secret, "found no key or token prompt")
+                for prompt, read in secret:
+                    self.assertIn("Read-Secret", read)
+                self.assertRegex(text, r"function Read-Secret")
+                self.assertIn("-AsSecureString", text)
+                self.assertIn("ZeroFreeBSTR", text)
+
     # ── What replaces the arguments ──
 
     def test_the_container_entrypoint_does_not_convert_the_environment_to_argv(self):
@@ -2366,6 +2478,54 @@ class TestSecretsStayOffTheCommandLine(unittest.TestCase):
         self.assertIn("--data-dir", text)
         self.assertLess(text.index("$env:RACCOON_KEY = $Key"),
                         text.index("& $Python @PyArgs"))
+
+    def test_the_powershell_launchers_put_back_the_environment_they_found(self):
+        # A script run as .\\x.ps1 shares the operator's session, so what it
+        # sets would otherwise outlive the server and be reused, unannounced,
+        # by the next run's RACCOON_KEY fallback.
+        for name, names in (("start_server.ps1", ("RACCOON_KEY", "RACCOON_TOKEN")),
+                            ("test_add_agent.ps1", ("RACCOON_KEY",))):
+            text = (_C2_DIR / name).read_text(encoding="utf-8")
+            launch = text.index("& $Python @PyArgs")
+            tail = text[text.rindex("# -- Launch --"):]
+            with self.subTest(file=name):
+                self.assertIn("try {", tail)
+                self.assertIn("finally {", tail)
+                for var in names:
+                    prior = "$Prior" + var[len("RACCOON_"):].capitalize()
+                    saved = text.index("%s = $env:%s" % (prior, var))
+                    set_ = text.index("$env:%s = " % var, saved)
+                    self.assertLess(saved, set_)
+                    self.assertLess(set_, launch)
+                    restore = text[text.index("finally {", launch):]
+                    self.assertIn("Remove-Item Env:" + var, restore)
+                    self.assertIn("$env:%s = %s" % (var, prior), restore)
+
+    def test_the_shell_launcher_does_not_claim_more_than_it_does(self):
+        # The agent is started earlier from the same environment the
+        # operator left, so "only the server gets the key" would be untrue
+        # if they had exported RACCOON_KEY themselves.
+        text = (_C2_DIR / "start_server.sh").read_text(encoding="utf-8")
+        self.assertNotIn("Only the server gets the key", text)
+        self.assertNotIn("the agent above never needed it", text)
+
+    def test_a_write_failure_with_no_reason_does_not_print_none(self):
+        with patch.object(server_mod, "_write_operator_token",
+                          side_effect=OSError()):
+            with _ran_main({"RACCOON_KEY": self.KEY,
+                            "RACCOON_TOKEN": self.TOKEN}) as ran:
+                self.assertIsInstance(ran["code"], int)
+                self.assertNotEqual(ran["code"], 0)
+                self.assertNotIn("None", ran["err"])
+                self.assertIn(server_mod._TOKEN_FILE, ran["err"])
+
+    def test_the_readme_says_the_token_file_stays_after_exit(self):
+        text = " ".join((_REPO / "README.md").read_text(encoding="utf-8").split())
+        signing_in = text[text.index("**Signing in:**"):]
+        signing_in = signing_in[:signing_in.index("**GUI Features:**")]
+        self.assertIn("operator-token", signing_in)
+        self.assertIn("not removed on exit", signing_in)
+        self.assertIn("whether the token was generated or supplied", signing_in)
 
     def test_the_launchers_and_the_server_agree_on_the_data_directory(self):
         sh = (_C2_DIR / "start_server.sh").read_text(encoding="utf-8")

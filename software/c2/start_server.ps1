@@ -34,6 +34,14 @@ param(
 $ErrorActionPreference = "Continue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ServerPy = Join-Path $ScriptDir "server.py"
+
+# A key or token typed at a prompt must not be left in the scrollback.
+function Read-Secret {
+    $secure = Read-Host -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
 # The data directory the server is given; it keeps the operator token in
 # operator-token there and this launcher names the path.
 $DataDir = Join-Path $env:USERPROFILE ".raccoon-c2"
@@ -269,7 +277,7 @@ if (-not $NoPrompt -and -not $Key) {
             Write-Host "  Key " -ForegroundColor Yellow -NoNewline
             Write-Host "(base64 AES-256-GCM, 32 bytes)" -ForegroundColor DarkGray -NoNewline
             Write-Host ": " -ForegroundColor White -NoNewline
-            $Input_ = Read-Host
+            $Input_ = Read-Secret
             if ($Input_) {
                 $Key = $Input_
                 $KeyOrigin = "entered by hand"
@@ -288,7 +296,7 @@ if (-not $NoPrompt -and -not $Key) {
     Write-Host "  Operator token " -ForegroundColor Cyan -NoNewline
     Write-Host "[random]" -ForegroundColor DarkGray -NoNewline
     Write-Host ": " -ForegroundColor White -NoNewline
-    $Input_ = Read-Host
+    $Input_ = Read-Secret
     if ($Input_) { $Token = $Input_ }
 
     Write-Host ""
@@ -387,6 +395,16 @@ if ($Cert)     { $PyArgs += "--cert", $Cert }
 if ($CertKey)  { $PyArgs += "--certkey", $CertKey }
 
 # -- Launch --
-$env:RACCOON_KEY = $Key
-$env:RACCOON_TOKEN = $Token
-& $Python @PyArgs
+# The script runs in the operator's own session, so what it sets would outlive
+# the server and be picked up again, unannounced, by the next run. Put back
+# whatever was there, including a value the operator set on purpose.
+$PriorKey = $env:RACCOON_KEY
+$PriorToken = $env:RACCOON_TOKEN
+try {
+    $env:RACCOON_KEY = $Key
+    $env:RACCOON_TOKEN = $Token
+    & $Python @PyArgs
+} finally {
+    if ($null -eq $PriorKey) { Remove-Item Env:RACCOON_KEY -ErrorAction SilentlyContinue } else { $env:RACCOON_KEY = $PriorKey }
+    if ($null -eq $PriorToken) { Remove-Item Env:RACCOON_TOKEN -ErrorAction SilentlyContinue } else { $env:RACCOON_TOKEN = $PriorToken }
+}

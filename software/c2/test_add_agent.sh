@@ -81,7 +81,8 @@ if [[ -z "$KEY" ]]; then
     echo -e "  ${D}This must match the key the server was started with.${N}"
     echo ""
     echo -ne "  ${Y}Key${N} ${D}(base64)${N}${W}: ${N}"
-    read -r KEY
+    read -rs KEY
+    echo ""
 
     if [[ -z "$KEY" ]]; then
         echo -e "  ${R}[✗]${N} ${W}A key is required; there is no default.${N}"
