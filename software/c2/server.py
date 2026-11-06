@@ -1897,6 +1897,18 @@ def _fake_response():
     return jsonify({"status": "ok", "version": "2.1.0"}), 200
 
 
+def _as_int(value, default: int) -> int:
+    """An agent-reported number as an int, or ``default`` if it is not one.
+
+    Agents are not a trusted source of text: a string here would otherwise be
+    rendered into the operator page and break the arithmetic in /api/agents.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _handle_register(payload: dict, crypto: ServerCrypto):
     implant_id = payload.get("id", "")
 
@@ -1907,8 +1919,8 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
                 "os": payload.get("os", ""),
                 "arch": payload.get("arch", ""),
                 "user": payload.get("user", ""),
-                "pid": payload.get("pid", 0),
-                "interval": payload.get("interval", 300),
+                "pid": _as_int(payload.get("pid"), 0),
+                "interval": _as_int(payload.get("interval"), 300),
                 "local_ips": payload.get("local_ips", []),
                 "caps": _clean_caps(payload),
                 "uplink_iface": payload.get("uplink_iface"),
@@ -1931,8 +1943,8 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
         "os": payload.get("os", ""),
         "arch": payload.get("arch", ""),
         "user": payload.get("user", ""),
-        "pid": payload.get("pid", 0),
-        "interval": payload.get("interval", 300),
+        "pid": _as_int(payload.get("pid"), 0),
+        "interval": _as_int(payload.get("interval"), 300),
         "local_ips": payload.get("local_ips", []),
         "proxy_mode": payload.get("proxy_mode", ""),
         "proxy_active": payload.get("proxy_active", ""),
@@ -2009,8 +2021,8 @@ def _handle_beacon(payload: dict, crypto: ServerCrypto):
         agents[agent_id]["last_seen"] = _now()
         agents[agent_id]["_last_seen_ts"] = time.time()
         agents[agent_id]["uptime"] = payload.get("uptime", 0)
-        agents[agent_id]["interval"] = payload.get("interval",
-                                                    agents[agent_id].get("interval", 300))
+        agents[agent_id]["interval"] = _as_int(
+            payload.get("interval"), agents[agent_id].get("interval", 300))
         if payload.get("local_ips"):
             agents[agent_id]["local_ips"] = payload["local_ips"]
         if payload.get("proxy_mode"):
@@ -3185,7 +3197,7 @@ async function renderAgentView(id){
       <span class="agent-name">${esc(id)}</span>
       <span class="tag">${esc(info.arch||'?')}</span>
       <span class="tag">${esc(info.os||'?')}</span>
-      <span class="detail">${esc(info.user||'?')}@${esc(info.hostname||'?')} · PID ${info.pid||'?'} · up ${formatUptime(info.uptime||0)}</span>
+      <span class="detail">${esc(info.user||'?')}@${esc(info.hostname||'?')} · PID ${esc(info.pid||'?')} · up ${formatUptime(info.uptime||0)}</span>
       ${info.proxy_active ? '<span class="tag" style="background:#1a6e1a">PROXY: '+esc(info.proxy_active)+'</span>' : ''}
       ${info.c2_profile && info.c2_profile.active ? '<span class="tag" style="background:#4a1a6e;cursor:pointer" onclick="showBeaconConfig()" title="Click for details">&#128737; C2 Profile</span>' : '<span class="tag" style="background:#333;opacity:0.5">No C2 Profile</span>'}
     </div>
@@ -3322,7 +3334,7 @@ async function pollHistory(id){
 
 function esc(s){
   if(s==null) return "";
-  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
 }
 
 function timeSince(iso){
@@ -3498,7 +3510,7 @@ async function pollProcsResult(procsCmd){
   if(!body) return;
   if(last.status!=="ok"){ body.innerHTML='<div class="t-error">'+esc(last.output||"(error)")+'</div>'; return; }
   const info = await api("/api/agents/"+selectedAgent);
-  const pid = info && info.pid ? String(info.pid) : null;
+  const pid = info && Number.isInteger(info.pid) && info.pid > 0 ? String(info.pid) : null;
   const lines = (last.output||"").split("\n");
 
   const detectedTools = new Map();
@@ -6068,7 +6080,7 @@ async function showBeaconConfig(){
       <div class="t-info" style="margin-bottom:12px">&#9881; Sleep / Jitter</div>
       <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px">
         <label style="color:var(--text2);font-size:12px;width:70px">Interval</label>
-        <input id="cfg-interval" type="number" min="1" max="86400" value="${curInterval}"
+        <input id="cfg-interval" type="number" min="1" max="86400" value="${esc(curInterval)}"
           style="width:80px;background:rgba(0,0,0,0.5);border:1px solid var(--border);border-radius:4px;padding:6px 10px;color:var(--text);font-family:var(--mono);font-size:13px">
         <span style="color:var(--text2);font-size:12px">seconds</span>
       </div>
@@ -6130,7 +6142,7 @@ async function showBeaconConfig(){
   if(ap){
     const prof = info.c2_profile;
     if(prof && prof.active){
-      const tbl = (label, val) => '<div style="display:flex;gap:6px;padding:2px 0;font-size:11px"><span style="color:var(--text2);min-width:90px">'+label+'</span><span style="color:var(--text);word-break:break-all">'+esc(String(val))+'</span></div>';
+      const tbl = (label, val) => '<div style="display:flex;gap:6px;padding:2px 0;font-size:11px"><span style="color:var(--text2);min-width:90px">'+esc(label)+'</span><span style="color:var(--text);word-break:break-all">'+esc(String(val))+'</span></div>';
       const tagList = (items, color) => items.map(i => '<span style="display:inline-block;font-size:9px;padding:1px 6px;border-radius:3px;background:rgba('+color+',0.12);color:rgba('+color+',1);margin:1px 2px">'+esc(i)+'</span>').join("");
       let html = '<div style="background:rgba(197,134,192,0.06);border:1px solid rgba(197,134,192,0.2);border-radius:6px;padding:10px 12px">';
       html += '<div style="font-size:11px;font-weight:600;color:#c586c0;margin-bottom:6px">&#10004; Agent Profile Active</div>';
@@ -6175,7 +6187,7 @@ async function showBeaconConfig(){
   // Show last raw HTTP request from this beacon (proof that profile is applied)
   const lr = info._last_request;
   if(lr && ap){
-    const tbl = (label, val) => '<div style="display:flex;gap:6px;padding:2px 0;font-size:11px"><span style="color:var(--text2);min-width:90px">'+label+'</span><span style="color:var(--text);word-break:break-all;font-family:monospace">'+esc(String(val))+'</span></div>';
+    const tbl = (label, val) => '<div style="display:flex;gap:6px;padding:2px 0;font-size:11px"><span style="color:var(--text2);min-width:90px">'+esc(label)+'</span><span style="color:var(--text);word-break:break-all;font-family:monospace">'+esc(String(val))+'</span></div>';
     let rhtml = '<div style="background:rgba(86,156,198,0.06);border:1px solid rgba(86,156,198,0.2);border-radius:6px;padding:10px 12px;margin-top:10px">';
     rhtml += '<div style="font-size:11px;font-weight:600;color:#569cd6;margin-bottom:6px">&#128225; Last Beacon HTTP Request</div>';
     rhtml += tbl("Path", lr.path);

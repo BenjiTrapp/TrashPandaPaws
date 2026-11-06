@@ -9,9 +9,14 @@ import json
 import socket
 import struct
 import unittest
+import re
+import shutil
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from software.c2 import beacon as beacon_mod
+from software.c2 import server as server_mod
 from software.c2.beacon import Beacon
 
 
@@ -182,6 +187,143 @@ class TestAeadIsNotOptional(unittest.TestCase):
         quic = _quic_beacon()
         self._enter(self._quic_returning(quic, quic._encrypt(genuine).encode()))
         self.assertEqual(quic._beacon_quic(), genuine)
+
+
+class TestGuiEscaping(unittest.TestCase):
+    """Agent-reported values must be escaped before they reach the DOM.
+
+    The operator interface is a Python string and the project has no
+    JavaScript runner, so the DOM-side checks locate one specific construct
+    in that string and assert on it. The coercion checks go through the real
+    beacon route.
+    """
+
+    TOKEN = "test-operator-token"
+
+    @staticmethod
+    def _line_with(needle, source=None):
+        source = server_mod._OPERATOR_HTML if source is None else source
+        lines = [ln for ln in source.splitlines() if needle in ln]
+        assert len(lines) == 1, "%r matched %d lines" % (needle, len(lines))
+        return lines[0]
+
+    def setUp(self):
+        server_mod.agents.clear()
+        server_mod.task_queues.clear()
+        server_mod.history.clear()
+        self.addCleanup(server_mod.agents.clear)
+        self.addCleanup(server_mod.task_queues.clear)
+        self.addCleanup(server_mod.history.clear)
+
+    def test_esc_escapes_single_quote(self):
+        html = server_mod._OPERATOR_HTML
+        body = re.search(r"function esc\(s\)\{(.*?)\n\}", html, re.S).group(1)
+        replacements = re.findall(r'\.replace\(/(.)/g,"([^"]*)"\)', body)
+        self.assertEqual(replacements, [
+            ("&", "&amp;"),
+            ("<", "&lt;"),
+            (">", "&gt;"),
+            ('"', "&quot;"),
+            ("'", "&#39;"),
+        ])
+
+    def test_agent_reported_pid_is_escaped(self):
+        line = self._line_with("PID ${")
+        self.assertIn("PID ${esc(info.pid", line)
+        self.assertNotIn("${info.pid", line)
+
+    def test_beacon_config_interval_is_escaped(self):
+        line = self._line_with('id="cfg-interval"')
+        self.assertIn('value="${esc(curInterval)}"', line)
+        self.assertNotIn('value="${curInterval}"', line)
+
+    def _tbl_definitions_after(self, marker):
+        html = server_mod._OPERATOR_HTML
+        tail = html[html.index(marker):]
+        return [ln for ln in tail.splitlines()
+                if ln.lstrip().startswith("const tbl = (label, val)")]
+
+    def test_last_request_header_names_are_escaped(self):
+        # The header name is the `k` of Object.entries(lr.headers), handed to
+        # the tbl helper defined in the _last_request block as its label.
+        tbl = self._tbl_definitions_after("const lr = info._last_request;")[0]
+        self.assertIn("+esc(label)+", tbl)
+        self.assertNotIn("+label+", tbl)
+        self.assertIn("rhtml += tbl(k, v);", server_mod._OPERATOR_HTML)
+
+    def test_beacon_profile_table_labels_are_escaped(self):
+        tbl = self._tbl_definitions_after(
+            'const prof = info.c2_profile;')[0]
+        self.assertIn("+esc(label)+", tbl)
+        self.assertNotIn("+label+", tbl)
+
+    def test_process_id_regexp_only_accepts_an_integer(self):
+        self._line_with('new RegExp("(^|\\\\s)"+pid')
+        assign = self._line_with("const pid = info")
+        self.assertIn("Number.isInteger(info.pid)", assign)
+
+    def _post(self, client, crypto, payload):
+        return client.post("/api/v1/beacon",
+                           data=json.dumps(crypto.wrap(payload)),
+                           content_type="application/json")
+
+    def _app(self):
+        crypto = server_mod.ServerCrypto(b"k" * 32)
+        data_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, data_dir, True)
+        app = server_mod.create_app(crypto, self.TOKEN, data_dir)
+        app.config["TESTING"] = True
+        return app.test_client(), crypto
+
+    def _list_agents(self, client):
+        return client.get("/api/agents",
+                          headers={"Authorization": "Bearer " + self.TOKEN})
+
+    def _register(self, client, crypto, **fields):
+        payload = {"action": "register", "id": "implant-1",
+                   "hostname": "h", "user": "u"}
+        payload.update(fields)
+        self._post(client, crypto, payload)
+        self.assertEqual(len(server_mod.agents), 1)
+        return next(iter(server_mod.agents.values()))
+
+    def test_pid_from_a_beacon_is_coerced_to_int(self):
+        client, crypto = self._app()
+        hostile = "<img src=x onerror=alert(1)>"
+        agent = self._register(client, crypto, pid=hostile)
+        self.assertEqual(agent["pid"], 0)
+        self.assertIsInstance(agent["pid"], int)
+
+        self._post(client, crypto, {"action": "register", "id": "implant-1",
+                                    "pid": hostile})
+        self.assertEqual(agent["pid"], 0)
+
+        self._post(client, crypto, {"action": "register", "id": "implant-1",
+                                    "pid": "4242"})
+        self.assertEqual(agent["pid"], 4242)
+
+    def test_interval_from_a_beacon_is_coerced_to_int(self):
+        client, crypto = self._app()
+        agent = self._register(client, crypto, interval="soon")
+        self.assertEqual(agent["interval"], 300)
+        self.assertIsInstance(agent["interval"], int)
+        self.assertEqual(self._list_agents(client).status_code, 200)
+
+        agent["interval"] = 30
+        self._post(client, crypto, {"action": "register", "id": "implant-1",
+                                    "interval": "soon"})
+        self.assertEqual(agent["interval"], 300)
+        self.assertEqual(self._list_agents(client).status_code, 200)
+
+    def test_interval_on_a_beacon_checkin_is_coerced_and_route_survives(self):
+        client, crypto = self._app()
+        agent = self._register(client, crypto, interval=30)
+        self._post(client, crypto, {"action": "beacon",
+                                    "agent_id": agent["agent_id"],
+                                    "interval": "<b>x</b>"})
+        self.assertEqual(agent["interval"], 30)
+        self.assertIsInstance(agent["interval"], int)
+        self.assertEqual(self._list_agents(client).status_code, 200)
 
 
 # New test classes belong above this guard; never append below it.
