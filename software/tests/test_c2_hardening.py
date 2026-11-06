@@ -6,12 +6,12 @@ team server.
 
 import base64
 import json
-import socket
-import struct
-import unittest
 import re
 import shutil
+import socket
+import struct
 import tempfile
+import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -314,6 +314,55 @@ class TestGuiEscaping(unittest.TestCase):
                                     "interval": "soon"})
         self.assertEqual(agent["interval"], 300)
         self.assertEqual(self._list_agents(client).status_code, 200)
+
+    def test_uptime_from_a_beacon_is_coerced_to_int(self):
+        client, crypto = self._app()
+        hostile = "<img src=x onerror=alert(1)>"
+        agent = self._register(client, crypto, uptime=hostile)
+        self.assertEqual(agent["uptime"], 0)
+        self.assertIsInstance(agent["uptime"], int)
+        self.assertEqual(self._list_agents(client).status_code, 200)
+
+        for hostile_uptime in (hostile, [5], {"a": 1}, " 5 x"):
+            self._post(client, crypto, {"action": "beacon",
+                                        "agent_id": agent["agent_id"],
+                                        "uptime": hostile_uptime})
+            self.assertEqual(agent["uptime"], 0)
+            self.assertIsInstance(agent["uptime"], int)
+        self.assertEqual(self._list_agents(client).status_code, 200)
+
+        self._post(client, crypto, {"action": "beacon",
+                                    "agent_id": agent["agent_id"],
+                                    "uptime": 3600})
+        self.assertEqual(agent["uptime"], 3600)
+
+    def test_as_int_pins_how_agent_numbers_are_read(self):
+        D = -1  # a default no input below can produce by accident
+        cases = [
+            # ints and numeric strings
+            (7, 7), ("7", 7), (" 7 ", 7),
+            # a float and its string form behave the same: truncated
+            (5.7, 5), ("5.7", 5), (-5.7, -5), ("-5.7", -5), ("1e3", 1000),
+            # range is deliberately not validated: zero and negatives are
+            # stored as reported
+            (0, 0), (-3, -3), ("-3", -3),
+            # a bool is not a number an agent would report
+            (True, D), (False, D),
+            # not finite
+            (float("nan"), D), (float("inf"), D), (float("-inf"), D),
+            ("nan", D), ("inf", D), ("1e999", D),
+            # not numbers
+            (None, D), ("", D), ("soon", D), ("0x10", D),
+            ("<img src=x onerror=alert(1)>", D),
+            ([5], D), ({"a": 5}, D),
+        ]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(server_mod._as_int(value, D), expected)
+                self.assertIs(type(server_mod._as_int(value, D)), int)
+
+        # the default is returned as given, not itself coerced
+        self.assertEqual(server_mod._as_int(None, 300), 300)
 
     def test_interval_on_a_beacon_checkin_is_coerced_and_route_survives(self):
         client, crypto = self._app()

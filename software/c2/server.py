@@ -1902,11 +1902,23 @@ def _as_int(value, default: int) -> int:
 
     Agents are not a trusted source of text: a string here would otherwise be
     rendered into the operator page and break the arithmetic in /api/agents.
+    Accepts ints, floats and numeric strings alike (a float and its string
+    form must not behave differently), truncating toward zero. Booleans,
+    NaN, infinities and anything non-numeric give ``default``. The range is
+    not checked: negative and zero values are stored as reported.
     """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return default
     try:
         return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
+    except (ValueError, OverflowError):
+        pass
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except (ValueError, OverflowError):
+            pass
+    return default
 
 
 def _handle_register(payload: dict, crypto: ServerCrypto):
@@ -1948,7 +1960,7 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
         "local_ips": payload.get("local_ips", []),
         "proxy_mode": payload.get("proxy_mode", ""),
         "proxy_active": payload.get("proxy_active", ""),
-        "uptime": payload.get("uptime", 0),
+        "uptime": _as_int(payload.get("uptime"), 0),
         "caps": _clean_caps(payload),
         "uplink_iface": payload.get("uplink_iface"),
         "registered": _now(),
@@ -2020,7 +2032,7 @@ def _handle_beacon(payload: dict, crypto: ServerCrypto):
     if agent_id and agent_id in agents:
         agents[agent_id]["last_seen"] = _now()
         agents[agent_id]["_last_seen_ts"] = time.time()
-        agents[agent_id]["uptime"] = payload.get("uptime", 0)
+        agents[agent_id]["uptime"] = _as_int(payload.get("uptime"), 0)
         agents[agent_id]["interval"] = _as_int(
             payload.get("interval"), agents[agent_id].get("interval", 300))
         if payload.get("local_ips"):
