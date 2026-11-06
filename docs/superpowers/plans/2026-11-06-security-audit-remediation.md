@@ -312,7 +312,7 @@ The structural half of finding C1, plus the operator's choice (c). Verified empi
 The discriminator cannot be the path: `beacon_handler` is registered as `POST /` and `POST /<path:path>`, i.e. the catch-all, deliberately, so the C2 profile can send beacons to arbitrary paths. The socket is therefore the only reliable split.
 
 **Files:**
-- Modify: `software/c2/server.py` — `create_app` (`:279`) gains the policy hook; `main()` (`:7495`-end) gains `--beacon-host`/`--beacon-port` and replaces `app.run()` with two `make_server` threads
+- Modify: `software/c2/server.py` — `create_app` (`:279`) gains the policy hook; `main()` (`:7495`-end) gains `--operator-host`/`--operator-port` and replaces `app.run()` with two `make_server` threads
 - Modify: `software/c2/start_server.sh:21` (`HOST` default), and the usage line at `:43`
 - Modify: `software/c2/docker-compose.yml:12-13`
 - Modify: `tools/demo_env.py` — expose both sockets
@@ -321,7 +321,7 @@ The discriminator cannot be the path: `beacon_handler` is registered as `POST /`
 
 **Interfaces:**
 - Consumes: `random_key()` from Task 5.
-- Produces: `create_app(crypto, operator_token, data_dir, server_config=None, beacon_port=None)` — when `beacon_port` is `None` the hook is inert and the app behaves exactly as today. `DemoEnv` gains a `beacon_port` attribute; Task 7's storyboards use `DemoEnv`.
+- Produces: `create_app(crypto, operator_token, data_dir, server_config=None, operator_port=None)` — when `operator_port` is `None` the hook is inert and the app behaves exactly as today. `DemoEnv` keeps a `beacon_port` attribute and its operator socket is `operator_port`; Task 7's storyboards use `DemoEnv`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -334,7 +334,7 @@ def test_beacon_socket_serves_a_beacon_checkin(self):
 def test_operator_socket_serves_the_page_and_the_api(self):
 def test_operator_socket_still_serves_a_beacon_checkin(self):
     # Local beacons in the demo reach the operator socket; that stays.
-def test_the_split_is_inert_when_no_beacon_port_is_configured(self):
+def test_the_split_is_inert_when_no_operator_port_is_configured(self):
     # app.test_client() does not go through a socket, so SERVER_PORT is
     # not meaningful. Assert a default-constructed app serves GET / --
     # otherwise this task breaks every existing test.
@@ -353,9 +353,9 @@ Expected: the beacon-socket tests FAIL; `test_the_split_is_inert_...` PASSES alr
 
 - [ ] **Step 3: Add the hook and the second listener**
 
-A `before_request` in `create_app` that returns `_fake_response()` unless the request is either on the operator socket or handled by `beacon_handler`. Decide by comparing `request.environ.get("SERVER_PORT")` to `beacon_port`; when `beacon_port` is `None`, return nothing and let everything through. Put the reasoning in a comment: why the socket and not the path, and what `None` means.
+A `before_request` in `create_app` that returns `_fake_response()` unless the request is either on the operator socket or handled by `beacon_handler`. Decide by comparing `request.environ.get("SERVER_PORT")` to `operator_port`; when `operator_port` is `None`, register no hook at all and the app behaves exactly as today. Put the reasoning in a comment: why the socket and not the path, and what `None` means.
 
-`main()` builds the app once and starts two `make_server` threads, each `threaded=True`; the operator socket defaults to `127.0.0.1`, the beacon socket to `args.host`. The banner prints both, and says plainly that the GUI is loopback-only and names the SSH-tunnel command. Keep a single-socket mode: if `--beacon-port` equals `--port`, run one listener and leave the hook inert, so nothing that exists today breaks.
+`main()` builds the app once and starts two `make_server` threads, each `threaded=True`; the operator socket defaults to `127.0.0.1`, the beacon socket to `args.host`. The banner prints both, and says plainly that the GUI is loopback-only and names the SSH-tunnel command. Keep a single-socket mode: if `--operator-port` equals `--port`, run one listener and leave the hook inert, so nothing that exists today breaks.
 
 - [ ] **Step 4: Run the suite**
 
@@ -480,7 +480,7 @@ The operator asked whether a redirector can sit in front of the team server, nam
 - Test: `software/tests/test_docs.py`
 
 **Interfaces:**
-- Consumes: Task 6's `--beacon-port`, whose name the config examples must match.
+- Consumes: Task 6's `--port` (the beacon socket, default 8443) and `--operator-port` (the interface, default 8444, loopback). The config examples must point at the beacon socket only.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -488,8 +488,9 @@ In `test_docs.py`:
 
 ```python
 def test_redirector_doc_exists_and_is_linked_from_the_readme(self):
-def test_redirector_config_names_the_beacon_port_flag(self):
-    # Drift guard: the example must use the flag Task 6 actually added.
+def test_redirector_config_points_at_the_beacon_socket(self):
+    # Drift guard: the example must name the beacon socket's port and
+    # must not reach the operator interface.
 def test_redirector_config_does_not_proxy_the_operator_routes(self):
 def test_known_limits_records_the_unfixed_audit_findings(self):
 ```
@@ -513,10 +514,10 @@ Expected: all green.
 
 **Spec coverage.** The six accepted points map to Tasks 1 (C4), 5 (C2+C3), 7 (C1 credential), 3 (C5), 4 (C6), 2 (H1–H3). Task 6 carries the structural half of C1 and the operator's choice (c). Task 8 adds H8, flagged as beyond the six. Task 9 answers the redirector question and records the rest. The audit's remaining findings are deliberately **not** fixed here; Task 9 makes that explicit rather than silent.
 
-**Type consistency.** `create_app` gains one keyword argument, `beacon_port`, defaulting to `None`, and `None` means inert — used identically in Tasks 6 and 7. `random_key()`/`key_b64()` are introduced in Task 5 and consumed in Tasks 6 and 7. The `sessionStorage` key is `raccoon_token` in Task 7's code, its tests, and both storyboards. `--beacon-port` is the flag name in Task 6 and in Task 9's config examples, with a drift test.
+**Type consistency.** `create_app` gains one keyword argument, `operator_port`, defaulting to `None`, and `None` means inert — used identically in Tasks 6 and 7. `random_key()`/`key_b64()` are introduced in Task 5 and consumed in Tasks 6 and 7. The `sessionStorage` key is `raccoon_token` in Task 7's code, its tests, and both storyboards. Task 6 keeps `--port` for the beacon socket and adds `--operator-port` for the interface; Task 9's config examples name the beacon socket, with a drift test.
 
 **Proportion.** Nine tasks over roughly the length of the findings document, with test names and assertions rather than bodies. The one empirical claim the architecture rests on — two listeners, distinct `SERVER_PORT` — was measured before planning, not assumed.
 
 **Ordering risk.** Tasks 1–4 are independent and touch no shared fixture. Task 5 changes key provisioning in four test modules; Tasks 6 and 7 change how the GUI is reached, which the capture tooling depends on. Hence the whole-suite gate on 5, 6 and 7 rather than a per-module run.
 
-**Residual risk I want a reviewer to look at.** Task 6 introduces a `before_request` that can deny service. Its failure mode when `beacon_port` is `None` must be *allow*, or 2094 tests and every existing deployment break at once. That is why `test_the_split_is_inert_when_no_beacon_port_is_configured` is written to pass before the change and asserted to keep passing after.
+**Residual risk I want a reviewer to look at.** Task 6 introduces a `before_request` that can deny service. Its failure mode when `operator_port` is `None` must be *allow*, or 2094 tests and every existing deployment break at once. That is why `test_the_split_is_inert_when_no_operator_port_is_configured` is written to pass before the change and asserted to keep passing after.
