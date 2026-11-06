@@ -58,6 +58,7 @@ screens, still, with the detail the captions cannot carry.
 20. [Automated Attack — configuring a campaign](#20-automated-attack--configuring-a-campaign)
 21. [Automated Attack — watching one run](#21-automated-attack--watching-one-run)
 22. [Automated Attack — the approval gate](#22-automated-attack--the-approval-gate)
+23. [Automated Attack — the deliverable](#23-automated-attack--the-deliverable)
 
 ---
 
@@ -1226,6 +1227,77 @@ pause rather than decide without its operator, the campaign suspended with
 that knock still open for a return. Supervised runs default to pausing for
 exactly that reason: in a supervised run the operator is the arbiter, and
 stepping away should not quietly promote the expected-value check.
+
+---
+
+## 23. Automated Attack — the deliverable
+
+A campaign ends with something you can hand over. The service panel has a
+**Report** button for every campaign, running or finished, and the same
+thing is at `GET /api/ai/campaign/<id>/report` as `text/markdown`.
+
+![The service panel](screenshots/35_agent_service_panel.png)
+
+The panel also names the fallback provider chain — the order the agent tries
+if the first one cannot serve. The counts above the button come from the
+same `/api/ai/status` the form reads.
+
+This is a real report from the run in the figure above — not an example
+written for the documentation:
+
+```markdown
+# Campaign report — run 1
+
+- **Mode**: Automated Attack
+- **Status**: completed, phase 5
+- **Authorised scope**: 127.0.0.0/8
+- **Phases**: 1, 2, 3, 4, 5
+- **OpSec profile**: normal
+
+## Summary
+
+- Findings: **3**
+- Tasks: 3 of 3 completed, 0 failed
+- Gated actions: 1
+
+## Findings
+
+### 127.0.0.1
+
+- **service** · executed-live — vsftpd 2.3.4 answering on 2121 — a version with a known backdoor
+
+  ```
+  2121/tcp open  ftp     vsftpd 2.3.4
+  ```
+
+- **vuln** · inferred — CVE-2011-2523 in vsftpd 2.3.4, CVSS 9.8 — read from the banner, not triggered
+
+## Decisions
+
+| Action | Decision | By | EV |
+|---|---|---|---|
+| `exploit_known_poc` | refused | operator | +110.1 |
+```
+
+Three things in it are deliberate.
+
+**Each finding says how it was proven.** `executed-live` means the agent
+ran it and saw the result; `inferred` means it read it off a banner and
+never triggered it. Without that distinction a vulnerability read from a
+version string looks exactly like one that was reproduced — and in this
+report the CVE is the second kind, because the operator refused the
+exploit.
+
+**The decisions table is not an appendix.** A report listing only what the
+agent did would invite the reader to assume it did everything it wanted.
+The refusal, with its expected-value arithmetic, is the evidence that it
+did not.
+
+**A campaign that found nothing still gets a report**, and says so against
+its completed task count. "Nothing was found" and "nothing was looked for"
+are different results, and only the task count tells them apart.
+
+---
 
 > **Configuration guide:** [`AGENT.md`](AGENT.md) — providers and capability
 > tiers, risk and OpSec profiles with measured numbers, the scope rules that

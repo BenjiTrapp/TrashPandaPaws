@@ -9,7 +9,7 @@
   <a href="https://benjitrapp.github.io/trashpandapaws-network-implant/"><img src="https://img.shields.io/badge/write--up-the%20why%20behind%20it-ff8c00?logo=jekyll&logoColor=white" alt="Write-up"></a>
   <img src="https://img.shields.io/badge/platform-Raspberry%20Pi%204%20%7C%20CM4-c51a4a?logo=raspberrypi&logoColor=white" alt="Platform">
   <img src="https://img.shields.io/badge/OS-ParrotOS%20ARM64-00e5ff?logo=linux&logoColor=white" alt="OS">
-  <a href="docs/C2_DEMO.md"><img src="https://img.shields.io/badge/C2%20Demo-30%20stills%20%2B%202%20GIFs-blueviolet" alt="C2 Demo"></a>
+  <a href="docs/C2_DEMO.md"><img src="https://img.shields.io/badge/C2%20Demo-31%20stills%20%2B%202%20GIFs-blueviolet" alt="C2 Demo"></a>
   <img src="https://img.shields.io/badge/transport-HTTPS%20%7C%20DNS%20%7C%20SMB%20%7C%20QUIC-blue" alt="Transports">
   <img src="https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen" alt="No Dependencies">
   <img src="https://img.shields.io/badge/license-use%20responsibly-red" alt="License">
@@ -49,7 +49,7 @@ or an HP network printer to blend into enterprise infrastructure.
 | **Egress Proxy** | Auto-discovery (env, registry, PAC/WPAD) plus pure-stdlib NTLMv2 proxy authentication via loopback relay |
 | **Persistence** | 5 independent autorun layers (systemd, crontab, rc.local, udev, watchdog timer) with PID lock dedup |
 | **SMBLoot** | Pure-Python SMB2 browser for remote share enumeration, file read, and download — no impacket on target |
-| **Automated Attack** | Optional LLM agent mode inside the operator GUI: eight-phase campaigns, a gate where eight irreversible actions are refused outright and eleven are asked about every time, fail-closed scope, and every decision recorded |
+| **Automated Attack** | Optional LLM agent mode inside the operator GUI: eight-phase campaigns, a gate where eight irreversible actions are refused outright and eleven are asked about every time, fail-closed scope, a provider chain so one dead key does not end a run, and a Markdown report with every finding's proof basis and every refusal |
 
 ## Architecture
 
@@ -802,7 +802,7 @@ Responder).
 
 </details>
 
-> **Full walkthrough:** [`docs/C2_DEMO.md`](docs/C2_DEMO.md) — 22 sections covering every feature, command reference, Mermaid diagrams, and a full attack flow sequence diagram.
+> **Full walkthrough:** [`docs/C2_DEMO.md`](docs/C2_DEMO.md) — 23 sections covering every feature, command reference, Mermaid diagrams, and a full attack flow sequence diagram.
 
 ### C2: Automated Attack (autonomous agent)
 

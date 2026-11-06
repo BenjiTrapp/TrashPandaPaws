@@ -21,7 +21,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from software.agent import config, prompts, safety  # noqa: E402
+from software.agent import config, prompts
+from software.agent.llm import failover
+from software.agent.store import queries  # noqa: E402
+from software.agent import safety  # noqa: E402
 from software.agent.executor import server_tool  # noqa: E402
 from software.agent.llm import provider  # noqa: E402
 
@@ -64,6 +67,18 @@ class _DocCase(unittest.TestCase):
         flat = " ".join(self.doc.split()).lower()
         self.assertTrue(" ".join(needle.split()).lower() in flat,
                         "%s: %r is not in AGENT.md" % (what, needle))
+
+    def states_number(self, text, what):
+        """Like present(), but a number must stand on its own.
+
+        `present("2 minutes")` passed against "22 minutes of probing"
+        further down the page -- an accidental substring match, so the
+        cooldown figure was never actually checked. Numbers get word
+        boundaries.
+        """
+        flat = " ".join(self.doc.split())
+        self.assertRegex(flat, r"(?<![\d.])" + re.escape(text),
+                         "%s: %r is not stated in AGENT.md" % (what, text))
 
     def absent(self, needle, what):
         self.assertTrue(needle not in self.doc, "%s: %r should not be in "
@@ -265,6 +280,119 @@ class TestTheStatusQuoPromiseIsStated(_DocCase):
         self.present("run exactly as they do today", "the status-quo promise")
         self.present("test_status_quo.py", "where to verify it")
 
+
+
+class TestTheProofBasesAreStatedCorrectly(_DocCase):
+    """Three values and no free text -- so all three have to be documented,
+    and the documentation must not invent a fourth."""
+
+    def test_every_basis_the_code_accepts_is_documented(self):
+        for basis in queries.PROOF_BASES:
+            self.present(basis, "proof basis")
+
+    def _table(self):
+        """The proof-basis table's rows, by its header."""
+        after = self.doc.split("| `proof_basis` | means |", 1)
+        self.assertEqual(len(after), 2, "the proof-basis table is gone")
+        rows = []
+        # lstrip: the text after the header starts with the newline that
+        # ended it, so the first splitlines() element is empty and the
+        # loop used to break before reading a single row.
+        for line in after[1].lstrip("\n").splitlines():
+            if not line.startswith("|"):
+                break
+            rows.append(line)
+        return [r for r in rows if "---" not in r]
+
+    def test_the_table_lists_exactly_the_three(self):
+        # Scoped to the table, not the page: "inferred" also appears in the
+        # report example further down, so a table row renamed to `guessed`
+        # was invisible to a page-wide search for each known value.
+        listed = []
+        for row in self._table():
+            found = re.findall(r"`([a-z-]+)`", row)
+            listed.extend(found)
+        self.assertEqual(sorted(listed), sorted(queries.PROOF_BASES),
+                         "the table lists %s; the code accepts %s"
+                         % (sorted(listed), sorted(queries.PROOF_BASES)))
+
+
+class TestTheFallbackFieldsAreStatedCorrectly(_DocCase):
+    """A config example that names a field the parser refuses is worse than
+    no example: it is followed, and then the agent will not start."""
+
+    def test_every_field_an_entry_takes_is_documented(self):
+        for field in config._FALLBACK_FIELDS:
+            self.present(field, "fallback field")
+
+    def test_the_example_uses_no_field_the_parser_refuses(self):
+        block = self.doc.split("fallbacks:", 1)[1].split("```", 1)[0]
+        for key in re.findall(r"^\s*[-\s]*([a-z_]+):", block, re.M):
+            self.assertIn(key, config._FALLBACK_FIELDS,
+                          "the example sets %r, which an entry does not take"
+                          % key)
+
+    def test_the_literal_key_refusal_is_written_down(self):
+        # The one thing someone will try, and the reason it is refused.
+        self.present("api_key", "the refused literal")
+        self.present("under git", "why a literal key is refused")
+
+    def test_the_trip_and_cooldown_are_the_real_numbers(self):
+        self.states_number("%d minutes"
+                           % round(failover.DEFAULT_COOLDOWN / 60), "cooldown")
+        self.present("twice in a row", "the trip threshold in words")
+        self.assertEqual(failover.DEFAULT_TRIP_AFTER, 2,
+                         "AGENT.md says 'twice in a row'; the code no longer "
+                         "agrees")
+
+
+class TestTheDeadlineThresholdsAreStatedCorrectly(_DocCase):
+    def test_the_numbers_match_the_prompt(self):
+        self.states_number(
+            "%d minutes" % round(prompts._NEARLY_SPENT_SECONDS / 60),
+            "the nearly-spent runtime")
+        self.states_number("%d tokens" % prompts._NEARLY_SPENT_TOKENS,
+                           "the nearly-spent token figure")
+
+
+class TestTheReadmeCountsTheDemoSections(unittest.TestCase):
+    """The README advertised "22 sections" while the tour had 23.
+
+    A number written once and never derived goes stale on the next
+    addition, and this one is the first thing an evaluator reads.
+    """
+
+    def test_the_count_matches_the_tour(self):
+        root = Path(__file__).resolve().parents[2]
+        demo = (root / "docs" / "C2_DEMO.md").read_text()
+        readme = (root / "README.md").read_text()
+        sections = len(re.findall(r"^## \d+\. ", demo, re.M))
+        found = re.search(r"\u2014 (\d+) sections covering", readme)
+        self.assertIsNotNone(found, "the README no longer states a count")
+        self.assertEqual(int(found.group(1)), sections)
+
+    def test_the_badge_counts_the_figures(self):
+        # Three numbers in the README now derive from the repository:
+        # the section count, and the stills and GIFs in the badge. Each
+        # one written by hand is one that goes stale on the next addition.
+        root = Path(__file__).resolve().parents[2]
+        shots = root / "docs" / "screenshots"
+        readme = (root / "README.md").read_text()
+        found = re.search(r"C2%20Demo-(\d+)%20stills%20%2B%20(\d+)%20GIFs",
+                          readme)
+        self.assertIsNotNone(found, "the README no longer counts the figures")
+        self.assertEqual(int(found.group(1)),
+                         len(list(shots.glob("*.png"))), "stills")
+        self.assertEqual(int(found.group(2)),
+                         len(list(shots.glob("*.gif"))), "GIFs")
+
+    def test_the_tour_numbers_its_sections_consecutively(self):
+        # A gap or a repeat means the table of contents and the headings
+        # have drifted apart.
+        root = Path(__file__).resolve().parents[2]
+        demo = (root / "docs" / "C2_DEMO.md").read_text()
+        numbers = [int(n) for n in re.findall(r"^## (\d+)\. ", demo, re.M)]
+        self.assertEqual(numbers, list(range(1, len(numbers) + 1)))
 
 if __name__ == "__main__":
     unittest.main()
