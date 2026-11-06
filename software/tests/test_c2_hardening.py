@@ -1282,6 +1282,21 @@ class TestKeyMustBeSupplied(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("no shares", done.stdout)
 
+    # ── Nothing that ships still offers the removed shortcut ──
+
+    def test_no_launcher_script_or_doc_offers_a_derived_or_default_key(self):
+        shipped = [_REPO / "README.md", _REPO / "docs" / "AGENT.md",
+                   _REPO / "configs" / "raccoon.yaml"]
+        shipped += [p for p in (_REPO / "software" / "c2").iterdir()
+                    if p.suffix in (".sh", ".ps1", ".py", ".yml")]
+        banned = ("derive-key", "derive_key", "DeriveKey", "DERIVE_KEY",
+                  'SHA256(":")', "SHA256(':')", "Derive from callback")
+        for path in shipped:
+            text = path.read_text(encoding="utf-8-sig")
+            for phrase in banned:
+                with self.subTest(path=path.name, phrase=phrase):
+                    self.assertNotIn(phrase, text)
+
     # ── Shipped config ──
 
     def test_shipped_config_does_not_claim_a_derived_key(self):

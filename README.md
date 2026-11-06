@@ -718,10 +718,14 @@ firewall rules, AMSI, and AppLocker on the compromised host.
 
 **Encryption:**
 
-All beacon communication uses **AES-256-GCM** authenticated encryption. Keys
-can be auto-generated, manually set (base64), or derived from the callback URL
-via SHA-256. The server uses the `cryptography` library while the beacon calls
-OpenSSL via `ctypes`. Both implementations interoperate seamlessly.
+All beacon communication uses **AES-256-GCM** authenticated encryption. The
+key is always supplied explicitly: the server needs `--key <base64>` and the
+beacon needs the same value as `encryption_key`, each exactly 32 bytes once
+decoded. There is no default and nothing is derived from the callback URL, so a
+server started without a key refuses to run. Make one with
+`python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"`
+(`start_server.sh` can generate one for you). The server uses the
+`cryptography` library while the beacon calls OpenSSL via `ctypes`. Both implementations interoperate seamlessly.
 
 #### Quick Start (Native)
 
@@ -763,8 +767,7 @@ Responder).
 |---------------------|---------|-------------|
 | `RACCOON_PORT` | `8443` | Listen port |
 | `RACCOON_HOST` | `0.0.0.0` | Listen address |
-| `RACCOON_KEY` | (none) | AES-256-GCM key (base64) |
-| `RACCOON_DERIVE_KEY` | (none) | Derive key from string via SHA-256 |
+| `RACCOON_KEY` | **required** | AES-256-GCM key (base64, 32 bytes); the container exits without it |
 | `RACCOON_TOKEN` | (random) | Operator token for GUI auth |
 | `RACCOON_SSL` | (none) | Enable TLS (set to `1`) |
 | `RACCOON_CERT` | (none) | Path to TLS certificate |

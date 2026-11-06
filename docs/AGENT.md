@@ -622,7 +622,7 @@ have to be distinguishable.
 | **Agent unavailable**, "no LLM provider configured" | `AGENT_PROVIDER` / `AGENT_MODEL` unset. |
 | **401 on every agent call**, or the GUI shows it unavailable with no reason | `RACCOON_TOKEN` is not fixed, so the C2 invented one at startup. Set it for both. |
 | **Campaign starts and finds zero beacons** | Same as above, or the beacon registered under a different encryption key. |
-| **Beacon never appears at all** | Key mismatch. The server's key is derived from the callback URL; the beacon's `callback_url` must match it exactly. A mismatch is *silent* — registration is simply never accepted. |
+| **Beacon never appears at all** | Key mismatch. The server's `--key` and the beacon's `encryption_key` must be the same base64 value; nothing is derived from the callback URL, so the URL is not the cause. A mismatch is *silent* — registration is simply never accepted. |
 | **Commands come back `Unknown command: <program>`** | A beacon command starts with a beacon **verb**. `shell arp -a`, not `arp -a`. The prompt states this; if you see it, the beacon is probably running an older build. |
 | **Phase 5 never happens** | It needs a confirmed service version with a known exploit. With `quiet`, `lookup_cve` is not offered and `searchsploit` is probably not installed either. |
 | **A scan seems to hang** | It is rate-limited, not stuck. 1000 ports ≈ 7 minutes; `-sV` more. The agent's stream shows the command, and `effective_command` in the event detail shows what actually ran. |
