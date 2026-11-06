@@ -50,6 +50,8 @@ or an HP network printer to blend into enterprise infrastructure.
 | **Persistence** | 5 independent autorun layers (systemd, crontab, rc.local, udev, watchdog timer) with PID lock dedup |
 | **SMBLoot** | Pure-Python SMB2 browser for remote share enumeration, file read, and download — no impacket on target |
 | **Automated Attack** | Optional LLM agent mode inside the operator GUI: eight-phase campaigns, a gate where eight irreversible actions are refused outright and eleven are asked about every time, fail-closed scope, a provider chain so one dead key does not end a run, and a Markdown report with every finding's proof basis and every refusal |
+| **Two listening sockets** | The agent endpoint (`--port`, `8443`) and the operator interface (`--operator-port`, `8444`, loopback only) are separate sockets, and the server decides by the socket, not the path — so a request on the agent side reaches the interface with no valid token and no invalid one either. The token is never served in the page; the GUI asks for it once. See [`docs/REDIRECTOR.md`](docs/REDIRECTOR.md) for putting a redirector in front of it |
+| **What is still open** | A hardening pass closed most of what an audit of the C2 found. What it did not close is written down, grouped by consequence, in *Known limits* in [`docs/AGENT.md`](docs/AGENT.md#known-limits) — with a test that fails if an entry is fixed and left in the list |
 
 ## Architecture
 

@@ -634,6 +634,8 @@ have to be distinguishable.
 
 ## Known limits
 
+### The agent layer
+
 - **Wifi phases 6–8 are unreachable.** `max_phase` tops out at 5 for every
   capability tier, so the wifi chain cannot be selected yet. Monitor mode
   has only ever been mock-tested here: the Pi's onboard WLAN is the only
@@ -653,6 +655,227 @@ have to be distinguishable.
   re-reaches the action — with `pause` still configured it suspends again,
   so switch the behaviour to `decide` or `skip` before resuming, or stop the
   run. The record is complete either way.
+
+
+### Left open by the security hardening
+
+The hardening pass of November 2026 closed most of what an audit of the C2
+found. What follows is what it did not change. Each item was checked against
+the code when this was written, not copied from the audit's report, and
+`software/tests/test_docs.py` re-checks the ones the code can answer for:
+fix one and that test fails until the entry is deleted from here.
+
+The groups are by consequence. **Would stop a deployment** means do not put
+the C2 or a beacon on a network you do not control until it is fixed or you
+have accepted it knowingly. **Would stop a release** means it should not ship
+to other people as it stands, though a closed lab does not hinge on it.
+**Housekeeping** is cheap to fix and visible to a reviewer, and nothing
+more.
+
+#### Would stop a deployment
+
+- **The beacon cannot verify TLS at all.** `software/c2/beacon.py` sets
+  `ssl.CERT_NONE` unconditionally on its HTTPS opener and its proxy probe,
+  and `verify_ssl` is assigned from the configuration and never read, so the
+  setting in `configs/raccoon.yaml` cannot be turned on. (`exfil.py` does
+  pass its own copy of the flag to `requests`; the beacon's callback channel
+  is the one with no switch.) Over the internet the payload encryption is the
+  only control left. For a self-signed certificate the answer is pinning, not
+  skipping verification.
+- **No replay protection, in either direction.** There is no counter, no
+  timestamp, no window and no seen-message cache. Resubmitting a captured
+  result overwrites the recorded output for that task and writes its loot
+  file again; replaying a check-in takes the queued task off the queue, so
+  the real beacon never sees it. A captured message is enough; the key is
+  not needed.
+- **The staged-implant download has no integrity control in the shipped
+  configuration.** Nothing is fetched until `c2.sliver.staging_url` is set,
+  and it ships empty. Once it is, `software/c2/sliver.py` downloads with
+  `verify=False`, and the expected hash (`c2.sliver.sha256`) also ships empty
+  and is checked only when set. The file is then run by a unit that runs as
+  root. Set `sha256` whenever you set `staging_url`.
+- **`shell=True` on a request-derived string.** `/api/server/rdp` builds a
+  command line from fields of the request and runs it through a shell. The
+  VNC branch also pipes the password through
+  `bash -c "echo '{password}' | vncpasswd -f"`, inside single quotes: a
+  password containing `'` is a command-injection primitive, the password is
+  visible in the process table in clear text, and the generated
+  `/tmp/.vnc_pass_*` file is never removed. The route requires the operator
+  token, so the input is whoever holds it.
+- **The loot download escapes its directory.** `/api/loot/<agent_id>/<filename>`
+  joins an unvalidated path and gives it to `send_file` rather than
+  `send_from_directory`, so `/api/loot/%2e%2e/<name>` reaches the data
+  directory. Confirmed against the Flask test client, with the operator
+  token. In the container layout `docker-compose.yml` documents, that
+  directory holds the server's TLS private key when TLS is on.
+- **The server image runs as root.** `software/c2/Dockerfile` has no `USER`
+  directive, and the compose file grants `NET_ADMIN` and mounts the host's
+  X11 socket. The agent image gets this right and says why in a comment; the
+  server image holds the same credential and is the one running the
+  commands.
+
+#### Would stop a release
+
+- **`on*` handler-body injections remain, in the file browser.** A
+  directory-entry name that a beacon reports from the target's file system
+  reaches a JavaScript string literal inside an `onclick` attribute: the
+  download, loot and `cat` buttons and the directory tree, in the operator
+  page in `server.py`. The escaping helper escapes `'` as `&#39;`, which does
+  not help there, because the HTML parser decodes it before the JavaScript
+  parser sees it; and the sites that put a backslash before `'` never escape
+  the backslash. The loot list has the same shape, but names are flattened to
+  `[A-Za-z0-9._-]` when they are written, so it is reachable only through a
+  file written before that change. The fix is to attach handlers in
+  JavaScript instead of building them as strings. That is a GUI refactor,
+  which is why it was scoped out. Read from the code, not run in a browser.
+- **Nothing is pinned.** Both requirements files use lower bounds only. The
+  server image installs six packages with no version constraint at all and
+  builds NetExec, Responder and RelayKing from moving git branches with no
+  tag. A rebuild a month later is a different image.
+- **Two dependencies are old, and neither is imported here.** `netifaces`
+  0.11.0 (May 2021) is its last release, and being a C extension it breaks on
+  new CPython rather than merely ageing. Nothing in the repository imports it:
+  it is declared in `software/requirements.txt`, listed as required by the two
+  cover launchers, and checked by the first-boot test, so it can probably go,
+  from those four places. `ldap3`'s last stable release is 2.9.1 (July 2021),
+  with only release candidates of 2.10.2 since, the newest in April 2026: slow
+  rather than abandoned, which is softer than "effectively unmaintained". The
+  server image and the start scripts install it by name, but `impacket` 0.13.1
+  declares it as a dependency, so removing those lines would not remove it
+  from the image.
+- **No request-size cap and no rate limiting.** `MAX_CONTENT_LENGTH` is never
+  set, so one unauthenticated POST with a multi-gigabyte body is read into
+  memory and parsed as JSON before anything asks whether it is a valid
+  message. (Writing it to disk needs a message that decrypts and names a
+  registered agent, so that part applies to a sender with the key, not an
+  anonymous one.) There is no lockout on the operator token either: sixty
+  wrong-token requests in a row all answer 401. A first check reported rate
+  limiting as present, because its pattern matched the `X-RateLimit-Limit`
+  and `X-RateLimit-Remaining` values in a C2 profile example in `server.py`.
+  They are example response headers, not a limiter.
+- **`vnc_password` is a literal `raccoon`** in `configs/raccoon.yaml`, in a
+  file that says, in its agent section, "Secrets never go in this file,
+  because this file is in git". VNC ships disabled and binds to loopback, so
+  this is a default someone will copy rather than an open door.
+
+#### Housekeeping, but visible
+
+- **The operator token is compared with `==`**, not `hmac.compare_digest`
+  (`check_auth` in `software/c2/server.py`). Impractical to exploit remotely
+  and free to fix. The agent service already compares correctly, and the
+  agent layer's design document records this one.
+- **Project-written files land at `0644`**: the state file, the database, the
+  logs. The configuration loader refuses to read a key file looser than
+  owner-only, so the project asks of others what it does not do itself. The
+  operator-token file (`0600`) and the staged implant (`0700`) are the
+  exceptions. `os.umask(0o077)` at the service entry points would fix every
+  instance.
+- **There is no `LICENSE` file.** The README carries a badge, but nothing in
+  the repository says what anyone may do with the code, so this is not
+  cosmetic.
+- **Six commits carrying a former contributor's company e-mail address**
+  remain readable through a read-only GitHub reference, `refs/pull/2/head`.
+  No push can remove them; only GitHub Support's removal flow can. Checked by
+  fetching that reference into a scratch repository: six commits, none of
+  them reachable from a branch here.
+
+#### Found while hardening, not by the audit
+
+- **The SMB and QUIC request legs are dead in production.**
+  `Beacon._encrypt(data: dict)` serialises its argument itself, and three
+  call sites hand it a value that is already serialised:
+  `self._encrypt(json.dumps(...).encode())`, in `_beacon_smb`, in the SMB
+  result send and in `_quic_send`. `json.dumps` on bytes raises `TypeError`,
+  the surrounding `except` swallows it, and neither transport ever reaches a
+  response. Fixing it would switch on two transports that have never run,
+  which is not a change to make inside a security fix. The README's "four
+  independent channels" describes the design; two of the four have not
+  worked.
+- **A correction to the audit's severity.** An earlier summary of the pass
+  said encryption was optional on "three of four channels", with command
+  execution possible without any key. The accurate statement is narrower:
+  DNS was live and exploitable, since answering one TXT query was enough,
+  while SMB and QUIC could not be reached at all, so their unencrypted
+  fallbacks were latent. Removing all three fallbacks was still right. The
+  claim was overstated.
+
+#### Minor, deferred
+
+Nineteen minor findings were deferred, each by a reviewer who judged it not
+worth holding the change for. Two say nearly the same thing and are one entry
+below, so eighteen entries stand for nineteen findings. None is dropped. The
+first five are the ones that are traps for a later change.
+
+- **`_handle_result` still does bookkeeping for an unregistered agent.** It
+  records `results[task_id]`, appends history and saves state before it checks
+  that the agent is registered, so a sender who holds the beacon key but has
+  no registered identity can grow a dict without bound. "Creates nothing"
+  holds for the file system only: `_save_state` persists agents, history,
+  the scan store and the name counter, not `results`. Same family as the
+  missing request-size cap.
+- **The installer's unit-file test over-reads what a unit can reach.**
+  (Two findings, merged.) In `software/tests/test_c2_hardening.py`,
+  `_unit_reach` treats a system interpreter's prefix as a tree, so
+  `ExecStart=/usr/bin/python3` puts all of `/usr` in scope and any
+  user-targeted `chown` under `/usr` fails the test; and it treats every
+  absolute-path argument as a path read as root, so a unit with
+  `--out /opt/raccoon/captures` would fail against the very directory the fix
+  deliberately hands to the user. Latent: no current unit does either. The
+  trees rule should be restricted to virtualenvs.
+- **The operator listener runs unsupervised, in a thread.** If that thread
+  dies the agent socket keeps serving and the interface is gone, with nothing
+  logged. There is no half-started state (both sockets bind before either
+  thread starts) and shutdown is clean, so a supervisor is a larger change
+  than the fix that introduced the thread should carry.
+- **Both PowerShell launchers are unverified.** There is no PowerShell on the
+  machine this was built on. `start_server.ps1` and `test_add_agent.ps1` need
+  one run on Windows, for two things: the `Read-Secret` helper, and the
+  `try/finally` around the launch.
+- **The no-echo test helper has a floor.** `_assert_not_echoed` (two copies,
+  in `test_c2_hardening.py`) scans every 8-character window of a key, so a
+  leak of seven characters or fewer still passes.
+- **An unhashable `agent_id` raises** on `agent_id in history`, and the
+  catch-all returns the fake response. It is not an oracle, being independent
+  of registration, but it is an uncaught type error on a path any holder of
+  the key reaches.
+- **A registered agent still gets the fake response if `mkdir` or
+  `write_bytes` raises `OSError`.** Judged not inducible by the sender
+  (the file name is capped at 100 characters and the directory is named by
+  the server), and hiding a real write failure behind an acknowledgement
+  would be worse. The optional hardening named: catch `OSError`, log it at
+  error level, and still acknowledge.
+- **`_owner_of` and `_handed_away` do not normalise `..`**, so
+  `chown -R "${INSTALL_DIR}/../raccoon/software"` passes the unit-file test.
+- **`_unit_reach` raises a raw `ValueError` on a systemd line continuation**,
+  and sees only `/bin/sh` for an `ExecStart=/bin/sh -c '… venv/bin/python …'`
+  wrapper.
+- **`beacon.decode_key`'s docstring claims the launchers share it.** None do.
+- **`server.py`'s `except ImportError` around the beacon import** would also
+  catch an `ImportError` raised from inside `beacon`, re-raising something
+  less specific. It cannot happen today.
+- **Two loopback-equivalent page hosts are not recognised by the prefill
+  guard**: `*.localhost` (RFC 6761), and a hostname aliased to loopback in
+  `/etc/hosts` or an SSH config, which JavaScript cannot know. The documented
+  path, `ssh -L` and then `localhost`, is covered.
+- **The Settings panel shows the interface address as `localhost` only when
+  the operator host is `0.0.0.0`.** This predates the fix.
+- **`aiCall()` does not clear the token on a 401.** The `/api/ai/*` proxy
+  passes the companion service's status through, so a service-side 401 would
+  wrongly clear a good token. Accepted: any stored token also drives
+  `refreshAgents` every 3 s through `api()`, so a bad one is caught within one
+  poll. A `WWW-Authenticate: Bearer` header on the C2's own 401 would be a
+  sturdier marker, since the proxy forwards only body, status and
+  `Content-Type` and so cannot forge it, but it is a wider change.
+- **`tokenRejected` clears whatever is stored now, not the token that was
+  sent.** A tiny window; `submitToken` reloads at once.
+- **The route-walk test fills every URL argument with `"1"`**, so a route that
+  leaks only for particular argument values would be missed.
+- **The widened scanner flags an `echo` that ends a line whose successor
+  starts with `$`**, when the echo ends in `--key`. No real file does this,
+  the gap allows only whitespace, backslash and backtick, and it fails
+  loudly.
+- **The scanner matches only `--flag` forms**, so a single-dash PowerShell
+  `-Key $Key` handed to a child is not covered. None exists today.
 
 ---
 

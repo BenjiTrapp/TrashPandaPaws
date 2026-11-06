@@ -13,10 +13,16 @@ drift. It asserts that every key and every number is *present*, not that the
 surrounding sentences are unchanged -- the prose is free, the facts are not.
 """
 
+import inspect
+import json
+import os
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
+import yaml
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -27,6 +33,8 @@ from software.agent.store import queries  # noqa: E402
 from software.agent import safety  # noqa: E402
 from software.agent.executor import server_tool  # noqa: E402
 from software.agent.llm import provider  # noqa: E402
+from software.c2 import server as c2_server  # noqa: E402
+from software.c2.sliver import SliverManager  # noqa: E402
 
 AGENT_DOC = REPO / "docs" / "AGENT.md"
 DEMO_DOC = REPO / "docs" / "C2_DEMO.md"
@@ -414,6 +422,283 @@ class TestTheDocsSayHowToSignIn(unittest.TestCase):
             text = doc.read_text()
             for needle in ("?t=", "&t=", "token="):
                 self.assertNotIn(needle, text, "%s in %s" % (needle, doc.name))
+
+
+# ── Known limits: the findings the hardening pass left open ──
+#
+# Each entry is a phrase the section must carry, in the group it belongs to,
+# and -- where the code can say -- a function that is True for as long as the
+# finding is still open. When someone fixes one, its predicate turns False and
+# the test fails until the entry is deleted from the section and from here: the
+# section cannot go on calling a fixed thing open. When someone deletes an
+# entry from the section, the phrase goes missing. When someone adds a bullet
+# without adding it here, the count is off.
+#
+# The predicates are deliberately narrow. The first draft of the rate-limiting
+# one matched "X-RateLimit" header values in a C2 profile example and reported
+# a limiter that does not exist, so the ones that can be behavioural are:
+# they send the request and look at what comes back.
+
+_C2 = REPO / "software" / "c2"
+_BEACON_KEY = bytes(range(32))
+_BEACON_TOKEN = "known-limits-probe-token"
+
+
+def _read(*parts):
+    return REPO.joinpath(*parts).read_text()
+
+
+def _config():
+    return yaml.safe_load(_read("configs", "raccoon.yaml"))
+
+
+class _ProbeServer:
+    """A throwaway C2 on the Flask test client, with the globals put back."""
+
+    def __enter__(self):
+        self.data_dir = Path(tempfile.mkdtemp())
+        self.crypto = c2_server.ServerCrypto(_BEACON_KEY)
+        self.app = c2_server.create_app(self.crypto, _BEACON_TOKEN,
+                                        self.data_dir)
+        self.app.config["TESTING"] = True
+        self.client = self.app.test_client()
+        self.auth = {"Authorization": "Bearer " + _BEACON_TOKEN}
+        self._clear()
+        return self
+
+    def __exit__(self, *exc):
+        self._clear()
+
+    def _clear(self):
+        for store in (c2_server.agents, c2_server.task_queues,
+                      c2_server.history, c2_server.results):
+            store.clear()
+        c2_server._name_counter = 0
+
+    def post(self, payload):
+        reply = self.client.post("/b", data=json.dumps(
+            self.crypto.wrap(payload)), content_type="application/json")
+        return self.crypto.unwrap(reply.get_json())
+
+
+def _beacon_cannot_verify_tls():
+    text = _read("software", "c2", "beacon.py")
+    mentions = re.findall(r"^.*\bverify_ssl\b.*$", text, re.M)
+    return (len(mentions) == 1 and "self.verify_ssl = " in mentions[0]
+            and "ssl_ctx.verify_mode = ssl.CERT_NONE" in text)
+
+
+def _a_replayed_result_is_applied_again():
+    with _ProbeServer() as srv:
+        registered = srv.post({"action": "register", "id": "probe",
+                               "hostname": "h", "os": "L", "arch": "x",
+                               "user": "u", "pid": 1, "interval": 5})
+        captured = {"action": "result", "agent_id": registered["agent_id"],
+                    "task_id": "t1", "status": "ok", "output": "first"}
+        srv.post(captured)
+        c2_server.results["t1"]["output"] = "tampered"
+        srv.post(captured)
+        return c2_server.results["t1"]["output"] == "first"
+
+
+def _the_staged_download_is_unchecked():
+    sliver = _config()["c2"]["sliver"]
+    source = inspect.getsource(SliverManager._stage_implant)
+    return (sliver["staging_url"] == "" and sliver["sha256"] == ""
+            and "verify=False" in source and "if self.expected_hash:" in source)
+
+
+def _rdp_hands_request_text_to_a_shell():
+    text = _read("software", "c2", "server.py")
+    return ("cmd_str, shell=True" in text
+            and "echo '{password}' | vncpasswd -f" in text)
+
+
+def _the_loot_download_reaches_the_data_directory():
+    with _ProbeServer() as srv:
+        (srv.data_dir / "loot").mkdir()
+        (srv.data_dir / "key.pem").write_text("outside-loot")
+        reply = srv.client.get("/api/loot/%2e%2e/key.pem", headers=srv.auth)
+        return reply.status_code == 200 and reply.data == b"outside-loot"
+
+
+def _the_server_image_is_root_with_net_admin():
+    image = _read("software", "c2", "Dockerfile")
+    compose = _read("software", "c2", "docker-compose.yml")
+    return (not re.search(r"^\s*USER\s", image, re.M)
+            and "NET_ADMIN" in compose and "/tmp/.X11-unix" in compose)
+
+
+def _file_browser_names_reach_onclick_strings():
+    text = _read("software", "c2", "server.py")
+    return bool(re.search(
+        r"""onclick="[^"\n]*\\'\s*'\s*\+\s*esc\(full""", text))
+
+
+def _nothing_is_pinned():
+    reqs = [_read("software", "requirements.txt"),
+            _read("software", "agent", "requirements.txt")]
+    image = _read("software", "c2", "Dockerfile")
+    pip_block = image.split("RUN pip install", 1)[1].split("\n\n", 1)[0]
+    return (not any("==" in line for text in reqs
+                    for line in text.splitlines()
+                    if not line.lstrip().startswith("#"))
+            and not re.search(r"[<>=]", pip_block)
+            and re.search(r"NetExec\s*$", image, re.M) is not None)
+
+
+def _the_old_dependencies_are_still_declared():
+    return ("netifaces" in _read("software", "requirements.txt")
+            and "ldap3" in _read("software", "c2", "Dockerfile"))
+
+
+def _there_is_no_size_cap_and_no_rate_limit():
+    with _ProbeServer() as srv:
+        wrong = {"Authorization": "Bearer not-the-token"}
+        codes = {srv.client.get("/api/loot", headers=wrong).status_code
+                 for _ in range(60)}
+        right = srv.client.get("/api/loot", headers=srv.auth).status_code
+        return (srv.app.config.get("MAX_CONTENT_LENGTH") is None
+                and codes == {401} and right == 200)
+
+
+def _the_shipped_config_carries_a_vnc_password():
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "vnc_password":
+                    yield value
+                yield from walk(value)
+    return "raccoon" in list(walk(_config()))
+
+
+def _the_token_is_compared_with_plain_equality():
+    text = _read("software", "c2", "server.py")
+    return ("return auth[7:] == operator_token" in text
+            and "compare_digest" not in text)
+
+
+def _project_files_are_world_readable():
+    sources = [REPO / "software" / "main.py", REPO / "software" / "watchdog.py"]
+    for sub in ("c2", "agent"):
+        # A virtualenv inside the tree is not the project's code, and pip's
+        # own os.umask call in one once made this report the file modes fixed.
+        sources.extend(p for p in (REPO / "software" / sub).rglob("*.py")
+                       if not {".venv", "site-packages"} & set(p.parts))
+    no_umask = not any("os.umask" in p.read_text() for p in sources)
+    before = os.umask(0o022)
+    try:
+        with _ProbeServer() as srv:
+            c2_server._save_state(srv.data_dir)
+            mode = (srv.data_dir / "state.json").stat().st_mode & 0o777
+    finally:
+        os.umask(before)
+    return no_umask and mode == 0o644
+
+
+def _there_is_no_licence_file():
+    return not any(p.name.upper().startswith(("LICENSE", "LICENCE", "COPYING"))
+                   for p in REPO.iterdir() if p.is_file())
+
+
+def _smb_and_quic_double_serialise():
+    text = _read("software", "c2", "beacon.py")
+    return ("def _encrypt(self, data: dict)" in text
+            and len(re.findall(r"self\._encrypt\(json\.dumps\(", text)) == 3)
+
+
+# group -> [(phrase the entry must contain, True-while-open or None)].
+# None means nothing in the working tree can show it: the six commits are on
+# a GitHub reference, and the deferred minors are properties of tests, of
+# prose and of a GUI that this file cannot run. Those are checked for being
+# present, in the right group and counted, and no more than that.
+_OPEN_FINDINGS = {
+    "Would stop a deployment": [
+        ("cannot verify TLS at all", _beacon_cannot_verify_tls),
+        ("No replay protection", _a_replayed_result_is_applied_again),
+        ("staged-implant download", _the_staged_download_is_unchecked),
+        ("`shell=True`", _rdp_hands_request_text_to_a_shell),
+        ("loot download escapes its directory",
+         _the_loot_download_reaches_the_data_directory),
+        ("server image runs as root", _the_server_image_is_root_with_net_admin),
+    ],
+    "Would stop a release": [
+        ("handler-body injections", _file_browser_names_reach_onclick_strings),
+        ("Nothing is pinned", _nothing_is_pinned),
+        ("Two dependencies", _the_old_dependencies_are_still_declared),
+        ("No request-size cap and no rate limiting",
+         _there_is_no_size_cap_and_no_rate_limit),
+        ("`vnc_password`", _the_shipped_config_carries_a_vnc_password),
+    ],
+    "Housekeeping, but visible": [
+        ("compared with `==`", _the_token_is_compared_with_plain_equality),
+        ("land at `0644`", _project_files_are_world_readable),
+        ("no `LICENSE` file", _there_is_no_licence_file),
+        ("Six commits", None),
+    ],
+    "Found while hardening, not by the audit": [
+        ("SMB and QUIC request legs are dead", _smb_and_quic_double_serialise),
+        ("A correction to the audit's severity", None),
+    ],
+    "Minor, deferred": [
+        ("`_handle_result` still does bookkeeping", None),
+        ("unit-file test", None),
+        ("operator listener runs unsupervised", None),
+        ("PowerShell launchers are unverified", None),
+        ("no-echo test helper", None),
+        ("unhashable `agent_id`", None),
+        ("`OSError`", None),
+        ("do not normalise `..`", None),
+        ("line continuation", None),
+        ("`beacon.decode_key`'s docstring", None),
+        ("`except ImportError`", None),
+        ("loopback-equivalent", None),
+        ("Settings panel", None),
+        ("`aiCall()`", None),
+        ("`tokenRejected`", None),
+        ("route-walk test", None),
+        ("scanner flags an `echo`", None),
+        ("single-dash", None),
+    ],
+}
+
+# Nineteen findings were deferred; two say nearly the same thing and are one
+# entry, so eighteen entries stand for nineteen. The section says both.
+_DEFERRED_FINDINGS = 19
+_DEFERRED_MERGED = 1
+
+
+class TestTheKnownLimitsRecordTheOpenFindings(_DocCase):
+    def _groups(self):
+        body = self.doc.split("\n## Known limits\n", 1)[1].split("\n## ", 1)[0]
+        parts = re.split(r"^#### (.+)$", body, flags=re.M)
+        return {parts[i].strip(): parts[i + 1] for i in range(1, len(parts), 2)}
+
+    def test_the_section_holds_exactly_the_findings_that_are_still_open(self):
+        groups = self._groups()
+        self.assertEqual(sorted(groups), sorted(_OPEN_FINDINGS),
+                         "the severity groups in Known limits changed")
+        for group, entries in _OPEN_FINDINGS.items():
+            flat = " ".join(groups[group].split()).lower()
+            bullets = re.findall(r"^- \*\*", groups[group], re.M)
+            self.assertEqual(len(bullets), len(entries),
+                             "%s: the section has %d entries, the record %d"
+                             % (group, len(bullets), len(entries)))
+            for phrase, still_open in entries:
+                with self.subTest(group=group, entry=phrase):
+                    self.assertIn(" ".join(phrase.split()).lower(), flat,
+                                  "%r is not under %r" % (phrase, group))
+                    if still_open is not None:
+                        self.assertTrue(
+                            still_open(),
+                            "%r is no longer true of the code: it has been "
+                            "fixed. Delete it from Known limits and from "
+                            "_OPEN_FINDINGS." % phrase)
+        deferred = " ".join(groups["Minor, deferred"].split()).lower()
+        self.assertIn("nineteen", deferred)
+        self.assertEqual(
+            len(_OPEN_FINDINGS["Minor, deferred"]) + _DEFERRED_MERGED,
+            _DEFERRED_FINDINGS, "the merge count and the entry count differ")
 
 
 if __name__ == "__main__":
