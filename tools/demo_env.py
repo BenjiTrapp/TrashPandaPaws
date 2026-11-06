@@ -8,7 +8,10 @@ and a real `Beacon` this way, so the GUI being photographed is the GUI,
 talking to a beacon that answers for real -- not a mock-up and not a
 seeded database.
 
-    python3 tools/demo_env.py --port 18500 --token demo-token
+    python3 tools/demo_env.py --operator-port 18500 --token demo-token
+
+The flags mean what server.py's do: --port is the beacon socket and
+--operator-port the GUI and API, which is what a capture opens.
 
 Stays in the foreground until interrupted, printing the beacon id it got
 so the capture step can address it. Nothing here is specific to the
@@ -69,15 +72,15 @@ def beacon_config(port, key, interval=2):
 class DemoEnv:
     """The C2 on two sockets, as `server.py` runs it.
 
-    `port` is the operator socket -- the GUI and the API, and what the
-    capture tools open. `beacon_port` is the agent socket, the only one the
-    beacon is pointed at; 0 picks a free port, read back once bound. With
+    `operator_port` is the GUI and the API, what the capture tools open.
+    `beacon_port` is the agent socket, the only one the beacon is pointed
+    at. 0 for either picks a free port, read back once bound. With
     the two apart the socket policy is live, so the figures show the GUI as
     it is actually reached, not a single-socket arrangement nobody runs.
     """
 
-    def __init__(self, port, token, data_dir=None, beacon_port=0):
-        self.port = port
+    def __init__(self, operator_port, token, data_dir=None, beacon_port=0):
+        self.operator_port = operator_port
         self.beacon_port = beacon_port
         self.token = token
         self.data_dir = pathlib.Path(data_dir or tempfile.mkdtemp())
@@ -86,16 +89,17 @@ class DemoEnv:
         self.beacon_id = None
 
     def start_server(self):
-        operator = make_server("127.0.0.1", self.port, None, threaded=True)
+        operator = make_server("127.0.0.1", self.operator_port, None,
+                               threaded=True)
         agent = make_server("127.0.0.1", self.beacon_port, None, threaded=True)
-        self.port = operator.server_port
+        self.operator_port = operator.server_port
         self.beacon_port = agent.server_port
         self.app = create_app(
             ServerCrypto(self.key), self.token, self.data_dir,
             server_config={"host": "127.0.0.1", "port": self.beacon_port,
                            "operator_host": "127.0.0.1",
-                           "operator_port": self.port},
-            operator_port=self.port)
+                           "operator_port": self.operator_port},
+            operator_port=self.operator_port)
         self.servers = (operator, agent)
         for srv in self.servers:
             srv.app = self.app
@@ -107,7 +111,8 @@ class DemoEnv:
         import urllib.request
         try:
             urllib.request.urlopen(
-                "http://127.0.0.1:%d/api/agents" % self.port, timeout=2)
+                "http://127.0.0.1:%d/api/agents" % self.operator_port,
+                timeout=2)
         except urllib.error.HTTPError:
             return True          # 401 is an answer
         except Exception:
@@ -134,19 +139,23 @@ class DemoEnv:
         raise RuntimeError("timed out waiting for %s" % what)
 
 
-def main(argv=None):
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--port", type=int, default=18500,
+    parser.add_argument("--operator-port", type=int, default=18500,
                         help="operator socket: the GUI and the API")
-    parser.add_argument("--beacon-port", type=int, default=0,
-                        help="agent socket (default: any free port)")
+    parser.add_argument("--port", type=int, default=0,
+                        help="beacon socket (default: any free port)")
     parser.add_argument("--token", default="demo-operator-token")
     parser.add_argument("--data-dir")
-    args = parser.parse_args(argv)
+    return parser
 
-    env = DemoEnv(args.port, args.token, args.data_dir, args.beacon_port)
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    env = DemoEnv(args.operator_port, args.token, args.data_dir, args.port)
     env.start_server()
-    print("c2 http://127.0.0.1:%d  token %s" % (env.port, env.token))
+    print("c2 http://127.0.0.1:%d  token %s" % (env.operator_port, env.token))
     print("beacons http://127.0.0.1:%d" % env.beacon_port)
     env.start_beacon()
     print("beacon %s" % env.beacon_id)

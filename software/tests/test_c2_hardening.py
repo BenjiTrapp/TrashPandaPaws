@@ -26,7 +26,7 @@ from collections import namedtuple
 from pathlib import Path, PurePosixPath
 from unittest.mock import MagicMock, patch
 
-from werkzeug.serving import make_server
+from werkzeug.serving import WSGIRequestHandler, make_server
 
 from software.c2 import beacon as beacon_mod
 from software.c2 import server as server_mod
@@ -1461,6 +1461,11 @@ def _http(method, port, path, body=None, headers=None):
         return exc.code, exc.headers.get("Content-Type"), exc.read()
 
 
+class _QuietHandler(WSGIRequestHandler):
+    def log_request(self, *args, **kwargs):
+        pass
+
+
 class _FakeListener:
     def __init__(self, calls, host, port, app, **kwargs):
         calls.append({"host": host, "port": port, "app": app, **kwargs})
@@ -1533,9 +1538,11 @@ class TestSocketPolicy(unittest.TestCase):
         # which once measured a foreign process and reported the opposite of
         # the truth. The app needs the operator port before it exists, so the
         # listeners are bound first and handed the app afterwards.
-        self.operator = make_server("127.0.0.1", 0, None, threaded=True)
+        self.operator = make_server("127.0.0.1", 0, None, threaded=True,
+                                    request_handler=_QuietHandler)
         self.addCleanup(self.operator.server_close)
-        self.agent = make_server("127.0.0.1", 0, None, threaded=True)
+        self.agent = make_server("127.0.0.1", 0, None, threaded=True,
+                                 request_handler=_QuietHandler)
         self.addCleanup(self.agent.server_close)
         self.op_port = self.operator.server_port
         self.agent_port = self.agent.server_port
@@ -1668,6 +1675,99 @@ class TestSocketPolicy(unittest.TestCase):
         self.assertEqual([(c["host"], c["port"]) for c in listeners],
                          [("0.0.0.0", 8443)])
         self.assertIsNone(made.get("operator_port"))
+
+    def test_port_zero_is_refused_for_either_socket(self):
+        # 0 would bind an ephemeral port the policy never matches, and the
+        # GUI would be locked out with nothing said.
+        for flag in ("--port", "--operator-port"):
+            with self.subTest(flag=flag):
+                code, err = _server_main("--key", key_b64(random_key()),
+                                         flag, "0")
+                self.assertEqual(code, 2)
+                self.assertIn(flag, err)
+                self.assertIn("1-65535", err)
+
+    # ── The demo harness names its sockets as server.py does ──
+
+    def test_demo_env_flags_mean_what_the_servers_flags_mean(self):
+        from tools import demo_env
+        args = demo_env.build_parser().parse_args(
+            ["--port", "1111", "--operator-port", "2222"])
+        env = demo_env.DemoEnv(args.operator_port, "t", beacon_port=args.port)
+        self.assertEqual((env.operator_port, env.beacon_port), (2222, 1111))
+        self.assertNotIn("--beacon-port",
+                         demo_env.build_parser().format_help())
+
+    def test_the_capture_script_opens_the_demo_on_its_operator_port(self):
+        script = (_REPO / "tools" / "capture_figures.sh").read_text()
+        launches = re.findall(r"tools/demo_env\.py[\s\\]+(--[\w-]+)", script)
+        self.assertTrue(launches, "capture_figures.sh no longer runs demo_env")
+        self.assertEqual(set(launches), {"--operator-port"})
+
+
+class TestCallbackDefault(unittest.TestCase):
+    """The Beacon Generator must never prefill a callback no beacon can reach.
+
+    Through the documented SSH tunnel the GUI's own hostname is localhost,
+    and a beacon given that address never registers -- silently. The helper
+    is located by name in the interface string and its branches asserted on;
+    where node is installed it is also executed.
+    """
+
+    @staticmethod
+    def _helper():
+        found = re.search(r"\nfunction bgDefaultCallbackUrl\(cfg, pageHost\)\{.*?\n\}\n",
+                          server_mod._OPERATOR_HTML, re.S)
+        assert found, "bgDefaultCallbackUrl is gone from the interface"
+        return found.group(0)
+
+    def _show_beacon_gen(self):
+        html = server_mod._OPERATOR_HTML
+        start = html.index("async function showBeaconGen(){")
+        return html[start:html.index("\n}\n", start)]
+
+    def test_the_generator_takes_its_default_from_the_helper(self):
+        body = self._show_beacon_gen()
+        self.assertTrue("bgDefaultCallbackUrl(cfg, location.hostname)" in body,
+                        "showBeaconGen does not use the helper")
+        self.assertIsNone(re.search(r'"://"\+location\.hostname', body),
+                          "showBeaconGen still builds from the page host")
+
+    def test_the_helper_refuses_a_loopback_page_host(self):
+        helper = self._helper()
+        self.assertRegex(helper, r"localhost")
+        self.assertRegex(helper, r"127\\\.")
+        self.assertIn('return ""', helper)
+
+    def test_an_empty_default_is_explained_next_to_the_field(self):
+        body = self._show_beacon_gen()
+        self.assertTrue('id="bg-url-note"' in body, "no note beside the field")
+        self.assertIsNotNone(
+            re.search(r"(?s)\(defaultUrl \? '' : '<p id=\"bg-url-note\".{0,300}SSH tunnel", body),
+            "the note is not shown exactly when the default is empty")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_helper_behaves(self):
+        cases = [
+            # (cfg.host, cfg.port, cfg.ssl, page host, expected)
+            ("0.0.0.0", 8443, False, "localhost", ""),
+            ("0.0.0.0", 8443, False, "127.0.0.1", ""),
+            ("0.0.0.0", 8443, False, "[::1]", ""),
+            ("::", 8443, True, "localhost", ""),
+            ("0.0.0.0", 8443, False, "c2.example.net",
+             "http://c2.example.net:8443/api/v1/beacon"),
+            ("0.0.0.0", 9443, True, "10.0.0.5",
+             "https://10.0.0.5:9443/api/v1/beacon"),
+            ("10.1.2.3", 8443, False, "localhost",
+             "http://10.1.2.3:8443/api/v1/beacon"),
+        ]
+        script = self._helper() + "\nconst cases = %s;\n" % json.dumps(cases) + (
+            "console.log(JSON.stringify(cases.map(c => bgDefaultCallbackUrl("
+            "{host:c[0], port:c[1], ssl:c[2]}, c[3]))));\n")
+        out = subprocess.run(["node", "-e", script], capture_output=True,
+                             text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), [c[4] for c in cases])
 
 
 # New test classes belong above this guard; never append below it.

@@ -40,7 +40,7 @@ COLOURS="${GIF_COLOURS:-64}"
 mkdir -p "$WORK"
 
 cleanup() {
-  pkill -x -f "python3 tools/demo_env.py --port $C2_PORT" 2>/dev/null || true
+  pkill -x -f "python3 tools/demo_env.py --operator-port $C2_PORT" 2>/dev/null || true
   pkill -x -f "python3 tools/scripted_model.py --port $MODEL_PORT" 2>/dev/null || true
   pkill -f "software.agent .*--bind-port $AGENT_PORT" 2>/dev/null || true
 }
@@ -105,7 +105,7 @@ start_stack() {
       > "$WORK/agent.log" 2>&1 &
   sleep 1
   AGENT_URL="http://127.0.0.1:$AGENT_PORT" nohup python3 tools/demo_env.py \
-      --port "$C2_PORT" --token "$TOKEN" > "$WORK/c2.log" 2>&1 &
+      --operator-port "$C2_PORT" --token "$TOKEN" > "$WORK/c2.log" 2>&1 &
 
   wait_for_http "http://127.0.0.1:$C2_PORT/api/agents" "the C2"
   for _ in $(seq 1 60); do

@@ -4091,11 +4091,26 @@ async function runResponder(){
 }
 
 // ── Beacon Generator ──
+
+// The callback a new beacon should use, or "" when it cannot be known.
+// cfg.host is the beacon socket's bind address, and a specific one is the
+// answer. Bound to every interface, the page's own hostname is the only
+// other clue -- and through the documented SSH tunnel that is localhost,
+// which no remote beacon can reach. A beacon given it never registers and
+// nothing says why, so a loopback page host gives "" rather than a guess.
+function bgDefaultCallbackUrl(cfg, pageHost){
+  const anyHost = h => !h || h==="0.0.0.0" || h==="::" || h==="[::]";
+  const loopback = h => h==="localhost" || h==="::1" || h==="[::1]" || /^127\./.test(h);
+  let host = anyHost(cfg.host) ? (loopback(pageHost) ? "" : pageHost) : cfg.host;
+  if(!host) return "";
+  if(host.includes(":") && host[0]!=="[") host = "["+host+"]";
+  return (cfg.ssl ? "https" : "http")+"://"+host+":"+cfg.port+"/api/v1/beacon";
+}
+
 async function showBeaconGen(){
   const cfg = await api("/api/server/config");
   const gistCheck = await api("/api/server/beacon-gist/check");
-  const proto = cfg.ssl ? "https" : "http";
-  const defaultUrl = proto+"://"+location.hostname+":"+cfg.port+"/api/v1/beacon";
+  const defaultUrl = bgDefaultCallbackUrl(cfg, location.hostname);
   const ghOk = gistCheck.available;
   const overlay = document.createElement("div");
   overlay.className = "loot-overlay";
@@ -4117,6 +4132,7 @@ async function showBeaconGen(){
     +'</div>'
     +'<div id="bg-proto-https-opts" class="bgen-proto-opts">'
     +'<label>C2 Callback URL <input id="bg-url" value="'+esc(defaultUrl)+'" placeholder="https://c2.example.com:8443/api/v1/beacon"></label>'
+    +(defaultUrl ? '' : '<p id="bg-url-note" style="font-size:10px;color:var(--yellow);margin:2px 0 6px">&#9888; Not prefilled: this page is open on loopback, e.g. through an SSH tunnel, so it cannot tell which address beacons can reach. Enter the C2 host as the targets see it, port '+esc(String(cfg.port))+'.</p>')
     +'</div>'
     +'<div id="bg-proto-dns-opts" class="bgen-proto-opts" style="display:none">'
     +'<label>DNS Domain <input id="bg-dns-domain" placeholder="c2.example.com"></label>'
@@ -7627,6 +7643,11 @@ def main():
         help="Data directory for state persistence",
     )
     args = parser.parse_args()
+    # 0 would bind an ephemeral port that the socket policy never matches:
+    # the GUI would be locked out, or beacons sent nowhere, with nothing said.
+    for flag, port in (("--port", args.port), ("--operator-port", args.operator_port)):
+        if not 1 <= port <= 65535:
+            parser.error(f"{flag} must be a port number, 1-65535 (got {port})")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -7731,6 +7752,7 @@ def main():
 
 def _is_loopback(host: str) -> bool:
     return host == "localhost" or host == "::1" or host.startswith("127.")
+
 
 if __name__ == "__main__":
     main()
