@@ -710,6 +710,14 @@ class _ParserReached(Exception):
         self.parser = parser
 
 
+# Why this calls main() at all, and why the create_app patch must stay:
+# main() builds its parser inline, and extracting a _build_parser() would be a
+# production change. So the test runs main() and stops it at parse_args, which
+# is the first thing it does. That is only safe while it stays the first
+# thing. create_app is patched to raise so that if someone puts work ahead of
+# the parse -- reads a key, binds a socket -- this fails loudly instead of
+# starting a server from inside the test suite. Do not "simplify" the patch
+# away: it is the guard that makes calling main() acceptable.
 def _server_parser():
     """The argument parser main() builds, without main() going any further.
 
@@ -797,21 +805,107 @@ class TestTheRedirectorPageMatchesTheServer(unittest.TestCase):
                              "%s %s is not the agent socket's default port"
                              % (directive, target))
 
-    def test_every_flag_the_page_names_is_an_option_of_the_server(self):
-        # Prose, shell and table; not the nginx and Caddy blocks, which are
-        # another program's syntax and may contain a double dash of their own.
-        # A flag follows whitespace, a backtick, a bracket or a quote, so the
-        # "--" that punctuates a sentence (followed by a space) and one inside
-        # a word or a path do not count.
-        prose = self.text
-        for body in _fenced(prose, "nginx", "caddyfile", "caddy"):
-            prose = prose.replace(body, "")
-        flags = set(re.findall(r"(?<![^\s`(\['\"])(--[a-z][a-z0-9-]*)", prose))
-        self.assertTrue(flags, "no flag found in the page")
+    def _flag_table(self):
+        """(flag, default) for each row of the 'two sockets' table."""
+        rows = _rows_under(self.text, "## The two sockets")
+        found = []
+        for row in rows[1:]:
+            cells = re.match(r"\|\s*`(--[a-z][a-z0-9-]*)`\s*\|\s*`([^`]*)`\s*\|",
+                             row)
+            self.assertIsNotNone(cells, "a flag-table row names no flag or "
+                                 "no default in backticks: %s" % row)
+            found.append((cells.group(1), cells.group(2)))
+        return found
+
+    def test_every_default_in_the_flag_table_is_the_parsers(self):
+        table = self._flag_table()
+        self.assertEqual(
+            sorted(flag for flag, _ in table),
+            ["--host", "--operator-host", "--operator-port", "--port"],
+            "the flag table no longer covers the four socket flags")
+        for flag, shown in table:
+            self.assertEqual(shown, str(self.default(flag)),
+                             "the table gives %s a default of %s; the "
+                             "parser's is %s"
+                             % (flag, shown, self.default(flag)))
+
+    def test_every_default_the_prose_states_is_the_parsers(self):
+        # "`--port`, default `8443`": the sentence form of the same fact.
+        flat = re.sub(r"\n\s*>?\s*", " ", self.text)
+        stated = re.findall(r"`(--[a-z][a-z0-9-]*)`, default `([^`]+)`", flat)
+        self.assertTrue(stated, "the page no longer states a default in prose")
+        for flag, shown in stated:
+            self.assertEqual(shown, str(self.default(flag)),
+                             "the prose gives %s a default of %s; the "
+                             "parser's is %s"
+                             % (flag, shown, self.default(flag)))
+
+    def test_the_ssh_forward_names_the_operator_interface(self):
+        # The startup banner builds this line from the operator port and host
+        # (server.py: "ssh -L {operator_port}:{operator_host}:{operator_port}
+        # <user>@<this-host>"). The banner is printed deep inside main(),
+        # past the point this file stops it, so the line is rebuilt here from
+        # the parser's defaults rather than read from the banner.
+        port = self.default("--operator-port")
+        host = self.default("--operator-host")
+        # Any other option on the command (ssh -N -L ...) is the page's own
+        # business; the forward's three fields are the claim.
+        forwards = re.findall(r"^ssh\b[^\n]*?-L (\S+) <user>@<this-host>",
+                              self.text, re.M)
+        self.assertTrue(forwards, "the page no longer shows an ssh forward")
+        for forward in forwards:
+            self.assertEqual(forward, "%s:%s:%s" % (port, host, port),
+                             "the ssh forward is not the banner's form for "
+                             "the operator interface's defaults")
+        opened = re.findall(r"://localhost:(\d+)", self.text)
+        self.assertTrue(opened, "the page no longer says where to open the GUI")
+        for shown in opened:
+            self.assertEqual(shown, str(port), "the page opens localhost:%s; "
+                             "the operator interface is on %s" % (shown, port))
+
+    def _server_flags(self):
+        """The flags the page applies to this server, and nothing else.
+
+        Three places, each one where the subject is unambiguously the server:
+
+        - the flag table's first column;
+        - a command line that runs the server (it names software/c2/server.py
+          or software.c2.server), with its backslash continuations, up to a
+          pipe, `;`, `&&` or comment. Another program's command is not one,
+          even in the same code block;
+        - an inline code span in prose that is bare flags -- it starts with
+          `--` -- or that runs the server. A span led by another command
+          (`curl --insecure`, `ssh -L ...`) belongs to that command.
+
+        Everything else is left alone: other programs' flags, the nginx and
+        Caddy blocks, a "--" in a sentence.
+        """
+        flag = r"(?<![^\s])(--[a-z][a-z0-9-]*)"
+        runs_server = re.compile(r"software[/.]c2[/.]server")
+        flags = {f for f, _ in self._flag_table()}
+
+        fenced = [b for _, b in re.findall(r"^```(\w*)\n(.*?)^```", self.text,
+                                           re.M | re.S)]
+        for body in fenced:
+            for command in re.sub(r"\\\n", " ", body).splitlines():
+                ran = runs_server.search(command)
+                if ran:
+                    rest = re.split(r"[|;]|&&|\s#", command[ran.end():])[0]
+                    flags.update(re.findall(flag, rest))
+
+        prose = re.sub(r"^```\w*\n.*?^```", "", self.text, flags=re.M | re.S)
+        for span in re.findall(r"`([^`]+)`", prose):
+            if span.lstrip().startswith("--") or runs_server.search(span):
+                flags.update(re.findall(r"(?<![^\s])(--[a-z][a-z0-9-]*)", span))
+        return flags
+
+    def test_every_flag_the_page_applies_to_the_server_is_an_option_of_it(self):
+        flags = self._server_flags()
+        self.assertTrue(flags, "no server flag found in the page")
         for flag in sorted(flags):
             self.assertTrue(flag in self.options,
-                            "the page names %s; the server's parser has no "
-                            "such option" % flag)
+                            "the page names %s for the server; the server's "
+                            "parser has no such option" % flag)
 
 
 if __name__ == "__main__":
