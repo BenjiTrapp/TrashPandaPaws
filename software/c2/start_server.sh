@@ -20,7 +20,7 @@ N='\033[0m'       # Reset
 PORT="${PORT:-8443}"
 HOST="${HOST:-0.0.0.0}"
 KEY=""
-DERIVE_KEY=""
+KEY_ORIGIN=""
 TOKEN=""
 SSL=""
 CERT=""
@@ -32,15 +32,14 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)       PORT="$2"; shift 2;;
         --host)       HOST="$2"; shift 2;;
-        --key)        KEY="$2"; shift 2;;
-        --derive-key) DERIVE_KEY="$2"; shift 2;;
+        --key)        KEY="$2"; KEY_ORIGIN="passed with --key"; shift 2;;
         --token)      TOKEN="$2"; shift 2;;
         --ssl)        SSL="--ssl"; shift;;
         --cert)       CERT="$2"; shift 2;;
         --certkey)    CERTKEY="$2"; shift 2;;
         --interactive|-i) INTERACTIVE="1"; shift;;
         -h|--help)
-            echo "Usage: $0 [--port 8443] [--host 0.0.0.0] [--key <b64>] [--derive-key <str>] [--token <str>] [--ssl] [--cert <file>] [--certkey <file>] [-i|--interactive]"
+            echo "Usage: $0 [--port 8443] [--host 0.0.0.0] [--key <b64>] [--token <str>] [--ssl] [--cert <file>] [--certkey <file>] [-i|--interactive]"
             exit 0;;
         *) echo "Unknown option: $1"; exit 1;;
     esac
@@ -172,7 +171,7 @@ else
 fi
 
 # ── Interactive configuration ──
-if [[ -n "$INTERACTIVE" ]] || { [[ -z "$KEY" ]] && [[ -z "$DERIVE_KEY" ]] && [[ -t 0 ]]; }; then
+if [[ -n "$INTERACTIVE" ]] || { [[ -z "$KEY" ]] && [[ -t 0 ]]; }; then
     echo ""
     echo -e "${D}  ─────────────────────────────────────────────${N}"
     echo -e "${Y}  Server Configuration${N}"
@@ -198,14 +197,13 @@ if [[ -n "$INTERACTIVE" ]] || { [[ -z "$KEY" ]] && [[ -z "$DERIVE_KEY" ]] && [[ 
     echo -e "  ${W}Use AES-256-GCM encryption for beacon comms?${N}"
     echo -e "  ${D}Agents must use the same key to communicate.${N}"
     echo ""
-    echo -e "  ${C}[1]${N} ${W}Auto-generate a random key${N}"
+    echo -e "  ${C}[1]${N} ${W}Generate a random key (default)${N}"
     echo -e "  ${C}[2]${N} ${W}Enter a key manually (base64)${N}"
-    echo -e "  ${C}[3]${N} ${W}Derive from callback URL (default)${N}"
     echo ""
-    echo -ne "  ${Y}Choice${N} ${D}[3]${N}${W}: ${N}"
+    echo -ne "  ${Y}Choice${N} ${D}[1]${N}${W}: ${N}"
     read -r INPUT
 
-    case "${INPUT:-3}" in
+    case "${INPUT:-1}" in
         1)
             KEY=$($PYTHON -c "
 import base64, os
@@ -216,6 +214,7 @@ print(base64.b64encode(k).decode())
             echo -e "  ${G}[✓]${N} ${W}Generated random AES-256-GCM key${N}"
             echo -e "  ${C}${KEY}${N}"
             echo -e "  ${R}  ⚠  Save this key — agents need it to connect!${N}"
+            KEY_ORIGIN="generated for this run"
             ;;
         2)
             echo ""
@@ -223,16 +222,13 @@ print(base64.b64encode(k).decode())
             read -r INPUT
             if [[ -n "$INPUT" ]]; then
                 KEY="$INPUT"
+                KEY_ORIGIN="entered by hand"
                 echo -e "  ${G}[✓]${N} ${W}Using provided key${N}"
-            else
-                echo -e "  ${Y}[!]${N} ${W}No key entered — falling back to default derivation${N}"
             fi
             ;;
-        3|"")
-            echo -e "  ${D}[i]${N} ${W}Using default key: SHA256(\":\")${N}"
-            ;;
         *)
-            echo -e "  ${D}[i]${N} ${W}Using default key: SHA256(\":\")${N}"
+            echo -e "  ${R}[✗]${N} ${W}Choose 1 or 2${N}"
+            exit 1
             ;;
     esac
 
@@ -249,29 +245,19 @@ if [[ -z "$TOKEN" ]]; then
     TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(24))" 2>/dev/null || openssl rand -base64 24 | tr -d '=/+' | head -c 32)
 fi
 
-# ── Compute the actual encryption key for display ──
+# ── The key is required: there is no default and none is derived ──
 PROTO="http"
 [[ -n "$SSL" ]] && PROTO="https"
 
-if [[ -n "$KEY" ]]; then
-    ENC_KEY_B64="$KEY"
-    KEY_TYPE="explicit (AES-256-GCM)"
-elif [[ -n "$DERIVE_KEY" ]]; then
-    ENC_KEY_B64=$($PYTHON -c "
-import hashlib, base64
-k = hashlib.sha256('${DERIVE_KEY}'.encode()).digest()
-print(base64.b64encode(k).decode())
-")
-    KEY_TYPE="derived from --derive-key"
-else
-    CALLBACK="${PROTO}://${HOST}:${PORT}/api/v1/beacon"
-    ENC_KEY_B64=$($PYTHON -c "
-import hashlib, base64
-k = hashlib.sha256(':'.encode()).digest()
-print(base64.b64encode(k).decode())
-")
-    KEY_TYPE="DEFAULT — SHA256(\":\")"
+if [[ -z "$KEY" ]]; then
+    echo -e "  ${R}[✗]${N} ${W}No encryption key. The server will not start without one.${N}"
+    echo -e "  ${D}Pass --key <base64>, or run interactively and generate one:${N}"
+    echo -e "  ${D}python3 -c \"import os,base64; print(base64.b64encode(os.urandom(32)).decode())\"${N}"
+    exit 1
 fi
+
+ENC_KEY_B64="$KEY"
+KEY_TYPE="${KEY_ORIGIN} (AES-256-GCM)"
 
 ENC_KEY_PREVIEW="${ENC_KEY_B64:0:32}..."
 
@@ -293,8 +279,7 @@ echo -e "${D}  │${N}  ${C}GUI${N}          ${W}${GUI_STR}${N}$(printf '%*s' $P
 
 PAD_K=$((38 - ${#KEY_TYPE}))
 [[ $PAD_K -lt 0 ]] && PAD_K=0
-KEY_COLOR="$R"
-[[ -n "$KEY" || -n "$DERIVE_KEY" ]] && KEY_COLOR="$G"
+KEY_COLOR="$G"
 echo -e "${D}  │${N}  ${C}Encryption${N}   ${KEY_COLOR}${KEY_TYPE}${N}$(printf '%*s' $PAD_K '')${D}│${N}"
 
 echo -e "${D}  │${N}                                                      ${D}│${N}"
@@ -319,8 +304,7 @@ echo ""
 
 # ── Build command ──
 CMD=("$PYTHON" "$SERVER_PY" "--host" "$HOST" "--port" "$PORT" "--token" "$TOKEN")
-[[ -n "$KEY" ]]        && CMD+=("--key" "$KEY")
-[[ -n "$DERIVE_KEY" ]] && CMD+=("--derive-key" "$DERIVE_KEY")
+CMD+=("--key" "$KEY")
 [[ -n "$SSL" ]]        && CMD+=("--ssl")
 [[ -n "$CERT" ]]       && CMD+=("--cert" "$CERT")
 [[ -n "$CERTKEY" ]]    && CMD+=("--certkey" "$CERTKEY")

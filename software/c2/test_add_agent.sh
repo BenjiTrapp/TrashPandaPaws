@@ -36,8 +36,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: $0 [--host 127.0.0.1] [--port 8443] [--key <b64>] [--interval 5] [--jitter 10] [--ssl]"
             echo ""
-            echo "If --key is omitted, you will be prompted for it."
-            echo "Press Enter without input to derive the key from the callback URL."
+            echo "If --key is omitted, you will be prompted for it. A key is required."
             exit 0;;
         *) echo "Unknown option: $1"; exit 1;;
     esac
@@ -79,22 +78,16 @@ if [[ -z "$KEY" ]]; then
     echo -e "  ${W}Enter a base64 AES-256-GCM key.${N}"
     echo -e "  ${D}This must match the key the server was started with.${N}"
     echo ""
-    echo -e "  ${D}Leave blank to use server default:${N}"
-    echo -e "  ${C}SHA256(\":\")${N}"
-    echo ""
-    echo -ne "  ${Y}Key${N} ${D}(base64 or Enter to derive)${N}${W}: ${N}"
+    echo -ne "  ${Y}Key${N} ${D}(base64)${N}${W}: ${N}"
     read -r KEY
 
     if [[ -z "$KEY" ]]; then
-        KEY=$($PYTHON -c "
-import hashlib, base64
-k = hashlib.sha256(':'.encode()).digest()
-print(base64.b64encode(k).decode())
-")
-        echo -e "  ${G}[✓]${N} ${W}Using server default key: SHA256(':')${N}"
-    else
-        echo -e "  ${G}[✓]${N} ${W}Using explicit key${N}"
+        echo -e "  ${R}[✗]${N} ${W}A key is required; there is no default.${N}"
+        echo -e "  ${D}Use the key the server was started with, or generate one for both:${N}"
+        echo -e "  ${D}python3 -c \"import os,base64; print(base64.b64encode(os.urandom(32)).decode())\"${N}"
+        exit 1
     fi
+    echo -e "  ${G}[✓]${N} ${W}Using explicit key${N}"
 fi
 
 # ── Display config ──

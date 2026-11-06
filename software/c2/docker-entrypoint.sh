@@ -42,8 +42,9 @@ CMD=(python3 /opt/raccoon-c2/server.py
     --data-dir "$DATA"
 )
 
+# No key, no start: the server refuses and says how to make one. There is no
+# default and nothing is derived, so an unset RACCOON_KEY ends here.
 [ -n "$RACCOON_KEY" ]        && CMD+=(--key "$RACCOON_KEY")
-[ -n "$RACCOON_DERIVE_KEY" ] && CMD+=(--derive-key "$RACCOON_DERIVE_KEY")
 [ -n "$RACCOON_TOKEN" ]      && CMD+=(--token "$RACCOON_TOKEN")
 [ -n "$RACCOON_SSL" ]        && CMD+=(--ssl)
 [ -n "$RACCOON_CERT" ]       && CMD+=(--cert "$RACCOON_CERT")

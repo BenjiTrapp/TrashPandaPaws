@@ -14,7 +14,6 @@ param(
     [int]$Port = 8443,
     [string]$Host_ = "0.0.0.0",
     [string]$Key = "",
-    [string]$DeriveKey = "",
     [string]$Token = "",
     [switch]$SSL,
     [string]$Cert = "",
@@ -193,7 +192,10 @@ if ($nxcVer) {
 $Proto = "http"
 if ($SSL) { $Proto = "https" }
 
-if (-not $NoPrompt -and -not $Key -and -not $DeriveKey) {
+$KeyOrigin = ""
+if ($Key) { $KeyOrigin = "passed with -Key" }
+
+if (-not $NoPrompt -and -not $Key) {
     Write-Host ""
     Write-Host "  ─────────────────────────────────────────────" -ForegroundColor DarkGray
     Write-Host "  Server Configuration" -ForegroundColor Yellow
@@ -221,17 +223,15 @@ if (-not $NoPrompt -and -not $Key -and -not $DeriveKey) {
     Write-Host "  Agents must use the same key to communicate." -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  [1] " -ForegroundColor Cyan -NoNewline
-    Write-Host "Auto-generate a random key" -ForegroundColor White
+    Write-Host "Generate a random key (default)" -ForegroundColor White
     Write-Host "  [2] " -ForegroundColor Cyan -NoNewline
     Write-Host "Enter a key manually (base64)" -ForegroundColor White
-    Write-Host "  [3] " -ForegroundColor Cyan -NoNewline
-    Write-Host "Derive from callback URL (default)" -ForegroundColor White
     Write-Host ""
     Write-Host "  Choice " -ForegroundColor Yellow -NoNewline
-    Write-Host "[3]" -ForegroundColor DarkGray -NoNewline
+    Write-Host "[1]" -ForegroundColor DarkGray -NoNewline
     Write-Host ": " -ForegroundColor White -NoNewline
     $Input_ = Read-Host
-    if (-not $Input_) { $Input_ = "3" }
+    if (-not $Input_) { $Input_ = "1" }
 
     switch ($Input_) {
         "1" {
@@ -242,6 +242,7 @@ if (-not $NoPrompt -and -not $Key -and -not $DeriveKey) {
             Write-Host "Generated random AES-256-GCM key" -ForegroundColor White
             Write-Host "  $Key" -ForegroundColor Cyan
             Write-Host "  ! Save this key -- agents need it to connect!" -ForegroundColor Red
+            $KeyOrigin = "generated for this run"
         }
         "2" {
             Write-Host ""
@@ -251,16 +252,15 @@ if (-not $NoPrompt -and -not $Key -and -not $DeriveKey) {
             $Input_ = Read-Host
             if ($Input_) {
                 $Key = $Input_
+                $KeyOrigin = "entered by hand"
                 Write-Host "  [+] " -ForegroundColor Green -NoNewline
                 Write-Host "Using provided key" -ForegroundColor White
-            } else {
-                Write-Host "  [!] " -ForegroundColor Yellow -NoNewline
-                Write-Host "No key entered -- falling back to default derivation" -ForegroundColor White
             }
         }
         default {
-            Write-Host "  [i] " -ForegroundColor DarkGray -NoNewline
-            Write-Host 'Using default key: SHA256(":")' -ForegroundColor White
+            Write-Host "  [x] " -ForegroundColor Red -NoNewline
+            Write-Host "Choose 1 or 2" -ForegroundColor White
+            exit 1
         }
     }
 
@@ -285,22 +285,17 @@ if (-not $Token) {
     }
 }
 
-# -- Compute the actual encryption key for display --
-if ($Key) {
-    $EncKeyB64 = $Key
-    $KeyType = "explicit (AES-256-GCM)"
-    $KeyColor = "Green"
-} elseif ($DeriveKey) {
-    $PyCode = "import hashlib, base64; k = hashlib.sha256('$DeriveKey'.encode()).digest(); print(base64.b64encode(k).decode())"
-    $EncKeyB64 = & $Python -c $PyCode
-    $KeyType = "derived from --derive-key"
-    $KeyColor = "Green"
-} else {
-    $PyCode = "import hashlib, base64; k = hashlib.sha256(':'.encode()).digest(); print(base64.b64encode(k).decode())"
-    $EncKeyB64 = & $Python -c $PyCode
-    $KeyType = 'DEFAULT -- SHA256(":")'
-    $KeyColor = "Red"
+# -- The key is required: there is no default and none is derived --
+if (-not $Key) {
+    Write-Host "  [x] " -ForegroundColor Red -NoNewline
+    Write-Host "No encryption key. The server will not start without one." -ForegroundColor White
+    Write-Host "  Pass -Key <base64>, or run interactively and generate one:" -ForegroundColor DarkGray
+    Write-Host '  python -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"' -ForegroundColor DarkGray
+    exit 1
 }
+$EncKeyB64 = $Key
+$KeyType = "$KeyOrigin (AES-256-GCM)"
+$KeyColor = "Green"
 
 $EncKeyB64 = $EncKeyB64.Trim()
 
@@ -352,8 +347,7 @@ Write-Host ""
 
 # -- Build command --
 $PyArgs = @($ServerPy, "--host", $Host_, "--port", $Port, "--token", $Token)
-if ($Key)      { $PyArgs += "--key", $Key }
-if ($DeriveKey){ $PyArgs += "--derive-key", $DeriveKey }
+$PyArgs += "--key", $Key
 if ($SSL)      { $PyArgs += "--ssl" }
 if ($Cert)     { $PyArgs += "--cert", $Cert }
 if ($CertKey)  { $PyArgs += "--certkey", $CertKey }

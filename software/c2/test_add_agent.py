@@ -5,14 +5,10 @@ Used by test_add_agent.sh / test_add_agent.ps1.
 
 Usage:
   python test_add_agent.py --host 127.0.0.1 --port 8443 --key <b64>
-  python test_add_agent.py --derive-key "http://c2:8443/api/v1/beacon:"
-  python test_add_agent.py  # defaults: localhost:8443, derived from callback URL
+  python test_add_agent.py --key <b64>   # --key is required; the server's key
 """
 
 import argparse
-import base64
-import hashlib
-import os
 import signal
 import sys
 import time
@@ -20,16 +16,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from software.c2.beacon import Beacon
+from software.c2.beacon import Beacon, decode_key
 
 
 def main():
     parser = argparse.ArgumentParser(description="Raccoon C2 — Test Agent")
     parser.add_argument("--host", default="127.0.0.1", help="Server IP (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8443, help="Server port (default: 8443)")
-    parser.add_argument("--key", default="", help="Base64 AES-256-GCM key")
-    parser.add_argument("--derive-key", dest="derive_key", default="",
-                        help="Derive key from 'callback_url:domain' string")
+    parser.add_argument("--key", default="",
+                        help="Base64 AES-256-GCM key (required; the server's)")
     parser.add_argument("--interval", type=int, default=5, help="Beacon interval in seconds (default: 5)")
     parser.add_argument("--jitter", type=int, default=10, help="Jitter percent (default: 10)")
     parser.add_argument("--ssl", action="store_true", help="Use HTTPS")
@@ -38,23 +33,18 @@ def main():
     proto = "https" if args.ssl else "http"
     callback_url = f"{proto}://{args.host}:{args.port}/api/v1/beacon"
 
-    enc_key = ""
-    if args.key:
-        try:
-            base64.b64decode(args.key)
-            enc_key = args.key
-        except Exception:
-            print(f"[!] Invalid base64 key: {args.key!r}")
-            print("    Provide a valid base64 AES-256-GCM key, or omit --key to auto-derive.")
-            sys.exit(1)
-    elif args.derive_key:
-        raw_key = hashlib.sha256(args.derive_key.encode()).digest()
-        enc_key = base64.b64encode(raw_key).decode()
-
-    if not enc_key:
-        raw_key = hashlib.sha256(b":").digest()
-        enc_key = base64.b64encode(raw_key).decode()
-        print('[*] No key provided — using server default: SHA256(":")')
+    # The key is validated by the beacon itself, which names the problem
+    # and never the value; this only turns its refusal into a clean exit.
+    enc_key = args.key
+    try:
+        decode_key(enc_key)
+    except ValueError as exc:
+        refusal = str(exc)
+    else:
+        refusal = None
+    if refusal:
+        print(f"[!] {refusal}")
+        sys.exit(1)
 
     config = {
         "c2": {

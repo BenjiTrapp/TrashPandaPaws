@@ -70,22 +70,20 @@ if (-not $Key) {
     Write-Host "  Enter a base64 AES-256-GCM key." -ForegroundColor White
     Write-Host "  This must match the key the server was started with." -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  Leave blank to use server default:" -ForegroundColor DarkGray
-    Write-Host "  SHA256("":"")" -ForegroundColor Cyan
-    Write-Host ""
     Write-Host "  Key " -ForegroundColor Yellow -NoNewline
-    Write-Host "(base64 or Enter to derive)" -ForegroundColor DarkGray -NoNewline
+    Write-Host "(base64)" -ForegroundColor DarkGray -NoNewline
     Write-Host ": " -ForegroundColor White -NoNewline
     $Key = Read-Host
 
     if (-not $Key) {
-        $Key = & $Python -c "import hashlib, base64; k = hashlib.sha256(':'.encode()).digest(); print(base64.b64encode(k).decode())"
-        Write-Host "  [+] " -ForegroundColor Green -NoNewline
-        Write-Host "Using server default key: SHA256(':')" -ForegroundColor White
-    } else {
-        Write-Host "  [+] " -ForegroundColor Green -NoNewline
-        Write-Host "Using explicit key" -ForegroundColor White
+        Write-Host "  [x] " -ForegroundColor Red -NoNewline
+        Write-Host "A key is required; there is no default." -ForegroundColor White
+        Write-Host "  Use the key the server was started with, or generate one for both:" -ForegroundColor DarkGray
+        Write-Host '  python -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"' -ForegroundColor DarkGray
+        exit 1
     }
+    Write-Host "  [+] " -ForegroundColor Green -NoNewline
+    Write-Host "Using explicit key" -ForegroundColor White
 }
 
 # -- Display config --
