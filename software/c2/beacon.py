@@ -1746,10 +1746,11 @@ class Beacon:
                 try:
                     return self._decrypt(txt)
                 except Exception:
-                    try:
-                        return json.loads(base64.b64decode(txt))
-                    except Exception:
-                        pass
+                    # This used to fall back to json.loads(b64decode(txt)),
+                    # so anyone able to answer the TXT query could task the
+                    # implant without the key. A record that does not decrypt
+                    # is not tasking; try the next one.
+                    continue
         except Exception as e:
             logger.debug("DNS beacon failed: %s", e)
         return None
@@ -1988,7 +1989,10 @@ class Beacon:
             try:
                 return self._decrypt(resp_data.decode() if isinstance(resp_data, bytes) else resp_data)
             except Exception:
-                return json.loads(resp_data)
+                # This used to fall back to json.loads(resp_data), accepting
+                # unencrypted tasking from anything on the pipe. A response
+                # that does not decrypt is a failed exchange.
+                return None
         except Exception as e:
             logger.debug("SMB beacon failed: %s", e)
             return None
@@ -2087,7 +2091,11 @@ class Beacon:
             try:
                 return self._decrypt(resp_payload.decode())
             except Exception:
-                return json.loads(resp_payload)
+                # This used to fall back to json.loads(resp_payload),
+                # accepting unencrypted tasking from any UDP sender that
+                # answered. A response that does not decrypt is a failed
+                # exchange.
+                return None
         except Exception as e:
             logger.debug("QUIC beacon failed: %s", e)
             return None
