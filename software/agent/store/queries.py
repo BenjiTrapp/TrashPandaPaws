@@ -123,11 +123,32 @@ def update_task(conn, task_id, status, result) -> None:
 
 # ── Findings ──
 
-def log_finding(conn, run_id, host, finding_type, data, source) -> int:
+# How a finding was established. Three values and no free text: the
+# column exists to stop "probably" and "seems to", which is exactly what
+# a free-text field would fill up with.
+PROOF_BASES = ("executed-live", "executed-lab", "inferred")
+
+# A finding can cite the output of `nmap -sV`. A report that inlines
+# forty kilobytes of it is not a report, and the lines that matter are
+# always near the top.
+EVIDENCE_LIMIT = 4000
+
+_TRUNCATED = "\n[... evidence truncated at %d characters]" % EVIDENCE_LIMIT
+
+
+def log_finding(conn, run_id, host, finding_type, data, source,
+                evidence=None, proof_basis=None) -> int:
+    if proof_basis is not None and proof_basis not in PROOF_BASES:
+        raise ValueError("proof_basis must be one of %s, got %r"
+                         % (", ".join(PROOF_BASES), proof_basis))
+    if evidence is not None and len(evidence) > EVIDENCE_LIMIT:
+        evidence = evidence[:EVIDENCE_LIMIT - len(_TRUNCATED)] + _TRUNCATED
     cur = conn.execute(
-        "INSERT INTO findings (run_id, host, finding_type, data, source, timestamp) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (run_id, host, finding_type, data, source, _now()),
+        "INSERT INTO findings (run_id, host, finding_type, data, source, "
+        "evidence, proof_basis, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (run_id, host, finding_type, data, source, evidence, proof_basis,
+         _now()),
     )
     conn.commit()
     return cur.lastrowid

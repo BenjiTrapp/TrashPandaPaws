@@ -47,6 +47,7 @@ from typing import Any, Dict, List, Optional
 from aiohttp import web
 
 from software.agent import c2client, config, safety, scheduler
+from software.agent import report as agent_report
 from software.agent.llm import failover, provider
 from software.agent.orchestrator import Campaign, restore_orphans
 from software.agent.store import queries
@@ -245,6 +246,28 @@ class _Service:
                 for key, row in sorted(safety.RISK_TABLE.items())
                 if row.tier == safety.TIER_HARD],
             "campaigns": self._campaigns()})
+
+    async def report(self, request):
+        """The campaign's deliverable, as Markdown.
+
+        Text rather than a JSON envelope: an operator saves it, pastes it
+        into a ticket, or commits it beside the engagement notes, and a
+        JSON string makes all three worse.
+        """
+        run_id = int(request.match_info["run_id"])
+        if not self._run_exists(run_id):
+            # Not an empty report: that would be filed as evidence that a
+            # campaign found nothing, for a campaign that never ran.
+            return _json({"error": "no such run"}, status=404)
+        body = agent_report.render(self.conn, run_id)
+        return web.Response(
+            text=body, content_type="text/markdown", charset="utf-8",
+            headers={"Content-Disposition":
+                     'attachment; filename="campaign-%d-report.md"' % run_id})
+
+    def _run_exists(self, run_id) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is not None
 
     def _db_ready(self) -> bool:
         try:
@@ -611,6 +634,7 @@ def make_app(cfg, conn, c2, manager, *,
         web.get(r"/campaign/{run_id:\d+}", service.campaign_status),
         web.get(r"/campaign/{run_id:\d+}/stream", service.stream),
         web.get(r"/campaign/{run_id:\d+}/event/{seq:\d+}", service.event),
+        web.get(r"/campaign/{run_id:\d+}/report", service.report),
         web.get(r"/campaign/{run_id:\d+}/approvals", service.approvals),
         web.post(r"/campaign/{run_id:\d+}/approve", service.approve),
         web.post(r"/campaign/{run_id:\d+}/pause", service.pause),

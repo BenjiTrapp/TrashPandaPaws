@@ -37,6 +37,14 @@ CREATE TABLE IF NOT EXISTS findings (
     finding_type  TEXT NOT NULL,
     data          TEXT NOT NULL,
     source        TEXT NOT NULL DEFAULT '',
+    -- The output that proved it, truncated. Without this the report has
+    -- an evidence block with nothing in it, and a reader has no way to
+    -- see what the agent actually saw.
+    evidence      TEXT,
+    -- executed-live | executed-lab | inferred. An executed proof
+    -- outranks a static conclusion, and a finding read off a version
+    -- string must not look like one that was reproduced.
+    proof_basis   TEXT,
     timestamp     TEXT NOT NULL
 );
 

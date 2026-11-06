@@ -17,6 +17,7 @@ The assertions that carry the most weight:
 import asyncio
 import inspect
 import json
+import re
 import shlex
 import sys
 import unittest
@@ -1705,6 +1706,73 @@ class TestTheExecutorIsGivenTheBeaconItMayUse(_Case):
         await camp.start()
         await camp.wait()
         self.assertIn("raccoon-fox (Linux 6.1.0)", client.calls[1]["system"])
+
+
+class TestTheTaskCarriesTheRemainingBudget(_Case):
+    """prompts.budget_line is decoration unless something calls it.
+
+    The figures have to be the campaign's real ones and they have to
+    move: a constant would be worse than nothing, because the model
+    would reason confidently from a number that never changes.
+    """
+
+    async def test_the_task_prompt_states_what_is_left(self):
+        conn, c2 = _env()
+        client = _Script([
+            mock.calls(("dispatch_task", {"task_name": "recon",
+                                          "task_description": "look around"})),
+            mock.text("TASK: recon\nSTATUS: success"),
+            mock.text("seen")])
+        camp = _campaign(conn, c2, client, max_tokens_total=500000,
+                         max_runtime_seconds=7200)
+        await camp.start()
+        await camp.wait()
+        # Call 1 is the executor's: the orchestrator dispatched on call 0.
+        executor_prompt = client.told(1)
+        self.assertIn("Budget", executor_prompt)
+        self.assertIn("tokens", executor_prompt)
+
+    async def test_the_figure_falls_as_the_campaign_spends(self):
+        conn, c2 = _env()
+        # Big per-turn cost so the drop is visible in whole thousands.
+        client = _Script([
+            mock.calls(("dispatch_task", {"task_name": "one",
+                                          "task_description": "a"}),
+                       total_tokens=40000),
+            mock.text("TASK: one\nSTATUS: success", total_tokens=40000),
+            mock.calls(("dispatch_task", {"task_name": "two",
+                                          "task_description": "b"}),
+                       total_tokens=40000),
+            mock.text("TASK: two\nSTATUS: success", total_tokens=40000),
+            mock.text("finished", total_tokens=40000)])
+        camp = _campaign(conn, c2, client, max_tokens_total=500000,
+                         max_runtime_seconds=7200)
+        await camp.start()
+        await camp.wait()
+        first = _tokens_in(client.told(1))
+        second = _tokens_in(client.told(3))
+        self.assertLess(second, first,
+                        "the budget did not move between the two tasks")
+
+    async def test_a_campaign_with_no_token_limit_still_gets_a_line(self):
+        # max_runtime_seconds alone is enough to say something useful.
+        conn, c2 = _env()
+        client = _Script([
+            mock.calls(("dispatch_task", {"task_name": "x",
+                                          "task_description": "y"})),
+            mock.text("TASK: x\nSTATUS: success"),
+            mock.text("seen")])
+        camp = _campaign(conn, c2, client, max_runtime_seconds=7200)
+        await camp.start()
+        await camp.wait()
+        self.assertIn("Budget", client.told(1))
+
+
+def _tokens_in(prompt):
+    found = re.search(r"Budget[^\\n\"]*?(\d+)k tokens", prompt)
+    assert found, prompt[:400]
+    return int(found.group(1))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,9 +62,18 @@ def _run_command(ctx):
 
 
 def _log_discovery(ctx):
-    async def log_discovery(finding_type, data, host=None):
+    async def log_discovery(finding_type, data, host=None, evidence=None,
+                            proof_basis=None):
+        basis = clean(proof_basis)
+        if basis is not None and basis not in queries.PROOF_BASES:
+            # Handed back rather than raised: the model can fix it on the
+            # next turn, and a tool that crashes on a bad enum costs the
+            # whole task.
+            return {"error": "proof_basis must be one of %s"
+                             % ", ".join(queries.PROOF_BASES)}
         queries.log_finding(ctx.conn, ctx.run_id, clean(host) or NO_HOST,
-                            as_text(finding_type), as_text(data), "executor")
+                            as_text(finding_type), as_text(data), "executor",
+                            evidence=clean(evidence), proof_basis=basis)
         return {"logged": True}
     return log_discovery
 
@@ -149,7 +158,23 @@ def entries():
                                                      "host, service, os, vuln "
                                                      "or credential"},
                      "data": {"type": "string",
-                              "description": "the finding itself"}},
+                              "description": "the finding itself"},
+                     "evidence": {
+                         "type": "string",
+                         "description": "the output that proves it, quoted. "
+                                        "The lines a reader needs to see, "
+                                        "not the whole command output."},
+                     "proof_basis": {
+                         "type": "string",
+                         "enum": list(queries.PROOF_BASES),
+                         "description": "how this was established. "
+                                        "executed-live: you ran it against "
+                                        "the target and saw the result. "
+                                        "executed-lab: you reproduced it "
+                                        "elsewhere. inferred: you read it "
+                                        "off a version, a banner or a "
+                                        "configuration without triggering "
+                                        "it."}},
                  "required": ["finding_type", "data"]}),
             ("executor",), BARE, _log_discovery),
         Entry(

@@ -566,5 +566,130 @@ class TestTargetOutputIsNamedAsData(unittest.TestCase):
             text = prompts.executor(["batch"], scope=_scope(), tier=tier)
             self.assertIn("instructions", text.lower(), tier)
 
+
+class TestTheFindingBarIsStated(unittest.TestCase):
+    """A report is only worth reading if the findings in it are.
+
+    Before this, log_discovery took a host, a type and some text and
+    wrote whatever it was given. Nothing asked the model to try to
+    disprove a candidate first, nothing distinguished a vulnerability it
+    reproduced from one it read off a version string, and -- the line
+    that matters most -- nothing said that finding nothing is a valid
+    outcome. An agent whose only measure is output will produce output.
+
+    The wording is mine; the shape is ARTEX's, whose own prompt is the
+    best part of that project.
+    """
+
+    def _exec(self):
+        return prompts.executor(["batch"], scope=_scope(), tier="full")
+
+    def test_zero_findings_is_stated_to_be_a_valid_outcome(self):
+        # Without this sentence the rest of the bar reads as an obstacle
+        # to get past rather than a standard to meet.
+        text = self._exec().lower()
+        self.assertTrue(
+            "no findings" in text or "nothing" in text,
+            "the preamble does not say that finding nothing is acceptable")
+        self.assertIn("valid", text)
+
+    def test_the_proof_basis_and_its_values_are_explained(self):
+        text = self._exec()
+        self.assertIn("proof_basis", text)
+        for value in ("executed-live", "inferred"):
+            self.assertIn(value, text)
+
+    def test_evidence_is_asked_for_with_the_finding(self):
+        self.assertIn("evidence", self._exec())
+
+    def test_the_model_is_told_to_argue_the_opposite_first(self):
+        # The one instruction that turns a hypothesis into a finding.
+        text = self._exec().lower()
+        self.assertTrue(
+            any(w in text for w in ("disprove", "opposite", "rule out")),
+            "nothing asks the model to try to disprove a candidate")
+
+    def test_the_orchestrator_gets_the_bar_too(self):
+        # remember_finding is the orchestrator's, and it writes to the
+        # same table the report is built from.
+        text = _orch().lower()
+        self.assertIn("proof_basis", text)
+
+
+class TestTheDeadlineContractIsStated(unittest.TestCase):
+    """The model never knew how much budget was left.
+
+    Measured before: zero mentions of remaining runtime or tokens in
+    either preamble. A campaign has a two-hour wall clock and a 500k
+    token budget, and this project's own ledger holds the evidence for
+    why that matters -- a rate-limited thousand-port scan takes about
+    seven minutes, and one live run had an executor block on exactly
+    that until the run was cut off.
+
+    The contract is ARTEX's: never start work whose timeout can outlive
+    what remains, prefer the smaller variant that lands, and land what
+    you already have rather than opening new work.
+    """
+
+    def _exec(self):
+        return prompts.executor(["batch"], scope=_scope(), tier="full")
+
+    def test_the_contract_is_in_the_preamble(self):
+        text = self._exec().lower()
+        self.assertIn("budget", text)
+        self.assertTrue(
+            any(w in text for w in ("remaining", "what is left", "runs out")),
+            "nothing tells the model to reason about what is left")
+
+    def test_it_is_told_to_prefer_the_variant_that_lands(self):
+        text = self._exec().lower()
+        self.assertTrue(
+            any(w in text for w in ("smaller", "narrower", "that finishes")),
+            "nothing says to choose the smaller variant")
+
+    def test_it_is_told_to_land_what_it_has(self):
+        # The failure this prevents: a run cut off with everything still
+        # in the model's head and nothing in the findings table.
+        text = self._exec().lower()
+        self.assertTrue("record" in text or "land" in text)
+
+
+class TestTheBudgetIsHandedToTheTask(unittest.TestCase):
+    """The numbers themselves, fresh at the start of each task.
+
+    Not in the preamble: that is built once per task and would be stale
+    by the turn it mattered. The task prompt is built per dispatch, so
+    the figures are accurate when the executor starts choosing commands
+    -- and the wording says as of when, rather than implying they stay
+    true.
+    """
+
+    def test_the_remaining_tokens_and_seconds_are_named(self):
+        line = prompts.budget_line(tokens_left=120000, seconds_left=900.0)
+        self.assertIn("120", line)
+        self.assertIn("15", line)        # 900 seconds as minutes
+
+    def test_it_says_when_the_figures_were_taken(self):
+        line = prompts.budget_line(tokens_left=1000, seconds_left=60.0).lower()
+        self.assertTrue("start of this task" in line or "as of" in line)
+
+    def test_a_nearly_spent_budget_says_to_stop_opening_work(self):
+        # The one case where the behaviour has to change rather than
+        # merely be informed.
+        line = prompts.budget_line(tokens_left=2000, seconds_left=45.0).lower()
+        self.assertTrue(
+            any(w in line for w in ("nearly", "almost", "stop opening")),
+            line)
+
+    def test_a_generous_budget_does_not_sound_an_alarm(self):
+        line = prompts.budget_line(tokens_left=480000,
+                                   seconds_left=7000.0).lower()
+        self.assertNotIn("nearly", line)
+
+    def test_no_limits_configured_produces_nothing(self):
+        # A campaign with the budget disabled should not be handed a
+        # sentence about a budget it does not have.
+        self.assertEqual(prompts.budget_line(None, None), "")
+
 if __name__ == "__main__":
     unittest.main()

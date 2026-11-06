@@ -1134,5 +1134,54 @@ class TestAFallbackKeyNeverReachesTheResponse(_ServiceCase):
         self.assertNotIn("sk-fallback-secret", json.dumps(body))
         self.assertNotIn("api_key", json.dumps(body["fallbacks"]))
 
+
+class TestTheReportIsServedAsMarkdown(_ServiceCase):
+    """The deliverable has to leave the machine somehow.
+
+    Markdown as text rather than inside a JSON string: an operator saves
+    it, pastes it into a ticket, or commits it next to the engagement
+    notes, and a JSON envelope makes all three worse.
+    """
+
+    async def get_application(self):
+        self.rig = _rig()
+        return self.rig.app
+
+    async def test_a_run_produces_a_report(self):
+        rid = queries.create_run(self.rig.conn, "campaign", None, "auto", "{}")
+        resp = await self.get("/campaign/%d/report" % rid)
+        self.assertEqual(resp.status, 200)
+        body = await resp.text()
+        self.assertIn("# Campaign report", body)
+
+    async def test_it_is_served_as_text_not_json(self):
+        rid = queries.create_run(self.rig.conn, "campaign", None, "auto", "{}")
+        resp = await self.get("/campaign/%d/report" % rid)
+        self.assertIn("markdown", resp.headers.get("Content-Type", ""))
+
+    async def test_it_offers_a_filename_so_a_browser_saves_it(self):
+        rid = queries.create_run(self.rig.conn, "campaign", None, "auto", "{}")
+        resp = await self.get("/campaign/%d/report" % rid)
+        disposition = resp.headers.get("Content-Disposition", "")
+        self.assertIn("attachment", disposition)
+        self.assertIn(str(rid), disposition)
+
+    async def test_an_unknown_run_is_a_404_not_an_empty_report(self):
+        # An empty report for a run that never existed would be filed as
+        # evidence that a campaign found nothing.
+        resp = await self.get("/campaign/9999/report")
+        self.assertEqual(resp.status, 404)
+
+    async def test_the_findings_reach_the_report(self):
+        rid = queries.create_run(self.rig.conn, "campaign", None, "auto", "{}")
+        queries.log_finding(self.rig.conn, rid, "10.0.1.5", "service",
+                            "vsftpd 2.3.4", "executor",
+                            evidence="2121/tcp open ftp",
+                            proof_basis="executed-live")
+        body = await (await self.get("/campaign/%d/report" % rid)).text()
+        self.assertIn("vsftpd 2.3.4", body)
+        self.assertIn("executed-live", body)
+        self.assertIn("2121/tcp open ftp", body)
+
 if __name__ == "__main__":
     unittest.main()

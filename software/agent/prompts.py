@@ -385,6 +385,114 @@ def _untrusted_output_section(for_executor) -> str:
         "expected: comments, filenames, hostnames, certificate fields.")
 
 
+def _finding_bar_section(for_executor) -> str:
+    """What has to be true before something is recorded as a finding.
+
+    The tools took a host, a type and some text and wrote whatever they
+    were given. Nothing asked the model to try to disprove a candidate
+    first, nothing separated a vulnerability it reproduced from one it
+    read off a version string, and nothing said that finding nothing is
+    a valid outcome -- which is the line that matters most, because an
+    agent whose only measure is output will produce output.
+
+    Shorter than ARTEX's, which runs to five axes and a priority
+    discipline. That length earns its keep in bug-bounty work where a
+    weak finding costs a triager's afternoon. Here the campaign is a
+    network sweep from a drop-box, the reader is the operator who
+    authorised it, and the preamble goes out on every turn.
+    """
+    recorder = "log_discovery" if for_executor else "remember_finding"
+    return (
+        "Findings. Before you record one, try to disprove it: can it be "
+        "explained by something benign, does it need a starting position "
+        "you do not have, is the host even inside the scope? A candidate "
+        "you could not rule out is a finding; one you have not tried to "
+        "rule out is a guess.\n"
+        "- Give %s the evidence with the finding: the output "
+        "lines that prove it, quoted, not the whole command output.\n"
+        "- Give it a proof_basis. executed-live when you ran it against "
+        "the target and saw the result, executed-lab when you reproduced "
+        "it elsewhere, inferred when you read it off a version, a banner "
+        "or a configuration without triggering it. An executed proof "
+        "outranks an inferred one, and something never triggered is "
+        "suspected, never confirmed.\n"
+        "- Finding nothing is a valid outcome and a useful one. \"Tested "
+        "X across Y with method Z, clean\" is real work; record it as a "
+        "finding with its own evidence. Do not lower this bar to have "
+        "something to report." % recorder)
+
+
+# Below this much of either budget the wording stops informing and starts
+# instructing. Set so that one rate-limited thousand-port scan -- about
+# seven minutes and a few thousand tokens of output -- cannot fit in what
+# is left, because that is the command that actually overruns.
+_NEARLY_SPENT_SECONDS = 600.0
+_NEARLY_SPENT_TOKENS = 20000
+
+
+def budget_line(tokens_left, seconds_left) -> str:
+    """What is left, as of the start of a task.
+
+    Handed to the task rather than the preamble: the preamble is built
+    once per task and would be stale by the turn it mattered, while the
+    task prompt is built per dispatch. The wording says as of when, so
+    the figures are not read as staying true.
+    """
+    if tokens_left is None and seconds_left is None:
+        return ""
+    parts = []
+    if tokens_left is not None:
+        parts.append("%s tokens" % _thousands(tokens_left))
+    if seconds_left is not None:
+        parts.append(_duration(seconds_left))
+    nearly = ((seconds_left is not None
+               and seconds_left < _NEARLY_SPENT_SECONDS)
+              or (tokens_left is not None
+                  and tokens_left < _NEARLY_SPENT_TOKENS))
+    line = ("Budget, as of the start of this task: %s remaining."
+            % " and ".join(parts))
+    if nearly:
+        line += (" That is nearly spent: stop opening new work, finish what "
+                 "is in hand, and record every finding you already have "
+                 "before it runs out.")
+    return line
+
+
+def _thousands(value) -> str:
+    value = int(value)
+    return "%dk" % round(value / 1000.0) if value >= 1000 else str(value)
+
+
+def _duration(seconds) -> str:
+    seconds = float(seconds)
+    if seconds >= 3600:
+        return "%.1f hours" % (seconds / 3600.0)
+    if seconds >= 60:
+        return "%d minutes" % round(seconds / 60.0)
+    return "%d seconds" % round(seconds)
+
+
+def _deadline_section() -> str:
+    """Why a command has to fit in what is left.
+
+    A campaign has a wall clock and a token budget, and until now the
+    model knew neither. This project's own ledger holds the evidence: a
+    rate-limited thousand-port scan takes about seven minutes, and one
+    live run had an executor block on exactly that until the campaign was
+    cut off with its findings still unrecorded.
+    """
+    return (
+        "Budget. This campaign has a token budget and a wall clock, and "
+        "each task is told what remains when it starts. Before you run "
+        "anything, ask whether it can finish inside what is left: a scan "
+        "that would still be running when the budget runs out costs the "
+        "whole of it and returns nothing. Prefer the smaller variant that "
+        "finishes -- fewer ports, one host rather than a range -- over the "
+        "thorough one that does not. When the budget is nearly spent, stop "
+        "opening new work and record what you already have: a finding that "
+        "exists only in this conversation is lost when the run ends.")
+
+
 def orchestrator(caps_by_beacon, scope, phases, tier, os_by_beacon=None) -> str:
     caps_by_beacon = caps_by_beacon or {}
     phases = set(phases)
@@ -405,6 +513,8 @@ def orchestrator(caps_by_beacon, scope, phases, tier, os_by_beacon=None) -> str:
         _scan_section(),
         _scope_section(scope, for_executor=False),
         _untrusted_output_section(for_executor=False),
+        _finding_bar_section(for_executor=False),
+        _deadline_section(),
         _tier_section(phases, _wifi_phases_shown(caps_by_beacon, phases)),
         _phase_section(caps_by_beacon, phases),
     ]
@@ -448,6 +558,8 @@ def executor(caps, scope, tier, caps_by_beacon=None,
         "If the task cannot be done inside the scope, say so under ERRORS and "
         "stop.",
         _untrusted_output_section(for_executor=True),
+        _finding_bar_section(for_executor=True),
+        _deadline_section(),
         "Commands. Give run_command one plain command at a time, with no "
         "shell syntax. If a result carries blocked_reason, the command was "
         "refused: read the reason and change the command, or report it, and "

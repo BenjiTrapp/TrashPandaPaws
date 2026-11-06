@@ -512,6 +512,20 @@ class Campaign:
             self._conn, self.run_id)["total_tokens"]
         self._armed_at = time.monotonic()
 
+    def _task_prompt(self, name, description) -> str:
+        """The task, with what remains of the budget when it starts.
+
+        Here rather than in the preamble: the preamble is built once per
+        task and would be stale by the turn the figure mattered. The
+        wording in prompts.budget_line says as of when, so the numbers
+        are not read as holding for the whole task.
+        """
+        budget = prompts.budget_line(
+            max(0, self._cfg.max_tokens_total - self._tokens_used()),
+            max(0.0, self._cfg.max_runtime_seconds - self._elapsed()))
+        head = "Task name: %s\n\n%s" % (name, description)
+        return "%s\n\n%s" % (head, budget) if budget else head
+
     def _tokens_used(self, pending=0) -> int:
         total = queries.get_run_token_summary(
             self._conn, self.run_id)["total_tokens"]
@@ -628,7 +642,7 @@ class Campaign:
                 system=prompts.executor(caps, self._cfg, tier,
                                         caps_by_beacon=self._caps,
                                         os_by_beacon=self._platforms),
-                prompt="Task name: %s\n\n%s" % (name, description),
+                prompt=self._task_prompt(name, description),
                 tools=self._watch(tools),
                 max_turns=self._limits["executor_turns"],
                 conn=self._conn, run_id=self.run_id,

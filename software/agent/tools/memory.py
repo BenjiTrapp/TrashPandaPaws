@@ -93,10 +93,16 @@ def _search_memory(ctx):
 
 
 def _remember_finding(ctx):
-    async def remember_finding(host, finding_type, data):
+    async def remember_finding(host, finding_type, data, evidence=None,
+                               proof_basis=None):
+        basis = clean(proof_basis)
+        if basis is not None and basis not in queries.PROOF_BASES:
+            return {"error": "proof_basis must be one of %s"
+                             % ", ".join(queries.PROOF_BASES)}
         queries.log_finding(ctx.conn, ctx.run_id, clean(host) or NO_HOST,
                             as_text(finding_type), as_text(data),
-                            "orchestrator")
+                            "orchestrator", evidence=clean(evidence),
+                            proof_basis=basis)
         return {"logged": True}
     return remember_finding
 
@@ -159,7 +165,16 @@ def entries():
                      "finding_type": {"type": "string",
                                       "description": "the kind of finding"},
                      "data": {"type": "string",
-                              "description": "the finding itself"}},
+                              "description": "the finding itself"},
+                     "evidence": {
+                         "type": "string",
+                         "description": "the output or report line that "
+                                        "proves it, quoted"},
+                     "proof_basis": {
+                         "type": "string",
+                         "enum": list(queries.PROOF_BASES),
+                         "description": "executed-live, executed-lab or "
+                                        "inferred -- see log_discovery"}},
                  "required": ["host", "finding_type", "data"]}),
             ("orchestrator",), CORE, _remember_finding),
         Entry(
