@@ -41,7 +41,7 @@ from typing import Any, Dict, List, Optional
 from croniter import CroniterBadDateError, CroniterError, croniter
 
 from software.agent import config
-from software.agent.llm import provider
+from software.agent.llm import failover, provider
 from software.agent.orchestrator import Campaign
 from software.agent.store import queries
 
@@ -155,7 +155,7 @@ class _Refused(Exception):
 
 
 async def poll_once(conn, manager, cfg, *, c2,
-                    client_factory=provider.create_client) -> List[int]:
+                    client_factory=failover.create_chain) -> List[int]:
     """Settle the runs that ended, then start what is due; the ids started.
 
     `c2` and `client_factory` are what a Campaign is built from, which the
@@ -317,7 +317,7 @@ def _notify(row, run_id, result) -> None:
 # ── Loop ──
 
 
-def start_loop(conn, manager, cfg, *, c2, client_factory=provider.create_client,
+def start_loop(conn, manager, cfg, *, c2, client_factory=failover.create_chain,
                interval=POLL_SECONDS) -> asyncio.Task:
     return asyncio.get_running_loop().create_task(
         _loop(conn, manager, cfg, c2, client_factory, interval))

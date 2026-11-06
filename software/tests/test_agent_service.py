@@ -1087,5 +1087,52 @@ class TestABeaconIsOfferedUnderTheIdThatWorks(_ServiceCase):
         body = await (await self.get("/beacons")).json()
         self.assertEqual(body["beacons"][0]["id"], "only-this")
 
+
+class TestTheStatusNamesTheFallbackChain(_ServiceCase):
+    """A chain nobody can see is a chain nobody trusts.
+
+    The GUI's model line shows one provider. With a chain configured, an
+    operator has no way to tell that a second one exists, which it will
+    switch to, or that the primary is currently cooling down -- and the
+    moment that matters is the moment a campaign is running on the
+    fallback and the token counts are filed under a different model than
+    the form shows.
+    """
+
+    LINKS = ()
+
+    async def get_application(self):
+        return _rig(fallbacks=self.LINKS).app
+
+    async def test_no_chain_reports_an_empty_list(self):
+        body = await (await self.get("/status")).json()
+        self.assertEqual(body.get("fallbacks"), [])
+
+
+class TestEachFallbackLinkIsNamed(_ServiceCase):
+    async def get_application(self):
+        return _rig(fallbacks=(
+            config.FallbackLink(provider="local", model="qwen",
+                                base_url="http://127.0.0.1:11434/v1"),)).app
+
+    async def test_each_link_is_named_in_order(self):
+        body = await (await self.get("/status")).json()
+        self.assertEqual([f["provider"] for f in body["fallbacks"]], ["local"])
+        self.assertEqual(body["fallbacks"][0]["model"], "qwen")
+
+
+class TestAFallbackKeyNeverReachesTheResponse(_ServiceCase):
+    """/status is reachable by anything holding the operator token."""
+
+    async def get_application(self):
+        return _rig(fallbacks=(
+            config.FallbackLink(provider="anthropic", model="claude",
+                                api_key="sk-fallback-secret"),)).app
+
+    async def test_no_key_and_no_key_field(self):
+        body = await (await self.get("/status")).json()
+        self.assertNotIn("sk-fallback-secret", json.dumps(body))
+        self.assertNotIn("api_key", json.dumps(body["fallbacks"]))
+
 if __name__ == "__main__":
     unittest.main()

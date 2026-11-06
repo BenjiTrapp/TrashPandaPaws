@@ -977,5 +977,118 @@ class TestTheDefaultForAnUnansweredKnock(unittest.TestCase):
                               unattended_behavior=choice).unattended_behavior,
                     choice, (mode, choice))
 
+
+
+class TestAFallbackChainIsReadFromYaml(unittest.TestCase):
+    """The chain names each link's key *variable*, never the key.
+
+    A list of providers is the one place a config file would be tempted
+    to hold several secrets, and this file is under git. So an entry
+    carries `api_key_env` -- the name of an environment variable -- and a
+    literal `api_key` in an entry is refused the same way
+    `agent.llm.api_key` already is. A `local` link needs no key at all,
+    which makes a model on the box itself a sensible last resort: it
+    cannot be rate-limited and it cannot have its key revoked.
+
+    Outside the _FIELDS cascade on purpose: a list of mappings has no
+    sensible environment-variable form, and the api_key is already
+    handled outside it for the same kind of reason.
+    """
+
+    def _load(self, fallbacks, env=None, provider="bedrock"):
+        data = {"agent": {"llm": {"provider": provider, "model": "m",
+                                  "fallbacks": fallbacks}}}
+        return config.load(argv=[], yaml_path=_yaml(data),
+                           env=dict(env or {"AGENT_API_KEY": "primary"}))
+
+    def test_an_entry_becomes_a_link(self):
+        cfg = self._load([{"provider": "anthropic", "model": "claude",
+                           "api_key_env": "ANTHROPIC_KEY"}],
+                         env={"AGENT_API_KEY": "primary",
+                              "ANTHROPIC_KEY": "second"})
+        self.assertEqual(len(cfg.fallbacks), 1)
+        link = cfg.fallbacks[0]
+        self.assertEqual((link.provider, link.model), ("anthropic", "claude"))
+        self.assertEqual(link.api_key, "second")
+
+    def test_the_variable_name_is_not_the_key(self):
+        # The point of the whole design: what is written down is a name.
+        cfg = self._load([{"provider": "anthropic", "model": "claude",
+                           "api_key_env": "ANTHROPIC_KEY"}],
+                         env={"AGENT_API_KEY": "primary"})
+        self.assertIsNone(cfg.fallbacks[0].api_key)
+
+    def test_a_literal_key_in_an_entry_is_refused(self):
+        with self.assertRaises(config.ConfigError) as caught:
+            self._load([{"provider": "anthropic", "model": "claude",
+                         "api_key": "sk-literal-secret"}])
+        message = str(caught.exception)
+        self.assertIn("api_key_env", message)
+        self.assertNotIn("sk-literal-secret", message)
+
+    def test_a_local_link_needs_no_key(self):
+        cfg = self._load([{"provider": "local", "model": "qwen",
+                           "base_url": "http://127.0.0.1:11434/v1"}])
+        self.assertEqual(cfg.fallbacks[0].provider, "local")
+        self.assertIsNone(cfg.fallbacks[0].api_key)
+
+    def test_an_entry_without_a_provider_is_refused(self):
+        with self.assertRaises(config.ConfigError):
+            self._load([{"model": "claude"}])
+
+    def test_an_entry_without_a_model_is_refused(self):
+        # create_client refuses a provider with no explicit model, and
+        # finding that out at the first failover is finding it out
+        # mid-campaign.
+        with self.assertRaises(config.ConfigError):
+            self._load([{"provider": "anthropic"}])
+
+    def test_an_unknown_field_in_an_entry_is_refused_by_name(self):
+        with self.assertRaises(config.ConfigError) as caught:
+            self._load([{"provider": "anthropic", "model": "c",
+                         "api_key_envv": "X"}])
+        self.assertIn("api_key_envv", str(caught.exception))
+
+    def test_no_fallbacks_is_the_normal_case(self):
+        data = {"agent": {"llm": {"provider": "bedrock", "model": "m"}}}
+        cfg = config.load(argv=[], yaml_path=_yaml(data),
+                          env={"AGENT_API_KEY": "primary"})
+        self.assertEqual(cfg.fallbacks, ())
+
+    def test_a_fallbacks_value_that_is_not_a_list_is_refused(self):
+        with self.assertRaises(config.ConfigError):
+            self._load({"provider": "anthropic"})
+
+    def test_a_broken_link_is_reported_by_available(self):
+        # available()'s own docstring: "Every problem is reported, not the
+        # first: an operator who fixes the provider only to meet the
+        # Sliver conflict next has been sent round twice." A fallback that
+        # cannot be built is such a problem, and the alternative is
+        # discovering it at the first failover -- when the primary has
+        # already gone and nobody is watching.
+        cfg = config.AgentConfig(
+            provider="bedrock", model="m", api_key="primary",
+            fallbacks=(config.FallbackLink(provider="anthropic",
+                                           model="claude", api_key=None),))
+        ok, reason = cfg.available()
+        self.assertFalse(ok)
+        self.assertIn("fallback", reason.lower())
+
+    def test_a_sound_chain_is_available(self):
+        cfg = config.AgentConfig(
+            provider="bedrock", model="m", api_key="primary",
+            fallbacks=(config.FallbackLink(provider="local", model="qwen",
+                                           base_url="http://127.0.0.1:1/v1"),))
+        ok, reason = cfg.available()
+        self.assertTrue(ok, reason)
+
+    def test_the_chain_never_repeats_the_primary(self):
+        # A fallback identical to the primary adds a second attempt at the
+        # thing that just failed, and the trip logic then counts them
+        # separately.
+        with self.assertRaises(config.ConfigError) as caught:
+            self._load([{"provider": "bedrock", "model": "m"}])
+        self.assertIn("primary", str(caught.exception))
+
 if __name__ == "__main__":
     unittest.main()

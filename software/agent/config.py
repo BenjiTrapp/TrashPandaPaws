@@ -146,6 +146,80 @@ _SLIVER_REASON = (
 _SCRUB_MIN_LENGTH = 8
 
 
+@dataclass(frozen=True)
+class FallbackLink:
+    """One link in the provider chain after the primary.
+
+    `api_key` is resolved at load time from the variable the YAML names,
+    so what is written in the file is a variable name and never a
+    secret -- the one place a provider list would otherwise be tempted
+    to hold several of them, in a file under git.
+    """
+    provider: str
+    model: str
+    base_url: Optional[str] = None
+    api_key: Optional[str] = field(default=None, repr=False)
+
+
+# What an entry may say. Checked by name so a typo is refused at load
+# rather than silently ignored until the first failover, which is
+# mid-campaign.
+_FALLBACK_FIELDS = frozenset(("provider", "model", "base_url", "api_key_env"))
+
+
+def _read_fallbacks(data, env, primary_provider, primary_model, yaml_path):
+    raw = _dig(data, ("agent", "llm", "fallbacks"))
+    if _blank(raw):
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(
+            "agent.llm.fallbacks in %s must be a list of providers"
+            % yaml_path)
+    primary = (str(primary_provider or "").lower(),
+               str(primary_model or ""))
+    links = []
+    for number, entry in enumerate(raw, 1):
+        if not isinstance(entry, dict):
+            raise ConfigError("agent.llm.fallbacks[%d] is not a mapping"
+                              % number)
+        unknown = sorted(set(entry) - _FALLBACK_FIELDS)
+        if unknown:
+            if "api_key" in unknown:
+                # Named without quoting the value: this message goes to
+                # logs, and the value is exactly what must not.
+                raise ConfigError(
+                    "agent.llm.fallbacks[%d] holds an api_key; a chain "
+                    "names each link's variable with api_key_env and "
+                    "never the key itself. Rotate what was written there."
+                    % number)
+            raise ConfigError(
+                "agent.llm.fallbacks[%d] has unknown field(s): %s"
+                % (number, ", ".join(unknown)))
+        provider = str(entry.get("provider") or "").strip().lower()
+        model = str(entry.get("model") or "").strip()
+        if not provider:
+            raise ConfigError(
+                "agent.llm.fallbacks[%d] has no provider" % number)
+        if not model:
+            # create_client refuses a provider with no explicit model, and
+            # discovering that at the first failover is discovering it
+            # when the primary has already gone.
+            raise ConfigError(
+                "agent.llm.fallbacks[%d] (%s) has no model" % (number, provider))
+        if (provider, model) == primary:
+            raise ConfigError(
+                "agent.llm.fallbacks[%d] repeats the primary provider and "
+                "model (%s / %s); a chain of one thing is not a chain, and "
+                "the two links would be counted separately when it trips"
+                % (number, provider, model))
+        key_env = entry.get("api_key_env")
+        links.append(FallbackLink(
+            provider=provider, model=model,
+            base_url=entry.get("base_url") or None,
+            api_key=_from_env(env, str(key_env)) if key_env else None))
+    return tuple(links)
+
+
 @dataclass
 class AgentConfig:
     provider: Optional[str] = None
@@ -168,6 +242,8 @@ class AgentConfig:
     # Not an agent setting but a fact about the drop-box, read from the C2
     # block of the same file, because available() has to answer for it.
     sliver_enabled: bool = False
+    # The providers tried, in order, after the primary one fails.
+    fallbacks: Tuple["FallbackLink", ...] = ()
 
     def available(self) -> Tuple[bool, str]:
         """(usable, reason) for the status endpoint; reason is "" when usable.
@@ -179,7 +255,16 @@ class AgentConfig:
         """
         problems = []
         try:
-            llm_provider.create_client(self)
+            # The whole chain, not just the primary: a fallback that
+            # cannot be built is exactly the kind of problem this method
+            # exists to report before it is met in the dark, and it would
+            # otherwise surface at the first failover -- when the primary
+            # has already gone and nobody is watching. Imported here
+            # rather than at module scope: failover imports provider,
+            # which this module also imports, and the local import keeps
+            # the direction of that obvious.
+            from software.agent.llm import failover
+            failover.create_chain(self)
         except llm_provider.ProviderError as exc:
             problems.append(str(exc))
         # Spec §5.2. A comment in the YAML is not enough: this is what the
@@ -402,8 +487,11 @@ def load(argv=None, yaml_path=None, env=None) -> AgentConfig:
     sliver_enabled = False if _blank(sliver) else _to_bool(
         sliver, "c2.sliver.enabled")
 
+    fallbacks = _read_fallbacks(data, env, values.get("provider"),
+                                values.get("model"), yaml_path)
+
     return AgentConfig(
-        api_key=api_key, capability_tier=tier,
+        api_key=api_key, capability_tier=tier, fallbacks=fallbacks,
         c2_token=_from_env(env, _C2_TOKEN_ENV),
         agent_token=_from_env(env, _AGENT_TOKEN_ENV),
         sliver_enabled=sliver_enabled, **values)

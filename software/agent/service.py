@@ -47,7 +47,7 @@ from typing import Any, Dict, List, Optional
 from aiohttp import web
 
 from software.agent import c2client, config, safety, scheduler
-from software.agent.llm import provider
+from software.agent.llm import failover, provider
 from software.agent.orchestrator import Campaign, restore_orphans
 from software.agent.store import queries
 
@@ -221,6 +221,14 @@ class _Service:
             # why phase 5 is locked instead of only greying it out.
             "tier": tier,
             "max_phase": provider.TIER_LIMITS.get(tier, {}).get("max_phase"),
+            # The chain after the primary, in the order it is tried. A
+            # chain nobody can see is a chain nobody trusts: the moment it
+            # matters is the moment a campaign is running on the fallback
+            # and the token counts are filed under a model the form does
+            # not show. Names and models only -- /status is reachable by
+            # anything holding the operator token.
+            "fallbacks": [{"provider": link.provider, "model": link.model}
+                          for link in (self.cfg.fallbacks or ())],
             "db_ready": self._db_ready(),
             "opsec_warnings": self._opsec_by_profile(),
             # The never-permitted actions, generated rather than typed. A
@@ -586,7 +594,7 @@ _SERVICE = web.AppKey("service", _Service)
 
 
 def make_app(cfg, conn, c2, manager, *,
-             client_factory=provider.create_client) -> web.Application:
+             client_factory=failover.create_chain) -> web.Application:
     """The service for one agent configuration.
 
     `client_factory` builds the model client for each campaign. It is a
