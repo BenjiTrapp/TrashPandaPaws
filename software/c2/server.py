@@ -355,10 +355,9 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
 
     @app.route("/")
     def index():
-        # Served empty, never filled in: this route has no authentication,
-        # so whatever lands here is handed to anyone who can load the page.
-        # The page asks for the token and keeps it in sessionStorage.
-        return _OPERATOR_HTML.replace("{{TOKEN}}", "")
+        # No authentication here, so nothing secret may be in the page: it
+        # asks for the token and keeps it in sessionStorage.
+        return _OPERATOR_HTML
 
     # ── Operator API ──
 
@@ -3164,7 +3163,6 @@ header .info{font-size:11px;color:var(--text2)}
 </div>
 
 <script>
-const TOKEN = "{{TOKEN}}";
 const TOKEN_KEY = "raccoon_token";
 let selectedAgent = null;
 let pollTimer = null;
@@ -3282,6 +3280,7 @@ async function api(path, opts){
 }
 
 async function refreshAgents(){
+  if(!storedToken()) return;
   const agents = await api("/api/agents");
   const list = document.getElementById("agent-list");
   list.innerHTML = "";
@@ -3319,6 +3318,7 @@ async function refreshAgents(){
 }
 
 async function checkTaskResults(){
+  if(!storedToken()) return;
   if(!selectedAgent) return;
   const hist = await api("/api/agents/"+selectedAgent+"/history");
   const prevLen = lastHistLen[selectedAgent]||0;
@@ -6101,6 +6101,7 @@ async function showLootViewer(){
 }
 
 async function lootSave(url, filename){
+  if(!storedToken()) return;
   try {
     const r = await fetch(url, {headers:H()});
     if(r.status === 401){ tokenRejected(); return; }

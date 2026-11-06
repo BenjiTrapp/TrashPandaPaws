@@ -1,11 +1,11 @@
 [
   {
-    "note": "Setup, not a frame. The page is served without the operator token and asks for it once; this hands it over the way the prompt does -- into the tab's sessionStorage, never a URL -- and reloads, so the startup requests carry it. The wait holds until the reloaded page has stopped asking.",
+    "note": "Setup, not a frame. The page is served without the operator token and asks for it once; this hands it over the way the prompt does -- into the tab's sessionStorage, never a URL -- and reloads, so the startup requests carry it. The wait is for an agent row, which only an accepted token can fetch: a wrong one fails the capture here rather than as a timeout steps later.",
     "hold": 0.1,
     "shoot": false,
     "settle": 1.0,
     "js": "sessionStorage.setItem('raccoon_token', '{{TOKEN}}'); window.__raccoonReloading = true; setTimeout(() => location.reload(), 0); true",
-    "wait": "!window.__raccoonReloading && document.readyState === 'complete' && !document.getElementById('token-gate').classList.contains('open')"
+    "wait": "!window.__raccoonReloading && document.querySelector('#agent-list .agent-card')"
   },
   {
     "note": "Setup, not a frame. Toasts removed, the side panel widened -- the form is long and 420px would wrap every line -- and confirm() stubbed, because the Unleash button asks for confirmation and headless Chrome would block on the dialog forever.",

@@ -1835,7 +1835,12 @@ class TestTokenIsNotServed(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.get_data(as_text=True)
         self.assertFalse(self.TOKEN in body, "GET / serves the operator token")
-        self.assertFalse("{{TOKEN}}" in body, "the placeholder was served as-is")
+        # No substitution point at all: one edit away from the original
+        # finding is one edit too few.
+        self.assertFalse("{{TOKEN}}" in server_mod._OPERATOR_HTML,
+                         "the page template has a token placeholder again")
+        self.assertIsNone(re.search(r"\bconst TOKEN\b", server_mod._OPERATOR_HTML),
+                          "the page declares a TOKEN constant again")
 
     def test_get_root_still_serves_the_application(self):
         body = self.client.get("/").get_data(as_text=True)
@@ -1859,6 +1864,7 @@ class TestTokenIsNotServed(unittest.TestCase):
                                  "token in the body of " + where)
                 for name, value in resp.headers.items():
                     self.assertNotIn(self.TOKEN, value, where + " " + name)
+                resp.close()
                 visited.add(rule.endpoint)
         # Not vacuous: the page, the API and the beacon catch-all were walked.
         self.assertTrue({"index", "api_agents", "api_server_config",
@@ -1913,6 +1919,19 @@ class TestTokenIsNotServed(unittest.TestCase):
         self.assertEqual(result["sent"], ["Bearer wrong"])
         self.assertEqual(result["threw"], [True, True])
 
+    def test_nothing_is_requested_without_a_stored_token(self):
+        # The polls keep firing after a rejection, and agent.js reads its
+        # status at load: each returns before building a request, rather
+        # than sending a bare "Bearer " or throwing into the console.
+        for fn in ("refreshAgents", "checkTaskResults", "lootSave"):
+            body = self._js_function(fn)
+            first = body.strip().split("\n")[1].strip()
+            self.assertEqual(first, "if(!storedToken()) return;", fn)
+        js = (_REPO / "software" / "c2" / "static" / "agent.js").read_text()
+        call = re.search(r"\nasync function aiCall\(.*?\n\}\n", js, re.S).group(0)
+        self.assertRegex(call, r"if\(!storedToken\(\)\) return \{ok: false, status: 401")
+        self.assertLess(call.index("storedToken()"), call.index("fetch("))
+
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_rejected_notice_survives_the_next_poll(self):
         # Found by looking: a poll after the rejection asks again with
@@ -1946,11 +1965,14 @@ class TestTokenIsNotServed(unittest.TestCase):
                            "URLSearchParams", "pushState", "replaceState",
                            "?t=", "&t=", "token=", "<form"):
                 self.assertNotIn(needle, text, "%s in %s" % (needle, where))
-        # The storyboards hand the token over the way the page keeps it.
+        # The storyboards hand the token over the way the page keeps it, and
+        # wait for proof it was accepted -- an agent row -- so a wrong token
+        # fails the capture at the login step, not a timeout further on.
         for board in ("c2_tour.json", "agent_run.json"):
-            first = json.loads(sources[board])[0]["js"]
+            first = json.loads(sources[board])[0]
             self.assertIn("sessionStorage.setItem('%s', '{{TOKEN}}')" % self.KEY,
-                          first, board)
+                          first["js"], board)
+            self.assertIn("#agent-list .agent-card", first["wait"], board)
 
 
 class TestCaptureCleanup(unittest.TestCase):
@@ -1974,6 +1996,8 @@ class TestCaptureCleanup(unittest.TestCase):
         patterns = re.findall(r'pkill -f "([^"]+)"', script)
         self.assertEqual(len(patterns), 3, patterns)
         for pattern in patterns:
+            # Anchored after the port, so 18099 cannot match 180990.
+            self.assertTrue(pattern.endswith("_PORT "), pattern)
             self.assertFalse(pattern.startswith("python3 "),
                              "%r cannot match a macOS framework Python" % pattern)
             self.assertTrue(any(re.search(pattern.replace("$", r"\$"), l)

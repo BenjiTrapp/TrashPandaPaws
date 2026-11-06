@@ -48,7 +48,7 @@ mkdir -p "$WORK"
 cleanup() {
   pkill -f "tools/demo_env.py --operator-port $C2_PORT " 2>/dev/null || true
   pkill -f "tools/scripted_model.py --port $MODEL_PORT " 2>/dev/null || true
-  pkill -f "software.agent .*--bind-port $AGENT_PORT" 2>/dev/null || true
+  pkill -f "software.agent .*--bind-port $AGENT_PORT " 2>/dev/null || true
 }
 trap cleanup EXIT
 cleanup

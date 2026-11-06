@@ -415,5 +415,6 @@ class TestTheDocsSayHowToSignIn(unittest.TestCase):
             for needle in ("?t=", "&t=", "token="):
                 self.assertNotIn(needle, text, "%s in %s" % (needle, doc.name))
 
+
 if __name__ == "__main__":
     unittest.main()

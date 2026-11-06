@@ -74,7 +74,7 @@ class TestStaticAssets(ServerTestBase):
         html = self.client.get("/").get_data(as_text=True)
         tag = '<script src="/static/agent.js" defer></script>'
         self.assertEqual(html.count(tag), 1)
-        self.assertGreater(html.index(tag), html.index("const TOKEN"))
+        self.assertGreater(html.index(tag), html.index("const TOKEN_KEY"))
         self.assertLess(html.index(tag), html.index("</body>"))
 
     def test_stylesheet_is_linked_in_the_head(self):
