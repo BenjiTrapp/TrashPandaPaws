@@ -87,7 +87,11 @@ python3 -m venv "${INSTALL_DIR}/venv" --system-site-packages
 
 # ── Permissions ──
 echo -e "${GREEN}[+] Setting permissions${NC}"
-chown -R "${ACTUAL_USER}:${ACTUAL_USER}" "${INSTALL_DIR}"
+# The services run this tree's venv interpreter as root, so it stays root-owned:
+# owning it let ${ACTUAL_USER} rewrite code that runs as root. The -R also
+# repairs an install an earlier run handed away. Only the data dirs go to the user.
+chown -R root:root "${INSTALL_DIR}"
+chown "${ACTUAL_USER}:${ACTUAL_USER}" "${INSTALL_DIR}/captures" "${INSTALL_DIR}/logs"
 chmod 700 "${INSTALL_DIR}/captures"
 chmod 700 "${INSTALL_DIR}/logs"
 

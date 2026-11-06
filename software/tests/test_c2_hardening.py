@@ -8,12 +8,14 @@ import base64
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import struct
 import tempfile
 import unittest
-from pathlib import Path
+from collections import namedtuple
+from pathlib import Path, PurePosixPath
 from unittest.mock import MagicMock, patch
 
 from software.c2 import beacon as beacon_mod
@@ -584,6 +586,199 @@ class TestLootWriteIsContained(unittest.TestCase):
             self.assertEqual(self.crypto.unwrap(resp.get_json()),
                              {"ack": True})
         self.assertEqual(len(self._written_files()), 1)
+
+
+_REPO = Path(__file__).resolve().parents[2]
+_BOOTSTRAP = _REPO / "software" / "setup" / "bootstrap.sh"
+_UNIT_DIR = _REPO / "services"
+
+_SHELL_SEPARATORS = {";", "&&", "||", "|", "&"}
+_SHELL_PREFIXES = {"if", "elif", "then", "else", "do", "while", "until", "!",
+                   "{", "sudo", "command", "exec", "time"}
+
+_Chown = namedtuple("_Chown", "owner recursive contents path source")
+
+
+def _shell_commands(text):
+    """Each simple command in a shell script as a list of unquoted words."""
+    commands = []
+    for line in re.sub(r"\\\n", " ", text).splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        try:
+            words = list(lexer)
+        except ValueError:  # an unbalanced quote: prose in a heredoc
+            continue
+        command = []
+        for word in words + [";"]:
+            if word not in _SHELL_SEPARATORS:
+                if command or word not in _SHELL_PREFIXES:
+                    command.append(word)
+                continue
+            if command:
+                commands.append(command)
+            command = []
+    return commands
+
+
+def _expand_variables(word, variables):
+    return re.sub(r"\$\{(\w+)\}|\$(\w+)",
+                  lambda m: variables.get(m.group(1) or m.group(2), m.group(0)),
+                  word)
+
+
+def _expand_braces(word):
+    m = re.search(r"\{([^{}]*,[^{}]*)\}", word)
+    if not m:
+        return [word]
+    return [out for alt in m.group(1).split(",")
+            for out in _expand_braces(word[:m.start()] + alt + word[m.end():])]
+
+
+def _installer_chowns(script):
+    """(variables, [_Chown]) for every ownership change the script makes.
+
+    ``owner`` is "root" or "user": anything that is not root is the
+    unprivileged account, however it is spelled. A target the reader cannot
+    resolve raises instead of being skipped, so a spelling it does not
+    understand cannot pass the tests by being invisible to them.
+    """
+    variables = {}
+    chowns = []
+    for words in _shell_commands(script):
+        assignment = re.fullmatch(r"([A-Za-z_]\w*)=(.*)", words[0])
+        if len(words) == 1 and assignment:
+            variables[assignment.group(1)] = _expand_variables(
+                assignment.group(2), variables)
+            continue
+        if words[0] != "chown":
+            continue
+        recursive, operands, options_done = False, [], False
+        for word in words[1:]:
+            if not options_done and word == "--":
+                options_done = True
+            elif not options_done and word.startswith("--"):
+                recursive = recursive or word == "--recursive"
+            elif not options_done and re.fullmatch(r"-[A-Za-z]+", word):
+                recursive = recursive or "R" in word
+            else:
+                operands.append(word)
+        owner = re.split(r"[:.]", operands[0], maxsplit=1)[0]
+        if owner == "":  # ":group" changes the group only
+            continue
+        kind = "root" if owner in ("root", "0") else "user"
+        for operand in operands[1:]:
+            for target in _expand_braces(_expand_variables(operand, variables)):
+                contents = target.endswith("/*")
+                if contents:
+                    target = target[:-2]
+                if re.search(r"[$*?\[`]", target) or not target.startswith("/"):
+                    raise AssertionError(
+                        "cannot resolve chown target %r in: %s"
+                        % (target, " ".join(words)))
+                chowns.append(_Chown(kind, recursive, contents,
+                                     PurePosixPath(target), " ".join(words)))
+    return variables, chowns
+
+
+def _owner_of(chowns, path):
+    """Who owns ``path`` once the script has run; untouched means root."""
+    path = PurePosixPath(path)
+    owner = "root"
+    for c in chowns:
+        if c.contents:
+            hit = (path != c.path and c.path in path.parents
+                   and (c.recursive or path.parent == c.path))
+        else:
+            hit = path == c.path or (c.recursive and c.path in path.parents)
+        if hit:
+            owner = c.owner
+    return owner
+
+
+def _handed_away(chowns, path):
+    """True when ``path`` or a directory above it belongs to the user.
+
+    A user who owns the directory holding a file can replace that file, so
+    owning an ancestor is as good as owning the file.
+    """
+    path = PurePosixPath(path)
+    return any(_owner_of(chowns, p) == "user" for p in [path, *path.parents])
+
+
+def _root_units(unit_dir):
+    """{unit name: [paths its Exec* lines run]} for units running as root.
+
+    systemd runs a system unit as root unless it names another User=.
+    """
+    units = {}
+    for unit in sorted(Path(unit_dir).glob("*.service")):
+        user, executed, section = "root", [], None
+        for line in unit.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line
+            elif section == "[Service]" and "=" in line:
+                key, _, value = line.partition("=")
+                if key == "User":
+                    user = value.strip()
+                elif key.startswith("Exec") and value.strip():
+                    executed.append(value.strip().lstrip("@-:+!").split()[0])
+        if user in ("root", "0"):
+            units[unit.name] = executed
+    return units
+
+
+class TestInstallerOwnership(unittest.TestCase):
+    """bootstrap.sh must not give root's code to the account that ran sudo.
+
+    The services run /opt/raccoon/venv/bin/python as root with Restart=always,
+    so whoever owns that tree can make root run what they like. The suite
+    cannot run a root installer, so these read it as text.
+    """
+
+    def setUp(self):
+        self.variables, self.chowns = _installer_chowns(_BOOTSTRAP.read_text())
+        self.install_dir = self.variables.get("INSTALL_DIR")
+
+    def test_install_dir_is_not_handed_to_the_invoking_user(self):
+        self.assertEqual(self.install_dir, "/opt/raccoon")
+        self.assertFalse(
+            _handed_away(self.chowns, self.install_dir),
+            "bootstrap.sh gives the install directory to an unprivileged "
+            "account: " + "; ".join(c.source for c in self.chowns
+                                    if c.owner == "user"))
+
+    def test_the_two_data_dirs_are_still_user_owned(self):
+        chmods = {}
+        for words in _shell_commands(_BOOTSTRAP.read_text()):
+            if words[0] == "chmod" and len(words) >= 3:
+                for target in words[2:]:
+                    for path in _expand_braces(
+                            _expand_variables(target, self.variables)):
+                        chmods[path] = words[1]
+        for name in ("captures", "logs"):
+            path = "%s/%s" % (self.install_dir, name)
+            with self.subTest(directory=path):
+                self.assertEqual(_owner_of(self.chowns, path), "user")
+                self.assertIn(chmods.get(path), ("700", "0700", "u=rwx,go="))
+
+    def test_every_unit_running_as_root_executes_a_root_owned_path(self):
+        units = _root_units(_UNIT_DIR)
+        self.assertTrue(units, "no unit running as root found in %s"
+                        % _UNIT_DIR)
+        for name, executed in units.items():
+            self.assertTrue(executed, "%s has no Exec line" % name)
+            for path in executed:
+                with self.subTest(unit=name, executes=path):
+                    self.assertTrue(path.startswith("/"))
+                    self.assertFalse(
+                        _handed_away(self.chowns, path),
+                        "%s runs %s as root, but bootstrap.sh gives it or a "
+                        "directory above it to an unprivileged account: %s"
+                        % (name, path, "; ".join(
+                            c.source for c in self.chowns
+                            if c.owner == "user")))
 
 
 # New test classes belong above this guard; never append below it.
