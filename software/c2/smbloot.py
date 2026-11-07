@@ -27,6 +27,7 @@ Examples:
 """
 
 import argparse
+import base64
 import sys
 import os
 
@@ -67,15 +68,17 @@ Hash format (pass-the-hash):
     parts.extend(args.args)
     smbloot_args = " ".join(parts)
 
-    # Create a minimal beacon instance (no C2 connection)
-    beacon = Beacon({"c2": {"https": {"enabled": False}, "dns": {"enabled": False}}})
+    # Create a minimal beacon instance (no C2 connection). Both transports are
+    # off, so the key is never used; it only has to be a valid one.
+    beacon = Beacon({"c2": {
+        "encryption_key": base64.b64encode(os.urandom(32)).decode(),
+        "https": {"enabled": False}, "dns": {"enabled": False}}})
 
     result = beacon._exec_smbloot(smbloot_args)
 
     # For 'get' action, decode base64 and write to file
     if args.action == "get" and result.startswith("{"):
         import json
-        import base64
         try:
             data = json.loads(result)
             if "error" in data:

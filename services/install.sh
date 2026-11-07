@@ -17,6 +17,14 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 echo -e "${YELLOW}[*] Installing Raccoon Implant services${NC}"
 
+# ── Preflight: a config that would be refused ──
+# Warn and carry on rather than stop. The fix is an edit to the config, which
+# the services read at their next start, so nothing here needs re-running; and
+# a device installed but not enabled would fail after the next reboot just as
+# silently, in a different place.
+KEY_CHECK=0
+bash "${SCRIPT_DIR}/check_beacon_key.sh" || KEY_CHECK=$?
+
 # ── Core services ──
 echo -e "${GREEN}[+] Installing systemd units${NC}"
 cp "${SCRIPT_DIR}/raccoon-implant.service" /etc/systemd/system/
@@ -45,6 +53,10 @@ echo -e "${GREEN}============================================${NC}"
 echo -e "${GREEN}  All services installed${NC}"
 echo -e "${GREEN}============================================${NC}"
 echo ""
+if [ "$KEY_CHECK" -ne 0 ]; then
+    echo -e "${RED}[!] Not ready to call back: set c2.encryption_key in /opt/raccoon/configs/raccoon.yaml first (see the warning above).${NC}"
+    echo ""
+fi
 echo -e "${YELLOW}Management:${NC}"
 echo "  sudo systemctl start raccoon-implant    # full implant"
 echo "  sudo systemctl start raccoon-beacon     # beacon only"

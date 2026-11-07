@@ -16,6 +16,9 @@ from unittest.mock import MagicMock, patch
 from software.c2 import beacon as beacon_mod
 from software.c2 import beacon_standalone
 from software.c2.beacon import Beacon
+from tools.demo_env import key_b64, random_key
+
+_KEY = random_key()
 
 
 def _make_config(**overrides):
@@ -23,7 +26,7 @@ def _make_config(**overrides):
         "c2": {
             "beacon_interval_seconds": 10,
             "jitter_percent": 20,
-            "encryption_key": "",
+            "encryption_key": key_b64(_KEY),
             "proxy": {"mode": "none"},
             "https": {
                 "enabled": True,

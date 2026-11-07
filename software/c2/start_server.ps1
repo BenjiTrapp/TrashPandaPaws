@@ -9,12 +9,21 @@
     .\start_server.ps1 -Port 443 -SSL
     .\start_server.ps1 -Key "base64key==" -Token "my-secret-token"
     .\start_server.ps1 -NoPrompt
+.NOTES
+    -Key and -Token may instead come from $env:RACCOON_KEY and $env:RACCOON_TOKEN;
+    a parameter wins over its variable. Prefer the variables: a command line is
+    visible to every user. The server is handed both in its environment, never
+    on its command line. The token is kept in ~\.raccoon-c2\operator-token.
+    -Host_/-Port are the beacon socket, reachable from the network.
+    -OperatorHost/-OperatorPort are the GUI and API, loopback by default;
+    an -OperatorPort equal to -Port serves both on one socket.
 #>
 param(
     [int]$Port = 8443,
     [string]$Host_ = "0.0.0.0",
+    [int]$OperatorPort = 8444,
+    [string]$OperatorHost = "127.0.0.1",
     [string]$Key = "",
-    [string]$DeriveKey = "",
     [string]$Token = "",
     [switch]$SSL,
     [string]$Cert = "",
@@ -25,6 +34,17 @@ param(
 $ErrorActionPreference = "Continue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ServerPy = Join-Path $ScriptDir "server.py"
+
+# A key or token typed at a prompt must not be left in the scrollback.
+function Read-Secret {
+    $secure = Read-Host -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+# The data directory the server is given; it keeps the operator token in
+# operator-token there and this launcher names the path.
+$DataDir = Join-Path $env:USERPROFILE ".raccoon-c2"
 
 # -- Banner --
 Clear-Host
@@ -193,20 +213,30 @@ if ($nxcVer) {
 $Proto = "http"
 if ($SSL) { $Proto = "https" }
 
-if (-not $NoPrompt -and -not $Key -and -not $DeriveKey) {
+# Parameter first, then the environment (the order the server and agent/config.py use).
+$KeyOrigin = ""
+if ($Key) {
+    $KeyOrigin = "passed with -Key"
+} elseif ($env:RACCOON_KEY -and $env:RACCOON_KEY.Trim()) {
+    $Key = $env:RACCOON_KEY
+    $KeyOrigin = "from RACCOON_KEY"
+}
+if (-not $Token -and $env:RACCOON_TOKEN) { $Token = $env:RACCOON_TOKEN }
+
+if (-not $NoPrompt -and -not $Key) {
     Write-Host ""
     Write-Host "  ─────────────────────────────────────────────" -ForegroundColor DarkGray
     Write-Host "  Server Configuration" -ForegroundColor Yellow
     Write-Host "  ─────────────────────────────────────────────" -ForegroundColor DarkGray
     Write-Host ""
 
-    Write-Host "  Listen host " -ForegroundColor Cyan -NoNewline
+    Write-Host "  Beacon listen host " -ForegroundColor Cyan -NoNewline
     Write-Host "[$Host_]" -ForegroundColor DarkGray -NoNewline
     Write-Host ": " -ForegroundColor White -NoNewline
     $Input_ = Read-Host
     if ($Input_) { $Host_ = $Input_ }
 
-    Write-Host "  Listen port " -ForegroundColor Cyan -NoNewline
+    Write-Host "  Beacon listen port " -ForegroundColor Cyan -NoNewline
     Write-Host "[$Port]" -ForegroundColor DarkGray -NoNewline
     Write-Host ": " -ForegroundColor White -NoNewline
     $Input_ = Read-Host
@@ -221,17 +251,15 @@ if (-not $NoPrompt -and -not $Key -and -not $DeriveKey) {
     Write-Host "  Agents must use the same key to communicate." -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  [1] " -ForegroundColor Cyan -NoNewline
-    Write-Host "Auto-generate a random key" -ForegroundColor White
+    Write-Host "Generate a random key (default)" -ForegroundColor White
     Write-Host "  [2] " -ForegroundColor Cyan -NoNewline
     Write-Host "Enter a key manually (base64)" -ForegroundColor White
-    Write-Host "  [3] " -ForegroundColor Cyan -NoNewline
-    Write-Host "Derive from callback URL (default)" -ForegroundColor White
     Write-Host ""
     Write-Host "  Choice " -ForegroundColor Yellow -NoNewline
-    Write-Host "[3]" -ForegroundColor DarkGray -NoNewline
+    Write-Host "[1]" -ForegroundColor DarkGray -NoNewline
     Write-Host ": " -ForegroundColor White -NoNewline
     $Input_ = Read-Host
-    if (-not $Input_) { $Input_ = "3" }
+    if (-not $Input_) { $Input_ = "1" }
 
     switch ($Input_) {
         "1" {
@@ -242,25 +270,25 @@ if (-not $NoPrompt -and -not $Key -and -not $DeriveKey) {
             Write-Host "Generated random AES-256-GCM key" -ForegroundColor White
             Write-Host "  $Key" -ForegroundColor Cyan
             Write-Host "  ! Save this key -- agents need it to connect!" -ForegroundColor Red
+            $KeyOrigin = "generated for this run"
         }
         "2" {
             Write-Host ""
             Write-Host "  Key " -ForegroundColor Yellow -NoNewline
             Write-Host "(base64 AES-256-GCM, 32 bytes)" -ForegroundColor DarkGray -NoNewline
             Write-Host ": " -ForegroundColor White -NoNewline
-            $Input_ = Read-Host
+            $Input_ = Read-Secret
             if ($Input_) {
                 $Key = $Input_
+                $KeyOrigin = "entered by hand"
                 Write-Host "  [+] " -ForegroundColor Green -NoNewline
                 Write-Host "Using provided key" -ForegroundColor White
-            } else {
-                Write-Host "  [!] " -ForegroundColor Yellow -NoNewline
-                Write-Host "No key entered -- falling back to default derivation" -ForegroundColor White
             }
         }
         default {
-            Write-Host "  [i] " -ForegroundColor DarkGray -NoNewline
-            Write-Host 'Using default key: SHA256(":")' -ForegroundColor White
+            Write-Host "  [x] " -ForegroundColor Red -NoNewline
+            Write-Host "Choose 1 or 2" -ForegroundColor White
+            exit 1
         }
     }
 
@@ -268,7 +296,7 @@ if (-not $NoPrompt -and -not $Key -and -not $DeriveKey) {
     Write-Host "  Operator token " -ForegroundColor Cyan -NoNewline
     Write-Host "[random]" -ForegroundColor DarkGray -NoNewline
     Write-Host ": " -ForegroundColor White -NoNewline
-    $Input_ = Read-Host
+    $Input_ = Read-Secret
     if ($Input_) { $Token = $Input_ }
 
     Write-Host ""
@@ -285,24 +313,25 @@ if (-not $Token) {
     }
 }
 
-# -- Compute the actual encryption key for display --
-if ($Key) {
-    $EncKeyB64 = $Key
-    $KeyType = "explicit (AES-256-GCM)"
-    $KeyColor = "Green"
-} elseif ($DeriveKey) {
-    $PyCode = "import hashlib, base64; k = hashlib.sha256('$DeriveKey'.encode()).digest(); print(base64.b64encode(k).decode())"
-    $EncKeyB64 = & $Python -c $PyCode
-    $KeyType = "derived from --derive-key"
-    $KeyColor = "Green"
-} else {
-    $PyCode = "import hashlib, base64; k = hashlib.sha256(':'.encode()).digest(); print(base64.b64encode(k).decode())"
-    $EncKeyB64 = & $Python -c $PyCode
-    $KeyType = 'DEFAULT -- SHA256(":")'
-    $KeyColor = "Red"
+# -- The key is required: there is no default and none is derived --
+if (-not $Key) {
+    Write-Host "  [x] " -ForegroundColor Red -NoNewline
+    Write-Host "No encryption key. The server will not start without one." -ForegroundColor White
+    Write-Host "  Pass -Key <base64>, or run interactively and generate one:" -ForegroundColor DarkGray
+    Write-Host '  python -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"' -ForegroundColor DarkGray
+    exit 1
 }
+$EncKeyB64 = $Key
+$KeyType = "$KeyOrigin (AES-256-GCM)"
+$KeyColor = "Green"
 
 $EncKeyB64 = $EncKeyB64.Trim()
+# Enough to tell two keys apart, nowhere near enough to help guess one.
+$EncKeyPreview = $EncKeyB64
+if ($EncKeyB64.Length -gt 6) { $EncKeyPreview = $EncKeyB64.Substring(0, 6) + "..." }
+$TokenFile = Join-Path $DataDir "operator-token"
+# Shown as ~\..., which is what fits in the box.
+$TokenFileShown = $TokenFile.Replace($env:USERPROFILE, "~")
 
 # -- Display config --
 Write-Host ""
@@ -312,9 +341,9 @@ Write-Host "  ├─────────────────────
 Write-Host "  │                                                      │" -ForegroundColor DarkGray
 
 $ListenStr = "${Proto}://${Host_}:${Port}"
-$GuiStr = "${Proto}://localhost:${Port}"
+$GuiStr = "${Proto}://${OperatorHost}:${OperatorPort}"
 Write-Host "  │" -ForegroundColor DarkGray -NoNewline
-Write-Host "  Listen       " -ForegroundColor Cyan -NoNewline
+Write-Host "  Beacons      " -ForegroundColor Cyan -NoNewline
 Write-Host $ListenStr.PadRight(38) -ForegroundColor White -NoNewline
 Write-Host "│" -ForegroundColor DarkGray
 Write-Host "  │" -ForegroundColor DarkGray -NoNewline
@@ -329,34 +358,53 @@ Write-Host "│" -ForegroundColor DarkGray
 Write-Host "  │                                                      │" -ForegroundColor DarkGray
 Write-Host "  ├──────────────────────────────────────────────────────┤" -ForegroundColor DarkGray
 Write-Host "  │" -ForegroundColor DarkGray -NoNewline
-Write-Host "  Operator Token (for GUI login):                      " -ForegroundColor Yellow -NoNewline
+Write-Host "  Operator Token (for GUI login), in this file:        " -ForegroundColor Yellow -NoNewline
 Write-Host "│" -ForegroundColor DarkGray
 Write-Host "  │                                                      │" -ForegroundColor DarkGray
 Write-Host "  │" -ForegroundColor DarkGray -NoNewline
-Write-Host "  $($Token.PadRight(52))" -ForegroundColor Green -NoNewline
+Write-Host "  $($TokenFileShown.PadRight(52))" -ForegroundColor Green -NoNewline
 Write-Host "│" -ForegroundColor DarkGray
 Write-Host "  │                                                      │" -ForegroundColor DarkGray
 Write-Host "  ├──────────────────────────────────────────────────────┤" -ForegroundColor DarkGray
 Write-Host "  │" -ForegroundColor DarkGray -NoNewline
-Write-Host "  Encryption Key (for agent registration):             " -ForegroundColor Yellow -NoNewline
+Write-Host "  Encryption Key (agents need the whole of it):        " -ForegroundColor Yellow -NoNewline
 Write-Host "│" -ForegroundColor DarkGray
 Write-Host "  │                                                      │" -ForegroundColor DarkGray
 Write-Host "  │" -ForegroundColor DarkGray -NoNewline
-Write-Host "  $($EncKeyB64.PadRight(52))" -ForegroundColor Cyan -NoNewline
+Write-Host "  $($EncKeyPreview.PadRight(52))" -ForegroundColor Cyan -NoNewline
 Write-Host "│" -ForegroundColor DarkGray
 Write-Host "  │                                                      │" -ForegroundColor DarkGray
 Write-Host "  └──────────────────────────────────────────────────────┘" -ForegroundColor DarkGray
 Write-Host ""
+if ($OperatorPort -ne $Port -and ($OperatorHost -like "127.*" -or $OperatorHost -eq "localhost" -or $OperatorHost -eq "::1")) {
+    Write-Host "  The GUI is loopback only. From another machine:" -ForegroundColor DarkGray
+    Write-Host "  ssh -L ${OperatorPort}:${OperatorHost}:${OperatorPort} <user>@<this-host>, then open ${Proto}://localhost:${OperatorPort}" -ForegroundColor DarkGray
+    Write-Host ""
+}
 Write-Host "  Press Ctrl+C to stop the server" -ForegroundColor DarkGray
 Write-Host ""
 
 # -- Build command --
-$PyArgs = @($ServerPy, "--host", $Host_, "--port", $Port, "--token", $Token)
-if ($Key)      { $PyArgs += "--key", $Key }
-if ($DeriveKey){ $PyArgs += "--derive-key", $DeriveKey }
+# The key and token are not in it: a command line is readable by other users.
+# They go in the environment at launch, below.
+$PyArgs = @($ServerPy, "--host", $Host_, "--port", $Port,
+            "--operator-host", $OperatorHost, "--operator-port", $OperatorPort,
+            "--data-dir", $DataDir)
 if ($SSL)      { $PyArgs += "--ssl" }
 if ($Cert)     { $PyArgs += "--cert", $Cert }
 if ($CertKey)  { $PyArgs += "--certkey", $CertKey }
 
 # -- Launch --
-& $Python @PyArgs
+# The script runs in the operator's own session, so what it sets would outlive
+# the server and be picked up again, unannounced, by the next run. Put back
+# whatever was there, including a value the operator set on purpose.
+$PriorKey = $env:RACCOON_KEY
+$PriorToken = $env:RACCOON_TOKEN
+try {
+    $env:RACCOON_KEY = $Key
+    $env:RACCOON_TOKEN = $Token
+    & $Python @PyArgs
+} finally {
+    if ($null -eq $PriorKey) { Remove-Item Env:RACCOON_KEY -ErrorAction SilentlyContinue } else { $env:RACCOON_KEY = $PriorKey }
+    if ($null -eq $PriorToken) { Remove-Item Env:RACCOON_TOKEN -ErrorAction SilentlyContinue } else { $env:RACCOON_TOKEN = $PriorToken }
+}

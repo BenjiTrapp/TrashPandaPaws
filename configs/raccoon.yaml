@@ -104,8 +104,10 @@ c2:
 
   beacon_interval_seconds: 300
   jitter_percent: 20
-  # Base64-encoded 32-byte AES-GCM key for beacon encryption.
-  # If empty, derived from callback_url + dns_domain (deterministic).
+  # The shared secret for beacon traffic: a base64-encoded 32-byte AES-256-GCM
+  # key, the same one the team server is started with (--key).
+  # Required while fallback.enabled is true; the implant refuses to start
+  # without a valid one. There is no default.
   # Generate with: python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
   encryption_key: ""
 
@@ -223,7 +225,7 @@ agent:
 
   # ── C2 the agent drives ──
   c2:
-    url: "https://127.0.0.1:8443"
+    url: "https://127.0.0.1:8444"
     # The C2 certificate is self-signed.
     verify_tls: false
 

@@ -39,10 +39,16 @@ COLOURS="${GIF_COLOURS:-64}"
 
 mkdir -p "$WORK"
 
+# Substring matches, not -x: -x needs the pattern to be the whole command
+# line, and every launch below carries further arguments, so -x never matched
+# and a stale stack kept the ports -- a capture then measures a foreign
+# process. Nor do the patterns start at "python3": a framework Python on
+# macOS lists itself as .../Python.app/.../Python, so "python3 tools/..."
+# is not in its command line either.
 cleanup() {
-  pkill -x -f "python3 tools/demo_env.py --port $C2_PORT" 2>/dev/null || true
-  pkill -x -f "python3 tools/scripted_model.py --port $MODEL_PORT" 2>/dev/null || true
-  pkill -f "software.agent .*--bind-port $AGENT_PORT" 2>/dev/null || true
+  pkill -f "tools/demo_env.py --operator-port $C2_PORT " 2>/dev/null || true
+  pkill -f "tools/scripted_model.py --port $MODEL_PORT " 2>/dev/null || true
+  pkill -f "software.agent .*--bind-port $AGENT_PORT " 2>/dev/null || true
 }
 trap cleanup EXIT
 cleanup
@@ -105,7 +111,7 @@ start_stack() {
       > "$WORK/agent.log" 2>&1 &
   sleep 1
   AGENT_URL="http://127.0.0.1:$AGENT_PORT" nohup python3 tools/demo_env.py \
-      --port "$C2_PORT" --token "$TOKEN" > "$WORK/c2.log" 2>&1 &
+      --operator-port "$C2_PORT" --token "$TOKEN" > "$WORK/c2.log" 2>&1 &
 
   wait_for_http "http://127.0.0.1:$C2_PORT/api/agents" "the C2"
   for _ in $(seq 1 60); do
@@ -123,7 +129,7 @@ build() {           # name, storyboard
   python3 tools/capture_sequence.py \
       --url "http://127.0.0.1:$C2_PORT/" \
       --storyboard "$board" --out-dir "$WORK/$name" \
-      --set "BEACON_ID=$BEACON" \
+      --set "BEACON_ID=$BEACON" --set "TOKEN=$TOKEN" \
       --width 1440 --height 900 --scale 2
   python3 tools/make_gif.py --manifest "$WORK/$name/frames.txt" \
       --out "docs/screenshots/$name.gif" --width "$WIDTH" --colours "$COLOURS"
@@ -150,7 +156,7 @@ if [ "$WHICH" = "stills" ]; then
   python3 tools/capture_sequence.py \
       --url "http://127.0.0.1:$C2_PORT/" \
       --storyboard tools/storyboards/c2_tour.json \
-      --out-dir "$WORK/stills" --set "BEACON_ID=$BEACON" \
+      --out-dir "$WORK/stills" --set "BEACON_ID=$BEACON" --set "TOKEN=$TOKEN" \
       --no-captions --width 1440 --height 900 --scale 2
   echo "  wrote $(ls "$WORK/stills"/*.png | wc -l | tr -d ' ') stills to $WORK/stills"
   echo "  review them, then copy the ones you want into docs/screenshots/"

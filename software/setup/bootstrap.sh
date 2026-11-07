@@ -87,7 +87,13 @@ python3 -m venv "${INSTALL_DIR}/venv" --system-site-packages
 
 # ── Permissions ──
 echo -e "${GREEN}[+] Setting permissions${NC}"
-chown -R "${ACTUAL_USER}:${ACTUAL_USER}" "${INSTALL_DIR}"
+# The services run this tree's venv interpreter as root, so it stays root-owned:
+# owning it let ${ACTUAL_USER} rewrite code that runs as root. The -R also
+# repairs an install an earlier run handed away. Only the data dirs go to the user.
+# On such a re-run, files the user already had in captures/ and logs/ become
+# root-owned too: a mode-0600 file in their 0700 directory then needs sudo to read.
+chown -R root:root "${INSTALL_DIR}"
+chown "${ACTUAL_USER}:${ACTUAL_USER}" "${INSTALL_DIR}/captures" "${INSTALL_DIR}/logs"
 chmod 700 "${INSTALL_DIR}/captures"
 chmod 700 "${INSTALL_DIR}/logs"
 
@@ -210,7 +216,7 @@ echo -e "${GREEN}  Bootstrap complete! (ParrotOS)${NC}"
 echo -e "${GREEN}============================================${NC}"
 echo ""
 echo -e "${YELLOW}Next steps:${NC}"
-echo "  1. Edit ${INSTALL_DIR}/configs/raccoon.yaml"
+echo "  1. Edit ${INSTALL_DIR}/configs/raccoon.yaml (root-owned: use sudo)"
 echo "     - Set device_mode (cisco_phone / hp_printer)"
 echo "     - Set C2 callback URL and domain"
 echo "  2. Run: sudo ${PROJECT_DIR}/software/setup/configure_bridge.sh"

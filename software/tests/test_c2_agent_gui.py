@@ -22,9 +22,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from software.agent import config, prompts
 from software.c2.server import ServerCrypto, create_app
 from software.tests.test_c2_server import (
+    KEY,
     TEST_TOKEN,
     ServerTestBase as _Harness,
-    _derive_key,
     _reset_server_state,
 )
 
@@ -42,7 +42,7 @@ class ServerTestBase(_Harness):
     @classmethod
     def setUpClass(cls):
         _reset_server_state()
-        cls.crypto = ServerCrypto(_derive_key())
+        cls.crypto = ServerCrypto(KEY)
         cls.data_dir = Path(tempfile.mkdtemp())
         cls.app = create_app(cls.crypto, TEST_TOKEN, cls.data_dir)
         cls.app.config["TESTING"] = True
@@ -74,7 +74,7 @@ class TestStaticAssets(ServerTestBase):
         html = self.client.get("/").get_data(as_text=True)
         tag = '<script src="/static/agent.js" defer></script>'
         self.assertEqual(html.count(tag), 1)
-        self.assertGreater(html.index(tag), html.index("const TOKEN"))
+        self.assertGreater(html.index(tag), html.index("const TOKEN_KEY"))
         self.assertLess(html.index(tag), html.index("</body>"))
 
     def test_stylesheet_is_linked_in_the_head(self):
@@ -89,7 +89,9 @@ class TestGuiDegradation(ServerTestBase):
 
     def test_index_still_renders_without_agent_service(self):
         html = self.client.get("/").get_data(as_text=True)
-        self.assertIn(TEST_TOKEN, html)
+        # The page renders -- and without the token, which it used to carry
+        # on this unauthenticated route (finding C1).
+        self.assertNotIn(TEST_TOKEN, html)
         self.assertIn("Raccoon C2", html)
 
     def test_status_endpoint_answers_503_without_a_service(self):

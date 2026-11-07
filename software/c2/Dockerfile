@@ -44,6 +44,8 @@ RUN mkdir -p /data/raccoon-c2
 
 ENV RACCOON_PORT=8443 \
     RACCOON_HOST=0.0.0.0 \
+    RACCOON_OPERATOR_PORT=8444 \
+    RACCOON_OPERATOR_HOST=127.0.0.1 \
     RACCOON_DATA=/data/raccoon-c2
 
 EXPOSE 8443

@@ -17,10 +17,17 @@ D='\033[0;90m'    # Dim
 N='\033[0m'       # Reset
 
 # ── Defaults ──
+# HOST/PORT are the beacon socket and stay reachable from the network;
+# the operator GUI and API get their own socket, loopback by default.
 PORT="${PORT:-8443}"
 HOST="${HOST:-0.0.0.0}"
+OPERATOR_PORT="${OPERATOR_PORT:-8444}"
+OPERATOR_HOST="${OPERATOR_HOST:-127.0.0.1}"
+# The data directory the server is given; it keeps the operator token in
+# $DATA_DIR/operator-token (mode 0600) and this launcher names the path.
+DATA_DIR="$HOME/.raccoon-c2"
 KEY=""
-DERIVE_KEY=""
+KEY_ORIGIN=""
 TOKEN=""
 SSL=""
 CERT=""
@@ -32,19 +39,33 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)       PORT="$2"; shift 2;;
         --host)       HOST="$2"; shift 2;;
-        --key)        KEY="$2"; shift 2;;
-        --derive-key) DERIVE_KEY="$2"; shift 2;;
+        --operator-port) OPERATOR_PORT="$2"; shift 2;;
+        --operator-host) OPERATOR_HOST="$2"; shift 2;;
+        --key)        KEY="$2"; KEY_ORIGIN="passed with --key"; shift 2;;
         --token)      TOKEN="$2"; shift 2;;
         --ssl)        SSL="--ssl"; shift;;
         --cert)       CERT="$2"; shift 2;;
         --certkey)    CERTKEY="$2"; shift 2;;
         --interactive|-i) INTERACTIVE="1"; shift;;
         -h|--help)
-            echo "Usage: $0 [--port 8443] [--host 0.0.0.0] [--key <b64>] [--derive-key <str>] [--token <str>] [--ssl] [--cert <file>] [--certkey <file>] [-i|--interactive]"
+            echo "Usage: $0 [--port 8443] [--host 0.0.0.0] [--operator-port 8444] [--operator-host 127.0.0.1] [--key <b64>] [--token <str>] [--ssl] [--cert <file>] [--certkey <file>] [-i|--interactive]"
+            echo "  --host/--port: the beacon socket. --operator-host/--operator-port: the GUI and API."
+            echo "  The key and token may instead come from RACCOON_KEY and RACCOON_TOKEN; a flag wins over its"
+            echo "  variable. Prefer the variables: arguments are visible to every user in ps. The server is"
+            echo "  handed both in its environment, never on its command line."
             exit 0;;
         *) echo "Unknown option: $1"; exit 1;;
     esac
 done
+
+# Flag first, then the environment (the order the server and agent/config.py use).
+if [[ -z "$KEY" && -n "${RACCOON_KEY:-}" ]]; then
+    KEY="$RACCOON_KEY"
+    KEY_ORIGIN="from RACCOON_KEY"
+fi
+if [[ -z "$TOKEN" && -n "${RACCOON_TOKEN:-}" ]]; then
+    TOKEN="$RACCOON_TOKEN"
+fi
 
 # ── Banner ──
 clear 2>/dev/null || true
@@ -172,18 +193,18 @@ else
 fi
 
 # ── Interactive configuration ──
-if [[ -n "$INTERACTIVE" ]] || { [[ -z "$KEY" ]] && [[ -z "$DERIVE_KEY" ]] && [[ -t 0 ]]; }; then
+if [[ -n "$INTERACTIVE" ]] || { [[ -z "$KEY" ]] && [[ -t 0 ]]; }; then
     echo ""
     echo -e "${D}  ─────────────────────────────────────────────${N}"
     echo -e "${Y}  Server Configuration${N}"
     echo -e "${D}  ─────────────────────────────────────────────${N}"
     echo ""
 
-    echo -ne "  ${C}Listen host${N} ${D}[${HOST}]${N}: "
+    echo -ne "  ${C}Beacon listen host${N} ${D}[${HOST}]${N}: "
     read -r INPUT
     [[ -n "$INPUT" ]] && HOST="$INPUT"
 
-    echo -ne "  ${C}Listen port${N} ${D}[${PORT}]${N}: "
+    echo -ne "  ${C}Beacon listen port${N} ${D}[${PORT}]${N}: "
     read -r INPUT
     [[ -n "$INPUT" ]] && PORT="$INPUT"
 
@@ -198,14 +219,13 @@ if [[ -n "$INTERACTIVE" ]] || { [[ -z "$KEY" ]] && [[ -z "$DERIVE_KEY" ]] && [[ 
     echo -e "  ${W}Use AES-256-GCM encryption for beacon comms?${N}"
     echo -e "  ${D}Agents must use the same key to communicate.${N}"
     echo ""
-    echo -e "  ${C}[1]${N} ${W}Auto-generate a random key${N}"
+    echo -e "  ${C}[1]${N} ${W}Generate a random key (default)${N}"
     echo -e "  ${C}[2]${N} ${W}Enter a key manually (base64)${N}"
-    echo -e "  ${C}[3]${N} ${W}Derive from callback URL (default)${N}"
     echo ""
-    echo -ne "  ${Y}Choice${N} ${D}[3]${N}${W}: ${N}"
+    echo -ne "  ${Y}Choice${N} ${D}[1]${N}${W}: ${N}"
     read -r INPUT
 
-    case "${INPUT:-3}" in
+    case "${INPUT:-1}" in
         1)
             KEY=$($PYTHON -c "
 import base64, os
@@ -216,29 +236,29 @@ print(base64.b64encode(k).decode())
             echo -e "  ${G}[✓]${N} ${W}Generated random AES-256-GCM key${N}"
             echo -e "  ${C}${KEY}${N}"
             echo -e "  ${R}  ⚠  Save this key — agents need it to connect!${N}"
+            KEY_ORIGIN="generated for this run"
             ;;
         2)
             echo ""
             echo -ne "  ${Y}Key${N} ${D}(base64 AES-256-GCM, 32 bytes)${N}${W}: ${N}"
-            read -r INPUT
+            read -rs INPUT
+            echo ""
             if [[ -n "$INPUT" ]]; then
                 KEY="$INPUT"
+                KEY_ORIGIN="entered by hand"
                 echo -e "  ${G}[✓]${N} ${W}Using provided key${N}"
-            else
-                echo -e "  ${Y}[!]${N} ${W}No key entered — falling back to default derivation${N}"
             fi
             ;;
-        3|"")
-            echo -e "  ${D}[i]${N} ${W}Using default key: SHA256(\":\")${N}"
-            ;;
         *)
-            echo -e "  ${D}[i]${N} ${W}Using default key: SHA256(\":\")${N}"
+            echo -e "  ${R}[✗]${N} ${W}Choose 1 or 2${N}"
+            exit 1
             ;;
     esac
 
     echo ""
     echo -ne "  ${C}Operator token${N} ${D}[random]${N}: "
-    read -r INPUT
+    read -rs INPUT
+    echo ""
     [[ -n "$INPUT" ]] && TOKEN="$INPUT"
 
     echo ""
@@ -249,31 +269,26 @@ if [[ -z "$TOKEN" ]]; then
     TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(24))" 2>/dev/null || openssl rand -base64 24 | tr -d '=/+' | head -c 32)
 fi
 
-# ── Compute the actual encryption key for display ──
+# ── The key is required: there is no default and none is derived ──
 PROTO="http"
 [[ -n "$SSL" ]] && PROTO="https"
 
-if [[ -n "$KEY" ]]; then
-    ENC_KEY_B64="$KEY"
-    KEY_TYPE="explicit (AES-256-GCM)"
-elif [[ -n "$DERIVE_KEY" ]]; then
-    ENC_KEY_B64=$($PYTHON -c "
-import hashlib, base64
-k = hashlib.sha256('${DERIVE_KEY}'.encode()).digest()
-print(base64.b64encode(k).decode())
-")
-    KEY_TYPE="derived from --derive-key"
-else
-    CALLBACK="${PROTO}://${HOST}:${PORT}/api/v1/beacon"
-    ENC_KEY_B64=$($PYTHON -c "
-import hashlib, base64
-k = hashlib.sha256(':'.encode()).digest()
-print(base64.b64encode(k).decode())
-")
-    KEY_TYPE="DEFAULT — SHA256(\":\")"
+if [[ -z "$KEY" ]]; then
+    echo -e "  ${R}[✗]${N} ${W}No encryption key. The server will not start without one.${N}"
+    echo -e "  ${D}Pass --key <base64>, or run interactively and generate one:${N}"
+    echo -e "  ${D}python3 -c \"import os,base64; print(base64.b64encode(os.urandom(32)).decode())\"${N}"
+    exit 1
 fi
 
-ENC_KEY_PREVIEW="${ENC_KEY_B64:0:32}..."
+ENC_KEY_B64="$KEY"
+KEY_TYPE="${KEY_ORIGIN} (AES-256-GCM)"
+
+# Enough to tell two keys apart, nowhere near enough to help guess one.
+ENC_KEY_PREVIEW="${ENC_KEY_B64:0:6}..."
+TOKEN_FILE="$DATA_DIR/operator-token"
+# Shown as ~/..., which is what fits in the box.
+TILDE='~'
+TOKEN_FILE_SHOWN="${TOKEN_FILE/#$HOME/$TILDE}"
 
 echo ""
 echo -e "${D}  ┌──────────────────────────────────────────────────────┐${N}"
@@ -282,45 +297,51 @@ echo -e "${D}  ├────────────────────�
 echo -e "${D}  │${N}                                                      ${D}│${N}"
 
 LISTEN_STR="${PROTO}://${HOST}:${PORT}"
-GUI_STR="${PROTO}://localhost:${PORT}"
+GUI_STR="${PROTO}://${OPERATOR_HOST}:${OPERATOR_PORT}"
 PAD_L=$((38 - ${#LISTEN_STR}))
 PAD_G=$((38 - ${#GUI_STR}))
 [[ $PAD_L -lt 0 ]] && PAD_L=0
 [[ $PAD_G -lt 0 ]] && PAD_G=0
 
-echo -e "${D}  │${N}  ${C}Listen${N}       ${W}${LISTEN_STR}${N}$(printf '%*s' $PAD_L '')${D}│${N}"
+echo -e "${D}  │${N}  ${C}Beacons${N}      ${W}${LISTEN_STR}${N}$(printf '%*s' $PAD_L '')${D}│${N}"
 echo -e "${D}  │${N}  ${C}GUI${N}          ${W}${GUI_STR}${N}$(printf '%*s' $PAD_G '')${D}│${N}"
 
 PAD_K=$((38 - ${#KEY_TYPE}))
 [[ $PAD_K -lt 0 ]] && PAD_K=0
-KEY_COLOR="$R"
-[[ -n "$KEY" || -n "$DERIVE_KEY" ]] && KEY_COLOR="$G"
+KEY_COLOR="$G"
 echo -e "${D}  │${N}  ${C}Encryption${N}   ${KEY_COLOR}${KEY_TYPE}${N}$(printf '%*s' $PAD_K '')${D}│${N}"
 
 echo -e "${D}  │${N}                                                      ${D}│${N}"
 echo -e "${D}  ├──────────────────────────────────────────────────────┤${N}"
-echo -e "${D}  │${N}  ${Y}Operator Token (for GUI login):${N}                      ${D}│${N}"
+echo -e "${D}  │${N}  ${Y}Operator Token (for GUI login), in this file:${N}        ${D}│${N}"
 echo -e "${D}  │${N}                                                      ${D}│${N}"
-PAD_T=$((52 - ${#TOKEN}))
+PAD_T=$((52 - ${#TOKEN_FILE_SHOWN}))
 [[ $PAD_T -lt 0 ]] && PAD_T=0
-echo -e "${D}  │${N}  ${G}${TOKEN}${N}$(printf '%*s' $PAD_T '')${D}│${N}"
+echo -e "${D}  │${N}  ${G}${TOKEN_FILE_SHOWN}${N}$(printf '%*s' $PAD_T '')${D}│${N}"
 echo -e "${D}  │${N}                                                      ${D}│${N}"
 echo -e "${D}  ├──────────────────────────────────────────────────────┤${N}"
-echo -e "${D}  │${N}  ${Y}Encryption Key (for agent registration):${N}             ${D}│${N}"
+echo -e "${D}  │${N}  ${Y}Encryption Key (agents need the whole of it):${N}        ${D}│${N}"
 echo -e "${D}  │${N}                                                      ${D}│${N}"
-PAD_E=$((52 - ${#ENC_KEY_B64}))
+PAD_E=$((52 - ${#ENC_KEY_PREVIEW}))
 [[ $PAD_E -lt 0 ]] && PAD_E=0
-echo -e "${D}  │${N}  ${C}${ENC_KEY_B64}${N}$(printf '%*s' $PAD_E '')${D}│${N}"
+echo -e "${D}  │${N}  ${C}${ENC_KEY_PREVIEW}${N}$(printf '%*s' $PAD_E '')${D}│${N}"
 echo -e "${D}  │${N}                                                      ${D}│${N}"
 echo -e "${D}  └──────────────────────────────────────────────────────┘${N}"
 echo ""
+if [[ "$OPERATOR_PORT" != "$PORT" && ( "$OPERATOR_HOST" == 127.* || "$OPERATOR_HOST" == "localhost" || "$OPERATOR_HOST" == "::1" ) ]]; then
+    echo -e "${D}  The GUI is loopback only. From another machine:${N}"
+    echo -e "${D}  ssh -L ${OPERATOR_PORT}:${OPERATOR_HOST}:${OPERATOR_PORT} <user>@<this-host>, then open ${PROTO}://localhost:${OPERATOR_PORT}${N}"
+    echo ""
+fi
 echo -e "${D}  Press Ctrl+C to stop the server${N}"
 echo ""
 
 # ── Build command ──
-CMD=("$PYTHON" "$SERVER_PY" "--host" "$HOST" "--port" "$PORT" "--token" "$TOKEN")
-[[ -n "$KEY" ]]        && CMD+=("--key" "$KEY")
-[[ -n "$DERIVE_KEY" ]] && CMD+=("--derive-key" "$DERIVE_KEY")
+# The key and token are not in it: arguments are readable by every user in
+# ps and /proc/<pid>/cmdline. They go in the environment at launch, below.
+CMD=("$PYTHON" "$SERVER_PY" "--host" "$HOST" "--port" "$PORT"
+     "--operator-host" "$OPERATOR_HOST" "--operator-port" "$OPERATOR_PORT"
+     "--data-dir" "$DATA_DIR")
 [[ -n "$SSL" ]]        && CMD+=("--ssl")
 [[ -n "$CERT" ]]       && CMD+=("--cert" "$CERT")
 [[ -n "$CERTKEY" ]]    && CMD+=("--certkey" "$CERTKEY")
@@ -353,7 +374,8 @@ if [[ -n "$AGENT_START" ]]; then
     # the one this launcher just decided on rather than a second copy that
     # could drift.
     export RACCOON_TOKEN="$TOKEN"
-    export AGENT_C2_URL="${PROTO}://127.0.0.1:${PORT}"
+    # The operator socket: the agent drives the operator API.
+    export AGENT_C2_URL="${PROTO}://127.0.0.1:${OPERATOR_PORT}"
     if [[ -z "${AGENT_PROVIDER:-}" || -z "${AGENT_MODEL:-}" ]]; then
         echo -e "${Y}  [!]${N} ${W}Agent${N}         ${Y}AGENT_PROVIDER and AGENT_MODEL are not set;${N}"
         echo -e "      ${D}the service starts and reports itself unavailable in the GUI.${N}"
@@ -371,4 +393,7 @@ if [[ -n "$AGENT_START" ]]; then
 fi
 
 # ── Launch ──
-exec "${CMD[@]}"
+# The key is set for the server alone here. The agent above was started
+# earlier, from whatever environment the operator left; this launcher never
+# gave it the key.
+RACCOON_KEY="$KEY" RACCOON_TOKEN="$TOKEN" exec "${CMD[@]}"

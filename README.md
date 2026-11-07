@@ -50,6 +50,8 @@ or an HP network printer to blend into enterprise infrastructure.
 | **Persistence** | 5 independent autorun layers (systemd, crontab, rc.local, udev, watchdog timer) with PID lock dedup |
 | **SMBLoot** | Pure-Python SMB2 browser for remote share enumeration, file read, and download — no impacket on target |
 | **Automated Attack** | Optional LLM agent mode inside the operator GUI: eight-phase campaigns, a gate where eight irreversible actions are refused outright and eleven are asked about every time, fail-closed scope, a provider chain so one dead key does not end a run, and a Markdown report with every finding's proof basis and every refusal |
+| **Two listening sockets** | The agent endpoint (`--port`, `8443`) and the operator interface (`--operator-port`, `8444`, loopback only) are separate sockets, and the server decides by the socket a request arrived on, not by its path — so a request arriving on the agent side **cannot** reach the interface or the `/api/*` routes. A valid operator token does not help it, and neither does anything else: it gets the same cover reply as an unrecognised request. The token is never served in the page either; the GUI asks for it once. See [`docs/REDIRECTOR.md`](docs/REDIRECTOR.md) for putting a redirector in front of it |
+| **What is still open** | A hardening pass closed most of what an audit of the C2 found. What it did not close is written down, grouped by consequence, in *Known limits* in [`docs/AGENT.md`](docs/AGENT.md#known-limits) — and for the fifteen of those the code can answer for, a test fails if one is fixed and its entry left in the list |
 
 ## Architecture
 
@@ -178,7 +180,10 @@ graph LR
 # 2. Boot the Pi and connect the USB Ethernet adapter
 sudo ./software/setup/bootstrap.sh
 sudo ./software/setup/configure_bridge.sh
-sudo ./services/install.sh
+# Before installing: set c2.encryption_key in /opt/raccoon/configs/raccoon.yaml
+# (sudo) to the key your team server runs with (--key). Make one with:
+#   python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+sudo ./services/install.sh        # warns if the key is missing or invalid
 
 # 3. Connect UniFi switch uplink to target network, Pi to port 2, target device to port 3
 sudo reboot
@@ -425,6 +430,15 @@ sudo ./services/install.sh               # systemd + beacon persistence
 sudo reboot                              # activates MAC spoof + bridge + beacon autorun
 ```
 
+**Set `c2.encryption_key` first.** The implant has no default key and derives
+none: with `c2.fallback.enabled` on and no valid key in
+`/opt/raccoon/configs/raccoon.yaml` (edit with `sudo`), it refuses to start, and
+`raccoon-beacon` shows only "activating (auto-restart)" because that unit's
+output goes to `/opt/raccoon/logs/beacon.log`. Use the same base64 key as the
+team server's `--key`; make one with
+`python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"`.
+`install.sh` checks this and warns before it enables anything.
+
 After reboot the C2 beacon starts automatically via 5 independent persistence layers. No manual `systemctl start` is needed.
 
 ### Beacon Persistence (Autorun)
@@ -532,7 +546,7 @@ interactive terminal, and integrates offensive tooling for post-exploitation.
 ```mermaid
 graph LR
     subgraph "Operator"
-        BROWSER["Browser<br/>GUI on :8443"]
+        BROWSER["Browser<br/>GUI on 127.0.0.1:8444"]
     end
 
     subgraph "Raccoon C2 Team Server"
@@ -546,7 +560,7 @@ graph LR
     end
 
     BROWSER -->|"Bearer Token<br/>HTTPS"| FLASK
-    FLASK <-->|"AES-256-GCM<br/>encrypted tasking"| B1
+    FLASK <-->|"AES-256-GCM<br/>encrypted tasking<br/>on :8443"| B1
     FLASK <-->|"AES-256-GCM"| B2
     FLASK --- TOOLS
 
@@ -555,6 +569,27 @@ graph LR
     style B1 fill:#fa0,stroke:#333,color:#000
     style B2 fill:#fa0,stroke:#333,color:#000
 ```
+
+**Two sockets:** the server listens twice over one application. Beacons call
+back to `--host`/`--port` (`0.0.0.0:8443` by default), and that socket answers
+nothing but beacon traffic -- the GUI and the `/api/*` routes are not served
+there, whatever the path or token. The operator GUI and API are on
+`--operator-host`/`--operator-port`, `127.0.0.1:8444` by default, so open
+`http://127.0.0.1:8444` on the server itself, or from another machine forward it
+over SSH first: `ssh -L 8444:127.0.0.1:8444 <user>@<c2-host>`, then open
+`http://localhost:8444`. Setting `--operator-port` equal to `--port` puts both
+back on one socket.
+
+**Signing in:** the page is served without the operator token and asks for it
+once. The `Token:` line of the startup banner names the file it is kept in,
+`operator-token` in the data directory (mode `0600`); the banner never prints
+the token itself. The file is rewritten at every start, whether the token was
+generated or supplied, and is not removed on exit: delete it if you do not want
+a copy left on disk. Once entered, the token is kept in that tab's
+`sessionStorage` and sent as an `Authorization` header, never in a
+URL, so it stays out of browser history, `Referer` headers and proxy logs.
+Closing the tab forgets it; a token the server rejects is forgotten at once and
+asked for again.
 
 **GUI Features:**
 
@@ -718,10 +753,18 @@ firewall rules, AMSI, and AppLocker on the compromised host.
 
 **Encryption:**
 
-All beacon communication uses **AES-256-GCM** authenticated encryption. Keys
-can be auto-generated, manually set (base64), or derived from the callback URL
-via SHA-256. The server uses the `cryptography` library while the beacon calls
-OpenSSL via `ctypes`. Both implementations interoperate seamlessly.
+All beacon communication uses **AES-256-GCM** authenticated encryption. The
+key is always supplied explicitly: the server needs `--key <base64>` and the
+beacon needs the same value as `encryption_key`, each exactly 32 bytes once
+decoded. There is no default and nothing is derived from the callback URL, so a
+server started without a key refuses to run. Make one with
+`python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"`
+(`start_server.sh` can generate one for you). Give it to the server in
+`RACCOON_KEY` rather than `--key`, and the operator token in `RACCOON_TOKEN`
+rather than `--token`: a command line is visible to every user on the machine
+in `ps`, an environment is not. The flags still work, and win over the
+variables when both are set. The server uses the
+`cryptography` library while the beacon calls OpenSSL via `ctypes`. Both implementations interoperate seamlessly.
 
 #### Quick Start (Native)
 
@@ -735,14 +778,27 @@ cd software\c2
 .\start_server.ps1
 ```
 
+Both launchers take `RACCOON_KEY` and `RACCOON_TOKEN` from the environment (a
+`--key`/`--token` argument wins over its variable) and hand them to the server
+in its environment, not its arguments. The operator token is kept in
+`~/.raccoon-c2/operator-token` (mode `0600`) and the launcher prints that path.
+
 The launcher checks and installs dependencies automatically (`flask`,
 `cryptography`, `impacket`, `ldap3`, `netexec`, `lsassy`), then prompts for
-host, port, encryption key, and operator token.
+host, port, encryption key, and operator token. The host and port it asks for
+are the beacon socket; the GUI is at `http://127.0.0.1:8444`, loopback only
+(`--operator-host`/`--operator-port` to change it, an SSH tunnel to reach it
+from elsewhere).
 
 #### Quick Start (Docker)
 
 ```bash
 cd software/c2
+
+# A key is required: the container exits at start without one. Make one with
+#   python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+# and give the same value to the beacons' c2.encryption_key.
+export RACCOON_KEY=<base64-key>
 
 # Build and run
 docker compose up -d
@@ -761,11 +817,12 @@ Responder).
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `RACCOON_PORT` | `8443` | Listen port |
-| `RACCOON_HOST` | `0.0.0.0` | Listen address |
-| `RACCOON_KEY` | (none) | AES-256-GCM key (base64) |
-| `RACCOON_DERIVE_KEY` | (none) | Derive key from string via SHA-256 |
-| `RACCOON_TOKEN` | (random) | Operator token for GUI auth |
+| `RACCOON_PORT` | `8443` | Beacon listen port (the agent socket) |
+| `RACCOON_HOST` | `0.0.0.0` | Beacon listen address (the agent socket) |
+| `RACCOON_OPERATOR_PORT` | `8444` | Operator GUI and API listen port |
+| `RACCOON_OPERATOR_HOST` | `127.0.0.1` | Operator GUI and API listen address; loopback, so reach it with `ssh -L 8444:127.0.0.1:8444 <user>@<c2-host>` |
+| `RACCOON_KEY` | **required** | AES-256-GCM key (base64, 32 bytes); the container exits without it. Read by the server directly, never put on its command line |
+| `RACCOON_TOKEN` | (random) | Operator token for GUI auth, read the same way. Whatever it is, the server keeps it in `operator-token` in `RACCOON_DATA` (mode `0600`) |
 | `RACCOON_SSL` | (none) | Enable TLS (set to `1`) |
 | `RACCOON_CERT` | (none) | Path to TLS certificate |
 | `RACCOON_CERTKEY` | (none) | Path to TLS private key |
@@ -968,7 +1025,10 @@ remote_access:
 
 ### Configuration
 
-Edit [`configs/raccoon.yaml`](configs/raccoon.yaml) before deployment.
+Edit [`configs/raccoon.yaml`](configs/raccoon.yaml) before deployment. Set
+`c2.encryption_key` first: it has no default, and the implant will not start
+without a valid one while `c2.fallback.enabled` is on (see *Set `c2.encryption_key`
+first* above).
 
 #### Cover Identity
 

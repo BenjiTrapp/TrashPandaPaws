@@ -7,7 +7,6 @@ re-registration, operator API, and evasive URL handling.
 """
 
 import base64
-import hashlib
 import json
 import os
 import sys
@@ -29,6 +28,7 @@ from software.c2.server import (
     _PAYLOAD_FIELDS,
 )
 from software.c2.beacon import Beacon
+from tools.demo_env import key_b64, random_key
 
 
 def _pick_port() -> int:
@@ -53,17 +53,13 @@ def _pick_port() -> int:
 
 
 PORT = _pick_port()
-# Derived from the port, because the server's key is derived from the
-# callback URL: a port that moves and a key that does not means the beacon
-# registers under a key the server will not accept, and a key mismatch is
-# silent -- the fleet simply stays empty.
-CALLBACK_URL = "http://127.0.0.1:%d/api/v1/beacon" % PORT
+# One key for the whole module, minted once and handed to both ends: a key
+# mismatch is silent -- the beacon's registration is never accepted and the
+# fleet simply stays empty -- so the server and every beacon config take it
+# from here rather than each making their own.
+KEY = random_key()
 DNS_DOMAIN = ""
 TEST_TOKEN = "test-operator-token"
-
-
-def _derive_key() -> bytes:
-    return hashlib.sha256(f"{CALLBACK_URL}:{DNS_DOMAIN}".encode()).digest()
 
 
 def _beacon_config(port: int = None, interval: int = 1) -> dict:
@@ -72,7 +68,7 @@ def _beacon_config(port: int = None, interval: int = 1) -> dict:
         "c2": {
             "beacon_interval_seconds": interval,
             "jitter_percent": 0,
-            "encryption_key": "",
+            "encryption_key": key_b64(KEY),
             "proxy": {"mode": "none"},
             "https": {
                 "enabled": True,
@@ -105,8 +101,7 @@ class ServerTestBase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _reset_server_state()
-        key = _derive_key()
-        cls.crypto = ServerCrypto(key)
+        cls.crypto = ServerCrypto(KEY)
         cls.data_dir = Path(tempfile.mkdtemp())
         cls.app = create_app(cls.crypto, TEST_TOKEN, cls.data_dir)
         cls.app.config["TESTING"] = True
@@ -491,26 +486,6 @@ class TestCrossCompatibility(unittest.TestCase):
         wrapped = beacon._wrap_payload(data)
         unwrapped = server.unwrap(wrapped)
         self.assertEqual(unwrapped, data)
-
-    def test_derived_keys_match(self):
-        url = "https://c2.example.com/api/v1/beacon"
-        domain = "c2.example.com"
-
-        server_key = hashlib.sha256(f"{url}:{domain}".encode()).digest()
-        server = ServerCrypto(server_key)
-
-        beacon = Beacon({
-            "c2": {
-                "beacon_interval_seconds": 60, "jitter_percent": 0,
-                "encryption_key": "",
-                "https": {"enabled": True, "callback_url": url, "verify_ssl": False},
-                "dns": {"enabled": True, "domain": domain, "resolver": "8.8.8.8"},
-            }
-        })
-
-        data = {"test": True}
-        self.assertEqual(server.unwrap(beacon._wrap_payload(data)), data)
-        self.assertEqual(beacon._unwrap_response(server.wrap(data)), data)
 
 
 # ── Live beacon integration ──

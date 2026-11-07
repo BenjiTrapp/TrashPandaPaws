@@ -13,8 +13,9 @@
  *   - /api/ai/status is read on load and on click, never on a timer, so a
  *     service that was never started is asked once, not every few seconds.
  *
- * Reused from the main GUI, not reimplemented: TOKEN's Authorization header
- * (H), toast(), openPanel(), esc(), selectedAgent. They are read at call
+ * Reused from the main GUI, not reimplemented: the Authorization header
+ * (H() and storedToken(), from sessionStorage), toast(), openPanel(), esc(),
+ * selectedAgent. They are read at call
  * time; this file is deferred, so the inline script has already defined them.
  *
  * Plain ES2017: no optional chaining, no object spread, no Array#flat.
@@ -179,11 +180,13 @@ async function aiCall(path, opts){
   // header, which a test pins: one place to guard is one place to get
   // right. `asText` is for the report, which is Markdown rather than
   // JSON -- the body type changes, the choke point does not.
+  // No stored token, no request: a bare "Bearer " would only earn a 401.
+  if(!storedToken()) return {ok: false, status: 401, data: {error: "no operator token"}};
   const o = Object.assign({}, opts || {});
   const asText = !!o.asText;
   delete o.asText;
   try {
-    const r = await fetch("/api/ai/" + path, Object.assign({headers: H}, o));
+    const r = await fetch("/api/ai/" + path, Object.assign({headers: H()}, o));
     let data = null;
     if(asText){
       try { data = await r.text(); } catch(e){ data = null; }

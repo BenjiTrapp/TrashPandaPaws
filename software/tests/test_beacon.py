@@ -18,13 +18,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from tools.demo_env import key_b64, random_key
+
+_KEY = random_key()
+
 
 def _make_config(**overrides):
     cfg = {
         "c2": {
             "beacon_interval_seconds": 10,
             "jitter_percent": 20,
-            "encryption_key": "",
+            "encryption_key": key_b64(_KEY),
             "proxy": {"mode": "none"},
             "https": {
                 "enabled": True,
@@ -63,26 +67,6 @@ class TestEncryption(unittest.TestCase):
         b = Beacon(config)
 
         self.assertEqual(b._key, key)
-
-    def test_derived_key_deterministic(self):
-        from software.c2.beacon import Beacon
-
-        b1 = Beacon(_make_config())
-        b2 = Beacon(_make_config())
-
-        self.assertEqual(b1._key, b2._key)
-
-    def test_different_urls_different_keys(self):
-        from software.c2.beacon import Beacon
-
-        c1 = _make_config()
-        c2 = _make_config()
-        c2["c2"]["https"]["callback_url"] = "https://other.test/beacon"
-
-        b1 = Beacon(c1)
-        b2 = Beacon(c2)
-
-        self.assertNotEqual(b1._key, b2._key)
 
     def test_nonce_uniqueness(self):
         from software.c2.beacon import Beacon
