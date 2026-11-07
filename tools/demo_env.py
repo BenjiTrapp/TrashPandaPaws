@@ -79,10 +79,12 @@ class DemoEnv:
     it is actually reached, not a single-socket arrangement nobody runs.
     """
 
-    def __init__(self, operator_port, token, data_dir=None, beacon_port=0):
+    def __init__(self, operator_port, token, data_dir=None, beacon_port=0,
+                 listener_token=None):
         self.operator_port = operator_port
         self.beacon_port = beacon_port
         self.token = token
+        self.listener_token = listener_token
         self.data_dir = pathlib.Path(data_dir or tempfile.mkdtemp())
         self.key = random_key()
         self.beacon = None
@@ -99,7 +101,8 @@ class DemoEnv:
             server_config={"host": "127.0.0.1", "port": self.beacon_port,
                            "operator_host": "127.0.0.1",
                            "operator_port": self.operator_port},
-            operator_port=self.operator_port)
+            operator_port=self.operator_port,
+            listener_token=self.listener_token)
         self.servers = (operator, agent)
         for srv in self.servers:
             srv.app = self.app

@@ -17,6 +17,11 @@ import struct
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+import pathlib
+import re
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -25,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from software.c2 import beacon as beacon_mod
 from software.c2.beacon import Beacon
+from software.c2.listeners.dns import DnsListener
 from software.c2.listeners.quic import QuicListener
 from software.c2.listeners.relay import relay
 from software.c2.server import ServerCrypto
@@ -62,6 +68,106 @@ def _imports_and_names(*parts):
         elif isinstance(node, ast.Attribute):
             used.add(node.attr)
     return imported, used
+
+
+class _TaskingServer:
+    """A real team server on two sockets, with agents you can register.
+
+    The suite shares `agents`, `task_queues` and `results` as module state,
+    so each instance snapshots and restores them: a test that leaves a
+    registered agent behind changes what the next one sees, and that is a
+    class of flake this repository has paid for before.
+    """
+
+    def __init__(self, key: bytes, listener_token: str):
+        self.key = key
+        self.listener_token = listener_token
+        self.crypto = ServerCrypto(key)
+        self._saved = None
+        self.servers = ()
+
+    def start(self):
+        from werkzeug.serving import make_server
+
+        from software.c2 import server as server_mod
+
+        self._mod = server_mod
+        self._saved = (dict(server_mod.agents), dict(server_mod.task_queues),
+                       dict(server_mod.results))
+
+        operator = make_server("127.0.0.1", 0, None, threaded=True)
+        agent = make_server("127.0.0.1", 0, None, threaded=True)
+        self.operator_port = operator.server_port
+        self.agent_port = agent.server_port
+        app = server_mod.create_app(
+            self.crypto, "operator-token-for-tests",
+            pathlib.Path(tempfile.mkdtemp()),
+            server_config={"host": "127.0.0.1", "port": self.agent_port,
+                           "operator_host": "127.0.0.1",
+                           "operator_port": self.operator_port},
+            operator_port=self.operator_port,
+            listener_token=self.listener_token)
+        self.app = app
+        self.servers = (operator, agent)
+        for srv in self.servers:
+            srv.app = app
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    def stop(self):
+        for srv in self.servers:
+            srv.shutdown()
+        if self._saved is not None:
+            agents, queues, results_ = self._saved
+            self._mod.agents.clear()
+            self._mod.agents.update(agents)
+            self._mod.task_queues.clear()
+            self._mod.task_queues.update(queues)
+            self._mod.results.clear()
+            self._mod.results.update(results_)
+
+    def register(self, implant_id: str) -> str:
+        """Register an agent the way a beacon does, and return its name."""
+        before = set(self._mod.agents)
+        body = json.dumps(self.crypto.wrap({
+            "action": "register", "id": implant_id, "agent_id": None,
+            "hostname": "probe", "os": "Linux 6.1", "user": "nobody",
+            "pid": 1, "uptime": 1, "interval": 300,
+        })).encode()
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/api/v1/beacon" % self.agent_port,
+            data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=5):
+            pass
+        new = set(self._mod.agents) - before
+        if not new:
+            raise AssertionError("the probe agent did not register")
+        return new.pop()
+
+    def queue(self, name: str, cmd: str, args: str) -> str:
+        body = json.dumps({"cmd": cmd, "args": args, "data": ""}).encode()
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/api/agents/%s/task"
+            % (self.operator_port, name),
+            data=body, method="POST",
+            headers={"Authorization": "Bearer operator-token-for-tests",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read())["id"]
+
+
+def _dns_question(name, qtype=16):
+    """A well-formed single-question DNS query for `name`.
+
+    Built here rather than borrowed from the client, because these tests
+    need queries the client would never send.
+    """
+    qname = b""
+    for label in name.encode().split(b"."):
+        qname += struct.pack("B", len(label)) + label
+    qname += b"\x00"
+    return (struct.pack("!HHHHHH", 0x4242, 0x0100, 1, 0, 0, 0)
+            + qname + struct.pack("!HH", qtype, 1))
 
 
 def _wait_until(predicate, what, timeout=10.0):
@@ -786,6 +892,462 @@ class TestTheUdpListener(unittest.TestCase):
         self.assertIn("raccoon_rig", seen["result_output"],
                       "the command did not run: %r"
                       % (seen.get("result_output"),))
+
+
+class TestTheDnsTaskingRoute(unittest.TestCase):
+    """The server route a DNS listener reads tasking from.
+
+    DNS is the one transport that carries nothing upstream: the beacon
+    sends a bare TXT query and the only information that travels is the
+    agent id in the query name. So there is no payload for a listener to
+    relay, and something has to encrypt the answer -- which needs the key.
+
+    The listener does not get one. Instead the server hands out tasking
+    already wrapped, and the listener forwards it verbatim. That keeps the
+    key out of a listener container, which is the property the whole
+    package rests on.
+
+    The route is internal: the beacon never calls it, only a listener
+    does. So it is authenticated the way the team server already
+    authenticates its call to the companion service -- a shared token in a
+    header, checked per request. Without one, anyone could walk the agent
+    names, which come from a fixed word list, and take tasking the real
+    beacon would then never see, because the queue hands each task out
+    once.
+    """
+
+    TOKEN = "listener-token-for-tests"
+
+    def setUp(self):
+        self.raw, self.b64 = _key_pair()
+        quiet = logging.getLogger("werkzeug")
+        previous = quiet.level
+        quiet.setLevel(logging.ERROR)
+        self.addCleanup(quiet.setLevel, previous)
+        self.env = _TaskingServer(self.raw, self.TOKEN)
+        self.addCleanup(self.env.stop)
+        self.env.start()
+
+    def _get(self, path, *, token=TOKEN, port=None):
+        url = "http://127.0.0.1:%d%s" % (port or self.env.agent_port, path)
+        request = urllib.request.Request(url)
+        if token is not None:
+            request.add_header("X-Listener-Token", token)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            return exc.code, None
+
+    def test_tasking_for_a_registered_agent_comes_back_wrapped(self):
+        name = self.env.register("probe-one")
+        task_id = self.env.queue(name, "shell", "echo dns_route")
+
+        status, body = self._get("/api/v1/dns/%s" % name)
+
+        self.assertEqual(status, 200)
+        got = self.env.crypto.unwrap(body)
+        self.assertEqual(got["id"], task_id)
+        self.assertEqual(got["args"], "echo dns_route")
+
+    def test_an_agent_with_no_tasking_gets_an_empty_wrapped_answer(self):
+        name = self.env.register("probe-two")
+        status, body = self._get("/api/v1/dns/%s" % name)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.env.crypto.unwrap(body), {})
+
+    def test_an_unknown_id_gets_the_same_empty_answer(self):
+        # Indistinguishable from a known agent with nothing queued, so the
+        # route is not an existence oracle even for a token holder.
+        status, body = self._get("/api/v1/dns/raccoon-nosuchagent")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.env.crypto.unwrap(body), {})
+
+    def test_the_task_leaves_the_queue(self):
+        # Fire-and-forget: DNS has no result path, so a task that stayed in
+        # the queue would be handed out again at every check-in, forever.
+        # A `shell reboot` delivered that way would be a loop, not a task.
+        name = self.env.register("probe-three")
+        self.env.queue(name, "shell", "echo once")
+
+        first = self.env.crypto.unwrap(self._get("/api/v1/dns/%s" % name)[1])
+        second = self.env.crypto.unwrap(self._get("/api/v1/dns/%s" % name)[1])
+
+        self.assertEqual(first.get("args"), "echo once")
+        self.assertEqual(second, {}, "the task was handed out twice")
+
+    def test_a_dns_only_beacon_is_found_by_its_implant_id(self):
+        # The property that makes this route usable at all, and the one I
+        # got wrong first: `_beacon_dns` puts `self._agent_id or
+        # self._implant_id` into the query name, and a beacon that only
+        # speaks DNS is never told its agent name -- nothing over DNS
+        # carries one back. So the only identifier it can ever send is the
+        # implant id, and a route that accepts agent names alone is
+        # unreachable for every real client.
+        name = self.env.register("implant-id-probe")
+        task_id = self.env.queue(name, "shell", "echo by_implant_id")
+
+        status, body = self._get("/api/v1/dns/implant-id-probe")
+
+        self.assertEqual(status, 200)
+        got = self.env.crypto.unwrap(body)
+        self.assertEqual(got.get("id"), task_id,
+                         "the implant id did not resolve to the agent")
+
+    def test_without_the_token_it_is_refused(self):
+        name = self.env.register("probe-four")
+        self.env.queue(name, "shell", "echo secret")
+        status, _ = self._get("/api/v1/dns/%s" % name, token=None)
+        self.assertEqual(status, 401)
+
+    def test_with_a_wrong_token_it_is_refused(self):
+        name = self.env.register("probe-five")
+        status, _ = self._get("/api/v1/dns/%s" % name, token="wrong")
+        self.assertEqual(status, 401)
+
+    def test_a_server_with_no_listener_token_refuses_everyone(self):
+        # The route must add no surface to a deployment that does not use
+        # listeners, and that is the default: `create_app` takes the token
+        # as an optional argument, so an unconfigured server has nothing to
+        # compare against. It refuses rather than accepting the empty
+        # string, which is how this kind of check usually fails.
+        quiet = logging.getLogger("werkzeug")
+        previous = quiet.level
+        quiet.setLevel(logging.ERROR)
+        self.addCleanup(quiet.setLevel, previous)
+        # Both shapes an unconfigured server takes: the argument omitted,
+        # and an empty string -- which is what an unset environment
+        # variable becomes once configuration reads one, so it is the more
+        # likely of the two to reach production.
+        for index, configured in enumerate((None, "")):
+            bare = _TaskingServer(self.raw, configured)
+            self.addCleanup(bare.stop)
+            bare.start()
+            # A distinct implant id per round. Both servers share the
+            # module-level fleet, so re-using one id made the second
+            # registration resolve to the agent the first had created, no
+            # new name appeared, and the helper reported a registration
+            # failure -- in the full suite only, because I checked this
+            # test against a mutation and never against itself.
+            name = bare.register("unconfigured-probe-%d" % index)
+            bare.queue(name, "shell", "echo unreachable")
+
+            for presented in (None, "", self.TOKEN, "anything"):
+                with self.subTest(configured=configured, presented=presented):
+                    request = urllib.request.Request(
+                        "http://127.0.0.1:%d/api/v1/dns/%s"
+                        % (bare.agent_port, name))
+                    if presented is not None:
+                        request.add_header("X-Listener-Token", presented)
+                    with self.assertRaises(urllib.error.HTTPError) as caught:
+                        urllib.request.urlopen(request, timeout=5)
+                    self.assertEqual(caught.exception.code, 401)
+
+    def test_a_refused_identifier_cannot_forge_a_log_line(self):
+        # The identifier comes straight out of the URL path, and the
+        # refusal is logged. A newline in it would let an unauthenticated
+        # caller write its own lines into the server's log -- the same
+        # class of defect as the HTML escapes, in a different output.
+        from software.c2 import server as server_mod
+
+        with self.assertLogs(server_mod.logger, level="WARNING") as caught:
+            status, _ = self._get(
+                "/api/v1/dns/x%0aWARNING:raccoon.c2:all%20clear",
+                token="wrong")
+        self.assertEqual(status, 401)
+        for line in caught.output:
+            self.assertNotIn("\n", line,
+                             "a newline reached the log: %r" % line)
+
+    def test_the_token_comparison_is_constant_time(self):
+        # Asserted on this route's own body, not on the file. Searching the
+        # whole file for "compare_digest" would pass on a hit anywhere in
+        # it -- which is exactly the mistake that made a docs probe report
+        # the operator token's `==` fixed when this route was added.
+        import ast
+
+        from software.c2 import server as server_mod
+
+        tree = ast.parse(_read_source("software", "c2", "server.py"))
+        bodies = [fn for fn in ast.walk(tree)
+                  if isinstance(fn, ast.FunctionDef)
+                  and fn.name == "api_dns_tasking"]
+        self.assertEqual(len(bodies), 1, "api_dns_tasking is not defined once")
+        calls = {node.func.attr for node in ast.walk(bodies[0])
+                 if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)}
+        self.assertIn("compare_digest", calls,
+                      "the listener token must not be compared with ==")
+        self.assertNotIn("sha256", calls,
+                         "a hardening guard forbids sha256 in this file")
+        del server_mod
+
+    def test_the_agent_socket_still_serves_only_the_named_endpoints(self):
+        # This route is the first exception added to the agent socket since
+        # the hardening pass built that policy, so the test that matters is
+        # not "is the new route reachable" but "did adding it widen
+        # anything else". Walk every rule and check.
+        #
+        # It is served on the operator socket too, and that is correct:
+        # that socket binds loopback and the policy allows everything
+        # there. My first version of this test asserted a refusal there,
+        # which would have been a property the code does not have and
+        # should not.
+        from software.c2 import server as server_mod
+
+        allowed = server_mod._AGENT_SOCKET_ENDPOINTS
+        self.assertEqual(allowed, frozenset({"beacon_handler",
+                                             "api_dns_tasking"}),
+                         "the agent socket's allow-set changed")
+
+        cover = {"status": "ok", "version": "2.1.0"}
+        checked = 0
+        for rule in self.env.app.url_map.iter_rules():
+            if rule.endpoint in allowed or rule.endpoint == "static":
+                continue
+            if "GET" not in (rule.methods or set()):
+                continue
+            path = str(rule).replace("<path:path>", "x")
+            path = re.sub(r"<[^>]+>", "1", path)
+            status, body = self._get(path)
+            checked += 1
+            self.assertEqual(body, cover,
+                             "%s answered on the agent socket" % path)
+        self.assertGreater(checked, 10,
+                           "only %d routes were checked" % checked)
+
+
+class TestTheDnsListener(unittest.TestCase):
+    """The DNS listener against the client that defines its wire format.
+
+    The client sends `<base32(agent_id) lowercased, unpadded>.b.<zone>` as
+    a TXT question and decrypts each record it gets until one works. There
+    is no payload in the question, so this listener fetches already-wrapped
+    tasking from the team server and forwards it -- it holds no key.
+    """
+
+    TOKEN = "listener-token-for-tests"
+    ZONE = "c2.test"
+
+    def setUp(self):
+        self.raw, self.b64 = _key_pair()
+        quiet = logging.getLogger("werkzeug")
+        previous = quiet.level
+        quiet.setLevel(logging.ERROR)
+        self.addCleanup(quiet.setLevel, previous)
+        self.env = _TaskingServer(self.raw, self.TOKEN)
+        self.addCleanup(self.env.stop)
+        self.env.start()
+        self.listener = DnsListener(
+            "127.0.0.1", 0,
+            relay_url="http://127.0.0.1:%d" % self.env.agent_port,
+            zone=self.ZONE, listener_token=self.TOKEN)
+        self.listener.start()
+        self.addCleanup(self.listener.shutdown)
+
+    def _ask(self, name, qtype="TXT"):
+        """Query through the client's own resolver code, not a reimplementation."""
+        with patch.object(beacon_mod, "_DNS_PORT", self.listener.address[1]):
+            return beacon_mod._dns_query(name, qtype, "127.0.0.1", timeout=5)
+
+    @staticmethod
+    def _label(agent_id):
+        return (base64.b32encode(agent_id.encode()).decode()
+                .rstrip("=").lower())
+
+    # ── the deliverable ──
+
+    def test_a_registered_beacon_receives_tasking_over_dns(self):
+        name = self.env.register("dns-probe")
+        task_id = self.env.queue(name, "shell", "echo over_dns")
+
+        records = self._ask("%s.b.%s" % (self._label(name), self.ZONE))
+
+        self.assertEqual(len(records), 1, "expected one TXT record")
+        got = ServerCrypto(self.raw).decrypt(records[0])
+        self.assertEqual(got["id"], task_id)
+        self.assertEqual(got["args"], "echo over_dns")
+
+    def test_the_query_name_is_decoded_the_way_the_client_encodes_it(self):
+        # base32, lower-cased, padding stripped. An agent name of a length
+        # that needs padding is the case that breaks a naive decoder, so
+        # exercise several.
+        for agent in ("raccoon-bandit", "a", "ab", "abcde", "raccoon-x-12"):
+            with self.subTest(agent=agent):
+                label = self._label(agent)
+                decoded = self.listener._agent_of(
+                    "%s.b.%s" % (label, self.ZONE))
+                self.assertEqual(decoded, agent)
+
+    def test_an_unregistered_id_yields_no_tasking(self):
+        # The hard limit of this channel: no registration goes over DNS, so
+        # an id the server has never seen has nothing waiting.
+        #
+        # A record still comes back, and that is correct rather than a
+        # leak: the server answers an encrypted empty mapping, and the
+        # listener cannot tell that from real tasking because it holds no
+        # key. Asserting "no record" would have demanded the listener
+        # understand the payload, which is the one thing it must not do.
+        # The property that matters is what the beacon then sees.
+        records = self._ask("%s.b.%s" % (self._label("raccoon-ghost"),
+                                         self.ZONE))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(ServerCrypto(self.raw).decrypt(records[0]), {})
+
+    def test_an_agent_with_nothing_queued_yields_no_tasking(self):
+        name = self.env.register("dns-idle")
+        records = self._ask("%s.b.%s" % (self._label(name), self.ZONE))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(ServerCrypto(self.raw).decrypt(records[0]), {})
+
+    def test_a_known_and_an_unknown_id_are_indistinguishable_to_the_listener(self):
+        # Neither the listener nor anyone watching it can tell one from the
+        # other without the key, which is what stops the channel being an
+        # existence oracle.
+        known = self.env.register("dns-known")
+        a = self._ask("%s.b.%s" % (self._label(known), self.ZONE))
+        b = self._ask("%s.b.%s" % (self._label("raccoon-absent"), self.ZONE))
+        self.assertEqual(len(a), len(b), 1)
+        self.assertEqual(len(a[0]), len(b[0]),
+                         "the answer lengths differ, which leaks existence")
+
+    def test_a_query_outside_the_zone_is_refused(self):
+        name = self.env.register("dns-elsewhere")
+        self.env.queue(name, "shell", "echo leak")
+        for host in ("%s.b.evil.example" % self._label(name),
+                     "%s.x.%s" % (self._label(name), self.ZONE),
+                     self._label(name),
+                     "www.%s" % self.ZONE):
+            with self.subTest(host=host):
+                self.assertEqual(self._ask(host), [],
+                                 "%s was answered" % host)
+
+    def test_a_non_txt_question_gets_no_record(self):
+        name = self.env.register("dns-atype")
+        self.env.queue(name, "shell", "echo a_record")
+        self.assertEqual(
+            self._ask("%s.b.%s" % (self._label(name), self.ZONE), "A"), [])
+
+    def test_a_long_payload_is_split_into_character_strings(self):
+        # One TXT character-string caps at 255 bytes and the client joins
+        # them, which is why it joins rather than taking the first.
+        from software.c2.listeners.dns import _txt_chunks
+        payload = "p" * 900
+        chunks = _txt_chunks(payload)
+        self.assertGreater(len(chunks), 3)
+        self.assertTrue(all(len(c) <= 255 for c in chunks))
+        self.assertEqual(b"".join(chunks).decode(), payload)
+
+    def test_a_malformed_query_does_not_crash_the_listener(self):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.settimeout(1)
+        self.addCleanup(probe.close)
+        malformed = [
+            b"",
+            b"\x00" * 4,
+            os.urandom(11),
+            struct.pack("!HHHHHH", 1, 0x0100, 0, 0, 0, 0),      # no question
+            struct.pack("!HHHHHH", 2, 0x0100, 5, 0, 0, 0),      # five claimed
+            struct.pack("!HHHHHH", 3, 0x0100, 1, 0, 0, 0) + b"\xc0\x0c",
+            struct.pack("!HHHHHH", 4, 0x0100, 1, 0, 0, 0) + b"\x3fshort",
+            struct.pack("!HHHHHH", 5, 0x8400, 1, 0, 0, 0) + b"\x00",
+            b"A" * 600,
+        ]
+        before = self.listener.queries_seen()
+        for packet in malformed:
+            probe.sendto(packet, self.listener.address)
+        _wait_until(
+            lambda: self.listener.queries_seen() >= before + len(malformed),
+            "the listener to read %d malformed queries" % len(malformed))
+
+        name = self.env.register("dns-after")
+        self.env.queue(name, "shell", "echo still_up")
+        records = self._ask("%s.b.%s" % (self._label(name), self.ZONE))
+        self.assertEqual(len(records), 1,
+                         "the listener stopped answering after malformed input")
+
+    # ── properties the deliverable tests did not hold ──
+    #
+    # The four below exist because a mutation check found the deliverable
+    # tests indifferent to them: each mutation stayed green. Three further
+    # survivors -- following a compression pointer, allowing a dot in the
+    # label, ignoring qdcount -- turned out to be genuinely equivalent,
+    # because every one of those paths already collapses to None further
+    # along. Those got no test; a test that cannot fail is worse than none.
+
+    def test_the_answer_claims_to_be_an_authoritative_response(self):
+        # QR and AA. The client does not check either, so nothing in the
+        # deliverable noticed when they were cleared -- but a resolver in
+        # the path does, and in production there is always one: the beacon
+        # asks a resolver, not this listener. An answer without QR is not a
+        # response and gets dropped before it reaches the client.
+        from software.c2.listeners.dns import _build_answer
+
+        answer = _build_answer(0x1234, b"\x01a\x00\x00\x10\x00\x01",
+                               [b"payload"], 1)
+        flags = struct.unpack("!H", answer[2:4])[0]
+        self.assertTrue(flags & 0x8000, "QR is not set: this is not a reply")
+        self.assertTrue(flags & 0x0400, "AA is not set")
+        self.assertEqual(struct.unpack("!H", answer[:2])[0], 0x1234,
+                         "the transaction id was not echoed")
+
+    def test_the_record_name_points_at_the_question(self):
+        # A TXT record names its owner with a pointer to offset 12, where
+        # the question's name starts. The client happens to skip any
+        # pointer without reading it, which is why a wrong offset went
+        # unnoticed -- a resolver would reject the record.
+        from software.c2.listeners.dns import _build_answer
+
+        question = b"\x01a\x00\x00\x10\x00\x01"
+        answer = _build_answer(1, question, [b"x"], 1)
+        pointer = answer[12 + len(question):14 + len(question)]
+        self.assertEqual(pointer, b"\xc0\x0c",
+                         "the record points somewhere other than the question")
+
+    def test_an_oversized_query_is_dropped_without_parsing(self):
+        # The cap bounds the work one packet can cause. The malformed
+        # batch did not hold it: 600 bytes of "A" fail to parse anyway, so
+        # removing the cap changed nothing observable. A query that would
+        # otherwise parse does hold it.
+        name = self.env.register("dns-oversize")
+        label = self._label(name)
+        padding = ".".join(["a" * 60] * 9)          # pushes it over 512
+        question = _dns_question("%s.%s.b.%s" % (label, padding, self.ZONE))
+        self.assertGreater(len(question), self.listener.max_query_bytes)
+        self.assertIsNone(self.listener._answer_for(question))
+
+    def test_a_dns_response_is_not_answered(self):
+        # Answering something that is itself a response is how two
+        # nameservers end up talking to each other forever, and how a
+        # listener becomes a reflector for a spoofed source address.
+        name = self.env.register("dns-reflect")
+        self.env.queue(name, "shell", "echo reflected")
+        query = _dns_question("%s.b.%s" % (self._label(name), self.ZONE))
+        # Bytes 2:4 are the flags. My first attempt put QR into bytes 0:2,
+        # which is the transaction id, and the listener rightly answered a
+        # perfectly ordinary query.
+        response = query[:2] + struct.pack("!H", 0x8400) + query[4:]
+        self.assertIsNone(self.listener._answer_for(response),
+                          "the listener answered a response")
+
+    def test_no_result_path_is_offered(self):
+        # The documented limit must not drift into a half-built upstream:
+        # nothing here may accept a result.
+        imported, used = _imports_and_names("software", "c2", "listeners",
+                                            "dns.py")
+        for banned in ("_handle_result", "relay"):
+            self.assertNotIn(banned, used,
+                             "dns.py reaches for %s; this channel carries "
+                             "tasking only" % banned)
+        src = _read_source("software", "c2", "listeners", "dns.py")
+        self.assertNotIn("action\": \"result", src)
+
+    def test_the_listener_holds_no_key(self):
+        imported, used = _imports_and_names("software", "c2", "listeners",
+                                            "dns.py")
+        self.assertNotIn("cryptography", imported)
+        for banned in ("ServerCrypto", "AESGCM", "decode_key"):
+            self.assertNotIn(banned, used)
 
 
 # New test classes belong above this guard; never append below it.

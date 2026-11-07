@@ -450,6 +450,13 @@ def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> by
 
 # ── Stdlib DNS resolver (TXT + A records) ──
 
+# The resolver port. Named rather than written into the sendto call so a
+# test can point this at a listener on a free port: binding 53 needs root,
+# and in production dockerd or systemd owns it and forwards to an
+# unprivileged listener, so nothing here ever binds it either.
+_DNS_PORT = 53
+
+
 def _dns_query(name: str, qtype: str, server: str, timeout: float = 10) -> list:
     """Minimal DNS query using raw UDP sockets. Returns list of strings (TXT) or IPs (A)."""
     qtypes = {"A": 1, "TXT": 16}
@@ -470,7 +477,7 @@ def _dns_query(name: str, qtype: str, server: str, timeout: float = 10) -> list:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
     try:
-        sock.sendto(packet, (server, 53))
+        sock.sendto(packet, (server, _DNS_PORT))
         data, _ = sock.recvfrom(4096)
     finally:
         sock.close()

@@ -577,8 +577,14 @@ def _the_shipped_config_carries_a_vnc_password():
 
 def _the_token_is_compared_with_plain_equality():
     text = _read("software", "c2", "server.py")
-    return ("return auth[7:] == operator_token" in text
-            and "compare_digest" not in text)
+    # Only the operator token's own comparison counts. This used to also
+    # require that `compare_digest` appeared nowhere in the file, which
+    # read as a shortcut for "nothing here compares tokens properly yet".
+    # The listener tasking route then added a second, correct comparison,
+    # and the shortcut made this probe report the finding fixed while
+    # line 350 still held an `==`. A probe that names one comparison has
+    # to look at that comparison.
+    return "return auth[7:] == operator_token" in text
 
 
 def _project_files_are_world_readable():
