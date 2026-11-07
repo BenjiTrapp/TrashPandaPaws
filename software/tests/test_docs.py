@@ -604,12 +604,6 @@ def _there_is_no_licence_file():
                    for p in REPO.iterdir() if p.is_file())
 
 
-def _smb_and_quic_double_serialise():
-    text = _read("software", "c2", "beacon.py")
-    return ("def _encrypt(self, data: dict)" in text
-            and len(re.findall(r"self\._encrypt\(json\.dumps\(", text)) == 3)
-
-
 # group -> [(phrase the entry must contain, True-while-open or None)].
 # None means nothing in the working tree can show it: the six commits are on
 # a GitHub reference, and the deferred minors are properties of tests, of
@@ -652,7 +646,6 @@ _OPEN_FINDINGS = {
         ("Six commits", None),
     ],
     "Found while hardening, not by the audit": [
-        ("SMB and QUIC request legs are dead", _smb_and_quic_double_serialise),
         ("A correction to the audit's severity", None),
     ],
     "Minor, deferred": [

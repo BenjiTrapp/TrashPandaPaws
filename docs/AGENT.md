@@ -795,16 +795,6 @@ more.
 
 #### Found while hardening, not by the audit
 
-- **The SMB and QUIC request legs are dead in production.**
-  `Beacon._encrypt(data: dict)` serialises its argument itself, and three
-  call sites hand it a value that is already serialised:
-  `self._encrypt(json.dumps(...).encode())`, in `_beacon_smb`, in the SMB
-  result send and in `_quic_send`. `json.dumps` on bytes raises `TypeError`,
-  the surrounding `except` swallows it, and neither transport ever reaches a
-  response. Fixing it would switch on two transports that have never run,
-  which is not a change to make inside a security fix. The README's "four
-  independent channels" describes the design; two of the four have not
-  worked.
 - **A correction to the audit's severity.** An earlier summary of the pass
   said encryption was optional on "three of four channels", with command
   execution possible without any key. The accurate statement is narrower:
