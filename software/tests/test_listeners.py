@@ -12,6 +12,8 @@ import base64
 import json
 import logging
 import os
+import socket
+import struct
 import sys
 import threading
 import time
@@ -23,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from software.c2 import beacon as beacon_mod
 from software.c2.beacon import Beacon
+from software.c2.listeners.quic import QuicListener
 from software.c2.listeners.relay import relay
 from software.c2.server import ServerCrypto
 
@@ -59,6 +62,16 @@ def _imports_and_names(*parts):
         elif isinstance(node, ast.Attribute):
             used.add(node.attr)
     return imported, used
+
+
+def _wait_until(predicate, what, timeout=10.0):
+    """Poll for a condition rather than sleeping a guessed interval."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError("timed out waiting for %s" % what)
 
 
 _PAYLOAD_FIELD_FOR_TEST = beacon_mod._PAYLOAD_FIELDS[0]
@@ -468,6 +481,311 @@ class TestTheRelay(unittest.TestCase):
             self.assertFalse(name.endswith(".server") or name == "server",
                              "relay.py imports the team server module (%s)"
                              % name)
+
+
+class TestTheUdpListener(unittest.TestCase):
+    """The UDP listener against the client that defines its wire format.
+
+    The framing is the beacon's: a frame is [4-byte length][payload], cut
+    into 1200-byte chunks, each datagram prefixed
+    struct ">IHH" = [stream_id][frag_index][total_frags]. Eight bytes, not
+    sixteen -- an assumption that cost one earlier test in this file.
+
+    The client reads answers with recvfrom(1500) and ignores the stream_id
+    it gets back, so an answer datagram must stay under 1500 bytes
+    including its header, and every answer datagram must agree on
+    total_frags because the client takes `expected` from whichever it last
+    parsed.
+    """
+
+    FRAG = 1200
+    HEADER = struct.Struct(">IHH")
+
+    def setUp(self):
+        self.raw, self.b64 = _key_pair()
+        self.crypto = ServerCrypto(self.raw)
+        quiet = logging.getLogger("werkzeug")
+        previous = quiet.level
+        quiet.setLevel(logging.ERROR)
+        self.addCleanup(quiet.setLevel, previous)
+        self._deferred = []
+
+    # ── helpers ──
+
+    def _listener(self, relay_url="http://127.0.0.1:1/"):
+        listener = QuicListener("127.0.0.1", 0, relay_url=relay_url)
+        listener.start()
+        self.addCleanup(listener.shutdown)
+        return listener
+
+    def _relaying_to(self, handler):
+        """A real HTTP endpoint on a free port, plus a listener aimed at it."""
+        from werkzeug.serving import make_server
+
+        def app(environ, start_response):
+            length = int(environ.get("CONTENT_LENGTH") or 0)
+            body = json.loads(environ["wsgi.input"].read(length) or b"{}")
+            answer = json.dumps(handler(body) or {}).encode()
+            start_response("200 OK", [("Content-Type", "application/json"),
+                                      ("Content-Length", str(len(answer)))])
+            return [answer]
+
+        srv = make_server("127.0.0.1", 0, app, threaded=True)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        url = "http://127.0.0.1:%d/" % srv.server_port
+        return self._listener(url)
+
+    def _send_frame(self, listener, payload: bytes, stream_id=None,
+                    sock=None, interleave=False):
+        """Frame and fragment `payload` exactly as the beacon does."""
+        import random as _random
+        stream_id = (stream_id if stream_id is not None
+                     else _random.getrandbits(32))
+        frame = struct.pack(">I", len(payload)) + payload
+        total = (len(frame) + self.FRAG - 1) // self.FRAG or 1
+        own = sock is None
+        sock = sock or socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if own:
+            sock.settimeout(10)
+            self.addCleanup(sock.close)
+        datagrams = []
+        for i in range(total):
+            chunk = frame[i * self.FRAG:(i + 1) * self.FRAG]
+            datagrams.append(self.HEADER.pack(stream_id, i, total) + chunk)
+        if interleave and total > 1:
+            # Send everything but the last fragment now and the last one
+            # on the deferred call, so two senders' partials coexist in the
+            # listener at the same time. That is the only arrangement in
+            # which a collision on stream_id can actually splice them.
+            for dgram in datagrams[:-1]:
+                sock.sendto(dgram, listener.address)
+            self._deferred.append((sock, datagrams[-1], listener.address))
+        else:
+            for dgram in datagrams:
+                sock.sendto(dgram, listener.address)
+        return sock, stream_id
+
+    def _flush_deferred(self):
+        for sock, dgram, addr in self._deferred:
+            sock.sendto(dgram, addr)
+        self._deferred = []
+
+    def _read_frame(self, sock):
+        """Collect an answer the way the beacon does, and unframe it."""
+        fragments, expected = {}, None
+        while True:
+            data, _ = sock.recvfrom(1500)
+            if len(data) < 8:
+                continue
+            _sid, idx, total = self.HEADER.unpack(data[:8])
+            expected = total
+            fragments[idx] = data[8:]
+            if len(fragments) == expected:
+                break
+        joined = b"".join(fragments[i] for i in sorted(fragments))
+        length = struct.unpack(">I", joined[:4])[0]
+        return joined[4:4 + length]
+
+    # ── the exchange ──
+
+    def test_a_payload_is_relayed_and_the_answer_comes_back(self):
+        answer = self.crypto.wrap({"tasks": [{"cmd": "shell"}]})
+        seen = []
+        listener = self._relaying_to(lambda body: seen.append(body) or answer)
+
+        sent = self.crypto.encrypt({"action": "beacon"})
+        sock, _ = self._send_frame(listener, sent.encode())
+        got = self._read_frame(sock)
+
+        self.assertEqual(self.crypto.decrypt(got.decode()),
+                         {"tasks": [{"cmd": "shell"}]})
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(self.crypto.unwrap(seen[0]), {"action": "beacon"})
+
+    def test_a_payload_larger_than_one_fragment_reassembles(self):
+        # A task carrying a file is the real case; 4 KB is three fragments.
+        big = self.crypto.encrypt({"action": "result", "output": "x" * 4096})
+        self.assertGreater(len(big), self.FRAG * 2,
+                           "the fixture is not multi-fragment")
+        seen = []
+        listener = self._relaying_to(
+            lambda body: seen.append(body) or self.crypto.wrap({"ack": True}))
+
+        sock, _ = self._send_frame(listener, big.encode())
+        got = self._read_frame(sock)
+
+        self.assertEqual(self.crypto.decrypt(got.decode()), {"ack": True})
+        self.assertEqual(self.crypto.unwrap(seen[0])["output"], "x" * 4096)
+
+    def test_an_answer_larger_than_one_fragment_is_fragmented(self):
+        # The client reads 1500 bytes at a time, so a long answer must come
+        # back in pieces that each fit.
+        answer = self.crypto.wrap({"tasks": [{"cmd": "upload",
+                                              "data": "y" * 8192}]})
+        listener = self._relaying_to(lambda _body: answer)
+        sock, _ = self._send_frame(
+            listener, self.crypto.encrypt({"action": "beacon"}).encode())
+        got = self._read_frame(sock)
+        self.assertEqual(
+            self.crypto.decrypt(got.decode())["tasks"][0]["data"], "y" * 8192)
+
+    def test_two_senders_sharing_a_stream_id_each_get_their_own_answer(self):
+        # stream_id is four random bytes chosen by the sender, so two
+        # clients can collide. Reassembly keyed on stream_id alone would
+        # splice them together; keyed on (address, stream_id) it cannot.
+        def handler(body):
+            got = self.crypto.unwrap(body)
+            return self.crypto.wrap({"echo": got["who"]})
+
+        listener = self._relaying_to(handler)
+        collision = 0x41414141
+
+        # The payloads must span several fragments, or there is nothing to
+        # splice: a single-fragment frame completes on arrival and leaves
+        # the buffer before the other sender's datagram gets there. A
+        # mutation check caught this -- keying on stream_id alone passed the
+        # first version of this test, which therefore held nothing.
+        socks = []
+        for who in ("first", "second"):
+            payload = self.crypto.encrypt({"action": "beacon", "who": who,
+                                           "pad": who * 2000})
+            self.assertGreater(len(payload), self.FRAG,
+                               "the fixture is not multi-fragment")
+            sock, _ = self._send_frame(listener, payload.encode(),
+                                       stream_id=collision, interleave=True)
+            socks.append((who, sock))
+
+        self._flush_deferred()
+
+        for who, sock in socks:
+            got = self.crypto.decrypt(self._read_frame(sock).decode())
+            self.assertEqual(got["echo"], who,
+                             "%s received %s's answer" % (who, got["echo"]))
+
+    # ── traffic that is not a client ──
+
+    def test_stray_datagrams_reach_nothing_and_do_not_stop_the_listener(self):
+        relayed = []
+        listener = self._relaying_to(
+            lambda body: relayed.append(body) or self.crypto.wrap({}))
+
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.settimeout(1)
+        self.addCleanup(probe.close)
+        # Detectably malformed: each fails a check the listener can make on
+        # the datagram alone, so none of these may leave anything buffered.
+        detectable = [
+            b"",                                   # empty
+            b"\x00",                               # shorter than a header
+            b"A" * 7,                              # one byte short
+            self.HEADER.pack(1, 0, 0) + b"abc",    # total_frags = 0
+            self.HEADER.pack(2, 5, 1) + b"abc",    # index beyond total
+            self.HEADER.pack(3, 0, 65535) + b"a",  # absurd total
+        ]
+        # Indistinguishable from a real first fragment: the first eight
+        # bytes of an HTTP request line unpack to total=18516, index=12064,
+        # which is arithmetically fine. Buffering these is correct -- the
+        # bounded-and-expires test covers the consequence. Asserting zero
+        # partials after them was my mistake, not the listener's, and a
+        # mutation check is what exposed the muddle.
+        plausible = [
+            os.urandom(64),
+            b"GET / HTTP/1.1\r\n\r\n",
+        ]
+        before = listener.datagrams_seen()
+        for stray in detectable:
+            probe.sendto(stray, listener.address)
+        # Wait for the listener to have read them, not for a fixed moment.
+        # The first version of this used _wait_until(lambda: True, ...),
+        # which returns at once and asserted before the service had looked
+        # at its input -- three mutations passed because of it.
+        _wait_until(
+            lambda: listener.datagrams_seen() >= before + len(detectable),
+            "the listener to read %d stray datagrams" % len(detectable))
+        self.assertEqual(listener.partial_count(), 0,
+                         "a detectably malformed datagram was buffered")
+        for stray in plausible:
+            probe.sendto(stray, listener.address)
+
+        # The listener must still serve a real exchange afterwards.
+        sent = self.crypto.encrypt({"action": "beacon"})
+        sock, _ = self._send_frame(listener, sent.encode())
+        self._read_frame(sock)
+
+        self.assertEqual(len(relayed), 1,
+                         "%d stray datagrams reached the HTTP endpoint"
+                         % (len(relayed) - 1))
+        # Nor may a malformed datagram leave anything buffered: a header
+        # claiming total_frags=0 used to be dropped by the index check
+        # rather than by its own, which a mutation check exposed -- the
+        # endpoint stayed clean either way, so the old assertion held
+        # nothing about the buffer.
+        self.assertLessEqual(listener.partial_count(), listener.max_partials,
+                             "partials grew past the cap")
+
+    def test_a_frame_that_lies_about_its_length_is_dropped(self):
+        # One fragment, complete, but the four-byte length header claims
+        # more than the body carries. Nothing in the stray set reached this
+        # check, so it was untested until a mutation check said so.
+        relayed = []
+        listener = self._relaying_to(
+            lambda body: relayed.append(body) or self.crypto.wrap({}))
+
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.settimeout(1)
+        self.addCleanup(probe.close)
+        for claimed, body in ((9999, b"short"), (0, b"something"),
+                              (4, b"ab")):
+            frame = struct.pack(">I", claimed) + body
+            probe.sendto(self.HEADER.pack(0x5A5A, 0, 1) + frame,
+                         listener.address)
+
+        sent = self.crypto.encrypt({"action": "beacon"})
+        sock, _ = self._send_frame(listener, sent.encode())
+        self._read_frame(sock)
+
+        self.assertEqual(len(relayed), 1,
+                         "a frame with a false length was relayed")
+
+    def test_an_incomplete_reassembly_is_bounded_and_expires(self):
+        listener = self._listener()
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(probe.close)
+
+        # One fragment of nine, from many ports, over and over: a partial
+        # that never completes is one packet from anybody.
+        for i in range(400):
+            probe.sendto(self.HEADER.pack(i, 0, 9) + b"z" * 1200,
+                         listener.address)
+        _wait_until(lambda: listener.partial_count() > 0,
+                    "the listener to buffer a partial")
+
+        self.assertLessEqual(listener.partial_count(), listener.max_partials,
+                             "partials grew past the cap")
+        self.assertLessEqual(listener.buffered_bytes(),
+                             listener.max_buffered_bytes,
+                             "buffered bytes grew past the cap")
+
+        listener.expire_partials(older_than=0.0)
+        self.assertEqual(listener.partial_count(), 0,
+                         "expiry left partials behind")
+
+    # ── the deliverable ──
+
+    def test_a_real_beacon_completes_a_full_cycle_over_udp_alone(self):
+        from tools.listener_rig import run_cycle
+
+        seen = run_cycle("quic")
+
+        self.assertTrue(seen["registered"], "the beacon never registered")
+        self.assertEqual(seen["transport"], "quic")
+        self.assertTrue(seen["task_id"], "no task was queued")
+        self.assertEqual(seen["result_status"], "ok",
+                         "result was %r" % (seen.get("result_status"),))
+        self.assertIn("raccoon_rig", seen["result_output"],
+                      "the command did not run: %r"
+                      % (seen.get("result_output"),))
 
 
 # New test classes belong above this guard; never append below it.
