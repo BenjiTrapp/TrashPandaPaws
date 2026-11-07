@@ -40,7 +40,7 @@ or an HP network printer to blend into enterprise infrastructure.
 |------|------------|
 | **Hardware** | Custom PoE HAT (SI3402-B + TPS54302), USB-GbE via RTL8153B, 3 build variants (Lite / v1 HAT / v2 CM4) |
 | **Cover Identity** | Cisco IP Phone 7960 (SIP, RTP, HTTP) or HP LaserJet MFP M478 (PJL, LPD, IPP, SNMP, Telnet) |
-| **C2 Transport** | 4 independent channels: HTTPS, DNS, SMB named pipes, QUIC-style UDP — with automatic fallback |
+| **C2 Transport** | 3 independent channels — HTTPS, SMB named pipes, QUIC-style UDP — plus DNS as a tasking-only side channel, with automatic fallback |
 | **Encryption** | AES-256-GCM on all channels, keys auto-generated or operator-defined |
 | **Beacon** | Pure Python stdlib, zero external dependencies, multi-layer obfuscation (1–6 layers zlib+base64) |
 | **Operator GUI** | Flask-based team server with embedded SPA: terminal, file browser, pivot map, profile editor, 16 Impacket tools |
@@ -606,7 +606,11 @@ asked for again.
 
 #### Transport Protocols
 
-The beacon supports four independent C2 transport channels, all implemented in pure Python stdlib with zero external dependencies. Multiple protocols can be enabled simultaneously; the beacon tries them in order and falls through to the next on failure.
+The beacon supports four C2 transport channels, all implemented in pure Python stdlib with zero external dependencies. Multiple protocols can be enabled simultaneously; the beacon tries them in order and falls through to the next on failure.
+
+**Three of the four are independent; DNS is not.** HTTPS, SMB and QUIC each carry a registration, a check-in and a result, so a beacon configured with any one of them alone completes a full cycle. DNS carries tasking only: `_beacon_dns` queries a TXT record and decrypts the answer, but there is no `_send_result_dns` and no registration over DNS. A beacon that falls through to DNS alone will execute what it is given and report nothing. Use DNS alongside another channel, not instead of one.
+
+Only HTTPS has a server counterpart in this repository: the team server answers it. SMB expects a named pipe on an SMB server, QUIC expects a UDP listener, and DNS expects an authoritative nameserver for the configured zone — none of which ships here. For the current working state of each channel, including which have ever completed an exchange, see *Known limits* in [`docs/AGENT.md`](docs/AGENT.md#known-limits); that section is held by a test that fails if an entry is fixed and left in the list. The design that closes the gap is [`docs/superpowers/specs/2026-11-07-c2-listeners-design.md`](docs/superpowers/specs/2026-11-07-c2-listeners-design.md).
 
 ```mermaid
 flowchart LR
