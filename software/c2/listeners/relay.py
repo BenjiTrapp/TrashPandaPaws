@@ -43,6 +43,19 @@ _REQUEST_FIELD = _PAYLOAD_FIELDS[0]
 
 _MIN_PAYLOAD_LEN = 32
 
+# An explicit ceiling on what we will read back, because without one a
+# hostile or broken server can make this function hold a string of any
+# size -- and the listener above it would then dutifully fragment that
+# into datagrams or push it down a pipe to the beacon, amplifying on the
+# server's behalf. Measured before this was added: a 1 MB body with one
+# long string came back as a 1 MB payload.
+#
+# 64 MiB is generous rather than tight on purpose. A check-in answer
+# carries tasking, and a task may legitimately carry a file to drop on the
+# target, so a small cap would break real work; the point here is that the
+# number is bounded and stated rather than absent.
+_MAX_ANSWER_BYTES = 64 * 1024 * 1024
+
 
 def relay(payload: str, *, url: str, timeout: float = 30.0) -> Optional[str]:
     """POST `payload` to `url`; return the payload that comes back.
@@ -63,7 +76,13 @@ def relay(payload: str, *, url: str, timeout: float = 30.0) -> Optional[str]:
             if response.status != 200:
                 logger.debug("relay: status %s from %s", response.status, url)
                 return None
-            raw = response.read()
+            # One byte more than the ceiling, so a body that is exactly at
+            # the limit still reads and one over it is detectable.
+            raw = response.read(_MAX_ANSWER_BYTES + 1)
+            if len(raw) > _MAX_ANSWER_BYTES:
+                logger.debug("relay: answer from %s exceeded %d bytes",
+                             url, _MAX_ANSWER_BYTES)
+                return None
     except urllib.error.HTTPError as exc:
         logger.debug("relay: HTTP %s from %s", exc.code, url)
         return None

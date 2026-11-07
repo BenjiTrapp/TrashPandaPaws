@@ -61,6 +61,9 @@ def _imports_and_names(*parts):
     return imported, used
 
 
+_PAYLOAD_FIELD_FOR_TEST = beacon_mod._PAYLOAD_FIELDS[0]
+
+
 def _key_pair():
     """One key, both ends -- the mismatch this repository has paid for twice."""
     raw = os.urandom(32)
@@ -361,6 +364,55 @@ class TestTheRelay(unittest.TestCase):
             with self.subTest(answer=answer):
                 url = self._serve(lambda _b, a=answer: (200, a))
                 self.assertIsNone(relay("x" * 40, url=url, timeout=5.0))
+
+    def test_an_answer_over_the_ceiling_gives_None(self):
+        # Found by enumerating the failure modes rather than by reading:
+        # without a ceiling, a 1 MB body with one long string came back as
+        # a 1 MB payload, and the listener above would have fragmented that
+        # into some 850 datagrams on a hostile server's behalf.
+        from software.c2.listeners import relay as relay_mod
+        from werkzeug.serving import make_server
+
+        oversized = (b'{"x":"' + b"y" * (relay_mod._MAX_ANSWER_BYTES + 64)
+                     + b'"}')
+
+        def app(environ, start_response):
+            start_response("200 OK",
+                           [("Content-Type", "application/json"),
+                            ("Content-Length", str(len(oversized)))])
+            return [oversized]
+
+        srv = make_server("127.0.0.1", 0, app, threaded=True)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        url = "http://127.0.0.1:%d/" % srv.server_port
+        self.assertIsNone(relay("x" * 40, url=url, timeout=30.0))
+
+    def test_an_answer_just_under_the_ceiling_still_arrives(self):
+        # The ceiling must not reject real work. A task may carry a file.
+        from software.c2.listeners import relay as relay_mod
+        payload = self.crypto.encrypt({"tasks": [{"cmd": "upload"}]})
+        filler = "z" * 4096
+        url = self._serve(lambda _b: (200, {_PAYLOAD_FIELD_FOR_TEST: payload,
+                                            "pad": filler}))
+        got = relay("x" * 40, url=url, timeout=30.0)
+        self.assertIsNotNone(got)
+        self.assertEqual(self.crypto.decrypt(got),
+                         {"tasks": [{"cmd": "upload"}]})
+        self.assertLess(len(filler), relay_mod._MAX_ANSWER_BYTES)
+
+    def test_a_decoy_field_cannot_be_mistaken_for_the_payload(self):
+        # ServerCrypto.wrap adds decoy fields beside the payload. Measured
+        # over 200 draws: every decoy is an int or a float, never a string,
+        # so the scan cannot return one. This test holds that property on
+        # the server's side, where it is decided.
+        from software.c2.server import _decoy_fields
+        for _ in range(50):
+            for value in _decoy_fields(8).values():
+                self.assertNotIsInstance(
+                    value, str,
+                    "a decoy field became a string; the relay's scan takes "
+                    "the first long string it finds")
 
     def test_a_200_with_a_body_that_is_not_json_gives_None(self):
         from werkzeug.serving import make_server
