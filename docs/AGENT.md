@@ -770,6 +770,20 @@ more.
   operator-token file (`0600`) and the staged implant (`0700`) are the
   exceptions. `os.umask(0o077)` at the service entry points would fix every
   instance.
+- **A beacon sleep floor of 10 s silently overrides a shorter interval.**
+  `_jittered_sleep` in `software/c2/beacon.py` ends in
+  `time.sleep(max(10, delay))`, so any configured
+  `c2.beacon_interval_seconds` below 10 is ignored — and the beacon still
+  *reports* the configured value in its check-in. The server sizes its
+  freshness windows from that reported number (`online` under
+  `interval * 2`, `stale` under `interval * 5`), so the two disagree.
+  Measured with `tools/demo_env.py`, which configures 2 s: the beacon posts
+  every 10 s exactly, and a perfectly healthy agent therefore shows green
+  for 4 seconds out of every 10 and yellow for the other 6. The shipped
+  default is 300 s, so this only bites a lab or a capture run — but there it
+  makes a working beacon look like a failing one. Either report the floored
+  value, or refuse a configured interval under the floor. The floor itself
+  predates the hardening pass; it is in the initial commit.
 - **There is no `LICENSE` file.** The README carries a badge, but nothing in
   the repository says what anyone may do with the code, so this is not
   cosmetic.

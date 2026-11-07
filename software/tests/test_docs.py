@@ -615,6 +615,17 @@ def _smb_and_quic_double_serialise():
 # a GitHub reference, and the deferred minors are properties of tests, of
 # prose and of a GUI that this file cannot run. Those are checked for being
 # present, in the right group and counted, and no more than that.
+def _the_sleep_floor_overrides_a_short_interval():
+    # Two halves, and the second is what makes it a defect rather than a
+    # policy: the beacon floors its sleep at 10 s, and still reports the
+    # configured interval to the server, which sizes its freshness windows
+    # from that number.
+    text = _read("software", "c2", "beacon.py")
+    floored = "time.sleep(max(10, delay))" in text
+    reports_configured = re.search(r'"interval":\s*self\.interval', text)
+    return floored and bool(reports_configured)
+
+
 _OPEN_FINDINGS = {
     "Would stop a deployment": [
         ("cannot verify TLS at all", _beacon_cannot_verify_tls),
@@ -636,6 +647,7 @@ _OPEN_FINDINGS = {
     "Housekeeping, but visible": [
         ("compared with `==`", _the_token_is_compared_with_plain_equality),
         ("land at `0644`", _project_files_are_world_readable),
+        ("sleep floor of 10 s", _the_sleep_floor_overrides_a_short_interval),
         ("no `LICENSE` file", _there_is_no_licence_file),
         ("Six commits", None),
     ],
