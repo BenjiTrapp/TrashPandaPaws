@@ -10,8 +10,11 @@ the code does and prove nothing about the two sides matching.
 
 import base64
 import json
+import logging
 import os
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -20,7 +23,42 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from software.c2 import beacon as beacon_mod
 from software.c2.beacon import Beacon
+from software.c2.listeners.relay import relay
 from software.c2.server import ServerCrypto
+
+
+def _read_source(*parts):
+    """Read a file in the repository as text, for assertions about it."""
+    return Path(__file__).resolve().parents[2].joinpath(*parts).read_text()
+
+
+def _imports_and_names(*parts):
+    """Every module a file imports, and every identifier it uses in code.
+
+    Parsed with `ast` rather than grepped, so a module that explains in
+    prose which packages it deliberately avoids does not fail a test about
+    what it imports.
+    """
+    import ast
+    tree = ast.parse(_read_source(*parts))
+    imported, used = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add(alias.name)
+                imported.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            imported.add(base)
+            if base:
+                imported.add(base.split(".")[0])
+            for alias in node.names:
+                used.add(alias.name)
+        elif isinstance(node, ast.Name):
+            used.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            used.add(node.attr)
+    return imported, used
 
 
 def _key_pair():
@@ -193,6 +231,191 @@ class TestTheEncryptContract(unittest.TestCase):
         self.assertIsInstance(got, dict)
         self.assertEqual(got["action"], "beacon")
         self.assertEqual(got["agent_id"], "probe")
+
+
+class TestTheRelay(unittest.TestCase):
+    """The relay moves an opaque string and never learns what is in it.
+
+    It is the one piece all three listeners share, so it is also the one
+    place where a key could leak into a container that has no business
+    holding one. The tests therefore pin two things that are easy to lose
+    later: that its signature takes no key, and that its module imports
+    nothing from the crypto code.
+
+    Everything else runs against a real HTTP server on an ephemeral port.
+    A mock would agree with whatever the relay does; the point is that the
+    far end finds the payload where the relay puts it.
+    """
+
+    def setUp(self):
+        self.raw, self.b64 = _key_pair()
+        self.crypto = ServerCrypto(self.raw)
+        self._servers = []
+        # werkzeug's development server logs every request at INFO, which
+        # would put a line per test into the suite's output. This project
+        # keeps that output pristine.
+        quiet = logging.getLogger("werkzeug")
+        previous = quiet.level
+        quiet.setLevel(logging.ERROR)
+        self.addCleanup(quiet.setLevel, previous)
+
+    def _serve(self, handler):
+        """Run `handler(body_dict) -> (status, dict|None)` on a free port."""
+        from werkzeug.serving import make_server
+
+        def app(environ, start_response):
+            length = int(environ.get("CONTENT_LENGTH") or 0)
+            body = json.loads(environ["wsgi.input"].read(length) or b"{}")
+            status, answer = handler(body)
+            payload = json.dumps(answer or {}).encode()
+            start_response("%d WHATEVER" % status,
+                           [("Content-Type", "application/json"),
+                            ("Content-Length", str(len(payload)))])
+            return [payload]
+
+        srv = make_server("127.0.0.1", 0, app, threaded=True)
+        self._servers.append(srv)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return "http://127.0.0.1:%d/" % srv.server_port
+
+    # ── the happy path, both directions ──
+
+    def test_a_payload_reaches_the_server_and_the_answer_comes_back(self):
+        seen = []
+
+        def handler(body):
+            seen.append(body)
+            return 200, self.crypto.wrap({"tasks": [{"cmd": "shell"}]})
+
+        url = self._serve(handler)
+        sent = self.crypto.encrypt({"action": "beacon"})
+        got = relay(sent, url=url)
+
+        self.assertIsNotNone(got, "the relay returned nothing")
+        self.assertEqual(self.crypto.decrypt(got), {"tasks": [{"cmd": "shell"}]})
+        self.assertEqual(len(seen), 1)
+
+    def test_the_request_field_is_one_the_server_scans_for(self):
+        # unwrap() checks 14 named fields and then falls back to any string
+        # over 32 characters. The fallback is robustness, not an interface:
+        # the relay must land in the named loop.
+        seen = []
+        url = self._serve(lambda body: (seen.append(body) or (200, {})))
+        sent = self.crypto.encrypt({"action": "beacon"})
+        relay(sent, url=url)
+
+        self.assertEqual(len(seen), 1)
+        field = next(k for k, v in seen[0].items() if v == sent)
+        self.assertIn(field, beacon_mod._PAYLOAD_FIELDS,
+                      "the relay used a field unwrap()'s named loop misses")
+        self.assertEqual(self.crypto.unwrap(seen[0]), {"action": "beacon"})
+
+    def test_the_answer_is_found_whichever_field_carries_it(self):
+        # ServerCrypto.wrap picks the field at random, so the relay cannot
+        # rely on a fixed one.
+        answer = {"tasks": []}
+        for field in beacon_mod._PAYLOAD_FIELDS:
+            with self.subTest(field=field):
+                body = {field: self.crypto.encrypt(answer), "seq": 7}
+                url = self._serve(lambda _b, body=body: (200, body))
+                got = relay(self.crypto.encrypt({"action": "beacon"}), url=url)
+                self.assertIsNotNone(got, "field %s was not found" % field)
+                self.assertEqual(self.crypto.decrypt(got), answer)
+
+    # ── failure is None, never an exception ──
+
+    def test_a_server_that_is_down_gives_None(self):
+        import socket as _s
+        probe = _s.socket()
+        probe.bind(("127.0.0.1", 0))
+        dead = probe.getsockname()[1]
+        probe.close()
+        self.assertIsNone(relay("x" * 40, url="http://127.0.0.1:%d/" % dead,
+                                timeout=2.0))
+
+    def test_a_server_that_hangs_gives_None_within_the_timeout(self):
+        # A hang here would hold a listener's connection open. The timeout
+        # is the whole reason it does not, so assert the clock too.
+        def handler(_body):
+            time.sleep(5)
+            return 200, {}
+
+        url = self._serve(handler)
+        start = time.monotonic()
+        got = relay("x" * 40, url=url, timeout=1.0)
+        elapsed = time.monotonic() - start
+
+        self.assertIsNone(got)
+        self.assertLess(elapsed, 4.0,
+                        "the relay waited %.1fs on a 1s timeout" % elapsed)
+
+    def test_a_non_200_gives_None(self):
+        for status in (401, 404, 500, 503):
+            with self.subTest(status=status):
+                url = self._serve(lambda _b, s=status: (s, {}))
+                self.assertIsNone(relay("x" * 40, url=url, timeout=5.0))
+
+    def test_a_200_with_no_usable_field_gives_None(self):
+        for answer in ({}, {"seq": 1, "ok": True}, {"short": "abc"}):
+            with self.subTest(answer=answer):
+                url = self._serve(lambda _b, a=answer: (200, a))
+                self.assertIsNone(relay("x" * 40, url=url, timeout=5.0))
+
+    def test_a_200_with_a_body_that_is_not_json_gives_None(self):
+        from werkzeug.serving import make_server
+
+        def app(environ, start_response):
+            start_response("200 OK", [("Content-Type", "text/html"),
+                                      ("Content-Length", "5")])
+            return [b"<html"]
+
+        srv = make_server("127.0.0.1", 0, app, threaded=True)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        url = "http://127.0.0.1:%d/" % srv.server_port
+        self.assertIsNone(relay("x" * 40, url=url, timeout=5.0))
+
+    # ── the relay cannot be handed a key ──
+
+    def test_the_signature_takes_no_key(self):
+        import inspect
+        params = set(inspect.signature(relay).parameters)
+        self.assertEqual(params, {"payload", "url", "timeout"})
+        for name in params:
+            self.assertNotIn("key", name.lower())
+
+    def test_the_module_imports_nothing_from_the_crypto_code(self):
+        # Parsed, not grepped: the module's own prose explains which
+        # packages it avoids and why, so a substring scan fires on the
+        # explanation. What matters is what it imports and what names it
+        # uses in code.
+        imported, used = _imports_and_names("software", "c2", "listeners",
+                                            "relay.py")
+        for banned in ("cryptography", "software.c2.server"):
+            self.assertNotIn(banned, imported,
+                             "relay.py imports %s; it must never be able "
+                             "to hold or use a key" % banned)
+        for banned in ("ServerCrypto", "AESGCM", "decode_key",
+                       "_aes_gcm_encrypt", "_aes_gcm_decrypt"):
+            self.assertNotIn(banned, used,
+                             "relay.py uses %s in code" % banned)
+
+    def test_the_module_needs_no_third_party_import(self):
+        # A listener container must stay stdlib-only. server.py pulls in
+        # flask, werkzeug, cryptography, jinja2 and click -- measured;
+        # beacon.py pulls in none of them, which is why the field list
+        # comes from there.
+        imported, _ = _imports_and_names("software", "c2", "listeners",
+                                         "relay.py")
+        third_party = {"flask", "werkzeug", "cryptography", "jinja2", "click",
+                       "requests"}
+        self.assertEqual(third_party & imported, set(),
+                         "relay.py imports %s" % (third_party & imported))
+        for name in imported:
+            self.assertFalse(name.endswith(".server") or name == "server",
+                             "relay.py imports the team server module (%s)"
+                             % name)
 
 
 # New test classes belong above this guard; never append below it.
