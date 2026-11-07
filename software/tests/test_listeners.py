@@ -64,13 +64,25 @@ class TestTheEncryptContract(unittest.TestCase):
         b = _beacon(self.b64)
         with self.assertRaises(TypeError) as caught:
             b._encrypt(json.dumps({"action": "beacon"}))
-        self.assertIn("dict", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("dict", message)
+        # The type received must appear too, or the message tells a caller
+        # what was wanted and not what it gave.
+        self.assertIn("str", message)
 
     def test_encrypt_refuses_bytes(self):
         b = _beacon(self.b64)
         with self.assertRaises(TypeError) as caught:
             b._encrypt(json.dumps({"action": "beacon"}).encode())
-        self.assertIn("dict", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("dict", message)
+        self.assertIn("bytes", message)
+
+    def test_the_refusal_names_the_parameter(self):
+        b = _beacon(self.b64)
+        with self.assertRaises(TypeError) as caught:
+            b._encrypt(b"x")
+        self.assertIn("data", str(caught.exception))
 
     def test_encrypt_refuses_none_and_a_list(self):
         b = _beacon(self.b64)

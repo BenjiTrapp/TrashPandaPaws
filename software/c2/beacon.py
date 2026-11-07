@@ -1423,8 +1423,8 @@ class Beacon:
         # plaintext about to be encrypted.
         if not isinstance(data, dict):
             raise TypeError(
-                "_encrypt takes a dict, not %s -- pass the mapping, not a "
-                "serialised form of it" % type(data).__name__)
+                "_encrypt(data) takes a dict, not %s -- pass the mapping, "
+                "not a serialised form of it" % type(data).__name__)
         plaintext = json.dumps(data, separators=(",", ":")).encode()
         nonce = os.urandom(12)
         ct = _aes_gcm_encrypt(self._key, nonce, plaintext)
