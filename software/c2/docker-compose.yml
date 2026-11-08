@@ -93,6 +93,104 @@ services:
       - AGENT_API_KEY=${AGENT_API_KEY:-}
       - AGENT_API_KEY_FILE=${AGENT_API_KEY_FILE:-}
 
+  # ── Listeners ──
+  #
+  # One container per transport, each terminating the protocol the beacon
+  # already speaks and relaying opaque ciphertext to the team server's
+  # beacon socket. **None of them is given RACCOON_KEY.** They cannot read
+  # beacon traffic and cannot forge it; a compromised listener can drop or
+  # replay messages and nothing more, and replay is a recorded property of
+  # the protocol rather than something this arrangement introduces.
+  #
+  # Behind a compose profile, so `docker compose up` starts none of them:
+  #
+  #   docker compose --profile listeners up -d
+  #
+  # A listener is a socket facing the network and nothing should open one
+  # because a file happened to mention it. The profile is the compose
+  # equivalent of `enabled: false` in raccoon.yaml, and unlike commenting
+  # the services out it leaves them readable and testable.
+  #
+  # They are not on the host network, unlike the two services above. Port
+  # mapping does not exist under `network_mode: host`, and the mapping is
+  # the whole mechanism: dockerd holds the privilege for 445 and 53, and
+  # the process inside binds something above 1024 as nobody. That is why
+  # this package needs no cap_add, no setcap and no sudo anywhere.
+  #
+  # Being off the host network also means there is no shared compose
+  # network and no service name to resolve, so `host-gateway` is the one
+  # route back to the team server.
+
+  raccoon-listener-smb:
+    profiles: ["listeners"]
+    build:
+      context: ../..
+      dockerfile: software/c2/listeners/Dockerfile
+    container_name: raccoon-listener-smb
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "445:8445"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: >
+      --transport smb --name smb-445
+      --bind-host 0.0.0.0 --bind-port 8445
+      --relay-url http://host.docker.internal:8443/api/v1/beacon
+
+  raccoon-listener-quic:
+    profiles: ["listeners"]
+    build:
+      context: ../..
+      dockerfile: software/c2/listeners/Dockerfile
+    container_name: raccoon-listener-quic
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # Not a privileged port, and published anyway rather than bound on the
+    # host: a listener that needs no privilege should not be handed the
+    # host's whole network namespace to avoid asking for one.
+    ports:
+      - "8445:8445/udp"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: >
+      --transport quic --name quic-8445
+      --bind-host 0.0.0.0 --bind-port 8445
+      --relay-url http://host.docker.internal:8443/api/v1/beacon
+
+  raccoon-listener-dns:
+    profiles: ["listeners"]
+    build:
+      context: ../..
+      dockerfile: software/c2/listeners/Dockerfile
+    container_name: raccoon-listener-dns
+    restart: unless-stopped
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    ports:
+      - "53:8053/udp"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # The only secret a listener is given, and it is not the encryption
+      # key: it authenticates the tasking route on the team server. DNS
+      # carries tasking only -- an agent reached this way will never
+      # report a result, and each task is delivered once.
+      - RACCOON_LISTENER_TOKEN=${RACCOON_LISTENER_TOKEN:-}
+    command: >
+      --transport dns --name dns-53
+      --bind-host 0.0.0.0 --bind-port 8053
+      --setting zone=c2.example.com
+      --relay-url http://host.docker.internal:8443
+
 volumes:
   raccoon-data:
   raccoon-agent-data:

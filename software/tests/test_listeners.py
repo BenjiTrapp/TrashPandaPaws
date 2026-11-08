@@ -3254,6 +3254,366 @@ class TestTheServerCommandLine(unittest.TestCase):
                   % (process.returncode, process.stderr.read()[:400]))
 
 
+_LISTENER_SERVICES = ("raccoon-listener-smb", "raccoon-listener-quic",
+                      "raccoon-listener-dns")
+
+
+def _compose():
+    import yaml
+
+    with open(Path("software") / "c2" / "docker-compose.yml") as handle:
+        return yaml.safe_load(handle)
+
+
+def _unit(name):
+    return (Path("services") / name).read_text()
+
+
+def _directives(text):
+    """The lines that do something, with the prose dropped.
+
+    These files explain at length that they use no capability and no
+    setcap, which made three tests fail against their own rationale: a
+    check for a directive has to look at directives. The same mistake as
+    the docs probe that read "compare_digest appears somewhere in the
+    file" as "the token comparison was fixed".
+    """
+    return "\n".join(line for line in text.splitlines()
+                      if line.strip() and not line.lstrip().startswith("#"))
+
+
+class TestTheListenerContainers(unittest.TestCase):
+    """How the compose file runs a listener, and what it refuses to give it.
+
+    The whole argument for separate processes is blast radius. A listener
+    container that ran as root, held a capability, or carried the
+    encryption key would have given that up -- so each of those is a test
+    rather than a comment.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.compose = _compose()
+        cls.services = cls.compose["services"]
+
+    def test_there_is_a_service_per_transport(self):
+        from software.c2.listeners.registry import transport_names
+
+        for transport in transport_names():
+            name = "raccoon-listener-%s" % transport
+            self.assertIn(name, self.services,
+                          "%s has no container" % transport)
+
+    def test_they_are_not_on_the_host_network(self):
+        # Port mapping does not exist under network_mode: host, and
+        # publishing a privileged port is the entire mechanism that keeps
+        # these unprivileged. The team server stays on the host network
+        # because Responder and the relay tooling need it; a listener
+        # needs one port and nothing else.
+        for name in _LISTENER_SERVICES:
+            with self.subTest(service=name):
+                service = self.services[name]
+                self.assertNotEqual(service.get("network_mode"), "host",
+                                    "%s cannot publish a port" % name)
+                self.assertTrue(service.get("ports"),
+                                "%s publishes no port" % name)
+
+    def test_the_privileged_ports_are_published_not_bound(self):
+        # dockerd holds the privilege. Inside the container the listener
+        # binds something above 1024 as an unprivileged user, and the
+        # mapping is what makes 445 and 53 answer.
+        expected = {"raccoon-listener-smb": ("445", False),
+                    "raccoon-listener-dns": ("53", True)}
+        for name, (outside, udp) in expected.items():
+            with self.subTest(service=name):
+                published = self.services[name]["ports"]
+                mapping = str(published[0])
+                self.assertTrue(mapping.startswith(outside + ":"),
+                                "%s publishes %r, not port %s"
+                                % (name, mapping, outside))
+                inside = mapping.split(":")[1].split("/")[0]
+                self.assertGreater(int(inside), 1024,
+                                   "%s binds privileged port %s inside the "
+                                   "container, which needs privilege it "
+                                   "must not have" % (name, inside))
+                self.assertEqual(mapping.endswith("/udp"), udp,
+                                 "%s has the wrong protocol" % name)
+
+    def test_none_of_them_adds_a_capability(self):
+        for name in _LISTENER_SERVICES:
+            with self.subTest(service=name):
+                service = self.services[name]
+                self.assertNotIn("cap_add", service,
+                                 "%s adds a capability" % name)
+                self.assertNotIn("privileged", service)
+                self.assertEqual(service.get("cap_drop"), ["ALL"],
+                                 "%s does not drop every capability" % name)
+
+    def test_none_of_them_runs_as_root(self):
+        for name in _LISTENER_SERVICES:
+            with self.subTest(service=name):
+                user = str(self.services[name].get("user", ""))
+                self.assertTrue(user, "%s names no user, so it is root"
+                                % name)
+                self.assertFalse(user.startswith("0:") or user == "0"
+                                 or user == "root",
+                                 "%s runs as root" % name)
+
+    def test_none_of_them_can_gain_privilege(self):
+        for name in _LISTENER_SERVICES:
+            with self.subTest(service=name):
+                opts = self.services[name].get("security_opt") or []
+                self.assertIn("no-new-privileges:true", opts,
+                              "%s can gain privilege through a setuid "
+                              "binary" % name)
+
+    def test_none_of_them_is_given_the_encryption_key(self):
+        # The property the whole package rests on. A listener moves opaque
+        # ciphertext; one holding the key could read every beacon and
+        # forge any answer.
+        for name in _LISTENER_SERVICES:
+            with self.subTest(service=name):
+                environment = self.services[name].get("environment") or []
+                joined = " ".join(str(item) for item in environment)
+                for banned in ("RACCOON_KEY", "RACCOON_TOKEN",
+                               "encryption_key"):
+                    self.assertTrue(banned not in joined,
+                                    "%s is given %s" % (name, banned))
+
+    def test_they_reach_the_team_server_through_the_host_gateway(self):
+        # The team server is on the host network and these are not, so
+        # there is no compose network they share and no service name to
+        # resolve. `host-gateway` is the one route between them.
+        for name in _LISTENER_SERVICES:
+            with self.subTest(service=name):
+                service = self.services[name]
+                hosts = " ".join(service.get("extra_hosts") or [])
+                self.assertIn("host-gateway", hosts,
+                              "%s has no route to the team server" % name)
+                command = " ".join(str(x) for x in (service.get("command")
+                                                    or []))
+                if isinstance(service.get("command"), str):
+                    command = service["command"]
+                self.assertIn("host.docker.internal", command,
+                              "%s relays somewhere other than the host"
+                              % name)
+
+    def test_a_plain_up_starts_none_of_them(self):
+        # A listener is a socket facing the network, and nothing should
+        # open one because a file happened to mention it. The compose
+        # equivalent of `enabled: false` in raccoon.yaml is a profile, and
+        # unlike commenting the services out it leaves them readable and
+        # testable.
+        for name in _LISTENER_SERVICES:
+            with self.subTest(service=name):
+                self.assertEqual(self.services[name].get("profiles"),
+                                 ["listeners"],
+                                 "%s would start on a plain docker compose "
+                                 "up" % name)
+        for name in ("raccoon-c2", "agent"):
+            with self.subTest(service=name):
+                self.assertIsNone(self.services[name].get("profiles"),
+                                  "%s was put behind a profile" % name)
+
+    def test_they_build_their_own_image_not_the_team_server_s(self):
+        # The team server's image carries impacket, NetExec, Responder and
+        # a graphical RDP client. A listener is stdlib only, and running it
+        # from that image would put all of it one process away from the
+        # port that faces the network.
+        for name in _LISTENER_SERVICES:
+            with self.subTest(service=name):
+                build = self.services[name].get("build")
+                self.assertIsInstance(build, dict,
+                                      "%s does not build its own image"
+                                      % name)
+                self.assertIn("listeners", build.get("dockerfile", ""),
+                              "%s builds from %r" % (name, build))
+
+    def test_the_listener_image_installs_nothing(self):
+        # Stdlib only is a property, not an aspiration: a pip install in
+        # this image would be the first dependency a listener container
+        # ever had.
+        text = _directives(
+            (Path("software") / "c2" / "listeners" / "Dockerfile").read_text())
+        for banned in ("pip install", "apt-get install", "apk add"):
+            self.assertTrue(banned not in text,
+                            "the listener image runs %r" % banned)
+
+    def test_the_listener_image_does_not_copy_the_team_server(self):
+        text = _directives(
+            (Path("software") / "c2" / "listeners" / "Dockerfile").read_text())
+        self.assertTrue("server.py" not in text,
+                        "the listener image carries the team server")
+        self.assertTrue("beacon.py" not in text,
+                        "the listener image carries the beacon")
+
+
+class TestTheListenerUnits(unittest.TestCase):
+    """The systemd half: socket activation, so no unit needs privilege.
+
+    A `.socket` unit is owned by systemd, which already has the privilege
+    to bind 53 and 445. It hands the descriptor to a `.service` unit that
+    runs as an unprivileged user and never calls bind. That is why this
+    package needs no `cap_add`, no `setcap` and no sudo.
+    """
+
+    def test_a_socket_and_a_service_unit_exist_per_transport(self):
+        from software.c2.listeners.registry import transport_names
+
+        for transport in transport_names():
+            for suffix in (".socket", ".service"):
+                name = "raccoon-listener-%s%s" % (transport, suffix)
+                with self.subTest(unit=name):
+                    self.assertTrue((Path("services") / name).exists(),
+                                    "%s is missing" % name)
+
+    def test_the_socket_units_declare_the_privileged_port(self):
+        expected = {"smb": "ListenStream=445",
+                    "dns": "ListenDatagram=53",
+                    "quic": "ListenDatagram="}
+        for transport, directive in expected.items():
+            with self.subTest(transport=transport):
+                text = _unit("raccoon-listener-%s.socket" % transport)
+                self.assertIn(directive, text,
+                              "the %s socket unit does not declare its port"
+                              % transport)
+
+    def test_the_service_units_run_as_an_unprivileged_user(self):
+        for transport in ("smb", "dns", "quic"):
+            with self.subTest(transport=transport):
+                text = _unit("raccoon-listener-%s.service" % transport)
+                self.assertIn("User=", text,
+                              "the %s service unit names no user, so it is "
+                              "root" % transport)
+                user = [line.split("=", 1)[1].strip()
+                        for line in text.splitlines()
+                        if line.startswith("User=")][0]
+                self.assertNotIn(user, ("root", "0"),
+                                 "the %s listener runs as root" % transport)
+
+    def test_the_service_units_take_the_socket_from_systemd(self):
+        for transport in ("smb", "dns", "quic"):
+            with self.subTest(transport=transport):
+                text = _unit("raccoon-listener-%s.service" % transport)
+                self.assertIn("Requires=raccoon-listener-%s.socket"
+                              % transport, text,
+                              "the %s service does not require its socket"
+                              % transport)
+                self.assertIn("software.c2.listeners", text,
+                              "the %s service starts something else"
+                              % transport)
+
+    def test_no_unit_grants_a_capability_or_uses_setcap(self):
+        for transport in ("smb", "dns", "quic"):
+            for suffix in (".socket", ".service"):
+                name = "raccoon-listener-%s%s" % (transport, suffix)
+                with self.subTest(unit=name):
+                    text = _directives(_unit(name))
+                    for banned in ("AmbientCapabilities",
+                                   "CapabilityBoundingSet=CAP_NET_BIND",
+                                   "setcap", "PermissionsStartOnly"):
+                        self.assertTrue(banned not in text,
+                                        "%s uses %s" % (name, banned))
+
+    def test_no_unit_carries_a_secret_on_a_command_line(self):
+        for transport in ("smb", "dns", "quic"):
+            text = _unit("raccoon-listener-%s.service" % transport)
+            exec_lines = [line for line in text.splitlines()
+                          if line.startswith("ExecStart")]
+            self.assertTrue(exec_lines)
+            for line in exec_lines:
+                with self.subTest(transport=transport):
+                    for banned in ("--control-token", "--listener-token",
+                                   "RACCOON_KEY=", "--key"):
+                        self.assertTrue(banned not in line,
+                                        "%s puts a secret where ps can "
+                                        "read it" % transport)
+
+    def test_the_dns_unit_reads_its_token_from_a_file(self):
+        # It needs one, and a unit file is world-readable: EnvironmentFile
+        # points at something that is not.
+        text = _directives(_unit("raccoon-listener-dns.service"))
+        self.assertIn("EnvironmentFile=", text,
+                      "the DNS listener has nowhere to get its token")
+        self.assertTrue("RACCOON_LISTENER_TOKEN=" not in text,
+                        "the token is written into the unit file")
+
+
+class TestThePayloadFieldsAgree(unittest.TestCase):
+    """The three copies of the field list, held in step.
+
+    `beacon.py` and `server.py` have each carried this list since before
+    this branch, with a comment asking them to match and nothing checking
+    it. `relay.py` is now a third copy, for a reason recorded in that
+    file: importing the beacon's would put the entire implant source --
+    persistence, loot, the SMB browser, exfiltration -- into the one
+    container that faces the network, and the beacon cannot import a
+    shared module because the generator serves it as a single file.
+
+    So: three copies by necessity, one test.
+    """
+
+    def _lists(self):
+        from software.c2 import beacon as beacon_mod
+        from software.c2 import server as server_mod
+        from software.c2.listeners import relay as relay_mod
+
+        return {
+            "beacon.py": beacon_mod._PAYLOAD_FIELDS,
+            "server.py": server_mod._PAYLOAD_FIELDS,
+            "listeners/relay.py": relay_mod._PAYLOAD_FIELDS,
+        }
+
+    def test_all_three_carry_the_same_names(self):
+        lists = self._lists()
+        reference = lists["beacon.py"]
+        for name, values in lists.items():
+            with self.subTest(module=name):
+                self.assertEqual(values, reference,
+                                 "%s has drifted from beacon.py" % name)
+
+    def test_the_list_is_not_empty_and_has_no_duplicates(self):
+        # A field the server never picks is dead cover, and a duplicate
+        # would weight the random choice without saying so.
+        for name, values in self._lists().items():
+            with self.subTest(module=name):
+                self.assertGreater(len(values), 5)
+                self.assertEqual(len(set(values)), len(values),
+                                 "%s repeats a field name" % name)
+
+    def test_the_relay_does_not_import_the_beacon(self):
+        # The property the copy exists for. A listener container must not
+        # need `beacon.py`, and the Dockerfile does not copy it -- so an
+        # import here would be a container that crashes on startup, which
+        # is how this was found.
+        imported, _used = _imports_and_names("software", "c2", "listeners",
+                                             "relay.py")
+        self.assertTrue("beacon" not in " ".join(imported),
+                        "the relay imports the beacon again")
+
+    def test_no_listener_module_imports_the_beacon_or_the_server(self):
+        # Read as imports, not as text. My first version searched the
+        # source for "from ..beacon" and failed on the comment in relay.py
+        # that quotes the import it replaced -- the third time on this
+        # branch that a check for a construct read the prose explaining
+        # it. The AST knows the difference.
+        for module in ("relay.py", "dns.py", "quic.py", "smb.py",
+                       "registry.py", "supervisor.py", "__main__.py",
+                       "errors.py"):
+            with self.subTest(module=module):
+                imported, _used = _imports_and_names(
+                    "software", "c2", "listeners", module)
+                # Exact names. A substring test called `socketserver` a
+                # team-server import, which is the fourth variation of the
+                # same mistake: a check that is looser than the property
+                # it names will eventually fire on something innocent.
+                banned = {"beacon", "server", "software.c2.beacon",
+                          "software.c2.server"}
+                self.assertEqual(banned & set(imported), set(),
+                                 "%s imports %s"
+                                 % (module, banned & set(imported)))
+
+
 # New test classes belong above this guard; never append below it.
 if __name__ == "__main__":
     unittest.main()

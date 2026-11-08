@@ -1,0 +1,52 @@
+[Unit]
+Description=Raccoon smb listener
+# The socket is the only way in. Without it this service has no descriptor
+# to serve and would have to bind for itself, which is the privilege this
+# arrangement exists to avoid.
+Requires=raccoon-listener-smb.socket
+After=raccoon-listener-smb.socket network-online.target
+
+[Service]
+Type=simple
+# Unprivileged, and nothing here changes that. The descriptor arrives on
+# fd 3 from the socket unit above; $LISTEN_FDS and $LISTEN_PID are set by
+# systemd and read by the listener.
+User=nobody
+Group=nogroup
+WorkingDirectory=/opt/raccoon
+# The port named here is what the panel displays. The socket actually
+# served is the inherited one, so these two have to agree or the display
+# lies -- they are not what makes the listener reachable.
+ExecStart=/opt/raccoon/venv/bin/python -m software.c2.listeners \
+    --transport smb --name smb-8445 \
+    --bind-host 0.0.0.0 --bind-port 8445 \
+    --relay-url http://127.0.0.1:8443/api/v1/beacon
+Restart=always
+RestartSec=10
+
+# No secret on this command line: a unit file is world-readable and so is
+# /proc/<pid>/cmdline. The encryption key is not here in any form -- a
+# listener moves opaque ciphertext and must not be able to read it.
+
+Environment="PYTHONPATH=/opt/raccoon"
+Environment="PATH=/opt/raccoon/venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/raccoon
+# A listener parses attacker-controlled bytes on a network-facing port, so
+# it gets the smallest surface this project can give a service.
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=raccoon-listener-smb
+
+[Install]
+WantedBy=multi-user.target
