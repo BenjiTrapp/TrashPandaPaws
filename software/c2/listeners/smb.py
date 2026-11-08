@@ -97,7 +97,7 @@ class SmbListener:
     max_connections = 32
 
     def __init__(self, bind_host: str, bind_port: int, *, relay_url: str,
-                 pipe_name: str = "msrpc_6e2f"):
+                 pipe_name: str = "msrpc_6e2f", sock=None):
         self.relay_url = relay_url
         self.pipe_name = pipe_name
         # Random per listener, and that is the point. These go on the wire
@@ -119,7 +119,24 @@ class SmbListener:
         self._exchanges = 0
         self._in_flight = threading.BoundedSemaphore(self.max_connections)
         self._lock = threading.Lock()
-        self._server = _ThreadedServer((bind_host, bind_port), _PipeHandler)
+        # A pre-bound socket, for socket activation. systemd or dockerd
+        # holds the privileged port and hands the descriptor over, so no
+        # listener process ever needs the privilege to bind 53, 445 or
+        # anything else below 1024 -- which is the property that keeps
+        # these out of `cap_add`, `setcap` and sudo entirely.
+        if sock is not None:
+            # socketserver binds in its constructor, so it is told not to
+            # and handed the descriptor instead. Its own unbound socket is
+            # closed rather than leaked.
+            self._server = _ThreadedServer((bind_host, bind_port),
+                                           _PipeHandler,
+                                           bind_and_activate=False)
+            self._server.socket.close()
+            self._server.socket = sock
+            self._server.server_address = sock.getsockname()
+        else:
+            self._server = _ThreadedServer((bind_host, bind_port),
+                                           _PipeHandler)
         self._server.listener = self
         self.address = self._server.server_address
         self._thread = None            # type: Optional[threading.Thread]
@@ -159,6 +176,12 @@ class SmbListener:
             self._thread = None
 
     # ── observable state ──
+
+    def counters(self) -> dict:
+        return {"connections_seen": self.connections_seen(),
+                "connections_refused": self.connections_refused(),
+                "exchanges_completed": self.exchanges_completed()}
+
 
     def connections_seen(self) -> int:
         with self._lock:

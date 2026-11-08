@@ -79,9 +79,17 @@ def run(target: pathlib.Path, tests: str, mutations, timeout=600):
 
 
 def _failed(tests: str, timeout: int) -> bool:
-    """True if the test selection fails. A hang counts as failure."""
+    """True if the test selection fails. A hang counts as failure.
+
+    `tests` may name several selections separated by whitespace, which
+    `unittest` takes as separate arguments. Passing them as one string
+    made it look for a test case with a space in its name, the baseline
+    check refused to measure anything, and that is the only reason the
+    mistake was cheap.
+    """
+    selections = tests.split()
     try:
-        done = subprocess.run([sys.executable, "-m", "unittest", tests],
+        done = subprocess.run([sys.executable, "-m", "unittest"] + selections,
                               capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return True

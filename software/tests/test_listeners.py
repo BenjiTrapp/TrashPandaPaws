@@ -9,6 +9,7 @@ the code does and prove nothing about the two sides matching.
 """
 
 import base64
+import io
 import json
 import logging
 import os
@@ -21,6 +22,8 @@ import urllib.error
 import urllib.request
 import pathlib
 import re
+import signal
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,10 +35,12 @@ from software.c2 import beacon as beacon_mod
 from software.c2.beacon import Beacon, beacon_config_from_fallback
 from software.c2.listeners.dns import DnsListener
 from software.c2.listeners.quic import QuicListener
-from software.c2.listeners.registry import load_listeners
+from software.c2.listeners.registry import ListenerSpec, load_listeners
+from software.c2.listeners.supervisor import Supervisor, SupervisorError
 from software.c2.listeners.smb import SmbListener
 from software.c2.listeners.relay import relay
 from software.c2.server import ServerCrypto
+from tools import listener_lab as lab
 
 
 def _read_source(*parts):
@@ -81,6 +86,8 @@ class _TaskingServer:
     class of flake this repository has paid for before.
     """
 
+    operator_token = "operator-token-for-tests"
+
     def __init__(self, key: bytes, listener_token: str):
         self.key = key
         self.listener_token = listener_token
@@ -102,7 +109,7 @@ class _TaskingServer:
         self.operator_port = operator.server_port
         self.agent_port = agent.server_port
         app = server_mod.create_app(
-            self.crypto, "operator-token-for-tests",
+            self.crypto, self.operator_token,
             pathlib.Path(tempfile.mkdtemp()),
             server_config={"host": "127.0.0.1", "port": self.agent_port,
                            "operator_host": "127.0.0.1",
@@ -159,10 +166,37 @@ class _TaskingServer:
             "http://127.0.0.1:%d/api/agents/%s/task"
             % (self.operator_port, name),
             data=body, method="POST",
-            headers={"Authorization": "Bearer operator-token-for-tests",
+            headers={"Authorization": "Bearer %s" % self.operator_token,
                      "Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=5) as response:
             return json.loads(response.read())["id"]
+
+
+# The control token a supervised child authenticates its control socket
+# with. Deliberately not the operator token: a listener holding that could
+# task the fleet if it ever reached the operator socket, and a listener is
+# the most exposed process in the arrangement.
+_CONTROL_TOKEN = "control-token-for-tests"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _command_line_of(pid: int) -> str:
+    """The child's argv as `ps` shows it, which is the threat being tested."""
+    try:
+        done = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return done.stdout.strip()
 
 
 def _free_port() -> int:
@@ -1993,6 +2027,802 @@ class TestTheListenerRegistry(unittest.TestCase):
                               "%s does not use the shared mapping" % name)
                 self.assertNotIn('"https": fallback_cfg.get', source,
                                  "%s still builds the block by hand" % name)
+
+
+class _SupervisedEnv:
+    """A team server, a listener spec per transport, and a supervisor.
+
+    Child processes are real. The whole point of task 8 is that a listener
+    is its own process, so a test that supervised threads would be testing
+    something else: a thread cannot be killed, cannot die on its own, and
+    leaves no pid to assert about.
+    """
+
+    def __init__(self, key, *, managed=True, transports=("quic",)):
+        self.key = key
+        self.managed = managed
+        self.transports = transports
+        self.env = None
+        self.supervisor = None
+
+    def start(self):
+        self.env = _TaskingServer(self.key, _CONTROL_TOKEN)
+        self.env.start()
+        specs = []
+        for transport in self.transports:
+            settings = {"zone": "c2.test"} if transport == "dns" else {}
+            specs.append(ListenerSpec(
+                name="probe-%s" % transport, transport=transport,
+                enabled=True, bind_host="127.0.0.1",
+                bind_port=_free_port(),
+                relay_url=lab.relay_url_for(transport, self.env.agent_port),
+                settings=settings))
+        self.specs = specs
+        self.supervisor = Supervisor(specs, managed=self.managed,
+                                     listener_token=_CONTROL_TOKEN)
+        return self.supervisor
+
+    def stop(self):
+        if self.supervisor is not None:
+            self.supervisor.stop_all()
+        if self.env is not None:
+            self.env.stop()
+
+
+class TestTheSupervisor(unittest.TestCase):
+    """Starting, stopping and reporting on listeners that are real processes.
+
+    Every refusal here has to carry a reason. A listener that silently
+    fails to start, or a stop that returns and leaves the process running,
+    both show up later as a beacon that does not check in -- which is the
+    single hardest symptom in this project to attribute, because four
+    other faults produce it too.
+    """
+
+    def setUp(self):
+        self.raw, self.b64 = _key_pair()
+        quiet = logging.getLogger("werkzeug")
+        previous = quiet.level
+        quiet.setLevel(logging.ERROR)
+        self.addCleanup(quiet.setLevel, previous)
+        self.harness = _SupervisedEnv(self.raw)
+        self.addCleanup(self.harness.stop)
+        self.supervisor = self.harness.start()
+
+    def test_a_listener_starts_and_reports_running(self):
+        record = self.supervisor.start("probe-quic")
+        self.assertEqual(record["state"], "running")
+        self.assertIsInstance(record["pid"], int)
+        self.assertTrue(_pid_alive(record["pid"]),
+                        "the reported pid is not a live process")
+
+        status = {entry["name"]: entry for entry in self.supervisor.status()}
+        self.assertEqual(status["probe-quic"]["state"], "running")
+        self.assertEqual(status["probe-quic"]["pid"], record["pid"])
+
+    def test_a_real_beacon_registers_through_a_supervised_child(self):
+        # "running" has to mean the socket answers, not that a process
+        # exists: a child that died after forking and before binding would
+        # have a pid for a moment too. The only answer that settles it is a
+        # beacon that got through, and this is the first test on the branch
+        # where the listener is a separate process rather than a thread.
+        self.supervisor.start("probe-quic")
+        spec = self.specs_by_name()["probe-quic"]
+        before = set(self.harness.env.agents())
+
+        beacon = Beacon(lab.beacon_config_for(
+            "quic", self.raw, (spec.bind_host, spec.bind_port)))
+        beacon.start()
+        self.addCleanup(beacon.stop)
+
+        _wait_until(lambda: set(self.harness.env.agents()) - before,
+                    "the beacon to register through the supervised listener",
+                    timeout=30)
+        name = (set(self.harness.env.agents()) - before).pop()
+        self.assertTrue(name.startswith("raccoon-"))
+
+    def test_starting_a_running_listener_is_refused_with_a_reason(self):
+        first = self.supervisor.start("probe-quic")
+        with self.assertRaises(SupervisorError) as caught:
+            self.supervisor.start("probe-quic")
+        self.assertIn("probe-quic", str(caught.exception))
+        self.assertIn(str(first["pid"]), str(caught.exception),
+                      "the refusal does not say which process already has it")
+
+        # Not a second socket, and not a silent no-op: the original is
+        # still the one running.
+        status = self.supervisor.status()[0]
+        self.assertEqual(status["pid"], first["pid"])
+        self.assertEqual(status["state"], "running")
+
+    def test_starting_a_name_that_is_not_configured_is_refused(self):
+        with self.assertRaises(SupervisorError) as caught:
+            self.supervisor.start("no-such-listener")
+        self.assertIn("no-such-listener", str(caught.exception))
+
+    def test_stop_leaves_no_child_behind(self):
+        record = self.supervisor.start("probe-quic")
+        pid = record["pid"]
+
+        self.supervisor.stop("probe-quic")
+
+        self.assertFalse(_pid_alive(pid),
+                         "stop returned but pid %d is still alive" % pid)
+        status = self.supervisor.status()[0]
+        self.assertEqual(status["state"], "stopped")
+        self.assertIsNone(status["pid"])
+
+    def test_stop_during_an_exchange_closes_cleanly(self):
+        # A beacon mid-handshake is the normal case for a stop: the
+        # operator does not wait for a quiet moment. SMB, because it is
+        # the stateful one -- an open TCP connection with half a message
+        # written into it, which is exactly the state a listener could
+        # hang in on the way down.
+        harness = _SupervisedEnv(self.raw, transports=("smb",))
+        self.addCleanup(harness.stop)
+        supervisor = harness.start()
+        record = supervisor.start("probe-smb")
+        spec = harness.specs[0]
+
+        half = socket.socket()
+        half.settimeout(10)
+        self.addCleanup(half.close)
+        half.connect((spec.bind_host, spec.bind_port))
+        # A length header announcing a message, and then only part of it.
+        half.sendall(b"\x00\x00\x00\x80" + b"\xfeSMB" + b"\x00" * 20)
+        _wait_until(
+            lambda: (supervisor.status()[0].get("counters") or {})
+            .get("connections_seen", 0) >= 1,
+            "the child to accept the half-written connection")
+
+        started = time.monotonic()
+        supervisor.stop("probe-smb")
+        took = time.monotonic() - started
+
+        self.assertFalse(_pid_alive(record["pid"]),
+                         "a child was left behind by a stop during an "
+                         "exchange")
+        self.assertLess(took, 10.0,
+                        "the stop took %.1fs, so it waited for the hung "
+                        "connection rather than closing it" % took)
+        self.assertEqual(supervisor.status()[0]["state"], "stopped")
+
+    def test_stopping_a_listener_that_is_not_running_is_refused(self):
+        with self.assertRaises(SupervisorError) as caught:
+            self.supervisor.stop("probe-quic")
+        self.assertIn("probe-quic", str(caught.exception))
+
+    def test_status_of_a_listener_that_died_says_so(self):
+        # A child killed from outside -- a crash, an OOM, an operator with
+        # a terminal. The panel must not keep showing it as running.
+        record = self.supervisor.start("probe-quic")
+        os.kill(record["pid"], signal.SIGKILL)
+        _wait_until(lambda: self.supervisor.status()[0]["state"] != "running",
+                    "the supervisor to notice the child died")
+
+        status = self.supervisor.status()[0]
+        self.assertEqual(status["state"], "died")
+        self.assertIn("exit", status["detail"].lower())
+        self.assertFalse(_pid_alive(record["pid"]))
+
+    def test_a_died_listener_can_be_started_again(self):
+        first = self.supervisor.start("probe-quic")
+        os.kill(first["pid"], signal.SIGKILL)
+        _wait_until(lambda: self.supervisor.status()[0]["state"] == "died",
+                    "the supervisor to notice the child died")
+
+        second = self.supervisor.start("probe-quic")
+        self.assertNotEqual(second["pid"], first["pid"])
+        self.assertEqual(second["state"], "running")
+
+    def test_status_lists_a_configured_listener_that_never_started(self):
+        status = self.supervisor.status()
+        self.assertEqual(len(status), 1)
+        self.assertEqual(status[0]["name"], "probe-quic")
+        self.assertEqual(status[0]["state"], "stopped")
+        self.assertEqual(status[0]["transport"], "quic")
+        self.assertIsNone(status[0]["pid"])
+
+    def test_no_secret_reaches_the_child_command_line(self):
+        # Established before this branch: anything on a command line is
+        # visible to every user on the host through ps.
+        record = self.supervisor.start("probe-quic")
+        command = _command_line_of(record["pid"])
+        self.assertTrue(command, "could not read the child's command line")
+        self.assertNotIn(_CONTROL_TOKEN, command)
+        self.assertNotIn(self.b64, command,
+                         "the encryption key is on a listener's command "
+                         "line, and a listener must never even have it")
+
+    def specs_by_name(self):
+        return {spec.name: spec for spec in self.harness.specs}
+
+
+class TestSupervisionWhenItIsNotInCharge(unittest.TestCase):
+    """`managed=False`: the Docker case, where something else owns the processes.
+
+    The compose file deliberately does not mount the Docker socket, so a
+    team server in a container cannot start a sibling. The panel then has
+    to show what is configured and say plainly why it cannot act, because
+    a control that silently does nothing is the anti-goal this branch was
+    written against.
+    """
+
+    def setUp(self):
+        self.raw, self.b64 = _key_pair()
+        quiet = logging.getLogger("werkzeug")
+        previous = quiet.level
+        quiet.setLevel(logging.ERROR)
+        self.addCleanup(quiet.setLevel, previous)
+        self.harness = _SupervisedEnv(self.raw, managed=False)
+        self.addCleanup(self.harness.stop)
+        self.supervisor = self.harness.start()
+
+    def test_status_still_reports_what_is_configured(self):
+        status = self.supervisor.status()
+        self.assertEqual(len(status), 1)
+        self.assertEqual(status[0]["name"], "probe-quic")
+        self.assertEqual(status[0]["state"], "unmanaged")
+        self.assertFalse(status[0]["can_control"])
+
+    def test_the_reason_is_stated_rather_than_implied(self):
+        for entry in self.supervisor.status():
+            self.assertTrue(entry["detail"],
+                            "an unmanaged listener gives no reason")
+            self.assertIn("manage", entry["detail"].lower())
+
+    def test_start_and_stop_refuse_and_say_why(self):
+        for action in (self.supervisor.start, self.supervisor.stop):
+            with self.subTest(action=action.__name__):
+                with self.assertRaises(SupervisorError) as caught:
+                    action("probe-quic")
+                self.assertIn("manage", str(caught.exception).lower())
+
+
+def _ask_control(port, payload, *, raw=None, timeout=5.0):
+    """Send one line to a child's control socket and read the answer."""
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall(raw if raw is not None
+                     else json.dumps(payload).encode() + b"\n")
+        buffer = b""
+        while b"\n" not in buffer and len(buffer) < 65536:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buffer += chunk
+    if not buffer:
+        return None
+    return json.loads(buffer.split(b"\n", 1)[0])
+
+
+def _a_non_loopback_address():
+    """An address of this host that is not 127.0.0.1, or None.
+
+    Found by asking the routing table where it would send a packet, which
+    sends nothing: a connected UDP socket has a local address and no
+    traffic.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 53))
+        address = probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
+    return None if address.startswith("127.") else address
+
+
+class TestTheControlSocket(unittest.TestCase):
+    """The one new control surface on this branch.
+
+    It can start nothing and stop nothing: the only verb is `status`. A
+    listener cannot start itself, and a verb that let it stop itself would
+    be a remote kill switch on the most exposed process in the
+    arrangement, reachable by anything that learned one token on one host.
+    Starting and stopping are things the supervisor does from outside with
+    a signal.
+    """
+
+    def setUp(self):
+        self.raw, self.b64 = _key_pair()
+        quiet = logging.getLogger("werkzeug")
+        previous = quiet.level
+        quiet.setLevel(logging.ERROR)
+        self.addCleanup(quiet.setLevel, previous)
+        self.harness = _SupervisedEnv(self.raw)
+        self.addCleanup(self.harness.stop)
+        self.supervisor = self.harness.start()
+        self.supervisor.start("probe-quic")
+        self.port = self.supervisor._children["probe-quic"].control_port
+        self.assertIsNotNone(self.port, "the child opened no control socket")
+
+    def test_it_answers_status_to_the_control_token(self):
+        answer = _ask_control(self.port,
+                              {"token": self.supervisor.control_token,
+                               "verb": "status"})
+        self.assertEqual(answer["transport"], "quic")
+        self.assertIn("counters", answer)
+        self.assertIn("datagrams_seen", answer["counters"])
+
+    def test_it_binds_loopback_only(self):
+        # Asserted on the address the child reports, because the obvious
+        # test -- fail to connect from another address of this host --
+        # skips on a host that has only one, and a test that skips holds
+        # nothing. A mutation to 0.0.0.0 survived exactly that way.
+        answer = _ask_control(self.port,
+                              {"token": self.supervisor.control_token,
+                               "verb": "status"})
+        self.assertEqual(answer["control_address"][0], "127.0.0.1",
+                         "the control socket is bound to %r"
+                         % (answer["control_address"],))
+
+        outside = _a_non_loopback_address()
+        if outside is not None:
+            with self.assertRaises(OSError):
+                socket.create_connection((outside, self.port), timeout=3)
+
+    def test_the_token_comparison_is_constant_time(self):
+        import ast
+
+        source = _read_source("software", "c2", "listeners", "__main__.py")
+        tree = ast.parse(source)
+        same = [fn for fn in ast.walk(tree)
+                if isinstance(fn, ast.FunctionDef) and fn.name == "_same"]
+        self.assertEqual(len(same), 1)
+        calls = {node.func.attr for node in ast.walk(same[0])
+                 if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)}
+        self.assertIn("compare_digest", calls,
+                      "the control token must not be compared with ==")
+
+    def test_it_requires_the_token(self):
+        for request in ({"verb": "status"},
+                        {"token": None, "verb": "status"},
+                        {"token": "", "verb": "status"},
+                        {"token": "wrong", "verb": "status"}):
+            with self.subTest(request=request):
+                answer = _ask_control(self.port, request)
+                self.assertEqual(answer, {"error": "unauthorized"})
+
+    def test_the_control_token_is_not_the_operator_token(self):
+        # A listener is the most exposed process here. One holding the
+        # operator token could task the whole fleet the moment it reached
+        # the operator socket, so the supervisor mints its own.
+        self.assertNotEqual(self.supervisor.control_token,
+                            self.harness.env.operator_token)
+        answer = _ask_control(self.port,
+                              {"token": self.harness.env.operator_token,
+                               "verb": "status"})
+        self.assertEqual(answer, {"error": "unauthorized"})
+
+    def test_status_is_the_only_verb(self):
+        for verb in ("start", "stop", "shutdown", "exec", "key", "relay",
+                     "", None, 7, {"nested": True}):
+            with self.subTest(verb=verb):
+                answer = _ask_control(
+                    self.port, {"token": self.supervisor.control_token,
+                                "verb": verb})
+                self.assertEqual(answer.get("error"),
+                                 "the only verb is status",
+                                 "verb %r was not refused" % (verb,))
+
+    def test_a_request_that_is_not_an_object_is_refused(self):
+        for raw in (b"not json\n", b"[1,2,3]\n", b'"a string"\n', b"\n"):
+            with self.subTest(raw=raw):
+                answer = _ask_control(self.port, None, raw=raw)
+                self.assertIn("error", answer or {"error": "closed"})
+
+    def test_the_request_read_stops_at_the_cap(self):
+        # Driven directly, because over a socket the handler's own
+        # five-second timeout ends the connection whether or not the cap
+        # is there -- so the end-to-end flood test below passed with the
+        # cap deleted. What the cap actually bounds is how many bytes a
+        # fast sender can make this process hold inside those five
+        # seconds, and that is only visible from inside.
+        from software.c2.listeners import __main__ as child_mod
+
+        handler = object.__new__(child_mod._ControlHandler)
+        handler.request = _EndlessSocket()
+
+        self.assertIsNone(handler._read_line(),
+                          "an endless request was accepted as a line")
+        self.assertLess(handler.request.given,
+                        child_mod._MAX_REQUEST + 8192,
+                        "the read took %d bytes before giving up"
+                        % handler.request.given)
+
+    def test_a_flood_without_a_newline_is_dropped_unanswered(self):
+        # The read is capped, so a client cannot make this process buffer
+        # for ever. Past the cap the connection is dropped with no reply
+        # at all -- which is what distinguishes the cap from merely
+        # failing to parse what arrived, and a mutation that removed the
+        # cap survived a test that only checked the socket still worked
+        # afterwards.
+        flooded = socket.create_connection(("127.0.0.1", self.port),
+                                           timeout=10)
+        self.addCleanup(flooded.close)
+        try:
+            flooded.sendall(b"x" * 200000)
+        except OSError:
+            pass
+        flooded.settimeout(10)
+        # Dropped shows up two ways depending on whether unread bytes are
+        # still in the buffer when the handler returns: an orderly close,
+        # or a reset from the kernel. Both mean the request was refused
+        # without being answered. A timeout would mean the opposite -- the
+        # handler still waiting for a newline that is never coming -- and
+        # a JSON body would mean it answered.
+        try:
+            answered = flooded.recv(64)
+        except ConnectionResetError:
+            answered = b""
+        except socket.timeout:
+            self.fail("the listener is still waiting for the rest of an "
+                      "over-long request")
+        self.assertEqual(answered, b"",
+                         "the listener answered an over-long request")
+
+        # And it is still serving for the supervisor.
+        answer = _ask_control(self.port,
+                              {"token": self.supervisor.control_token,
+                               "verb": "status"})
+        self.assertEqual(answer["transport"], "quic")
+
+    def test_the_counters_it_reports_are_the_listener_s_own(self):
+        before = _ask_control(self.port,
+                              {"token": self.supervisor.control_token,
+                               "verb": "status"})["counters"]
+        spec = self.harness.specs[0]
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(probe.close)
+        for _ in range(3):
+            probe.sendto(b"not a frame", (spec.bind_host, spec.bind_port))
+
+        def grew():
+            now = _ask_control(self.port,
+                               {"token": self.supervisor.control_token,
+                                "verb": "status"})["counters"]
+            return now["datagrams_seen"] > before["datagrams_seen"]
+
+        _wait_until(grew, "the child's datagram count to rise")
+
+
+class TestSocketActivation(unittest.TestCase):
+    """A privileged port belongs to systemd or dockerd, never to a listener.
+
+    This is what keeps the package out of `cap_add`, `setcap` and sudo:
+    the descriptor for port 53 or 445 is bound by something that already
+    has the privilege and handed over. The listener process runs
+    unprivileged and never calls bind at all.
+    """
+
+    def _spawn(self, extra_env, *, sock=None, port=0):
+        root = str(Path(__file__).resolve().parents[2])
+        command = [sys.executable, "-m", "software.c2.listeners",
+                   "--transport", "quic", "--name", "activated",
+                   "--bind-host", "127.0.0.1", "--bind-port", str(port),
+                   "--relay-url", "http://127.0.0.1:1/api/v1/beacon",
+                   "--control-port", "0"]
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = root
+        environment["PYTHONUNBUFFERED"] = "1"
+        environment["RACCOON_CONTROL_TOKEN"] = _CONTROL_TOKEN
+        environment.update(extra_env)
+
+        kwargs = {}
+        if sock is not None:
+            fd = sock.fileno()
+            # systemd hands the descriptor over as fd 3. subprocess keeps
+            # whatever number it had, so it is moved into place just before
+            # the exec -- and 3 has to be listed in `pass_fds` as well,
+            # because the close-everything-else pass runs *after*
+            # `preexec_fn` and would otherwise close the copy we just made.
+            # Measured: without the 3 the child dies with "Socket operation
+            # on non-socket", and it passed on the first try only because
+            # a fresh process happened to give the socket fd 3 already.
+            kwargs["pass_fds"] = (fd, 3)
+            kwargs["preexec_fn"] = lambda: os.dup2(fd, 3)
+
+        process = subprocess.Popen(
+            command, cwd=root, env=environment, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
+            **kwargs)
+        self.addCleanup(_reap, process)
+        return process
+
+    def test_an_inherited_descriptor_is_used_instead_of_binding(self):
+        bound = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(bound.close)
+        bound.bind(("127.0.0.1", 0))
+        chosen = bound.getsockname()[1]
+
+        process = self._spawn({"LISTEN_FDS": "1"}, sock=bound,
+                              port=chosen + 1)
+        control = _control_port_of(process)
+        answer = _ask_control(control, {"token": _CONTROL_TOKEN,
+                                        "verb": "status"})
+
+        # The port it serves is the inherited one, not the one on its own
+        # command line. That is the whole point: bind_port becomes a label
+        # the panel shows, and the socket comes from elsewhere.
+        self.assertEqual(answer["address"][1], chosen,
+                         "the child bound its own socket instead of using "
+                         "the one it was handed")
+
+    def test_without_listen_fds_it_binds_for_itself(self):
+        process = self._spawn({}, port=_free_port())
+        control = _control_port_of(process)
+        answer = _ask_control(control, {"token": _CONTROL_TOKEN,
+                                        "verb": "status"})
+        self.assertEqual(answer["transport"], "quic")
+
+    def test_a_descriptor_meant_for_another_process_is_ignored(self):
+        # `$LISTEN_PID` is inherited by grandchildren that were never meant
+        # to have the socket. Using it there would steal the descriptor
+        # from the process systemd is waiting on.
+        bound = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(bound.close)
+        bound.bind(("127.0.0.1", 0))
+        inherited = bound.getsockname()[1]
+        own = _free_port()
+
+        process = self._spawn({"LISTEN_FDS": "1", "LISTEN_PID": "1"},
+                              sock=bound, port=own)
+        control = _control_port_of(process)
+        answer = _ask_control(control, {"token": _CONTROL_TOKEN,
+                                        "verb": "status"})
+        self.assertEqual(answer["address"][1], own,
+                         "the child took a descriptor addressed to pid 1")
+        self.assertNotEqual(answer["address"][1], inherited)
+
+    def test_a_descriptor_of_the_wrong_kind_is_refused_with_a_reason(self):
+        # A QUIC listener needs a datagram socket. Handed a stream one it
+        # must say so and exit, not bind a second socket of its own: the
+        # whole point of activation is that the port it should serve is
+        # the one it was given.
+        stream = socket.socket()
+        self.addCleanup(stream.close)
+        stream.bind(("127.0.0.1", 0))
+        stream.listen(4)
+
+        process = self._spawn({"LISTEN_FDS": "1"}, sock=stream,
+                              port=_free_port())
+        try:
+            process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("the child kept running with the wrong socket kind")
+        self.assertEqual(process.returncode, 1)
+        complaint = process.stderr.read()
+        self.assertIn("stream", complaint)
+        self.assertIn("datagram", complaint)
+
+    def test_a_listener_started_by_hand_opens_no_control_socket(self):
+        # No control token means no control surface. Same shape as the
+        # rest of the branch: the socket policy is inert without
+        # `operator_port`, the tasking route refuses everyone without a
+        # listener token. A systemd unit with no supervisor to answer
+        # should open nothing.
+        root = str(Path(__file__).resolve().parents[2])
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = root
+        environment["PYTHONUNBUFFERED"] = "1"
+        environment.pop("RACCOON_CONTROL_TOKEN", None)
+        process = subprocess.Popen(
+            [sys.executable, "-m", "software.c2.listeners",
+             "--transport", "quic", "--bind-host", "127.0.0.1",
+             "--bind-port", str(_free_port()),
+             "--relay-url", "http://127.0.0.1:1/api/v1/beacon"],
+            cwd=root, env=environment, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True)
+        self.addCleanup(_reap, process)
+        line = process.stdout.readline().strip()
+        self.assertEqual(line, "control-port none")
+
+
+def _control_port_of(process, timeout=20.0):
+    line = process.stdout.readline().strip()
+    if not line.startswith("control-port "):
+        raise AssertionError("the child printed %r, and its error output "
+                             "was: %s" % (line, process.stderr.read()[:400]))
+    value = line.split(" ", 1)[1]
+    if value == "none":
+        raise AssertionError("the child opened no control socket")
+    del timeout
+    return int(value)
+
+
+def _reap(process):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+class TestHowAChildIsHandled(unittest.TestCase):
+    """The three escalations, driven directly rather than through a listener.
+
+    Each of these is a path a real listener almost never takes, which is
+    exactly why none of them had a test: a mutation check found all three
+    invisible. A child that ignores SIGTERM, a child that never prints,
+    and a child that prints something else are the three ways starting or
+    stopping one goes wrong, and each would otherwise end as a process
+    left behind or a team server blocked for ever.
+    """
+
+    def test_a_child_that_ignores_sigterm_is_killed(self):
+        from software.c2.listeners import supervisor as sup
+
+        ignoring = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, time\n"
+             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+             "print('ready', flush=True)\n"
+             "time.sleep(300)\n"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.addCleanup(_reap, ignoring)
+        # Waited for, and this is the whole test. Without it the SIGTERM
+        # arrives during interpreter startup, before SIG_IGN is installed,
+        # so the child dies politely and the escalation never runs -- the
+        # test passed with the SIGKILL deleted, in six milliseconds, and
+        # held nothing at all.
+        self.assertEqual(ignoring.stdout.readline().strip(), "ready",
+                         "the child never reported itself ready")
+        child = sup._Child(ignoring, None, os.devnull)
+
+        with patch.object(sup, "_TERM_GRACE", 1.0):
+            started = time.monotonic()
+            child.terminate()
+            took = time.monotonic() - started
+
+        self.assertFalse(_pid_alive(ignoring.pid),
+                         "a child that ignores SIGTERM was left running")
+        self.assertLess(took, 10.0,
+                        "the escalation took %.1fs" % took)
+
+    def test_a_child_that_never_prints_is_given_up_on(self):
+        from software.c2.listeners import supervisor as sup
+
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(read_fd)
+        # Cleanups run in reverse, so this registers the stream close
+        # first and the write end second, which means the write end is
+        # closed *first*. That order matters: the reader thread holds the
+        # buffered stream's lock while it blocks, and `close()` waits for
+        # that lock -- so closing the stream while nothing has sent EOF
+        # deadlocks the cleanup. It hung this test until the pipe was shut
+        # from the other side. In production the supervisor kills the
+        # child, which closes its stdout and ends the read the same way.
+        self.addCleanup(stream.close)
+        self.addCleanup(os.close, write_fd)
+
+        started = time.monotonic()
+        line = sup._read_line_with_timeout(stream, 0.5)
+        took = time.monotonic() - started
+
+        self.assertIsNone(line)
+        self.assertLess(took, 5.0,
+                        "the read blocked for %.1fs; a child that never "
+                        "prints would hold the team server" % took)
+
+    def test_a_child_that_never_prints_is_abandoned_by_start(self):
+        # The direct test of `_read_line_with_timeout` above does not cover
+        # the call site, so a mutation that replaced it with a blocking
+        # readline survived. This one goes through `Supervisor.start` with
+        # a stand-in interpreter that prints nothing, which is what a
+        # wedged listener looks like from outside.
+        from software.c2.listeners import supervisor as sup
+
+        shim = Path(tempfile.mkdtemp()) / "quiet"
+        shim.write_text("#!/bin/sh\nsleep 60\n")
+        shim.chmod(0o755)
+
+        spec = ListenerSpec(name="quiet", transport="quic", enabled=True,
+                            bind_host="127.0.0.1", bind_port=_free_port(),
+                            relay_url="http://127.0.0.1:1/api/v1/beacon")
+        supervisor = Supervisor([spec], python=str(shim))
+        self.addCleanup(supervisor.stop_all)
+
+        with patch.object(sup, "_START_TIMEOUT", 1.0):
+            started = time.monotonic()
+            with self.assertRaises(SupervisorError) as caught:
+                supervisor.start("quiet")
+            took = time.monotonic() - started
+
+        self.assertIn("quiet", str(caught.exception))
+        self.assertIn("did not come up", str(caught.exception))
+        self.assertLess(took, 20.0,
+                        "start blocked for %.1fs on a child that never "
+                        "printed" % took)
+        self.assertEqual(supervisor.status()[0]["state"], "stopped",
+                         "the abandoned child is still counted as started")
+
+    def test_a_child_that_prints_something_else_is_refused(self):
+        from software.c2.listeners import supervisor as sup
+
+        spec = ListenerSpec(name="noisy", transport="quic", enabled=True,
+                            bind_host="127.0.0.1", bind_port=1,
+                            relay_url="http://127.0.0.1:1")
+        with tempfile.NamedTemporaryFile("w", suffix=".log",
+                                         delete=False) as handle:
+            handle.write("it printed a banner instead")
+            stderr_path = handle.name
+        self.addCleanup(os.unlink, stderr_path)
+
+        for printed in ("hello there", "control-port", "control-port abc",
+                        "CONTROL-PORT 5"):
+            with self.subTest(printed=printed):
+                process = _StubProcess(printed)
+                with self.assertRaises(SupervisorError) as caught:
+                    sup._Child._read_control_port(process, stderr_path, spec)
+                self.assertIn("noisy", str(caught.exception))
+                self.assertTrue(process.killed,
+                                "a child that printed %r was left running"
+                                % printed)
+
+    def test_a_child_that_prints_a_port_is_accepted(self):
+        # The other half of the claim: the refusals above are not simply
+        # refusing everything.
+        from software.c2.listeners import supervisor as sup
+
+        spec = ListenerSpec(name="fine", transport="quic", enabled=True,
+                            bind_host="127.0.0.1", bind_port=1,
+                            relay_url="http://127.0.0.1:1")
+        process = _StubProcess("control-port 54321")
+        self.assertEqual(
+            sup._Child._read_control_port(process, os.devnull, spec), 54321)
+        self.assertFalse(process.killed)
+
+        none = _StubProcess("control-port none")
+        self.assertIsNone(
+            sup._Child._read_control_port(none, os.devnull, spec))
+
+
+class _StubProcess:
+    """Just enough of a Popen to drive `_read_control_port`."""
+
+    def __init__(self, line):
+        self.stdout = io.StringIO(line + "\n")
+        self.killed = False
+        self.returncode = None
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        del timeout
+        self.returncode = -9
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+
+class _EndlessSocket:
+    """A socket that answers every read with bytes and never a newline."""
+
+    def __init__(self):
+        self.given = 0
+
+    def recv(self, size):
+        self.given += size
+        return b"x" * size
+
+    def settimeout(self, _seconds):
+        pass
+
+    def sendall(self, _data):
+        raise AssertionError("an endless request must not be answered")
 
 
 # New test classes belong above this guard; never append below it.

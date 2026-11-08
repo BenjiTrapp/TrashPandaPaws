@@ -67,8 +67,12 @@ class ListenerSpec:
     relay_url: str
     settings: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
-    def build(self, listener_token: Optional[str] = None):
+    def build(self, listener_token: Optional[str] = None, sock=None):
         """Construct the listener this spec describes.
+
+        `sock` is a pre-bound socket for socket activation: when systemd
+        or dockerd owns the privileged port, the descriptor is handed over
+        and `bind_host`/`bind_port` are only what the panel displays.
 
         Raises `ValueError` if the transport needs a token and none was
         given, rather than building something that will refuse every
@@ -77,6 +81,8 @@ class ListenerSpec:
         cls, _required, _accepted = _TRANSPORTS[self.transport]
         kwargs = dict(self.settings)
         kwargs["relay_url"] = self.relay_url
+        if sock is not None:
+            kwargs["sock"] = sock
         if self.transport == "dns":
             if not listener_token:
                 raise ValueError(

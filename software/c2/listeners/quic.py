@@ -92,12 +92,20 @@ class QuicListener:
     max_frame_bytes = 64 * 1024 * 1024
 
     def __init__(self, bind_host: str, bind_port: int, *, relay_url: str,
-                 frag_size: int = _DEFAULT_FRAG):
+                 frag_size: int = _DEFAULT_FRAG, sock=None):
         self.relay_url = relay_url
         self.frag_size = frag_size
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind((bind_host, bind_port))
+        # A pre-bound socket, for socket activation. systemd or dockerd
+        # holds the privileged port and hands the descriptor over, so no
+        # listener process ever needs the privilege to bind 53, 445 or
+        # anything else below 1024 -- which is the property that keeps
+        # these out of `cap_add`, `setcap` and sudo entirely.
+        if sock is not None:
+            self._sock = sock
+        else:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind((bind_host, bind_port))
         self._sock.settimeout(0.2)
         self.address = self._sock.getsockname()
         self._partials: Dict[Tuple[Tuple[str, int], int], _Partial] = {}
@@ -146,6 +154,17 @@ class QuicListener:
             self._thread = None
 
     # ── observable state, for tests and for the status panel ──
+
+    def counters(self) -> dict:
+        """What this listener has seen, in the shape every listener uses.
+
+        One shape across the three transports, because the panel shows
+        them side by side and a per-transport dictionary would have the
+        panel knowing which keys each one happens to have.
+        """
+        return {"datagrams_seen": self.datagrams_seen(),
+                "partials_open": self.partial_count()}
+
 
     def datagrams_seen(self) -> int:
         """Datagrams read off the socket, counted before any is judged.

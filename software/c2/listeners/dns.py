@@ -61,7 +61,7 @@ class DnsListener:
     max_query_bytes = 512
 
     def __init__(self, bind_host: str, bind_port: int, *, relay_url: str,
-                 zone: str, listener_token: str, ttl: int = 1):
+                 zone: str, listener_token: str, ttl: int = 1, sock=None):
         self.relay_url = relay_url
         self.zone = zone.strip(".").lower()
         self.listener_token = listener_token
@@ -69,9 +69,17 @@ class DnsListener:
         # resolver holding an answer would hand the beacon a stale task or
         # none at all.
         self.ttl = ttl
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind((bind_host, bind_port))
+        # A pre-bound socket, for socket activation. systemd or dockerd
+        # holds the privileged port and hands the descriptor over, so no
+        # listener process ever needs the privilege to bind 53, 445 or
+        # anything else below 1024 -- which is the property that keeps
+        # these out of `cap_add`, `setcap` and sudo entirely.
+        if sock is not None:
+            self._sock = sock
+        else:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind((bind_host, bind_port))
         self._sock.settimeout(0.2)
         self.address = self._sock.getsockname()
         self._seen = 0
@@ -126,6 +134,11 @@ class DnsListener:
             self._thread = None
 
     # ── observable state ──
+
+    def counters(self) -> dict:
+        return {"queries_seen": self.queries_seen(),
+                "answers_sent": self.answers_sent()}
+
 
     def queries_seen(self) -> int:
         with self._lock:
