@@ -88,9 +88,10 @@ class _TaskingServer:
 
     operator_token = "operator-token-for-tests"
 
-    def __init__(self, key: bytes, listener_token: str):
+    def __init__(self, key: bytes, listener_token: str, supervisor=None):
         self.key = key
         self.listener_token = listener_token
+        self.supervisor = supervisor
         self.crypto = ServerCrypto(key)
         self._saved = None
         self.servers = ()
@@ -115,7 +116,8 @@ class _TaskingServer:
                            "operator_host": "127.0.0.1",
                            "operator_port": self.operator_port},
             operator_port=self.operator_port,
-            listener_token=self.listener_token)
+            listener_token=self.listener_token,
+            supervisor=self.supervisor)
         self.app = app
         self.servers = (operator, agent)
         for srv in self.servers:
@@ -152,6 +154,22 @@ class _TaskingServer:
         if not new:
             raise AssertionError("the probe agent did not register")
         return new.pop()
+
+    def check_in(self, implant_id: str, action: str = "beacon") -> None:
+        """Contact the agent socket the way a beacon does, without expecting
+        a new agent. `register` asserts that one appeared, which is right
+        for a first contact and wrong for every one after it."""
+        body = json.dumps(self.crypto.wrap({
+            "action": action, "id": implant_id, "agent_id": None,
+            "hostname": "probe", "os": "Linux 6.1", "user": "nobody",
+            "pid": 1, "uptime": 2, "interval": 300,
+        })).encode()
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/api/v1/beacon" % self.agent_port,
+            data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=5):
+            pass
 
     def agents(self):
         """The fleet as the server holds it, for before/after comparisons."""
@@ -197,6 +215,29 @@ def _command_line_of(pid: int) -> str:
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return done.stdout.strip()
+
+
+def _served_page() -> str:
+    """The operator page as the server serves it.
+
+    Read through a real request rather than out of the source, so a change
+    that breaks the template is a failure here and not a surprise in a
+    browser.
+    """
+    raw, _b64 = _key_pair()
+    quiet = logging.getLogger("werkzeug")
+    previous = quiet.level
+    quiet.setLevel(logging.ERROR)
+    env = _TaskingServer(raw, None)
+    try:
+        env.start()
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/" % env.operator_port)
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.read().decode("utf-8", "replace")
+    finally:
+        env.stop()
+        quiet.setLevel(previous)
 
 
 def _free_port() -> int:
@@ -1052,6 +1093,41 @@ class TestTheDnsTaskingRoute(unittest.TestCase):
         got = self.env.crypto.unwrap(body)
         self.assertEqual(got.get("id"), task_id,
                          "the implant id did not resolve to the agent")
+
+    def test_an_agent_reached_over_dns_is_marked_as_such(self):
+        # The interface cannot otherwise know: a check-in over HTTPS, SMB
+        # or QUIC all arrive as an HTTP POST on the agent socket and are
+        # indistinguishable. This route is the one contact that can be
+        # attributed, and it has to be, because an agent reached this way
+        # will never report a result -- so an operator queueing a task
+        # against it is owed a warning.
+        name = self.env.register("channel-probe")
+        self.assertNotEqual(self.env.agents()[name].get("last_channel"),
+                            "dns")
+
+        self._get("/api/v1/dns/%s" % name)
+
+        self.assertEqual(self.env.agents()[name]["last_channel"], "dns")
+
+    def test_a_later_check_in_clears_the_dns_mark(self):
+        # A beacon with DNS as a fallback would otherwise carry the mark
+        # for ever, and the interface would warn about a limit that no
+        # longer applies.
+        name = self.env.register("channel-probe-two")
+        self._get("/api/v1/dns/%s" % name)
+        self.assertEqual(self.env.agents()[name]["last_channel"], "dns")
+
+        # A check-in, not a registration: `register` asserts a new agent
+        # appeared, which is right for a first contact and wrong for every
+        # one after it. Both paths clear the mark, and both are tested --
+        # a re-registration is a contact over the agent socket too.
+        self.env.check_in("channel-probe-two")
+        self.assertEqual(self.env.agents()[name]["last_channel"], "http")
+
+        self._get("/api/v1/dns/%s" % name)
+        self.assertEqual(self.env.agents()[name]["last_channel"], "dns")
+        self.env.check_in("channel-probe-two", action="register")
+        self.assertEqual(self.env.agents()[name]["last_channel"], "http")
 
     def test_without_the_token_it_is_refused(self):
         name = self.env.register("probe-four")
@@ -2823,6 +2899,359 @@ class _EndlessSocket:
 
     def sendall(self, _data):
         raise AssertionError("an endless request must not be answered")
+
+
+class TestTheListenerPanel(unittest.TestCase):
+    """The 📡 panel's route, and the properties a new route erodes first.
+
+    The interface is the only reason the listeners are separate processes
+    rather than a config file -- goal 4 of the design was runtime listing,
+    starting and stopping. So this route exists, and it is the third one
+    added to this server on this branch, which makes the two-socket
+    property the thing to check hardest.
+    """
+
+    def setUp(self):
+        self.raw, self.b64 = _key_pair()
+        quiet = logging.getLogger("werkzeug")
+        previous = quiet.level
+        quiet.setLevel(logging.ERROR)
+        self.addCleanup(quiet.setLevel, previous)
+        spec = ListenerSpec(
+            name="panel-quic", transport="quic", enabled=True,
+            bind_host="127.0.0.1", bind_port=_free_port(),
+            relay_url="http://127.0.0.1:1/api/v1/beacon")
+        self.spec = spec
+        self.supervisor = Supervisor([spec], listener_token=_CONTROL_TOKEN)
+        self.addCleanup(self.supervisor.stop_all)
+        self.env = _TaskingServer(self.raw, _CONTROL_TOKEN,
+                                  supervisor=self.supervisor)
+        self.addCleanup(self.env.stop)
+        self.env.start()
+
+    def _get(self, path, *, port=None, token="operator-token-for-tests"):
+        return self._call(path, port=port, token=token)
+
+    def _post(self, path, *, port=None, token="operator-token-for-tests"):
+        return self._call(path, port=port, token=token, method="POST")
+
+    def _call(self, path, *, port=None, token=None, method="GET"):
+        url = "http://127.0.0.1:%d%s" % (port or self.env.operator_port, path)
+        request = urllib.request.Request(url, method=method)
+        if token is not None:
+            request.add_header("Authorization", "Bearer %s" % token)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            try:
+                return exc.code, json.loads(body or b"{}")
+            except ValueError:
+                return exc.code, None
+
+    # ── the route ──
+
+    def test_it_lists_what_is_configured(self):
+        status, body = self._get("/api/server/listeners")
+        self.assertEqual(status, 200)
+        self.assertEqual([entry["name"] for entry in body["listeners"]],
+                         ["panel-quic"])
+        self.assertEqual(body["listeners"][0]["state"], "stopped")
+        self.assertTrue(body["listeners"][0]["can_control"])
+
+    def test_it_starts_and_stops_through_the_route(self):
+        status, body = self._post("/api/server/listeners/panel-quic/start")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["state"], "running")
+        pid = body["pid"]
+        self.assertTrue(_pid_alive(pid))
+
+        status, body = self._post("/api/server/listeners/panel-quic/stop")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["state"], "stopped")
+        self.assertFalse(_pid_alive(pid), "the route returned but pid %d "
+                                          "is still alive" % pid)
+
+    def test_a_refusal_comes_back_with_its_reason(self):
+        self._post("/api/server/listeners/panel-quic/start")
+        status, body = self._post("/api/server/listeners/panel-quic/start")
+        self.assertEqual(status, 409)
+        self.assertIn("already running", body["error"])
+
+    def test_an_unknown_name_is_refused(self):
+        status, body = self._post("/api/server/listeners/nope/start")
+        self.assertEqual(status, 404)
+        self.assertIn("nope", body["error"])
+
+    def test_an_unknown_action_is_refused(self):
+        # No arbitrary verb reaches the supervisor: the route takes start
+        # and stop and nothing else.
+        for action in ("restart", "exec", "kill", "status", "START"):
+            with self.subTest(action=action):
+                status, body = self._post(
+                    "/api/server/listeners/panel-quic/%s" % action)
+                self.assertEqual(status, 404, "action %r was served" % action)
+                self.assertIn("start and stop", body["error"])
+
+    def test_nothing_outside_the_two_actions_can_start_a_listener(self):
+        # The stronger claim, and the one worth holding: whatever a
+        # request looks like, if it is not one of the two actions then no
+        # process appears.
+        #
+        # A path with `..` in it is in here because my first version of
+        # the test above expected a 404 for it and got a 200: urllib
+        # normalises the path, and what arrives lands on the beacon
+        # catch-all, which answers any POST path by design. That is
+        # pre-existing cover behaviour and not this route's business --
+        # but "no listener started" has to hold for it too.
+        for path in ("/api/server/listeners/panel-quic/../start",
+                     "/api/server/listeners/panel-quic/start/extra",
+                     "/api/server/listeners//start",
+                     "/api/server/listeners/panel-quic/sTaRt"):
+            with self.subTest(path=path):
+                self._post(path)
+                self.assertEqual(self.supervisor.status()[0]["state"],
+                                 "stopped",
+                                 "%s started a listener" % path)
+
+    def test_it_requires_the_operator_token(self):
+        for token in (None, "", "wrong"):
+            with self.subTest(token=token):
+                status, _ = self._get("/api/server/listeners", token=token)
+                self.assertEqual(status, 401)
+                status, _ = self._post(
+                    "/api/server/listeners/panel-quic/start", token=token)
+                self.assertEqual(status, 401)
+
+    def test_it_is_refused_on_the_agent_socket(self):
+        # The property a new route erodes first. The agent socket serves
+        # the beacon endpoint and the DNS tasking route, and nothing else;
+        # everything else gets the cover answer.
+        cover = {"status": "ok", "version": "2.1.0"}
+        status, body = self._get("/api/server/listeners",
+                                 port=self.env.agent_port)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, cover)
+
+        status, body = self._post("/api/server/listeners/panel-quic/start",
+                                  port=self.env.agent_port)
+        self.assertEqual(body, cover,
+                         "a listener could be started from the beacon "
+                         "socket")
+
+    def test_no_response_carries_the_encryption_key(self):
+        self._post("/api/server/listeners/panel-quic/start")
+        for path in ("/api/server/listeners",):
+            _status, body = self._get(path)
+            blob = json.dumps(body)
+            self.assertNotIn(self.b64, blob)
+            self.assertNotIn(base64.b64encode(self.raw).decode(), blob)
+            self.assertNotIn(self.raw.hex(), blob)
+        # And the control token stays between the supervisor and its
+        # children: the panel never needs it.
+        _status, body = self._get("/api/server/listeners")
+        self.assertNotIn(self.supervisor.control_token, json.dumps(body))
+
+    def test_an_unconfigured_server_says_so_rather_than_failing(self):
+        # Every deployment before this branch has no supervisor at all.
+        bare = _TaskingServer(self.raw, None)
+        self.addCleanup(bare.stop)
+        bare.start()
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/api/server/listeners" % bare.operator_port)
+        request.add_header("Authorization", "Bearer %s" % bare.operator_token)
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = json.loads(response.read())
+        self.assertEqual(body["listeners"], [])
+        self.assertIn("detail", body)
+        self.assertTrue(body["detail"],
+                        "a server with no listeners gives no explanation")
+
+        # And a start button pressed against it refuses with a reason
+        # rather than failing. Without this the route calls a method on
+        # None and answers 500, which tells an operator nothing.
+        action = urllib.request.Request(
+            "http://127.0.0.1:%d/api/server/listeners/anything/start"
+            % bare.operator_port, method="POST")
+        action.add_header("Authorization", "Bearer %s" % bare.operator_token)
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(action, timeout=10)
+        self.assertEqual(caught.exception.code, 409)
+        self.assertIn("no listeners are configured",
+                      json.loads(caught.exception.read())["error"])
+
+
+class TestThePanelMarkup(unittest.TestCase):
+    """What the served page says, read out of the page itself."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.page = _served_page()
+
+    def test_the_header_has_the_button_between_generator_and_loot(self):
+        generator = self.page.index("showBeaconGen()")
+        loot = self.page.index("showLootViewer()")
+        panel = self.page.index("showListeners()")
+        self.assertLess(generator, panel,
+                        "the listeners button is before the generator")
+        self.assertLess(panel, loot,
+                        "the listeners button is after the loot button")
+        window = self.page[generator:loot]
+        self.assertIn("&#128225;", window,
+                      "the button is not the satellite antenna")
+
+    def test_the_panel_states_the_dns_limit_in_words(self):
+        # An operator tasking a DNS-only agent must be told, in the place
+        # they are doing it, that the task will be delivered once and
+        # never reported on.
+        for phrase in ("tasking only", "never report"):
+            self.assertIn(phrase, self.page.lower(),
+                          "the panel does not say %r" % phrase)
+
+    def test_the_controls_are_disabled_with_a_reason_when_unmanaged(self):
+        # Not greyed out and silent: the reason is rendered. A control
+        # that silently does nothing is the anti-goal of this branch.
+        self.assertIn("can_control", self.page)
+        self.assertIn("disabled", self.page)
+        self.assertIn("entry.detail", self.page,
+                      "the panel never renders the reason it was given")
+
+    def test_an_agent_last_reached_over_dns_is_flagged_in_its_header(self):
+        self.assertTrue("last_channel === 'dns'" in self.page,
+                        "the agent header does not check the channel")
+        self.assertIn("VIA DNS", self.page)
+        window = self.page[self.page.index("VIA DNS") - 400:
+                           self.page.index("VIA DNS") + 400]
+        self.assertIn("never reported", window,
+                      "the flag does not say what the limit is")
+
+    def test_every_value_a_listener_influences_is_escaped(self):
+        # A listener's name and detail come from configuration and from a
+        # child process. The hardening pass established that each one goes
+        # through esc(), and a handler is attached in JavaScript rather
+        # than built into an attribute string.
+        start = self.page.index("function showListeners()")
+        end = self.page.index("</script>", start)
+        body = self.page[start:end]
+        for field in ("name", "transport", "state", "detail"):
+            self.assertIn("esc(entry.%s)" % field, body,
+                          "entry.%s reaches the page unescaped" % field)
+        self.assertNotIn('onclick="listener', body,
+                         "a handler body is built as a string")
+
+
+class TestTheServerCommandLine(unittest.TestCase):
+    """What `--config` does, and what it refuses.
+
+    A listener that was silently not configured shows up as a beacon that
+    never checks in, so every way of getting this wrong is fatal at
+    startup with the reason printed.
+    """
+
+    def _run(self, *extra, env=None):
+        root = str(Path(__file__).resolve().parents[2])
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = root
+        environment.pop("RACCOON_LISTENER_TOKEN", None)
+        environment.update(env or {})
+        return subprocess.run(
+            [sys.executable, "-m", "software.c2.server", "--help"] + list(extra),
+            cwd=root, env=environment, capture_output=True, text=True,
+            timeout=60)
+
+    def _start(self, config_path, *extra, env=None):
+        root = str(Path(__file__).resolve().parents[2])
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = root
+        environment.pop("RACCOON_LISTENER_TOKEN", None)
+        environment.update(env or {})
+        key = base64.b64encode(os.urandom(32)).decode()
+        return subprocess.run(
+            [sys.executable, "-m", "software.c2.server",
+             "--key", key, "--config", str(config_path),
+             "--port", str(_free_port()),
+             "--operator-port", str(_free_port()),
+             "--data-dir", tempfile.mkdtemp()] + list(extra),
+            cwd=root, env=environment, capture_output=True, text=True,
+            timeout=60)
+
+    def _config(self, text):
+        path = Path(tempfile.mkdtemp()) / "raccoon.yaml"
+        path.write_text(text)
+        return path
+
+    def test_the_flags_are_offered(self):
+        done = self._run()
+        self.assertIn("--config", done.stdout)
+        self.assertIn("--no-manage-listeners", done.stdout)
+
+    def test_a_config_that_cannot_be_read_is_fatal(self):
+        done = self._start("/nonexistent/raccoon.yaml")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("could not read", done.stderr)
+
+    def test_a_config_with_a_bad_listener_is_fatal_with_the_reason(self):
+        path = self._config(
+            "c2:\n"
+            "  listeners:\n"
+            "    - name: wrong\n"
+            "      transport: telepathy\n"
+            "      bind_port: 1234\n"
+            "      relay_url: http://127.0.0.1:8443/api/v1/beacon\n")
+        done = self._start(path)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("telepathy", done.stderr)
+
+    def test_a_dns_listener_without_the_token_is_fatal(self):
+        # It would start and look healthy while answering every beacon an
+        # empty record, because the tasking route would refuse it.
+        path = self._config(
+            "c2:\n"
+            "  listeners:\n"
+            "    - name: dns-53\n"
+            "      transport: dns\n"
+            "      bind_port: 1053\n"
+            "      relay_url: http://127.0.0.1:8443\n"
+            "      settings:\n"
+            "        zone: c2.example\n")
+        done = self._start(path)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("RACCOON_LISTENER_TOKEN", done.stderr)
+        self.assertNotIn("--listener-token", done.stderr,
+                         "the message suggests putting a secret on the "
+                         "command line")
+
+    def test_the_shipped_config_starts_the_server(self):
+        # The file this project ships has all three listeners disabled and
+        # one of them is DNS, so reading it must not require a token --
+        # and it must not stop the server from coming up.
+        #
+        # Started rather than run to completion: the server runs until it
+        # is killed, so `subprocess.run` with a timeout raises, which my
+        # first version of this treated as the success case and then did
+        # not catch.
+        root = str(Path(__file__).resolve().parents[2])
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = root
+        environment["RACCOON_LISTENER_TOKEN"] = "a-token"
+        process = subprocess.Popen(
+            [sys.executable, "-m", "software.c2.server",
+             "--key", base64.b64encode(os.urandom(32)).decode(),
+             "--config", "configs/raccoon.yaml",
+             "--port", str(_free_port()),
+             "--operator-port", str(_free_port()),
+             "--data-dir", tempfile.mkdtemp()],
+            cwd=root, env=environment, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        self.addCleanup(_reap, process)
+
+        try:
+            process.wait(timeout=6)
+        except subprocess.TimeoutExpired:
+            return                      # still running: it started
+        self.fail("the server exited with %d; its error output was: %s"
+                  % (process.returncode, process.stderr.read()[:400]))
 
 
 # New test classes belong above this guard; never append below it.

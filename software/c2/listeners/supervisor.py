@@ -45,6 +45,7 @@ import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from .errors import SupervisorError
 from .registry import ListenerSpec
 
 # How long to wait for a child to print its control port before giving up
@@ -58,10 +59,6 @@ _START_TIMEOUT = 20.0
 _TERM_GRACE = 5.0
 
 _CONTROL_TIMEOUT = 5.0
-
-
-class SupervisorError(Exception):
-    """A refusal with a reason in it, for the panel to show verbatim."""
 
 
 class Supervisor:

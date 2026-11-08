@@ -33,7 +33,26 @@ from werkzeug.serving import make_server
 
 from software.c2.beacon import Beacon
 from software.c2.server import ServerCrypto, agents, create_app
+from software.c2.listeners.registry import ListenerSpec
+from software.c2.listeners.supervisor import Supervisor
 from tools import listener_lab as lab
+
+
+def _free_port() -> int:
+    """A port that was free a moment ago.
+
+    A listener in a config file needs a fixed port because the beacon is
+    configured with one, so `bind_port: 0` is refused there -- a local
+    environment picks a concrete free one instead.
+    """
+    import socket as _socket
+
+    probe = _socket.socket()
+    try:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+    finally:
+        probe.close()
 
 
 def random_key() -> bytes:
@@ -87,7 +106,9 @@ class DemoEnv:
         self.token = token
         self.listener_token = listener_token
         self.listeners = {}
+        self.listener_ports = {}
         self.beacons = {}
+        self.supervisor = None
         self.data_dir = pathlib.Path(data_dir or tempfile.mkdtemp())
         self.key = random_key()
         self.beacon = None
@@ -105,7 +126,8 @@ class DemoEnv:
                            "operator_host": "127.0.0.1",
                            "operator_port": self.operator_port},
             operator_port=self.operator_port,
-            listener_token=self.listener_token)
+            listener_token=self.listener_token,
+            supervisor=self)
         self.servers = (operator, agent)
         for srv in self.servers:
             srv.app = self.app
@@ -138,31 +160,40 @@ class DemoEnv:
     # ── listeners in front of the agent socket ──
 
     def start_listeners(self, transports):
-        """Stand up one listener per transport, each relaying to this server.
+        """Stand up one listener per transport, as separate processes.
 
-        A listener is a separate process in a real deployment -- that is
-        the whole point of the arrangement, since it means no listener ever
-        holds the key. Here they are threads in this process, because what
-        a local environment is for is clicking around the panel, and a
-        thread that dies takes the environment down where a container
-        would hide it.
+        Through the supervisor, which is how a deployment does it: a
+        listener is its own process so that a fault in one protocol parser
+        costs one transport instead of the fleet and the operator
+        interface together. Running them as threads here would be simpler
+        and would test something this project does not ship.
+
+        A side effect worth having: the 📡 panel lists exactly these and
+        can stop and start them, so the panel can be used rather than only
+        looked at.
         """
         if self.listener_token is None:
             raise RuntimeError(
                 "the server was built without a listener token, so its "
                 "tasking route refuses every listener")
+        specs = []
         for transport in transports:
-            listener = lab.make_listener(
-                transport, 0,
-                lab.relay_url_for(transport, self.beacon_port),
-                token=self.listener_token)
-            listener.start()
-            self.listeners[transport] = listener
+            settings = {"zone": lab.DNS_ZONE} if transport == "dns" else {}
+            port = _free_port()
+            specs.append(ListenerSpec(
+                name="%s-%d" % (transport, port), transport=transport,
+                enabled=True, bind_host="127.0.0.1", bind_port=port,
+                relay_url=lab.relay_url_for(transport, self.beacon_port),
+                settings=settings))
+            self.listener_ports[transport] = port
             if transport == "dns":
-                # Process-wide, and it has to outlive this call: the
-                # beacons started below ask their resolver on this port for
-                # as long as the environment runs.
-                lab.set_resolver_port(listener.address[1])
+                # Process-wide and it has to outlive this call: the beacons
+                # started below ask their resolver on this port for as long
+                # as the environment runs.
+                lab.set_resolver_port(port)
+        self.supervisor = Supervisor(specs, listener_token=self.listener_token)
+        for spec in specs:
+            self.listeners[spec.transport] = self.supervisor.start(spec.name)
         return self.listeners
 
     def start_beacon_over(self, transport):
@@ -171,9 +202,8 @@ class DemoEnv:
         Returns the agent name the panel shows, so a caller can print
         something you can act on rather than "started".
         """
-        listener = self.listeners[transport]
-        beacon = Beacon(lab.beacon_config_for(transport, self.key,
-                                              listener.address))
+        address = ("127.0.0.1", self.listener_ports[transport])
+        beacon = Beacon(lab.beacon_config_for(transport, self.key, address))
         # Every beacon on one host computes the same implant id --
         # `sha256("<hostname>:<machine>")[:16]`, plus the eth0 MAC where
         # that file exists -- so without this the three beacons here would
@@ -199,6 +229,39 @@ class DemoEnv:
             name = (set(agents) - before).pop()
         self.beacons[transport] = beacon
         return name
+
+    # ── the panel's view of this environment ──
+    #
+    # `create_app` is built before the listeners exist, so DemoEnv stands
+    # in for the supervisor and forwards once there is one. Without this
+    # the panel would have been given None at startup and would report
+    # "none configured" for the whole run.
+
+    @property
+    def managed(self):
+        return self.supervisor.managed if self.supervisor else False
+
+    def status(self):
+        return self.supervisor.status() if self.supervisor else []
+
+    def start(self, name):
+        return self._delegate("start", name)
+
+    def stop(self, name):
+        return self._delegate("stop", name)
+
+    def _delegate(self, action, name):
+        from software.c2.listeners.errors import SupervisorError
+
+        if self.supervisor is None:
+            raise SupervisorError("no listeners are configured in this "
+                                  "environment; start it with "
+                                  "--with-listeners")
+        return getattr(self.supervisor, action)(name)
+
+    def stop_all(self):
+        if self.supervisor is not None:
+            self.supervisor.stop_all()
 
     @staticmethod
     def _wait(predicate, what, timeout=20.0):
@@ -242,15 +305,14 @@ def main(argv=None):
     if args.with_listeners:
         env.start_listeners(lab.available_transports())
         for transport in lab.available_transports():
-            listener = env.listeners[transport]
             name = env.start_beacon_over(transport)
             note = ""
             if lab.is_tasking_only(transport):
                 note = ("  tasking only: it will never report a result, "
                         "and each task is delivered once")
-            print("beacon %s  %s via %s:%d%s"
-                  % (name, transport, listener.address[0],
-                     listener.address[1], note))
+            print("beacon %s  %s via 127.0.0.1:%d  listener pid %s%s"
+                  % (name, transport, env.listener_ports[transport],
+                     env.listeners[transport].get("pid"), note))
         print("listener token %s" % args.listener_token)
     print("data %s" % env.data_dir)
     sys.stdout.flush()
