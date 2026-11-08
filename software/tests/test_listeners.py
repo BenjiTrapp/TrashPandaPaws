@@ -32,6 +32,7 @@ from software.c2 import beacon as beacon_mod
 from software.c2.beacon import Beacon
 from software.c2.listeners.dns import DnsListener
 from software.c2.listeners.quic import QuicListener
+from software.c2.listeners.smb import SmbListener
 from software.c2.listeners.relay import relay
 from software.c2.server import ServerCrypto
 
@@ -143,6 +144,13 @@ class _TaskingServer:
         if not new:
             raise AssertionError("the probe agent did not register")
         return new.pop()
+
+    def agents(self):
+        """The fleet as the server holds it, for before/after comparisons."""
+        return dict(self._mod.agents)
+
+    def result(self, task_id: str):
+        return self._mod.results.get(task_id)
 
     def queue(self, name: str, cmd: str, args: str) -> str:
         body = json.dumps({"cmd": cmd, "args": args, "data": ""}).encode()
@@ -1345,6 +1353,366 @@ class TestTheDnsListener(unittest.TestCase):
     def test_the_listener_holds_no_key(self):
         imported, used = _imports_and_names("software", "c2", "listeners",
                                             "dns.py")
+        self.assertNotIn("cryptography", imported)
+        for banned in ("ServerCrypto", "AESGCM", "decode_key"):
+            self.assertNotIn(banned, used)
+
+
+class TestTheSmbListener(unittest.TestCase):
+    """The SMB listener driven by the client that defines its wire format.
+
+    Every assertion here goes through the beacon's own methods --
+    `_beacon_smb` and `_send_result_smb` -- rather than a reimplementation
+    of SMB2. The client is the only specification this protocol has in
+    this project, and it is an inconsistent one: it declares a WRITE data
+    offset of 70 and puts the payload at 112, and it picks the session,
+    tree and file ids up four bytes past where it writes them. A listener
+    built from the SMB2 specification alone would not interoperate with
+    it, so the listener is built from measurements of it, and these tests
+    are those measurements.
+
+    Unlike DNS, this transport is bidirectional and carries registration,
+    so a beacon that speaks only SMB is a complete client.
+    """
+
+    def setUp(self):
+        self.raw, self.b64 = _key_pair()
+        quiet = logging.getLogger("werkzeug")
+        previous = quiet.level
+        quiet.setLevel(logging.ERROR)
+        self.addCleanup(quiet.setLevel, previous)
+        self.env = _TaskingServer(self.raw, None)
+        self.addCleanup(self.env.stop)
+        self.env.start()
+        self.listener = SmbListener(
+            "127.0.0.1", 0,
+            relay_url="http://127.0.0.1:%d/api/v1/beacon" % self.env.agent_port)
+        self.listener.start()
+        self.addCleanup(self.listener.shutdown)
+
+    def _beacon(self, interval=2):
+        host, port = self.listener.address
+        return Beacon({"c2": {
+            "beacon_interval_seconds": interval,
+            "jitter_percent": 0,
+            "encryption_key": self.b64,
+            "proxy": {"mode": "none"},
+            "https": {"enabled": False},
+            "dns": {"enabled": False, "domain": "", "resolver": "127.0.0.1"},
+            "quic": {"enabled": False},
+            "smb": {"enabled": True, "server": "%s:%d" % (host, port),
+                    "pipe_name": "msrpc_6e2f"},
+        }})
+
+    # ── the deliverable ──
+
+    def test_a_beacon_registers_over_smb_alone(self):
+        beacon = self._beacon()
+        before = set(self.env.agents())
+
+        answer = beacon._beacon_smb()
+
+        self.assertIsNotNone(answer, "the exchange produced nothing")
+        self.assertTrue(answer.get("success"), answer)
+        new = set(self.env.agents()) - before
+        self.assertEqual(len(new), 1, "the beacon did not register")
+        self.assertEqual(answer.get("agent_id"), new.pop())
+
+    def test_tasking_comes_back_over_smb(self):
+        beacon = self._beacon()
+        before = set(self.env.agents())
+        beacon._beacon_smb()
+        name = (set(self.env.agents()) - before).pop()
+        beacon._registered = True
+        task_id = self.env.queue(name, "shell", "echo over_smb")
+
+        answer = beacon._beacon_smb()
+
+        self.assertIsNotNone(answer, "no tasking came back")
+        # A batch envelope, not a bare task: this client advertises the
+        # `batch` capability, so the server wraps tasking in `{"tasks":
+        # [..]}`. My first version of this test asserted the bare shape and
+        # failed against correct code -- worth pinning, because a listener
+        # that reshaped the payload would be reading it, and it must not.
+        self.assertEqual(list(answer), ["tasks"], answer)
+        self.assertEqual(len(answer["tasks"]), 1)
+        task = answer["tasks"][0]
+        self.assertEqual(task.get("id"), task_id)
+        self.assertEqual(task.get("args"), "echo over_smb")
+
+    def test_a_result_travels_back_over_smb(self):
+        # The property DNS cannot have. This transport is bidirectional, so
+        # a beacon reached only over SMB is a complete client.
+        beacon = self._beacon()
+        before = set(self.env.agents())
+        beacon._beacon_smb()
+        name = (set(self.env.agents()) - before).pop()
+        beacon._agent_id = name
+        beacon._registered = True
+        task_id = self.env.queue(name, "shell", "echo result_path")
+
+        beacon._send_result_smb(task_id, "ok", "result_over_smb")
+
+        _wait_until(lambda: self.env.result(task_id),
+                    "the result to reach the server")
+        record = self.env.result(task_id)
+        self.assertEqual(record.get("status"), "ok")
+        self.assertEqual(record.get("output"), "result_over_smb")
+
+    # ── the measurements the listener is built from ──
+
+    def test_the_payload_is_taken_from_where_the_client_puts_it(self):
+        # The client declares DataOffset 70 in its WRITE and places the
+        # payload at 112. A listener that trusted the declared offset would
+        # relay 42 bytes of the request's own body as if it were
+        # ciphertext, and the server would answer an error that the beacon
+        # would read as a failed exchange -- silently.
+        beacon = self._beacon()
+        relayed = []
+        from software.c2.listeners import smb as smb_mod
+        original = smb_mod.relay
+
+        def recording(payload, **kwargs):
+            relayed.append(payload)
+            return original(payload, **kwargs)
+
+        smb_mod.relay = recording
+        self.addCleanup(setattr, smb_mod, "relay", original)
+        beacon._beacon_smb()
+
+        self.assertEqual(len(relayed), 1, "the listener relayed %d times"
+                         % len(relayed))
+        self.assertEqual(ServerCrypto(self.raw).decrypt(relayed[0])["action"],
+                         "register",
+                         "what was relayed is not what the beacon encrypted")
+
+    def test_the_echoed_ids_are_not_validated(self):
+        # Measured: the client reads the session id from offset 44 where it
+        # was written at 40, the tree id from 40 where it was written at
+        # 36, and the file id from 132 where it was written at 128. So it
+        # echoes four bytes of the next field and loses four of its own. A
+        # listener that compared those values against what it issued would
+        # reject every real beacon.
+        beacon = self._beacon()
+        self.assertIsNotNone(beacon._beacon_smb())
+        self.assertNotEqual(beacon._smb_session_id,
+                            self.listener.issued_session_id,
+                            "the client echoed the session id unchanged; the "
+                            "measurement this listener was built on no "
+                            "longer holds")
+
+    def test_two_beacons_do_not_mix_their_exchanges(self):
+        # One connection per exchange, several at once. State kept per
+        # listener rather than per connection would splice two beacons
+        # together and each would decrypt the other's answer.
+        first, second = self._beacon(), self._beacon()
+        second._implant_id = first._implant_id + "-second"
+        answers = {}
+
+        def run(label, beacon):
+            answers[label] = beacon._beacon_smb()
+
+        threads = [threading.Thread(target=run, args=("a", first)),
+                   threading.Thread(target=run, args=("b", second))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertIsNotNone(answers.get("a"))
+        self.assertIsNotNone(answers.get("b"))
+        self.assertNotEqual(answers["a"]["agent_id"], answers["b"]["agent_id"],
+                            "both beacons were given the same agent")
+
+    # ── robustness ──
+
+    def test_a_malformed_message_does_not_take_the_listener_down(self):
+        malformed = [
+            b"",
+            b"\x00\x00\x00",
+            b"\x00\x00\x00\x04\xfeSMB",
+            b"\x00\x00\x00\x40" + b"\xfeSMB" + b"\x00" * 60,
+            b"\x00\x00\x00\x10" + b"not an smb message",
+            b"\x00\xff\xff\xff" + b"\xfeSMB",
+        ]
+        for packet in malformed:
+            probe = socket.socket()
+            probe.settimeout(3)
+            try:
+                probe.connect(self.listener.address)
+                probe.sendall(packet)
+                probe.recv(64)
+            except (OSError, socket.timeout):
+                pass
+            finally:
+                probe.close()
+
+        beacon = self._beacon()
+        self.assertIsNotNone(beacon._beacon_smb(),
+                             "the listener stopped serving after malformed "
+                             "input")
+
+    def test_an_oversized_message_is_refused(self):
+        probe = socket.socket()
+        probe.settimeout(5)
+        self.addCleanup(probe.close)
+        probe.connect(self.listener.address)
+        # A length header claiming more than the cap, so the listener must
+        # refuse on the header alone rather than reading the body.
+        probe.sendall(b"\x00" + struct.pack(">I", self.listener.max_message
+                                            + 1)[1:])
+        self.assertEqual(probe.recv(16), b"",
+                         "the listener kept the connection open")
+
+    # ── properties the deliverable tests did not hold ──
+    #
+    # A mutation run found seven of these indifferent, and the reason is
+    # the same for most: the client checks almost nothing. It reads the
+    # command out of the NEGOTIATE response and reads data out of a READ
+    # response, and takes everything else on faith. So a listener can get
+    # the status, the flags, the echoed command and the field offsets all
+    # wrong and still serve this one client perfectly -- which is exactly
+    # why those need tests of their own rather than being left to the
+    # end-to-end exchange.
+    #
+    # One survivor is left deliberately: keeping the pending answer after
+    # a READ instead of clearing it. The client does one WRITE and one
+    # READ per connection and never reads twice, so no test can tell the
+    # two apart without driving raw SMB2 through a sequence the client
+    # will never send. The reset stays because a second READ returning a
+    # stale answer would be worse than nothing.
+
+    def test_a_message_without_the_smb2_magic_is_not_served(self):
+        # Reachable only at 64 bytes or more, because shorter messages are
+        # refused on the length header. A listener that dispatched on
+        # whatever sits at offset 12 would answer arbitrary traffic.
+        probe = socket.socket()
+        probe.settimeout(5)
+        self.addCleanup(probe.close)
+        probe.connect(self.listener.address)
+        bogus = b"HTTP" + b"\x00" * 8 + struct.pack("<H", 0) + b"\x00" * 50
+        self.assertEqual(len(bogus), 64)
+        probe.sendall(b"\x00" + struct.pack(">I", len(bogus))[1:] + bogus)
+        self.assertEqual(probe.recv(16), b"",
+                         "a message with the wrong magic was answered")
+
+    def test_a_write_that_declares_more_than_it_carries_is_refused(self):
+        # Without the check the payload is silently short, because slicing
+        # past the end of a bytes object does not raise. The server would
+        # fail to decrypt it and the beacon would see a failed exchange
+        # with nothing anywhere saying why.
+        from software.c2.listeners.smb import _write_payload
+
+        message = b"\xfeSMB" + b"\x00" * 60            # header
+        message += struct.pack("<HH", 49, 70)
+        message += struct.pack("<I", 500)                # declares 500
+        message += b"\x00" * 40                         # rest of the body
+        message += b"only a little"                     # carries 13
+        with self.assertRaises(ValueError):
+            _write_payload(message, 16 * 1024 * 1024)
+
+    def test_every_response_echoes_its_request_and_reports_success(self):
+        # The client checks the command on the NEGOTIATE response and
+        # nothing else, so these went unnoticed. A real client, and anyone
+        # reading the traffic, would find a reply that claims to be a
+        # different command or carries an error status while the handshake
+        # proceeds incoherent.
+        from software.c2.listeners.smb import _header
+
+        for command in (0, 1, 3, 5, 8, 9):
+            with self.subTest(command=command):
+                header = _header(command, 0x4242, self.listener)
+                self.assertEqual(struct.unpack_from("<H", header, 12)[0],
+                                 command, "the command was not echoed")
+                self.assertEqual(struct.unpack_from("<I", header, 8)[0], 0,
+                                 "the status is not SUCCESS")
+                self.assertEqual(struct.unpack_from("<Q", header, 24)[0],
+                                 0x4242, "the message id was not echoed")
+                self.assertTrue(struct.unpack_from("<I", header, 16)[0] & 1,
+                                "SMB2_FLAGS_SERVER_TO_REDIR is not set")
+
+    def test_the_create_response_puts_the_file_id_where_one_belongs(self):
+        # Offset 128 from the start of the header, which is where the SMB2
+        # specification puts it. Neither this listener nor this client
+        # cares what the value is, so only its position carries meaning --
+        # and a position nobody checks is one that rots.
+        from software.c2.listeners.smb import _create_body
+
+        file_id = bytes(range(16))
+        body = _create_body(file_id)
+        self.assertEqual(body[64:80], file_id,
+                         "the file id is not at offset 128 of the message")
+        self.assertEqual(struct.unpack_from("<H", body, 0)[0], 89,
+                         "the declared structure size changed")
+
+    # ── what goes on the wire, and how much of it ──
+
+    def test_the_issued_ids_are_not_a_fixed_string(self):
+        # The first version of this listener put b"raccoonpipe00001" in the
+        # file id and "RACOON" in the session id. Both travel in clear
+        # text in every exchange, so that was the project's name written
+        # into every capture of its own traffic.
+        other = SmbListener("127.0.0.1", 0, relay_url=self.listener.relay_url)
+        other.start()
+        self.addCleanup(other.shutdown)
+        for field in ("issued_session_id", "issued_tree_id",
+                      "issued_file_id"):
+            with self.subTest(field=field):
+                mine = getattr(self.listener, field)
+                theirs = getattr(other, field)
+                self.assertNotEqual(mine, theirs,
+                                    "%s is the same for two listeners" % field)
+                for word in (b"raccoon", b"RACCOON", b"RACOON", b"pipe"):
+                    self.assertNotIn(word, mine,
+                                     "%s names the project" % field)
+
+    def test_a_listener_that_never_started_can_be_shut_down(self):
+        # `BaseServer.shutdown` waits on an event only `serve_forever`
+        # sets, so this used to block for ever. Supervision has to tear
+        # down a listener whose start failed, and the test above built one
+        # without starting it and hung the suite for four hundred seconds.
+        built = SmbListener("127.0.0.1", 0, relay_url=self.listener.relay_url)
+        done = threading.Event()
+
+        def close():
+            built.shutdown()
+            done.set()
+
+        threading.Thread(target=close, daemon=True).start()
+        self.assertTrue(done.wait(timeout=5),
+                        "shutdown blocked on a listener that never served")
+
+    def test_connections_beyond_the_ceiling_are_refused_and_counted(self):
+        # A thread per connection with no ceiling is a way to be talked out
+        # of memory by anyone who can reach the port. The refusal is
+        # counted so a panel can show it rather than leaving an operator
+        # wondering why check-ins thinned out.
+        held = []
+        self.addCleanup(lambda: [s.close() for s in held])
+        for _ in range(self.listener.max_connections):
+            sock = socket.socket()
+            sock.settimeout(5)
+            sock.connect(self.listener.address)
+            held.append(sock)
+        _wait_until(
+            lambda: self.listener.connections_seen()
+            >= self.listener.max_connections,
+            "the listener to take up its ceiling of connections")
+
+        extra = socket.socket()
+        extra.settimeout(5)
+        held.append(extra)
+        extra.connect(self.listener.address)
+        self.assertEqual(extra.recv(16), b"",
+                         "a connection past the ceiling was served")
+        _wait_until(lambda: self.listener.connections_refused() >= 1,
+                    "the refusal to be counted")
+
+    # ── the property the package rests on ──
+
+    def test_the_listener_holds_no_key(self):
+        imported, used = _imports_and_names("software", "c2", "listeners",
+                                            "smb.py")
         self.assertNotIn("cryptography", imported)
         for banned in ("ServerCrypto", "AESGCM", "decode_key"):
             self.assertNotIn(banned, used)

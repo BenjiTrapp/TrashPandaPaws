@@ -2551,5 +2551,73 @@ class TestSecretsStayOffTheCommandLine(unittest.TestCase):
 
 
 # New test classes belong above this guard; never append below it.
+class TestNoMethodIsDefinedTwice(unittest.TestCase):
+    """A name bound twice in one scope silently loses the first binding.
+
+    Python does not warn. The later `def` wins, every caller of the earlier
+    one gets the wrong signature, and if those callers sit inside a broad
+    `except Exception` the failure is a debug log and nothing else.
+
+    That is not hypothetical here. `Beacon._smb2_negotiate` and
+    `Beacon._smb2_tree_connect` were each defined twice -- once as the C2
+    transport's message builders, once as the `smbloot` file-browsing
+    helpers, which take a socket. The `smbloot` versions came later and
+    won, so `_smb_connect` called them with the wrong arguments, raised
+    `TypeError` on its first line of real work, caught it, logged at debug
+    and returned None. **The SMB C2 transport could never connect**, and a
+    beacon configured with SMB as its only channel was simply invisible.
+
+    One AST walk over the project is enough to make that class of defect
+    impossible to reintroduce, and it found exactly these two.
+    """
+
+    def _duplicates(self):
+        found = []
+        for path in sorted(Path("software").rglob("*.py")):
+            if {".venv", "site-packages"} & set(path.parts):
+                continue
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError:
+                continue
+            scopes = [("module", tree.body)]
+            scopes.extend((node.name, node.body) for node in ast.walk(tree)
+                          if isinstance(node, ast.ClassDef))
+            for scope, body in scopes:
+                defs = [node for node in body
+                        if isinstance(node, (ast.FunctionDef,
+                                             ast.AsyncFunctionDef))]
+                seen = {}
+                for node in defs:
+                    if node.name in seen:
+                        found.append("%s:%d %s.%s first defined at line %d"
+                                     % (path, node.lineno, scope, node.name,
+                                        seen[node.name]))
+                    else:
+                        seen[node.name] = node.lineno
+        return found
+
+    def test_nothing_in_the_project_shadows_an_earlier_definition(self):
+        self.assertEqual(self._duplicates(), [])
+
+    def test_the_check_finds_a_shadowed_method_when_there_is_one(self):
+        # A guard that cannot fail is not a guard. Give it a file with the
+        # defect and watch it report it.
+        with tempfile.TemporaryDirectory() as tmp:
+            shadowed = Path(tmp) / "software" / "shadowed.py"
+            shadowed.parent.mkdir(parents=True)
+            shadowed.write_text("class A:\n"
+                                "    def f(self):\n        pass\n"
+                                "    def f(self, sock):\n        pass\n")
+            previous = os.getcwd()
+            os.chdir(tmp)
+            try:
+                found = self._duplicates()
+            finally:
+                os.chdir(previous)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("A.f", found[0])
+
+
 if __name__ == "__main__":
     unittest.main()

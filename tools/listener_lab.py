@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from software.c2 import beacon as beacon_mod
 from software.c2.listeners.dns import DnsListener
 from software.c2.listeners.quic import QuicListener
+from software.c2.listeners.smb import SmbListener
 
 # Defaults, overridable at every call site. A listener token is a shared
 # secret between the team server and a listener, so in a real deployment
@@ -69,10 +70,33 @@ def _dns_beacon_config(key, address, interval, zone):
     }
 
 
+def _smb_listener(bind_port, relay_url, token, zone):
+    return SmbListener("127.0.0.1", bind_port, relay_url=relay_url)
+
+
+def _smb_beacon_config(key, address, interval, zone):
+    host, port = address
+    return {
+        "beacon_interval_seconds": interval,
+        "jitter_percent": 0,
+        "encryption_key": _key_b64(key),
+        "proxy": {"mode": "none"},
+        "https": {"enabled": False},
+        "dns": {"enabled": False, "domain": "", "resolver": "127.0.0.1"},
+        "quic": {"enabled": False},
+        # Port 445 is where a real deployment puts this, and binding it
+        # needs root. The client takes "host:port", so nothing local has to
+        # -- in production dockerd maps it.
+        "smb": {"enabled": True, "server": "%s:%d" % (host, port),
+                "pipe_name": "msrpc_6e2f"},
+    }
+
+
 # transport -> (listener factory, beacon-config builder)
 _TRANSPORTS = {
     "quic": (_quic_listener, _quic_beacon_config),
     "dns": (_dns_listener, _dns_beacon_config),
+    "smb": (_smb_listener, _smb_beacon_config),
 }
 
 # Transports with no upstream path. A beacon reached over one of these can
@@ -85,6 +109,7 @@ TASKING_ONLY = frozenset({"dns"})
 _RELAY_SHAPE = {
     "dns": "http://127.0.0.1:%d",
     "quic": "http://127.0.0.1:%d/api/v1/beacon",
+    "smb": "http://127.0.0.1:%d/api/v1/beacon",
 }
 
 
