@@ -23,7 +23,11 @@
   `python3 -m unittest discover -s software/tests -t . -p "test_*.py"` (~230 s). `Port NNNNN is in use` appears 6 times and is pre-existing noise.
 - **Never hardcode a port in a test.** Bind `('127.0.0.1', 0)` and read it back. On this machine `tls-viewer` holds 8443 and `rdpview` holds 8099; a hardcoded port once made a measurement return the opposite of the truth.
 - Commit style `feat(scope): subject` for new capability, `fix(scope):` for a correction, blank line, prose explaining why.
-- No `@deutschebahn.com` anywhere, including commit metadata.
+- No employer email domain anywhere, including commit metadata. The
+  domain is deliberately not written out here: this sentence used to
+  name it, which put it in the repository it was meant to keep it out
+  of -- and `origin/main` still carries that wording in
+  `a4ea094`, where only GitHub Support can remove it.
 - `software/tests/test_docs.py` holds `docs/AGENT.md`'s *Known limits* with one probe per finding. **Fixing a recorded finding fails that test until its entry is deleted** — that is deliberate, and Tasks 1 and 11 must handle it rather than work around it.
 
 ## Review Focus

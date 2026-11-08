@@ -18,7 +18,13 @@
 - Python **3.9** compatible — `software/.venv` is 3.9. No `match`, no `X | Y` type unions, no `str.removeprefix`.
 - Baseline before the first commit: **2094 tests green**, whole-suite command
   `python3 -m unittest discover -s software/tests -t . -p "test_*.py"` (~222 s). Per-module runs hide cross-suite interference; the whole suite is the gate.
-- No `@deutschebahn.com` in any file, commit message, or author field.
+- No employer email domain in any file, commit message, or author
+  field. The domain is deliberately not written out here: this
+  sentence used to name it, which put it in the repository it was
+  meant to keep it out of. `origin/main` still carries the old
+  wording in `a4ea094`, and history is not being rewritten for it --
+  the string is already public there, so a rewrite would cost nine
+  commit hashes and buy nothing.
 - `tools/storyboards/agent_run_script.json` keeps `Hackepeter-2.local` and `uid=501(derbenji)` — explicitly approved by the operator. Do not "fix" it.
 - Error messages about a key or token name the **path and the mode**, never the value or a prefix of it. `software/agent/config.py:415-451` is the house pattern; follow it.
 
