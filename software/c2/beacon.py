@@ -539,6 +539,40 @@ def _dns_query(name: str, qtype: str, server: str, timeout: float = 10) -> list:
     return results
 
 
+# The four channels a beacon can use, and the one place the config file is
+# mapped onto them. `main.py` and `beacon_standalone.py` each used to build
+# this dictionary by hand, and each listed https and dns only -- so `smb`
+# and `quic` in a config file never reached the beacon, and the only way
+# to switch either on was to construct a Beacon in Python. Two copies of
+# one mapping, both missing the same half, is how that survived.
+_FALLBACK_TRANSPORTS = ("https", "dns", "smb", "quic")
+
+
+def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True) -> dict:
+    """Build a Beacon config from a `c2` block of `configs/raccoon.yaml`.
+
+    Reads `c2.fallback.*`, which is the **beacon** side of the file: the
+    channels an implant on this host will try. `c2.listeners` is the
+    server side and is read by `listeners.registry` instead.
+
+    A transport absent from the file becomes an empty mapping, which the
+    beacon reads as disabled. That is why this cannot simply pass the
+    fallback block through: the beacon expects its transports at the top
+    of its own `c2` block, not nested under `fallback`.
+    """
+    fallback = c2_cfg.get("fallback") or {}
+    block = {
+        "beacon_interval_seconds": c2_cfg.get("beacon_interval_seconds", 300),
+        "jitter_percent": c2_cfg.get("jitter_percent", 20),
+        "encryption_key": c2_cfg.get("encryption_key", ""),
+        "proxy": c2_cfg.get("proxy", {}),
+        "dropbox": dropbox,
+    }
+    for transport in _FALLBACK_TRANSPORTS:
+        block[transport] = fallback.get(transport, {})
+    return {"c2": block}
+
+
 # ── Stdlib HTTP client ──
 
 class _HttpSession:

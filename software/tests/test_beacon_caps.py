@@ -282,12 +282,25 @@ class TestDropboxDetection(_Hermetic):
             self.assertIn("dropbox", b._detect_caps())
 
     def test_launchers_tell_the_beacon_it_runs_on_the_dropbox(self):
-        """main.py and beacon_standalone.py build the config for the beacon;
-        both must carry the hint."""
+        """Both launchers build the beacon's config; both must carry the hint.
+
+        This used to look for the literal `"dropbox": True` in each file,
+        because each file built the mapping by hand. They no longer do:
+        both lost `smb` and `quic` that way, so the mapping moved into
+        `beacon.beacon_config_from_fallback`. The hint is checked where it
+        now lives, and both launchers are checked for going through it --
+        which is the stronger claim, because a launcher that built its own
+        mapping again would fail this even if it happened to set the hint.
+        """
+        from software.c2.beacon import beacon_config_from_fallback
+
+        built = beacon_config_from_fallback({"fallback": {"enabled": True}})
+        self.assertIs(built["c2"]["dropbox"], True)
+
         root = Path(__file__).resolve().parents[1]
         for rel in ("main.py", "c2/beacon_standalone.py"):
             src = (root / rel).read_text()
-            self.assertIn('"dropbox": True', src, rel)
+            self.assertIn("beacon_config_from_fallback", src, rel)
 
 
 class TestCapsInPayload(_Hermetic):

@@ -17,9 +17,7 @@ import urllib.request
 from contextlib import contextmanager
 
 from software.c2 import beacon as beacon_mod
-from software.c2.listeners.dns import DnsListener
-from software.c2.listeners.quic import QuicListener
-from software.c2.listeners.smb import SmbListener
+from software.c2.listeners.registry import ListenerSpec, transport_names
 
 # Defaults, overridable at every call site. A listener token is a shared
 # secret between the team server and a listener, so in a real deployment
@@ -27,15 +25,6 @@ from software.c2.listeners.smb import SmbListener
 # environment needs no arguments to stand up.
 LISTENER_TOKEN = "lab-listener-token"
 DNS_ZONE = "c2.lab"
-
-
-def _quic_listener(bind_port, relay_url, token, zone):
-    return QuicListener("127.0.0.1", bind_port, relay_url=relay_url)
-
-
-def _dns_listener(bind_port, relay_url, token, zone):
-    return DnsListener("127.0.0.1", bind_port, relay_url=relay_url,
-                       zone=zone, listener_token=token)
 
 
 def _quic_beacon_config(key, address, interval, zone):
@@ -70,10 +59,6 @@ def _dns_beacon_config(key, address, interval, zone):
     }
 
 
-def _smb_listener(bind_port, relay_url, token, zone):
-    return SmbListener("127.0.0.1", bind_port, relay_url=relay_url)
-
-
 def _smb_beacon_config(key, address, interval, zone):
     host, port = address
     return {
@@ -92,11 +77,17 @@ def _smb_beacon_config(key, address, interval, zone):
     }
 
 
-# transport -> (listener factory, beacon-config builder)
-_TRANSPORTS = {
-    "quic": (_quic_listener, _quic_beacon_config),
-    "dns": (_dns_listener, _dns_beacon_config),
-    "smb": (_smb_listener, _smb_beacon_config),
+# transport -> the beacon configuration that reaches a listener of it.
+#
+# Only this half lives here. Which transports exist, and how to construct
+# a listener for one, belongs to `listeners.registry`, which the running
+# system reads. A second list of the same three things is how `smb` and
+# `quic` came to be missing from two config mappings at once, and how an
+# SMB listener could have been added without the rig ever driving it.
+_BEACON_CONFIGS = {
+    "quic": _quic_beacon_config,
+    "dns": _dns_beacon_config,
+    "smb": _smb_beacon_config,
 }
 
 # Transports with no upstream path. A beacon reached over one of these can
@@ -114,7 +105,8 @@ _RELAY_SHAPE = {
 
 
 def available_transports():
-    return sorted(_TRANSPORTS)
+    """The transports the running system has that we can also drive."""
+    return sorted(set(transport_names()) & set(_BEACON_CONFIGS))
 
 
 def is_tasking_only(transport):
@@ -128,10 +120,19 @@ def relay_url_for(transport, beacon_port):
 
 def make_listener(transport, bind_port, relay_url, *,
                   token=LISTENER_TOKEN, zone=DNS_ZONE):
-    if transport not in _TRANSPORTS:
+    if transport not in _BEACON_CONFIGS:
         raise ValueError("no listener for %r; have %s"
                          % (transport, ", ".join(available_transports())))
-    return _TRANSPORTS[transport][0](bind_port, relay_url, token, zone)
+    # Built through the same path a deployment uses. `bind_port=0` is
+    # deliberate here and refused in a configuration file: an operator
+    # needs a fixed port because the beacon is configured with one, while
+    # a rig only needs a port nothing else holds right now.
+    settings = {"zone": zone} if transport == "dns" else {}
+    spec = ListenerSpec(name="lab-%s" % transport, transport=transport,
+                        enabled=True, bind_host="127.0.0.1",
+                        bind_port=bind_port, relay_url=relay_url,
+                        settings=settings)
+    return spec.build(listener_token=token)
 
 
 def beacon_config_for(transport, key, listener_address, *, interval=2,
@@ -142,10 +143,10 @@ def beacon_config_for(transport, key, listener_address, *, interval=2,
     still enabled would fall back to it and a cycle would prove nothing
     about the listener.
     """
-    if transport not in _TRANSPORTS:
+    if transport not in _BEACON_CONFIGS:
         raise ValueError("no beacon config for %r; have %s"
                          % (transport, ", ".join(available_transports())))
-    block = _TRANSPORTS[transport][1](key, listener_address, interval, zone)
+    block = _BEACON_CONFIGS[transport](key, listener_address, interval, zone)
     return {"c2": block}
 
 

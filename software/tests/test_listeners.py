@@ -29,9 +29,10 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from software.c2 import beacon as beacon_mod
-from software.c2.beacon import Beacon
+from software.c2.beacon import Beacon, beacon_config_from_fallback
 from software.c2.listeners.dns import DnsListener
 from software.c2.listeners.quic import QuicListener
+from software.c2.listeners.registry import load_listeners
 from software.c2.listeners.smb import SmbListener
 from software.c2.listeners.relay import relay
 from software.c2.server import ServerCrypto
@@ -162,6 +163,22 @@ class _TaskingServer:
                      "Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=5) as response:
             return json.loads(response.read())["id"]
+
+
+def _free_port() -> int:
+    """A port that was free a moment ago.
+
+    Inherently racy, and that is why `bind_port: 0` is refused in a
+    configuration file but used freely in tests: an operator needs a fixed
+    port because the beacon is configured with one, while a test only
+    needs a port no other test is using right now.
+    """
+    probe = socket.socket()
+    try:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+    finally:
+        probe.close()
 
 
 def _dns_question(name, qtype=16):
@@ -1716,6 +1733,266 @@ class TestTheSmbListener(unittest.TestCase):
         self.assertNotIn("cryptography", imported)
         for banned in ("ServerCrypto", "AESGCM", "decode_key"):
             self.assertNotIn(banned, used)
+
+
+class TestTheListenerRegistry(unittest.TestCase):
+    """Turning a config file into listeners, and refusing the ones that lie.
+
+    Two blocks in `configs/raccoon.yaml` look alike and mean opposite
+    things. `c2.listeners` is the **server** side: sockets this deployment
+    opens for beacons to reach. `c2.fallback.*` is the **beacon** side:
+    channels an implant on this host will try. Confusing them would have
+    an operator open a listening socket on a drop-box, or configure a
+    beacon and wonder why nothing listens.
+    """
+
+    def _config(self, **overrides):
+        base = {
+            "name": "smb-main", "transport": "smb", "enabled": True,
+            "bind_host": "0.0.0.0", "bind_port": 445,
+            "relay_url": "http://127.0.0.1:8443/api/v1/beacon",
+        }
+        base.update(overrides)
+        return {"c2": {"listeners": [base]}}
+
+    # ── what the shipped file says ──
+
+    def test_the_shipped_config_defines_all_three_disabled(self):
+        import yaml
+
+        with open(Path("configs") / "raccoon.yaml") as handle:
+            shipped = yaml.safe_load(handle)
+        specs = load_listeners(shipped)
+
+        self.assertEqual({spec.transport for spec in specs},
+                         {"smb", "quic", "dns"})
+        for spec in specs:
+            with self.subTest(name=spec.name):
+                self.assertFalse(spec.enabled,
+                                 "%s ships enabled; a fresh checkout would "
+                                 "open a socket nobody asked for" % spec.name)
+
+    def test_the_shipped_fallback_block_documents_smb_and_quic(self):
+        # The beacon has read `smb` and `quic` out of its config block
+        # since those transports were written, and the shipped file never
+        # mentioned either. So the only way to switch them on was to know
+        # they existed from the source.
+        import yaml
+
+        with open(Path("configs") / "raccoon.yaml") as handle:
+            shipped = yaml.safe_load(handle)
+        fallback = shipped["c2"]["fallback"]
+        for transport in ("https", "dns", "smb", "quic"):
+            self.assertIn(transport, fallback,
+                          "the fallback block does not mention %s"
+                          % transport)
+
+    def test_the_server_side_and_beacon_side_blocks_are_not_confusable(self):
+        # The two blocks look alike and mean opposite things, and the key
+        # names do not say which is which. So each one states its side in
+        # words, once, above itself.
+        #
+        # My first version of this test searched a 600-character window
+        # before `listeners:` for the string "fallback", which passed or
+        # failed on how long the surrounding comment happened to be. A
+        # marker that is put there to be found is the honest way to check
+        # that it is there.
+        text = (Path("configs") / "raccoon.yaml").read_text()
+        client = "THIS HOST AS A CLIENT"
+        server = "THIS HOST AS A SERVER"
+
+        self.assertEqual(text.count(client), 1,
+                         "the beacon-side marker is not there exactly once")
+        self.assertEqual(text.count(server), 1,
+                         "the server-side marker is not there exactly once")
+        self.assertLess(text.index(client), text.index("  fallback:"),
+                        "the client marker does not precede the fallback "
+                        "block it describes")
+        self.assertLess(text.index(server), text.index("  listeners:"),
+                        "the server marker does not precede the listeners "
+                        "block it describes")
+        self.assertLess(text.index("  fallback:"), text.index(server),
+                        "the two markers do not bracket their own blocks")
+
+    # ── what the registry refuses ──
+
+    def test_an_unknown_transport_is_refused_by_name(self):
+        with self.assertRaises(ValueError) as caught:
+            load_listeners(self._config(transport="telepathy"))
+        self.assertIn("telepathy", str(caught.exception),
+                      "the message does not say what was wrong")
+
+    def test_a_missing_relay_url_is_refused(self):
+        for value in (None, "", "   "):
+            with self.subTest(relay_url=value):
+                with self.assertRaises(ValueError) as caught:
+                    load_listeners(self._config(relay_url=value))
+                self.assertIn("relay_url", str(caught.exception))
+
+    def test_a_listener_with_no_name_is_refused(self):
+        # Task 8 starts and stops by name and task 9 shows it. An unnamed
+        # listener could be neither controlled nor reported.
+        with self.assertRaises(ValueError):
+            load_listeners(self._config(name=""))
+
+    def test_two_listeners_with_one_name_are_refused(self):
+        config = self._config()
+        config["c2"]["listeners"].append(dict(config["c2"]["listeners"][0],
+                                              bind_port=446))
+        with self.assertRaises(ValueError) as caught:
+            load_listeners(config)
+        self.assertIn("smb-main", str(caught.exception))
+
+    def test_two_listeners_on_one_port_are_refused(self):
+        config = self._config(bind_host="127.0.0.1")
+        config["c2"]["listeners"].append(
+            dict(config["c2"]["listeners"][0], name="smb-other"))
+        with self.assertRaises(ValueError) as caught:
+            load_listeners(config)
+        self.assertIn("445", str(caught.exception))
+
+    def test_a_wildcard_bind_collides_with_a_specific_one(self):
+        # 0.0.0.0:445 and 127.0.0.1:445 are not two free sockets, and the
+        # second one to start would fail at bind time with an error an
+        # operator would have to go looking for.
+        config = self._config(bind_host="0.0.0.0")
+        config["c2"]["listeners"].append(
+            dict(config["c2"]["listeners"][0], name="smb-local",
+                 bind_host="127.0.0.1"))
+        with self.assertRaises(ValueError) as caught:
+            load_listeners(config)
+        self.assertIn("445", str(caught.exception))
+
+    def test_a_disabled_listener_is_still_validated(self):
+        # Otherwise a typo sits in the file until the day someone enables
+        # it, which is the worst moment to find out.
+        with self.assertRaises(ValueError):
+            load_listeners(self._config(enabled=False, transport="nonsense"))
+
+    def test_a_port_outside_the_range_is_refused(self):
+        for port in (0, -1, 65536, "445", None):
+            with self.subTest(port=port):
+                with self.assertRaises(ValueError):
+                    load_listeners(self._config(bind_port=port))
+
+    def test_a_yaml_boolean_port_is_refused(self):
+        # `bind_port: yes` is a plausible thing to type into a YAML file
+        # and parses as True, which is 1 in Python -- so without this the
+        # listener would bind port 1 and the operator would be looking for
+        # a typo in the wrong place. A mutation check found this missing.
+        for port in (True, False):
+            with self.subTest(port=port):
+                with self.assertRaises(ValueError) as caught:
+                    load_listeners(self._config(bind_port=port))
+                self.assertIn("bind_port", str(caught.exception))
+
+    def test_a_setting_the_transport_does_not_take_is_refused(self):
+        # Ignored would be worse: a dropped setting and an applied one look
+        # exactly alike from the outside, and `pipe_name` on a QUIC
+        # listener means somebody has the wrong model of what they built.
+        with self.assertRaises(ValueError) as caught:
+            load_listeners(self._config(transport="quic",
+                                        settings={"pipe_name": "x"}))
+        self.assertIn("pipe_name", str(caught.exception))
+
+    def test_a_dns_listener_without_a_zone_is_refused(self):
+        # A DNS listener with no zone answers nothing: every query falls
+        # outside the zone it does not have.
+        with self.assertRaises(ValueError) as caught:
+            load_listeners(self._config(transport="dns", settings={}))
+        self.assertIn("zone", str(caught.exception))
+
+    def test_a_listeners_block_that_is_not_a_list_is_refused(self):
+        # A mapping would be iterated over its keys, and each key is a
+        # string, so the error would arrive as "str is not a mapping" with
+        # no hint about the real mistake.
+        for block in ({"smb": {}}, "smb", 7):
+            with self.subTest(block=block):
+                with self.assertRaises(ValueError) as caught:
+                    load_listeners({"c2": {"listeners": block}})
+                self.assertIn("list", str(caught.exception))
+
+    def test_the_rig_can_drive_every_transport_the_registry_has(self):
+        # A transport the registry grows and the lab does not would be
+        # invisible to the rig, which is the only place a listener is
+        # proven against a real beacon. One list, asserted against the
+        # other.
+        from software.c2.listeners.registry import transport_names
+        from tools import listener_lab as lab
+
+        self.assertEqual(sorted(lab.available_transports()),
+                         sorted(transport_names()),
+                         "the rig and the registry disagree about which "
+                         "transports exist")
+
+    # ── what task 8 will call ──
+
+    def test_a_spec_builds_the_listener_it_describes(self):
+        spec = load_listeners(self._config(
+            transport="quic", bind_port=_free_port(),
+            bind_host="127.0.0.1"))[0]
+        listener = spec.build()
+        self.addCleanup(listener.shutdown)
+        self.assertEqual(listener.address[0], "127.0.0.1")
+        self.assertEqual(listener.address[1], spec.bind_port)
+        self.assertEqual(listener.relay_url, spec.relay_url)
+
+    def test_a_dns_spec_refuses_to_build_without_the_token(self):
+        # It would build happily and then answer every beacon an empty
+        # record, because the tasking route would refuse it -- a listener
+        # that looks healthy and delivers nothing.
+        spec = load_listeners(self._config(
+            transport="dns", bind_port=_free_port(), bind_host="127.0.0.1",
+            settings={"zone": "c2.test"}))[0]
+        with self.assertRaises(ValueError) as caught:
+            spec.build()
+        self.assertIn("token", str(caught.exception))
+
+        listener = spec.build(listener_token="a-token")
+        self.addCleanup(listener.shutdown)
+        self.assertEqual(listener.zone, "c2.test")
+
+    def test_no_listeners_block_is_not_an_error(self):
+        # Every deployment before this branch has no such block, and must
+        # keep starting.
+        self.assertEqual(load_listeners({"c2": {}}), [])
+        self.assertEqual(load_listeners({}), [])
+
+    # ── the beacon side, which was losing two transports ──
+
+    def test_the_beacon_block_carries_every_transport(self):
+        # `main.py` and `beacon_standalone.py` each built this mapping by
+        # hand and each listed https and dns only, so a deployment could
+        # not switch SMB or QUIC on at all -- the keys never reached the
+        # beacon. Two copies of one mapping, both missing the same half.
+        fallback = {
+            "enabled": True,
+            "https": {"enabled": True, "callback_url": "https://x/y"},
+            "dns": {"enabled": True, "domain": "d", "resolver": "1.1.1.1"},
+            "smb": {"enabled": True, "server": "10.0.0.1:445"},
+            "quic": {"enabled": True, "server": "10.0.0.1:8443"},
+        }
+        built = beacon_config_from_fallback(
+            {"beacon_interval_seconds": 60, "jitter_percent": 10,
+             "encryption_key": "k", "proxy": {"mode": "none"},
+             "fallback": fallback})
+
+        for transport in ("https", "dns", "smb", "quic"):
+            with self.subTest(transport=transport):
+                self.assertEqual(built["c2"][transport],
+                                 fallback[transport],
+                                 "%s did not reach the beacon" % transport)
+
+    def test_both_entry_points_use_the_shared_mapping(self):
+        # The duplication is what let the two drift in step for as long as
+        # it did. Neither file may build the block by hand again.
+        for name in ("main.py", "c2/beacon_standalone.py"):
+            with self.subTest(file=name):
+                source = (Path("software") / name).read_text()
+                self.assertIn("beacon_config_from_fallback", source,
+                              "%s does not use the shared mapping" % name)
+                self.assertNotIn('"https": fallback_cfg.get', source,
+                                 "%s still builds the block by hand" % name)
 
 
 # New test classes belong above this guard; never append below it.
