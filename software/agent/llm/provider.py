@@ -422,6 +422,9 @@ _PROVIDERS = {
     "opencode":   ("openai", None, True, True),
     "local":      ("openai", "http://127.0.0.1:11434/v1", False, False),
     "ollama":     ("openai", "http://127.0.0.1:11434/v1", False, False),
+    "gemini":     ("openai",
+                   "https://generativelanguage.googleapis.com/v1beta/openai",
+                   True, False),
 }
 
 # Providers whose endpoint is whatever the operator typed, so the model name

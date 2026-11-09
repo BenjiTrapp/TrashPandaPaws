@@ -201,7 +201,10 @@ agent:
   # readable by its owner only (chmod 600) or the agent refuses to start. The
   # C2 and agent tokens come from RACCOON_TOKEN and RACCOON_AGENT_TOKEN.
   llm:
-    # anthropic | bedrock | openrouter | opencode | local | ollama
+    # anthropic | bedrock | openrouter | opencode | local | ollama | gemini
+    #
+    # gemini takes the bare model id (gemini-3-pro) and a key; it needs no
+    # base_url. Its free tier suits the last link of a fallbacks chain.
     #
     # bedrock reads AWS_BEARER_TOKEN_BEDROCK if no key is configured, and its
     # endpoint follows AWS_REGION; the model id carries its own region prefix

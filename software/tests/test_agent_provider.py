@@ -219,6 +219,24 @@ class TestClientSelection(unittest.TestCase):
             base_url="http://127.0.0.1:11434/v1", transport=stub)
         self.assertIs(c._transport, stub)
 
+    def test_gemini_posts_to_the_openai_compatible_endpoint(self):
+        c = provider.create_client(_cfg(provider="gemini", api_key=_KEY,
+                                        model="gemini-3-pro"))
+        stub = _Stub({"choices": [{"message": {"content": "hi"}}]})
+        c._transport = stub
+        _run(c.complete("", [{"role": "user", "content": "x"}], [], 16, 0.0))
+        url, headers, _ = stub.calls[0]
+        self.assertEqual(url, "https://generativelanguage.googleapis.com"
+                              "/v1beta/openai/chat/completions")
+        self.assertEqual(headers["Authorization"], "Bearer " + _KEY)
+
+    def test_gemini_requires_a_key(self):
+        with self.assertRaises(provider.ProviderError) as cm:
+            provider.create_client(_cfg(provider="gemini", api_key=None,
+                                        model="gemini-3-pro"))
+        self.assertIn("requires an api_key", str(cm.exception))
+        self.assertNotIn(_KEY, str(cm.exception))
+
 
 # ── Capability tiers ──
 
@@ -319,6 +337,17 @@ class TestCapabilityTiers(unittest.TestCase):
         self.assertEqual(
             provider.capability_tier("claude-sonnet-20240229", "anthropic"),
             "reduced")
+
+    def test_gemini_pro_is_full_and_the_small_variants_are_not(self):
+        # Pinned, not earned: flash and lite fall out through _SMALL_VARIANT.
+        # A free flash model must never reach "full", which permits phase 5.
+        self.assertEqual(provider.capability_tier("gemini-3-pro", "gemini"),
+                         "full")
+        self.assertEqual(provider.capability_tier("gemini-3-pro-preview",
+                                                  "gemini"), "full")
+        for small in ("gemini-3-flash", "gemini-2.5-flash-lite"):
+            self.assertEqual(provider.capability_tier(small, "gemini"),
+                             "reduced")
 
     def test_local_models_are_not_full(self):
         self.assertIn(provider.capability_tier("qwen2.5:14b", "local"),

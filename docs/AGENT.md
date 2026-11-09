@@ -121,6 +121,7 @@ comes with a `reason`.
 | `opencode` | `AGENT_API_KEY` **and** `AGENT_BASE_URL` — there is no built-in endpoint |
 | `local` | a `AGENT_BASE_URL` (LM Studio, llama.cpp); no key |
 | `ollama` | a model that is pulled (`ollama pull`); no key; endpoint defaults to `http://127.0.0.1:11434/v1` |
+| `gemini` | `AGENT_API_KEY`, a bare model id (`gemini-3-pro`); no endpoint to set |
 
 A Bedrock model id carries its own region prefix (`eu.`, `us.`). An EU id
 against a US endpoint fails at the first call rather than at configuration,
@@ -173,13 +174,18 @@ agent:
       - provider: local
         model: qwen2.5-coder
         base_url: http://127.0.0.1:11434/v1
+      - provider: gemini
+        model: gemini-3-flash
+        api_key_env: GEMINI_API_KEY
 ```
 
 An entry takes `provider`, `model`, and optionally `base_url` and
 `api_key_env`. A literal `api_key` is refused — by name, without the value
 being echoed into the error. A `local` link needs no key at all, which
-makes a model on the box itself the sensible last resort: it cannot be
-rate-limited and it cannot have its key revoked.
+makes a model on the box itself a sensible late link: it cannot be
+rate-limited and it cannot have its key revoked. `gemini` goes last because
+its free tier cannot be relied on for a whole campaign, but it cannot run
+out of credit either.
 
 **How it behaves.** Any failure moves to the next link. The HTTP status is
 not consulted, because a 401 is a revoked key *or* a header this code got
