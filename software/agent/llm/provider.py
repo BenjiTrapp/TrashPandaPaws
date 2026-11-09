@@ -600,6 +600,32 @@ def vertex_base_url(project: Any, location: Any) -> str:
 # the first call, which on an unattended run nobody is there to see.
 _VERTEX_MODEL = re.compile(r"\A[a-z0-9][a-z0-9-]*/[^/\s][^\s]*\Z")
 
+_VERTEX_GLOBAL_HOST = "aiplatform.googleapis.com"
+_VERTEX_REGIONAL_SUFFIX = "-aiplatform.googleapis.com"
+
+
+def _check_vertex_host(name: str, base_url: str) -> None:
+    """Refuse a base_url whose host is not Vertex, when a token source feeds it.
+
+    The computed URL is validated because the bearer goes wherever the URL
+    points; one typed by hand needs the same, and a fallback link must type
+    it. A token from the operator's own gcloud login carries their account's
+    cloud-platform scope for an hour, so a typo such as
+    `aiplatform.googleapis.co` would hand that to whoever holds the name.
+    There is deliberately no way to turn this off: a Vertex token goes to
+    Vertex, and a gateway in front of it is what `opencode` with the
+    gateway's own key is for.
+    """
+    host = (urlparse(base_url).hostname or "").lower()
+    if host == _VERTEX_GLOBAL_HOST or host.endswith(_VERTEX_REGIONAL_SUFFIX):
+        return
+    raise ProviderError(
+        "provider %r: base_url host %.80r is not Vertex AI; a token from the "
+        "Google token source is sent only to %s or LOCATION%s. To reach a "
+        "gateway or proxy, use provider 'opencode' with that gateway's own "
+        "key instead" % (name, host, _VERTEX_GLOBAL_HOST,
+                         _VERTEX_REGIONAL_SUFFIX))
+
 
 def _vertex_token_source(kind: str, key_file: Optional[str]):
     # The failure is captured and raised once the except has exited, as in
@@ -674,6 +700,7 @@ def create_client(cfg) -> LlmClient:
     base_url = _checked_base_url(
         name, base_url, bool(api_key) or token_source is not None)
     if token_source is not None:
+        _check_vertex_host(name, base_url)
         # The source's token replaces the key before every turn; keeping both
         # would leave a credential the operator has superseded in memory.
         api_key = None

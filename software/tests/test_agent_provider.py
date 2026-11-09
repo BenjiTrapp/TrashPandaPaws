@@ -25,8 +25,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from software.agent.llm import (bedrock_client, anthropic_client, gcp_token,
-                                openai_client, provider)
+from software.agent.llm import (bedrock_client, anthropic_client, failover,
+                                gcp_token, openai_client, provider)
 
 _KEY = "sk-live-SECRET-0123456789abcdef"
 
@@ -1389,7 +1389,62 @@ class TestCreateClientBuildsVertex(unittest.TestCase):
             c._base_url, provider.vertex_base_url("proj", "europe-west4"))
 
     def test_an_explicit_base_url_is_used_instead_of_the_computed_one(self):
-        c = self._vertex(vertex_project=None,
+        url = ("https://us-central1-aiplatform.googleapis.com/v1/projects/"
+               "other/locations/us-central1/endpoints/openapi")
+        c = self._vertex(vertex_project=None, base_url=url)
+        self.assertEqual(c._base_url, url)
+
+    def test_a_hand_typed_vertex_host_is_accepted(self):
+        for host in ("aiplatform.googleapis.com",
+                     "europe-west4-aiplatform.googleapis.com",
+                     "US-CENTRAL1-AIPLATFORM.GOOGLEAPIS.COM"):
+            with self.subTest(host=host):
+                self._vertex(base_url="https://%s/v1/projects/p/locations/"
+                                      "l/endpoints/openapi" % host)
+
+    def test_a_base_url_that_is_not_vertex_gets_no_token(self):
+        # The bearer goes wherever the URL points, and from a token source
+        # it is the operator's own Google login for an hour. A typo'd or
+        # look-alike host would receive it.
+        for url in ("https://europe-west4-aiplatform.googleapis.co/v1",
+                    "https://aiplatform.googleapis.com.evil.example/v1",
+                    "https://evil-aiplatform.googleapis.com.example/v1",
+                    "https://xaiplatform.googleapis.com/v1",
+                    "https://aiplatform-googleapis.com/v1",
+                    "https://gateway.example/v1",
+                    "https://aiplatform.googleapis.com@evil.example/v1",
+                    "http://127.0.0.1:9000/v1"):
+            for source in ("auto", "gcloud"):
+                with self.subTest(url=url, token_source=source):
+                    with self.assertRaises(provider.ProviderError) as cm:
+                        self._vertex(token_source=source, base_url=url)
+                    message = str(cm.exception)
+                    self.assertIn("not Vertex AI", message)
+                    # The refusal leads somewhere: no opt-out, a provider.
+                    self.assertIn("opencode", message)
+
+    def test_a_vertex_fallback_link_is_held_to_the_same_host(self):
+        # A fallback must type its base_url out, so this is where a typo is
+        # likeliest.
+        def link(host):
+            return types.SimpleNamespace(
+                provider="vertex", model="google/gemini-3-pro", api_key=None,
+                base_url="https://%s/v1/projects/p/locations/europe-west4/"
+                         "endpoints/openapi" % host)
+
+        with self.assertRaises(provider.ProviderError) as cm:
+            failover.link_client(link("europe-west4-aiplatform.googleapis.co"),
+                                 1)
+        self.assertIn("fallback 1", str(cm.exception))
+        self.assertIn("not Vertex AI", str(cm.exception))
+        built = failover.link_client(
+            link("europe-west4-aiplatform.googleapis.com"), 1)
+        self.assertIsNotNone(built._token_source)
+
+    def test_a_static_bearer_is_not_held_to_the_vertex_host(self):
+        # Scoped to a token the agent fetches from the operator's login; a
+        # static key is labelled by available() and pointed by the operator.
+        c = self._vertex(api_key=_KEY, token_source="auto", static_bearer=True,
                          base_url="https://gateway.example/v1")
         self.assertEqual(c._base_url, "https://gateway.example/v1")
 
@@ -1426,9 +1481,14 @@ class TestCreateClientBuildsVertex(unittest.TestCase):
                                  base_url="http://proxy.example/v1")
                 self.assertIn("https", str(cm.exception))
 
-    def test_a_vertex_client_may_use_loopback_http(self):
-        c = self._vertex(base_url="http://127.0.0.1:9000/v1")
-        self.assertEqual(c._base_url, "http://127.0.0.1:9000/v1")
+    def test_a_vertex_client_with_a_token_source_may_not_use_loopback_http(
+            self):
+        # The cleartext guard allows loopback; the host check does not, since
+        # no Vertex endpoint lives there. A local proxy in front of Vertex is
+        # the opt-out that was refused.
+        with self.assertRaises(provider.ProviderError) as cm:
+            self._vertex(base_url="http://127.0.0.1:9000/v1")
+        self.assertIn("not Vertex AI", str(cm.exception))
 
 
 class TestCreateClientChecksTheTokenSourceAtStartup(unittest.TestCase):

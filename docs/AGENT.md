@@ -350,6 +350,12 @@ things follow, both by design and neither visible until it bites:
 - It needs an explicit `base_url`, the whole endpoint, since there is
   nothing to compute it from. Leave it out and startup says so; it does not
   say "set `AGENT_VERTEX_PROJECT`", which is probably already set.
+- Its host must be `aiplatform.googleapis.com` or end in
+  `-aiplatform.googleapis.com`, and so must any `base_url` a `vertex` primary
+  is given while its token comes from a token source. The token is your own
+  Google login for an hour, and a typo in the host would hand it to whoever
+  owns the name. There is no switch to turn this off: to go through a gateway
+  or proxy, use `opencode` with that gateway's own key.
 
 ```yaml
       - provider: vertex
