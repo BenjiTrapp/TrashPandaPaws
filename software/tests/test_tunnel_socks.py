@@ -79,6 +79,7 @@ from software.c2.tunnel.protocol import (
     write_frame,
 )
 from software.c2.tunnel.server import TunnelServer
+from software.c2.tunnel import socks as socks_mod
 from software.c2.tunnel.socks import SocksFront
 
 _LOOPBACK = "127.0.0.1"
@@ -333,6 +334,19 @@ class _StubEndpoint(object):
         self._pump.join(timeout=5.0)
         for thread in threads:
             thread.join(timeout=5.0)
+
+
+class _NoThreads(SocksFront):
+    """A front whose per-connection threads cannot be started.
+
+    `_start` is the seam the module keeps for exactly this. The branch
+    under test is a process with no threads left, and exhausting this
+    machine's thread table to reach it would be neither quick nor kind to
+    the rest of the suite.
+    """
+
+    def _start(self, thread):
+        raise RuntimeError("can't start new thread")
 
 
 class SocksFrontTestCase(unittest.TestCase):
@@ -853,6 +867,173 @@ class TestHundredsOfParallelSessions(SocksFrontTestCase):
         self.assertEqual(stats["carried"], 0)
 
 
+class TestWhatAnUnauthenticatedPeerCanHold(SocksFrontTestCase):
+    """Review focus: this port's threat model is the other local users.
+
+    Loopback keeps other hosts out, so what is left is whoever has a shell
+    here -- and this process hosts the rest of the C2's listeners, so a
+    peer that can hold threads and descriptors can take those down with
+    it. Each test here is a peer that is never refused by any check that
+    only looks at bytes, because it sends them correctly and slowly.
+    """
+
+    def test_a_drip_fed_handshake_is_cut_off_at_its_deadline(self):
+        _, front, _ = self.rig(with_endpoint=False, handshake_timeout=0.5)
+        client = self.client(front, authenticate=False)
+        user = self.username.encode("utf-8")
+        secret = self.password.encode("utf-8")
+        # A correct greeting and a correct RFC 1929 exchange -- with the
+        # right credentials -- sent one byte at a time. Every single read
+        # lands far inside a per-`recv` timeout of 0.5s, so nothing but an
+        # absolute deadline can ever stop this peer: it would otherwise
+        # hold its thread and its descriptor for as long as it kept
+        # dripping, which is the whole technique.
+        payload = (b"\x05\x01\x02" + bytes([1, len(user)]) + user
+                   + bytes([len(secret)]) + secret)
+        stop = threading.Event()
+
+        def drip():
+            for index in range(len(payload)):
+                if stop.wait(0.15):
+                    return
+                try:
+                    client.sock.sendall(payload[index:index + 1])
+                except OSError:
+                    return
+
+        thread = threading.Thread(target=drip, name="drip", daemon=True)
+
+        def unwind():
+            stop.set()
+            thread.join(timeout=5.0)
+
+        self.addCleanup(unwind)
+        thread.start()
+
+        self.wait_for(lambda: front.stats()["refused_timeout"] == 1,
+                      timeout=10.0)
+        self.assertTrue(_drain(client.sock, timeout=3.0)[1],
+                        "the drip feed was left holding its thread")
+        # Cut off, not lost: a deliberate close is counted, and it is not
+        # confused with any of the three resource limits.
+        stats = front.stats()
+        self.assertEqual(stats["refused"], 1)
+        self.assertEqual(stats["refused_capacity"], 0)
+        self.assertEqual(stats["refused_pending"], 0)
+        self.assertEqual(stats["pending"], 0)
+
+    def test_too_many_handshakes_in_flight_are_closed_and_counted(self):
+        _, front, _ = self.rig(with_endpoint=False, max_pending=1,
+                               handshake_timeout=10.0)
+        # One client that connects and says nothing holds the only slot.
+        silent = self.client(front, authenticate=False)
+        self.wait_for(lambda: front.stats()["pending"] == 1)
+
+        crowded = _SocksClient(front.port, timeout=10.0)
+        self.addCleanup(crowded.close)
+        received, closed = _drain(crowded.sock, timeout=3.0)
+        # Before a greeting there is no SOCKS message to refuse it with,
+        # so this one is closed rather than answered -- and counted, so it
+        # is not a silent drop as far as the operator's row is concerned.
+        self.assertEqual(received, b"")
+        self.assertTrue(closed, "a connection past the cap was left open")
+        stats = front.stats()
+        self.assertEqual(stats["refused_pending"], 1)
+        self.assertEqual(stats["refused_capacity"], 0)
+        self.assertEqual(stats["refused_threads"], 0)
+        self.assertEqual(stats["max_pending"], 1)
+        self.assertEqual(stats["accepted"], 2)
+
+        # Authenticating releases the slot. That is the point of the cap
+        # being separate: a flood of silent peers must not be able to
+        # crowd out the operator, whose connections stop counting against
+        # it the moment they prove who they are.
+        self.assertEqual(silent.greet(), b"\x05\x02")
+        self.assertEqual(silent.authenticate(self.username, self.password),
+                         b"\x01\x00")
+        self.wait_for(lambda: front.stats()["pending"] == 0)
+        admitted = self.client(front)
+        self.assertEqual(
+            admitted.request(CMD_BIND, ATYP_IPV4, "10.0.0.1", 80)[0],
+            REPLY_COMMAND_NOT_SUPPORTED)
+        self.assertEqual(front.stats()["refused_pending"], 1)
+
+    def test_a_connection_is_closed_and_counted_when_no_thread_can_start(self):
+        server = self.start_server()
+        front = _NoThreads(server, self.identity, 0, self.username,
+                           self.password)
+        front.start()
+        self.addCleanup(front.stop)
+
+        with self.assertLogs("raccoon.tunnel.socks", level="WARNING") as caught:
+            first = _SocksClient(front.port, timeout=10.0)
+            self.addCleanup(first.close)
+            received, closed = _drain(first.sock, timeout=3.0)
+        self.assertEqual(received, b"")
+        self.assertTrue(closed)
+        self.assertTrue(any("thread" in line for line in caught.output))
+
+        stats = front.stats()
+        self.assertEqual(stats["refused_threads"], 1)
+        # Its own key: the two caps are this port's policy and this is the
+        # host having run out, which is a different thing to tune.
+        self.assertEqual(stats["refused_capacity"], 0)
+        self.assertEqual(stats["refused_pending"], 0)
+        self.assertEqual(stats["pending"], 0)
+
+        # And the accept loop survived it, rather than dying and leaving
+        # the port open but mute.
+        second = _SocksClient(front.port, timeout=10.0)
+        self.addCleanup(second.close)
+        self.assertTrue(_drain(second.sock, timeout=3.0)[1])
+        self.wait_for(lambda: front.stats()["refused_threads"] == 2)
+
+    def test_finish_stops_draining_at_its_deadline(self):
+        # `_finish` drains what a client sent and nobody wanted, so that
+        # closing cannot replace an already-written refusal with an RST.
+        # Against a client that keeps sending, a timeout per read never
+        # ends: only the deadline does. Called directly because there is
+        # no way to observe a thread pinned inside it from outside.
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        stop = threading.Event()
+
+        def blast():
+            while not stop.is_set():
+                try:
+                    left.sendall(b"x" * 4096)
+                except OSError:
+                    return
+
+        blaster = threading.Thread(target=blast, name="blast", daemon=True)
+
+        def unwind():
+            stop.set()
+            try:
+                left.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            blaster.join(timeout=5.0)
+
+        self.addCleanup(unwind)
+        blaster.start()
+
+        done = threading.Event()
+
+        def drain_it():
+            socks_mod._finish(right)
+            done.set()
+
+        runner = threading.Thread(target=drain_it, name="finish", daemon=True)
+        runner.start()
+        self.assertTrue(
+            done.wait(3.0),
+            "_finish drained past its deadline; a client that keeps sending "
+            "pins the thread that is trying to close it")
+        runner.join(timeout=5.0)
+
+
 class TestTheListener(SocksFrontTestCase):
     def test_a_bind_address_that_is_not_loopback_is_refused(self):
         server = self.start_server()
@@ -901,6 +1082,18 @@ class TestTheListener(SocksFrontTestCase):
                 SocksFront(server, self.identity, 0, self.username,
                            self.password, max_sessions=bad)
 
+    def test_max_pending_must_be_at_least_one(self):
+        server = self.start_server()
+        for bad in (0, -1):
+            with self.assertRaises(ValueError):
+                SocksFront(server, self.identity, 0, self.username,
+                           self.password, max_pending=bad)
+        # Unset, it follows the session cap: a handshake that could never
+        # become a session is one this port has no use for.
+        front = SocksFront(server, self.identity, 0, self.username,
+                           self.password, max_sessions=7)
+        self.assertEqual(front.stats()["max_pending"], 7)
+
     def test_stop_is_safe_before_start_and_twice(self):
         server = self.start_server()
         front = SocksFront(server, self.identity, 0, self.username,
@@ -928,12 +1121,17 @@ class TestTheListener(SocksFrontTestCase):
             REPLY_SUCCEEDED)
         self.assertEqual(front.stats()["sessions"], 1)
 
-        endpoint.close()
+        # `stop` while the endpoint is still connected and the relay is
+        # still live, so that what ends the session is this call and
+        # nothing else. Closing the endpoint first would let the relay
+        # hang up on its own, and this test would then pass with `stop`
+        # doing nothing at all.
         front.stop()
         self.assertEqual(front.stats()["sessions"], 0)
         self.assertFalse(front.stats()["serving"])
         self.assertTrue(_drain(client.sock)[1],
                         "a session outlived the port it arrived on")
+        self.assert_endpoint_healthy(endpoint)
 
     def test_starting_twice_is_an_error(self):
         _, front, _ = self.rig(with_endpoint=False)

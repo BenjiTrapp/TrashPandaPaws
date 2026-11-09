@@ -63,17 +63,22 @@ nothing: the only message this layer can send is itself a SOCKS5 message.
 Two sharp edges in the layers below, handled here:
 
 * **`RelayStream`'s exception contract is coarser than it looks.** On the
-  stream, `recv` returning `b""` is an orderly end -- that class does one
-  `MSG_PEEK` before each frame, so the FIN-with-nothing-behind-it case is
-  already told apart from a truncated frame for us -- while a `ValueError`
-  means a frame did not authenticate and the stream has closed itself,
-  which is Noise §5.1. `socket.timeout` is an `OSError` and is reachable
-  only while a timeout is set, which here is exactly the request/reply
-  exchange: a bounded wait on the endpoint's answer, where a stall means
-  a dead endpoint and the client is told `0x01` rather than left hanging.
-  The pump itself runs with no timeout, because an idle SOCKS session is
-  a normal thing -- a target that speaks first and a client that waits --
-  and `stop` unparks both directions by shutting their descriptors down.
+  stream, `recv` returning `b""` means the far end is finished and says
+  nothing about why: `RelayStream.recv_message` turns an orderly FIN, a
+  truncated frame and a dead socket into the same empty answer, and its
+  `MSG_PEEK` separates them only for its own logging, not for a caller.
+  They are indistinguishable here and they do not need to be told apart,
+  because the one action available is the same for all three: end the
+  session. A `ValueError` is the exception -- a frame that did not
+  authenticate, over which the stream has already closed itself, which is
+  Noise §5.1 -- and it is logged as the hostile thing it may be.
+  `socket.timeout` is an `OSError` and is reachable only while a timeout
+  is set, which here is exactly the request/reply exchange: a bounded wait
+  on the endpoint's answer, where a stall means a dead endpoint and the
+  client is told `0x01` rather than left hanging. The pump itself runs
+  with no timeout, because an idle SOCKS session is a normal thing -- a
+  target that speaks first and a client that waits -- and `stop` unparks
+  both directions by shutting their descriptors down.
 
 * **A single `sendall` does not make concurrent writes safe**; it loops
   over partial sends and releases the GIL. The relay stream has a write
@@ -85,6 +90,30 @@ Two sharp edges in the layers below, handled here:
   the endpoint-to-client pump is the only writer from then on, and it is
   joined before anything else touches that socket. No SOCKS reply is ever
   sent after pumping starts, which is what makes that hold.
+
+**Nothing an unauthenticated peer does is open-ended.** The threat model
+for this port is the other local users of this host, and this process
+hosts the rest of the C2's listeners, so a peer that can hold threads and
+descriptors here can take those down with it. Two bounds, because a
+socket timeout alone is not one:
+
+* **An absolute deadline on the handshake**, not a timeout per `recv`.
+  `handshake_timeout` is measured from the accept with `time.monotonic`
+  and every read of the greeting, the sub-negotiation and the request is
+  given what is left of it. A per-`recv` timeout bounds nothing: a peer
+  that sends one byte just inside it, over and over, resets it every time
+  and holds its thread for as long as it likes. The same deadline shape
+  is in `_finish`, whose drain would otherwise never end against a client
+  that keeps sending.
+
+* **A cap on handshakes in flight**, separate from `max_sessions` and
+  released the moment a connection authenticates. It defaults to
+  `max_sessions`, because a handshake that could never become a session
+  is one this port has no use for, and it can be set far lower. Past it a
+  connection is closed without a byte -- there is no SOCKS message to
+  refuse with before a greeting -- and counted under its own key. Its
+  point is that a flood of silent peers cannot crowd out the operator's
+  authenticated sessions, which `max_sessions` alone would let it do.
 
 Stdlib only, and nothing from `software.c2.server`. There is no import of
 this package's own `server` module either: a duck-typed
@@ -98,6 +127,7 @@ import ipaddress
 import logging
 import socket
 import threading
+import time
 from typing import Dict, List, Optional, Set, Tuple
 
 from .protocol import (
@@ -126,6 +156,13 @@ __all__ = ["SocksFront", "DEFAULT_MAX_SESSIONS"]
 # See the module docstring: above what a connect scan holds open, and
 # about 512 threads at full stretch.
 DEFAULT_MAX_SESSIONS = 256
+
+# How long a reply is given to leave for a client that is not reading it.
+# Bounded for the same reason the handshake is, and separate from the
+# handshake's deadline: a client that drips its request right up to that
+# deadline must still be answered rather than silently dropped, which is
+# what sending the reply on the remainder of an exhausted budget would do.
+_REPLY_TIMEOUT = 10.0
 
 # RFC 1928 §3, the method-selection messages. Only username/password is
 # accepted; 0xFF is "none of the methods you offered".
@@ -158,7 +195,9 @@ _JOIN_TIMEOUT = 5.0
 # How long a polite close spends reading what the client sent and we never
 # wanted. Without it, closing a socket with unread bytes in its receive
 # buffer sends an RST, and an RST can discard the refusal we just wrote --
-# which would turn "the client gets a reply" into "sometimes it does".
+# which would turn "the client gets a reply" into "sometimes it does". It
+# is an absolute deadline on the drain, not a timeout per read: a client
+# that keeps sending would otherwise be drained for as long as it liked.
 _LINGER = 0.25
 
 
@@ -172,11 +211,18 @@ class SocksFront(object):
     `bind_port` is the port this identity owns in the tunnel server's port
     table. 0 binds an ephemeral port, which is what the tests use; `port`
     reports what was actually bound.
+
+    `max_pending` caps the handshakes in flight and defaults to
+    `max_sessions`; `handshake_timeout` is an absolute deadline on one,
+    measured from the accept. Both exist because the peers on this port
+    are unauthenticated until they are not, and this process hosts more
+    than this port.
     """
 
     def __init__(self, tunnel_server, identity: str, bind_port: int,
                  username: str, password: str,
                  max_sessions: int = DEFAULT_MAX_SESSIONS,
+                 max_pending: Optional[int] = None,
                  bind_host: str = "127.0.0.1",
                  handshake_timeout: float = 15.0,
                  connect_timeout: float = 30.0,
@@ -195,6 +241,16 @@ class SocksFront(object):
         if self.max_sessions < 1:
             raise ValueError("max_sessions must be at least 1, got %r"
                              % (max_sessions,))
+        # A handshake that could never become a session is one this port
+        # has no use for, so the default is the session cap itself. It is
+        # its own knob because a deployment that wants the pre-auth
+        # exposure much smaller than the session count should be able to
+        # say so without shrinking what the operator can open.
+        self.max_pending = (self.max_sessions if max_pending is None
+                            else int(max_pending))
+        if self.max_pending < 1:
+            raise ValueError("max_pending must be at least 1, got %r"
+                             % (max_pending,))
         self.handshake_timeout = _positive(handshake_timeout,
                                            "handshake_timeout")
         self.connect_timeout = _positive(connect_timeout, "connect_timeout")
@@ -211,14 +267,21 @@ class SocksFront(object):
         # can unpark a pump instead of waiting for one to notice.
         self._clients = set()       # type: Set[socket.socket]
         self._sessions = set()
+        # The subset of `_clients` that has not authenticated yet, which is
+        # what `max_pending` bounds. A set rather than a counter so that
+        # releasing a slot is idempotent: the connection's own thread
+        # releases it on a successful authentication and its teardown
+        # releases it again for every other outcome.
+        self._pending = set()       # type: Set[socket.socket]
         self._live = 0
         self._accepted = 0
         self._carried = 0
         self._bytes_in = 0
         self._bytes_out = 0
         self._refusals = {"auth": 0, "capacity": 0, "command": 0,
-                          "address": 0, "tunnel": 0,
-                          "protocol": 0}  # type: Dict[str, int]
+                          "address": 0, "tunnel": 0, "protocol": 0,
+                          "timeout": 0, "pending": 0,
+                          "threads": 0}   # type: Dict[str, int]
 
     # ── lifecycle ──
 
@@ -286,6 +349,19 @@ class SocksFront(object):
         toward the target network and `bytes_in` is back from it, both
         plaintext and both for the life of this object.
 
+        The refusal keys are deliberately not interchangeable, because the
+        three resource limits fail for different reasons and an operator
+        reading this row has to be able to tell them apart:
+
+        * `refused_capacity` -- `max_sessions`, which is the operator's own
+          tooling asking for more than the port carries.
+        * `refused_pending` -- `max_pending`, which is more handshakes in
+          flight than this port will hold open at once.
+        * `refused_threads` -- no thread could be started for a connection,
+          which is the process as a whole out of room.
+        * `refused_timeout` -- a handshake that ran past its deadline,
+          counted because it was cut off deliberately and not lost.
+
         `refused_auth` covers a client that would not authenticate as well
         as one that got the credentials wrong: both mean nobody proved
         they were the operator.
@@ -298,6 +374,8 @@ class SocksFront(object):
                 "serving": self._listener is not None,
                 "sessions": self._live,
                 "max_sessions": self.max_sessions,
+                "pending": len(self._pending),
+                "max_pending": self.max_pending,
                 "accepted": self._accepted,
                 "carried": self._carried,
                 "bytes_in": self._bytes_in,
@@ -334,47 +412,96 @@ class SocksFront(object):
             worker = threading.Thread(target=self._serve, args=(conn, peer),
                                       name="socks-conn", daemon=True)
             with self._lock:
-                self._workers = [t for t in self._workers if t.is_alive()]
-                self._workers.append(worker)
-                self._clients.add(conn)
                 self._accepted += 1
+                crowded = len(self._pending) >= self.max_pending
+                if not crowded:
+                    self._workers = [t for t in self._workers if t.is_alive()]
+                    self._workers.append(worker)
+                    self._clients.add(conn)
+                    self._pending.add(conn)
+                else:
+                    self._refusals["pending"] += 1
+            if crowded:
+                # Nothing has been read, so there is no SOCKS message to
+                # refuse this inside: a greeting has to come first. Closed
+                # on the accept loop rather than in a thread, because the
+                # whole point of the cap is not to start one.
+                logger.warning(
+                    "socks: %r already has %d handshakes in flight, which is "
+                    "its limit; closed %s", self.identity, self.max_pending,
+                    peer)
+                _shut(conn)
+                continue
             try:
-                worker.start()
+                self._start(worker)
             except RuntimeError as exc:
-                # No thread left to serve it with. Nothing has been read
-                # yet, so there is no SOCKS exchange to refuse inside
-                # either; it is dropped, loudly and counted, and the accept
-                # loop lives to answer the next one.
+                # The process has no more threads to give. Nothing has
+                # been read here either, so this is also a close rather
+                # than a refusal on the wire -- and it is counted apart
+                # from both session and handshake limits, because it is
+                # the host that ran out and not this port.
                 with self._lock:
                     self._clients.discard(conn)
-                    self._refusals["capacity"] += 1
+                    self._pending.discard(conn)
+                    # And out of the join list, or `stop` would raise on a
+                    # thread that was never started.
+                    if worker in self._workers:
+                        self._workers.remove(worker)
+                    self._refusals["threads"] += 1
                 logger.warning("socks: no thread could be started for %s: "
                                "%s", peer, exc)
                 _shut(conn)
 
+    def _start(self, thread: threading.Thread) -> None:
+        """Start a thread that is already registered for teardown.
+
+        A method rather than a bare `thread.start()` at two call sites, so
+        that both report a process with no threads left the same way --
+        and so that a test can reach that branch without having to
+        exhaust the host to do it.
+
+        `start` does not use this: a front whose accept loop cannot be
+        started has failed to start, and that belongs to the caller rather
+        than to one connection.
+        """
+        thread.start()
+
     def _serve(self, conn: socket.socket, peer: str) -> None:
         """One client connection, from its greeting to its last byte."""
+        # Absolute, and from here rather than from the first read: what is
+        # being bounded is how long an unauthenticated peer may hold this
+        # thread, which starts when the connection was accepted.
+        deadline = time.monotonic() + self.handshake_timeout
         try:
-            conn.settimeout(self.handshake_timeout)
-            self._handle(conn, peer)
+            self._handle(conn, peer, deadline)
+        except socket.timeout:
+            # Only reachable from the handshake reads, which are the only
+            # place a timeout is set on this socket, and `_exactly` gives
+            # each of them no more than the deadline has left. So this is
+            # the deadline and not a per-read stall.
+            logger.warning("socks: %s did not finish its handshake within "
+                           "%.1fs; closed", peer, self.handshake_timeout)
+            self._refused("timeout")
         except (OSError, ValueError) as exc:
-            # A client that left mid-handshake, a stalled one, a reset: all
-            # of it is this one connection's business. Not counted as a
-            # refusal, because this end did not refuse anything.
+            # A client that left mid-handshake, or a reset: all of it is
+            # this one connection's business. Not counted as a refusal,
+            # because this end did not refuse anything.
             logger.debug("socks: dropped %s: %s", peer, exc)
         except Exception:
             logger.exception("socks: unexpected error serving %s", peer)
         finally:
             with self._lock:
                 self._clients.discard(conn)
+                self._pending.discard(conn)
             _finish(conn)
 
-    def _handle(self, conn: socket.socket, peer: str) -> None:
-        if not self._greet(conn, peer):
+    def _handle(self, conn: socket.socket, peer: str,
+                deadline: float) -> None:
+        if not self._greet(conn, peer, deadline):
             return
-        if not self._authenticate(conn, peer):
+        if not self._authenticate(conn, peer, deadline):
             return
-        request = self._read_request(conn, peer)
+        request = self._read_request(conn, peer, deadline)
         if request is None:
             return
         cmd, atyp, address, port = request
@@ -409,9 +536,10 @@ class SocksFront(object):
 
     # ── the greeting and RFC 1929 ──
 
-    def _greet(self, conn: socket.socket, peer: str) -> bool:
+    def _greet(self, conn: socket.socket, peer: str,
+               deadline: float) -> bool:
         """RFC 1928 §3. True once username/password has been selected."""
-        head = _exactly(conn, 2)
+        head = _exactly(conn, 2, deadline)
         if head[0] != SOCKS_VERSION:
             # Nothing to answer with: every message this layer can send is
             # itself a SOCKS5 message, and this peer is not speaking one.
@@ -419,42 +547,48 @@ class SocksFront(object):
                         peer, head[0], SOCKS_VERSION)
             self._refused("protocol")
             return False
-        methods = _exactly(conn, head[1])
+        methods = _exactly(conn, head[1], deadline)
         if _METHOD_USERPASS not in methods:
-            conn.sendall(bytes([SOCKS_VERSION, _METHOD_NONE_ACCEPTABLE]))
+            _say(conn, bytes([SOCKS_VERSION, _METHOD_NONE_ACCEPTABLE]))
             logger.info("socks: %s offered no authentication method this "
                         "port accepts; refused", peer)
             self._refused("auth")
             return False
-        conn.sendall(bytes([SOCKS_VERSION, _METHOD_USERPASS]))
+        _say(conn, bytes([SOCKS_VERSION, _METHOD_USERPASS]))
         return True
 
-    def _authenticate(self, conn: socket.socket, peer: str) -> bool:
+    def _authenticate(self, conn: socket.socket, peer: str,
+                      deadline: float) -> bool:
         """RFC 1929 §2. True once the credentials match."""
-        head = _exactly(conn, 2)
+        head = _exactly(conn, 2, deadline)
         if head[0] != _AUTH_VERSION:
             logger.info("socks: %s sent sub-negotiation version %d, not %d; "
                         "closed", peer, head[0], _AUTH_VERSION)
             self._refused("protocol")
             return False
-        username = _exactly(conn, head[1])
-        password = _exactly(conn, _exactly(conn, 1)[0])
+        username = _exactly(conn, head[1], deadline)
+        password = _exactly(conn, _exactly(conn, 1, deadline)[0], deadline)
         # Both comparisons run before the branch: `and` would skip the
         # second one whenever the first failed, which tells a caller
         # whether it got the username right.
         user_ok = hmac.compare_digest(username, self._username)
         password_ok = hmac.compare_digest(password, self._password)
         if not (user_ok and password_ok):
-            conn.sendall(bytes([_AUTH_VERSION, _AUTH_FAILURE]))
+            _say(conn, bytes([_AUTH_VERSION, _AUTH_FAILURE]))
             logger.warning("socks: %s failed to authenticate to %r's port",
                            peer, self.identity)
             self._refused("auth")
             return False
-        conn.sendall(bytes([_AUTH_VERSION, _AUTH_SUCCESS]))
+        _say(conn, bytes([_AUTH_VERSION, _AUTH_SUCCESS]))
+        # It is the operator from here, so it stops counting against the
+        # cap on unauthenticated connections. What it can do next is
+        # bounded by `max_sessions` instead.
+        with self._lock:
+            self._pending.discard(conn)
         return True
 
-    def _read_request(self, conn: socket.socket,
-                      peer: str) -> Optional[Tuple[int, int, str, int]]:
+    def _read_request(self, conn: socket.socket, peer: str,
+                      deadline: float) -> Optional[Tuple[int, int, str, int]]:
         """One request off the stream, or None having answered the client.
 
         A request arrives as its own frame on the relay channel, so
@@ -464,21 +598,21 @@ class SocksFront(object):
         here: the codec is the authority on those, and the read is bounded
         either way at four bytes plus a 255-byte name plus a port.
         """
-        header = _exactly(conn, _REQUEST_HEADER_LEN)
+        header = _exactly(conn, _REQUEST_HEADER_LEN, deadline)
         atyp = header[3]
         if atyp == ATYP_IPV4:
-            body = _exactly(conn, 4)
+            body = _exactly(conn, 4, deadline)
         elif atyp == ATYP_IPV6:
-            body = _exactly(conn, 16)
+            body = _exactly(conn, 16, deadline)
         elif atyp == ATYP_DOMAIN:
-            length = _exactly(conn, 1)
-            body = length + _exactly(conn, length[0])
+            length = _exactly(conn, 1, deadline)
+            body = length + _exactly(conn, length[0], deadline)
         else:
             logger.info("socks: %s sent address type %d, which has no length "
                         "this end can know; refused", peer, atyp)
             self._refuse(conn, REPLY_ADDRESS_TYPE_NOT_SUPPORTED, "address")
             return None
-        raw = header + body + _exactly(conn, 2)
+        raw = header + body + _exactly(conn, 2, deadline)
         try:
             return decode_socks_request(raw)
         except ValueError as exc:
@@ -551,9 +685,9 @@ class SocksFront(object):
             self._refuse(conn, REPLY_GENERAL_FAILURE, "tunnel")
             return False
         except (OSError, ValueError) as exc:
-            # `b""` is the orderly case and is handled below. Here the
-            # relay either broke under the write or delivered a frame that
-            # did not authenticate, which has already closed the stream.
+            # An empty read is handled below. Here the relay either broke
+            # under the write or delivered a frame that did not
+            # authenticate, which has already closed the stream.
             logger.warning("socks: the relay carrying %s for %r failed: %s",
                            target, self.identity, exc)
             self._refuse(conn, REPLY_GENERAL_FAILURE, "tunnel")
@@ -574,7 +708,7 @@ class SocksFront(object):
                            self.identity, target, exc)
             self._refuse(conn, REPLY_GENERAL_FAILURE, "tunnel")
             return False
-        conn.sendall(raw)
+        _say(conn, raw)
         if reply != REPLY_SUCCEEDED:
             logger.info("socks: %r could not reach %s: %s", self.identity,
                         target, SOCKS_REPLY_NAMES.get(reply, reply))
@@ -602,7 +736,7 @@ class SocksFront(object):
         back = threading.Thread(target=self._downstream, args=(conn, stream),
                                 name="socks-relay", daemon=True)
         try:
-            back.start()
+            self._start(back)
         except RuntimeError as exc:
             # No thread for the return direction. A one-way proxy is worse
             # than none, so the session ends here: the caller's `finally`
@@ -662,9 +796,12 @@ class SocksFront(object):
                 return
             except OSError:
                 return
-            # `b""` here is an orderly end and nothing else: the stream
-            # does one `MSG_PEEK` before each frame, so a FIN with nothing
-            # behind it is already told apart from a truncated frame.
+            # `b""` is the far end finished, and which of the three ways it
+            # finished -- an orderly teardown, a truncated frame, a dead
+            # socket -- is not knowable here: `RelayStream.recv_message`
+            # answers all three with an empty read. They need no telling
+            # apart, because the one thing to do about any of them is to
+            # end the session.
             if not data:
                 return
             try:
@@ -685,7 +822,7 @@ class SocksFront(object):
         """
         self._refused(why)
         try:
-            conn.sendall(encode_socks_reply(reply))
+            _say(conn, encode_socks_reply(reply))
         except OSError as exc:
             logger.debug("socks: could not answer %s: %s", why, exc)
 
@@ -694,13 +831,31 @@ class SocksFront(object):
             self._refusals[why] += 1
 
 
-def _exactly(sock: socket.socket, count: int) -> bytes:
-    """Exactly `count` bytes, or `ValueError` if the peer stopped short."""
+def _exactly(sock: socket.socket, count: int, deadline: float) -> bytes:
+    """Exactly `count` bytes, before `deadline`.
+
+    `deadline` is an absolute `time.monotonic()`, and each `recv` is given
+    only what is left of it. A plain `settimeout` would be no bound at
+    all: it restarts on every byte that arrives, so a peer sending one
+    byte just inside it holds this thread for as long as it cares to.
+    Reaching the deadline raises `socket.timeout`, which is also what the
+    last `recv` raises when it runs the budget out, so the caller has one
+    case and not two.
+
+    `ValueError` is a peer that closed with the read half-done, which is a
+    client that left rather than one that stalled.
+    """
     if count <= 0:
         return b""
     chunks = []
     have = 0
     while have < count:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout(
+                "the handshake deadline passed with %d of %d bytes read"
+                % (have, count))
+        sock.settimeout(remaining)
         chunk = sock.recv(count - have)
         if not chunk:
             raise ValueError("the client closed with %d of %d bytes sent"
@@ -708,6 +863,20 @@ def _exactly(sock: socket.socket, count: int) -> bytes:
         chunks.append(chunk)
         have += len(chunk)
     return b"".join(chunks)
+
+
+def _say(sock: socket.socket, data: bytes) -> None:
+    """Write a handshake message or a reply, on a bounded timeout.
+
+    Its own timeout rather than whatever the last read left behind. The
+    reads run on the remainder of the handshake deadline, so a client that
+    dripped its request until that budget was nearly gone would otherwise
+    have its refusal written with microseconds to spare and dropped -- and
+    a refusal that is not delivered is the silent drop this port exists
+    not to do.
+    """
+    sock.settimeout(_REPLY_TIMEOUT)
+    sock.sendall(data)
 
 
 def _loopback(value) -> Tuple[str, int]:
@@ -774,17 +943,26 @@ def _finish(sock: socket.socket) -> None:
     RST, and an RST can discard bytes already queued the other way -- so a
     client that pipelined data behind its request could lose the very
     refusal this port sent it. The FIN goes first, then what the client
-    sent is read and dropped on a short deadline, and only then is the
-    descriptor closed.
+    sent is read and dropped, and only then is the descriptor closed.
+
+    The drain runs to an absolute deadline rather than on a timeout per
+    read, for the same reason the handshake does: a client that keeps
+    sending would reset a per-read timeout forever and pin this thread
+    inside a function whose whole purpose is to end quickly.
     """
     try:
         sock.shutdown(socket.SHUT_WR)
     except OSError:
         pass
+    deadline = time.monotonic() + _LINGER
     try:
-        sock.settimeout(_LINGER)
-        while sock.recv(4096):
-            pass
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            sock.settimeout(remaining)
+            if not sock.recv(4096):
+                break
     except OSError:
         pass
     try:
