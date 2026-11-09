@@ -1961,6 +1961,41 @@ class TestTheListenerRegistry(unittest.TestCase):
             load_listeners(config)
         self.assertIn("445", str(caught.exception))
 
+    def test_a_listener_that_binds_the_port_it_relays_to_is_refused(self):
+        # I shipped exactly this: a QUIC listener on 8443, which is the
+        # team server's own beacon port. UDP and TCP do not collide, so it
+        # would have bound and worked while reading as a conflict to
+        # everyone who saw it -- and the SMB listener next to it, being
+        # TCP, would simply have failed at bind time.
+        config = self._config(
+            bind_port=8443,
+            relay_url="http://127.0.0.1:8443/api/v1/beacon")
+        with self.assertRaises(ValueError) as caught:
+            load_listeners(config)
+        self.assertIn("8443", str(caught.exception))
+        self.assertIn("relay", str(caught.exception).lower())
+
+    def test_a_different_port_in_the_relay_url_is_fine(self):
+        specs = load_listeners(self._config(
+            bind_port=445,
+            relay_url="http://127.0.0.1:8443/api/v1/beacon"))
+        self.assertEqual(specs[0].bind_port, 445)
+
+    def test_a_relay_url_without_a_port_is_fine(self):
+        # http and https have default ports, and they are deliberately not
+        # filled in: a listener on 80 relaying to an `http://` URL with no
+        # port is somebody else's arrangement, not a typo this check can
+        # recognise. The ports here are 80 and 443 on purpose -- with
+        # anything else the test passes whether the default is substituted
+        # or not, which is how the first version of it held nothing.
+        for url, port in (("http://team-server/api/v1/beacon", 80),
+                          ("https://team-server/api/v1/beacon", 443)):
+            with self.subTest(url=url):
+                specs = load_listeners(self._config(bind_port=port,
+                                                    relay_url=url))
+                self.assertEqual(specs[0].relay_url, url)
+                self.assertEqual(specs[0].bind_port, port)
+
     def test_a_wildcard_bind_collides_with_a_specific_one(self):
         # 0.0.0.0:445 and 127.0.0.1:445 are not two free sockets, and the
         # second one to start would fail at bind time with an error an

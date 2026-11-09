@@ -186,6 +186,19 @@ def _spec_of(entry: dict, index: int) -> ListenerSpec:
         raise ValueError("listener %r has a non-string bind_host %r"
                          % (name, bind_host))
 
+    relay_port = _port_of(relay_url)
+    if relay_port is not None and relay_port == port:
+        # Shipped exactly this once: a QUIC listener on 8443, which is the
+        # team server's own beacon port. UDP and TCP do not collide, so it
+        # would have bound and worked while reading as a conflict to
+        # everyone who saw the file -- and a TCP listener in the same spot
+        # would simply have failed at bind time, with the error arriving
+        # somewhere nobody was looking.
+        raise ValueError(
+            "listener %r binds port %d and relays to port %d, which is the "
+            "same socket. The relay_url is the team server's; a listener "
+            "cannot be it." % (name, port, relay_port))
+
     settings = entry.get("settings") or {}
     if not isinstance(settings, dict):
         raise ValueError("listener %r has non-mapping settings %r"
@@ -196,6 +209,21 @@ def _spec_of(entry: dict, index: int) -> ListenerSpec:
                         enabled=bool(entry.get("enabled", False)),
                         bind_host=bind_host, bind_port=port,
                         relay_url=relay_url.strip(), settings=dict(settings))
+
+
+def _port_of(url: str) -> Optional[int]:
+    """The port a URL names, or None when it relies on the scheme's default.
+
+    A listener on 443 relaying to an `https://` URL with no port is
+    somebody else's arrangement, not a typo this can recognise, so the
+    default ports are deliberately not filled in.
+    """
+    import urllib.parse
+
+    try:
+        return urllib.parse.urlsplit(url).port
+    except ValueError:
+        return None
 
 
 def _check_settings(name: str, transport: str, settings: dict) -> None:

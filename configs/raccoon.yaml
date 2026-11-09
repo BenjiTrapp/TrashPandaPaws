@@ -156,11 +156,14 @@ c2:
       relay_url: "http://127.0.0.1:8443/api/v1/beacon"
       settings:
         pipe_name: "msrpc_6e2f"
-    - name: quic-8443
+    - name: quic-8445
       transport: quic
       enabled: false
       bind_host: "0.0.0.0"
-      bind_port: 8443
+      # Not 8443: that is the team server's own beacon socket. UDP and TCP
+      # would not actually collide, but an example that reads as a conflict
+      # is an example somebody copies.
+      bind_port: 8445
       relay_url: "http://127.0.0.1:8443/api/v1/beacon"
     - name: dns-53
       transport: dns

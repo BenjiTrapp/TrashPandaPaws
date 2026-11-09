@@ -818,6 +818,63 @@ class TestTheListenersGuide(_DocCase):
                         "the README never mentions the listeners")
 
 
+class TestTheGuiTourKeepsUpWithTheHeader(unittest.TestCase):
+    """The tour lists the header buttons; the page defines them.
+
+    A document that enumerates buttons drifts the moment one is added,
+    and one just was. So the list is checked against the page rather than
+    read for plausibility.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tour = _read("docs", "C2_DEMO.md")
+        cls.page = _read("software", "c2", "server.py")
+
+    def test_every_header_button_is_named_in_the_tour(self):
+        import re
+
+        header = self.page[self.page.index('<button class="topbar-ico-btn"'):]
+        header = header[:header.index("</header>")]
+        titles = re.findall(r'title="([^"]+)"', header)
+        self.assertGreaterEqual(len(titles), 4,
+                                "the header was not parsed: %r" % titles)
+
+        # Scoped to the section that describes the header, not the whole
+        # tour. Searching the document for "listeners" passed while the
+        # Header Bar paragraph did not mention the button, because the
+        # word appears three times elsewhere -- "unusual listeners" in the
+        # connection analyser, and an SMB listener in a diagram. The sixth
+        # time on this branch that a check was looser than the property it
+        # named.
+        section = self.tour.split("### Header Bar", 1)
+        self.assertEqual(len(section), 2,
+                         "the tour has no Header Bar section any more")
+        body = section[1].split("\n###", 1)[0]
+        flat = " ".join(body.split()).lower()
+        for title in titles:
+            self.assertTrue(title.lower() in flat,
+                            "the tour's Header Bar section never mentions "
+                            "the %r button" % title)
+
+    def test_the_tour_links_the_listener_guide(self):
+        self.assertIn("LISTENERS.md", self.tour,
+                      "the tour describes a Listeners panel and does not "
+                      "say where to read about it")
+
+
+class TestTheRedirectorGuideKnowsAboutListeners(unittest.TestCase):
+    def test_it_points_at_the_listener_guide(self):
+        # Same shape, different transport: a front host that carries
+        # traffic and holds no key. A reader who found one should find the
+        # other.
+        text = _read("docs", "REDIRECTOR.md")
+        self.assertIn("LISTENERS.md", text,
+                      "the redirector guide does not mention the listeners, "
+                      "which are the same arrangement for the other three "
+                      "transports")
+
+
 class TestKnownLimitsDropsWhatThisWorkFixed(_DocCase):
     def test_the_line_continuation_half_is_gone(self):
         # `_unit_reach` joins systemd continuations now, with a test. The
