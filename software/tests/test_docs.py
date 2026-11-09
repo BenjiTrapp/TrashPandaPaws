@@ -30,9 +30,9 @@ import yaml
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from software.agent import config, prompts
-from software.agent.llm import failover
-from software.agent.store import queries  # noqa: E402
+from software.agent import config, orchestrator, prompts
+from software.agent.llm import failover, mock
+from software.agent.store import db, queries  # noqa: E402
 from software.agent import safety  # noqa: E402
 from software.agent.executor import server_tool  # noqa: E402
 from software.agent.llm import provider  # noqa: E402
@@ -612,7 +612,7 @@ def _smb_and_quic_double_serialise():
 
 
 class _StubLink(provider.LlmClient):
-    """A chain link that fails or answers, wearing a real link's identity."""
+    """A chain link that fails, or keeps calling a tool, under a given name."""
 
     def __init__(self, provider_name, model, fails):
         self.provider = provider_name
@@ -622,33 +622,53 @@ class _StubLink(provider.LlmClient):
     async def complete(self, system, messages, tools, max_tokens, temperature):
         if self._fails:
             raise provider.ProviderError("down")
-        return provider.Completion("ok", [], 1, 1, 2, "end_turn")
+        return mock.calls(("set_phase", {"phase": 1}))
+
+
+class _StubC2:
+    """Just enough of the C2 for a campaign to start, run and wind up."""
+
+    async def get_agent(self, agent_id):
+        return {"id": agent_id, "status": "online", "caps": []}
+
+    async def set_beacon_interval(self, agent_id, seconds, jitter):
+        return None
 
 
 def _a_failover_keeps_the_primarys_tier():
-    # Behavioural, on the public surface: a configuration whose primary is a
-    # `full` model and whose last link is a small local one, and a chain in
-    # which the primary fails and that last link answers. Open while the
-    # limits the run holds are the primary's and are looser than the answering
-    # link's own tier would give it.
-    link = {"provider": "ollama", "model": "qwen2.5:7b"}
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "raccoon.yaml"
-        path.write_text(yaml.safe_dump(
-            {"agent": {"llm": {"fallbacks": [link]}}}))
-        cfg = config.load(
-            [], yaml_path=str(path),
-            env={"AGENT_PROVIDER": "anthropic",
-                 "AGENT_MODEL": "claude-sonnet-4-5"})
-    chain = failover.FailoverClient([
-        _StubLink(cfg.provider, cfg.model, fails=True),
-        _StubLink(link["provider"], link["model"], fails=False)])
-    asyncio.run(chain.complete("", [], [], 16, 0.0))
-    answering = provider.capability_tier(chain.model, chain.provider)
-    return (cfg.capability_tier
-            == provider.capability_tier(cfg.model, cfg.provider)
-            and provider.TIER_LIMITS[cfg.capability_tier]["max_phase"]
-            > provider.TIER_LIMITS[answering]["max_phase"])
+    # Behavioural, at the point of use: a campaign is run on a `full` tier over
+    # a chain whose primary is down and which has already failed over to a
+    # `local` link (never above `reduced`), and the model never stops calling
+    # tools. The report says how many orchestrator turns it was allowed, which
+    # is the limit the run actually held. Open while that is the primary's
+    # figure and the answering link's own tier would have allowed fewer.
+    async def turns_allowed():
+        chain = failover.FailoverClient([
+            _StubLink("anthropic", "claude-sonnet-4-5", fails=True),
+            _StubLink("local", "small-local-model", fails=False)])
+        # Failed over before the campaign is built, so a fix that reads the
+        # answering link when the campaign starts sees the small one too.
+        await chain.complete("", [], [], 16, 0.0)
+        agent_cfg = config.AgentConfig(capability_tier="full")
+        campaign_cfg = config.CampaignConfig.from_form(
+            {"beacons": ["b1"], "scope_allow": ["10.0.1.0/24"],
+             "mode": "auto"}, tier="full")
+        conn = db.open_store(":memory:")
+        try:
+            campaign = orchestrator.Campaign(
+                agent_cfg, campaign_cfg, conn, _StubC2(), chain)
+            await campaign.start()
+            report = await campaign.wait()
+        finally:
+            conn.close()
+        found = re.search(r"MAX_TURNS reached after (\d+) turns", report)
+        answering = provider.capability_tier(chain.model, chain.provider)
+        return (int(found.group(1)) if found else None,
+                provider.TIER_LIMITS["full"]["orchestrator_turns"],
+                provider.TIER_LIMITS[answering]["orchestrator_turns"])
+
+    allowed, primarys, answerings = asyncio.run(turns_allowed())
+    return allowed == primarys and answerings < primarys
 
 
 # group -> [(phrase the entry must contain, True-while-open or None)].
@@ -787,6 +807,31 @@ class TestTheAgentLayerLimitsAreStillOpen(_DocCase):
                     "%r is no longer true of the code: it has been fixed. "
                     "Delete it from Known limits and from "
                     "_OPEN_AGENT_LIMITS." % phrase)
+
+
+_NUMBER_WORDS = ("zero one two three four five six seven eight nine ten eleven "
+                 "twelve thirteen fourteen fifteen sixteen seventeen eighteen "
+                 "nineteen twenty").split()
+
+
+class TestTheReadmeCountsTheTiedLimits(unittest.TestCase):
+    """The README promises a test for every limit the code can answer for.
+
+    It says how many, in words. The number was written once and drifted by
+    one when an entry was added, so it is derived here: whoever ties another
+    limit is sent to the sentence by this test failing.
+    """
+
+    def test_the_sentence_states_how_many_entries_are_tied(self):
+        tied = (sum(1 for entries in _OPEN_FINDINGS.values()
+                    for _, still_open in entries if still_open is not None)
+                + len(_OPEN_AGENT_LIMITS))
+        found = re.search(r"for the (\w+) of those the code can answer for",
+                          README.read_text())
+        self.assertIsNotNone(found, "README.md no longer states the count")
+        self.assertEqual(found.group(1), _NUMBER_WORDS[tied],
+                         "README.md says %r; %d entries have a test tied to "
+                         "the code" % (found.group(1), tied))
 
 
 class _ParserReached(Exception):

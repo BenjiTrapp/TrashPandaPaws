@@ -362,6 +362,11 @@ call in a deadline, but twenty orchestrator turns of that is ten minutes spent
 waiting for nothing. With a chain the failover counts those failures like any
 other, trips the link after two, and the later turns do not pay for it.
 
+The chain is written in the YAML only; there is no environment form for it.
+The agent image does not contain `configs/raccoon.yaml`, so a container has no
+chain unless a file is mounted at `/opt/raccoon/configs/raccoon.yaml`, one of
+the places the service looks, or named with `-c`.
+
 Every link is built at startup, so a fallback that cannot be constructed is
 a configuration error reported then — `/api/ai/status` says so and no
 campaign starts — rather than at the first failover, which by definition

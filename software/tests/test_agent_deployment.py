@@ -217,10 +217,19 @@ class TestCompose(unittest.TestCase):
             self.assertIn(key, env, key)
             self.assertEqual(env[key], "${%s:-}" % key, key)
 
+    def test_the_tier_override_reaches_the_container(self):
+        # The documented workaround for a chain that ends on a small model is
+        # AGENT_CAPABILITY_TIER, and it is a safety limit. A document that
+        # tells the operator to set it while the container drops it is worse
+        # than saying nothing.
+        env = _env_map(self.services["agent"])
+        self.assertEqual(env.get("AGENT_CAPABILITY_TIER"),
+                         "${AGENT_CAPABILITY_TIER:-}")
+
     def test_the_file_says_why_gcloud_is_not_in_the_container(self):
         # The slim image has no gcloud on purpose; without the comment the
         # next reader adds it, or wonders why `auto` finds nothing.
-        self.assertRegex(self.raw, r"(?is)gcloud.{0,300}(absent|not in|no )")
+        self.assertRegex(self.raw, r"(?is)gcloud.{0,300}(absent|not in)")
 
     def test_the_fixed_token_requirement_is_written_down(self):
         # Without a fixed RACCOON_TOKEN the C2 invents one at startup and the

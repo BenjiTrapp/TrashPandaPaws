@@ -94,6 +94,10 @@ services:
       # | vertex
       - AGENT_PROVIDER=${AGENT_PROVIDER:-}
       - AGENT_MODEL=${AGENT_MODEL:-}
+      # Blank derives the tier from the model. Set it to force one: it is the
+      # documented way to hold a whole run to a small model's limits (see
+      # "Known limits" in docs/AGENT.md), so the container has to pass it.
+      - AGENT_CAPABILITY_TIER=${AGENT_CAPABILITY_TIER:-}
       # Never a literal here. Put it in a .env file that is not committed,
       # or export it before `docker compose up`; this repository has a
       # pre-commit hook that refuses credential material in a diff.
@@ -108,7 +112,7 @@ services:
       # pointing at it. Mount the file's directory, not the file, or a
       # refresher that writes by rename is invisible in here. All three stay
       # blank when unset so that the defaults (europe-west4, auto) apply.
-      # docs/AGENT.md, "Where it runs".
+      # docs/AGENT.md, "Vertex AI: the token, and where it runs".
       - AGENT_VERTEX_PROJECT=${AGENT_VERTEX_PROJECT:-}
       - AGENT_VERTEX_LOCATION=${AGENT_VERTEX_LOCATION:-}
       - AGENT_TOKEN_SOURCE=${AGENT_TOKEN_SOURCE:-}
