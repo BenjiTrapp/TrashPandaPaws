@@ -8,13 +8,22 @@ nothing else.
 **One child, not a table of them.** There is one tunnel server per
 deployment -- one implant-facing port, one port table, one key store --
 so this is deliberately not `listeners/supervisor.py` with a different
-spec type. The two share their discipline and not their code, for the
-reason `listeners/errors.py` exists: importing `listeners.supervisor`
-pulls in `listeners.registry`, which imports all three listener classes,
-and the DNS parser, the QUIC reassembler and the hand-written SMB2 parser
-must not be loaded into a process that only wants to spawn a tunnel. The
-exception is shared, because that module was written to be importable by
-anything.
+spec type. The two state machines have almost nothing in common: this one
+holds a single child rather than a dict keyed by name, it reads
+`c2.tunnel_server` rather than `c2.listeners`, it has no `ListenerSpec`
+and no transport, and its refusals are about state rather than about a
+name that might have been typed wrong. What they *do* share is the
+mechanics of being a supervised child, and that is shared code rather
+than a second copy: `listeners/child.py`. Two copies of it had already
+drifted within one commit, each time in the direction of the version
+fewer people read.
+
+That module is in the listeners' package and imports no listener, for the
+same reason `listeners/errors.py` is there: anything may import it. This
+module reaches for both and for nothing else in that package, so it loads
+no transport. It is also 150 lines of `subprocess` discipline that has no
+business in a 9,000-line Flask module, which is where it would otherwise
+have gone.
 
 Three properties this is built around, each one borrowed from the
 listeners' supervisor because each was learned from a failure:
@@ -43,17 +52,15 @@ so before and after acting -- an endpoint's own stop is a task for its
 agent and takes a check-in, which is the other half of the same point.
 """
 
-import json
 import os
 import secrets
-import socket
-import subprocess
 import sys
-import tempfile
 import threading
 from pathlib import Path
 from typing import Optional
 
+from ..listeners.child import (SupervisedChild, discard, launch,
+                               read_control_port)
 from ..listeners.errors import SupervisorError
 
 __all__ = ["TunnelSupervisor", "SupervisorError", "tunnel_server_config"]
@@ -68,14 +75,11 @@ _START_TIMEOUT = 30.0
 # its sockets and joins its threads, which is quick; one that needs longer
 # is wedged, and leaving it running would hold the implant-facing port
 # against the next start.
+#
+# Kept here rather than read from `child.py` so that a test can patch the
+# escalation in the module it is testing; `_Child.term_grace` resolves it
+# when it is asked.
 _TERM_GRACE = 5.0
-
-_CONTROL_TIMEOUT = 5.0
-
-# A control reply carries one row per endpoint with its counters, so it is
-# larger than a listener's. Bounded all the same: the child is trusted,
-# the socket is not a reason to read without a limit.
-_MAX_REPLY = 4 << 20
 
 _DEFAULTS = {
     "bind_host": "0.0.0.0",
@@ -266,14 +270,19 @@ class TunnelSupervisor:
         return self.data_dir / "tunnel" / "ports.json"
 
 
-class _Child:
-    """The tunnel-server process, and what is known about how it ended."""
+class _Child(SupervisedChild):
+    """The tunnel-server process. Its command line, and nothing else.
 
-    def __init__(self, process, control_port, stderr_path):
-        self.process = process
-        self.control_port = control_port
-        self.stderr_path = stderr_path
-        self.pid = process.pid
+    Spawning, the control-port read, the SIGTERM/SIGKILL escalation and
+    the status question live in `listeners/child.py`, shared with the
+    listeners' supervisor -- see this module's docstring for why that is
+    the one thing the two have in common.
+    """
+
+    # One row per endpoint with its counters, which is larger than a
+    # listener's handful. Bounded all the same: the child is trusted, a
+    # socket is not a reason to read without a limit.
+    max_reply = 4 << 20
 
     @classmethod
     def spawn(cls, supervisor: "TunnelSupervisor") -> "_Child":
@@ -297,176 +306,17 @@ class _Child:
         environment["PYTHONPATH"] = supervisor.cwd
         environment["PYTHONUNBUFFERED"] = "1"
 
-        # stderr to a file rather than a pipe. A pipe nobody drains fills
-        # its buffer and then blocks the child mid-log, which would look
-        # exactly like a tunnel server that hung.
-        handle = tempfile.NamedTemporaryFile(prefix="raccoon-tunnel-",
-                                             suffix=".log", delete=False)
-        process = subprocess.Popen(
-            command, cwd=supervisor.cwd, env=environment,
-            stdout=subprocess.PIPE, stderr=handle, stdin=subprocess.DEVNULL,
-            text=True)
-        handle.close()
-
-        port = cls._read_control_port(process, handle.name)
-        return cls(process, port, handle.name)
-
-    @staticmethod
-    def _read_control_port(process, stderr_path):
-        """Read the one line the child prints, or raise with its stderr."""
-        line = _read_line_with_timeout(process.stdout, _START_TIMEOUT)
-        if line is None:
-            # A child that exited and one that is alive and silent are
-            # the same `None` here and are not the same fault, so they
-            # are not reported in the same words: the listeners'
-            # supervisor calls both a timeout, and a start refused in
-            # half a second that says "did not come up within 30s" sends
-            # the reader looking for a slow machine.
-            code = process.poll()
-            _kill(process)
-            if code is not None:
-                raise SupervisorError(
-                    "the tunnel server %s before it could serve. Its "
-                    "output was: %s"
-                    % ("exited on signal %d" % -code if code < 0
-                       else "exited with code %d" % code,
-                       _tail(stderr_path)))
-            raise SupervisorError(
-                "the tunnel server did not come up within %gs. Its output "
-                "was: %s" % (_START_TIMEOUT, _tail(stderr_path)))
-        if not line.startswith("control-port "):
-            _kill(process)
-            raise SupervisorError(
-                "the tunnel server printed %r instead of its control port. "
-                "Its output was: %s" % (line[:120], _tail(stderr_path)))
-        value = line.split(" ", 1)[1].strip()
-        if value == "none":
-            return None
+        process, stderr_path = launch(command, supervisor.cwd, environment,
+                                      "raccoon-tunnel-")
         try:
-            return int(value)
-        except ValueError:
-            _kill(process)
-            raise SupervisorError(
-                "the tunnel server printed an unreadable control port %r"
-                % value)
+            port = read_control_port(process, stderr_path,
+                                     "the tunnel server", _START_TIMEOUT)
+        except SupervisorError:
+            discard(stderr_path)
+            raise
+        return cls(process, port, stderr_path, owned=True)
 
-    def alive(self) -> bool:
-        return self.process.poll() is None
-
-    def reap(self) -> None:
-        try:
-            self.process.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            pass
-
-    def death_detail(self) -> str:
-        code = self.process.returncode
-        if code is None:
-            return "exit status unknown"
-        if code < 0:
-            reason = "exited on signal %d" % -code
-        else:
-            reason = "exit code %d" % code
-        tail = _tail(self.stderr_path)
-        return "%s; its output was: %s" % (reason, tail) if tail else reason
-
-    def terminate(self) -> None:
-        """SIGTERM, then SIGKILL, then reap. No child is left behind.
-
-        Reaped rather than merely signalled: an unreaped child is a
-        zombie, its pid still answers `kill -0`, and `status` would keep
-        reporting it as running.
-        """
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=_TERM_GRACE)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                try:
-                    self.process.wait(timeout=_TERM_GRACE)
-                except subprocess.TimeoutExpired:
-                    pass
-        if self.process.stdout is not None:
-            try:
-                self.process.stdout.close()
-            except OSError:
-                pass
-
-    def ask_status(self, token: str) -> Optional[dict]:
-        """One question over the control socket, or None if it did not answer."""
-        if self.control_port is None:
-            return None
-        try:
-            with socket.create_connection(("127.0.0.1", self.control_port),
-                                          timeout=_CONTROL_TIMEOUT) as sock:
-                sock.sendall(json.dumps({"token": token,
-                                         "verb": "status"}).encode() + b"\n")
-                sock.settimeout(_CONTROL_TIMEOUT)
-                raw = b""
-                while b"\n" not in raw and len(raw) < _MAX_REPLY:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    raw += chunk
-        except (OSError, socket.timeout):
-            return None
-        try:
-            answer = json.loads(raw.split(b"\n", 1)[0] or b"{}")
-        except ValueError:
-            return None
-        return answer if isinstance(answer, dict) and "error" not in answer \
-            else None
-
-
-def _read_line_with_timeout(stream, timeout):
-    """Read one line, giving up after `timeout`.
-
-    A blocking readline on a child that never prints would hang the team
-    server, so the read happens on a thread the caller can abandon. The
-    thread is a daemon: if the child is killed its stdout closes and the
-    read returns, and if it is not, the thread costs nothing.
-    """
-    if stream is None:
-        return None
-    out = {}
-
-    def _read():
-        try:
-            out["line"] = stream.readline()
-        except (OSError, ValueError):
-            out["line"] = ""
-
-    worker = threading.Thread(target=_read, daemon=True)
-    worker.start()
-    worker.join(timeout)
-    line = out.get("line")
-    if not line:
-        return None
-    return line.strip()
-
-
-def _tail(path, limit=400):
-    try:
-        with open(path) as handle:
-            text = handle.read()
-    except OSError:
-        return ""
-    text = " ".join(text.split())
-    return text[-limit:]
-
-
-def _kill(process):
-    try:
-        process.kill()
-        process.wait(timeout=5.0)
-    except Exception:
-        pass
-    # Closed here as well as in `terminate`: every path that gives up on a
-    # child goes through one of the two, and a pipe left open is a
-    # ResourceWarning in whatever test happens to run next.
-    if process.stdout is not None:
-        try:
-            process.stdout.close()
-        except (OSError, ValueError):
-            pass
+    def term_grace(self):
+        # Resolved here, from this module, for the reason the listeners'
+        # one is: a test patches the constant in the module it is testing.
+        return _TERM_GRACE

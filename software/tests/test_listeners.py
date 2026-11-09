@@ -2822,7 +2822,11 @@ class TestHowAChildIsHandled(unittest.TestCase):
                         "the escalation took %.1fs" % took)
 
     def test_a_child_that_never_prints_is_given_up_on(self):
-        from software.c2.listeners import supervisor as sup
+        # The helper moved to `listeners/child.py` when the tunnel
+        # supervisor started sharing it, and is driven there rather than
+        # through a re-export: a module that no longer calls a function
+        # should not keep importing it so that a test can reach it.
+        from software.c2.listeners import child as sup
 
         read_fd, write_fd = os.pipe()
         stream = os.fdopen(read_fd)
@@ -2838,7 +2842,7 @@ class TestHowAChildIsHandled(unittest.TestCase):
         self.addCleanup(os.close, write_fd)
 
         started = time.monotonic()
-        line = sup._read_line_with_timeout(stream, 0.5)
+        line = sup.read_line_with_timeout(stream, 0.5)
         took = time.monotonic() - started
 
         self.assertIsNone(line)
@@ -3654,7 +3658,7 @@ class TestThePayloadFieldsAgree(unittest.TestCase):
         # it. The AST knows the difference.
         for module in ("relay.py", "dns.py", "quic.py", "smb.py",
                        "registry.py", "supervisor.py", "__main__.py",
-                       "errors.py"):
+                       "errors.py", "child.py"):
             with self.subTest(module=module):
                 imported, _used = _imports_and_names(
                     "software", "c2", "listeners", module)

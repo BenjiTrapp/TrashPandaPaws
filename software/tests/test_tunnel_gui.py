@@ -27,9 +27,6 @@ binding those ports has to apply that rule again, and this is that task.
 
 import json
 import os
-import pathlib
-import re
-import signal
 import socket
 import subprocess
 import sys
@@ -360,6 +357,46 @@ class TestTheTunnelProcess(unittest.TestCase):
         quiet = fronts.decorate(rows[1])
         self.assertIsNone(quiet["socks"])
         self.assertTrue(quiet["socks_detail"])
+
+
+class TestTheRowFixtureMatchesTheRealThing(unittest.TestCase):
+    """`_endpoint()` is hand-written, so something must hold it honest.
+
+    No route or panel test ever sees a row from a real `TunnelServer`,
+    and the supervisor tests that start a real child have no endpoint
+    connected, so they see an empty list. Rename a key in the tunnel
+    server and every test in this file would stay green while the panel
+    rendered blanks.
+    """
+
+    def test_the_fixture_only_uses_keys_a_real_row_has(self):
+        from software.c2.tunnel import __main__ as tunnel_main
+        from software.c2.tunnel.keys import KeyStore
+        from software.c2.tunnel.server import TunnelServer
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        # A port table with one identity already in it, which is what a
+        # restart reads: `endpoints()` then reports that identity as
+        # disconnected without anything having to connect. The port is
+        # recorded, never bound.
+        port = _free_port()
+        (root / "ports.json").write_text(
+            json.dumps({"version": 1, "ports": {"a1b2c3d4e5f6": port}}),
+            encoding="utf-8")
+        server = TunnelServer(KeyStore(root / "keys.json"), "127.0.0.1", 0,
+                              (port, port), str(root / "ports.json"))
+        rows = server.endpoints()
+        self.assertEqual([row["identity"] for row in rows], ["a1b2c3d4e5f6"])
+
+        # Plus what the process adds on the way out through its control
+        # socket, which is the other half of what the route receives.
+        real = set(tunnel_main._Fronts(server).decorate(rows[0]))
+        self.assertLessEqual(
+            set(_endpoint()), real,
+            "the fixture carries keys a real endpoint row does not: %s"
+            % sorted(set(_endpoint()) - real))
 
 
 class TestTheSupervisor(unittest.TestCase):
@@ -712,13 +749,16 @@ class TestTheSocketPolicy(unittest.TestCase):
         self.addCleanup(quiet.setLevel, previous)
 
         self.supervisor = _FakeTunnelSupervisor(endpoints=[_endpoint()])
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
         operator = make_server("127.0.0.1", 0, None, threaded=True)
+        self.addCleanup(operator.server_close)
         agent = make_server("127.0.0.1", 0, None, threaded=True)
+        self.addCleanup(agent.server_close)
         self.operator_port = operator.server_port
         self.agent_port = agent.server_port
         app = create_app(
-            ServerCrypto(b"k" * 32), self.TOKEN,
-            pathlib.Path(tempfile.mkdtemp()),
+            ServerCrypto(b"k" * 32), self.TOKEN, Path(tmp.name),
             server_config={"host": "127.0.0.1", "port": self.agent_port,
                            "operator_host": "127.0.0.1",
                            "operator_port": self.operator_port},
@@ -779,10 +819,9 @@ class TestTheTunnelPanel(unittest.TestCase):
         quiet = logging.getLogger("werkzeug")
         previous = quiet.level
         quiet.setLevel(logging.ERROR)
+        tmp = tempfile.TemporaryDirectory()
         server = make_server("127.0.0.1", 0, None, threaded=True)
-        app = create_app(ServerCrypto(b"k" * 32), "t",
-                         pathlib.Path(tempfile.mkdtemp()))
-        server.app = app
+        server.app = create_app(ServerCrypto(b"k" * 32), "t", Path(tmp.name))
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             with urllib.request.urlopen(
@@ -791,6 +830,8 @@ class TestTheTunnelPanel(unittest.TestCase):
                 cls.page = response.read().decode("utf-8", "replace")
         finally:
             server.shutdown()
+            server.server_close()
+            tmp.cleanup()
             quiet.setLevel(previous)
         start = cls.page.index("function showTunnel()")
         cls.body = cls.page[start:cls.page.index("</script>", start)]
@@ -803,8 +844,17 @@ class TestTheTunnelPanel(unittest.TestCase):
         self.assertLess(tunnel, loot)
 
     def test_the_panel_warns_that_stopping_the_server_drops_every_endpoint(self):
-        # Before it acts, not after: the warning is in a confirm() the
-        # stop button goes through, and the count is in it.
+        """The warning is in a `confirm()` the stop button goes through.
+
+        **What this does not hold:** the assertion below is on source
+        order, so it proves the question is written before the request is
+        built and nothing stronger. A bare `confirm(...)` whose answer was
+        discarded, or an `||` where the code has `&&`, would still pass.
+        There is no JavaScript runner in this repository and the panel
+        needs a DOM rather than a function, so this is the stopping point
+        rather than a step towards one -- read it as "the question is
+        asked first", not as "the gate works".
+        """
         self.assertIn("every endpoint", self.body)
         confirm = [line for line in self.body.splitlines()
                    if "confirm(" in line]

@@ -1170,8 +1170,13 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 "the tunnel server is running. Endpoints are not started "
                 "from here: each one dials in by itself once its agent has "
                 "been tasked `tunnel start`.")
-        _log_event("TUNNEL", "server %s (%d endpoint%s dropped)"
-                   % (action, dropped, "" if dropped == 1 else "s"))
+        logged = "server %s" % action
+        if action == "stop":
+            # Only where it happened: "start (0 endpoints dropped)" reads
+            # like a bug in the line that reports it.
+            logged += " (%d endpoint%s dropped)" % (
+                dropped, "" if dropped == 1 else "s")
+        _log_event("TUNNEL", logged)
         return jsonify({
             "server": state,
             "endpoints": rows,
@@ -6954,6 +6959,15 @@ async function drawTunnel(panel){
   const running = srv.state === "running";
   const bytes = n => n >= 1048576 ? (n/1048576).toFixed(1)+" MB"
                    : n >= 1024 ? (n/1024).toFixed(1)+" KB" : (n||0)+" B";
+  // Every refusal kind that is not zero, read off the keys rather than
+  // from a list written here. `refused` is the sum over nine kinds, and
+  // naming three of them turned "5 refused (auth 0, capacity 0, tunnel
+  // 0)" into something a reader takes for a broken panel instead of a
+  // refusal for one of the six that were not shown.
+  const refusals = s => Object.keys(s)
+    .filter(k => k.indexOf("refused_") === 0 && s[k])
+    .map(k => esc(k.slice(8).replace(/_/g," ")) + " " + esc(String(s[k])))
+    .join(", ");
 
   // The two objects, named here because the panel cannot otherwise show
   // why one button is immediate and the other is not. A stop that
@@ -7008,6 +7022,7 @@ async function drawTunnel(panel){
   rows.forEach(row => {
     const connected = row.state === "connected";
     const socks = row.socks;
+    const refused = socks ? refusals(socks) : "";
     html += '<div class="loot-item">'
       + '<div><strong>' + esc(row.identity) + '</strong>'
       + ' <span style="color:var(--dim)">SOCKS 127.0.0.1:' + esc(String(row.port))
@@ -7037,9 +7052,8 @@ async function drawTunnel(panel){
       + (socks && socks.refused
          ? '<div style="font-size:11px;color:var(--dim)">'
            + esc(String(socks.refused)) + ' refused on the SOCKS port'
-           + ' (auth ' + esc(String(socks.refused_auth))
-           + ', capacity ' + esc(String(socks.refused_capacity))
-           + ', tunnel ' + esc(String(socks.refused_tunnel)) + ')</div>'
+           + (refused ? ' &mdash; ' + refused : '')
+           + '</div>'
          : '')
       + (row.socks_detail
          ? '<div style="font-size:11px;color:var(--dim)">' + esc(row.socks_detail) + '</div>'
