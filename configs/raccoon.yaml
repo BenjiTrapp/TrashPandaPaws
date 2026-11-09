@@ -201,7 +201,7 @@ agent:
   # readable by its owner only (chmod 600) or the agent refuses to start. The
   # C2 and agent tokens come from RACCOON_TOKEN and RACCOON_AGENT_TOKEN.
   llm:
-    # anthropic | bedrock | openrouter | opencode | local
+    # anthropic | bedrock | openrouter | opencode | local | ollama
     #
     # bedrock reads AWS_BEARER_TOKEN_BEDROCK if no key is configured, and its
     # endpoint follows AWS_REGION; the model id carries its own region prefix

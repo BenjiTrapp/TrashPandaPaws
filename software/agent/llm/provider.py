@@ -379,7 +379,7 @@ def _on_full_allowlist(model: str) -> bool:
 def capability_tier(model, provider_name) -> str:
     """"full", "reduced" or "minimal" for the model driving the agent."""
     name = (model or "").strip().lower()
-    local = (provider_name or "").strip().lower() == "local"
+    local = (provider_name or "").strip().lower() in LOCAL_PROVIDERS
     # A local endpoint never reaches "full" on its name alone. The name is
     # whatever the operator typed; the server behind it may be anything,
     # while openrouter and opencode route to the model they are asked for.
@@ -407,7 +407,15 @@ _PROVIDERS = {
     "openrouter": ("openai", "https://openrouter.ai/api/v1", True, False),
     "opencode":   ("openai", None, True, True),
     "local":      ("openai", "http://127.0.0.1:11434/v1", False, False),
+    "ollama":     ("openai", "http://127.0.0.1:11434/v1", False, False),
 }
+
+# Providers whose endpoint is whatever the operator typed, so the model name
+# vouches for nothing: a server named "gpt-4o" may be a 7B model. openrouter
+# and opencode route to the model they are asked for and are not in here.
+# "local" is LM Studio and llama.cpp; "ollama" is its own name for the same
+# shape of endpoint.
+LOCAL_PROVIDERS = frozenset(("local", "ollama"))
 
 
 def _is_loopback(host: Optional[str]) -> bool:

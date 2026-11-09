@@ -119,7 +119,8 @@ comes with a `reason`.
 | `bedrock` | `AWS_BEARER_TOKEN_BEDROCK` is read if no key is set; the endpoint follows `AWS_REGION` |
 | `openrouter` | `AGENT_API_KEY`, a `vendor/model` name |
 | `opencode` | `AGENT_API_KEY` **and** `AGENT_BASE_URL` — there is no built-in endpoint |
-| `local` | a `AGENT_BASE_URL` (Ollama, LM Studio, llama.cpp); no key |
+| `local` | a `AGENT_BASE_URL` (LM Studio, llama.cpp); no key |
+| `ollama` | a model that is pulled (`ollama pull`); no key; endpoint defaults to `http://127.0.0.1:11434/v1` |
 
 A Bedrock model id carries its own region prefix (`eu.`, `us.`). An EU id
 against a US endpoint fails at the first call rather than at configuration,

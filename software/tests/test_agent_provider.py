@@ -188,6 +188,21 @@ class TestClientSelection(unittest.TestCase):
             provider.create_client(_cfg(
                 provider="local", model="m", base_url="file:///etc/passwd"))
 
+    def test_ollama_defaults_to_loopback_and_needs_no_key(self):
+        c = provider.create_client(_cfg(provider="ollama", model="qwen2.5:14b"))
+        self.assertEqual(c.provider, "ollama")
+        self.assertIsInstance(c, openai_client.OpenAiCompatibleClient)
+        stub = _Stub({"choices": [{"message": {"content": "hi"}}]})
+        c._transport = stub
+        _run(c.complete("", [{"role": "user", "content": "x"}], [], 16, 0.0))
+        self.assertEqual(stub.calls[0][0],
+                         "http://127.0.0.1:11434/v1/chat/completions")
+        self.assertNotIn("Authorization", stub.calls[0][1])
+
+    def test_ollama_is_a_local_provider(self):
+        self.assertIn("ollama", provider.LOCAL_PROVIDERS)
+        self.assertIn("local", provider.LOCAL_PROVIDERS)
+
 
 # ── Capability tiers ──
 
@@ -311,6 +326,16 @@ class TestCapabilityTiers(unittest.TestCase):
                   "mixtral:8x7b", "llama3"):
             self.assertEqual(provider.capability_tier(m, "local"),
                              "reduced", m)
+
+    def test_a_local_provider_never_reaches_full_on_its_model_name(self):
+        for name in sorted(provider.LOCAL_PROVIDERS):
+            self.assertEqual(provider.capability_tier("gpt-4o", name),
+                             "reduced")
+
+    def test_a_small_model_on_any_local_provider_is_minimal(self):
+        for name in sorted(provider.LOCAL_PROVIDERS):
+            self.assertEqual(provider.capability_tier("qwen2.5:14b", name),
+                             "minimal")
 
     def test_parameter_count_only_counts_for_local(self):
         self.assertEqual(
