@@ -2418,6 +2418,14 @@ _OPERATOR_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Raccoon C2</title>
+<!-- A real file, so the tab is right before any script runs and stays
+     right if one fails. The animation below replaces this href with
+     frames it draws; the id is how it finds it. -->
+<link id="favicon" rel="icon" type="image/png" sizes="64x64"
+      href="/static/favicon-64.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png">
+<link rel="apple-touch-icon" href="/static/favicon-128.png">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -2446,7 +2454,14 @@ header{
   background:var(--surface);border-bottom:1px solid var(--border);
   box-shadow:0 2px 20px rgba(255,26,26,0.08);
 }
-header img{width:38px;height:38px;border-radius:50%;border:2px solid var(--red-dim)}
+/* object-fit is the part that matters. This used to be handed
+   /logo.png -- a 677x369 banner of a round badge on a white field --
+   and 38x38 squashed a 1.83:1 image into a square, after which the
+   border-radius cropped a circle out of the white margin. The source is
+   square now, and `cover` means that even a wrong one would be cropped
+   rather than distorted. */
+header img{width:38px;height:38px;border-radius:50%;object-fit:cover;
+  border:2px solid var(--red-dim);box-shadow:0 0 10px var(--red-glow)}
 header h1{font-size:18px;font-weight:700;color:var(--red);text-shadow:0 0 15px var(--red-glow);letter-spacing:0.04em}
 header .subtitle{font-size:11px;color:var(--text2);margin-left:4px}
 header .spacer{flex:1}
@@ -3298,7 +3313,8 @@ header .info{font-size:11px;color:var(--text2)}
 <body>
 <div id="app">
   <header>
-    <img src="/logo.png" alt="Logo" onerror="this.style.display='none'">
+    <img src="/static/favicon-128.png" alt="Trash Panda Paws"
+         onerror="this.style.display='none'">
     <h1>RACCOON C2</h1>
     <span class="subtitle">Team Server</span>
     <div class="spacer"></div>
@@ -3693,6 +3709,66 @@ async function pollHistory(id){
   term.scrollTop = term.scrollHeight;
   refreshAgents();
 }
+
+// ── The favicon, with the eyes alight ──
+//
+// Measured, not eyeballed: these are where the glowing eyes are in
+// `/static/favicon-64.png`, as fractions of its size, printed by
+// `tools/make_brand_assets.py` when it cut the face out of the
+// wallpaper. A test in `software/tests/test_brand_assets.py` re-derives
+// them from the committed file and fails if they drift, because a crop
+// that moves would otherwise leave the glow sitting on the fur.
+const FAVICON_EYES = [[0.3340, 0.4414], [0.5664, 0.4453]];
+const FAVICON_EYE_RADIUS = 0.0293;
+
+function animateFavicon(){
+  const link = document.getElementById("favicon");
+  if(!link || !window.HTMLCanvasElement) return;
+  const size = 64;
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if(!ctx) return;
+
+  const base = new Image();
+  base.onerror = () => {};   // the static href above stays; nothing breaks
+  base.onload = () => {
+    const draw = () => {
+      // Nothing is drawn while the tab is hidden. A favicon nobody can
+      // see is not worth ten frames a second, and this runs for as long
+      // as the console is open -- which for an operator is all day.
+      if(document.hidden){ setTimeout(draw, 1000); return; }
+
+      const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 1000 * 2.2);
+      ctx.clearRect(0, 0, size, size);
+      ctx.drawImage(base, 0, 0, size, size);
+      ctx.globalCompositeOperation = "lighter";
+      FAVICON_EYES.forEach(eye => {
+        const cx = eye[0] * size, cy = eye[1] * size;
+        const r = FAVICON_EYE_RADIUS * size * (2.0 + 1.6 * pulse);
+        const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+        grad.addColorStop(0, "rgba(255,120,90," + (0.30 + 0.60 * pulse).toFixed(3) + ")");
+        grad.addColorStop(0.40, "rgba(255,26,26," + (0.20 + 0.45 * pulse).toFixed(3) + ")");
+        grad.addColorStop(1, "rgba(255,26,26,0)");
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.fill();
+      });
+      ctx.globalCompositeOperation = "source-over";
+      try {
+        link.href = canvas.toDataURL("image/png");
+      } catch(e) {
+        return;   // a tainted canvas would throw once and for ever
+      }
+      setTimeout(draw, 100);
+    };
+    draw();
+  };
+  base.src = "/static/favicon-64.png";
+}
+
+animateFavicon();
 
 function esc(s){
   if(s==null) return "";
