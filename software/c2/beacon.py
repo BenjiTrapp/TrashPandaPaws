@@ -2858,8 +2858,17 @@ class TunnelEndpoint(object):
         self._proxy_ntlm = ntlm if isinstance(ntlm, dict) else {}
 
         self._lock = threading.Lock()
+        # Write-once: `run` never clears it. A `stop` that lands before
+        # `run` -- including the whole window between a caller's
+        # `thread.start()` and `run`'s first line, which is milliseconds
+        # under load -- has to be the one that wins, and a flag `run`
+        # could clear would erase it and leave the reconnect loop running
+        # for ever. So one `TunnelEndpoint` is one `run`: the keep-alive
+        # and both relay directions read this same event, and supporting
+        # a restart would mean threading a generation number through all
+        # of them for a caller nothing has asked for. Task 8 constructs a
+        # fresh endpoint per child, which is the shape that wants.
         self._stop = threading.Event()
-        self._stop.set()
         self._channel = None        # type: Optional[_TunnelChannel]
         self._connected = False
         self._failures = 0
@@ -2882,6 +2891,9 @@ class TunnelEndpoint(object):
     def run(self) -> None:
         """Hold a command channel open, reconnecting until `stop`. Blocks.
 
+        Called once per instance: a `stop` is final, because the flag it
+        sets is also what the keep-alive and both relay directions watch.
+
         Refuses to start on the pure-Python cipher unless told otherwise.
         Pure-Python AES-GCM moves roughly 50-200 KB/s, which is fine for
         the small messages the rest of this file sends and useless for a
@@ -2900,7 +2912,13 @@ class TunnelEndpoint(object):
                 "cared to look. Install OpenSSL, or set "
                 "c2.tunnel.allow_slow_crypto to run on the slow path "
                 "deliberately.")
-        self._stop.clear()
+        if self._stop.is_set():
+            # A `stop` that landed before this line, which is a caller
+            # that changed its mind during thread start-up. It wins: the
+            # flag is write-once and this returns without dialling.
+            logger.info("tunnel: endpoint %r was stopped before it started",
+                        self.identity)
+            return
         logger.info("tunnel: endpoint %r dialling %s:%d, crypto %s",
                     self.identity, self.server, self.port,
                     self._crypto_path())
@@ -2927,6 +2945,11 @@ class TunnelEndpoint(object):
     def stop(self) -> None:
         """Stop reconnecting and drop everything. Safe before `run`, twice.
 
+        Final, and before `run` as well as during it: the flag is never
+        cleared, so a `stop` that arrives while a caller is still getting
+        `run` onto a thread makes that `run` return without dialling,
+        rather than being erased by it.
+
         Every socket is shut down rather than only closed: a pump parked
         in a read, or in a send that TCP backpressure has stopped, does
         not wake on a bare close on every platform, and this must not wait
@@ -2935,6 +2958,14 @@ class TunnelEndpoint(object):
         self._stop.set()
         with self._lock:
             channel = self._channel
+            # Cleared here and not left to the command loop's own
+            # unwinding: `stop` has just closed the channel, so a
+            # `status` read immediately afterwards would otherwise report
+            # an endpoint that is connected to a socket it no longer has.
+            # The command loop clears it again on its way out, which is
+            # idempotent.
+            self._connected = False
+            self._channel = None
             sockets = list(self._relay_sockets)
             threads = list(self._relay_threads)
             relay, self._ntlm_relay = self._ntlm_relay, None
@@ -3506,14 +3537,23 @@ class TunnelEndpoint(object):
                            "(%s); falling back", exc)
             return None
         with self._lock:
-            if self._ntlm_relay is None:
+            if self._stop.is_set():
+                # `stop` ran while this relay was binding its port, and
+                # took `_ntlm_relay` with it. Installing it now would
+                # leave a bound loopback port and an accept thread that
+                # nothing is left to stop.
+                installed = None
+            elif self._ntlm_relay is None:
                 self._ntlm_relay = relay
-                relay = None
-            started = self._ntlm_relay
-        if relay is not None:
-            # Another thread won the race; one local port is enough.
+                installed = relay
+            else:
+                # Another thread won the race; one local port is enough.
+                installed = self._ntlm_relay
+        if installed is not relay:
             relay.stop()
-        return "127.0.0.1", started.port
+        if installed is None:
+            return None
+        return "127.0.0.1", installed.port
 
     def _discovered_routes(self) -> list:
         """What `ProxyDiscovery` finds, run once per endpoint and cached.

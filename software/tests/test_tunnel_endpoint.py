@@ -418,11 +418,19 @@ class TunnelEndpointTestCase(unittest.TestCase):
         endpoint = factory(config)
         thread = threading.Thread(target=endpoint.run, name="endpoint",
                                   daemon=True)
-        # LIFO: `stop` runs first, then the join it unblocks.
+        # LIFO: `stop` runs first, then the join it unblocks, and last the
+        # assertion that the join was not a timeout. Without that
+        # assertion a `run` that outlived its `stop` would leave the suite
+        # green, which is a tunnel that ignores shutdown.
+        self.addCleanup(self.assert_ended, thread)
         self.addCleanup(thread.join, 5.0)
         self.addCleanup(endpoint.stop)
         thread.start()
         return endpoint
+
+    def assert_ended(self, thread):
+        self.assertFalse(thread.is_alive(),
+                         "the endpoint's run() thread outlived its stop()")
 
     def fast_retries(self):
         """Shrink the reconnect backoff so a restart test is not a wait.
@@ -845,6 +853,121 @@ class TestTheThroughputGate(TunnelEndpointTestCase):
         endpoint = self.start_endpoint(self.config_for(server.port))
         self.wait_connected(server)
         self.assertEqual(endpoint.status()["crypto"], "openssl")
+
+
+class TestLifecycle(TunnelEndpointTestCase):
+    """`stop` is final, and final before `run` as well as during it.
+
+    Task 8 is the consumer that owns this: it starts the endpoint on a
+    thread and stops it on a command, so a `stop` arriving in the
+    milliseconds between `thread.start()` and `run`'s first line is an
+    ordinary event and not a contrived one. These tests do not race for
+    it -- they set the flag first and then require `run` to honour it,
+    which is the same property without the timing.
+    """
+
+    def test_stop_before_run_keeps_the_endpoint_from_dialling(self):
+        server = self.start_server()
+        endpoint = TunnelEndpoint(self.config_for(server.port))
+        endpoint.stop()
+
+        ended = threading.Event()
+
+        def once():
+            endpoint.run()
+            ended.set()
+
+        thread = threading.Thread(target=once, name="endpoint", daemon=True)
+        self.addCleanup(self.assert_ended, thread)
+        self.addCleanup(thread.join, 5.0)
+        thread.start()
+
+        self.assertTrue(
+            ended.wait(5.0),
+            "run() did not return after a stop() that preceded it; a run "
+            "that clears the flag reconnects for ever instead")
+        self.assertEqual(server.endpoints(), [],
+                         "the endpoint dialled out after it had been stopped")
+        self.assertFalse(endpoint.status()["connected"])
+
+    def test_stop_is_safe_twice_and_after_a_session(self):
+        server = self.start_server()
+        endpoint = self.start_endpoint(self.config_for(server.port))
+        self.wait_connected(server)
+
+        endpoint.stop()
+        endpoint.stop()
+        self.assertFalse(endpoint.status()["connected"])
+
+
+class TestTheNtlmRoute(TunnelEndpointTestCase):
+    """`_ntlm_route`, with no NTLM upstream in sight.
+
+    `_NtlmProxyRelay.start()` binds its loopback port before it returns
+    and touches the upstream only when a CONNECT arrives, so the route it
+    offers can be asserted without a proxy that speaks NTLM at all. What
+    is under test is this class's half of the wiring: that the config keys
+    are read, that the local relay is put ahead of `proxy.url`, that a
+    config with no credentials yields no route rather than a relay that
+    could never authenticate, and that `stop` takes the relay's port with
+    it. Everything from `_dial_route` onward is the same code the stub
+    CONNECT proxy tests above already carry traffic through.
+    """
+
+    def endpoint(self, ntlm, url=""):
+        proxy = {"mode": "manual", "url": url, "ntlm": ntlm}
+        # Port 1234 is never dialled here: nothing in this class connects.
+        endpoint = TunnelEndpoint(self.config_for(1234, proxy=proxy))
+        self.addCleanup(endpoint.stop)
+        return endpoint
+
+    @staticmethod
+    def _refuses(port):
+        """True once nothing is listening on `port`."""
+        try:
+            sock = socket.create_connection((_LOOPBACK, port), timeout=1.0)
+        except OSError:
+            return True
+        sock.close()
+        return False
+
+    def test_an_ntlm_upstream_becomes_the_first_way_out(self):
+        endpoint = self.endpoint(
+            {"enabled": True, "host": "proxy.corp.invalid", "port": 8080,
+             "username": "CORP\\operator", "password": "not-a-real-secret"},
+            url="http://%s:3128" % _LOOPBACK)
+
+        # `_configured_routes` rather than `_routes`, so that asserting on
+        # the order does not also run proxy discovery, which shells out
+        # and resolves names on whatever host this is.
+        routes = endpoint._configured_routes()
+        self.assertEqual(len(routes), 2)
+        host, port = routes[0]
+        self.assertEqual(host, _LOOPBACK)
+        self.assertNotEqual(port, 0)
+        # The local relay and not the configured proxy: a build told to
+        # authenticate with NTLM has to reach the upstream through the
+        # thing that can do it, and `proxy.url` is the fallback behind it.
+        self.assertNotEqual(port, 3128)
+        self.assertEqual(routes[1], (_LOOPBACK, 3128))
+        # Asked twice, the same relay: one local port per endpoint.
+        self.assertEqual(endpoint._configured_routes(), routes)
+
+        endpoint.stop()
+        self.wait_for(lambda: self._refuses(port), timeout=5.0,
+                      what="the NTLM relay's port closing with its endpoint")
+
+    def test_ntlm_without_credentials_offers_no_route(self):
+        endpoint = self.endpoint({"enabled": True,
+                                  "host": "proxy.corp.invalid"},
+                                 url="http://%s:3128" % _LOOPBACK)
+        self.assertEqual(endpoint._configured_routes(), [(_LOOPBACK, 3128)])
+
+    def test_ntlm_disabled_offers_no_route(self):
+        endpoint = self.endpoint({"enabled": False, "host": "proxy.corp",
+                                  "username": "u", "password": "p"},
+                                 url="http://%s:3128" % _LOOPBACK)
+        self.assertEqual(endpoint._configured_routes(), [(_LOOPBACK, 3128)])
 
 
 class TestConfigProblems(TunnelEndpointTestCase):
