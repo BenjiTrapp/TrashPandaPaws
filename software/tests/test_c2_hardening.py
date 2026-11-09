@@ -1222,9 +1222,14 @@ class TestKeyMustBeSupplied(unittest.TestCase):
         self.assertNotIn("derive_key", source)
 
     def test_no_sha256_of_a_url_remains_in_the_beacon(self):
-        # The one hash left names the implant; it never touches the key.
+        # An allow-list, so a new hash in the beacon is a decision and not
+        # an accident. `_generate_id` names the implant. `mix_hash` keeps
+        # the Noise handshake hash, which is a transcript of public
+        # material -- protocol name, prologue, ephemeral public keys,
+        # ciphertexts -- and derives no key: every Noise key comes out of
+        # `_hkdf`. Neither one has ever seen the callback URL.
         self.assertEqual(self._sha256_callers(beacon_mod.__file__),
-                         {"_generate_id"})
+                         {"_generate_id", "mix_hash"})
 
     # ── Beacon ──
 

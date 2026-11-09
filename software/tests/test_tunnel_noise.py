@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Unit tests for the tunnel's Noise primitives in `software/c2/beacon.py`:
-X25519 key agreement and the Noise-flavoured HKDF.
+Unit tests for the tunnel's Noise layer in `software/c2/beacon.py`: X25519
+key agreement, the Noise-flavoured HKDF, and the
+`Noise_NKpsk0_25519_AESGCM_SHA256` handshake and transport state machine.
 
 Both primitives have two backends, as AES-256-GCM in the same module
 already does -- OpenSSL through ctypes where libcrypto offers the EVP
@@ -15,6 +16,13 @@ The arbiter for X25519 is the RFC 7748 §5.2 test vector. The arbiter for
 HKDF is RFC 5869 test case 1, adapted to Noise's calling convention: the
 chaining key is the salt and there is no `info`, so the expected outputs
 are chained from the PRK the RFC publishes for that case.
+
+The arbiter for the state machine is the Cacophony vector for this exact
+suite, copied in below. It has to be an outside arbiter: a Noise
+implementation driven against itself agrees with itself even when it has
+misread the pattern, so every self-interop test here would pass on a
+transcript no other implementation could speak. The vector pins the bytes
+instead.
 """
 
 import unittest
@@ -99,6 +107,45 @@ def _available_backends():
     backends = [_pure_backend()]
     if not _IMPORT_PURE:
         backends.append(_ctypes_backend())
+    return backends
+
+
+# The same question for AES-256-GCM, which the Noise cipher state drives.
+# A separate flag and a separate measurement: libcrypto 1.0.2 serves
+# AES-256-GCM while exporting no raw-key API, so one backend can be the
+# fast path while the other is not.
+_IMPORT_PURE_AES = beacon_mod._USE_PURE_PYTHON_AES
+
+
+@contextmanager
+def _pure_aes_backend():
+    """Force the pure-Python AES-256-GCM path."""
+    original = beacon_mod._USE_PURE_PYTHON_AES
+    beacon_mod._USE_PURE_PYTHON_AES = True
+    try:
+        yield
+    finally:
+        beacon_mod._USE_PURE_PYTHON_AES = original
+
+
+@contextmanager
+def _ctypes_aes_backend():
+    """Force the OpenSSL AES-256-GCM path. Skips where it is unusable."""
+    if _IMPORT_PURE_AES:
+        raise unittest.SkipTest("no OpenSSL AES-256-GCM on this machine")
+    original = beacon_mod._USE_PURE_PYTHON_AES
+    beacon_mod._USE_PURE_PYTHON_AES = False
+    try:
+        yield
+    finally:
+        beacon_mod._USE_PURE_PYTHON_AES = original
+
+
+def _available_aes_backends():
+    """(name, context manager) for every AES backend this machine runs."""
+    backends = [("pure", _pure_aes_backend())]
+    if not _IMPORT_PURE_AES:
+        backends.append(("openssl", _ctypes_aes_backend()))
     return backends
 
 
@@ -216,6 +263,423 @@ class TestHkdf(unittest.TestCase):
         for num_outputs in (1, 4):
             with self.assertRaises(ValueError):
                 beacon_mod._hkdf(RFC5869_SALT, RFC5869_IKM, num_outputs)
+
+
+# ── The Cacophony vector for Noise_NKpsk0_25519_AESGCM_SHA256 ──
+#
+# Copied from `vectors/cacophony.txt` in haskell-cryptography/cacophony,
+# the entry whose `protocol_name` is exactly this suite. Cacophony is an
+# independent Haskell implementation of the Noise Protocol Framework, and
+# its corpus is the one the Noise wiki points implementers at. The vector
+# fixes both ephemerals and a non-empty prologue, because the transcript
+# is only reproducible if every input is pinned.
+#
+# This is the only Noise test here that can disagree with the
+# specification. Every other Noise test below drives our initiator against
+# our own responder, which proves the two halves agree with each other and
+# nothing at all about whether they agree with the standard.
+
+VECTOR_PROLOGUE = b"John Galt"
+VECTOR_PSK = bytes.fromhex(
+    "54686973206973206d7920417573747269616e20706572737065637469766521")
+VECTOR_INIT_EPHEMERAL = bytes.fromhex(
+    "893e28b9dc6ca8d611ab664754b8ceb7bac5117349a4439a6b0569da977c464a")
+VECTOR_RESP_EPHEMERAL = bytes.fromhex(
+    "bbdb4cdbd309f1a1f2e1456967fe288cadd6f712d65dc7b7793d5e63da6b375b")
+VECTOR_RESP_STATIC = bytes.fromhex(
+    "4a3acbfdb163dec651dfa3194dece676d437029c62a408b4c5ea9114246e4893")
+# The vector calls this `init_remote_static`: the public half of
+# `resp_static`, which the NK pre-message says the initiator already has.
+VECTOR_RESP_STATIC_PUBLIC = bytes.fromhex(
+    "31e0303fd6418d2f8c0e78b91f22e8caed0fbe48656dcf4767e4834f701b8f62")
+VECTOR_HANDSHAKE_HASH = bytes.fromhex(
+    "c9855b6c52aeba6b7d07097d260e058ea90e85fa810c0c3e2ec3869f3f4319c9")
+
+# The vector's first two messages are the handshake: message 1 from the
+# initiator, message 2 from the responder, each carrying a payload.
+VECTOR_ONE_PAYLOAD = b"Ludwig von Mises"
+VECTOR_ONE_MESSAGE = bytes.fromhex(
+    "ca35def5ae56cec33dc2036731ab14896bc4c75dbb07a61f879f8e3afa4c7944"
+    "052cffc8d5cdfaed3f9ca0a86c406cf58d24cfc3cec1af5060fd25c4e8a5ac04")
+VECTOR_TWO_PAYLOAD = b"Murray Rothbard"
+VECTOR_TWO_MESSAGE = bytes.fromhex(
+    "95ebc60d2b1fa672c1f46a8aa265ef51bfe38e7ccb39ec5be34069f144808843"
+    "afd57077a1747b71254c19bd798c87ac61a2d4808a30a1372f81b2cb4d85f6")
+
+# The rest are transport messages, alternating with the initiator first.
+VECTOR_TRANSPORT = (
+    ("initiator", b"F. A. Hayek",
+     bytes.fromhex("0ed5fabce6ef0ded315c4f213c51ea1e89be89f86c5dc98e50d15d")),
+    ("responder", b"Carl Menger",
+     bytes.fromhex("ba3cbc8800e6eb1b585269dca0f00fdc21f830eb1a497589215f7f")),
+    ("initiator", b"Jean-Baptiste Say",
+     bytes.fromhex("f1205cc05144bce5aad775bc12a7d569bfdd474337cdb03b09ae54"
+                   "78c0cd166eb4")),
+    ("responder", b"Eugen B\xf6hm von Bawerk",
+     bytes.fromhex("32b8e77e5be275d093618c2a1fef8b6c4c263b23a39d25cce75101"
+                   "5d44a7b4003aa4f66512")),
+)
+
+
+def _vector_sessions():
+    """The vector's two sessions, with its ephemerals and prologue pinned."""
+    initiator = beacon_mod.NoiseSession.initiator(
+        VECTOR_RESP_STATIC_PUBLIC, VECTOR_PSK, prologue=VECTOR_PROLOGUE)
+    initiator._fix_ephemeral(VECTOR_INIT_EPHEMERAL)
+    responder = beacon_mod.NoiseSession.responder(
+        VECTOR_RESP_STATIC, lambda: [VECTOR_PSK], prologue=VECTOR_PROLOGUE)
+    responder._fix_ephemeral(VECTOR_RESP_EPHEMERAL)
+    return initiator, responder
+
+
+def _handshake_pair(psk=None, psk_lookup=None, payload=b"hello"):
+    """A completed handshake over fresh keys.
+
+    Returns (initiator, responder, the first message's payload): the shape
+    every caller below needs, with the two PSK arguments left open so a
+    test can give the two ends different material.
+    """
+    static_private, static_public = beacon_mod._x25519_keypair()
+    if psk is None:
+        psk = b"\x11" * 32
+    if psk_lookup is None:
+        psk_lookup = (lambda: [psk])
+    initiator = beacon_mod.NoiseSession.initiator(static_public, psk)
+    responder = beacon_mod.NoiseSession.responder(static_private, psk_lookup)
+    first = responder.respond(initiator.initiate(payload))
+    initiator.complete(responder.reply())
+    return initiator, responder, first
+
+
+class TestNoiseAgainstThePublishedVector(unittest.TestCase):
+    """`Noise_NKpsk0_25519_AESGCM_SHA256` against the Cacophony corpus.
+
+    Run under every AES backend this machine has, because the handshake
+    is where the authenticated data matters: Noise uses the running
+    handshake hash as the AAD of each handshake payload, so a backend that
+    mishandles AAD would produce a transcript that still round-trips
+    against itself.
+    """
+
+    def test_the_protocol_name_is_exactly_the_hash_length(self):
+        # Noise's InitializeSymmetric pads a short protocol name with
+        # zeroes and hashes a long one. This suite's name is 32 bytes --
+        # exactly SHA256's output -- so `h` starts as the name verbatim and
+        # neither branch is reachable. That is why the implementation
+        # carries neither; a rename that broke the coincidence would make
+        # it wrong, so the coincidence is pinned here.
+        self.assertEqual(len(beacon_mod.NoiseSession.PROTOCOL_NAME), 32)
+        self.assertEqual(beacon_mod.NoiseSession.PROTOCOL_NAME,
+                         b"Noise_NKpsk0_25519_AESGCM_SHA256")
+
+    def test_handshake_messages_match_the_published_vector(self):
+        for name, backend in _available_aes_backends():
+            with self.subTest(aes=name), backend:
+                initiator, responder = _vector_sessions()
+                message_one = initiator.initiate(VECTOR_ONE_PAYLOAD)
+                self.assertEqual(message_one, VECTOR_ONE_MESSAGE)
+                self.assertEqual(responder.respond(message_one),
+                                 VECTOR_ONE_PAYLOAD)
+                message_two = responder.reply(VECTOR_TWO_PAYLOAD)
+                self.assertEqual(message_two, VECTOR_TWO_MESSAGE)
+                initiator.complete(message_two)
+
+    def test_handshake_hash_matches_the_published_vector(self):
+        # The handshake hash covers the protocol name, the prologue, the
+        # pre-message, both ephemerals and both handshake ciphertexts, so
+        # agreeing on it means agreeing on the order every one of those
+        # was mixed in.
+        for name, backend in _available_aes_backends():
+            with self.subTest(aes=name), backend:
+                initiator, responder = _vector_sessions()
+                responder.respond(initiator.initiate(VECTOR_ONE_PAYLOAD))
+                initiator.complete(responder.reply(VECTOR_TWO_PAYLOAD))
+                self.assertEqual(initiator.handshake_hash,
+                                 VECTOR_HANDSHAKE_HASH)
+                self.assertEqual(responder.handshake_hash,
+                                 VECTOR_HANDSHAKE_HASH)
+
+    def test_transport_messages_match_the_published_vector(self):
+        # Four transport messages, alternating, which pins the split --
+        # which of the two keys each end sends under -- and the nonce
+        # encoding, since the third message from each end uses counter 1.
+        for name, backend in _available_aes_backends():
+            with self.subTest(aes=name), backend:
+                initiator, responder = _vector_sessions()
+                responder.respond(initiator.initiate(VECTOR_ONE_PAYLOAD))
+                initiator.complete(responder.reply(VECTOR_TWO_PAYLOAD))
+                for sender, payload, expected in VECTOR_TRANSPORT:
+                    if sender == "initiator":
+                        writer, reader = initiator, responder
+                    else:
+                        writer, reader = responder, initiator
+                    message = writer.encrypt(payload)
+                    self.assertEqual(message, expected,
+                                     "%s transport message" % sender)
+                    self.assertEqual(reader.decrypt(message), payload)
+
+
+class TestNoiseSession(unittest.TestCase):
+    """The state machine as the tunnel will drive it, over fresh keys."""
+
+    def test_nkpsk0_handshake_completes_and_keys_match(self):
+        initiator, responder, _ = _handshake_pair()
+        self.assertEqual(initiator.handshake_hash, responder.handshake_hash)
+        self.assertEqual(len(initiator.handshake_hash), 32)
+        # Matching hashes are not matching keys: carry traffic each way.
+        self.assertEqual(responder.decrypt(initiator.encrypt(b"up")), b"up")
+        self.assertEqual(initiator.decrypt(responder.encrypt(b"down")),
+                         b"down")
+        # The two directions are separate keys with separate counters, so
+        # the first message each way is distinct even for one plaintext.
+        self.assertNotEqual(initiator.encrypt(b"same"),
+                            responder.encrypt(b"same"))
+
+    def test_first_message_carries_a_payload_the_responder_reads(self):
+        # The discriminator the tunnel server dispatches on: whether this
+        # connection is a command channel or a relay is inside the first
+        # authenticated payload, so `respond` has to hand it back.
+        _, _, first = _handshake_pair(payload=b'{"kind":1,"id":"abc"}')
+        self.assertEqual(first, b'{"kind":1,"id":"abc"}')
+
+    def test_wrong_psk_fails_the_handshake(self):
+        static_private, static_public = beacon_mod._x25519_keypair()
+        initiator = beacon_mod.NoiseSession.initiator(
+            static_public, b"\x01" * 32)
+        responder = beacon_mod.NoiseSession.responder(
+            static_private, lambda: [b"\x02" * 32])
+        secret = b"PAYLOAD-THAT-MUST-NOT-APPEAR"
+        message = initiator.initiate(secret)
+        with self.assertRaises(ValueError) as caught:
+            responder.respond(message)
+        # The refusal must not become a disclosure: no part of the
+        # plaintext in the message, and no plaintext anywhere in the
+        # message bytes, which would mean it was never encrypted at all.
+        self.assertNotIn("PAYLOAD", str(caught.exception))
+        self.assertNotIn(secret, message)
+        # And the session is dead rather than half-open.
+        with self.assertRaises(RuntimeError):
+            responder.reply()
+        with self.assertRaises(RuntimeError):
+            responder.encrypt(b"anything")
+
+    def test_responder_tries_several_psks_and_takes_the_matching_one(self):
+        # A deployment holds one PSK per build, so the responder cannot
+        # know which one a connection belongs to until it authenticates.
+        psk = b"\x33" * 32
+        calls = []
+
+        def lookup():
+            calls.append(1)
+            return [b"\x44" * 32, psk, b"\x55" * 32]
+
+        initiator, responder, first = _handshake_pair(
+            psk=psk, psk_lookup=lookup, payload=b"third-in-the-list")
+        self.assertEqual(first, b"third-in-the-list")
+        # Which one matched is what the caller maps to a build identity.
+        self.assertEqual(responder.psk, psk)
+        self.assertEqual(initiator.psk, psk)
+        # Asked once, and the candidate list is the whole bound on the work.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(responder.decrypt(initiator.encrypt(b"x")), b"x")
+
+    def test_an_empty_psk_list_fails_the_handshake(self):
+        # A responder with no PSKs registered has nothing to try. It must
+        # say so rather than fall through to an unauthenticated session.
+        static_private, static_public = beacon_mod._x25519_keypair()
+        initiator = beacon_mod.NoiseSession.initiator(
+            static_public, b"\x11" * 32)
+        responder = beacon_mod.NoiseSession.responder(
+            static_private, lambda: [])
+        with self.assertRaises(ValueError):
+            responder.respond(initiator.initiate(b"hello"))
+
+    def test_first_message_is_indistinguishable_without_the_psk(self):
+        # Everything about message 1 that an enumerator could fingerprint:
+        # a constant byte at any offset is the `00 00` mistake the
+        # original's infrastructure was mapped by. Same server key, same
+        # PSK, same payload, so only the ephemeral differs -- and that
+        # must be enough to vary every byte, which it is only if the
+        # ephemeral is mixed into the key before the payload is sealed.
+        static_private, static_public = beacon_mod._x25519_keypair()
+        psk = b"\x66" * 32
+        payload = b"HELLO"
+        messages = [
+            beacon_mod.NoiseSession.initiator(
+                static_public, psk).initiate(payload)
+            for _ in range(12)]
+        lengths = set(len(m) for m in messages)
+        # Length is the one thing the pattern does leak: 32 bytes of
+        # ephemeral, the payload, and a 16-byte tag.
+        self.assertEqual(lengths, {32 + len(payload) + 16})
+        for offset in range(32 + len(payload) + 16):
+            seen = set(m[offset] for m in messages)
+            self.assertGreater(len(seen), 1,
+                               "byte %d is the same in all 12 first "
+                               "messages" % offset)
+        self.assertEqual(len(set(messages)), len(messages))
+        for message in messages:
+            self.assertNotIn(payload, message)
+        # Each of those is a real message, not noise: the responder that
+        # holds the matching static key reads the last one.
+        responder = beacon_mod.NoiseSession.responder(
+            static_private, lambda: [psk])
+        self.assertEqual(responder.respond(messages[-1]), payload)
+
+    def test_transport_messages_are_sequenced(self):
+        # Noise gives each direction a counter and no window, which is
+        # what a stream wants: a frame that arrives early and a frame that
+        # arrives twice are both the wrong counter, and both are refused.
+        initiator, responder, _ = _handshake_pair()
+        first = initiator.encrypt(b"one")
+        second = initiator.encrypt(b"two")
+        self.assertNotEqual(first, second)
+        with self.assertRaises(ValueError):
+            responder.decrypt(second)
+        self.assertEqual(responder.decrypt(first), b"one")
+        with self.assertRaises(ValueError):
+            responder.decrypt(first)
+        # None of those failures consumed the counter, so the stream can
+        # still be read in order.
+        self.assertEqual(responder.decrypt(second), b"two")
+
+    def test_the_nonce_counter_refuses_to_wrap(self):
+        # Noise forbids the 2**64-1 nonce outright: reusing a counter
+        # under one key would destroy the cipher, so the session must stop
+        # instead. Unreachable in practice at 64 bits, so it is driven
+        # here rather than left as an unexercised branch.
+        initiator, responder, _ = _handshake_pair()
+        initiator._send._nonce = 2 ** 64 - 1
+        with self.assertRaises(ValueError) as caught:
+            initiator.encrypt(b"one too many")
+        self.assertIn("nonce", str(caught.exception))
+        responder._recv._nonce = 2 ** 64 - 1
+        with self.assertRaises(ValueError) as caught:
+            responder.decrypt(b"\x00" * 32)
+        self.assertIn("nonce", str(caught.exception))
+
+    def test_message_over_65535_is_refused_by_the_api(self):
+        # A Noise transport message is at most 65535 bytes including the
+        # 16-byte tag, so the plaintext ceiling is 65519. The refusal has
+        # to happen here: the framing above this adds a `>H` prefix, and a
+        # message that does not fit in it would be silently truncated.
+        initiator, responder, _ = _handshake_pair()
+        largest = b"A" * 65519
+        sealed = initiator.encrypt(largest)
+        self.assertEqual(len(sealed), 65535)
+        self.assertEqual(responder.decrypt(sealed), largest)
+        with self.assertRaises(ValueError) as caught:
+            initiator.encrypt(b"A" * 65520)
+        self.assertIn("65519", str(caught.exception))
+        with self.assertRaises(ValueError):
+            responder.decrypt(b"A" * 65536)
+
+    def test_a_handshake_payload_that_cannot_fit_is_refused(self):
+        # Message 1 spends 32 bytes on the ephemeral and 16 on the tag, so
+        # its payload ceiling is lower than the transport one. Checked
+        # separately because the overhead differs, not because the rule
+        # does.
+        _, static_public = beacon_mod._x25519_keypair()
+        initiator = beacon_mod.NoiseSession.initiator(
+            static_public, b"\x77" * 32)
+        with self.assertRaises(ValueError):
+            initiator.initiate(b"A" * (65535 - 32 - 16 + 1))
+
+    def test_decrypt_of_a_tampered_frame_raises(self):
+        initiator, responder, _ = _handshake_pair()
+        sealed = initiator.encrypt(b"carry me")
+        for offset in (0, len(sealed) // 2, len(sealed) - 1):
+            tampered = bytearray(sealed)
+            tampered[offset] ^= 0x01
+            with self.assertRaises(ValueError):
+                responder.decrypt(bytes(tampered))
+        # A truncated frame is refused too, and none of those failures
+        # moved the counter: the honest frame still reads.
+        with self.assertRaises(ValueError):
+            responder.decrypt(sealed[:-1])
+        self.assertEqual(responder.decrypt(sealed), b"carry me")
+
+    def test_a_tampered_handshake_message_raises(self):
+        static_private, static_public = beacon_mod._x25519_keypair()
+        psk = b"\x88" * 32
+        message = bytearray(beacon_mod.NoiseSession.initiator(
+            static_public, psk).initiate(b"hello"))
+        # Offset 0 is inside the ephemeral public key, which the pattern
+        # sends in clear. Changing it changes both the hash and the shared
+        # secret, so the clear part of the message is authenticated too:
+        # there is no part of message 1 an attacker can edit in flight.
+        message[0] ^= 0x01
+        responder = beacon_mod.NoiseSession.responder(
+            static_private, lambda: [psk])
+        with self.assertRaises(ValueError):
+            responder.respond(bytes(message))
+
+    def test_a_truncated_handshake_message_raises(self):
+        static_private, _ = beacon_mod._x25519_keypair()
+        responder = beacon_mod.NoiseSession.responder(
+            static_private, lambda: [b"\x99" * 32])
+        for length in (0, 31, 32, 47):
+            with self.assertRaises(ValueError):
+                responder.respond(b"\x00" * length)
+
+    def test_calls_out_of_order_are_refused(self):
+        # Worth a guard rather than left to fail obscurely: Noise's cipher
+        # state returns the plaintext unchanged when it holds no key, so a
+        # transport call before the split is the one sequencing mistake
+        # that would quietly put cleartext on the wire. One keypair
+        # throughout, so the only thing being refused here is the order.
+        static_private, static_public = beacon_mod._x25519_keypair()
+        initiator = beacon_mod.NoiseSession.initiator(
+            static_public, b"\xaa" * 32)
+        responder = beacon_mod.NoiseSession.responder(
+            static_private, lambda: [b"\xaa" * 32])
+        for session in (initiator, responder):
+            with self.assertRaises(RuntimeError):
+                session.encrypt(b"too early")
+            with self.assertRaises(RuntimeError):
+                session.decrypt(b"too early")
+        # Each role refuses the other's messages, and refuses to repeat
+        # its own.
+        with self.assertRaises(RuntimeError):
+            initiator.respond(b"\x00" * 48)
+        with self.assertRaises(RuntimeError):
+            responder.initiate(b"")
+        with self.assertRaises(RuntimeError):
+            responder.reply()
+        with self.assertRaises(RuntimeError):
+            initiator.complete(b"\x00" * 48)
+        message = initiator.initiate(b"hello")
+        with self.assertRaises(RuntimeError):
+            initiator.initiate(b"again")
+        responder.respond(message)
+        with self.assertRaises(RuntimeError):
+            responder.respond(message)
+        initiator.complete(responder.reply())
+        with self.assertRaises(RuntimeError):
+            responder.reply()
+
+    def test_a_psk_that_is_not_32_bytes_is_refused(self):
+        # Noise defines the PSK as 32 bytes. HKDF would accept any length
+        # and the handshake would complete, so a short key would look like
+        # it worked -- which is the worst possible outcome for a secret.
+        _, static_public = beacon_mod._x25519_keypair()
+        for psk in (b"", b"\x01" * 31, b"\x01" * 33):
+            with self.assertRaises(ValueError):
+                beacon_mod.NoiseSession.initiator(static_public, psk)
+        static_private, static_public = beacon_mod._x25519_keypair()
+        initiator = beacon_mod.NoiseSession.initiator(
+            static_public, b"\x01" * 32)
+        responder = beacon_mod.NoiseSession.responder(
+            static_private, lambda: [b"\x01" * 31])
+        with self.assertRaises(ValueError):
+            responder.respond(initiator.initiate(b"hello"))
+
+    def test_a_static_key_that_is_not_32_bytes_is_refused(self):
+        with self.assertRaises(ValueError):
+            beacon_mod.NoiseSession.initiator(b"\x01" * 31, b"\x02" * 32)
+        with self.assertRaises(ValueError):
+            beacon_mod.NoiseSession.responder(b"\x01" * 33,
+                                              lambda: [b"\x02" * 32])
 
 
 if __name__ == "__main__":
