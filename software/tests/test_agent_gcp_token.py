@@ -13,6 +13,7 @@ the file reader are injected; nothing here touches the network beyond
 Every credential in here is an obvious fake.
 """
 
+import datetime
 import http.server
 import json
 import os
@@ -481,41 +482,234 @@ class TestMetadata(unittest.TestCase):
                 self._source().bearer()
 
 
+_HELPER = ["gcloud", "config", "config-helper", "--format=json"]
+_PRINT = ["gcloud", "auth", "print-access-token"]
+# Fixed, so an expiry string and the clock it is compared with agree.
+_WALL0 = 1_800_000_000.0
+
+
+def _expiry(seconds_from_wall0):
+    when = datetime.datetime.fromtimestamp(_WALL0 + seconds_from_wall0,
+                                           datetime.timezone.utc)
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _helper_json(token, expires_in=None, expiry=None):
+    """What `gcloud config config-helper --format=json` prints. The id_token
+    and the account are there because the real output carries them, and
+    neither may ever reach a message."""
+    credential = {"access_token": token, "id_token": "idtok-SECRET"}
+    if expiry is not None:
+        credential["token_expiry"] = expiry
+    elif expires_in is not None:
+        credential["token_expiry"] = _expiry(expires_in)
+    return json.dumps({"configuration": {"properties": {"core": {
+        "account": "bob@corp.example"}}}, "credential": credential})
+
+
+class _Gcloud:
+    """subprocess.run standing in for gcloud, answering per subcommand."""
+
+    def __init__(self, helper=None, plain=None):
+        self.helper, self.plain = helper, plain
+        self.calls = []
+
+    def __call__(self, args, **kwargs):
+        self.calls.append((list(args), kwargs))
+        answer = self.helper if args == _HELPER else self.plain
+        if callable(answer):
+            answer = answer()
+        if isinstance(answer, BaseException):
+            raise answer
+        if answer is None:
+            raise AssertionError("unexpected gcloud call %r" % (args,))
+        return answer
+
+
 class TestGcloud(unittest.TestCase):
-    def _source(self, clock=None):
-        return gcp_token.TokenSource("gcloud", now=clock or _Clock())
+    def setUp(self):
+        self.clock = _Clock()
+        # The wall clock moves with the cache's clock, as it would.
+        wall = unittest.mock.patch.object(
+            gcp_token, "_wall_clock", lambda: _WALL0 + self.clock.t)
+        wall.start()
+        self.addCleanup(wall.stop)
 
-    def _run(self, **kwargs):
-        return unittest.mock.patch.object(
-            gcp_token.subprocess, "run", **kwargs)
+    def _source(self):
+        return gcp_token.TokenSource("gcloud", now=self.clock)
 
-    def test_stdout_becomes_the_token_and_is_not_in_any_message(self):
-        with self._run(return_value=_completed("tok-fake\n")) as run:
+    def _run(self, fake):
+        return unittest.mock.patch.object(gcp_token.subprocess, "run", fake)
+
+    # ── config-helper, which says when the token expires ──
+
+    def test_config_helper_is_asked_first_and_its_token_is_used(self):
+        fake = _Gcloud(helper=_completed(_helper_json("tok-fake", 3000)))
+        with self._run(fake):
             self.assertEqual(self._source().bearer(), "tok-fake")
-        args, kwargs = run.call_args
-        self.assertEqual(args[0], ["gcloud", "auth", "print-access-token"])
+        self.assertEqual([c[0] for c in fake.calls], [_HELPER])
+        kwargs = fake.calls[0][1]
         self.assertEqual(kwargs["timeout"], gcp_token.GCLOUD_TIMEOUT)
         self.assertTrue(kwargs["capture_output"])
         self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
 
-        with self._run(return_value=_completed("tok-SECRET\n", "", 1)):
+    def test_the_real_expiry_sets_the_lifetime(self):
+        # Ten minutes left: refreshed five minutes in, not twenty-five.
+        # And fifty-eight minutes left: not refreshed after one, as the
+        # short assumption for an unknown expiry would.
+        for left, quiet_at, due_at in ((600, 250, 350),
+                                       (3480, 3000, 3200)):
+            with self.subTest(left=left):
+                self.clock.t = 0
+                fake = _Gcloud(helper=lambda: _completed(
+                    _helper_json("tok-%d" % len(fake.calls), left)))
+                src = self._source()
+                with self._run(fake):
+                    src.bearer()
+                    self.clock.t = quiet_at
+                    src.bearer()
+                    self.assertEqual(len(fake.calls), 1)
+                    self.clock.t = due_at
+                    src.bearer()
+                    self.assertEqual(len(fake.calls), 2)
+
+    def test_gcloud_handing_back_its_cached_token_never_outlives_it(self):
+        # The reviewer's sequence. gcloud prints the token it holds until
+        # that one is within five minutes of expiry, then a new one for an
+        # hour. Under a fixed assumed lifetime the same token was re-cached
+        # at every refresh and handed out after it had died. Walked over two
+        # hours, a token is never handed out at or past its real expiry.
+        issued = [("tok-0", 3600.0)]  # (token, expiry in seconds from _WALL0)
+
+        def gcloud():
+            token, expiry = issued[-1]
+            if expiry - self.clock.t <= 300:
+                token, expiry = "tok-%d" % len(issued), self.clock.t + 3600
+                issued.append((token, expiry))
+            return _completed(_helper_json(token, expiry=_expiry(expiry)))
+
+        expiries = {}
+        src = self._source()
+        with self._run(_Gcloud(helper=gcloud)):
+            for t in range(0, 7200, 30):
+                self.clock.t = t
+                token = src.bearer()
+                expiries.update(issued)
+                self.assertGreater(expiries[token], t,
+                                   "%s handed out at t=%d, dead at %d"
+                                   % (token, t, expiries[token]))
+        self.assertGreater(len(issued), 1)
+
+    def test_an_unreadable_expiry_gets_the_short_assumed_lifetime(self):
+        for expiry in ("soon", "", "2026-13-45T99:00:00Z", 12345):
+            with self.subTest(expiry=expiry):
+                self.clock.t = 0
+                payload = json.loads(_helper_json("tok-fake"))
+                payload["credential"]["token_expiry"] = expiry
+                fake = _Gcloud(helper=_completed(json.dumps(payload)))
+                src = self._source()
+                life = gcp_token.GCLOUD_ASSUMED_LIFETIME
+                with self._run(fake):
+                    src.bearer()
+                    self.clock.t = life - _SKEW - 1
+                    src.bearer()
+                    self.assertEqual(len(fake.calls), 1)
+                    self.clock.t = life - _SKEW
+                    src.bearer()
+                    self.assertEqual(len(fake.calls), 2)
+                # The token was there; nothing ran a second command for it.
+                self.assertEqual({tuple(c[0]) for c in fake.calls},
+                                 {tuple(_HELPER)})
+
+    def test_config_helper_output_that_is_not_json_holds_nothing(self):
+        # A JSONDecodeError keeps the whole document in `.doc`, and the
+        # document is the token, an id_token and the account.
+        broken = _helper_json("tok-SECRET", 3000)[:-7]
+        fake = _Gcloud(helper=_completed(broken),
+                       plain=_completed("", "bob@corp.example", 1))
+        with self._run(fake):
             with self.assertRaises(gcp_token.TokenUnavailable) as caught:
                 self._source().bearer()
-        self.assertNotIn("SECRET", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("JSONDecodeError", message)
+        self.assertIn("not JSON", message)
+        for secret_text in ("SECRET", "bob@corp.example"):
+            self.assertNotIn(secret_text, message)
+            self.assertNotIn(secret_text, _chain(caught.exception))
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
 
-    def test_a_nonzero_exit_reports_only_the_return_code(self):
-        stderr = "ERROR: account bob@corp.example has no credentials"
-        with self._run(return_value=_completed("", stderr, 2)):
-            with self.assertRaises(gcp_token.TokenUnavailable) as caught:
-                self._source().bearer()
-        self.assertNotIn("bob@corp.example", str(caught.exception))
-        self.assertNotIn("credentials", str(caught.exception))
-        self.assertIn("2", str(caught.exception))
+    def test_a_failing_config_helper_falls_back_to_print_access_token(self):
+        for helper in (_completed("", "ERROR: unknown command", 2),
+                       _completed("not json"),
+                       _completed(json.dumps({"credential": {}})),
+                       _completed(json.dumps(["tok-SECRET"])),
+                       UnicodeDecodeError("utf-8", b"tok-SECRET", 0, 1, "x")):
+            with self.subTest(helper=helper):
+                fake = _Gcloud(helper=helper, plain=_completed("tok-plain\n"))
+                with self._run(fake):
+                    self.assertEqual(self._source().bearer(), "tok-plain")
+                self.assertEqual([c[0] for c in fake.calls], [_HELPER, _PRINT])
+                self.assertIs(fake.calls[1][1]["stdin"], subprocess.DEVNULL)
 
-    def test_a_hanging_gcloud_is_killed_and_reported(self):
+    def test_the_fallback_assumes_a_short_lifetime(self):
+        fake = _Gcloud(helper=_completed("", "", 2),
+                       plain=_completed("tok-plain\n"))
+        src = self._source()
+        life = gcp_token.GCLOUD_ASSUMED_LIFETIME
+        # Short, and so is the window past the skew: a printed token may
+        # have only a few minutes left.
+        self.assertLessEqual(life, _SKEW + 120)
+        with self._run(fake):
+            src.bearer()
+            self.clock.t = life - _SKEW - 1
+            src.bearer()
+            self.assertEqual(len(fake.calls), 2)
+            self.clock.t = life - _SKEW
+            src.bearer()
+            self.assertEqual(len(fake.calls), 4)
+
+    def test_a_gcloud_that_cannot_run_is_not_run_twice(self):
+        # The fallback is the same binary; after a hang it would most likely
+        # sit out the same thirty seconds again.
         hung = subprocess.TimeoutExpired(
             ["gcloud"], 30.0, output="tok-SECRET", stderr="bob@corp.example")
-        with self._run(side_effect=hung):
+        missing = FileNotFoundError(2, "no such file", "/secret/path/gcloud")
+        for failure, said in ((hung, "timed out"),
+                              (missing, "FileNotFoundError")):
+            with self.subTest(failure=type(failure).__name__):
+                fake = _Gcloud(helper=failure, plain=_completed("tok-plain"))
+                with self._run(fake):
+                    with self.assertRaises(gcp_token.TokenUnavailable) as caught:
+                        self._source().bearer()
+                self.assertEqual(len(fake.calls), 1)
+                message = str(caught.exception)
+                self.assertIn(said, message)
+                for leaked in ("SECRET", "bob@corp.example", "/secret/path"):
+                    self.assertNotIn(leaked, message)
+                self.assertIsNone(caught.exception.__context__)
+
+    # ── print-access-token, the fallback ──
+
+    def test_both_failing_reports_both_return_codes_and_no_output(self):
+        stderr = "ERROR: account bob@corp.example has no credentials"
+        fake = _Gcloud(helper=_completed("tok-SECRET", stderr, 3),
+                       plain=_completed("tok-SECRET", stderr, 2))
+        with self._run(fake):
+            with self.assertRaises(gcp_token.TokenUnavailable) as caught:
+                self._source().bearer()
+        message = str(caught.exception)
+        self.assertIn("status 3", message)
+        self.assertIn("status 2", message)
+        for leaked in ("SECRET", "bob@corp.example", "credentials"):
+            self.assertNotIn(leaked, message)
+        self.assertIsNone(caught.exception.__context__)
+
+    def test_a_hanging_fallback_is_killed_and_reported(self):
+        hung = subprocess.TimeoutExpired(
+            ["gcloud"], 30.0, output="tok-SECRET", stderr="bob@corp.example")
+        fake = _Gcloud(helper=_completed("", "", 2), plain=hung)
+        with self._run(fake):
             with self.assertRaises(gcp_token.TokenUnavailable) as caught:
                 self._source().bearer()
         message = str(caught.exception)
@@ -529,14 +723,14 @@ class TestGcloud(unittest.TestCase):
 
         def emit_bad_bytes(args, **kwargs):
             # A real child whose stdout is not UTF-8, so the real decode
-            # error is the one raised.
+            # error is the one raised, for both commands.
             return real_run(
                 [sys.executable, "-c",
                  "import sys; "
                  "sys.stdout.buffer.write(b'tok-SECRET\\xff\\xfe')"],
                 **kwargs)
 
-        with self._run(side_effect=emit_bad_bytes):
+        with self._run(emit_bad_bytes):
             with self.assertRaises(gcp_token.TokenUnavailable) as caught:
                 self._source().bearer()
         self.assertIn("decoded", str(caught.exception))
@@ -547,43 +741,20 @@ class TestGcloud(unittest.TestCase):
     def test_undecodable_output_lets_auto_fall_through(self):
         bad = UnicodeDecodeError("utf-8", b"tok-SECRET", 0, 1, "invalid")
         src = gcp_token.TokenSource(
-            "auto", now=_Clock(),
+            "auto", now=self.clock,
             fetchers={"metadata": _failing("down"),
                       "file": lambda: ("tok-file", 3600)})
-        with self._run(side_effect=bad):
+        with self._run(_Gcloud(helper=bad, plain=bad)):
             self.assertEqual(src.bearer(), "tok-file")
 
-    def test_undecodable_output_on_refresh_keeps_the_cached_token(self):
-        clock = _Clock()
-        src = self._source(clock)
-        with self._run(return_value=_completed("tok-1\n")):
+    def test_a_failure_on_refresh_keeps_a_cached_token_that_is_still_alive(self):
+        src = self._source()
+        with self._run(_Gcloud(helper=_completed(_helper_json("tok-1", 600)))):
             self.assertEqual(src.bearer(), "tok-1")
-        clock.t = gcp_token.GCLOUD_ASSUMED_LIFETIME - 10
+        self.clock.t = 600 - 10
         bad = UnicodeDecodeError("utf-8", b"tok-SECRET", 0, 1, "invalid")
-        with self._run(side_effect=bad):
+        with self._run(_Gcloud(helper=bad, plain=bad)):
             self.assertEqual(src.bearer(), "tok-1")
-
-    def test_a_missing_gcloud_binary_is_unavailable(self):
-        with self._run(side_effect=FileNotFoundError(2, "no such file",
-                                                     "/secret/path/gcloud")):
-            with self.assertRaises(gcp_token.TokenUnavailable) as caught:
-                self._source().bearer()
-        self.assertIn("FileNotFoundError", str(caught.exception))
-        self.assertNotIn("/secret/path", str(caught.exception))
-        self.assertIsNone(caught.exception.__context__)
-
-    def test_the_assumed_lifetime_is_used(self):
-        clock = _Clock()
-        src = self._source(clock)
-        life = gcp_token.GCLOUD_ASSUMED_LIFETIME
-        with self._run(return_value=_completed("tok-fake\n")) as run:
-            src.bearer()
-            clock.t = life - _SKEW - 1
-            src.bearer()
-            self.assertEqual(run.call_count, 1)
-            clock.t = life - _SKEW
-            src.bearer()
-            self.assertEqual(run.call_count, 2)
 
 
 class TestFile(unittest.TestCase):

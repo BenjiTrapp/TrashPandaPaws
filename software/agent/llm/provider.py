@@ -92,7 +92,15 @@ class TransportError(Exception):
     The transport knows neither provider nor model, so the client adds them
     when it turns this into a ProviderError. Anyone writing a replacement
     transport raises this, with a message that holds no URL, header or body.
+
+    `status` is the HTTP status when there was one. The client reads it for
+    a single purpose, to tell a token source that its token was refused;
+    parsing it back out of the message would tie that to the wording.
     """
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
 
 
 # (url, headers, json_body) -> parsed JSON object. Blocking; run in a thread.
@@ -206,7 +214,8 @@ def http_post_json(url: str, headers: Dict[str, str], body: dict, *,
         raise TransportError(failure)
     if resp.status_code != 200:
         raise TransportError("HTTP %d%s" % (
-            resp.status_code, _STATUS_HINTS.get(resp.status_code, "")))
+            resp.status_code, _STATUS_HINTS.get(resp.status_code, "")),
+            status=resp.status_code)
     try:
         payload = resp.json()
     except ValueError:
@@ -288,6 +297,7 @@ class HttpLlmClient(LlmClient):
         """Turn the vendor's reply into a Completion."""
 
     async def complete(self, system, messages, tools, max_tokens, temperature):
+        token = None
         if self._token_source is not None:
             # Off the event loop: bearer() may run gcloud or fetch from the
             # metadata server. Nothing is awaited between storing the token
@@ -317,11 +327,13 @@ class HttpLlmClient(LlmClient):
         # every normal path but leaves it reachable on the object, and a
         # transport exception can hold the request headers.
         failure = None
+        refused = False
         try:
             payload = await asyncio.to_thread(
                 self._transport, url, headers, body)
         except TransportError as exc:
             failure = str(exc)
+            refused = getattr(exc, "status", None) == 401
         except ProviderError:
             raise
         except Exception as exc:
@@ -329,6 +341,14 @@ class HttpLlmClient(LlmClient):
             # the library under it, may hold the URL or the headers.
             failure = "request failed (%s)" % type(exc).__name__
         if failure is not None:
+            invalidate = getattr(self._token_source, "invalidate", None)
+            if refused and token is not None and invalidate is not None:
+                # The token the source vouched for was refused, so its idea
+                # of the expiry was wrong. Without this the next turn would
+                # be handed the same token, and so would every turn until
+                # the cache let go of it. The local `token`, not
+                # self._bearer: another turn may have replaced that since.
+                await asyncio.to_thread(invalidate, token)
             raise self._fail(failure)
         bad_shape = False
         try:

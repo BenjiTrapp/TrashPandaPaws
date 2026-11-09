@@ -192,13 +192,19 @@ less than 5 minutes of the old one remain.
 |---|---|---|
 | `auto` (default) | nothing of its own: tries `metadata`, then `gcloud`, then `file`, in that order, and if none works names all three | the sum of those it has to try |
 | `metadata` | to run on one of Google's own machines (a GCE VM) with a service account allowed to call Vertex | up to a 1-second timeout anywhere else |
-| `gcloud` | `gcloud` on `PATH`, already logged in; the agent runs `gcloud auth print-access-token` | a subprocess, with a 30-second timeout |
+| `gcloud` | `gcloud` on `PATH`, already logged in; the agent runs `gcloud config config-helper --format=json`, and `gcloud auth print-access-token` if that fails | a subprocess, with a 30-second timeout |
 | `file` | `AGENT_API_KEY_FILE` naming a file holding a current token, mode `600` | a read |
 
-The order is by cost, cheapest first. `gcloud` does not say how old the token
-it prints is, so the agent assumes half an hour and runs it again after about
-25 minutes. A `file` is re-read, so a token rewritten underneath a running
-agent is picked up within ten minutes.
+The order is by cost, cheapest first. A source's token is kept until five
+minutes before it expires, and the expiry is the one the source states: the
+metadata server says how long its token lives, and `config-helper` prints the
+expiry of the token `gcloud` holds. `print-access-token` says nothing about
+that, and the token it prints is `gcloud`'s own stored one, which may have an
+hour left or only a few minutes, so a token from it is asked for again after
+about a minute. A token the model endpoint refuses with a 401 is forgotten, so
+the next turn fetches again rather than being handed the same one. A `file` is
+re-read, so a token rewritten underneath a running agent is picked up within
+five minutes.
 
 **A key beats `auto`.** If `AGENT_API_KEY` or `AGENT_API_KEY_FILE` is set and
 the source is left at `auto`, that value is used as it stands and is never
@@ -238,11 +244,14 @@ refreshes and the container reads:
 
 ```bash
 # On the host. umask 077 makes the file mode 600, which the agent insists on.
+# --force-auth-refresh mints a new token each time: without it gcloud prints
+# the one it already holds, which may be minutes from expiry.
 umask 077
 while :; do
-  gcloud auth print-access-token > /etc/raccoon/vertex.token.new \
+  gcloud config config-helper --force-auth-refresh \
+      --format='value(credential.access_token)' > /etc/raccoon/vertex.token.new \
     && mv /etc/raccoon/vertex.token.new /etc/raccoon/vertex.token
-  sleep 1800
+  sleep 1200
 done
 ```
 
@@ -270,9 +279,13 @@ Three things that are not obvious:
   says which uid that is, and the file, and the directory the refresher
   writes into, need to belong to it.
 
-The refresher writes every 30 minutes against a token that lives about an
-hour, so the file always holds a token with at least half its life left. If
-the refresher dies, the agent carries on with the last token until it expires,
+The refresher writes a newly minted token, good for about an hour, every 20
+minutes, and the agent re-reads the file at least every 5 minutes, so the
+token in use always has more than half an hour left. That holds only for a
+token that is minted, not reprinted: `gcloud auth print-access-token` in the
+loop would write `gcloud`'s stored token, which can be minutes from expiry,
+and the file would then hold a dead token until the next write. If the
+refresher dies, the agent carries on with the last token until it expires,
 at most an hour later, and then fails; nothing warns beforehand.
 
 ### On GCE

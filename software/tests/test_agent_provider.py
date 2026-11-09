@@ -949,6 +949,23 @@ class TestRealTransport(unittest.TestCase):
         self.assertIn("401", str(cm.exception))
         self.assertNotIn(_KEY, str(cm.exception))
 
+    def test_an_http_error_carries_its_status_for_the_client(self):
+        # The client reads the status to tell a token source its token was
+        # refused; reading it out of the message would tie that to wording.
+        for status in (401, 403, 500):
+            with self.subTest(status=status):
+                post = unittest.mock.Mock(return_value=self._resp(
+                    status=status))
+                with self.assertRaises(provider.TransportError) as cm:
+                    self._post(post)
+                self.assertEqual(cm.exception.status, status)
+
+    def test_a_failure_without_a_response_has_no_status(self):
+        post = unittest.mock.Mock(side_effect=self._RequestException("x"))
+        with self.assertRaises(provider.TransportError) as cm:
+            self._post(post)
+        self.assertIsNone(cm.exception.status)
+
     def test_a_redirect_is_an_error(self):
         post = unittest.mock.Mock(return_value=self._resp(status=302))
         with self.assertRaises(provider.TransportError) as cm:
@@ -1127,6 +1144,74 @@ class TestATokenSourceSuppliesTheCredential(unittest.TestCase):
         with self.assertRaises(provider.ProviderError):
             _run(c.complete(*_TURN))
         self.assertEqual(c._bearer.reveal(), "tok-first")
+
+
+class TestARefusedTokenIsForgotten(unittest.TestCase):
+    """A 401 on a token-source client makes the next turn fetch again.
+
+    The second net behind a source's expiry. A real TokenSource with an
+    injected fetcher, so the cache being emptied is the one the client uses.
+    """
+
+    _OK = {"choices": [{"message": {"content": "a"}}]}
+
+    def _source(self):
+        tokens = iter(["tok-1", "tok-2", "tok-3"])
+        calls = []
+
+        def fetch():
+            calls.append(1)
+            return next(tokens), 3600
+
+        src = gcp_token.TokenSource("metadata", now=lambda: 0.0,
+                                    fetchers={"metadata": fetch})
+        return src, calls
+
+    def _refused(self, status):
+        return provider.TransportError("HTTP %d" % status, status=status)
+
+    def test_a_401_makes_the_next_turn_fetch_a_new_token(self):
+        src, calls = self._source()
+        stub = _Stub(self._refused(401), self._OK)
+        c = _vertex(src, stub)
+        with self.assertRaises(provider.ProviderError):
+            _run(c.complete(*_TURN))
+        _run(c.complete(*_TURN))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(stub.calls[0][1]["Authorization"], "Bearer tok-1")
+        self.assertEqual(stub.calls[1][1]["Authorization"], "Bearer tok-2")
+
+    def test_other_failures_keep_the_cached_token(self):
+        # A 403 is a permission, a 429 a quota, a 500 the server: a new
+        # token answers none of them, and fetching one costs a subprocess.
+        for status in (403, 429, 500):
+            with self.subTest(status=status):
+                src, calls = self._source()
+                stub = _Stub(self._refused(status), self._OK)
+                c = _vertex(src, stub)
+                with self.assertRaises(provider.ProviderError):
+                    _run(c.complete(*_TURN))
+                _run(c.complete(*_TURN))
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(stub.calls[1][1]["Authorization"],
+                                 "Bearer tok-1")
+
+    def test_only_the_refused_token_is_forgotten(self):
+        # Another turn may already have replaced it; that one is good.
+        src, calls = self._source()
+        self.assertEqual(src.bearer(), "tok-1")
+        src.invalidate("tok-1")
+        self.assertEqual(src.bearer(), "tok-2")
+        src.invalidate("tok-1")
+        self.assertEqual(src.bearer(), "tok-2")
+        self.assertEqual(len(calls), 2)
+
+    def test_a_source_without_invalidate_still_gets_the_401(self):
+        c = _vertex(_FakeSource("tok"), _Stub(self._refused(401)))
+        with self.assertRaises(provider.ProviderError) as cm:
+            _run(c.complete(*_TURN))
+        self.assertIn("401", str(cm.exception))
+        self.assertIsNone(cm.exception.__context__)
 
 
 class TestCleartextGuardCountsATokenSource(unittest.TestCase):
