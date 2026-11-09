@@ -549,6 +549,9 @@ _GCP_IDENTIFIER = re.compile(r"\A[a-z0-9][a-z0-9-]{0,61}[a-z0-9]\Z")
 _VERTEX_HOST_SUFFIX = "-aiplatform"
 _VERTEX_MAX_LOCATION = 63 - len(_VERTEX_HOST_SUFFIX)
 
+# The API version on Vertex's openapi path; see vertex_base_url.
+VERTEX_API_VERSION = "v1"
+
 # Google's non-regional location. Its host has no regional prefix:
 # "global-aiplatform.googleapis.com" does not exist.
 _VERTEX_GLOBAL = "global"
@@ -580,8 +583,10 @@ def vertex_base_url(project: Any, location: Any) -> str:
     it, and an operator who typed it meant exactly that host.
 
     "v1" is the stable path. "v1beta1" is the documented alternative on this
-    endpoint if tool calling misbehaves on v1; this is the only place the
-    version appears, so switching is a one-word change here.
+    endpoint if tool calling misbehaves on v1. The code takes the version
+    from VERTEX_API_VERSION, here and in the fallback hint failover gives,
+    so switching it is a one-word change there; a hand-typed base_url, and
+    the examples in docs/AGENT.md, spell it out and would change with it.
     """
     project = _vertex_identifier("vertex_project", "AGENT_VERTEX_PROJECT",
                                  project)
@@ -592,8 +597,8 @@ def vertex_base_url(project: Any, location: Any) -> str:
     # endpoints/openapi: the unprefixed host, with "global" only in the path.
     host = ("aiplatform.googleapis.com" if location == _VERTEX_GLOBAL
             else location + _VERTEX_HOST_SUFFIX + ".googleapis.com")
-    return ("https://%s/v1/projects/%s/locations/%s/endpoints/openapi"
-            % (host, project, location))
+    return ("https://%s/%s/projects/%s/locations/%s/endpoints/openapi"
+            % (host, VERTEX_API_VERSION, project, location))
 
 
 # Vertex's openapi endpoint takes "publisher/model". A bare id is a 404 at

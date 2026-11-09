@@ -14,6 +14,7 @@ every link fails it raises rather than returning something empty.
 
 import asyncio
 import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -283,6 +284,22 @@ class TestTheChainIsBuiltFromTheConfig(unittest.TestCase):
         # not resolve.
         self.assertIn("global", message)
         self.assertIn("no prefix", message)
+
+    def test_the_hint_and_the_builder_share_one_api_version(self):
+        # vertex_base_url's docstring says the version is switched in one
+        # place; the hint a fallback gets must follow it.
+        import unittest.mock
+        from software.agent.llm import provider
+        from software.agent.llm.provider import ProviderError
+        link = types.SimpleNamespace(provider="vertex", model="google/m",
+                                     api_key=None, base_url=None)
+        with unittest.mock.patch.object(provider, "VERTEX_API_VERSION",
+                                        "v1beta1"):
+            with self.assertRaises(ProviderError) as caught:
+                failover.link_client(link, 1)
+            built = provider.vertex_base_url("proj", "europe-west4")
+        self.assertIn("googleapis.com/v1beta1/projects", str(caught.exception))
+        self.assertIn("googleapis.com/v1beta1/projects", built)
 
     def test_link_client_takes_the_link_and_its_place(self):
         from software.agent import config
