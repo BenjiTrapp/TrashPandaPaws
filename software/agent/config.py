@@ -28,14 +28,13 @@ Usage:
 import argparse
 import math
 import os
-import stat
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import yaml
 
-from software.agent import scope
+from software.agent import scope, secret
 from software.agent.llm import provider as llm_provider
 
 
@@ -413,42 +412,13 @@ def _from_env(env, name: str) -> Optional[str]:
 
 
 def _read_keyfile(path: str) -> str:
-    """The key in a file only its owner can read.
-
-    The mode is checked on the descriptor that is then read, not on the path
-    beforehand, so the file cannot be swapped between check and read. Every
-    message names the path and the mode and nothing of the content.
-    """
-    path = os.path.expanduser(path)
+    # The reader lives in secret.py so the Google token source can use the
+    # same mode check without importing this module (config imports the LLM
+    # package, which would close a cycle). Same text, same ConfigError.
     try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError as exc:
-        raise ConfigError("api_key_file %s cannot be opened (%s)"
-                          % (path, exc.strerror)) from None
-    # fstat before fdopen: opening a directory as text raises at fdopen.
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise ConfigError("api_key_file %s is not a regular file" % path)
-        # Any group or other bit, not only "not 0644": 0640 shares the key
-        # with a group just as surely. 0400 passes; it is stricter than 0600.
-        if info.st_mode & 0o077:
-            raise ConfigError(
-                "api_key_file %s has mode %04o; it holds a secret and must be "
-                "readable by its owner only (chmod 600)"
-                % (path, stat.S_IMODE(info.st_mode)))
-    except ConfigError:
-        os.close(fd)
-        raise
-    with os.fdopen(fd, "r", encoding="utf-8") as handle:
-        try:
-            key = handle.read().strip()
-        except (OSError, UnicodeDecodeError):
-            raise ConfigError("api_key_file %s cannot be read as text"
-                              % path) from None
-    if not key:
-        raise ConfigError("api_key_file %s is empty" % path)
-    return key
+        return secret.read_keyfile(path)
+    except secret.SecretError as exc:
+        raise ConfigError(str(exc)) from None
 
 
 def load(argv=None, yaml_path=None, env=None) -> AgentConfig:
