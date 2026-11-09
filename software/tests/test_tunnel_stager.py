@@ -636,22 +636,41 @@ class TestWhatTheRenderedTextCarries(unittest.TestCase):
             with self.subTest(platform=platform):
                 self.assertNotIn(".dll", self.render(platform).lower())
 
-    def test_the_windows_probe_redirects_no_standard_error(self):
+    def test_the_windows_probe_neither_captures_stderr_nor_holds_stop(self):
         """A regression guard for a trap no shell here can reproduce.
 
-        In Windows PowerShell 5.1 any `2>` on a native command turns its
-        stderr into `NativeCommandError` records that `'Stop'` throws on,
-        so the probe would read a warning-printing interpreter as one
-        below the floor. Nothing on this machine can run that, which is
-        why the shape is pinned here as well as explained in the
-        template: a later tidy-up that adds `2>$null` back fails this.
+        In Windows PowerShell 5.1 a native command's stderr becomes
+        `NativeCommandError` records whenever PowerShell captures it, and
+        `'Stop'` throws on the first -- which the probe would read as a
+        failed version check. Three things cause that capture: this
+        script redirecting stderr, the caller redirecting the script's
+        stderr, and no console to inherit (which is how a C2 delivers
+        this). The fix is in two halves and *both* are pinned here,
+        deliberately as shape rather than behaviour: nothing on this
+        machine can run either half, and a comment cannot fail a build.
         """
-        probe = [line for line in self.render("windows").splitlines()
+        text = self.render("windows")
+        probe = [line for line in text.splitlines()
                  if "sys.version_info" in line]
         self.assertEqual(len(probe), 1,
                          "expected exactly one probe line: %r" % (probe,))
+
+        # Half one: the script captures nothing itself. `*>` as well as
+        # `2>`, because `*>$null` and `*>&1` promote stderr too and
+        # neither contains the substring `2>`.
         self.assertIn("1>$null", probe[0])
-        self.assertNotIn("2>", probe[0])
+        for redirection in ("2>", "*>"):
+            self.assertNotIn(redirection, probe[0],
+                             "the probe redirects stderr again")
+
+        # Half two: the bounded preference change, for the two triggers
+        # the script cannot prevent. The restore has to be in a `finally`
+        # -- a plain trailing assignment would be skipped by the `catch`
+        # path, which is the path the trap takes.
+        body = text.split("function sProbe")[1].split("\n}")[0]
+        self.assertIn("$sEap = $ErrorActionPreference", body)
+        self.assertIn("$ErrorActionPreference = 'Continue'", body)
+        self.assertIn("finally { $ErrorActionPreference = $sEap }", body)
 
     def test_both_templates_parse_in_their_own_shell(self):
         """A syntax check, which is *not* a run of either stager.

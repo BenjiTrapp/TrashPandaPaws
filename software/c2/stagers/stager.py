@@ -45,22 +45,49 @@ which is what runs the hook under either gate.
 
 **The emitted text carries almost no comments.** It ships verbatim to a
 target, so the reasons live in this docstring; see this package's own for
-the rule. There are two deliberate exceptions. The refusal messages: a
-stager that gave up silently is the shape in which this feature would
-die quietly on an engagement, and no line of them names this project.
-And one comment in the PowerShell template, on its probe, which is there
-because of a trap that cannot be reproduced anywhere but on a real
-Windows host: in Windows PowerShell 5.1, redirecting a native command's
-standard error at all -- `2>&1` and `2>$null` behave identically here --
-routes its stderr lines through the command runtime as
-`NativeCommandError` records, and under `$ErrorActionPreference = 'Stop'`
-the first one throws. The probe would read that as a failed version
-check, so an interpreter at or above the floor that printed a single
-warning line would be judged unusable and a bundle fetched onto a host
-that already had a Python -- the one outcome probing first exists to
-prevent. So that line redirects **only stdout** and leaves stderr alone,
-which removes the capture instead of compensating for it, and the
-comment says so where somebody would otherwise add a `2>` back.
+the rule. There are exactly two deliberate exceptions, and this list is
+the whole of them. The refusal messages: a stager that gave up silently
+is the shape in which this feature would die quietly on an engagement,
+and no line of them names this project. And one comment in the
+PowerShell template, on its probe, for the trap below.
+
+**The trap on the Windows probe, which cannot be reproduced anywhere but
+on a real Windows host.** In Windows PowerShell 5.1, a native command's
+stderr lines are promoted to `NativeCommandError` records whenever
+PowerShell captures that stderr, and under
+`$ErrorActionPreference = 'Stop'` the first record throws. The probe
+would read the throw as a failed version check -- so an interpreter at
+or above the floor that printed a single warning line would be judged
+unusable and a bundle fetched onto a host that already had a Python,
+which is the one outcome probing first exists to prevent. There are
+three triggers and they need both halves of one fix:
+
+1. **This script redirecting stderr.** Any `2>` or `*>` on the
+   invocation does it; `2>&1` and `2>$null` behave identically. Handled
+   by not redirecting stderr at all -- only stdout goes to `$null`.
+2. **The caller redirecting this script's stderr**, as in
+   `powershell -File stager.ps1 2> log`.
+3. **No console handle to inherit** -- ISE, WinRM, `Invoke-Command`,
+   `Start-Process -RedirectStandardError`, or a C2 task that pipes both
+   streams, **which is how this script normally arrives on a host**.
+
+Nothing inside the script can stop 2 and 3 from capturing stderr, so for
+those the verdict on the record is changed rather than the capture
+prevented: `$ErrorActionPreference` is saved, set to `'Continue'` for the
+invocation and the read of `$LASTEXITCODE`, and restored in a `finally`.
+That window writes nothing, runs before any directory exists, and sits
+inside a `catch` that already turns any failure into "unusable", so the
+`'Stop'` that the layout's all-or-nothing behaviour depends on is never
+absent from anything that could leave a partial layout.
+
+**Why the proxy block in the Windows fetch has its own `try`/`catch`.**
+Its caller turns a throw from the fetch into "try the next drop", so one
+environment quirk in `GetSystemWebProxy` or `DefaultCredentials` would
+otherwise cost the whole drop list rather than a single attempt. Caught
+there, the request keeps whatever proxy it was given by default and the
+fetch is still attempted. This reasoning is here rather than beside those
+three lines because the list of comments in the emitted text is closed
+above.
 """
 
 import pathlib
