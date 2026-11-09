@@ -118,7 +118,7 @@ class BedrockClient(provider.HttpLlmClient):
                 {"toolSpec": {"name": t.name, "description": t.description,
                               "inputSchema": {"json": t.parameters}}}
                 for t in tools]}
-        headers = {"Authorization": "Bearer %s" % (self._api_key.reveal() or ""),
+        headers = {"Authorization": "Bearer %s" % (self._bearer.reveal() or ""),
                    "Content-Type": "application/json"}
         # The id goes in the path and may contain a colon (…-v1:0), which is
         # legal in a path segment but must not be read as a port.

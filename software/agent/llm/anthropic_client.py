@@ -103,7 +103,7 @@ class AnthropicClient(provider.HttpLlmClient):
         if tools:
             body["tools"] = [{"name": t.name, "description": t.description,
                               "input_schema": t.parameters} for t in tools]
-        headers = {"x-api-key": self._api_key.reveal() or "",
+        headers = {"x-api-key": self._bearer.reveal() or "",
                    "anthropic-version": _API_VERSION,
                    "content-type": "application/json"}
         return self._base_url + "/v1/messages", headers, body

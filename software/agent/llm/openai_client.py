@@ -96,7 +96,7 @@ class OpenAiCompatibleClient(provider.HttpLlmClient):
                  "function": {"name": t.name, "description": t.description,
                               "parameters": t.parameters}} for t in tools]
         headers = {"Content-Type": "application/json"}
-        key = self._api_key.reveal()
+        key = self._bearer.reveal()
         if key:
             headers["Authorization"] = "Bearer " + key
         return self._base_url + "/chat/completions", headers, body
