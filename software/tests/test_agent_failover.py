@@ -279,6 +279,23 @@ class TestTheChainIsBuiltFromTheConfig(unittest.TestCase):
         self.assertIn("explicit base_url", message)
         self.assertIn("fallback 1", message)
         self.assertNotIn("AGENT_VERTEX_PROJECT", message)
+        # A reader copying the shape must not build the one URL that does
+        # not resolve.
+        self.assertIn("global", message)
+        self.assertIn("no prefix", message)
+
+    def test_link_client_takes_the_link_and_its_place(self):
+        from software.agent import config
+        from software.agent.llm.provider import ProviderError
+        link = config.FallbackLink(provider="anthropic", model="claude",
+                                   api_key=None)
+        with self.assertRaises(ProviderError) as caught:
+            failover.link_client(link, 3)
+        self.assertIn("fallback 3 (anthropic / claude)", str(caught.exception))
+        built = failover.link_client(
+            config.FallbackLink(provider="anthropic", model="claude",
+                                api_key="k"), 1)
+        self.assertEqual(built.provider, "anthropic")
 
     def test_a_vertex_link_with_a_base_url_is_built(self):
         import unittest.mock

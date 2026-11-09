@@ -48,7 +48,8 @@ import json
 import sys
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import (Any, Callable, Dict, List, NamedTuple, Optional,
+                    Tuple)
 from urllib.parse import urlparse
 
 from software.agent import config
@@ -154,6 +155,10 @@ def _names(payload: Any, list_key: str, name_key: str) -> Optional[List[str]]:
     return names
 
 
+# A server that answers these is up and wants a credential.
+_NEEDS_CREDENTIALS = (401, 403)
+
+
 def _probe_failure(exc: Exception, where: str, path: str) -> str:
     """What a failed GET means, without the URL or the exception's text."""
     if isinstance(exc, urllib.error.HTTPError):
@@ -164,12 +169,26 @@ def _probe_failure(exc: Exception, where: str, path: str) -> str:
     return "no server answering at %s (%s)" % (where, type(exc).__name__)
 
 
-def _check_local(client, name: str, endpoint: str,
-                 probe: Probe) -> Tuple[bool, str]:
+def _check_local(client, name: str, endpoint: str, probe: Probe,
+                 has_key: bool) -> Tuple[bool, str]:
     url_for, path, read_names, is_there = _LOCAL_LISTS[name]
     where = _host_port(endpoint)
     try:
         payload = probe(url_for(endpoint), PROBE_TIMEOUT)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in _NEEDS_CREDENTIALS:
+            return False, _probe_failure(exc, where, path)
+        # llama.cpp --api-key and LM Studio can require one. The probe sends
+        # none, deliberately: a credential goes only to the model transport.
+        # So this is a healthy server, not a broken one, and calling it down
+        # would teach the operator to ignore the tool. It is ok only if the
+        # link has a key to send; with none, the first model call is a 401.
+        said = ("reachable at %s, but %s needs credentials and this probe "
+                "does not send one; the model list was not checked"
+                % (where, path))
+        if has_key:
+            return True, said + " (--ping tests the key)"
+        return False, said + ", and this link has no api_key"
     except Exception as exc:
         return False, _probe_failure(exc, where, path)
     names = read_names(payload)
@@ -180,6 +199,19 @@ def _check_local(client, name: str, endpoint: str,
                        "(%s was not the expected shape)" % (where, path))
     if is_there(client.model, names):
         return True, "server at %s lists %r" % (where, client.model)
+    if name == "local":
+        # llama-server in single-model mode ignores the request's model and
+        # advertises its file path, or --alias, as the id. A working link
+        # with any label would otherwise fail here. One model listed is
+        # reported ok with both names shown, so the operator can judge the
+        # mismatch; a choice that lacks yours is a real misconfiguration.
+        if not names:
+            return False, ("server at %s is up, but lists no models; load "
+                           "one" % where)
+        if len(names) == 1:
+            return True, ("server at %s lists one model %r; the configured "
+                          "%r may be ignored"
+                          % (where, names[0][:60], client.model))
     shown = ", ".join(repr(n[:60]) for n in names[:_LISTED_MODELS])
     if len(names) > _LISTED_MODELS:
         shown += ", ..."
@@ -210,16 +242,26 @@ def _secrets(cfg) -> List[str]:
             if isinstance(k, str) and len(k) >= config._SCRUB_MIN_LENGTH]
 
 
-def _links(cfg) -> List[Tuple[str, str, Callable[[], Any], Optional[str]]]:
-    """(provider, model, build, base_url) for the primary and each fallback."""
-    links = [(str(getattr(cfg, "provider", None) or "(none)").lower(),
-              str(getattr(cfg, "model", None) or ""),
-              lambda: provider.create_client(cfg),
-              getattr(cfg, "base_url", None))]
+class _Link(NamedTuple):
+    provider: str
+    model: str
+    build: Callable[[], Any]
+    base_url: Optional[str]
+    has_key: bool
+
+
+def _links(cfg) -> List[_Link]:
+    """The primary and each fallback, in the order they are tried."""
+    links = [_Link(str(getattr(cfg, "provider", None) or "(none)").lower(),
+                   str(getattr(cfg, "model", None) or ""),
+                   lambda: provider.create_client(cfg),
+                   getattr(cfg, "base_url", None),
+                   bool(getattr(cfg, "api_key", None)))]
     for number, link in enumerate(getattr(cfg, "fallbacks", ()) or (), 1):
-        links.append((link.provider, link.model,
-                      lambda n=number: failover.link_client(cfg, n),
-                      link.base_url))
+        links.append(_Link(
+            link.provider, link.model,
+            lambda l=link, n=number: failover.link_client(l, n),
+            link.base_url, bool(link.api_key)))
     return links
 
 
@@ -237,7 +279,7 @@ def check(cfg, *, ping: bool = False,
     probe = probe or _http_get_json
     secrets = _secrets(cfg)
     rows = []
-    for name, model, build, base_url in _links(cfg):
+    for name, model, build, base_url, has_key in _links(cfg):
         try:
             client = build()
         except ProviderError as exc:
@@ -245,7 +287,8 @@ def check(cfg, *, ping: bool = False,
         else:
             if name in provider.LOCAL_PROVIDERS:
                 ok, detail = _check_local(client, name,
-                                          _endpoint(name, base_url), probe)
+                                          _endpoint(name, base_url), probe,
+                                          has_key)
                 if ok and ping:
                     ok, said = _ping(client)
                     detail = "%s; %s" % (detail, said)

@@ -166,13 +166,13 @@ class _LinkConfig(NamedTuple):
     base_url: Optional[str]
 
 
-def link_client(cfg, number: int) -> LlmClient:
-    """The client for fallback `number` (1-based), or ProviderError.
+def link_client(link, number: int) -> LlmClient:
+    """The client for one fallback link, or ProviderError.
 
-    One place builds a fallback, so the startup chain and the pre-engagement
-    check cannot disagree about what a link needs.
+    `number` (1-based) is only the link's place, for the message. One place
+    builds a fallback, so the startup chain and the pre-engagement check
+    cannot disagree about what a link needs.
     """
-    link = cfg.fallbacks[number - 1]
     if link.provider == "vertex" and not link.base_url:
         # A link carries provider, model, key and base_url and nothing else,
         # so it cannot read the primary's vertex_project. Letting
@@ -182,8 +182,10 @@ def link_client(cfg, number: int) -> LlmClient:
             "fallback %d (%s / %s) cannot be used: a vertex fallback link "
             "needs an explicit base_url, "
             "https://LOCATION-aiplatform.googleapis.com/v1/projects/PROJECT/"
-            "locations/LOCATION/endpoints/openapi; it does not inherit "
-            "vertex_project or vertex_location from the primary"
+            "locations/LOCATION/endpoints/openapi (for location global the "
+            "host is aiplatform.googleapis.com, with no prefix; "
+            "global-aiplatform.googleapis.com does not exist); it does not "
+            "inherit vertex_project or vertex_location from the primary"
             % (number, link.provider, link.model))
     try:
         return _provider.create_client(_LinkConfig(
@@ -207,6 +209,6 @@ def create_chain(cfg, **kwargs) -> LlmClient:
     # provider.create_client -- the one guarding that a leaked key never
     # reaches an availability reason -- would otherwise not reach this.
     clients = [_provider.create_client(cfg)]
-    for number in range(1, len(getattr(cfg, "fallbacks", ()) or ()) + 1):
-        clients.append(link_client(cfg, number))
+    for number, link in enumerate(getattr(cfg, "fallbacks", ()) or (), 1):
+        clients.append(link_client(link, number))
     return chain(clients, **kwargs)

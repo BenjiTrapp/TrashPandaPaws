@@ -241,6 +241,50 @@ class TestLocalIsAskedForTheOpenAiList(unittest.TestCase):
         self.assertEqual([c[0] for c in probe.calls],
                          ["http://127.0.0.1:1234/v1/models"])
 
+    def test_the_four_cases_of_what_a_local_server_lists(self):
+        # llama-server in single-model mode ignores the request's model and
+        # lists its file path or --alias, so one listed model that is not the
+        # configured name is still a working link.
+        def lists(*ids):
+            return {"data": [{"id": i} for i in ids]}
+
+        match = preflight.check(
+            _local(model="qwen"), probe=_Probe(lists("qwen", "other")))[0]
+        self.assertTrue(match["ok"], match)
+        self.assertIn("lists 'qwen'", match["detail"])
+
+        one = preflight.check(
+            _local(model="qwen"), probe=_Probe(lists("/models/q.gguf")))[0]
+        self.assertTrue(one["ok"], one)
+        self.assertIn("one model '/models/q.gguf'", one["detail"])
+        self.assertIn("'qwen' may be ignored", one["detail"])
+
+        many = preflight.check(
+            _local(model="qwen"), probe=_Probe(lists("a.gguf", "b.gguf")))[0]
+        self.assertFalse(many["ok"])
+        self.assertIn("'qwen'", many["detail"])
+        self.assertIn("not in its model list", many["detail"])
+        self.assertNotIn("may be ignored", many["detail"])
+
+        none = preflight.check(_local(model="qwen"),
+                               probe=_Probe(lists()))[0]
+        self.assertFalse(none["ok"])
+        self.assertIn("lists no models", none["detail"])
+        self.assertNotIn("not in its model list", none["detail"])
+
+    def test_one_model_that_is_not_the_configured_one_is_still_not_ok_on_ollama(
+            self):
+        # Ollama honours the model field, so an absent model is not pulled.
+        row = preflight.check(
+            _ollama(model="mistral:7b"),
+            probe=_Probe({"models": [{"name": "qwen2.5:14b"}]}))[0]
+        self.assertFalse(row["ok"])
+        self.assertIn("not pulled", row["detail"])
+
+    def test_an_empty_ollama_list_stays_not_ok(self):
+        row = preflight.check(_ollama(), probe=_Probe({"models": []}))[0]
+        self.assertFalse(row["ok"])
+
     def test_the_name_is_matched_exactly_with_no_latest_rule(self):
         # Ollama's `llama3.2` means `llama3.2:latest`; an OpenAI-style id is
         # just a string.
@@ -266,6 +310,67 @@ class TestLocalIsAskedForTheOpenAiList(unittest.TestCase):
                                         _a_completion):
             row = preflight.check(_local(), ping=True,
                                   probe=_Probe(_MODELS))[0]
+        self.assertTrue(row["ok"], row)
+        self.assertIn("answered", row["detail"])
+
+
+def _http_error(code):
+    import urllib.error
+    return urllib.error.HTTPError("http://x/v1/models", code, "x", {}, None)
+
+
+class TestAServerThatNeedsCredentialsIsNotDown(unittest.TestCase):
+    """The probe sends no Authorization header, so a server that requires
+    one answers 401 -- which is a server that is up."""
+
+    def test_a_401_with_a_key_configured_is_ok_and_says_what_was_not_done(self):
+        for code in (401, 403):
+            for make, path in ((_local, "/v1/models"), (_ollama, "/api/tags")):
+                with self.subTest(code=code, path=path):
+                    row = preflight.check(
+                        make(api_key=_KEY),
+                        probe=_Probe(raises=_http_error(code)))[0]
+                    self.assertTrue(row["ok"], row)
+                    self.assertIn("needs credentials", row["detail"])
+                    self.assertIn("does not send one", row["detail"])
+                    self.assertIn("not checked", row["detail"])
+                    self.assertIn(path, row["detail"])
+                    self.assertNotIn(_KEY, row["detail"])
+
+    def test_a_401_with_no_key_is_not_ok(self):
+        # The first model call would be this same 401.
+        row = preflight.check(_local(),
+                              probe=_Probe(raises=_http_error(401)))[0]
+        self.assertFalse(row["ok"])
+        self.assertIn("needs credentials", row["detail"])
+        self.assertIn("no api_key", row["detail"])
+
+    def test_it_is_not_the_line_for_down_unreadable_or_other_http_errors(self):
+        auth = preflight.check(_local(api_key=_KEY),
+                               probe=_Probe(raises=_http_error(401)))[0]
+        self.assertNotIn("no server answering", auth["detail"])
+        self.assertNotIn("unreadable", auth["detail"])
+        self.assertNotIn("answered HTTP", auth["detail"])
+        other = preflight.check(_local(api_key=_KEY),
+                                probe=_Probe(raises=_http_error(500)))[0]
+        self.assertFalse(other["ok"])
+        self.assertIn("answered HTTP 500", other["detail"])
+
+    def test_a_fallback_links_own_key_decides(self):
+        cfg = _cfg(fallbacks=(
+            config.FallbackLink(provider="local", model="m"),
+            config.FallbackLink(provider="local", model="m",
+                                api_key=_OTHER_KEY)))
+        rows = preflight.check(cfg, probe=_Probe(raises=_http_error(401)))
+        self.assertEqual([r["ok"] for r in rows], [True, False, True])
+        self.assertTrue(all(_OTHER_KEY not in r["detail"] for r in rows))
+
+    def test_the_ping_is_what_tests_the_key(self):
+        with unittest.mock.patch.object(provider, "http_post_json",
+                                        _a_completion):
+            row = preflight.check(
+                _local(api_key=_KEY), ping=True,
+                probe=_Probe(raises=_http_error(401)))[0]
         self.assertTrue(row["ok"], row)
         self.assertIn("answered", row["detail"])
 
