@@ -459,6 +459,44 @@ class TestADeadServerIsAReport(unittest.TestCase):
         self.assertFalse(row["ok"])
         self.assertIn("127.0.0.1:%d" % port, row["detail"])
 
+    def test_the_default_probe_does_not_go_through_a_proxy(self):
+        # A proxy that is set but dead: a probe that honoured it would report
+        # a working local server as down. The token source makes the same
+        # choice for the same kind of address.
+        import http.server
+        import json
+        import os
+        import socket
+        import threading
+
+        class Tags(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps(_TAGS).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        with contextlib.closing(socket.socket()) as s:
+            s.bind(("127.0.0.1", 0))
+            dead = "http://127.0.0.1:%d" % s.getsockname()[1]
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Tags)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, args=(0.01,),
+                         daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        env = {"http_proxy": dead, "HTTP_PROXY": dead,
+               "no_proxy": "", "NO_PROXY": ""}
+        with unittest.mock.patch.dict(os.environ, env):
+            row = preflight.check(_ollama(
+                base_url="http://127.0.0.1:%d/v1" % server.server_address[1]
+            ))[0]
+        self.assertTrue(row["ok"], row)
+
 
 def _a_completion(url, headers, body, **kw):
     return {"choices": [{"message": {"content": "ok"},

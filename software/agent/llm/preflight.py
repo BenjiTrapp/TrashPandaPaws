@@ -78,7 +78,12 @@ Probe = Callable[[str, float], Any]
 
 
 def _http_get_json(url: str, timeout: float) -> Any:
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+    # Not through a proxy, as gcp_token's metadata fetch is not: the servers
+    # asked here are the local model servers, on loopback or the LAN, and a
+    # team server with http_proxy set would otherwise ask the proxy about
+    # them and report its answer, or its failure, as theirs.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(url, timeout=timeout) as resp:
         return json.loads(resp.read(_MAX_PROBE_BYTES).decode("utf-8"))
 
 
