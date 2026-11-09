@@ -82,6 +82,11 @@ anywhere else. Neither service declares `depends_on` in either direction —
 the C2 comes up without the agent, and the agent survives a C2 that is not
 there yet.
 
+`docker compose` passes the `AGENT_*` variables of the shell it runs in,
+`AGENT_BASE_URL` among them, so a value still exported from a host-run session
+(an LM Studio endpoint, say) repoints the container's provider too; `unset` it
+first.
+
 ### Without Docker
 
 ```bash
