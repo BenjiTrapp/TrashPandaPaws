@@ -134,10 +134,8 @@ _DEFAULT_BIND_HOST = "127.0.0.1"
 _DEFAULT_BIND_PORT = 8099
 _DEFAULT_MAX_EXECUTORS = 4
 _DEFAULT_APPROVAL_TIMEOUT = 300.0
-# EU first, as the Bedrock endpoint here already is: a default that sent an
-# operator's findings to a US region without being asked would be the quiet
-# kind of surprise this project avoids.
-_DEFAULT_VERTEX_LOCATION = "europe-west4"
+# Written once, in provider, which applies it when a config has none.
+_DEFAULT_VERTEX_LOCATION = llm_provider.VERTEX_DEFAULT_LOCATION
 
 _SLIVER_REASON = (
     "Sliver is enabled (c2.sliver.enabled in raccoon.yaml): a Sliver-managed "

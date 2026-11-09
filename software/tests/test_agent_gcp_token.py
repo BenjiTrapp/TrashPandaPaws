@@ -215,7 +215,9 @@ class TestCaching(unittest.TestCase):
         answered = []
         waiter = threading.Thread(target=lambda: answered.append(src.bearer()))
         waiter.start()
-        waiter.join(1.0)
+        # The blocked fetch holds for 5 s, so 4 s still tells queueing from
+        # not, with room for a loaded machine.
+        waiter.join(4.0)
         self.assertFalse(waiter.is_alive(), "queued behind the refresh")
         self.assertEqual(answered, ["tok-1"])
         self.assertEqual(len(src.calls), 2)
@@ -432,7 +434,9 @@ class TestMetadata(unittest.TestCase):
                 with self.assertRaises(gcp_token.TokenUnavailable) as caught:
                     self._source().bearer()
                 elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 1.0)
+        # Well short of the server's 5 s, which is all the bound has to show;
+        # closer to the 0.3 s timeout would be a margin a loaded machine eats.
+        self.assertLess(elapsed, 4.0)
         self.assertIn("unreachable", str(caught.exception))
 
     def test_the_request_does_not_go_through_a_proxy(self):

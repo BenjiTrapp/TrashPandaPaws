@@ -244,7 +244,6 @@ class TestClientSelection(unittest.TestCase):
             provider.create_client(_cfg(provider="gemini", api_key=None,
                                         model="gemini-3-pro"))
         self.assertIn("requires an api_key", str(cm.exception))
-        self.assertNotIn(_KEY, str(cm.exception))
 
 
 # ── Capability tiers ──

@@ -549,6 +549,11 @@ _GCP_IDENTIFIER = re.compile(r"\A[a-z0-9][a-z0-9-]{0,61}[a-z0-9]\Z")
 _VERTEX_HOST_SUFFIX = "-aiplatform"
 _VERTEX_MAX_LOCATION = 63 - len(_VERTEX_HOST_SUFFIX)
 
+# EU first, as the Bedrock endpoint here already is: a default that sent an
+# operator's findings to a US region without being asked would be the quiet
+# kind of surprise this project avoids. config.py's default is this one.
+VERTEX_DEFAULT_LOCATION = "europe-west4"
+
 # The API version on Vertex's openapi path; see vertex_base_url.
 VERTEX_API_VERSION = "v1"
 
@@ -685,7 +690,8 @@ def create_client(cfg) -> LlmClient:
         if not base_url:
             base_url = vertex_base_url(
                 getattr(cfg, "vertex_project", None),
-                getattr(cfg, "vertex_location", None) or "europe-west4")
+                getattr(cfg, "vertex_location", None)
+                or VERTEX_DEFAULT_LOCATION)
         # A fixed key, which the configuration has already labelled for the
         # operator as one that will not be refreshed, is used as it stands.
         # Otherwise the token comes from a source, and that choice is checked
