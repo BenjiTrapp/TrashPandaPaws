@@ -415,10 +415,14 @@ def _read_keyfile(path: str) -> str:
     # The reader lives in secret.py so the Google token source can use the
     # same mode check without importing this module (config imports the LLM
     # package, which would close a cycle). Same text, same ConfigError.
+    failure = None
     try:
         return secret.read_keyfile(path)
     except secret.SecretError as exc:
-        raise ConfigError(str(exc)) from None
+        failure = str(exc)
+    # Raised once the except block has exited, so __context__ is empty
+    # rather than merely hidden by `from None`.
+    raise ConfigError(failure)
 
 
 def load(argv=None, yaml_path=None, env=None) -> AgentConfig:

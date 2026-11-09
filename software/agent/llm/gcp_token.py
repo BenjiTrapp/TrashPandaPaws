@@ -40,7 +40,6 @@ import http.client
 import json
 import os
 import shutil
-import stat
 import subprocess
 import threading
 import time
@@ -148,15 +147,22 @@ def _fetch_gcloud() -> Tuple[Any, Any]:
         failure = "gcloud timed out after %g seconds" % GCLOUD_TIMEOUT
     except OSError as exc:
         failure = "gcloud could not be run (%s)" % type(exc).__name__
+    except ValueError as exc:
+        # text=True decodes stdout, which is the token, and a
+        # UnicodeDecodeError keeps the bytes it failed on in `.object`.
+        failure = ("gcloud output could not be decoded (%s)"
+                   % type(exc).__name__)
     if failure is not None:
         raise TokenUnavailable(failure)
     if proc.returncode != 0:
-        raise TokenUnavailable("gcloud exited with status %d" % proc.returncode)
+        raise TokenUnavailable("gcloud exited with status %d"
+                               % proc.returncode)
     # stdout is the token: returned, never formatted into anything.
     return proc.stdout, GCLOUD_ASSUMED_LIFETIME
 
 
-def _file_fetcher(key_file: Optional[str], read: Callable[[str], str]) -> Fetcher:
+def _file_fetcher(key_file: Optional[str],
+                  read: Callable[[str], str]) -> Fetcher:
     def fetch() -> Tuple[Any, Any]:
         if not key_file:
             raise TokenUnavailable("no key file is configured")
@@ -189,8 +195,9 @@ class TokenSource:
         self.kind = kind
         self._now = time.monotonic if now is None else now
         self._lock = threading.Lock()
-        self._token = None  # type: Optional[str]
-        self._expires_at = 0.0
+        # (token, expires_at) as one tuple, so a caller that does not hold
+        # the lock can read both from one consistent object.
+        self._cached = None  # type: Optional[Tuple[str, float]]
         # Looked up by name at call time, so a replacement of the module
         # functions is seen, as well as the injected ones.
         self._fetchers = {
@@ -202,36 +209,50 @@ class TokenSource:
 
     def bearer(self) -> str:
         """A token with more than SKEW_SECONDS left. Blocks while fetching."""
-        with self._lock:
-            started = self._now()
-            if self._token is not None and \
-                    self._expires_at - started > SKEW_SECONDS:
-                return self._token
-            failure = None
-            token = lifetime = None
-            try:
-                token, lifetime = self._fetch()
-            except TokenUnavailable as exc:
-                failure = exc
-            if failure is not None:
-                # The refresh runs SKEW_SECONDS early, so a token inside the
-                # skew window is still good and the caller gets a working
-                # credential. Raising here would throw it away, and a job
-                # that runs two hours on a one-hour token would be marked
-                # dead for a blip in gcloud. The failure is not lost: the
-                # cache is left as it was, so the next call retries, and
-                # once the token has really expired that retry's failure
-                # reaches the caller. A token at or past its expiry is never
-                # returned. One attempt per call; no loop, no backoff.
-                if self._token is not None and \
-                        self._expires_at - self._now() > 0:
-                    return self._token
-                raise failure
-            # Measured from before the fetch: a slow gcloud must not make the
-            # token look younger than it is.
-            self._token = token
-            self._expires_at = started + lifetime
-            return token
+        if not self._lock.acquire(blocking=False):
+            # Someone is fetching, possibly a gcloud that will hang for its
+            # full timeout. A caller whose token is still good has no reason
+            # to queue behind it; five of them waiting out thirty seconds
+            # each is the last one waiting two and a half minutes for
+            # nothing. A caller with no usable token does queue, so the
+            # fetch still happens once.
+            held = self._cached
+            if held is not None and held[1] - self._now() > 0:
+                return held[0]
+            self._lock.acquire()
+        try:
+            return self._bearer_locked()
+        finally:
+            self._lock.release()
+
+    def _bearer_locked(self) -> str:
+        started = self._now()
+        cached = self._cached
+        if cached is not None and cached[1] - started > SKEW_SECONDS:
+            return cached[0]
+        failure = None
+        token = lifetime = None
+        try:
+            token, lifetime = self._fetch()
+        except TokenUnavailable as exc:
+            failure = exc
+        if failure is not None:
+            # The refresh runs SKEW_SECONDS early, so a token inside the
+            # skew window is still good and the caller gets a working
+            # credential. Raising here would throw it away, and a job that
+            # runs two hours on a one-hour token would be marked dead for a
+            # blip in gcloud. The failure is not lost: the cache is left as
+            # it was, so the next call retries, and once the token has
+            # really expired that retry's failure reaches the caller. A
+            # token at or past its expiry is never returned. One attempt per
+            # call; no loop, no backoff.
+            if cached is not None and cached[1] - self._now() > 0:
+                return cached[0]
+            raise failure
+        # Measured from before the fetch: a slow gcloud must not make the
+        # token look younger than it is.
+        self._cached = (token, started + lifetime)
+        return token
 
     def _fetch(self) -> Tuple[str, int]:
         if self.kind != "auto":
@@ -323,15 +344,18 @@ def _validate_file(key_file: Optional[str]) -> None:
     if not key_file:
         raise TokenUnavailable("no key file is configured")
     path = os.path.expanduser(key_file)
+    failure = None
+    info = None
     try:
         info = os.stat(path)
     except OSError as exc:
-        raise TokenUnavailable("api_key_file %s cannot be opened (%s)"
-                               % (path, exc.strerror)) from None
-    if not stat.S_ISREG(info.st_mode):
-        raise TokenUnavailable("api_key_file %s is not a regular file" % path)
-    if info.st_mode & 0o077:
-        raise TokenUnavailable(
-            "api_key_file %s has mode %04o; it holds a secret and must be "
-            "readable by its owner only (chmod 600)"
-            % (path, stat.S_IMODE(info.st_mode)))
+        failure = ("api_key_file %s cannot be checked (%s)"
+                   % (path, exc.strerror))
+    if failure is None:
+        # The reader's own test, so the two cannot disagree.
+        try:
+            secret.check_keyfile_mode(path, info.st_mode)
+        except secret.SecretError as exc:
+            failure = str(exc)
+    if failure is not None:
+        raise TokenUnavailable(failure)

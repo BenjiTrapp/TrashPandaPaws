@@ -34,6 +34,21 @@ from software.agent.llm import gcp_token
 _SKEW = gcp_token.SKEW_SECONDS
 
 
+def _chain(exc):
+    """Everything a hand-written error serialiser could reach from `exc`:
+    each link's repr, its attributes, and the bytes a decode error holds."""
+    parts, seen, current = [], set(), exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(repr(current))
+        parts.append(repr(getattr(current, "__dict__", {})))
+        parts.append(repr(getattr(current, "object", None)))
+        parts.append(repr(getattr(current, "output", None)))
+        parts.append(repr(getattr(current, "stderr", None)))
+        current = current.__context__ or current.__cause__
+    return " ".join(parts)
+
+
 class _Clock:
     def __init__(self, start=0.0):
         self.t = start
@@ -164,6 +179,69 @@ class TestCaching(unittest.TestCase):
         self.assertEqual(fetcher.calls, 1)
         self.assertEqual(results, ["tok-1"] * 8)
 
+    def _blocked_refresh(self):
+        """A source whose second fetch blocks until `release` is set.
+
+        Returns (source, clock, release, started). `started` is set once the
+        refreshing thread is inside the fetch, holding the lock. The first
+        token is fetched at t=0 and lives to 3600.
+        """
+        clock = _Clock()
+        started, release = threading.Event(), threading.Event()
+        calls = []
+
+        def fetch():
+            calls.append(1)
+            if len(calls) == 2:
+                started.set()
+                release.wait(5)
+            return "tok-%d" % len(calls), 3600
+
+        src = _with(fetch, clock=clock)
+        src.calls = calls
+        self.assertEqual(src.bearer(), "tok-1")
+        return src, clock, release, started
+
+    def test_a_caller_with_a_usable_token_does_not_queue_behind_a_refresh(self):
+        src, clock, release, started = self._blocked_refresh()
+        clock.t = 3600 - 10  # inside the skew window, not expired
+        refresher = threading.Thread(target=src.bearer)
+        refresher.start()
+        self.addCleanup(refresher.join)
+        self.addCleanup(release.set)
+        self.assertTrue(started.wait(5))
+
+        answered = []
+        waiter = threading.Thread(target=lambda: answered.append(src.bearer()))
+        waiter.start()
+        waiter.join(1.0)
+        self.assertFalse(waiter.is_alive(), "queued behind the refresh")
+        self.assertEqual(answered, ["tok-1"])
+        self.assertEqual(len(src.calls), 2)
+
+    def test_a_caller_with_an_expired_token_waits_and_shares_the_one_fetch(self):
+        src, clock, release, started = self._blocked_refresh()
+        clock.t = 3600 + 1  # expired
+        answered = []
+        refresher = threading.Thread(
+            target=lambda: answered.append(src.bearer()))
+        refresher.start()
+        self.addCleanup(refresher.join)
+        self.addCleanup(release.set)
+        self.assertTrue(started.wait(5))
+
+        waiter = threading.Thread(target=lambda: answered.append(src.bearer()))
+        waiter.start()
+        self.addCleanup(waiter.join)
+        waiter.join(0.2)
+        self.assertTrue(waiter.is_alive(), "returned an expired token")
+
+        release.set()
+        waiter.join(5)
+        refresher.join(5)
+        self.assertEqual(answered, ["tok-2", "tok-2"])
+        self.assertEqual(len(src.calls), 2)
+
     def test_a_failed_refresh_inside_the_skew_window_returns_the_cached_token(self):
         clock = _Clock()
         outcomes = [("tok-1", 3600), gcp_token.TokenUnavailable("down"),
@@ -245,6 +323,7 @@ class TestCaching(unittest.TestCase):
         self.assertEqual(src.bearer(), "tok-2")
 
     def test_the_shared_source_is_returned_per_kind_and_path(self):
+        self.addCleanup(gcp_token._shared.clear)
         self.assertIs(gcp_token.source("gcloud"), gcp_token.source("gcloud"))
         self.assertIsNot(gcp_token.source("file", key_file="/a"),
                          gcp_token.source("file", key_file="/b"))
@@ -252,9 +331,11 @@ class TestCaching(unittest.TestCase):
                          gcp_token.source("metadata"))
 
     def test_the_source_reports_its_kind(self):
+        self.addCleanup(gcp_token._shared.clear)
         self.assertEqual(gcp_token.source("metadata").kind, "metadata")
 
     def test_an_unknown_kind_is_refused(self):
+        self.addCleanup(gcp_token._shared.clear)
         with self.assertRaises(gcp_token.TokenUnavailable):
             gcp_token.source("kerberos")
         with self.assertRaises(gcp_token.TokenUnavailable):
@@ -334,16 +415,33 @@ class TestMetadata(unittest.TestCase):
                 self._source().bearer()
 
     def test_a_metadata_server_that_never_answers_raises_within_its_timeout(self):
-        with _MetadataServer(delay=1.5, body=b"{}"):
+        # The server would answer after 5 s, far past the bound, and what it
+        # would say is a valid body: only the timeout can make this fail, so
+        # the test proves the timeout is applied.
+        body = b'{"access_token": "tok-fake", "expires_in": 3599}'
+        with _MetadataServer(delay=5.0, body=body):
             with unittest.mock.patch.object(gcp_token, "METADATA_TIMEOUT", 0.3):
                 started = time.monotonic()
-                with self.assertRaises(gcp_token.TokenUnavailable):
+                with self.assertRaises(gcp_token.TokenUnavailable) as caught:
                     self._source().bearer()
                 elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 2.0)
+        self.assertLess(elapsed, 1.0)
+        self.assertIn("unreachable", str(caught.exception))
 
-    def test_the_default_timeout_is_short(self):
-        self.assertLessEqual(gcp_token.METADATA_TIMEOUT, 1.0)
+    def test_the_request_does_not_go_through_a_proxy(self):
+        # A proxy that is set but dead: a request that honoured it would
+        # fail, and one that did not reaches the server.
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        dead = "http://127.0.0.1:%d" % probe.getsockname()[1]
+        probe.close()
+        body = b'{"access_token": "tok-fake", "expires_in": 3599}'
+        env = {"http_proxy": dead, "HTTP_PROXY": dead,
+               "no_proxy": "", "NO_PROXY": ""}
+        with _MetadataServer(body=body) as server, \
+                unittest.mock.patch.dict(os.environ, env):
+            self.assertEqual(self._source().bearer(), "tok-fake")
+        self.assertEqual(len(server.requests), 1)
 
     def test_a_failure_message_holds_no_body_and_no_url(self):
         body = b'{"access_token": "tok-SECRET"}'
@@ -398,6 +496,7 @@ class TestGcloud(unittest.TestCase):
         self.assertEqual(args[0], ["gcloud", "auth", "print-access-token"])
         self.assertEqual(kwargs["timeout"], gcp_token.GCLOUD_TIMEOUT)
         self.assertTrue(kwargs["capture_output"])
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
 
         with self._run(return_value=_completed("tok-SECRET\n", "", 1)):
             with self.assertRaises(gcp_token.TokenUnavailable) as caught:
@@ -424,6 +523,45 @@ class TestGcloud(unittest.TestCase):
         self.assertNotIn("SECRET", message)
         self.assertNotIn("bob@corp.example", message)
         self.assertIsNone(caught.exception.__context__)
+
+    def test_undecodable_output_is_unavailable_and_holds_no_bytes(self):
+        real_run = subprocess.run
+
+        def emit_bad_bytes(args, **kwargs):
+            # A real child whose stdout is not UTF-8, so the real decode
+            # error is the one raised.
+            return real_run(
+                [sys.executable, "-c",
+                 "import sys; "
+                 "sys.stdout.buffer.write(b'tok-SECRET\\xff\\xfe')"],
+                **kwargs)
+
+        with self._run(side_effect=emit_bad_bytes):
+            with self.assertRaises(gcp_token.TokenUnavailable) as caught:
+                self._source().bearer()
+        self.assertIn("decoded", str(caught.exception))
+        self.assertIn("UnicodeDecodeError", str(caught.exception))
+        self.assertNotIn("SECRET", _chain(caught.exception))
+        self.assertIsNone(caught.exception.__context__)
+
+    def test_undecodable_output_lets_auto_fall_through(self):
+        bad = UnicodeDecodeError("utf-8", b"tok-SECRET", 0, 1, "invalid")
+        src = gcp_token.TokenSource(
+            "auto", now=_Clock(),
+            fetchers={"metadata": _failing("down"),
+                      "file": lambda: ("tok-file", 3600)})
+        with self._run(side_effect=bad):
+            self.assertEqual(src.bearer(), "tok-file")
+
+    def test_undecodable_output_on_refresh_keeps_the_cached_token(self):
+        clock = _Clock()
+        src = self._source(clock)
+        with self._run(return_value=_completed("tok-1\n")):
+            self.assertEqual(src.bearer(), "tok-1")
+        clock.t = gcp_token.GCLOUD_ASSUMED_LIFETIME - 10
+        bad = UnicodeDecodeError("utf-8", b"tok-SECRET", 0, 1, "invalid")
+        with self._run(side_effect=bad):
+            self.assertEqual(src.bearer(), "tok-1")
 
     def test_a_missing_gcloud_binary_is_unavailable(self):
         with self._run(side_effect=FileNotFoundError(2, "no such file",
@@ -620,11 +758,14 @@ class TestValidate(unittest.TestCase):
         def boom(*args, **kwargs):
             raise AssertionError("validate performed I/O")
 
+        # Patched at the socket and process level, so any route to the
+        # network or a child process is caught, whichever library it takes.
         with unittest.mock.patch.object(gcp_token, "_fetch_metadata", boom), \
                 unittest.mock.patch.object(gcp_token, "_fetch_gcloud", boom), \
-                unittest.mock.patch.object(gcp_token.subprocess, "run", boom), \
-                unittest.mock.patch.object(
-                    gcp_token.urllib.request, "build_opener", boom), \
+                unittest.mock.patch.object(socket.socket, "connect", boom), \
+                unittest.mock.patch.object(socket, "create_connection", boom), \
+                unittest.mock.patch.object(socket, "getaddrinfo", boom), \
+                unittest.mock.patch.object(subprocess, "Popen", boom), \
                 unittest.mock.patch.object(secret, "read_keyfile", boom), \
                 unittest.mock.patch.object(
                     gcp_token.shutil, "which", return_value="/usr/bin/gcloud"):
@@ -669,11 +810,34 @@ class TestValidate(unittest.TestCase):
 
     def test_file_validate_refuses_a_missing_file_and_a_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(gcp_token.TokenUnavailable):
+            with self.assertRaises(gcp_token.TokenUnavailable) as missing:
                 gcp_token.validate("file", key_file=os.path.join(tmp, "nope"))
             os.chmod(tmp, 0o700)
-            with self.assertRaises(gcp_token.TokenUnavailable):
+            with self.assertRaises(gcp_token.TokenUnavailable) as directory:
                 gcp_token.validate("file", key_file=tmp)
+        self.assertIn("cannot be checked", str(missing.exception))
+        self.assertNotIn("opened", str(missing.exception))
+        self.assertIn("not a regular file", str(directory.exception))
+        for caught in (missing, directory):
+            self.assertIsNone(caught.exception.__context__)
+
+    def test_file_validate_and_the_reader_apply_the_same_check(self):
+        calls = []
+        real = secret.check_keyfile_mode
+
+        def spy(path, st_mode):
+            calls.append(path)
+            return real(path, st_mode)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "key")
+            with open(path, "w") as f:
+                f.write("tok-fake")
+            os.chmod(path, 0o600)
+            with unittest.mock.patch.object(secret, "check_keyfile_mode", spy):
+                gcp_token.validate("file", key_file=path)
+                secret.read_keyfile(path)
+        self.assertEqual(calls, [path, path])
 
     def test_file_validate_accepts_an_owner_only_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -699,6 +863,19 @@ class TestReadKeyfile(unittest.TestCase):
             self.assertNotIn("tok-fake", str(caught.exception))
             os.chmod(path, 0o600)
             self.assertEqual(secret.read_keyfile(path), "tok-fake")
+
+    def test_an_undecodable_file_leaves_no_key_bytes_on_the_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "key")
+            with open(path, "wb") as f:
+                f.write(b"tok-SECRET\xff\xfe")
+            os.chmod(path, 0o600)
+            with self.assertRaises(secret.SecretError) as caught:
+                secret.read_keyfile(path)
+        self.assertIn("cannot be read as text", str(caught.exception))
+        self.assertIsNone(caught.exception.__context__)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertNotIn("SECRET", _chain(caught.exception))
 
 
 if __name__ == "__main__":

@@ -252,7 +252,8 @@ class HttpLlmClient(LlmClient):
         self.model = model
         self.supports_tools = supports_tools
         self._base_url = base_url.rstrip("/")
-        # The credential currently in use. A token source may replace it between turns.
+        # The credential currently in use. A token source may replace it
+        # between turns.
         self._bearer = Secret(api_key)
         self._timeout = _TIMEOUT_SECONDS if timeout is None else timeout
         if transport is None:

@@ -54,6 +54,24 @@ class Secret:
     __str__ = __repr__
 
 
+def check_keyfile_mode(path: str, st_mode: int) -> None:
+    """Refuse a credential file that is not a regular file only its owner can
+    read.
+
+    The one place this test is written. `read_keyfile` calls it on the
+    descriptor it is about to read, and the token source's startup check
+    calls it on a stat of the path, so tightening it here tightens both.
+    """
+    if not stat.S_ISREG(st_mode):
+        raise SecretError("api_key_file %s is not a regular file" % path)
+    # Any group or other bit, not only "not 0644": 0640 shares the key with a
+    # group just as surely. 0400 passes; it is stricter than 0600.
+    if st_mode & 0o077:
+        raise SecretError(
+            "api_key_file %s has mode %04o; it holds a secret and must be "
+            "readable by its owner only (chmod 600)"
+            % (path, stat.S_IMODE(st_mode)))
+
 
 def read_keyfile(path: str) -> str:
     """The key in a file only its owner can read.
@@ -70,25 +88,22 @@ def read_keyfile(path: str) -> str:
                           % (path, exc.strerror)) from None
     # fstat before fdopen: opening a directory as text raises at fdopen.
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise SecretError("api_key_file %s is not a regular file" % path)
-        # Any group or other bit, not only "not 0644": 0640 shares the key
-        # with a group just as surely. 0400 passes; it is stricter than 0600.
-        if info.st_mode & 0o077:
-            raise SecretError(
-                "api_key_file %s has mode %04o; it holds a secret and must be "
-                "readable by its owner only (chmod 600)"
-                % (path, stat.S_IMODE(info.st_mode)))
+        check_keyfile_mode(path, os.fstat(fd).st_mode)
     except SecretError:
         os.close(fd)
         raise
+    failure = None
+    key = ""
     with os.fdopen(fd, "r", encoding="utf-8") as handle:
         try:
             key = handle.read().strip()
         except (OSError, UnicodeDecodeError):
-            raise SecretError("api_key_file %s cannot be read as text"
-                              % path) from None
+            failure = "api_key_file %s cannot be read as text" % path
+    # Raised once the except block has exited. A UnicodeDecodeError holds the
+    # bytes it failed on in `.object`, which here are the key, and `from None`
+    # hides __context__ without clearing it.
+    if failure is not None:
+        raise SecretError(failure)
     if not key:
         raise SecretError("api_key_file %s is empty" % path)
     return key

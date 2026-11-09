@@ -342,6 +342,25 @@ class TestSecrets(unittest.TestCase):
         with self.assertRaises(config.ConfigError):
             _load(argv=["--api-key-file", path])
 
+    def test_undecodable_keyfile_leaves_no_key_bytes_on_the_chain(self):
+        # A UnicodeDecodeError holds the bytes it failed on in `.object`,
+        # and here those are the key. Nothing on the ConfigError's chain may
+        # reach them, however an error serialiser walks it.
+        handle, path = tempfile.mkstemp(dir=_tmp.name, suffix=".key")
+        with os.fdopen(handle, "wb") as f:
+            f.write(_FAKE_KEY.encode() + b"\xff\xfe")
+        os.chmod(path, 0o600)
+        with self.assertRaises(config.ConfigError) as ctx:
+            config._read_keyfile(path)
+        seen, current = [], ctx.exception
+        while current is not None:
+            seen.append(current)
+            self.assertNotIn(_FAKE_KEY, repr(current))
+            self.assertNotIn(_FAKE_KEY, repr(vars(current)))
+            self.assertNotIn(_FAKE_KEY, repr(getattr(current, "object", "")))
+            current = current.__context__ or current.__cause__
+        self.assertEqual(len(seen), 1, "the chain should hold nothing else")
+
     def test_directory_as_keyfile_is_refused(self):
         with self.assertRaises(config.ConfigError):
             _load(argv=["--api-key-file", _tmp.name])
