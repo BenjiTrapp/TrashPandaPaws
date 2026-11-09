@@ -88,6 +88,12 @@ def _lifetime(raw: Any) -> int:
     keeps a wrong `expires_in` from outliving the real token. A value that is
     missing, not a number, or not positive says nothing usable about the
     token, so it gets the assumed lifetime rather than either extreme.
+
+    Zero and negative values are deliberately not clamped up to the floor.
+    A floor of SKEW_SECONDS + 1 is cached for one second, which for a value
+    the server got wrong is a fetch on every call, the very thing the clamp
+    is there to prevent. Only a positive number is believed, and it is
+    clamped into [SKEW_SECONDS + 1, 3600].
     """
     seconds = None
     if not isinstance(raw, bool):
@@ -201,7 +207,26 @@ class TokenSource:
             if self._token is not None and \
                     self._expires_at - started > SKEW_SECONDS:
                 return self._token
-            token, lifetime = self._fetch()
+            failure = None
+            token = lifetime = None
+            try:
+                token, lifetime = self._fetch()
+            except TokenUnavailable as exc:
+                failure = exc
+            if failure is not None:
+                # The refresh runs SKEW_SECONDS early, so a token inside the
+                # skew window is still good and the caller gets a working
+                # credential. Raising here would throw it away, and a job
+                # that runs two hours on a one-hour token would be marked
+                # dead for a blip in gcloud. The failure is not lost: the
+                # cache is left as it was, so the next call retries, and
+                # once the token has really expired that retry's failure
+                # reaches the caller. A token at or past its expiry is never
+                # returned. One attempt per call; no loop, no backoff.
+                if self._token is not None and \
+                        self._expires_at - self._now() > 0:
+                    return self._token
+                raise failure
             # Measured from before the fetch: a slow gcloud must not make the
             # token look younger than it is.
             self._token = token

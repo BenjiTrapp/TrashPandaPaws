@@ -164,7 +164,69 @@ class TestCaching(unittest.TestCase):
         self.assertEqual(fetcher.calls, 1)
         self.assertEqual(results, ["tok-1"] * 8)
 
-    def test_a_failed_refresh_raises_and_leaves_the_next_call_to_retry(self):
+    def test_a_failed_refresh_inside_the_skew_window_returns_the_cached_token(self):
+        clock = _Clock()
+        outcomes = [("tok-1", 3600), gcp_token.TokenUnavailable("down"),
+                    ("tok-2", 3600)]
+        calls = []
+
+        def fetch():
+            calls.append(1)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        src = _with(fetch, clock=clock)
+        self.assertEqual(src.bearer(), "tok-1")
+        # Inside the window (refresh due) but one second short of expiry.
+        clock.t = 3600 - 1
+        self.assertEqual(src.bearer(), "tok-1")
+        self.assertEqual(len(calls), 2)
+        # The failure did not poison the cache: the next call retries.
+        self.assertEqual(src.bearer(), "tok-2")
+        self.assertEqual(len(calls), 3)
+
+    def test_a_failed_refresh_at_the_start_of_the_window_returns_the_cached_token(self):
+        clock = _Clock()
+        outcomes = [("tok-1", 3600), gcp_token.TokenUnavailable("down")]
+
+        def fetch():
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        src = _with(fetch, clock=clock)
+        src.bearer()
+        clock.t = 3600 - _SKEW
+        self.assertEqual(src.bearer(), "tok-1")
+
+    def test_a_failed_refresh_past_expiry_raises(self):
+        for at in (3600, 3601, 10 ** 6):
+            with self.subTest(at=at):
+                clock = _Clock()
+                outcomes = [("tok-1", 3600),
+                            gcp_token.TokenUnavailable("down")]
+
+                def fetch():
+                    outcome = outcomes.pop(0)
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+
+                src = _with(fetch, clock=clock)
+                self.assertEqual(src.bearer(), "tok-1")
+                clock.t = at
+                with self.assertRaises(gcp_token.TokenUnavailable) as caught:
+                    src.bearer()
+                self.assertIn("down", str(caught.exception))
+
+    def test_a_failed_first_fetch_raises(self):
+        with self.assertRaises(gcp_token.TokenUnavailable):
+            _with(_failing("down")).bearer()
+
+    def test_a_failed_refresh_then_recovery_after_expiry(self):
         clock = _Clock()
         outcomes = [("tok-1", 3600), gcp_token.TokenUnavailable("down"),
                     ("tok-2", 3600)]
@@ -176,7 +238,7 @@ class TestCaching(unittest.TestCase):
             return outcome
 
         src = _with(fetch, clock=clock)
-        self.assertEqual(src.bearer(), "tok-1")
+        src.bearer()
         clock.t = 3600
         with self.assertRaises(gcp_token.TokenUnavailable):
             src.bearer()
