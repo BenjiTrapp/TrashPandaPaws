@@ -1126,6 +1126,75 @@ class TestAFallbackChainIsReadFromYaml(unittest.TestCase):
         self.assertIn("primary", str(caught.exception))
 
 
+class TestAWeakerFallbackIsANoteNotADowngrade(unittest.TestCase):
+    """The tier is the primary's for the whole run (Known limits), so a
+    fallback weaker than it is labelled, the way a static bearer is. The run
+    keeps its tier: lowering it to the weakest link was decided against."""
+
+    _PI = {"provider": "ollama", "model": "qwen2.5:7b",
+           "base_url": "http://10.0.1.50:11434/v1"}
+
+    def _load(self, fallbacks, env=None):
+        data = {"agent": {"llm": {"provider": "anthropic",
+                                  "model": "claude-sonnet-4-5",
+                                  "fallbacks": fallbacks}}}
+        return _load(data=data, env=dict(env or {}, AGENT_API_KEY=_FAKE_KEY))
+
+    def test_a_weaker_fallback_is_named_with_both_tiers(self):
+        cfg = self._load([self._PI])
+        ok, reason = cfg.available()
+        self.assertTrue(ok, reason)
+        self.assertEqual(cfg.capability_tier, "full")
+        for said in ("fallback 1", "ollama / qwen2.5:7b", "'minimal'",
+                     "'full'", "highest phase 5", "AGENT_CAPABILITY_TIER"):
+            self.assertIn(said, reason)
+        self.assertNotIn(_FAKE_KEY, reason)
+
+    def test_the_weakest_link_is_the_one_named(self):
+        cfg = self._load([
+            {"provider": "ollama", "model": "qwen2.5-coder",
+             "base_url": "http://127.0.0.1:11434/v1"},          # reduced
+            self._PI,                                           # minimal
+            {"provider": "gemini", "model": "gemini-3-flash",
+             "api_key_env": "GEMINI_API_KEY"}],                 # reduced
+            env={"GEMINI_API_KEY": "gm-fake-0123456789"})
+        reason = cfg.available()[1]
+        self.assertIn("fallback 2", reason)
+        self.assertNotIn("fallback 1", reason)
+        self.assertNotIn("fallback 3", reason)
+
+    def test_the_note_changes_nothing_about_the_run(self):
+        cfg = self._load([self._PI])
+        self.assertEqual(cfg.capability_tier, "full")
+        campaign = config.CampaignConfig.from_form(
+            dict(_FORM, phases=[1, 2, 3, 4, 5]), tier=cfg.capability_tier)
+        self.assertIn(5, campaign.phases)
+
+    def test_no_weaker_fallback_is_no_note(self):
+        for fallbacks in ((), [{"provider": "openrouter",
+                                "model": "openai/gpt-5",
+                                "api_key_env": "OR_KEY"}]):
+            with self.subTest(fallbacks=fallbacks):
+                cfg = self._load(list(fallbacks),
+                                 env={"OR_KEY": "or-fake-0123456789"})
+                self.assertEqual(cfg.available(), (True, ""))
+
+    def test_a_tier_set_to_the_weakest_link_is_no_note(self):
+        # The remedy the note names is what silences it.
+        cfg = self._load([self._PI],
+                         env={"AGENT_CAPABILITY_TIER": "minimal"})
+        self.assertEqual(cfg.available(), (True, ""))
+
+    def test_it_rides_beside_the_other_reasons(self):
+        cfg = self._load([self._PI, {"provider": "anthropic",
+                                     "model": "claude-x",
+                                     "api_key_env": "MISSING_KEY"}])
+        ok, reason = cfg.available()
+        self.assertFalse(ok)
+        self.assertIn("requires an api_key", reason)
+        self.assertIn("fallback 1 (ollama / qwen2.5:7b) is 'minimal'", reason)
+
+
 # ── Vertex ──
 
 _VERTEX = {"AGENT_PROVIDER": "vertex", "AGENT_MODEL": "google/m",

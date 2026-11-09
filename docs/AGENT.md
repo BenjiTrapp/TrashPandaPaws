@@ -481,7 +481,9 @@ not a second brain.
   has not been measured for this page.
 - **The tier does not follow the failover.** It is fixed once, at startup,
   from the *primary* model, so a run that fails over to the Pi keeps the
-  primary's limits. See [Known limits](#the-agent-layer). On its own, a local
+  primary's limits. See [Known limits](#the-agent-layer); the status panel and
+  the startup log say so, naming the link, when a fallback is weaker than the
+  run's tier. On its own, a local
   model whose name states a size under 30 billion parameters (`qwen2.5:7b`)
   is `minimal` and stops at phase 3, and one whose name states no size is
   `reduced`. If a chain ends on a small model, `AGENT_CAPABILITY_TIER` sets
@@ -932,19 +934,29 @@ have to be distinguishable.
   approval gate and the scope are not affected and still stand between that
   model and an action. This predates the provider work and is more reachable
   now that a [model on the Pi](#a-model-on-the-pi) is a documented fallback.
+  It is not silent: when a fallback's own tier is below the run's,
+  `/api/ai/status`, the startup log and the campaign form carry a note naming
+  that link, its tier, and the tier the run keeps. The note changes nothing.
 
   **What re-deriving the tier per active link would and would not reach.** It
-  would reach the turn limit, the truncation, the tool set and the prompt,
-  which a run reads as it goes. It would not reach the phases: `max_phase` is
-  applied once, when the form becomes a `CampaignConfig`, before any model has
-  been asked, so a run started at phase 5 on a `full` primary keeps phase 5
-  whichever link answers. Closing that half needs a cap or an abort at the
-  moment of failover, which is separate work. A fix that only re-reads the
-  tier leaves this entry half true: it should then be cut down to the phase
-  ceiling, not deleted. The test that ties this entry watches the turn limit
-  and nothing else. Until then, put the weakest model you would accept as the
-  whole run's tier in `AGENT_CAPABILITY_TIER`, which also lowers the phases
-  the form may select.
+  would reach the turn limit, the truncation, the tool set and the prompt, but
+  only together with a change to the loop: all four are fixed at launch (the
+  limits when the campaign is built, the truncation when it starts, the
+  prompt, the tools and the turn limit when each loop is begun), so a failover
+  partway through a run would also need the loop to read them again. It would
+  not reach the phases: `max_phase` is applied once, when the form becomes a
+  `CampaignConfig`, before any model has been asked, so a run started at
+  phase 5 on a `full` primary keeps phase 5 whichever link answers. Closing
+  that half needs a cap or an abort at the moment of failover, which is
+  separate work. A fix that only re-reads the tier leaves this entry half
+  true: it should then be cut down to the phase ceiling, not deleted. A fix
+  that instead gives the whole run the weakest link's tier, in `config.load`,
+  closes both halves, the phases included, and the entry goes. The test that
+  ties this entry watches the turn limit, with the tier taken from
+  `config.load` and the run driven through a failover, so either fix turns it
+  red. Until then, put the weakest model you would accept as the whole run's
+  tier in `AGENT_CAPABILITY_TIER`, which also lowers the phases the form may
+  select.
 - **Wifi phases 6–8 are unreachable.** `max_phase` tops out at 5 for every
   capability tier, so the wifi chain cannot be selected yet. Monitor mode
   has only ever been mock-tested here: the Pi's onboard WLAN is the only

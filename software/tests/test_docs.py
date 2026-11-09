@@ -636,12 +636,18 @@ class _StubC2:
 
 
 def _a_failover_keeps_the_primarys_tier():
-    # Behavioural, at the point of use: a campaign is run on a `full` tier over
-    # a chain whose primary is down and which has already failed over to a
-    # `local` link (never above `reduced`), and the model never stops calling
-    # tools. The report says how many orchestrator turns it was allowed, which
-    # is the limit the run actually held. Open while that is the primary's
-    # figure and the answering link's own tier would have allowed fewer.
+    # Behavioural, at the point of use: a campaign is run over a chain whose
+    # primary is down and which has already failed over to a `local` link
+    # (never above `reduced`), and the model never stops calling tools. The
+    # report says how many orchestrator turns it was allowed, which is the
+    # limit the run actually held. Open while that is the primary's figure
+    # and the answering link's own tier would have allowed fewer.
+    #
+    # The tier the run is given comes from config.load, from a YAML naming
+    # the same chain, and not from an AgentConfig built by hand: a fix that
+    # derives the tier at load from the weakest link would otherwise leave
+    # this green and the entry stale. So both places a fix could land, the
+    # load and the run, are watched.
     async def turns_allowed():
         chain = failover.FailoverClient([
             _StubLink("anthropic", "claude-sonnet-4-5", fails=True),
@@ -649,10 +655,20 @@ def _a_failover_keeps_the_primarys_tier():
         # Failed over before the campaign is built, so a fix that reads the
         # answering link when the campaign starts sees the small one too.
         await chain.complete("", [], [], 16, 0.0)
-        agent_cfg = config.AgentConfig(capability_tier="full")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "raccoon.yaml")
+            with open(path, "w") as handle:
+                yaml.safe_dump({"agent": {"llm": {
+                    "provider": "anthropic", "model": "claude-sonnet-4-5",
+                    "fallbacks": [{"provider": "local",
+                                   "model": "small-local-model",
+                                   "base_url": "http://127.0.0.1:1/v1"}],
+                }}}, handle)
+            agent_cfg = config.load(argv=[], yaml_path=path,
+                                    env={"AGENT_API_KEY": "sk-fake-tier"})
         campaign_cfg = config.CampaignConfig.from_form(
             {"beacons": ["b1"], "scope_allow": ["10.0.1.0/24"],
-             "mode": "auto"}, tier="full")
+             "mode": "auto"}, tier=agent_cfg.capability_tier)
         conn = db.open_store(":memory:")
         try:
             campaign = orchestrator.Campaign(
@@ -788,12 +804,16 @@ class TestTheKnownLimitsRecordTheOpenFindings(_DocCase):
 # and delete this record. Do not "fix" the test by changing what it asserts.
 #
 # One exception, and the tier entry is it. Its predicate watches the
-# orchestrator-turn limit only, which is the half of that entry a per-link
-# tier would close. The entry says that the other half, the phase ceiling
-# fixed when the form becomes a CampaignConfig, stays open under such a fix.
-# So when that predicate fails, read the entry before deleting it: if nothing
-# caps or aborts a run at failover, cut the entry down to the phase ceiling
-# instead, and say there that no test ties it.
+# orchestrator-turn limit only, with the tier taken from config.load and the
+# run driven through a failover, so a fix at either place turns it red. The
+# two fixes close different amounts, and the entry says which:
+#   * the run's tier made the weakest link's in config.load closes both
+#     halves, phases included -- delete the entry as usual;
+#   * the tier re-read per active link closes the turn limit only. The phase
+#     ceiling, fixed when the form becomes a CampaignConfig, stays open, so
+#     if nothing caps or aborts a run at failover, cut the entry down to the
+#     phase ceiling instead, and say there that no test ties it.
+# The failover note in config.available() is not a fix and leaves this green.
 _OPEN_AGENT_LIMITS = [
     ("A failover does not re-derive the capability tier",
      _a_failover_keeps_the_primarys_tier),

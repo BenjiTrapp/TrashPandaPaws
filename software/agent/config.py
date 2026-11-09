@@ -159,6 +159,39 @@ _STATIC_BEARER_NOTE = (
 _SCRUB_MIN_LENGTH = 8
 
 
+def _failover_tier_note(cfg) -> Optional[str]:
+    """A note when a fallback is weaker than the tier the run keeps, or None.
+
+    The tier is derived once, from the primary, and a failover does not
+    re-derive it (docs/AGENT.md, Known limits), so a small last link runs
+    with the primary's limits, the highest phase among them. Lowering the
+    run's tier to the weakest link here would close that, and was decided
+    against: it would quietly change what an existing chain may do, and a
+    phase-5 engagement would be refused with nothing to say why. So the
+    operator is told instead, and the choice stays theirs. Nothing about the
+    run changes.
+    """
+    order = list(llm_provider.TIER_LIMITS)  # strongest first
+    kept = cfg.capability_tier
+    if kept not in order:
+        return None
+    weakest = None
+    for number, link in enumerate(cfg.fallbacks or (), 1):
+        tier = llm_provider.capability_tier(link.model, link.provider)
+        if order.index(tier) > order.index(kept if weakest is None
+                                           else weakest[0]):
+            weakest = (tier, number, link)
+    if weakest is None:
+        return None
+    tier, number, link = weakest
+    return ("fallback %d (%s / %s) is %r on its own, but a failover keeps "
+            "this run's tier %r on every link, highest phase %d included; "
+            "AGENT_CAPABILITY_TIER=%s holds the whole run, the primary too, "
+            "to that link's limits"
+            % (number, link.provider, link.model, tier, kept,
+               llm_provider.TIER_LIMITS[kept]["max_phase"], tier))
+
+
 @dataclass(frozen=True)
 class FallbackLink:
     """One link in the provider chain after the primary.
@@ -282,8 +315,10 @@ class AgentConfig:
     def available(self) -> Tuple[bool, str]:
         """(usable, reason) for the status endpoint.
 
-        The reason is "" when usable, with one exception: a note that a
-        vertex run is on a static key is carried beside a usable answer.
+        The reason is "" when usable, with one exception: notes the operator
+        must see are carried beside a usable answer. One says a vertex run is
+        on a static key; one says a fallback is weaker than the tier the run
+        keeps.
 
         Every problem is reported, not the first: an operator who fixes the
         provider only to meet the Sliver conflict next has been sent round
@@ -314,6 +349,9 @@ class AgentConfig:
         # since nothing else says the run will die at the token's hour. So it
         # rides beside a usable answer and does not turn it into a refusal.
         notes = [_STATIC_BEARER_NOTE] if self.static_bearer else []
+        tier_note = _failover_tier_note(self)
+        if tier_note:
+            notes.append(tier_note)
         if not problems and not notes:
             return True, ""
         reason = "; ".join(problems + notes)
