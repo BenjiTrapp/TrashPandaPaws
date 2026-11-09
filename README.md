@@ -40,7 +40,7 @@ or an HP network printer to blend into enterprise infrastructure.
 |------|------------|
 | **Hardware** | Custom PoE HAT (SI3402-B + TPS54302), USB-GbE via RTL8153B, 3 build variants (Lite / v1 HAT / v2 CM4) |
 | **Cover Identity** | Cisco IP Phone 7960 (SIP, RTP, HTTP) or HP LaserJet MFP M478 (PJL, LPD, IPP, SNMP, Telnet) |
-| **C2 Transport** | 3 independent channels — HTTPS, SMB named pipes, QUIC-style UDP — plus DNS as a tasking-only side channel, with automatic fallback |
+| **C2 Transport** | 3 independent channels — HTTPS, SMB named pipes, QUIC-style UDP — plus DNS as a tasking-only side channel, with automatic fallback. Each non-HTTPS channel has a listener that terminates it; see [`docs/LISTENERS.md`](docs/LISTENERS.md) |
 | **Encryption** | AES-256-GCM on all channels, keys auto-generated or operator-defined |
 | **Beacon** | Pure Python stdlib, zero external dependencies, multi-layer obfuscation (1–6 layers zlib+base64) |
 | **Operator GUI** | Flask-based team server with embedded SPA: terminal, file browser, pivot map, profile editor, 16 Impacket tools |
@@ -610,7 +610,7 @@ The beacon supports four C2 transport channels, all implemented in pure Python s
 
 **Three of the four are independent; DNS is not.** HTTPS, SMB and QUIC each carry a registration, a check-in and a result, so a beacon configured with any one of them alone completes a full cycle. DNS carries tasking only: `_beacon_dns` queries a TXT record and decrypts the answer, but there is no `_send_result_dns` and no registration over DNS. A beacon that falls through to DNS alone will execute what it is given and report nothing. Use DNS alongside another channel, not instead of one.
 
-Only HTTPS has a server counterpart in this repository: the team server answers it. SMB expects a named pipe on an SMB server, QUIC expects a UDP listener, and DNS expects an authoritative nameserver for the configured zone — none of which ships here. For the current working state of each channel, including which have ever completed an exchange, see *Known limits* in [`docs/AGENT.md`](docs/AGENT.md#known-limits); that section is held by a test that fails if an entry is fixed and left in the list. The design that closes the gap is [`docs/superpowers/specs/2026-11-07-c2-listeners-design.md`](docs/superpowers/specs/2026-11-07-c2-listeners-design.md).
+All four transports now have a server counterpart. The team server answers HTTPS on its beacon socket; SMB, QUIC and DNS are answered by **listeners** — separate processes that terminate one protocol each and relay the encrypted payload to that same socket. **None of them is given the encryption key**, which is what makes one safe to put on an exposed forwarding host. How to configure and run them, including the limits of each, is [`docs/LISTENERS.md`](docs/LISTENERS.md); the design and the alternatives it rejected are [`docs/superpowers/specs/2026-11-07-c2-listeners-design.md`](docs/superpowers/specs/2026-11-07-c2-listeners-design.md). For what is still open elsewhere in the project, see *Known limits* in [`docs/AGENT.md`](docs/AGENT.md#known-limits), a section held by a test that fails if an entry is fixed and left in the list.
 
 ```mermaid
 flowchart LR

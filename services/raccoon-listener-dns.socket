@@ -1,0 +1,20 @@
+[Unit]
+Description=Raccoon dns listener socket
+# systemd owns the port, so the service below never binds one. That is the
+# whole mechanism: a privileged port is bound by something that already
+# has the privilege, and the descriptor is handed over. No AmbientCapabilities,
+# no setcap, no sudo.
+Documentation=file:///opt/raccoon/docs/LISTENERS.md
+
+[Socket]
+ListenDatagram=53
+# The service runs as nobody and must be able to read the descriptor.
+SocketUser=root
+SocketGroup=nogroup
+SocketMode=0660
+# One listener, one socket. Accept=no means the service is started once and
+# handed the listening descriptor, not once per connection.
+Accept=no
+
+[Install]
+WantedBy=sockets.target

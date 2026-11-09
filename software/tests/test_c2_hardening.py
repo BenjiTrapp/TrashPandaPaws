@@ -774,7 +774,7 @@ def _unit_reach(text):
     systemd runs a system unit as root unless it names another User=.
     """
     user, workdir, pythonpath, execs, section = "root", None, [], [], None
-    for line in text.splitlines():
+    for line in _joined_lines(text):
         line = line.strip()
         if line.startswith("[") and line.endswith("]"):
             section = line
@@ -813,6 +813,27 @@ def _unit_reach(text):
                     paths.add(base.joinpath(*parts))
                     paths.add(base.joinpath(*parts).with_suffix(".py"))
     return _Reach(sorted(str(p) for p in paths), sorted(str(t) for t in trees))
+
+
+def _joined_lines(text):
+    """Unit-file lines with systemd's backslash continuations joined.
+
+    systemd lets a directive run across lines, and a long `ExecStart` is
+    the usual reason to. Without this the value ends in a lone backslash,
+    `shlex.split` raises, and this guard stops guarding -- which is how
+    three new listener units took it down.
+    """
+    out, pending = [], ""
+    for raw in text.splitlines():
+        line = pending + raw.rstrip()
+        if line.endswith("\\"):
+            pending = line[:-1].rstrip() + " "
+            continue
+        pending = ""
+        out.append(line)
+    if pending:
+        out.append(pending)
+    return out
 
 
 def _root_units(unit_dir):
@@ -1062,6 +1083,20 @@ class TestInstallerReader(unittest.TestCase):
         self.assertEqual(reach.trees, ["/srv/app/pkg", "/srv/lib/pkg",
                                        "/usr"])
         self.assertIn("/srv/lib/pkg/sub/tool.py", reach.paths)
+
+    def test_a_directive_split_across_lines_is_read_whole(self):
+        # systemd allows a backslash continuation and a long ExecStart is
+        # the usual reason to use one. Before this the value ended in a
+        # lone backslash, shlex raised, and the guard above stopped
+        # guarding -- three new listener units took it down that way, and
+        # an erroring guard is a guard that has to be fixed before it can
+        # protect anything again.
+        reach = _unit_reach("[Service]\n"
+                            "ExecStart=/opt/raccoon/venv/bin/python \\\n"
+                            "    -m software.c2.listeners \\\n"
+                            "    --transport smb\n")
+        self.assertIsNotNone(reach)
+        self.assertIn("/opt/raccoon/venv/bin/python", reach.paths)
 
     def test_a_unit_runs_as_root_unless_it_names_another_user(self):
         self.assertIsNotNone(_unit_reach("[Service]\nExecStart=/bin/true\n"))
@@ -2551,5 +2586,73 @@ class TestSecretsStayOffTheCommandLine(unittest.TestCase):
 
 
 # New test classes belong above this guard; never append below it.
+class TestNoMethodIsDefinedTwice(unittest.TestCase):
+    """A name bound twice in one scope silently loses the first binding.
+
+    Python does not warn. The later `def` wins, every caller of the earlier
+    one gets the wrong signature, and if those callers sit inside a broad
+    `except Exception` the failure is a debug log and nothing else.
+
+    That is not hypothetical here. `Beacon._smb2_negotiate` and
+    `Beacon._smb2_tree_connect` were each defined twice -- once as the C2
+    transport's message builders, once as the `smbloot` file-browsing
+    helpers, which take a socket. The `smbloot` versions came later and
+    won, so `_smb_connect` called them with the wrong arguments, raised
+    `TypeError` on its first line of real work, caught it, logged at debug
+    and returned None. **The SMB C2 transport could never connect**, and a
+    beacon configured with SMB as its only channel was simply invisible.
+
+    One AST walk over the project is enough to make that class of defect
+    impossible to reintroduce, and it found exactly these two.
+    """
+
+    def _duplicates(self):
+        found = []
+        for path in sorted(Path("software").rglob("*.py")):
+            if {".venv", "site-packages"} & set(path.parts):
+                continue
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError:
+                continue
+            scopes = [("module", tree.body)]
+            scopes.extend((node.name, node.body) for node in ast.walk(tree)
+                          if isinstance(node, ast.ClassDef))
+            for scope, body in scopes:
+                defs = [node for node in body
+                        if isinstance(node, (ast.FunctionDef,
+                                             ast.AsyncFunctionDef))]
+                seen = {}
+                for node in defs:
+                    if node.name in seen:
+                        found.append("%s:%d %s.%s first defined at line %d"
+                                     % (path, node.lineno, scope, node.name,
+                                        seen[node.name]))
+                    else:
+                        seen[node.name] = node.lineno
+        return found
+
+    def test_nothing_in_the_project_shadows_an_earlier_definition(self):
+        self.assertEqual(self._duplicates(), [])
+
+    def test_the_check_finds_a_shadowed_method_when_there_is_one(self):
+        # A guard that cannot fail is not a guard. Give it a file with the
+        # defect and watch it report it.
+        with tempfile.TemporaryDirectory() as tmp:
+            shadowed = Path(tmp) / "software" / "shadowed.py"
+            shadowed.parent.mkdir(parents=True)
+            shadowed.write_text("class A:\n"
+                                "    def f(self):\n        pass\n"
+                                "    def f(self, sock):\n        pass\n")
+            previous = os.getcwd()
+            os.chdir(tmp)
+            try:
+                found = self._duplicates()
+            finally:
+                os.chdir(previous)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("A.f", found[0])
+
+
 if __name__ == "__main__":
     unittest.main()

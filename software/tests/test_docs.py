@@ -577,8 +577,14 @@ def _the_shipped_config_carries_a_vnc_password():
 
 def _the_token_is_compared_with_plain_equality():
     text = _read("software", "c2", "server.py")
-    return ("return auth[7:] == operator_token" in text
-            and "compare_digest" not in text)
+    # Only the operator token's own comparison counts. This used to also
+    # require that `compare_digest` appeared nowhere in the file, which
+    # read as a shortcut for "nothing here compares tokens properly yet".
+    # The listener tasking route then added a second, correct comparison,
+    # and the shortcut made this probe report the finding fixed while
+    # line 350 still held an `==`. A probe that names one comparison has
+    # to look at that comparison.
+    return "return auth[7:] == operator_token" in text
 
 
 def _project_files_are_world_readable():
@@ -604,12 +610,6 @@ def _there_is_no_licence_file():
                    for p in REPO.iterdir() if p.is_file())
 
 
-def _smb_and_quic_double_serialise():
-    text = _read("software", "c2", "beacon.py")
-    return ("def _encrypt(self, data: dict)" in text
-            and len(re.findall(r"self\._encrypt\(json\.dumps\(", text)) == 3)
-
-
 # group -> [(phrase the entry must contain, True-while-open or None)].
 # None means nothing in the working tree can show it: the six commits are on
 # a GitHub reference, and the deferred minors are properties of tests, of
@@ -624,6 +624,58 @@ def _the_sleep_floor_overrides_a_short_interval():
     floored = "time.sleep(max(10, delay))" in text
     reports_configured = re.search(r'"interval":\s*self\.interval', text)
     return floored and bool(reports_configured)
+
+
+def _the_quic_client_trusts_any_sender():
+    """The beacon reassembles datagrams without checking where they came from.
+
+    `_quic_send` reads answers with `recvfrom` and ignores the returned
+    address, so anything that can reach the beacon's source port can
+    inject fragments into a reassembly in progress. The listener cannot
+    compensate: the client is the one that trusts.
+    """
+    text = _read("software", "c2", "beacon.py")
+    start = text.find("def _quic_send")
+    if start < 0:
+        return False
+    body = text[start:start + 4000]
+    uses_recvfrom = "recvfrom(" in body
+    # A fix would compare the address it got against the one it sent to.
+    compares = "addr ==" in body or "address ==" in body or "src ==" in body
+    return uses_recvfrom and not compares
+
+
+def _a_task_delivered_over_dns_stays_pending():
+    """`/api/tasks/<id>` answers from `results` alone.
+
+    A task that went out over DNS never produces a result, so it reports
+    `pending` for ever -- the same answer as a task still sitting in the
+    queue. Nothing distinguishes "not delivered yet" from "delivered, and
+    you will never hear about it".
+    """
+    text = _read("software", "c2", "server.py")
+    start = text.find("def api_task_result")
+    if start < 0:
+        return False
+    body = text[start:start + 400]
+    return 'return jsonify({"status": "pending"})' in body \
+        and "dispatched" not in body
+
+
+def _a_beacons_implant_id_is_one_per_host():
+    """`_generate_id` hashes the hostname and architecture, not the implant.
+
+    So two implants on one host are one agent to the server, sharing one
+    task queue -- and since tasking is dequeued, whichever polls first
+    takes the task. The id is also computable by anyone who knows the
+    hostname, on any host without `/sys/class/net/eth0/address`.
+    """
+    text = _read("software", "c2", "beacon.py")
+    start = text.find("def _generate_id")
+    if start < 0:
+        return False
+    body = text[start:start + 500]
+    return "platform.node()" in body and "platform.machine()" in body
 
 
 _OPEN_FINDINGS = {
@@ -643,6 +695,10 @@ _OPEN_FINDINGS = {
         ("No request-size cap and no rate limiting",
          _there_is_no_size_cap_and_no_rate_limit),
         ("`vnc_password`", _the_shipped_config_carries_a_vnc_password),
+        ("QUIC client accepts fragments from any sender",
+         _the_quic_client_trusts_any_sender),
+        ("stays `pending` for ever", _a_task_delivered_over_dns_stays_pending),
+        ("implant id is one per host", _a_beacons_implant_id_is_one_per_host),
     ],
     "Housekeeping, but visible": [
         ("compared with `==`", _the_token_is_compared_with_plain_equality),
@@ -652,7 +708,6 @@ _OPEN_FINDINGS = {
         ("Six commits", None),
     ],
     "Found while hardening, not by the audit": [
-        ("SMB and QUIC request legs are dead", _smb_and_quic_double_serialise),
         ("A correction to the audit's severity", None),
     ],
     "Minor, deferred": [
@@ -681,6 +736,171 @@ _OPEN_FINDINGS = {
 # entry, so eighteen entries stand for nineteen. The section says both.
 _DEFERRED_FINDINGS = 19
 _DEFERRED_MERGED = 1
+
+
+class TestTheListenersGuide(_DocCase):
+    """What `docs/LISTENERS.md` has to say, and what the README may not.
+
+    The drift this project actually suffered was a renamed flag left
+    standing in a document, so the config keys are read out of the
+    registry rather than written here as literals: a key that is renamed
+    in code and not in the guide fails this.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.guide = _read("docs", "LISTENERS.md")
+        cls.readme = _read("README.md")
+
+    def test_the_guide_exists_and_the_readme_links_it(self):
+        self.assertIn("docs/LISTENERS.md", self.readme,
+                      "the README does not link the guide")
+        self.assertGreater(len(self.guide), 2000,
+                           "the guide is a stub")
+
+    def test_the_guide_names_the_real_transports(self):
+        from software.c2.listeners.registry import transport_names
+
+        for transport in transport_names():
+            self.assertIn(transport, self.guide,
+                          "the guide does not mention %s" % transport)
+
+    def test_the_guide_names_the_real_config_keys(self):
+        # Read from the code, not written here. A field renamed in
+        # `ListenerSpec` and not in the guide is exactly the drift this
+        # test exists for.
+        import dataclasses
+
+        from software.c2.listeners.registry import ListenerSpec
+
+        for field in dataclasses.fields(ListenerSpec):
+            self.assertIn(field.name, self.guide,
+                          "the guide never mentions %s, which is a field of "
+                          "every configured listener" % field.name)
+
+    def test_the_guide_names_the_environment_variables(self):
+        for variable in ("RACCOON_LISTENER_TOKEN", "LISTEN_FDS"):
+            self.assertIn(variable, self.guide,
+                          "the guide does not mention %s" % variable)
+
+    def test_the_guide_states_the_dns_limit(self):
+        flat = " ".join(self.guide.split()).lower()
+        for phrase in ("tasking only", "never report"):
+            self.assertTrue(phrase in flat,
+                            "the guide does not say %r about DNS" % phrase)
+
+    def test_the_guide_states_that_no_listener_holds_the_key(self):
+        flat = " ".join(self.guide.split()).lower()
+        self.assertTrue("never" in flat)
+        self.assertTrue("encryption key" in flat)
+
+    # ── what this work made false ──
+
+    def test_the_readme_no_longer_says_only_https_has_a_counterpart(self):
+        flat = " ".join(self.readme.split()).lower()
+        self.assertTrue("only https has a server counterpart" not in flat,
+                        "the README still says what this work made false")
+
+    def test_the_dns_side_channel_statement_survives(self):
+        # DNS is still a dependent channel after this work: nothing
+        # registers over it and no result comes back. The claim must not
+        # be quietly upgraded to four independent channels again.
+        flat = " ".join(self.readme.split()).lower()
+        self.assertTrue("side channel" in flat,
+                        "the README no longer calls DNS a side channel")
+        self.assertTrue("4 independent channels" not in flat)
+        self.assertTrue("four independent channels" not in flat)
+
+    def test_the_readme_says_the_counterparts_now_exist(self):
+        flat = " ".join(self.readme.split()).lower()
+        self.assertTrue("listener" in flat,
+                        "the README never mentions the listeners")
+
+
+class TestTheGuiTourKeepsUpWithTheHeader(unittest.TestCase):
+    """The tour lists the header buttons; the page defines them.
+
+    A document that enumerates buttons drifts the moment one is added,
+    and one just was. So the list is checked against the page rather than
+    read for plausibility.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tour = _read("docs", "C2_DEMO.md")
+        cls.page = _read("software", "c2", "server.py")
+
+    def test_every_header_button_is_named_in_the_tour(self):
+        import re
+
+        header = self.page[self.page.index('<button class="topbar-ico-btn"'):]
+        header = header[:header.index("</header>")]
+        titles = re.findall(r'title="([^"]+)"', header)
+        self.assertGreaterEqual(len(titles), 4,
+                                "the header was not parsed: %r" % titles)
+
+        # Scoped to the section that describes the header, not the whole
+        # tour. Searching the document for "listeners" passed while the
+        # Header Bar paragraph did not mention the button, because the
+        # word appears three times elsewhere -- "unusual listeners" in the
+        # connection analyser, and an SMB listener in a diagram. The sixth
+        # time on this branch that a check was looser than the property it
+        # named.
+        section = self.tour.split("### Header Bar", 1)
+        self.assertEqual(len(section), 2,
+                         "the tour has no Header Bar section any more")
+        body = section[1].split("\n###", 1)[0]
+        flat = " ".join(body.split()).lower()
+        for title in titles:
+            self.assertTrue(title.lower() in flat,
+                            "the tour's Header Bar section never mentions "
+                            "the %r button" % title)
+
+    def test_the_tour_links_the_listener_guide(self):
+        self.assertIn("LISTENERS.md", self.tour,
+                      "the tour describes a Listeners panel and does not "
+                      "say where to read about it")
+
+
+class TestTheRedirectorGuideKnowsAboutListeners(unittest.TestCase):
+    def test_it_points_at_the_listener_guide(self):
+        # Same shape, different transport: a front host that carries
+        # traffic and holds no key. A reader who found one should find the
+        # other.
+        text = _read("docs", "REDIRECTOR.md")
+        self.assertIn("LISTENERS.md", text,
+                      "the redirector guide does not mention the listeners, "
+                      "which are the same arrangement for the other three "
+                      "transports")
+
+
+class TestKnownLimitsDropsWhatThisWorkFixed(_DocCase):
+    def test_the_line_continuation_half_is_gone(self):
+        # `_unit_reach` joins systemd continuations now, with a test. The
+        # other half of that deferred finding -- that it sees only
+        # `/bin/sh` for a `sh -c` wrapper -- is still true and still
+        # recorded.
+        flat = " ".join(self.doc.split())
+        self.assertTrue(
+            "raises a raw `ValueError` on a systemd line continuation"
+            not in flat,
+            "Known limits still records the continuation fault, which is "
+            "fixed")
+        self.assertTrue("/bin/sh" in flat,
+                        "the half that is still open was dropped too")
+
+    def test_the_severity_correction_records_that_the_gap_is_closed(self):
+        # The entry says SMB and QUIC "could not be reached at all", which
+        # was true and is the reason their unencrypted fallbacks were
+        # latent rather than exploitable. It is a statement about the
+        # past; now that listeners exist it has to say so, or a reader
+        # takes it for a current description.
+        flat = " ".join(self.doc.split()).lower()
+        self.assertTrue("could not be reached at all" in flat)
+        self.assertTrue("listener" in flat,
+                        "nothing in Known limits mentions that the "
+                        "counterparts now exist")
 
 
 class TestTheKnownLimitsRecordTheOpenFindings(_DocCase):

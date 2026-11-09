@@ -264,3 +264,14 @@ If you want what InfraGuard does -- scanner filtering, JA3 matching, decoy
 pages, burn detection -- run it in front of this server and point it at the
 agent socket exactly as above. It remains the better-maintained answer to that
 need than anything written here.
+
+---
+
+## The same shape for the other transports
+
+A redirector carries HTTPS and holds no key. The beacon's three other
+transports have the equivalent: **listeners**, separate processes that
+terminate SMB, QUIC or DNS and relay the encrypted payload to the team
+server's beacon socket, holding no key either. The reasoning is the same
+one this page makes, and the operator guide is
+[`docs/LISTENERS.md`](LISTENERS.md).

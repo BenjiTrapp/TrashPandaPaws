@@ -753,6 +753,29 @@ more.
   limiting as present, because its pattern matched the `X-RateLimit-Limit`
   and `X-RateLimit-Remaining` values in a C2 profile example in `server.py`.
   They are example response headers, not a limiter.
+- **The QUIC client accepts fragments from any sender.** `_quic_send` reads
+  its answer with `recvfrom` and ignores the address it came from, so anything
+  that can reach the beacon's source port can inject fragments into a
+  reassembly in progress and make the exchange fail. It cannot inject
+  *tasking* without the key, so this denies a channel rather than opening a
+  command path. The listener keys reassembly on the source address; a listener
+  cannot compensate for a client that does not.
+- **A task delivered over DNS stays `pending` for ever.**
+  `/api/tasks/<task_id>` answers from `results` alone, and nothing on the DNS
+  channel ever produces a result, so "not delivered yet" and "delivered, and
+  you will never hear about it" are the same answer. The interface flags the
+  agent (`VIA DNS`) and the panel states the limit, but the task's own status
+  does not distinguish the two. Reporting `dispatched` would improve this for
+  every transport and changes an API the GUI polls.
+- **A beacon's implant id is one per host, not one per implant.**
+  `_generate_id` hashes `platform.node()` and `platform.machine()`, plus the
+  eth0 MAC where that file exists. So two implants on one machine register as
+  one agent and share one task queue, and since tasking is dequeued, whichever
+  polls first takes the task — a redundant pair of HTTPS primary and DNS
+  fallback is one agent, not two. On any host without
+  `/sys/class/net/eth0/address` — macOS, Windows, and containers whose
+  interface is not named eth0 — the id is computable by anyone who knows the
+  hostname, and so is the DNS query name derived from it.
 - **`vnc_password` is a literal `raccoon`** in `configs/raccoon.yaml`, in a
   file that says, in its agent section, "Secrets never go in this file,
   because this file is in git". VNC ships disabled and binds to loopback, so
@@ -795,16 +818,6 @@ more.
 
 #### Found while hardening, not by the audit
 
-- **The SMB and QUIC request legs are dead in production.**
-  `Beacon._encrypt(data: dict)` serialises its argument itself, and three
-  call sites hand it a value that is already serialised:
-  `self._encrypt(json.dumps(...).encode())`, in `_beacon_smb`, in the SMB
-  result send and in `_quic_send`. `json.dumps` on bytes raises `TypeError`,
-  the surrounding `except` swallows it, and neither transport ever reaches a
-  response. Fixing it would switch on two transports that have never run,
-  which is not a change to make inside a security fix. The README's "four
-  independent channels" describes the design; two of the four have not
-  worked.
 - **A correction to the audit's severity.** An earlier summary of the pass
   said encryption was optional on "three of four channels", with command
   execution possible without any key. The accurate statement is narrower:
@@ -812,6 +825,16 @@ more.
   while SMB and QUIC could not be reached at all, so their unencrypted
   fallbacks were latent. Removing all three fallbacks was still right. The
   claim was overstated.
+
+  That sentence describes the code as it stood in November 2026 and no longer
+  describes it: all three transports have a listener now
+  ([`docs/LISTENERS.md`](LISTENERS.md)), and SMB turned out to be unreachable
+  for a second reason the audit had not found — `Beacon._smb2_negotiate` and
+  `_smb2_tree_connect` were each defined **twice** in that class, so the later
+  `smbloot` versions won, `_smb_connect` raised `TypeError` on its first real
+  statement and swallowed it in its own `except`, and a beacon configured with
+  SMB alone was invisible. A test now walks every scope in `software/` for a
+  name bound twice.
 
 #### Minor, deferred
 
@@ -860,9 +883,11 @@ first five are the ones that are traps for a later change.
   error level, and still acknowledge.
 - **`_owner_of` and `_handed_away` do not normalise `..`**, so
   `chown -R "${INSTALL_DIR}/../raccoon/software"` passes the unit-file test.
-- **`_unit_reach` raises a raw `ValueError` on a systemd line continuation**,
-  and sees only `/bin/sh` for an `ExecStart=/bin/sh -c '… venv/bin/python …'`
-  wrapper.
+- **`_unit_reach` sees only `/bin/sh` for an
+  `ExecStart=/bin/sh -c '… venv/bin/python …'` wrapper.** It no longer raises
+  on a systemd line continuation: the listener units of November 2026 used
+  one, which took the root-ownership guard down with a raw `ValueError`, so
+  continuations are joined now and a test holds it. The wrapper half stands.
 - **`beacon.decode_key`'s docstring claims the launchers share it.** None do.
 - **`server.py`'s `except ImportError` around the beacon import** would also
   catch an `ImportError` raised from inside `beacon`, re-raising something
