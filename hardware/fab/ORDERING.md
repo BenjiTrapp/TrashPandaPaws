@@ -56,6 +56,29 @@ files that are committed. To rebuild after a board change: `python3
 hardware/tools/export_fab.py`. It runs the DRC first and writes nothing if the
 board fails.
 
+**Before concluding the package is stale, read this.** A rebuild changes every
+file of `gerber/` even when the board has not changed: each gerber, drill file,
+the job file, the DRC report and the two drill-map PDFs carry the time of the
+export, so their bytes and the SHA-256 values in `release-manifest.json` differ
+from the committed ones on every run. Measured on 2026-11-09 with KiCad 10.0.6,
+the Homebrew `kicad-cli` and the one in the KiCad.app bundle alike: 16 of 16 files
+differ byte for byte, and no gerber or drill file differs once the lines carrying the
+time are removed (`_normalised` in `tests/check_fab_release.py`). So "git shows the
+whole set modified" and "the hashes changed" say nothing about the board; the
+freshness check compares the normalised content, and the board's own SHA-256 in the
+manifest is what binds the set to a board. A different KiCad version may change the
+content itself; that was not measured. The gerber and drill comparison cannot see a
+KiCad version change: `_normalised` strips the lines that name the generating software
+(`TF.GenerationSoftware`, "Created by KiCad", "DRILL file KiCad"). The job-file comparison
+can: it drops only `CreationDate` from the header and compares the rest, including
+`Header.GenerationSoftware.Version`, so a rebuild with another KiCad version fails
+`test_the_job_file_is_what_a_new_export_gives` (shown on 2026-11-09 by editing the
+committed version to 10.0.5). The manifest's `kicad` field records the version, but no
+test compares it with the running one. If
+you rebuild only to refresh the CPL or the assembly BOM, restore the gerber folder
+afterwards (`git checkout hardware/fab/gerber`): the exporter always rewrites it, and a
+new time stamp is churn, not a change.
+
 ### Archiving (ruling E)
 
 `.gitignore` excludes `hardware/gerber/*.gbr` and `*.drl`. The set is exported
@@ -101,9 +124,41 @@ The board has 123 vias (pad / drill, mm):
 |---|---|---|
 | 0.6 / 0.3 | 121 | everywhere by default |
 | 0.8 / 0.4 | 1 | J3 pin 1's +5V via (current) |
-| 0.56 / 0.3 | 1 | **the board's minimum via**: U3 pin 3's +1V0 via at (28.31, 24.375) mm from the top-left corner (128.31, 104.375 on the page). Annular ring 0.13 mm, **which may be below PCBWay's published minimum for an annular ring (believed to be 0.15 mm), i.e. out of process; not confirmed**. The smaller pad is what keeps In1's hole round it 0.11 mm from both MDI pairs (ruling BP). Ask Question 7. |
+| 0.56 / 0.3 | 1 | **the board's minimum via**: U3 pin 3's +1V0 via at (28.31, 24.375) mm from the top-left corner (128.31, 104.375 on the page). Annular ring **0.130 mm**: below the 0.15 mm that PCBWay's own capabilities page lists for its Standard PCB, not below the 5 mil (0.127 mm) of its Advanced table; which of them applies to this order is **not confirmed**. **Kept as it is by the operator's decision (ruling CN).** The smaller pad is what keeps In1's hole round it 0.11 mm from both MDI pairs (ruling BP). See "Annular ring" below and Question 7. |
 
 That is three via sizes on two drill diameters (0.3 and 0.4 mm).
+
+**Annular ring: what is measured, what is published, what is not known.**
+
+* **Measured** on the committed board (pcbnew, 2026-11-09; ring = (pad - drill) / 2):
+  1 via at 0.56 / 0.30 mm has **0.130 mm**, **121 vias at 0.60 / 0.30 mm have 0.150 mm
+  exactly**, 1 via at 0.80 / 0.40 mm has 0.200 mm. So one via is 0.020 mm below
+  0.15 mm, and the other 121 are on it with **no margin**. The second fact is the one
+  that matters more to a fabricator: it is nearly every via on the board.
+* **Published by PCBWay itself** (`pcbway-source-excerpts.txt` [8], fetched 2026-11-09):
+  the "Standard PCB" table of `capabilities.html`, whose layer row reads "1-14
+  layers", lists "Min Width of Annular Ring: 0.15mm(6mil)"; `Annular_rings.html` says
+  "Typically, the minimum width of the annular ring is 0.15mm (6mil)"; and the
+  "Advanced PCB" table, row 17, "Minimum weld ring (outer layer)", copper 35um, via hole,
+  gives "≥5mil" in its normal-process column and "≥4mil" in its medium-difficulty one.
+  We found **no separate annular-ring figure for 4-layer boards** on either page.
+* **Not established:** which table PCBWay applies to this order (the 0.15 mm in the
+  first, the 5 mil, 0.127 mm, in the second); whether "weld ring" in row 17 is the
+  same quantity as "annular ring" (we assume so, the page does not say); and that
+  0.150 mm is 5.91 mil, i.e. exactly the millimetre figure but a hair under "6mil".
+* **The vendored reference does not settle it.**
+  `vendor/kicad-happy/skills/pcbway/SKILL.md` has "Annular ring | 0.15mm (6mil)" only
+  in a table headed "Standard PCB (1-2 layers)" and none in its "Multi-layer (4+
+  layers)" table. It is a third-party capability summary kept in this repository, not
+  a PCBWay page, and PCBWay's own Standard table covers 1-14 layers, so its 1-2 layer
+  heading is not PCBWay's. Nothing here rests on it.
+* **Decision (ruling CN): the via is not changed, and no via is.** The pad of the 0.56 mm
+  via was made smaller so that In1's hole round it keeps 0.11 mm from the MDI pairs on
+  both sides (`tools/route_pcb.py`, `stage_pin3_via`, states the reason; measured here:
+  the via centre is 0.686 and 0.690 mm from the edges of the nearest MDI tracks). A
+  0.60 mm pad has a radius 0.02 mm larger, and the hole round it follows, so the 0.11 mm
+  would become 0.09 mm, under the 0.1 mm the routing keeps there, on a board whose DRC is
+  clean today. The risk is put to PCBWay before payment instead (Question 7).
 
 **Tented from the back** (B.Mask covers them; ten vias, rulings BA and BP):
 
@@ -199,31 +254,40 @@ board with parts on both sides is soldered on both sides by hand.
 
 | Part | Mid X | Mid Y | Rotation | Layer |
 |---|---|---|---|---|
-| U3 | 124.0000 | -103.0000 | 180 | Top |
-| Y1 | 124.0000 | -111.0000 | 0 | Top |
+| U3 | 24.0000 | 13.0000 | 180 | Top |
+| Y1 | 24.0000 | 5.0000 | 0 | Top |
 
-* **Coordinate system: the gerbers'.** X to the right, **Y up**, origin at the
-  page origin of the KiCad file, because the board has no drill/place origin.
-  Hence Mid Y is negative. The board outline runs from X 100 to 158 and Y -80 to
-  -116. Measured from the board's **lower-left corner**, U3's centre is at
-  (24.0, 13.0) mm and Y1's at (24.0, 5.0) mm.
-* **This departs from PCBWay's own KiCad instruction.** PCBWay's help-centre page
-  "Generate Position File Centroid File(pick place) in Kicad" (last updated
-  16/07/2024; fetched 2026-11-03, excerpt [6] in `pcbway-source-excerpts.txt`)
-  says: "Select the menu bar Place-> Drilling and Position Offset, place the
-  origin at the bottom left corner of the PCB board frame". PCBWay's general
-  centroid article (excerpt [7]) says: "The board's origin is defined as the (0,
-  0) value and is located at the lower left corner of the board from a top point
-  of view." The board file is frozen, so its origin was not moved and the CPL
-  keeps the page origin. Whether PCBWay accepts that, or wants the lower-left
-  values above, **is an assumption to confirm in the quote** (Question 10 (d)).
-  **The placement preview is a gate before payment, not a courtesy** (Question 10,
-  and the box below).
+* **Coordinate system: PCBWay's, board coordinates (ruling CC, the CPL one).** X to
+  the right, **Y up**, origin at the **lower-left corner of the board**, both
+  coordinates positive. PCBWay's help-centre page "Generate Position File Centroid
+  File(pick place) in Kicad" (last updated 16/07/2024; fetched 2026-11-03, excerpt [6]
+  in `pcbway-source-excerpts.txt`) says: "Select the menu bar Place-> Drilling and
+  Position Offset, place the origin at the bottom left corner of the PCB board
+  frame". PCBWay's general centroid article (excerpt [7]) says: "The board's origin
+  is defined as the (0, 0) value and is located at the lower left corner of the
+  board from a top point of view." The CPL follows that, rather than asking PCBWay to
+  accept ours. The board file is frozen and has no drill/place origin, so the exporter
+  (`write_cpl`) translates KiCad's position export, which is in page coordinates:
+  X = PosX - 100, Y = PosY + 116 (page Y 103.0 arrives as -103.0). Those two numbers
+  are not typed anywhere: the exporter reads the corner from the board's Edge.Cuts.
+  The corner is the Edge.Cuts **centreline** (X 100..158, Y 80..116 on the page, the
+  designed 58 x 36 mm), not the bounding box, which includes the 0.1 mm line width and
+  would shift every coordinate by 0.05 mm (24.05 / 13.05). Rotation is unchanged.
+  **The gerbers are not in these coordinates.** They keep KiCad's page origin (the
+  board has no aux origin), Y up, so the board's lower-left corner is at gerber
+  (100.000, -116.000) (the lower-left corner of `raccoon-tap-Edge_Cuts.gm1`), and a
+  position in the CPL is the gerber position shifted by exactly that: gerber X = Mid X
+  + 100.000, gerber Y = Mid Y - 116.000. U3's centre, (24.0000, 13.0000) in the CPL,
+  is at gerber (124.000, -103.000). This holds for every gerber and drill file of the
+  package. That PCBWay's tooling puts its own origin at the outline's corner when it
+  reads the gerbers (so that the two agree) is taken from the two excerpts, not tested:
+  the preview shows it. **The placement preview is a gate before payment, not a
+  courtesy** (Question 10, and the box below).
 * **U3 rotation 180**: U3's library pose (rotation 0) has pin 1 at the upper
   left; the board has it turned half a turn. Pad 1 is at (+2.4375, -1.8) mm
-  from the centre in the gerber (Y up), and the pin-1 triangle on the silkscreen
-  is just outside the pad column at the height of pin 1. **To check a picture, do
-  not use "left" or "right"**: a preview may be turned or mirrored. Use ruling
+  from the centre in the gerber (Y up, as in the CPL), and the pin-1 triangle on the
+  silkscreen is just outside the pad column at the height of pin 1. **To check a
+  picture, do not use "left" or "right"**: a preview may be turned or mirrored. Use ruling
   CB: the pin-1 dot sits on the corner carrying the silkscreen triangle, the
   corner nearest Y1 (of the two corners that face Y1, the one toward J2, the RJ45).
   The board's F.Fab outline has its chamfer at the same corner.
@@ -245,8 +309,7 @@ board with parts on both sides is soldered on both sides by hand.
 * **The CPL's format is unverified against PCBWay, not only its rotation.** Nobody has
   checked these against PCBWay's template or an accepted file: the `Layer` value `Top`
   (against `T` / `B`), the absence of a unit suffix (`mm`) on Mid X and Mid Y, the
-  negative Mid Y (a consequence of the page origin), the column set and order
-  (Designator, Val, Package, Mid X, Mid Y, Rotation, Layer). The column names follow what
+  column set and order (Designator, Val, Package, Mid X, Mid Y, Rotation, Layer). The column names follow what
   the exporter calls PCBWay's sample; no PCBWay template was fetched or checked in this
   task. All of it goes to Question 10.
 * **The CPL's rotation convention may not be PCBWay's.** KiCad's rotation is
@@ -384,7 +447,7 @@ quote page).
     Stackup: your standard 4-layer 1.6MM stackup, entry 1 (7628 RC46% prepreg, 0.1855 mm after lamination, DK 4.74; core 1.03 mm). The job file in the zip carries the same stackup.
     IMPEDANCE CONTROL, L1 (top) referenced to L2 (GND): 90 ohm differential +/-10% at 0.20 mm track / 0.17 mm gap (nets USB3_*, USB2_*); 100 ohm differential +/-10% at 0.18 mm / 0.21 mm gap (nets MDI0..MDI3). The geometry already allows 8 ohm for ONE pass of solder mask. Before production, tell me how many mask passes you print and the widths you calculate. Do not change any trace width or gap without asking me first. Please supply an impedance test coupon and report.
     Minimum track 0.15 mm (5.9 mil); minimum spacing 0.15 mm (between QFN pads).
-    Vias: 121 x 0.6/0.3 mm, 1 x 0.8/0.4 mm, and 1 x 0.56/0.30 mm (0.13 mm annular ring): please confirm it is within your process.
+    Vias: 121 x 0.6/0.3 mm (annular ring 0.150 mm), 1 x 0.8/0.4 mm, and 1 x 0.56/0.30 mm (annular ring 0.130 mm). I am not changing the vias: please confirm both sizes are within your process, or tell me before production which sizes you need.
     Via covering as in the mask gerbers: all vias tented on both sides, except 10 vias inside pads (9 in U3's exposed pad, 1 in U8 pin 2) that are open on top and must stay tented on the bottom.
     2 PLATED SLOTS, 1.0 x 2.5 mm, for J3 (G85 in the PTH drill file): please make them as slots, not round holes.
     Partial assembly, top side only: U3 and Y1, nothing else (BOM and CPL attached). Three parts on the bottom are soldered by hand later: no bottom stencil, no bottom assembly.
@@ -440,8 +503,15 @@ Not yet asked. Answers go into the order and, where they change a number, into
    what cost?
 6. **Vias covered from the back (ten, listed above):** confirm they are tented,
    not left open by a default.
-7. **Is the 0.56 / 0.3 mm via (0.13 mm annular ring) inside your normal process?**
-   Same for the 0.3 mm drill generally.
+7. **Annular ring: a yes or no before I pay.** The board has 123 vias: 121 at 0.60 / 0.30 mm
+   (annular ring 0.150 mm exactly), 1 at 0.80 / 0.40 mm (0.200 mm) and 1 at 0.56 / 0.30 mm
+   (0.130 mm). Your capabilities page lists a minimum annular ring of 0.15 mm (6 mil) in the
+   Standard PCB table (1-14 layers) and, in the Advanced table, a minimum weld ring for vias of
+   5 mil normal / 4 mil medium difficulty on 35 um outer copper; I found no separate 4-layer
+   figure. I am **not changing the vias**. Is this acceptable on this 4-layer board at your
+   normal process and price, including the 121 vias that sit exactly on 0.150 mm and the one
+   at 0.130 mm? If not, which via sizes do you need? Is the ring measured against the drill
+   size or the finished hole? Same for the 0.3 mm drill generally.
 8. **Resin-filled and capped vias for the whole board: the price difference** for 5
    boards (ruling BD). Operator decides.
 9. **Assembly, U3 and Y1 only:** setup / engineering fee; whether the assembly
@@ -460,12 +530,12 @@ Not yet asked. Answers go into the order and, where they change a number, into
     this CPL, whether you accept: (a) the rotation convention (KiCad's, counter-clockwise
     from the library pose); (b) the `Layer` value `Top`, or do you need `T` / `Top` /
     `TopLayer`; (c) Mid X and Mid Y as plain millimetre numbers **without** a unit
-    suffix; (d) a **negative** Mid Y and an origin that is the page origin, not the
-    board's corner, although your KiCad instruction puts the origin at the bottom
-    left corner of the board (positions from the lower-left corner: U3 24.0 / 13.0 mm,
-    Y1 24.0 / 5.0 mm); (e)
-    the columns Designator, Val, Package, Mid X, Mid Y, Rotation, Layer, in that
-    order; or send me your template.
+    suffix; (d) the columns Designator, Val, Package, Mid X, Mid Y, Rotation, Layer, in
+    that order; or send me your template. The origin is the board's lower-left corner as
+    your KiCad instruction says (U3 24.0 / 13.0 mm, Y1 24.0 / 5.0 mm), so I am not
+    asking about the convention, but I do ask you to confirm that your tooling places
+    these against the gerbers' outline corner, which in the gerbers (KiCad page
+    coordinates) is at X 100.000, Y -116.000; the preview will show it.
 11. **Surface finish:** ENIG is ruled (ruling CA) and goes on the order form. Confirm
     that your ENIG is available for this build (4 layers, 1.6 mm, 5 pieces, 0.15 mm
     minimum track) and give the price against lead-free HASL, for the record only.

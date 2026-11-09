@@ -2733,6 +2733,7 @@ def pair_coupling_problems(probe, targets=None):
 # ---------------------------------------------------------------------------
 
 import hashlib
+import inspect
 import os
 
 FAB = HARDWARE / "fab"
@@ -3047,6 +3048,48 @@ def footprint_local_pad(block, number):
     return float(m.group(1)), float(m.group(2))
 
 
+def edge_cuts_outline(pcb_text):
+    """(x_min, y_min, x_max, y_max) in mm, KiCad page coordinates (Y down), of the
+    Edge.Cuts centreline, read from the board file's own gr_line items. This is the
+    outline the fabricator routes along and the one the designed 58 x 36 mm is
+    measured on; it is not pcbnew's GetBoardEdgesBoundingBox(), which adds half the
+    stroke width on every side. Refuses anything but straight lines, so a board
+    that gains an arc is not silently measured wrongly."""
+    lines = [b for b in re.findall(r"\n\t\(gr_line\n(.*?)\n\t\)", pcb_text, re.S)
+             if '(layer "Edge.Cuts")' in b]
+    if len(lines) != pcb_text.count('(layer "Edge.Cuts")') or not lines:
+        raise ValueError("Edge.Cuts holds something other than gr_line items")
+    xs, ys = [], []
+    for b in lines:
+        for tag in ("start", "end"):
+            x, y = re.search(rf"\({tag} ([-0-9.]+) ([-0-9.]+)\)", b).groups()
+            xs.append(float(x))
+            ys.append(float(y))
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def board_origin_of(pcb_text):
+    """The CPL origin (ruling CC) in page coordinates, Y down: the lower-left corner
+    of the Edge.Cuts centreline, i.e. the smallest X and the largest Y."""
+    x_min, _, _, y_max = edge_cuts_outline(pcb_text)
+    return x_min, y_max
+
+
+def gerber_to_board(point, pcb_text):
+    """A gerber coordinate (page X, Y up) in the CPL's board coordinates (origin at
+    the lower-left corner of the outline, Y up)."""
+    ox, oy = board_origin_of(pcb_text)
+    return point[0] - ox, point[1] + oy
+
+
+def footprint_board_position(pcb_text, ref):
+    """A footprint's (x, y) in board coordinates, computed from its `(at x y)` in the
+    board file and the outline, with no help from kicad-cli or the exporter."""
+    ox, oy = board_origin_of(pcb_text)
+    x, y = re.search(r"\n\t\t\(at ([-0-9.]+) ([-0-9.]+)", footprint_block(pcb_text, ref)).groups()
+    return float(x) - ox, oy - float(y)
+
+
 def footprint_silk_marker(block):
     """The pin-1 marking of a footprint in its own frame (Y down): the centre of
     the polygon on F.SilkS if there is one, else the corner where two silkscreen
@@ -3083,14 +3126,17 @@ def cpl_pin1_problems(rows, pcb_text, copper_gerber_text, tolerance_deg=0.5):
     coordinates in the board file are: the library pose). So the angle from the
     centre to the pad-1 flash in the gerber, less the angle of the library pad 1,
     is the rotation the part has been given. The gerber is what the fab will
-    see; the board-file angle is not used."""
+    see; the board-file angle is not used. The gerber is in page coordinates and the
+    CPL in board coordinates (origin at the lower-left corner of the outline, ruling
+    CC); the pad positions are translated, so rotations and distances are unaffected."""
     problems = []
     for row in rows:
         ref = row["Designator"]
         block = footprint_block(pcb_text, ref)
         centre = (float(row["Mid X"]), float(row["Mid Y"]))
         rotation = float(row["Rotation"])
-        pads = gerber_pad_positions(copper_gerber_text, ref)
+        pads = {n: gerber_to_board(pos, pcb_text)       # the CPL is in board coordinates,
+                for n, pos in gerber_pad_positions(copper_gerber_text, ref).items()}   # the gerber in page ones
         if "1" not in pads:
             problems.append(f"{ref}: pad 1 is not in the copper gerber")
             continue
@@ -3138,18 +3184,13 @@ class CplRotationIsVerifiedAgainstPinOne(unittest.TestCase):
     def test_u3_is_turned_180_degrees_pin_1_at_the_lower_right(self):
         u3 = {r["Designator"]: r for r in read_cpl()}["U3"]
         self.assertEqual(float(u3["Rotation"]) % 360, 180)
-        pads = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")
+        pad1 = gerber_to_board(gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"],
+                               PCB.read_text())
         cx, cy = float(u3["Mid X"]), float(u3["Mid Y"])
-        self.assertGreater(pads["1"][0], cx)      # right of the centre
-        self.assertLess(pads["1"][1], cy)         # below it (Y is up in the gerber)
-        self.assertAlmostEqual(pads["1"][0] - cx, 2.4375, places=4)
-        self.assertAlmostEqual(pads["1"][1] - cy, -1.8, places=4)
-
-    def test_position_is_the_footprint_position_in_gerber_coordinates(self):
-        text = PCB.read_text()
-        for row in read_cpl():
-            x, y = re.search(r"\n\t\t\(at ([-0-9.]+) ([-0-9.]+)", footprint_block(text, row["Designator"])).groups()
-            self.assertEqual((float(row["Mid X"]), float(row["Mid Y"])), (float(x), -float(y)))
+        self.assertGreater(pad1[0], cx)      # right of the centre
+        self.assertLess(pad1[1], cy)         # below it (Y is up in the CPL as in the gerber)
+        self.assertAlmostEqual(pad1[0] - cx, 2.4375, places=4)
+        self.assertAlmostEqual(pad1[1] - cy, -1.8, places=4)
 
     def test_a_cpl_with_the_wrong_rotation_is_caught(self):
         copper = (GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text()
@@ -3254,6 +3295,140 @@ class PasteIsOpenOnlyForTheAssembledParts(unittest.TestCase):
     def test_there_is_no_bottom_paste_layer_and_no_bottom_part_is_assembled(self):
         names = json.loads((GERBER_DIR / MANIFEST_NAME).read_text())["files"]
         self.assertFalse([n for n in names if n.endswith(("B_Paste.gbp",))])
+
+
+class CplIsInBoardCoordinatesFromTheLowerLeftCorner(unittest.TestCase):
+    """Ruling CC: the CPL follows PCBWay's documented convention (fab/pcbway-source-
+    excerpts.txt [6], [7]): origin at the lower-left corner of the board, Y up. The
+    corner is the Edge.Cuts centreline, 58 x 36 mm as designed, not the bounding box
+    that includes the 0.1 mm line width (that moves every coordinate by 0.05 mm).
+    The expected values are computed from the board file here, not copied from the
+    CPL; the exporter reads the same corner through pcbnew, so the two derivations
+    are independent. Rotation is untouched and checked by the pin-1 tests above."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.export = load_export_fab()
+        cls.pcb = PCB.read_text()
+
+    def edge_widths(self, text):
+        blocks = [b for b in re.findall(r"\n\t\(gr_line\n(.*?)\n\t\)", text, re.S)
+                  if '(layer "Edge.Cuts")' in b]
+        return [float(re.search(r"\(width ([0-9.]+)\)", b).group(1)) for b in blocks]
+
+    def scratch_board(self, directory, widths):
+        """A copy of the board whose four Edge.Cuts lines have the given stroke widths and
+        the same centreline. Nothing else changes."""
+        out, it = [], iter(widths)
+        for chunk in re.split(r"(?=\n\t\(gr_line\n)", self.pcb):
+            if chunk.startswith("\n\t(gr_line\n") and '(layer "Edge.Cuts")' in chunk.split("\n\t)")[0]:
+                chunk = re.sub(r"\(width [0-9.]+\)", f"(width {next(it)})", chunk, count=1)
+            out.append(chunk)
+        path = Path(directory) / "raccoon-tap.kicad_pcb"
+        path.write_text("".join(out))
+        return path
+
+    def test_the_outline_is_58_by_36_on_its_centreline_and_the_line_is_0_1_wide(self):
+        x0, y0, x1, y1 = edge_cuts_outline(self.pcb)
+        self.assertEqual((x1 - x0, y1 - y0), (58.0, 36.0))
+        self.assertEqual(set(self.edge_widths(self.pcb)), {0.1})
+
+    def test_the_cpl_is_the_footprint_position_less_the_outline_origin(self):
+        rows = read_cpl()
+        self.assertEqual([r["Designator"] for r in rows], list(ASSEMBLED_REFS))
+        for row in rows:
+            x, y = footprint_board_position(self.pcb, row["Designator"])
+            self.assertEqual((row["Mid X"], row["Mid Y"]), (f"{x:.4f}", f"{y:.4f}"), row["Designator"])
+
+    def test_every_cpl_coordinate_is_positive_and_on_the_board(self):
+        x0, y0, x1, y1 = edge_cuts_outline(self.pcb)
+        for row in read_cpl():
+            x, y = float(row["Mid X"]), float(row["Mid Y"])
+            self.assertGreater(x, 0, row["Designator"])
+            self.assertGreater(y, 0, row["Designator"])
+            self.assertLess(x, x1 - x0, row["Designator"])
+            self.assertLess(y, y1 - y0, row["Designator"])
+
+    def test_the_gerbers_differ_from_the_cpl_by_the_offset_ordering_states(self):
+        # the package has two frames; the fixed offset between them is a stated fact, not left to inference
+        text = re.sub(r"\s+", " ", ORDERING.read_text())
+        self.assertIn("(100.000, -116.000)", text)
+        self.assertIn("gerber X = Mid X + 100.000, gerber Y = Mid Y - 116.000", text)
+        outline = [(int(x) / 1e6, int(y) / 1e6)
+                   for x, y in re.findall(r"^X(-?\d+)Y(-?\d+)D0[12]\*", (GERBER_DIR / "raccoon-tap-Edge_Cuts.gm1").read_text(), re.M)]
+        self.assertEqual((min(x for x, _ in outline), min(y for _, y in outline)), (100.0, -116.0))
+        u3 = {r["Designator"]: r for r in read_cpl()}["U3"]
+        pad1 = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"]
+        self.assertAlmostEqual(pad1[0], float(u3["Mid X"]) + 100.0 + 2.4375, places=4)
+        self.assertAlmostEqual(pad1[1], float(u3["Mid Y"]) - 116.0 - 1.8, places=4)
+        self.assertIn("(124.000, -103.000)", text)
+
+    def test_ordering_says_which_comparison_is_blind_to_a_kicad_version_change(self):
+        text = re.sub(r"\s+", " ", ORDERING.read_text())
+        self.assertRegex(text, r"gerber and drill comparison cannot see a KiCad version change")
+        self.assertRegex(text, r"job-file comparison can: it drops only `CreationDate` from the header")
+        self.assertNotRegex(text, r"invisible to the freshness check")      # ruling CL's sentence, which was untrue
+        self.assertRegex(text, r"no test compares it with the running one")
+        # the two claims, against the code they describe
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = Path(tmp) / "x.gtl"
+            sample.write_text("%TF.GenerationSoftware,KiCad,Pcbnew,10.0.6*%\nX1Y1D03*\n")
+            self.assertEqual(_normalised(sample), "X1Y1D03*")
+        job = json.loads((GERBER_DIR / JOB_NAME).read_text())
+        self.assertIn("Version", job["Header"]["GenerationSoftware"])         # the field the job comparison sees
+        compare = inspect.getsource(GerberSetIsTheExportOfTheBoard.test_the_job_file_is_what_a_new_export_gives)
+        self.assertEqual(re.findall(r'\["Header"\]\.pop\("(\w+)"', compare), ["CreationDate"])
+        self.assertEqual(json.loads((GERBER_DIR / MANIFEST_NAME).read_text())["kicad"],
+                         job["Header"]["GenerationSoftware"]["Version"])
+
+    def test_question_10_asks_about_the_cpl_to_gerber_frame_as_well(self):
+        questions = ORDERING.read_text().split("## Questions for PCBWay", 1)[1]
+        q10 = re.sub(r"\s+", " ", questions.split("\n10. ", 1)[1].split("\n11. ", 1)[0])
+        self.assertRegex(q10, r"(?i)confirm that your tooling places these against the gerbers. outline corner")
+        self.assertIn("X 100.000, Y -116.000", q10)
+        self.assertRegex(q10, r"(?i)I am not asking about the convention")
+
+    def test_ordering_says_a_rebuild_changes_every_file_and_why_that_is_not_staleness(self):
+        text = re.sub(r"\s+", " ", ORDERING.read_text())
+        self.assertRegex(text, r"(?i)before concluding the package is stale")
+        self.assertRegex(text, r"16 of 16 files differ byte for byte")
+        committed = json.loads((GERBER_DIR / MANIFEST_NAME).read_text())["files"]
+        self.assertEqual(len(committed), 16)                       # the number the sentence states
+        self.assertRegex(text, r"restore the gerber folder")
+
+    def test_the_committed_cpl_is_what_the_exporter_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.export.write_cpl(Path(tmp) / "cpl.csv")
+            self.assertEqual((Path(tmp) / "cpl.csv").read_text(), CPL_PATH.read_text())
+
+    def test_the_origin_is_the_centreline_and_not_the_bounding_box_with_the_line_width(self):
+        # the defect this pins: the bounding box includes half the 0.1 mm line on each side,
+        # which puts the origin at (99.95, 116.05) and U3 at 24.05 / 13.05
+        ox, oy = board_origin_of(self.pcb)
+        self.assertEqual((ox, oy), (100.0, 116.0))
+        box_origin = (ox - 0.05, oy + 0.05)
+        u3 = {r["Designator"]: r for r in read_cpl()}["U3"]
+        self.assertEqual((float(u3["Mid X"]), float(u3["Mid Y"])), (24.0, 13.0))
+        self.assertNotEqual((float(u3["Mid X"]), float(u3["Mid Y"])),
+                            (round(124.0 - box_origin[0], 4), round(box_origin[1] - 103.0, 4)))
+        # and the exporter's own reading of the corner agrees, on the board and on boards whose
+        # lines are drawn wider (the bounding box would move by half the width, the centreline not)
+        self.assertEqual(self.export.board_origin(), (100.0, 116.0))
+        with tempfile.TemporaryDirectory() as tmp:
+            wide = self.scratch_board(tmp, [0.5] * 4)
+            self.assertEqual(self.edge_widths(wide.read_text()), [0.5] * 4)
+            self.assertEqual(self.export.board_origin(wide), (100.0, 116.0))
+            self.export.write_cpl(Path(tmp) / "cpl.csv", board=wide)
+            rows = {r["Designator"]: r for r in read_cpl(Path(tmp) / "cpl.csv")}
+            self.assertEqual((rows["U3"]["Mid X"], rows["U3"]["Mid Y"]), ("24.0000", "13.0000"))
+            self.assertEqual((rows["Y1"]["Mid X"], rows["Y1"]["Mid Y"]), ("24.0000", "5.0000"))
+
+    def test_an_outline_of_mixed_line_widths_is_refused(self):
+        # the half-width correction is exact only for one width throughout
+        with tempfile.TemporaryDirectory() as tmp:
+            mixed = self.scratch_board(tmp, [0.1, 0.1, 0.1, 0.3])
+            with self.assertRaises(self.export.ExportFailed):
+                self.export.board_origin(mixed)
 
 
 ASSEMBLY_BOM = FAB / "raccoon-tap-assembly-bom.csv"
@@ -3494,9 +3669,10 @@ class AssemblyBomIsTheTwoMachinePlacedParts(unittest.TestCase):
         self.assertRegex(u3, r"(?i)toward J2")
         self.assertNotRegex(u3, r"(?i)\b(left|right|above|below|upper|lower)\b")
         cpl = {r["Designator"]: r for r in read_cpl()}["U3"]
-        pad1 = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"]
+        pad1 = gerber_to_board(gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"],
+                               PCB.read_text())
         self.assertGreater(pad1[0], float(cpl["Mid X"]))        # right
-        self.assertLess(pad1[1], float(cpl["Mid Y"]))           # lower (Y is up in the gerber)
+        self.assertLess(pad1[1], float(cpl["Mid Y"]))           # lower (Y is up in the CPL)
         self.assertEqual(float(cpl["Rotation"]) % 360, 180)
         # Y1: pads 1 and 3 are the crystal terminals, 2 and 4 ground; no fixed pin-1 mark
         y1 = by_ref["Y1"]["Part Description"]
@@ -3621,7 +3797,6 @@ class OrderingStatesEveryRuledRequirement(unittest.TestCase):
         for needed, what in ((r"hard gate", "a hard gate"), (r"before I pay", "before payment"),
                              (r"`Layer`.{0,20}`Top`", "the Layer value Top"), (r"`T`", "T / B"),
                              (r"without.{0,10}unit suffix|unit suffix", "the missing mm suffix"),
-                             (r"negative", "the negative Mid Y"),
                              (r"Designator, Val, Package, Mid X, Mid Y, Rotation, Layer", "the column set"),
                              (r"rotation convention", "the rotation convention")):
             self.assertRegex(q10, rf"(?i){needed}", f"Question 10 does not state: {what}")
@@ -3630,14 +3805,89 @@ class OrderingStatesEveryRuledRequirement(unittest.TestCase):
         header = CPL_PATH.read_text().splitlines()[0].split(",")
         self.assertIn(", ".join(header), self.flat)               # the column set stated is the file's
         self.assertEqual({r["Layer"] for r in read_cpl()}, {"Top"})
-        self.assertTrue(float([r for r in read_cpl() if r["Designator"] == "U3"][0]["Mid Y"]) < 0)
+        for settled in (r"negative", r"page origin"):
+            self.assertNotRegex(q10, rf"(?i){settled}", "settled by ruling CC, no longer a question")
 
-    def test_the_narrow_via_is_flagged_as_possibly_out_of_process_in_the_table(self):
+    def test_the_narrow_via_row_states_the_measured_ring_and_the_decision(self):
         row = next(l for l in self.text.splitlines() if l.startswith("| 0.56 / 0.3"))
-        self.assertRegex(row, r"(?i)annular ring 0\.13 mm")
-        self.assertRegex(row, r"(?i)may be below PCBWay.s published minimum")
-        self.assertRegex(row, r"(?i)0\.15 mm")
+        self.assertRegex(row, r"(?i)annular ring \*\*0\.130 mm\*\*")
+        self.assertRegex(row, r"(?i)below the 0\.15 mm that PCBWay.s own capabilities page lists for its Standard PCB")
+        self.assertRegex(row, r"(?i)not below the 5 mil \(0\.127 mm\) of its Advanced table")
         self.assertRegex(row, r"(?i)not confirmed")
+        self.assertRegex(row, r"(?i)operator.s decision \(ruling CN\)")
+        self.assertNotRegex(self.flat, r"(?i)believed to be 0\.15")             # the framing ruling CN replaced
+        self.assertNotRegex(self.flat, r"(?i)may be below PCBWay.s published minimum")
+
+    def annular_note(self):
+        return re.sub(r"\s+", " ", self.text.split("**Annular ring: what is measured", 1)[1].split("\n\n**Tented", 1)[0])
+
+    def test_the_rings_it_states_are_the_boards(self):
+        rings = {}
+        for size, drill, _ in board_vias(PCB.read_text()):
+            rings[round((size - drill) / 2, 3)] = rings.get(round((size - drill) / 2, 3), 0) + 1
+        self.assertEqual(rings, {0.13: 1, 0.15: 121, 0.2: 1})
+        note = self.annular_note()
+        self.assertIn("1 via at 0.56 / 0.30 mm has **0.130 mm**", note)
+        self.assertIn("**121 vias at 0.60 / 0.30 mm have 0.150 mm exactly**", note)
+        self.assertIn("1 via at 0.80 / 0.40 mm has 0.200 mm", note)
+        self.assertRegex(note, r"no margin")
+        q7 = self.question(7)
+        self.assertRegex(q7, r"121 at 0\.60 / 0\.30 mm \(annular ring 0\.150 mm exactly\)")
+        self.assertRegex(q7, r"1 at 0\.80 / 0\.40 mm \(0\.200 mm\)")
+        self.assertRegex(q7, r"1 at 0\.56 / 0\.30 mm \(0\.130 mm\)")
+
+    def question(self, number):
+        questions = self.text.split("## Questions for PCBWay", 1)[1]
+        return re.sub(r"\s+", " ", questions.split(f"\n{number}. ", 1)[1].split(f"\n{number + 1}. ", 1)[0])
+
+    def test_question_7_is_a_yes_or_no_that_carries_what_is_known_and_what_is_not(self):
+        q7 = self.question(7)
+        self.assertRegex(q7, r"(?i)a yes or no before I pay")
+        self.assertRegex(q7, r"(?i)I am \*\*not changing the vias\*\*")
+        self.assertRegex(q7, r"(?i)Standard PCB table \(1-14 layers\)")
+        self.assertRegex(q7, r"(?i)I found no separate 4-layer figure")
+        self.assertRegex(q7, r"(?i)5 mil normal / 4 mil medium difficulty")
+        self.assertRegex(q7, r"(?i)acceptable on this 4-layer board")
+        self.assertRegex(q7, r"(?i)which via sizes do you need")
+        for stale in (r"believed", r"inside your normal process\?\*\*$"):
+            self.assertNotRegex(q7, stale)
+
+    def test_the_vendored_summary_is_described_as_what_it_is_and_what_it_says(self):
+        note = self.annular_note()
+        self.assertRegex(note, r"third-party capability summary kept in this repository, not a PCBWay page")
+        self.assertRegex(note, r"Nothing here rests on it")
+        self.assertRegex(note, r"PCBWay.s own Standard table covers 1-14 layers")
+        # and what it says about the summary is true of the file
+        skill = (REPO_ROOT / "vendor" / "kicad-happy" / "skills" / "pcbway" / "SKILL.md").read_text()
+        standard = skill.split("### Standard PCB (1-2 layers)", 1)[1].split("### Multi-layer (4+ layers)", 1)[0]
+        multilayer = skill.split("### Multi-layer (4+ layers)", 1)[1].split("###", 1)[0]
+        self.assertIn("Annular ring | 0.15mm (6mil)", standard)
+        self.assertNotRegex(multilayer, r"(?i)annular")
+
+    def test_what_it_quotes_about_the_ring_is_in_the_pcbway_excerpts(self):
+        excerpts = re.sub(r"\s+", " ", __import__("html").unescape((FAB / "pcbway-source-excerpts.txt").read_text()))
+        section = excerpts.split("[8] https://www.pcbway.com/capabilities.html", 1)[1]
+        for quote in ("Number of Layers | - | 1-14 layers",
+                      "Min Width of Annular Ring | | 0.15mm(6mil)",
+                      "Typically, the minimum width of the annular ring is 0.15mm (6mil)",
+                      "Minimum weld ring (outer layer)",
+                      "<td>via hole</td> <td>\u22655mil</td> <td>\u22654mil</td>"):
+            self.assertIn(quote, section, quote)
+        note = self.annular_note()
+        self.assertIn('"Min Width of Annular Ring: 0.15mm(6mil)"', note)
+        self.assertIn('"Typically, the minimum width of the annular ring is 0.15mm (6mil)"', note)
+        self.assertIn('"1-14 layers"', note)
+        self.assertRegex(note, r"gives \"\u22655mil\" in its normal-process column and \"\u22654mil\" in its medium-difficulty one")
+        self.assertRegex(note, r"(?i)no separate annular-ring figure for 4-layer boards")
+        self.assertRegex(note, r"(?i)assume so, the page does not say")
+        self.assertRegex(note, r"5\.91 mil")
+
+    def test_the_text_sent_to_pcbway_says_the_vias_stay_and_asks_for_sizes(self):
+        block_a = re.sub(r"\s+", " ", self.text.split("### Block A", 1)[1].split("### Block B", 1)[0])
+        self.assertIn("121 x 0.6/0.3 mm (annular ring 0.150 mm), 1 x 0.8/0.4 mm, and 1 x 0.56/0.30 mm (annular ring 0.130 mm)", block_a)
+        self.assertRegex(block_a, r"I am not changing the vias: please confirm both sizes are within your process, "
+                                  r"or tell me before production which sizes you need")
+        self.assertNotRegex(block_a, r"\bruling\b")
 
     def test_controlled_impedance_with_targets_and_the_mask_pass_question_first(self):
         self.assertStated(r"90\s*(ohm|Ω)", "90 ohm differential")
@@ -3996,7 +4246,8 @@ class PinOneGateIsRotationIndependent(unittest.TestCase):
         cpl = {r["Designator"]: r for r in read_cpl()}
         u3 = (float(cpl["U3"]["Mid X"]), float(cpl["U3"]["Mid Y"]))
         y1 = (float(cpl["Y1"]["Mid X"]), float(cpl["Y1"]["Mid Y"]))
-        pad1 = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"]
+        pcb = PCB.read_text()
+        pad1 = gerber_to_board(gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"], pcb)
         half = 2.5                                          # QFN-40 5 x 5 mm
         corners = [(u3[0] + sx * half, u3[1] + sy * half) for sx in (-1, 1) for sy in (-1, 1)]
         pin1 = min(corners, key=lambda c: math.dist(c, pad1))
@@ -4005,10 +4256,7 @@ class PinOneGateIsRotationIndependent(unittest.TestCase):
         self.assertAlmostEqual(math.dist(by_y1[0], y1), math.dist(by_y1[1], y1), places=6)
         self.assertLess(math.dist(by_y1[1], y1), math.dist(by_y1[2], y1))
         self.assertIn(pin1, by_y1[:2])
-        pcb = PCB.read_text()
-        def at(ref):
-            x, y = re.search(r"\n\t\t\(at ([-0-9.]+) ([-0-9.]+)", footprint_block(pcb, ref)).groups()
-            return float(x), -float(y)                      # board Y down, CPL and gerber Y up
+        at = lambda ref: footprint_board_position(pcb, ref)        # board file Y down, CPL Y up
         other = by_y1[1] if pin1 == by_y1[0] else by_y1[0]
         self.assertLess(math.dist(pin1, at("J2")), math.dist(other, at("J2")))
         self.assertGreater(math.dist(pin1, at("J3")), math.dist(other, at("J3")))
@@ -4030,7 +4278,9 @@ class OrderingCitesItsPcbwayConventions(unittest.TestCase):
         text = re.sub(r"\s+", " ", ORDERING.read_text())
         self.assertNotIn("PCBWay's own KiCad instruction says to put the origin at the lower-left corner; the", text)
         self.assertRegex(text, r"excerpt \[6\]")
-        self.assertRegex(text, r"(?i)is an assumption to confirm in the quote\**\s*\(Question 10 \(d\)\)")
+        self.assertRegex(text, r"excerpt \[7\]")
+        self.assertNotRegex(text, r"(?i)is an assumption to confirm in the quote\**\s*\(Question 10 \(d\)\)")
+        self.assertRegex(text, r"(?i)ruling CC")
 
 
 class U3ThermalIsNotLeftSilent(unittest.TestCase):
@@ -4073,17 +4323,88 @@ class NoOperatorPathIsCommitted(unittest.TestCase):
         return [n for n in names if not n.startswith("vendor/kicad-happy/")]
 
     def test_no_tracked_file_contains_an_absolute_user_path(self):
-        pattern = _relativize_module().HOME_PATH
+        tool = _relativize_module()
         found = {}
         for name in self.tracked_files():
             path = REPO_ROOT / name
             if not path.is_file():                     # a submodule or a deleted-but-staged entry
                 continue
-            hits = sorted(set(m.decode("utf-8", "replace")
-                              for m in re.findall(pattern.pattern.encode(), path.read_bytes())))
+            hits = tool.leaks(path.read_bytes().decode("utf-8", "replace"), name)
             if hits:
                 found[name] = hits
         self.assertEqual(found, {}, "absolute user paths are committed (run hardware/tools/relativize_paths.py)")
+
+    def test_a_real_user_directory_is_still_a_leak(self):
+        # ruling CJ narrowed the pattern to stop flagging platform-generic homes; these
+        # must still be caught, and the last group is what an allow-list that swallowed
+        # everything, or matched on a prefix, would let through
+        tool = _relativize_module()
+        H = "/" + "home/"      # split so that this file does not match its own scan
+        for leak in ("/" + "Users" + "/alice/gitRepos/x", H + "alice/gitRepos/x",
+                     "C:\\" + "Users\\alice\\x", "C:\\\\" + "Users\\\\alice\\\\x",   # and as escaped in JSON
+                     H + "pierre/x", H + "pi2/x", H + "pi.local/x", H + "ubuntu/x", H + "u2/x",
+                     "/" + "Users" + "/pi/x", "/" + "Users" + "/u/x"):                # exempt under /home only
+            self.assertTrue(tool.leaks(f'"{leak}"'), leak)
+            self.assertTrue(tool.HOME_PATH.search(leak), leak)
+
+    def test_the_two_fixture_strings_are_exempt_under_software_tests_and_only_there(self):
+        # ruling CL: the exemption is for strings in test fixtures that describe a command,
+        # not for any platform's home directory, so it is scoped to software/tests/
+        tool = _relativize_module()
+        H = "/" + "home/"      # split so that this file does not match its own scan
+        fixtures = ('chown -R "$ACTUAL_USER" ' + H + "pi/.ssh", "shell tee -a " + H + "u/.ssh/authorized_keys",
+                    "write " + H + "u/.bashrc", '"' + H + 'u"', H + "pi")
+        for text in fixtures:
+            self.assertEqual(tool.leaks(text, "software/tests/test_agent_safety.py"), [], text)
+            self.assertEqual(tool.leaks(text, "software/tests/sub/test_x.py"), [], text)
+            for outside in ("hardware/fab/ORDERING.md", "hardware/review/x/pcb.json", "README.md",
+                            "software/agent/safety.py", "software/tests_extra/x.py",     # not the same directory
+                            "software/tests/../../hardware/fab/x.md",                 # resolves outside it
+                            None):                                                    # no path: no exemption
+                self.assertTrue(tool.leaks(text, outside), (text, outside))
+
+    def test_other_names_are_not_exempt_even_under_software_tests(self):
+        tool = _relativize_module()
+        H = "/" + "home/"
+        for text in (H + "alice/x", H + "pierre/x", H + "pi2/x", H + "u2/x", H + "ubuntu/x",
+                     "/" + "Users" + "/pi/x", "/" + "Users" + "/u/x", "C:\\" + "Users\\pi\\x"):
+            self.assertTrue(tool.leaks(text, "software/tests/test_x.py"), text)
+
+    def test_the_exempt_names_are_pinned_and_the_tool_applies_the_scope(self):
+        tool = _relativize_module()
+        H = "/" + "home/"
+        self.assertEqual(tool.FIXTURE_HOME_NAMES, ("pi", "u"))      # a new name needs an argument and this line
+        self.assertEqual(tool.FIXTURE_DIR, "software/tests/")
+        self.assertEqual(tool.repo_relative(REPO_ROOT / "software" / "tests" / "x.py"), "software/tests/x.py")
+        self.assertIsNone(tool.repo_relative("/tmp/x.json"))
+        with tempfile.TemporaryDirectory() as tmp:
+            outside, bad = Path(tmp) / "outside.txt", Path(tmp) / "bad.txt"
+            outside.write_text("cd " + H + "pi/.ssh\n")          # not under software/tests/: a leak
+            bad.write_text("cd " + H + "alice/.ssh\n")
+            refused_pi = subprocess.run([sys.executable, str(RELATIVIZE), "--check", str(outside)], capture_output=True, text=True)
+            refused = subprocess.run([sys.executable, str(RELATIVIZE), "--check", str(bad)], capture_output=True, text=True)
+        self.assertEqual(refused_pi.returncode, 1)
+        self.assertIn(H + "pi", refused_pi.stdout)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn(H + "alice", refused.stdout)
+
+    def test_the_exemption_comment_cites_its_sources_and_both_hedges(self):
+        # presence, not proof: the comment must carry the source for "no default pi user", the
+        # source for "the software does not assume pi", and the two facts that stop a reader
+        # over-correcting (existing installs keep pi; pi can still be chosen at first boot)
+        source = RELATIVIZE.read_text()
+        flat = re.sub(r"\s*\n#\s*", " ", source)
+        for needed in ("https://www.raspberrypi.com/news/raspberry-pi-bullseye-update-april-2022/", "SUDO_USER",
+                       "existing installs keep their pi user", "may still choose pi at first boot"):
+            self.assertIn(needed, flat)
+
+    def test_four_retired_phrases_are_gone_from_the_exemption_comment(self):
+        # deliberately narrow: it pins four specific sentences of earlier drafts out of existence.
+        # A rephrasing of the same false claim would pass it; the sources test above and review
+        # are what guard the meaning
+        source = RELATIVIZE.read_text()
+        for claim in ("same on every deployment", "identifies no one", "long-standing default", "the one the software"):
+            self.assertNotIn(claim, source)
 
     def test_analyzer_json_records_repository_relative_sources(self):
         files = sorted((HARDWARE / "review").glob("*/schematic.json")) + sorted((HARDWARE / "review").glob("*/pcb.json"))
