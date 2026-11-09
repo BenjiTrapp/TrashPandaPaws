@@ -43,8 +43,9 @@ or an HP network printer to blend into enterprise infrastructure.
 | **C2 Transport** | 3 independent channels — HTTPS, SMB named pipes, QUIC-style UDP — plus DNS as a tasking-only side channel, with automatic fallback. Each non-HTTPS channel has a listener that terminates it; see [`docs/LISTENERS.md`](docs/LISTENERS.md) |
 | **Encryption** | AES-256-GCM on all channels, keys auto-generated or operator-defined |
 | **Beacon** | Pure Python stdlib, zero external dependencies, multi-layer obfuscation (1–6 layers zlib+base64) |
-| **Operator GUI** | Flask-based team server with embedded SPA: terminal, file browser, pivot map, profile editor, 16 Impacket tools |
+| **Operator GUI** | Flask-based team server with embedded SPA: terminal, file browser, pivot map (a visualisation of scan results, not a pivot), profile editor, 16 Impacket tools |
 | **Malleable C2** | 8 built-in traffic profiles (Slack, Google, Azure CDN, O365, …), Burp Suite import, real-time profile push |
+| **Reverse SOCKS tunnel** | The actual pivot: the implant dials out, the team server opens one authenticated loopback SOCKS5 port per build, and `proxychains`, `nmap` or a browser runs from inside the target network. Not the *pivot map*, which is a visualisation of scan results and carries no traffic. See [`docs/TUNNEL.md`](docs/TUNNEL.md) |
 | **NAC Bypass** | 802.1X EAPOL forwarding with passive discovery and L2/L3 rewriting |
 | **Egress Proxy** | Auto-discovery (env, registry, PAC/WPAD) plus pure-stdlib NTLMv2 proxy authentication via loopback relay |
 | **Persistence** | 5 independent autorun layers (systemd, crontab, rc.local, udev, watchdog timer) with PID lock dedup |
@@ -601,7 +602,8 @@ asked for again.
 | Loot Viewer | Browse and download all collected loot (files, credentials) |
 | Process Listing | `tasklist /v` with automatic AV/EDR/SOC product detection (33 products) |
 | Netstat View | Parsed network connections table with automatic security assessment |
-| Pivot View | Discover and enumerate hosts on adjacent subnets |
+| Pivot View | Discover and enumerate hosts on adjacent subnets, drawn as a **pivot map** — a visualisation of scan results. It carries no traffic; the thing that does is the reverse SOCKS tunnel, below |
+| Tunnel | Start and stop the tunnel server and each endpoint, with the per-identity SOCKS port and its credential ([`docs/TUNNEL.md`](docs/TUNNEL.md)) |
 | Server Logs | Global server log viewer with filtering (accessible without active agent) |
 
 #### Transport Protocols
@@ -848,7 +850,7 @@ Responder).
 | Interactive Terminal | <img src="docs/screenshots/04_terminal.png" width="400"> |
 | File Browser | <img src="docs/screenshots/05_file_browser.png" width="400"> |
 | Process Viewer (AV/EDR detection) | <img src="docs/screenshots/06_procs.png" width="400"> |
-| Pivot Map | <img src="docs/screenshots/09_pivot_map.png" width="400"> |
+| Pivot Map (a visualisation of scan results) | <img src="docs/screenshots/09_pivot_map.png" width="400"> |
 | Beacon Generator Pipeline | <img src="docs/screenshots/03_pipeline_flow.png" width="400"> |
 | Malleable C2 Profile Editor | <img src="docs/screenshots/10_profile_editor.png" width="400"> |
 | Profile Library | <img src="docs/screenshots/11_profile_library.png" width="400"> |
