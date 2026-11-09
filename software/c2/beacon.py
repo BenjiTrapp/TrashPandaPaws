@@ -1647,7 +1647,108 @@ def _dns_query(name: str, qtype: str, server: str, timeout: float = 10) -> list:
 _FALLBACK_TRANSPORTS = ("https", "dns", "smb", "quic")
 
 
-def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True) -> dict:
+def tunnel_config_from_yaml(c2_cfg: dict, env=None) -> Optional[dict]:
+    """Build the endpoint's `tunnel` block from `c2.tunnel`, or None.
+
+    The sibling of `beacon_config_from_fallback` for the other thing a
+    drop-box can run, and the reason goal 3 of this work is reachable: on
+    a host where systemd starts the endpoint there is no beacon above it
+    and no generated config block, so the file has to be able to say the
+    same eight things the generator bakes in.
+
+    `c2.tunnel` is **this host as a tunnel client** -- the endpoint dials
+    out. `c2.tunnel_server` is the other side, the socket endpoints dial
+    in to, and nothing here reads it. The two look alike and mean opposite
+    things, exactly as `c2.fallback` and `c2.listeners` do; see
+    `listeners/registry.py`.
+
+    No `c2.tunnel` block at all yields None and is not an error: every
+    deployment that predates this feature has none, and all of them have
+    to keep starting.
+
+    **The PSK is not read from the file.** Under `Noise_NKpsk0` the
+    endpoint presents no static key of its own, so the PSK plus the
+    server's public key is the entire credential, and this repository
+    already settled where such a thing lives when it kept
+    `RACCOON_LISTENER_TOKEN` out of the same file: a shared secret does
+    not belong in something somebody will paste into a ticket. It comes
+    from `RACCOON_TUNNEL_PSK`, which
+    `services/raccoon-tunnel.service` supplies through an
+    `EnvironmentFile`. A `psk` key found in the file is **refused by
+    name**, whether the tunnel is enabled or not: ignoring it silently
+    would leave the secret sitting in git with nobody told, and a
+    refusal that waited for somebody to switch the tunnel on would have
+    chosen the worst possible moment to appear.
+
+    `env` is a seam for the tests. The deployed path is `os.environ`.
+
+    Every problem is a `ValueError` naming the field, including the ones
+    `tunnel_config_problem` finds: this is where the config is loaded, so
+    this is where that predicate is asked. The caller decides what a
+    refusal costs -- `tunnel_standalone` exits, and
+    `beacon_config_from_fallback` leaves the block out and logs, because
+    the beacon is the access and the tunnel is the convenience.
+    """
+    tunnel = c2_cfg.get("tunnel") if isinstance(c2_cfg, dict) else None
+    if tunnel is None:
+        return None
+    if not isinstance(tunnel, dict):
+        raise ValueError("c2.tunnel is %s, not a mapping"
+                         % type(tunnel).__name__)
+    if "psk" in tunnel:
+        raise ValueError(
+            "c2.tunnel.psk is not read from this file: it is the whole "
+            "credential, and a shared secret does not belong in something "
+            "somebody will paste into a ticket. Delete the key and put the "
+            "value in %s instead, the way "
+            "services/raccoon-tunnel.service does with an EnvironmentFile."
+            % _TUNNEL_PSK_ENV)
+
+    enabled = bool(tunnel.get("enabled"))
+    psk = ""
+    if enabled:
+        source = os.environ if env is None else env
+        supplied = source.get(_TUNNEL_PSK_ENV, "")
+        problem = None
+        try:
+            _tunnel_key(supplied, _TUNNEL_PSK_ENV,
+                        "this host's pre-shared key")
+        except ValueError as exc:
+            problem = str(exc)
+        if problem:
+            # Raised outside the except block, as `_tunnel_key` raises its
+            # own: nothing that touched the value may ride along in the
+            # exception chain.
+            raise ValueError(
+                "%s, and c2.tunnel is enabled. It is deliberately not in "
+                "the config file; see services/raccoon-tunnel.service"
+                % problem)
+        psk = supplied.strip()
+
+    # Every field, always, so this and the generator produce one shape.
+    # `server`, `port`, `public_key` and `identity` are passed through
+    # untouched rather than defaulted, so that a block which cannot work
+    # is named by `tunnel_config_problem` below and not quietly completed
+    # here into something that dials the wrong place.
+    block = {
+        "enabled": enabled,
+        "server": tunnel.get("server", ""),
+        "port": tunnel.get("port"),
+        "public_key": tunnel.get("public_key", ""),
+        "psk": psk,
+        "identity": tunnel.get("identity", ""),
+        "keepalive_seconds": tunnel.get("keepalive_seconds",
+                                        _DEFAULT_KEEPALIVE),
+        "allow_slow_crypto": bool(tunnel.get("allow_slow_crypto")),
+    }
+    problem = tunnel_config_problem({"c2": {"tunnel": block}})
+    if problem:
+        raise ValueError(problem)
+    return block
+
+
+def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True,
+                                env=None) -> dict:
     """Build a Beacon config from a `c2` block of `configs/raccoon.yaml`.
 
     Reads `c2.fallback.*`, which is the **beacon** side of the file: the
@@ -1658,6 +1759,20 @@ def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True) -> dict:
     beacon reads as disabled. That is why this cannot simply pass the
     fallback block through: the beacon expects its transports at the top
     of its own `c2` block, not nested under `fallback`.
+
+    `c2.tunnel` comes through `tunnel_config_from_yaml` and lands at
+    `c2.tunnel` of the config this returns, which is where both `Beacon`
+    and `TunnelEndpoint` look for it.
+
+    **A tunnel this host cannot run does not cost it its beacon.** That
+    loader refuses a block it cannot make, naming the field; here the
+    refusal is logged at ERROR and the block is left out, because the
+    beacon is the access and the tunnel is the convenience -- a drop-box
+    that stopped calling home over a typo in `c2.tunnel` would be a box
+    lost for a feature nobody had switched on yet. Nothing is silent
+    about it: the reason is in the log, and `tunnel start` answers the
+    operator with `tunnel_mode_problem`'s own words. The host that exists
+    to run the endpoint is `tunnel_standalone`, and it exits instead.
     """
     fallback = c2_cfg.get("fallback") or {}
     block = {
@@ -1669,6 +1784,14 @@ def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True) -> dict:
     }
     for transport in _FALLBACK_TRANSPORTS:
         block[transport] = fallback.get(transport, {})
+    try:
+        tunnel = tunnel_config_from_yaml(c2_cfg, env=env)
+    except ValueError as exc:
+        logger.error("c2.tunnel cannot be used and has been left out of "
+                     "this config: %s", exc)
+        tunnel = None
+    if tunnel is not None:
+        block["tunnel"] = tunnel
     return {"c2": block}
 
 
@@ -2524,6 +2647,17 @@ _PROXY_MAX_HEADERS = 100
 # string: the parent and the child are the same file, and the two ends of
 # an agreement written twice are the two ends that drift.
 _TUNNEL_MODE_ENV = "RACCOON_TUNNEL_MODE"
+
+# Where the endpoint's PSK comes from on a host configured by file rather
+# than by a generated config block.
+#
+# Not from `configs/raccoon.yaml`, following `RACCOON_LISTENER_TOKEN`: that
+# file is in git, and under `NKpsk0` this value plus the server's public
+# key is the whole credential. `tunnel_config_from_yaml` refuses a `psk`
+# key in the file and names this variable instead;
+# `services/raccoon-tunnel.service` supplies it through an
+# `EnvironmentFile`, which unlike a unit file is not world-readable.
+_TUNNEL_PSK_ENV = "RACCOON_TUNNEL_PSK"
 
 # How long a terminated tunnel child is given to go before it is killed.
 # A child blocked in an uninterruptible syscall is exactly the pathology
