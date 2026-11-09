@@ -78,6 +78,15 @@ services:
       # Left commented: a mount of a path that does not exist would stop
       # `docker compose up` for everyone who does not use vertex.
       # - /etc/raccoon:/etc/raccoon:ro
+      #
+      # A provider chain (agent.llm.fallbacks) can only be written in YAML,
+      # and this image contains no configs/raccoon.yaml. The service reads
+      # /opt/raccoon/configs/raccoon.yaml if it exists; the alternative is
+      # `command: ["-c", "<path in the container>"]` on this service with the
+      # file mounted anywhere. Edit the host side and uncomment. The shipped
+      # file works, with c2.sliver.enabled set to false as docs/AGENT.md says
+      # at the top. Commented out for the same reason as the line above.
+      # - ../../configs/raccoon.yaml:/opt/raccoon/configs/raccoon.yaml:ro
     environment:
       # Loopback only. This API starts campaigns and runs commands; it has
       # no business being reachable from the network, and no port is
@@ -94,6 +103,11 @@ services:
       # | vertex
       - AGENT_PROVIDER=${AGENT_PROVIDER:-}
       - AGENT_MODEL=${AGENT_MODEL:-}
+      # Blank takes the provider's own endpoint. Needed for opencode, which
+      # has none, and for a local or ollama server that is not on this host's
+      # 127.0.0.1:11434. Set, it also overrides the endpoint that bedrock and
+      # vertex compute from their region and project.
+      - AGENT_BASE_URL=${AGENT_BASE_URL:-}
       # Blank derives the tier from the model. Set it to force one: it is the
       # documented way to hold a whole run to a small model's limits (see
       # "Known limits" in docs/AGENT.md), so the container has to pass it.

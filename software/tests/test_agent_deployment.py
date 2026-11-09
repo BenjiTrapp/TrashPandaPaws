@@ -217,6 +217,24 @@ class TestCompose(unittest.TestCase):
             self.assertIn(key, env, key)
             self.assertEqual(env[key], "${%s:-}" % key, key)
 
+    def test_a_custom_endpoint_reaches_the_container(self):
+        # opencode has no default endpoint at all, so without this it cannot
+        # start in the container; a local server elsewhere needs it too.
+        env = _env_map(self.services["agent"])
+        self.assertEqual(env.get("AGENT_BASE_URL"), "${AGENT_BASE_URL:-}")
+
+    def test_the_provider_chain_has_a_commented_mount_to_edit(self):
+        # The chain is YAML-only and the image has no YAML. The mount is
+        # commented out: an uncommented one for a path that may not exist
+        # would stop `docker compose up` for everybody, so the file offers
+        # the line and the test checks it stays a comment.
+        self.assertRegex(
+            self.raw, r"(?m)^\s*# - \S*raccoon\.yaml:"
+                      r"/opt/raccoon/configs/raccoon\.yaml:ro$")
+        agent_volumes = self.services["agent"].get("volumes") or []
+        self.assertFalse([v for v in agent_volumes if "raccoon.yaml" in str(v)],
+                         agent_volumes)
+
     def test_the_tier_override_reaches_the_container(self):
         # The documented workaround for a chain that ends on a small model is
         # AGENT_CAPABILITY_TIER, and it is a safety limit. A document that

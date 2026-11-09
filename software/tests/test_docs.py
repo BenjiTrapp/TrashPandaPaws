@@ -779,12 +779,21 @@ class TestTheKnownLimitsRecordTheOpenFindings(_DocCase):
 
 # The entries under "The agent layer" that the code can answer for. They are
 # kept apart from _OPEN_FINDINGS, whose groups are the hardening pass's and
-# are counted against it; this list is counted against nothing.
+# are counted against it; these are counted, with those, against the README's
+# sentence about how many entries have a test.
 #
 # READ THIS WHEN ONE OF THEM FAILS. The assertion states a limitation as
 # true. It fails when the limitation stops being true, which means the fix
 # has landed: delete the entry from Known limits, delete its predicate here,
 # and delete this record. Do not "fix" the test by changing what it asserts.
+#
+# One exception, and the tier entry is it. Its predicate watches the
+# orchestrator-turn limit only, which is the half of that entry a per-link
+# tier would close. The entry says that the other half, the phase ceiling
+# fixed when the form becomes a CampaignConfig, stays open under such a fix.
+# So when that predicate fails, read the entry before deleting it: if nothing
+# caps or aborts a run at failover, cut the entry down to the phase ceiling
+# instead, and say there that no test ties it.
 _OPEN_AGENT_LIMITS = [
     ("A failover does not re-derive the capability tier",
      _a_failover_keeps_the_primarys_tier),

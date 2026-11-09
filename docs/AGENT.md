@@ -365,7 +365,10 @@ other, trips the link after two, and the later turns do not pay for it.
 The chain is written in the YAML only; there is no environment form for it.
 The agent image does not contain `configs/raccoon.yaml`, so a container has no
 chain unless a file is mounted at `/opt/raccoon/configs/raccoon.yaml`, one of
-the places the service looks, or named with `-c`.
+the places the service looks, or named with `-c`. `docker-compose.yml` carries
+the mount as a commented-out line under the agent's `volumes`, to edit and
+uncomment, because an active mount of a path that does not exist would stop
+`docker compose up` for everyone who does not use a chain.
 
 Every link is built at startup, so a fallback that cannot be constructed is
 a configuration error reported then — `/api/ai/status` says so and no
@@ -902,20 +905,30 @@ have to be distinguishable.
 ### The agent layer
 
 - **A failover does not re-derive the capability tier.** The tier is worked
-  out once, at startup, from the primary provider and model
-  (`config.load`), and the orchestrator reads its limits from that single
-  value for the whole run. A chain whose primary is `full` therefore keeps
-  `full` limits on every link: 20 orchestrator turns, 4000 characters of
-  output kept, phase 5 and every tool, including when the link answering is a
-  small local model that the tier system would have put at `minimal` or
-  `reduced` had it been the primary. `max_phase` is a safety boundary, and
-  here a model the tier system would not trust with phase 5 can be handed
-  phase 5 by a failover. The approval gate and the scope are not affected and
-  still stand between that model and an action. This predates the provider
-  work and is more reachable now that a [model on the Pi](#a-model-on-the-pi)
-  is a documented fallback. Until the tier is re-derived per active link, put
-  the weakest model you would accept as the whole run's tier in
-  `AGENT_CAPABILITY_TIER`.
+  out once, at startup, from the primary provider and model (`config.load`),
+  and a run reads its limits from that single value for its whole life. A
+  chain whose primary is `full` therefore keeps `full` limits on every link:
+  20 orchestrator turns, 4000 characters of output kept, every tool, and a
+  phase ceiling of 5, including when the link answering is a small local model
+  that the tier system would have put at `minimal` or `reduced` had it been
+  the primary. `max_phase` is a safety boundary, and here a model the tier
+  system would not trust with phase 5 can be handed phase 5 by a failover. The
+  approval gate and the scope are not affected and still stand between that
+  model and an action. This predates the provider work and is more reachable
+  now that a [model on the Pi](#a-model-on-the-pi) is a documented fallback.
+
+  **What re-deriving the tier per active link would and would not reach.** It
+  would reach the turn limit, the truncation, the tool set and the prompt,
+  which a run reads as it goes. It would not reach the phases: `max_phase` is
+  applied once, when the form becomes a `CampaignConfig`, before any model has
+  been asked, so a run started at phase 5 on a `full` primary keeps phase 5
+  whichever link answers. Closing that half needs a cap or an abort at the
+  moment of failover, which is separate work. A fix that only re-reads the
+  tier leaves this entry half true: it should then be cut down to the phase
+  ceiling, not deleted. The test that ties this entry watches the turn limit
+  and nothing else. Until then, put the weakest model you would accept as the
+  whole run's tier in `AGENT_CAPABILITY_TIER`, which also lowers the phases
+  the form may select.
 - **Wifi phases 6–8 are unreachable.** `max_phase` tops out at 5 for every
   capability tier, so the wifi chain cannot be selected yet. Monitor mode
   has only ever been mock-tested here: the Pi's onboard WLAN is the only
