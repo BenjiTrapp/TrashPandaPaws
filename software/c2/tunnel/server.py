@@ -171,6 +171,10 @@ class RelayStream(object):
         self._eof = False
         self._closed = False
         self._write_lock = threading.Lock()
+        # A lock of its own for the closed flag, held across nothing. The
+        # write lock cannot serve: `sendall` holds that one across a
+        # blocking send, and `close` has to be able to run then.
+        self._state_lock = threading.Lock()
         self._counter_lock = threading.Lock()
         self.bytes_in = 0
         self.bytes_out = 0
@@ -241,7 +245,24 @@ class RelayStream(object):
         return plaintext
 
     def close(self) -> None:
-        with self._write_lock:
+        """Shut the stream down. Never waits on a write in flight.
+
+        `sendall` can be parked inside `write_frame` for as long as the far
+        end declines to read -- the consumer owns the socket timeout and
+        the default is none, so TCP backpressure alone parks it -- and it
+        holds the write lock the whole time. Waiting for that lock here
+        would hang `TunnelServer.stop`, whose whole promise is to be
+        immediate, on an operator thread. So the flag has a small lock of
+        its own and the socket is shut down from outside the write lock
+        rather than inside it.
+
+        That is safe in both directions. `shutdown` is what unparks a
+        blocked `sendall`: measured, it returns `BrokenPipeError` at once.
+        And CPython re-checks the descriptor on each iteration of its send
+        loop, so a parked writer cannot write into a descriptor that was
+        closed and recycled under it -- it raises instead.
+        """
+        with self._state_lock:
             if self._closed:
                 return
             self._closed = True
@@ -328,6 +349,12 @@ class _CommandChannel(object):
         # and the insertion have to be one atomic step.
         self.ready = False
         self._write_lock = threading.Lock()
+        # As on `RelayStream`, and for the same reason: `close` must not
+        # queue behind a send that is parked on a full buffer. The command
+        # channel escapes that today only because `_command_loop` leaves a
+        # one-second timeout on the descriptor, which is an accident of
+        # the read path and not a property of this one.
+        self._state_lock = threading.Lock()
         self._closed = False
 
     def send(self, kind: int, body: dict) -> None:
@@ -345,7 +372,7 @@ class _CommandChannel(object):
         self.last_seen = time.time()
 
     def close(self) -> None:
-        with self._write_lock:
+        with self._state_lock:
             if self._closed:
                 return
             self._closed = True
@@ -398,6 +425,15 @@ class TunnelServer(object):
         self._channels = {}         # type: Dict[str, _CommandChannel]
         self._sessions = []         # type: List[RelaySession]
         self._session_count = 0
+        # Bytes each way per identity, carried over from sessions that have
+        # finished. The panel's row is per endpoint, and a counter that
+        # dropped back to zero when a relay closed would tell the operator
+        # nothing moved through an endpoint that had just carried a scan.
+        # Per server run, not persisted: `state_path` exists to keep a
+        # SOCKS port stable, and turning it into a traffic log would mean
+        # writing it on every session teardown and showing numbers from a
+        # previous engagement.
+        self._traffic = {}          # type: Dict[str, List[int]]
         self._workers = []          # type: List[threading.Thread]
         # Every socket accepted but not yet authenticated, against the time
         # it arrived, so `stop` can drop a peer sitting halfway through a
@@ -469,6 +505,10 @@ class TunnelServer(object):
             channel.close()
         for conn in live:
             _shut(conn)
+        with self._lock:
+            # After the closes, so a row read after `stop` still reports
+            # everything those sessions carried.
+            self._retire(sessions)
         for worker in workers:
             worker.join(timeout=3.0)
 
@@ -485,9 +525,10 @@ class TunnelServer(object):
         the row would make an endpoint that aged out look like one that
         was never issued a port.
 
-        `bytes_in` and `bytes_out` are the traffic of the sessions open
-        right now, not a lifetime total: nothing here keeps a counter past
-        the session it belonged to.
+        `bytes_in` and `bytes_out` are everything that has crossed this
+        endpoint since the server started: the sessions open now plus the
+        totals carried over from the ones that have closed. They do not
+        survive a restart -- see `_traffic`.
         """
         now = time.time()
         with self._lock:
@@ -497,11 +538,22 @@ class TunnelServer(object):
                         if channel.ready}
             paired = [session for session in self._sessions
                       if session.state == "paired"]
+            # Every session still in the table, whatever its state, so a
+            # closed-but-not-yet-pruned one keeps counting until the prune
+            # folds it into `_traffic`. Summing only the paired ones would
+            # leave a tick-wide window in which the row reads zero again,
+            # which is the lie this total exists to stop telling.
+            live = list(self._sessions)
+            carried = {identity: list(total)
+                       for identity, total in self._traffic.items()}
         rows = []
         for identity in sorted(ports):
             channel = channels.get(identity)
             mine = [session for session in paired
                     if session.identity == identity]
+            counted = [session for session in live
+                       if session.identity == identity and session.sock]
+            before = carried.get(identity, [0, 0])
             implant_id = channel.implant_id if channel is not None else None
             agent = self._agent_for(implant_id)
             rows.append({
@@ -515,8 +567,8 @@ class TunnelServer(object):
                 "os": channel.os_name if channel is not None else None,
                 "peer": channel.peer if channel is not None else None,
                 "sessions": len(mine),
-                "bytes_in": sum(s.sock.bytes_in for s in mine if s.sock),
-                "bytes_out": sum(s.sock.bytes_out for s in mine if s.sock),
+                "bytes_in": before[0] + sum(s.sock.bytes_in for s in counted),
+                "bytes_out": before[1] + sum(s.sock.bytes_out for s in counted),
                 "last_seen_age": (now - channel.last_seen
                                   if channel is not None else None),
                 "connected_for": (now - channel.connected_at
@@ -809,6 +861,21 @@ class TunnelServer(object):
                              MESSAGE_KIND_NAMES.get(kind, kind))
                 return
 
+    def _retire(self, sessions: List[RelaySession]) -> None:
+        """Fold finished sessions' byte counts into their identity's total.
+
+        Called with the lock held, and exactly once per session: the
+        session has to have been taken out of `_sessions` in the same
+        critical section, or two callers could count it twice.
+        """
+        for session in sessions:
+            stream = session.sock
+            if stream is None:
+                continue
+            total = self._traffic.setdefault(session.identity, [0, 0])
+            total[0] += stream.bytes_in
+            total[1] += stream.bytes_out
+
     def _forget(self, channel: _CommandChannel) -> None:
         """Drop a channel and every session that belonged to it."""
         with self._lock:
@@ -823,6 +890,10 @@ class TunnelServer(object):
         # so a session outliving it could never pair or carry anything.
         for session in mine:
             session.close()
+        # After closing, so the totals are final: nothing can add a byte to
+        # a stream that is shut down.
+        with self._lock:
+            self._retire(mine)
 
     # ── the relay channel ──
 
@@ -890,7 +961,6 @@ class TunnelServer(object):
             with self._lock:
                 channels = [channel for channel in self._channels.values()
                             if channel.ready]
-                sessions = list(self._sessions)
                 # A peer that sends a byte just often enough to keep the
                 # socket's own timeout from firing would otherwise hold a
                 # thread for as long as it liked: `read_frame`'s timeout is
@@ -916,18 +986,32 @@ class TunnelServer(object):
                     logger.debug("tunnel: keep-alive to %r failed: %s",
                                  channel.identity, exc)
                     channel.close()
-            for session in sessions:
-                if (session.state == "pending"
-                        and now - session.created >= self.session_timeout):
-                    logger.info("tunnel: relay session %d for %r was never "
-                                "claimed in %.1fs; expiring it",
-                                session.number, session.identity,
-                                self.session_timeout)
-                    session._expire("expired")
             with self._lock:
-                self._sessions = [
-                    session for session in self._sessions
-                    if session.state in ("pending", "claimed", "paired")]
+                # The deadline check and the write that acts on it are one
+                # critical section, under the same lock `_claim` takes.
+                # Split, a relay arriving in between is claimed and paired
+                # and then overwritten as expired: the operator is told the
+                # pairing failed while a live, spliced connection sits in
+                # no table at all. The log line is deliberately outside, so
+                # nothing slow runs between the two.
+                expired = [session for session in self._sessions
+                           if session.state == "pending"
+                           and now - session.created >= self.session_timeout]
+                for session in expired:
+                    session._expire("expired")
+                keep, finished = [], []
+                for session in self._sessions:
+                    if session.state in ("pending", "claimed", "paired"):
+                        keep.append(session)
+                    else:
+                        finished.append(session)
+                self._sessions = keep
+                self._retire(finished)
+            for session in expired:
+                logger.info("tunnel: relay session %d for %r was never "
+                            "claimed in %.1fs; expiring it",
+                            session.number, session.identity,
+                            self.session_timeout)
 
     # ── the port table ──
 

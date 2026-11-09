@@ -281,6 +281,21 @@ class TunnelServerTestCase(unittest.TestCase):
         peer.handshake(encode_message(MSG_RELAY, {"token": token.hex()}))
         return peer
 
+    def dial_relay(self, server, identity, token):
+        """Open a relay connection, or None if the server refused it.
+
+        Unlike `relay_peer` this tolerates a refusal, registers no cleanup
+        and touches no `TestCase` state, because it is called from threads.
+        """
+        peer = _Peer("127.0.0.1", server.port, self.public,
+                     self.psks[identity])
+        try:
+            peer.handshake(encode_message(MSG_RELAY, {"token": token.hex()}))
+        except (OSError, ValueError):
+            peer.close()
+            return None
+        return peer
+
     def probe(self, server, data=b"", timeout=1.0):
         """Open a connection, send `data`, and return what came back."""
         sock = socket.create_connection(("127.0.0.1", server.port), timeout=10.0)
@@ -590,6 +605,144 @@ class TestRelayPairing(TunnelServerTestCase):
         self.assertFalse(session.wait_paired(0.2))
         self.wait_for(lambda: server.status() == [])
         self.assertEqual(session.state, "expired")
+
+    def test_a_relay_that_arrives_as_its_session_expires_is_not_lost(self):
+        server = self.start_server(session_timeout=0.3)
+        peer = self.command_peer(server, "build-alpha", pump=True)
+        session = server.open_session("build-alpha")
+        peer.next_open_relay()
+
+        # The window is driven deliberately rather than hoped for: the hook
+        # runs at the instant the expiry is applied and dials the relay
+        # from another thread while it does. If the deadline check and the
+        # write are not one critical section, the relay is claimed and
+        # paired in between and then overwritten as expired -- a live,
+        # spliced connection in no table at all, and an operator told the
+        # pairing failed.
+        arrived = []
+        dialled = []
+        expire = session._expire
+
+        def expiring(why):
+            thread = threading.Thread(
+                target=lambda: arrived.append(
+                    self.dial_relay(server, "build-alpha", session.token)),
+                daemon=True)
+            dialled.append(thread)
+            thread.start()
+            # Long enough for the dial to complete outright if nothing is
+            # holding it off, which is what the unlocked version did.
+            thread.join(0.5)
+            expire(why)
+
+        session._expire = expiring
+        self.wait_for(lambda: session.state != "pending", timeout=5.0)
+        for thread in dialled:
+            thread.join(timeout=5.0)
+            self.assertFalse(thread.is_alive())
+        for peer_or_none in arrived:
+            if peer_or_none is not None:
+                self.addCleanup(peer_or_none.close)
+
+        # The invariant, whichever side of the race won: a session is never
+        # both expired and holding a live stream.
+        self.assertEqual(len(arrived), 1)
+        if session.sock is not None:
+            self.assertEqual(session.state, "paired")
+            self.assertTrue(session.wait_paired(0))
+            self.assertIsNotNone(arrived[0])
+        else:
+            self.assertEqual(session.state, "expired")
+            self.assertIsNone(arrived[0])
+            self.assertFalse(session.wait_paired(0))
+
+    def test_stop_returns_while_a_relay_consumer_is_parked_on_a_full_buffer(self):
+        server = self.start_server()
+        peer = self.command_peer(server, "build-alpha", pump=True)
+        session = server.open_session("build-alpha")
+        peer.next_open_relay()
+        relay = self.relay_peer(server, "build-alpha", session.token)
+        self.assertTrue(session.wait_paired(5.0))
+
+        # The relay peer never reads, so ordinary TCP backpressure parks
+        # the consumer inside write_frame holding the stream's write lock.
+        # The stream has no socket timeout -- the consumer owns that -- so
+        # nothing bounds the park but `stop`.
+        broken = []
+
+        def consumer():
+            try:
+                while True:
+                    session.sock.sendall(b"x" * 32768)
+            except (OSError, ValueError) as exc:
+                broken.append(exc)
+
+        writer = threading.Thread(target=consumer, daemon=True)
+        writer.start()
+
+        def parked():
+            before = session.sock.bytes_out
+            time.sleep(0.2)
+            return writer.is_alive() and session.sock.bytes_out == before
+
+        # Observed, not assumed: the test's precondition is that the
+        # consumer really is blocked and holding the lock.
+        self.wait_for(parked, timeout=15.0)
+
+        stopper = threading.Thread(target=server.stop, daemon=True)
+        stopper.start()
+        stopper.join(timeout=10.0)
+        blocked = stopper.is_alive()
+
+        # Release the far end before asserting, so a regression fails this
+        # test instead of hanging every cleanup behind it.
+        relay.close()
+        stopper.join(timeout=10.0)
+        writer.join(timeout=5.0)
+
+        self.assertFalse(blocked, "stop() queued behind a parked sendall")
+        self.assertFalse(writer.is_alive(),
+                         "the parked consumer was never unparked")
+        self.assertTrue(broken, "the parked consumer saw no error")
+
+    def test_endpoint_bytes_survive_the_session_that_carried_them(self):
+        server = self.start_server()
+        peer = self.command_peer(server, "build-alpha", pump=True)
+
+        first = server.open_session("build-alpha")
+        peer.next_open_relay()
+        relay = self.relay_peer(server, "build-alpha", first.token)
+        self.assertTrue(first.wait_paired(5.0))
+        first.sock.sendall(b"a" * 100)
+        self.assertEqual(relay.recv_raw(), b"a" * 100)
+        relay.send_raw(b"b" * 40)
+        self.assertEqual(first.sock.recv(128), b"b" * 40)
+
+        row = self.row(server, "build-alpha")
+        self.assertEqual((row["bytes_out"], row["bytes_in"]), (100, 40))
+
+        # Closing the relay must not make the panel say nothing moved.
+        first.close()
+        relay.close()
+        row = self.row(server, "build-alpha")
+        self.assertEqual((row["bytes_out"], row["bytes_in"]), (100, 40))
+        # And still not after the prune, which is where the hand-over to
+        # the per-identity total happens -- once, not twice.
+        self.wait_for(lambda: server.status() == [])
+        row = self.row(server, "build-alpha")
+        self.assertEqual((row["bytes_out"], row["bytes_in"]), (100, 40))
+        self.assertEqual(row["sessions"], 0)
+
+        # A second session adds to the total rather than replacing it.
+        second = server.open_session("build-alpha")
+        peer.next_open_relay()
+        again = self.relay_peer(server, "build-alpha", second.token)
+        self.assertTrue(second.wait_paired(5.0))
+        second.sock.sendall(b"c" * 7)
+        self.assertEqual(again.recv_raw(), b"c" * 7)
+        row = self.row(server, "build-alpha")
+        self.assertEqual((row["bytes_out"], row["bytes_in"]), (107, 40))
+        self.assertEqual(row["sessions"], 1)
 
 
 class TestKeepAlive(TunnelServerTestCase):
