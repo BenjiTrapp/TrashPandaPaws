@@ -17,7 +17,7 @@ configured". So nothing here is called from `available()`, and nothing
 should be moved there. This module may touch the network because it runs
 once, on request.
 
-Two things it adds, and what each costs:
+Three things it adds, and what each costs:
 
   * **A local server is asked for its models.** The commonest local failure
     is a model that was never pulled, and it is invisible until the first
@@ -26,10 +26,15 @@ Two things it adds, and what each costs:
     different servers: `ollama` is asked for `/api/tags`, `local` (LM Studio,
     llama.cpp) for the OpenAI-compatible `/v1/models`. One endpoint per
     name, so a working LM Studio link is not reported as down.
+  * **A link with a token source is asked for a token.** Building the link
+    checks only that the source is a sensible choice, and `available()` can
+    afford no more, so a logged-out `gcloud` passes it. A token costs no
+    model tokens, so this always happens too.
   * **`--ping` sends one tiny completion per link.** Opt-in, because it
     spends tokens on a metered provider, and a health check that costs money
     is one nobody runs. Without it nothing here calls a model, and a hosted
-    link's "ok" means only that it is well-formed.
+    link's "ok" means it is well-formed and, if it has a token source, that
+    a token could be had.
 
 Every link is built and reported on its own. `failover.create_chain` stops at
 the first link it cannot build, which is right for startup and wrong here:
@@ -37,7 +42,8 @@ the operator wants to hear about all of them in one run.
 
 The config carries live keys and this prints a line per link, so no line is
 built from anything but a provider name, a model name, a host and port, a
-status code, an exception class or a ProviderError. The URL itself is never
+status code, an exception class, a ProviderError or a TokenUnavailable, and
+never from a token. The URL itself is never
 printed, because a base_url may carry userinfo, and every detail is scrubbed
 of the configured keys as a last line of defence.
 """
@@ -53,7 +59,7 @@ from typing import (Any, Callable, Dict, List, NamedTuple, Optional,
 from urllib.parse import urlparse
 
 from software.agent import config
-from software.agent.llm import failover, provider
+from software.agent.llm import failover, gcp_token, provider
 from software.agent.llm.provider import ProviderError
 
 # A person is waiting, and a local server that has not answered in this long
@@ -221,6 +227,21 @@ def _check_local(client, name: str, endpoint: str, probe: Probe,
                    % (where, client.model, absent, shown or "nothing"))
 
 
+def _token(source) -> Tuple[bool, str]:
+    # The token itself is dropped here: this prints a line per link, and the
+    # only thing worth saying about a token is whether there was one.
+    failure = None
+    try:
+        source.bearer()
+    except gcp_token.TokenUnavailable as exc:
+        failure = "no access token: %s" % exc
+    except Exception as exc:
+        failure = "no access token (%s)" % type(exc).__name__
+    if failure is not None:
+        return False, failure
+    return True, "a token was obtained"
+
+
 def _ping(client) -> Tuple[bool, str]:
     try:
         completion = asyncio.run(client.complete(
@@ -265,6 +286,36 @@ def _links(cfg) -> List[_Link]:
     return links
 
 
+def _check_built(client, name: str, base_url: Optional[str], probe: Probe,
+                 has_key: bool, ping: bool) -> Tuple[bool, str]:
+    """What a link that could be built can show, cheapest step first."""
+    said = []
+    source = getattr(client, "_token_source", None)
+    if source is not None:
+        # Free, unlike a ping: a token costs no model tokens, and whether one
+        # can be had is the question this command exists to answer for a
+        # link that has a source. Construction checked only that the choice
+        # of source was well-formed, and a logged-out gcloud passes that.
+        ok, detail = _token(source)
+        if not ok:
+            return False, detail
+        said.append(detail)
+    if name in provider.LOCAL_PROVIDERS:
+        ok, detail = _check_local(client, name, _endpoint(name, base_url),
+                                  probe, has_key)
+        said.append(detail)
+        if not ok:
+            return False, "; ".join(said)
+    elif not ping:
+        said.insert(0, "built")
+        said.append("nothing was sent (--ping sends one request)")
+    if ping:
+        ok, detail = _ping(client)
+        said.append(detail)
+        return ok, "; ".join(said)
+    return True, "; ".join(said)
+
+
 def check(cfg, *, ping: bool = False,
           probe: Optional[Probe] = None) -> List[Dict[str, Any]]:
     """One {provider, model, ok, detail} per link, primary first.
@@ -285,18 +336,8 @@ def check(cfg, *, ping: bool = False,
         except ProviderError as exc:
             ok, detail = False, str(exc)
         else:
-            if name in provider.LOCAL_PROVIDERS:
-                ok, detail = _check_local(client, name,
-                                          _endpoint(name, base_url), probe,
-                                          has_key)
-                if ok and ping:
-                    ok, said = _ping(client)
-                    detail = "%s; %s" % (detail, said)
-            elif ping:
-                ok, detail = _ping(client)
-            else:
-                ok, detail = True, ("built; nothing was sent (--ping sends "
-                                    "one request)")
+            ok, detail = _check_built(client, name, base_url, probe, has_key,
+                                      ping)
         for secret in secrets:
             detail = detail.replace(secret, "<redacted>")
         rows.append({"provider": name, "model": model, "ok": ok,

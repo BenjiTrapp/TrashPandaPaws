@@ -215,7 +215,8 @@ source (`file`, for the container below) and the explicit choice wins.
 for being on `PATH` and a `file` for its mode, but `auto` always passes, since
 the metadata server cannot be ruled out without asking it. A host with no
 working source therefore reports `available: true` and fails at the first
-model call. [`--ping`](#checking-the-chain-before-an-engagement) is the way to
+model call. [The pre-engagement check](#checking-the-chain-before-an-engagement)
+fetches a token for every `vertex` link, without `--ping`, and is the way to
 find out before then.
 
 ### On the host
@@ -412,7 +413,7 @@ any is not, and 2 if the configuration will not load. It reports every link in
 one run, where startup stops at the first it cannot build:
 
 ```
-ok     vertex google/gemini-3-pro built; nothing was sent (--ping sends one request)
+ok     vertex google/gemini-3-pro built; a token was obtained; nothing was sent (--ping sends one request)
 NOT OK ollama llama3.2            no server answering at 127.0.0.1:11434 (URLError)
 ```
 
@@ -427,14 +428,16 @@ What a line means depends on the link:
   what it does have. One that answers 401 or 403 is up and wants a
   credential, which the probe never sends; the line is ok only if the link has
   a key to send, and `--ping` is what tests it.
-- **A hosted link without `--ping` is only "built".** The key, the model id,
-  the endpoint and, for `vertex`, the project, location and source choice are
-  well-formed; nothing was sent. For `vertex` that is the weakest answer it
-  can give, because a broken `gcloud` passes it.
+- **A `vertex` link is asked for a token**, always, because a token costs no
+  model tokens and whether one can be had is exactly what building the link
+  does not tell you: a logged-out `gcloud` passes construction. A link whose
+  source cannot produce one is `NOT OK` with the source's own reason, and the
+  token itself is never printed.
+- **Any other hosted link without `--ping` is only "built".** The key, the
+  model id and the endpoint are well-formed; nothing was sent.
 - **`--ping` sends one tiny completion per link**, capped at 16 output
-  tokens, and for `vertex` it fetches a real token first, which is the only
-  step that tests the source. It is opt-in because it spends tokens on a
-  metered provider, and a health check that costs money is one nobody runs.
+  tokens. It is opt-in because it spends tokens on a metered provider, and a
+  health check that costs money is one nobody runs.
 
 This is a separate command, not part of `/api/ai/status`, on purpose. The
 status endpoint is polled by the interface and must not do I/O: probing a

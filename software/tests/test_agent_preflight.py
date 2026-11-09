@@ -470,6 +470,90 @@ def _fail_if_called(*args, **kwargs):
     raise AssertionError("a model was called")
 
 
+class _TokenSource:
+    """Stands in for a Google token source: hands out `token` or raises."""
+
+    def __init__(self, token=None, raises=None):
+        self.token, self.raises = token, raises
+        self.calls = 0
+
+    def bearer(self):
+        self.calls += 1
+        if self.raises is not None:
+            raise self.raises
+        return self.token
+
+
+def _vertex(**kw):
+    values = dict(provider="vertex", model="google/gemini-3-pro",
+                  api_key=None, vertex_project="proj")
+    values.update(kw)
+    return _cfg(**values)
+
+
+class TestALinkWithATokenSourceIsAskedForAToken(unittest.TestCase):
+    """Without --ping. A token costs no model tokens, and a logged-out
+    gcloud passes everything that building the link checks."""
+
+    def _check(self, source, cfg=None, **kw):
+        with unittest.mock.patch.object(
+                provider.gcp_token, "source", return_value=source), \
+                unittest.mock.patch.object(provider, "http_post_json",
+                                           _fail_if_called):
+            return preflight.check(cfg or _vertex(), probe=_Probe(_TAGS),
+                                   **kw)
+
+    def test_a_source_that_cannot_give_a_token_is_not_ok(self):
+        src = _TokenSource(raises=provider.gcp_token.TokenUnavailable(
+            "no Google token source worked: gcloud exited with status 1"))
+        row = self._check(src)[0]
+        self.assertEqual(src.calls, 1)
+        self.assertFalse(row["ok"])
+        self.assertIn("no access token", row["detail"])
+        self.assertIn("gcloud exited with status 1", row["detail"])
+
+    def test_a_source_that_gives_a_token_is_ok_and_the_token_is_not_shown(self):
+        src = _TokenSource(token="ya29.tok-SECRET-value")
+        row = self._check(src)[0]
+        self.assertEqual(src.calls, 1)
+        self.assertTrue(row["ok"], row)
+        self.assertIn("token was obtained", row["detail"])
+        self.assertIn("--ping", row["detail"])
+        self.assertNotIn("tok-SECRET", row["detail"])
+
+    def test_any_other_failure_is_named_by_class_only(self):
+        src = _TokenSource(raises=RuntimeError("Bearer tok-LEAK"))
+        row = self._check(src)[0]
+        self.assertFalse(row["ok"])
+        self.assertIn("RuntimeError", row["detail"])
+        self.assertNotIn("tok-LEAK", row["detail"])
+
+    def test_a_vertex_fallback_is_asked_too(self):
+        src = _TokenSource(raises=provider.gcp_token.TokenUnavailable("down"))
+        cfg = _cfg(fallbacks=(config.FallbackLink(
+            provider="vertex", model="google/gemini-3-pro",
+            base_url="https://europe-west4-aiplatform.googleapis.com/v1/"
+                     "projects/p/locations/europe-west4/endpoints/openapi"),))
+        rows = self._check(src, cfg=cfg)
+        self.assertEqual([r["ok"] for r in rows], [True, False])
+        self.assertIn("down", rows[1]["detail"])
+
+    def test_without_a_token_there_is_no_ping(self):
+        src = _TokenSource(raises=provider.gcp_token.TokenUnavailable("down"))
+        row = self._check(src, ping=True)[0]
+        self.assertFalse(row["ok"])
+        self.assertEqual(src.calls, 1)
+
+    def test_a_link_without_a_source_is_not_asked(self):
+        # Only a client that carries a source: the other providers have a
+        # static key and nothing to ask.
+        with unittest.mock.patch.object(
+                provider.gcp_token, "source",
+                side_effect=AssertionError("a source was asked for")):
+            row = preflight.check(_cfg(), probe=_Probe(_TAGS))[0]
+        self.assertTrue(row["ok"], row)
+
+
 class TestNothingIsSentToAModelUnlessAsked(unittest.TestCase):
     def test_nothing_is_pinged_unless_asked(self):
         cfg = _cfg(fallbacks=(
