@@ -3348,6 +3348,28 @@ class CplIsInBoardCoordinatesFromTheLowerLeftCorner(unittest.TestCase):
             self.assertLess(x, x1 - x0, row["Designator"])
             self.assertLess(y, y1 - y0, row["Designator"])
 
+    def test_the_gerbers_differ_from_the_cpl_by_the_offset_ordering_states(self):
+        # the package has two frames; the fixed offset between them is a stated fact, not left to inference
+        text = re.sub(r"\s+", " ", ORDERING.read_text())
+        self.assertIn("(100.000, -116.000)", text)
+        self.assertIn("gerber X = Mid X + 100.000, gerber Y = Mid Y - 116.000", text)
+        outline = [(int(x) / 1e6, int(y) / 1e6)
+                   for x, y in re.findall(r"^X(-?\d+)Y(-?\d+)D0[12]\*", (GERBER_DIR / "raccoon-tap-Edge_Cuts.gm1").read_text(), re.M)]
+        self.assertEqual((min(x for x, _ in outline), min(y for _, y in outline)), (100.0, -116.0))
+        u3 = {r["Designator"]: r for r in read_cpl()}["U3"]
+        pad1 = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"]
+        self.assertAlmostEqual(pad1[0], float(u3["Mid X"]) + 100.0 + 2.4375, places=4)
+        self.assertAlmostEqual(pad1[1], float(u3["Mid Y"]) - 116.0 - 1.8, places=4)
+        self.assertIn("(124.000, -103.000)", text)
+
+    def test_ordering_says_a_rebuild_changes_every_file_and_why_that_is_not_staleness(self):
+        text = re.sub(r"\s+", " ", ORDERING.read_text())
+        self.assertRegex(text, r"(?i)before concluding the package is stale")
+        self.assertRegex(text, r"16 of 16 files differ byte for byte")
+        committed = json.loads((GERBER_DIR / MANIFEST_NAME).read_text())["files"]
+        self.assertEqual(len(committed), 16)                       # the number the sentence states
+        self.assertRegex(text, r"restore the gerber folder")
+
     def test_the_committed_cpl_is_what_the_exporter_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.export.write_cpl(Path(tmp) / "cpl.csv")
@@ -4212,6 +4234,40 @@ class NoOperatorPathIsCommitted(unittest.TestCase):
             if hits:
                 found[name] = hits
         self.assertEqual(found, {}, "absolute user paths are committed (run hardware/tools/relativize_paths.py)")
+
+    def test_a_real_user_directory_is_still_a_leak(self):
+        # ruling CJ narrowed the pattern to stop flagging platform-generic homes; these
+        # must still be caught, and the last group is what an allow-list that swallowed
+        # everything, or matched on a prefix, would let through
+        tool = _relativize_module()
+        H = "/" + "home/"      # split so that this file does not match its own scan
+        for leak in ("/" + "Users" + "/alice/gitRepos/x", H + "alice/gitRepos/x",
+                     "C:\\" + "Users\\alice\\x", "C:\\\\" + "Users\\\\alice\\\\x",   # and as escaped in JSON
+                     H + "pierre/x", H + "pi2/x", H + "pi.local/x", H + "ubuntu/x", H + "u2/x",
+                     "/" + "Users" + "/pi/x", "/" + "Users" + "/u/x"):                # exempt under /home only
+            self.assertTrue(tool.leaks(f'"{leak}"'), leak)
+            self.assertTrue(tool.HOME_PATH.search(leak), leak)
+
+    def test_the_platform_generic_home_directories_are_not_a_leak(self):
+        tool = _relativize_module()
+        for fine in ("/home/pi", "/home/pi/.ssh", 'chown -R "$ACTUAL_USER" /home/pi/.ssh',
+                     "shell tee -a /home/u/.ssh/authorized_keys", "write /home/u/.bashrc", '"/home/u"'):
+            self.assertEqual(tool.leaks(fine), [], fine)
+
+    def test_the_exempt_names_are_pinned_and_the_tool_agrees_with_the_scan(self):
+        tool = _relativize_module()
+        H = "/" + "home/"
+        self.assertEqual(tool.GENERIC_HOME_NAMES, ("pi", "u"))      # a new name needs an argument and this line
+        with tempfile.TemporaryDirectory() as tmp:
+            fine, bad = Path(tmp) / "fine.txt", Path(tmp) / "bad.txt"
+            fine.write_text("cd /home/pi/.ssh && cat /home/u/.bashrc\n")
+            bad.write_text("cd /home/pi/.ssh && cat " + H + "alice/.bashrc\n")
+            ok = subprocess.run([sys.executable, str(RELATIVIZE), "--check", str(fine)], capture_output=True, text=True)
+            refused = subprocess.run([sys.executable, str(RELATIVIZE), "--check", str(bad)], capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, ok.stdout)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn(H + "alice", refused.stdout)
+        self.assertNotIn("/home/pi", refused.stdout)
 
     def test_analyzer_json_records_repository_relative_sources(self):
         files = sorted((HARDWARE / "review").glob("*/schematic.json")) + sorted((HARDWARE / "review").glob("*/pcb.json"))

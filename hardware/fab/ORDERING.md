@@ -56,6 +56,22 @@ files that are committed. To rebuild after a board change: `python3
 hardware/tools/export_fab.py`. It runs the DRC first and writes nothing if the
 board fails.
 
+**Before concluding the package is stale, read this.** A rebuild changes every
+file of `gerber/` even when the board has not changed: each gerber, drill file,
+the job file, the DRC report and the two drill-map PDFs carry the time of the
+export, so their bytes and the SHA-256 values in `release-manifest.json` differ
+from the committed ones on every run. Measured on 2026-11-09 with KiCad 10.0.6,
+the Homebrew `kicad-cli` and the one in the KiCad.app bundle alike: 16 of 16 files
+differ byte for byte, and no gerber or drill file differs once the lines carrying the
+time are removed (`_normalised` in `tests/check_fab_release.py`). So "git shows the
+whole set modified" and "the hashes changed" say nothing about the board; the
+freshness check compares the normalised content, and the board's own SHA-256 in the
+manifest is what binds the set to a board. A different KiCad version may change the
+content itself; that was not measured, and the manifest records the version used. If
+you rebuild only to refresh the CPL or the assembly BOM, restore the gerber folder
+afterwards (`git checkout hardware/fab/gerber`): the exporter always rewrites it, and a
+new time stamp is churn, not a change.
+
 ### Archiving (ruling E)
 
 `.gitignore` excludes `hardware/gerber/*.gbr` and `*.drl`. The set is exported
@@ -218,11 +234,16 @@ board with parts on both sides is soldered on both sides by hand.
   The corner is the Edge.Cuts **centreline** (X 100..158, Y 80..116 on the page, the
   designed 58 x 36 mm), not the bounding box, which includes the 0.1 mm line width and
   would shift every coordinate by 0.05 mm (24.05 / 13.05). Rotation is unchanged.
-  The gerbers keep the page origin (the board has no aux origin), so the CPL and the
-  gerbers differ by that fixed offset (100, -116 in gerber terms). That PCBWay's
-  tooling puts its own origin at the outline's corner when it reads the gerbers is
-  taken from the two excerpts, not tested: the preview shows it. **The placement
-  preview is a gate before payment, not a courtesy** (Question 10, and the box below).
+  **The gerbers are not in these coordinates.** They keep KiCad's page origin (the
+  board has no aux origin), Y up, so the board's lower-left corner is at gerber
+  (100.000, -116.000) (the lower-left corner of `raccoon-tap-Edge_Cuts.gm1`), and a
+  position in the CPL is the gerber position shifted by exactly that: gerber X = Mid X
+  + 100.000, gerber Y = Mid Y - 116.000. U3's centre, (24.0000, 13.0000) in the CPL,
+  is at gerber (124.000, -103.000). This holds for every gerber and drill file of the
+  package. That PCBWay's tooling puts its own origin at the outline's corner when it
+  reads the gerbers (so that the two agree) is taken from the two excerpts, not tested:
+  the preview shows it. **The placement preview is a gate before payment, not a
+  courtesy** (Question 10, and the box below).
 * **U3 rotation 180**: U3's library pose (rotation 0) has pin 1 at the upper
   left; the board has it turned half a turn. Pad 1 is at (+2.4375, -1.8) mm
   from the centre in the gerber (Y up, as in the CPL), and the pin-1 triangle on the

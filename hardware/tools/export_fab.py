@@ -41,6 +41,15 @@ the assembly BOM beside it all take their references from there.
 The set is built in a temporary folder and replaces the old one only when every
 step succeeded. Nothing is uploaded, ordered or paid for.
 
+Rebuilding changes every file of the set even when the board has not changed: the
+gerbers, drill files, job file, DRC report and drill-map PDFs carry the time of the
+export, so their bytes and the hashes in the manifest differ on every run (measured
+with KiCad 10.0.6, Homebrew kicad-cli and the app bundle alike; no gerber or drill file
+differs once the time lines are removed). That is not staleness; the freshness check
+compares the normalised content. To refresh only the CPL or the assembly BOM, restore
+the gerber folder afterwards. See "Before concluding the package is stale" in
+fab/ORDERING.md.
+
 Environment: KIPY (KiCad's Python, needs pcbnew; default is the macOS bundle),
 KICAD_CLI (default: the one on PATH, else the app bundle).
 """
