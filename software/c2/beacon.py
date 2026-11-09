@@ -1354,6 +1354,34 @@ _EXTRA_HEADERS = {
     "X-Requested-With": ["XMLHttpRequest"],
 }
 
+# The shortest check-in this beacon will honour. It has existed since the
+# initial commit as a bare `max(10, delay)` inside `_jittered_sleep`, and
+# the number was applied to the sleep while the configured value went on
+# being reported. The server sizes its freshness windows from that report
+# -- `online` under `interval * 2`, `stale` under `interval * 5` -- so an
+# interval of 2 meant a 4-second online window against a real 10.1-second
+# period, and a perfectly healthy beacon flapped between online and
+# offline on every single cycle. Measured in the local environment: four
+# agents, "Agent Offline" then "Agent Back Online", for ever.
+#
+# Raising the value instead of hiding it keeps one number true everywhere:
+# what the beacon reports is what it waits.
+_MIN_INTERVAL = 10
+
+
+def _clamp_interval(value) -> float:
+    """The interval this beacon will actually honour, from what was asked.
+
+    A value below the floor is raised rather than kept, because the number
+    held here is the one reported in every check-in.
+    """
+    try:
+        asked = float(value)
+    except (TypeError, ValueError):
+        return 300.0
+    return asked if asked >= _MIN_INTERVAL else float(_MIN_INTERVAL)
+
+
 _PAYLOAD_FIELDS = [
     "session_token", "auth_hash", "state_key", "nonce", "validation",
     "api_key", "request_token", "cipher_text", "payload_data", "signature",
@@ -1388,7 +1416,7 @@ class Beacon:
 
     def __init__(self, config: dict):
         c2 = config["c2"]
-        self.interval = c2.get("beacon_interval_seconds", 300)
+        self.interval = _clamp_interval(c2.get("beacon_interval_seconds", 300))
         self.jitter = c2.get("jitter_percent", 20) / 100.0
 
         https_cfg = c2.get("https", {})
@@ -1763,7 +1791,11 @@ class Beacon:
     def _jittered_sleep(self):
         offset = self.interval * self.jitter
         delay = self.interval + random.uniform(-offset, offset)
-        time.sleep(max(10, delay))
+        # Still a floor, because jitter can push a delay below it: at 100%
+        # jitter the draw reaches zero. The difference from before is that
+        # `self.interval` can no longer be smaller than the floor, so this
+        # clamps the jitter and not the operator's setting.
+        time.sleep(max(_MIN_INTERVAL, delay))
 
     def _backoff_sleep(self):
         delay = min(5 * (1.5 ** self._consecutive_failures), 300)
@@ -4123,8 +4155,14 @@ class Beacon:
                             parts.append(f"URIs: {n_get} GET, {n_post} POST")
                         logger.info("C2 profile reconfigured dynamically")
                     if reconf.get("sleeptime"):
-                        self.interval = max(1, int(reconf["sleeptime"]) / 1000)
-                        parts.append(f"interval={self.interval}s")
+                        asked = int(reconf["sleeptime"]) / 1000
+                        self.interval = _clamp_interval(asked)
+                        if self.interval != asked:
+                            parts.append(f"interval={self.interval}s "
+                                         f"(asked {asked}s, floor is "
+                                         f"{_MIN_INTERVAL}s)")
+                        else:
+                            parts.append(f"interval={self.interval}s")
                     if reconf.get("jitter"):
                         self.jitter = max(0, min(100, int(reconf["jitter"]))) / 100.0
                         parts.append(f"jitter={int(self.jitter*100)}%")
@@ -4135,10 +4173,19 @@ class Beacon:
 
             elif cmd == "sleep":
                 parts = str(args).split()
-                self.interval = max(1, float(parts[0]))
+                asked = float(parts[0])
+                self.interval = _clamp_interval(asked)
                 if len(parts) > 1:
                     self.jitter = max(0, min(100, float(parts[1]))) / 100.0
                 output = f"Sleep {self.interval}s jitter {int(self.jitter * 100)}%"
+                if self.interval != asked:
+                    # Said rather than clamped in silence. Clamping without
+                    # saying so is what made a healthy beacon look like a
+                    # failing one for as long as this project has existed:
+                    # it reported the number it was asked for and honoured
+                    # a different one.
+                    output += (f" (asked {asked:g}s; the floor is "
+                               f"{_MIN_INTERVAL}s)")
                 logger.info(output)
 
             elif cmd == "kill":

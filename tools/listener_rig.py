@@ -94,7 +94,8 @@ def run_cycle(transport, *, token="rig-token", timeout=40.0):
                 # shortcoming of the rig: a beacon reached only this way can be
                 # commanded and can never report.
                 name = lab.register_out_of_band(env.beacon_port, env.key,
-                                                beacon._implant_id)
+                                                beacon._implant_id,
+                                                beacon.interval)
                 seen["registered"] = True
                 seen["agent_id"] = name
                 seen["registered_out_of_band"] = True

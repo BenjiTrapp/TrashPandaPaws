@@ -1314,6 +1314,26 @@ class TestTheDnsListener(unittest.TestCase):
                     "%s.b.%s" % (label, self.ZONE))
                 self.assertEqual(decoded, agent)
 
+    def test_an_out_of_band_registration_reports_the_real_interval(self):
+        # The server sizes its freshness windows from the interval a
+        # registration reports, so a helper that understates it makes a
+        # healthy agent flap between online and stale. Measured in the
+        # local environment: the DNS agent reported 2 and checked in every
+        # 10 seconds, and the interface raised Agent Offline on every
+        # cycle. The same defect the beacon's own floor caused, put back
+        # by a test helper.
+        from software.c2.beacon import _MIN_INTERVAL
+        from software.c2.server import agents as fleet
+
+        before = set(fleet)
+        name = lab.register_out_of_band(self.env.agent_port, self.raw,
+                                        "interval-probe")
+        self.addCleanup(lambda: fleet.pop(name, None))
+        self.assertIn(name, set(fleet) - before)
+        self.assertGreaterEqual(fleet[name]["interval"], _MIN_INTERVAL,
+                                "the registration claims an interval no "
+                                "beacon can honour")
+
     def test_an_unregistered_id_yields_no_tasking(self):
         # The hard limit of this channel: no registration goes over DNS, so
         # an id the server has never seen has nothing waiting.

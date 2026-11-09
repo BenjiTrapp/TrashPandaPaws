@@ -212,7 +212,8 @@ def run_cycle(transport, *, timeout=90.0):
 
             if lab.is_tasking_only(transport):
                 name = lab.register_out_of_band(env.beacon_port, env.key,
-                                                beacon._implant_id)
+                                                beacon._implant_id,
+                                                beacon.interval)
                 seen["registered"] = True
                 seen["registered_out_of_band"] = True
             else:

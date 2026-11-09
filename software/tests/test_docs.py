@@ -620,10 +620,29 @@ def _the_sleep_floor_overrides_a_short_interval():
     # policy: the beacon floors its sleep at 10 s, and still reports the
     # configured interval to the server, which sizes its freshness windows
     # from that number.
-    text = _read("software", "c2", "beacon.py")
-    floored = "time.sleep(max(10, delay))" in text
-    reports_configured = re.search(r'"interval":\s*self\.interval', text)
-    return floored and bool(reports_configured)
+    # Behavioural rather than a search for a literal. The old version
+    # looked for `time.sleep(max(10, delay))`, which would have reported
+    # the finding closed the moment that number was given a name -- and
+    # the name was the smallest part of the fix. What matters is whether a
+    # beacon can report an interval it will not honour.
+    import base64
+    import os
+
+    from software.c2.beacon import Beacon
+
+    beacon = Beacon({"c2": {
+        "beacon_interval_seconds": 2,
+        "jitter_percent": 0,
+        "encryption_key": base64.b64encode(os.urandom(32)).decode(),
+        "proxy": {"mode": "none"},
+        "https": {"enabled": False},
+        "dns": {"enabled": False, "domain": "", "resolver": "1.1.1.1"},
+    }})
+    slept = []
+    with patch("software.c2.beacon.time.sleep", slept.append):
+        beacon._jittered_sleep()
+    reported = beacon._system_info()["interval"]
+    return bool(slept) and abs(slept[0] - reported) > 0.01
 
 
 def _the_quic_client_trusts_any_sender():
@@ -703,7 +722,6 @@ _OPEN_FINDINGS = {
     "Housekeeping, but visible": [
         ("compared with `==`", _the_token_is_compared_with_plain_equality),
         ("land at `0644`", _project_files_are_world_readable),
-        ("sleep floor of 10 s", _the_sleep_floor_overrides_a_short_interval),
         ("no `LICENSE` file", _there_is_no_licence_file),
         ("Six commits", None),
     ],

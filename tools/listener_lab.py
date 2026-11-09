@@ -179,7 +179,7 @@ def resolver_port(port):
         beacon_mod._DNS_PORT = previous
 
 
-def register_out_of_band(beacon_port, key, implant_id):
+def register_out_of_band(beacon_port, key, implant_id, interval=None):
     """Register an agent the way a bidirectional transport would, and name it.
 
     A tasking-only transport has no registration, so a beacon that speaks
@@ -198,7 +198,15 @@ def register_out_of_band(beacon_port, key, implant_id):
     body = json.dumps(ServerCrypto(key).wrap({
         "action": "register", "id": implant_id, "agent_id": None,
         "hostname": "lab", "os": "Linux 6.1", "user": "nobody",
-        "pid": 1, "uptime": 1, "interval": 2,
+        "pid": 1, "uptime": 1,
+        # The interval the beacon will really use, not a convenient
+        # constant. The server sizes its freshness windows from this
+        # number, so a registration that understates it makes a healthy
+        # agent flap between online and stale -- which is exactly the
+        # defect the beacon's own interval floor caused, reintroduced here
+        # by a test helper. Measured: the DNS agent reported 2 and checked
+        # in every 10 seconds.
+        "interval": interval if interval else beacon_mod._MIN_INTERVAL,
     })).encode()
     request = urllib.request.Request(
         "http://127.0.0.1:%d/api/v1/beacon" % beacon_port,

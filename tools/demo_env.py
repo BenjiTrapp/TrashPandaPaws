@@ -228,7 +228,8 @@ class DemoEnv:
             # way can be commanded and will never report -- the panel has
             # to say that, and so does this environment.
             name = lab.register_out_of_band(self.beacon_port, self.key,
-                                            beacon._implant_id)
+                                            beacon._implant_id,
+                                            beacon.interval)
             beacon.start()
         else:
             beacon.start()

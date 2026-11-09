@@ -1000,5 +1000,108 @@ class TestBeaconNtlmWiring(unittest.TestCase):
             socket.create_connection(("127.0.0.1", port), timeout=2).close()
 
 
+class TestTheReportedIntervalIsTheOneItHonours(unittest.TestCase):
+    """What the beacon says about its own check-in rate has to be true.
+
+    `_jittered_sleep` has ended in `time.sleep(max(10, delay))` since the
+    initial commit, so a configured interval below ten seconds was simply
+    ignored — while the beacon went on reporting the configured number.
+    The server sizes its freshness windows from that report (`online`
+    under `interval * 2`, `stale` under `interval * 5`), so with an
+    interval of 2 a perfectly healthy beacon checked in every 10.1
+    seconds against a 10-second offline line and flapped between online
+    and offline for ever.
+
+    Measured against the running demo environment before this was fixed:
+    reported interval 2, real period 10.0–10.1 s, and the interface
+    raising "Agent Offline" then "Agent Back Online" on every cycle for
+    all four agents.
+    """
+
+    FLOOR = 10
+
+    def _beacon(self, interval):
+        from software.c2.beacon import Beacon
+
+        return Beacon({"c2": {
+            "beacon_interval_seconds": interval,
+            "jitter_percent": 0,
+            "encryption_key": base64.b64encode(os.urandom(32)).decode(),
+            "proxy": {"mode": "none"},
+            "https": {"enabled": False},
+            "dns": {"enabled": False, "domain": "", "resolver": "1.1.1.1"},
+        }})
+
+    def test_a_configured_interval_below_the_floor_is_raised_not_hidden(self):
+        for configured in (1, 2, 5, 9):
+            with self.subTest(configured=configured):
+                beacon = self._beacon(configured)
+                self.assertEqual(beacon.interval, self.FLOOR,
+                                 "a configured %ds is still reported as %ds "
+                                 "and will not be honoured"
+                                 % (configured, beacon.interval))
+
+    def test_an_interval_above_the_floor_is_left_alone(self):
+        for configured in (10, 11, 300):
+            with self.subTest(configured=configured):
+                self.assertEqual(self._beacon(configured).interval,
+                                 configured)
+
+    def test_what_it_reports_is_what_it_sleeps(self):
+        # The property, stated once: the number in a check-in is the
+        # number the server may size its windows from.
+        beacon = self._beacon(2)
+        reported = beacon._system_info()["interval"]
+        slept = []
+        with patch("software.c2.beacon.time.sleep", slept.append):
+            beacon._jittered_sleep()
+        self.assertEqual(len(slept), 1)
+        self.assertAlmostEqual(slept[0], reported, delta=0.01,
+                               msg="it reports %r and sleeps %r"
+                                   % (reported, slept[0]))
+
+    def test_the_sleep_command_cannot_set_a_value_below_the_floor(self):
+        # The second way in. An operator typing `sleep 1` got the same lie
+        # from a different direction.
+        beacon = self._beacon(300)
+        beacon._process_tasking({"cmd": "sleep", "args": "1"})
+        self.assertEqual(beacon.interval, self.FLOOR)
+
+    def test_the_sleep_command_says_when_it_raised_the_value(self):
+        # Silently clamping is what caused this in the first place, so an
+        # operator who asks for two seconds has to be told they got ten.
+        #
+        # Caught at the result the beacon sends, not at the return value:
+        # `_process_tasking` returns None and hands its output to
+        # `_send_result_*`, which is where an operator would read it.
+        beacon = self._beacon(300)
+        # A result is only sent if some transport is enabled, and the
+        # helper above switches them all off so a test never touches the
+        # network. This one needs the reporting path, not the transport.
+        beacon.https_enabled = True
+        sent = []
+        with patch.object(beacon, "_send_result_https",
+                          side_effect=lambda *a, **k: sent.append(a)):
+            beacon._process_tasking({"cmd": "sleep", "args": "2",
+                                     "id": "t1"})
+
+        self.assertTrue(sent, "the command reported nothing at all")
+        text = " ".join(str(part) for part in sent[0])
+        self.assertIn("10", text, "the reply does not say what it will use")
+        self.assertIn("2", text,
+                      "the reply does not mention what was asked for")
+        self.assertIn("floor", text.lower(),
+                      "the reply does not say why the value changed")
+
+    def test_the_server_window_now_covers_the_real_period(self):
+        # The arithmetic that was wrong: with a reported 2, `online` was
+        # 4 s and `stale` ended at 10 s, against a real 10.1 s period.
+        beacon = self._beacon(2)
+        reported = beacon._system_info()["interval"]
+        self.assertGreater(reported * 2, self.FLOOR * 1.2,
+                           "the online window is still shorter than one "
+                           "check-in interval plus jitter")
+
+
 if __name__ == "__main__":
     unittest.main()
