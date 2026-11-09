@@ -256,8 +256,9 @@ export AGENT_API_KEY_FILE=/etc/raccoon/vertex.token
 Three things that are not obvious:
 
 - **Mount the directory, not the file.** `docker-compose.yml` mounts nothing
-  for the key file; add `- /etc/raccoon:/etc/raccoon:ro` under the agent's
-  `volumes`. A single-file bind mount follows the inode it was created
+  for the key file by default, since it cannot know your host path; under the
+  agent's `volumes` there is a commented-out `- /etc/raccoon:/etc/raccoon:ro`
+  to edit and uncomment. A single-file bind mount follows the inode it was created
   against, and the `mv` above replaces the inode, so the container would keep
   reading the first token for ever.
 - **The file must exist before the agent starts**, and cannot be empty: the
@@ -442,9 +443,11 @@ not a second brain.
   about the target, flowing toward the one host on that network you least want
   associated with it. The agent host also has to reach that address, which
   means being on the implant's segment or tunnelling to it.
-- **Power.** The Pi is PoE-powered at about 13 W while bridging and
-  capturing. That figure is without inference, which adds to it by an amount
-  that has not been measured here.
+- **Power.** The Pi is PoE-powered, and the 802.3af budget at the device
+  (the standard `README.md` names in its architecture diagram) is about 13 W.
+  That is a ceiling from the standard, not a measurement, and it has to cover
+  bridging and capturing as well. Neither the draw of inference nor its speed
+  has been measured here.
 - **It is a large forensic artefact on a device built to look like an IP
   phone.** An inference server, listening on the network with no
   authentication of its own (Ollama has none), and a model blob of several
@@ -452,16 +455,13 @@ not a second brain.
 - **A turn can take a long time.** The transport allows a local link 300
   seconds per call, against 120 for a hosted one. How much of that a Pi uses
   has not been measured for this page.
-- **The tier does not follow the failover.** The capability tier is fixed once,
-  at startup, from the *primary* model. A run that begins on a `full` model and
-  fails over to the Pi keeps `full` limits (20 orchestrator turns, 4000
-  characters of output kept, phase 5, every tool) in the hands of a 7B model.
-  The gate and the scope still stand between that model and a bad action; the
-  limits that were meant to fit the model do not. A local model named with a size under 30 billion
-  parameters (`qwen2.5:7b`) *is* `minimal` and stops at phase 3 when it is
-  the primary; a local model whose name states no size is `reduced`. If a
-  chain ends on a small model, set `AGENT_CAPABILITY_TIER` for the whole run
-  to what that model can bear, knowing the primary is held to it too.
+- **The tier does not follow the failover.** It is fixed once, at startup,
+  from the *primary* model, so a run that fails over to the Pi keeps the
+  primary's limits. See [Known limits](#the-agent-layer). On its own, a local
+  model whose name states a size under 30 billion parameters (`qwen2.5:7b`)
+  is `minimal` and stops at phase 3, and one whose name states no size is
+  `reduced`. If a chain ends on a small model, `AGENT_CAPABILITY_TIER` sets
+  the tier for the whole run, and the primary is held to it too.
 
 ---
 
@@ -896,6 +896,21 @@ have to be distinguishable.
 
 ### The agent layer
 
+- **A failover does not re-derive the capability tier.** The tier is worked
+  out once, at startup, from the primary provider and model
+  (`config.load`), and the orchestrator reads its limits from that single
+  value for the whole run. A chain whose primary is `full` therefore keeps
+  `full` limits on every link: 20 orchestrator turns, 4000 characters of
+  output kept, phase 5 and every tool, including when the link answering is a
+  small local model that the tier system would have put at `minimal` or
+  `reduced` had it been the primary. `max_phase` is a safety boundary, and
+  here a model the tier system would not trust with phase 5 can be handed
+  phase 5 by a failover. The approval gate and the scope are not affected and
+  still stand between that model and an action. This predates the provider
+  work and is more reachable now that a [model on the Pi](#a-model-on-the-pi)
+  is a documented fallback. Until the tier is re-derived per active link, put
+  the weakest model you would accept as the whole run's tier in
+  `AGENT_CAPABILITY_TIER`.
 - **Wifi phases 6–8 are unreachable.** `max_phase` tops out at 5 for every
   capability tier, so the wifi chain cannot be selected yet. Monitor mode
   has only ever been mock-tested here: the Pi's onboard WLAN is the only

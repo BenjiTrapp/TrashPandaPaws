@@ -70,6 +70,14 @@ services:
       # across restarts: the service marks unfinished runs aborted on the
       # way up, and that record is the audit trail.
       - raccoon-agent-data:/data/raccoon-agent
+      # vertex in this container: the directory that holds the token file the
+      # host's refresher rewrites, with AGENT_TOKEN_SOURCE=file and
+      # AGENT_API_KEY_FILE=<that path>. Edit the host side and uncomment.
+      # Mount the directory, not the file. The file inside must be chmod 600
+      # and owned by the container's user, or the agent refuses to start.
+      # Left commented: a mount of a path that does not exist would stop
+      # `docker compose up` for everyone who does not use vertex.
+      # - /etc/raccoon:/etc/raccoon:ro
     environment:
       # Loopback only. This API starts campaigns and runs commands; it has
       # no business being reachable from the network, and no port is
