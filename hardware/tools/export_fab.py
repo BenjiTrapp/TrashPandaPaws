@@ -31,7 +31,9 @@ Writes, into one folder:
     check in tests/check_fab_release.py reads it.
 
 The component placement list (CPL) for the partial assembly is written from the
-same board. Which parts are machine-assembled (U3 and Y1, rulings Y and AC) is
+same board, in board coordinates with the origin at the lower-left corner of the
+outline (ruling CC, the CPL one), the outline being read from the board's
+Edge.Cuts. Which parts are machine-assembled (U3 and Y1, rulings Y and AC) is
 read from netlist.yaml, the components that carry an `assembly:` mapping, and
 nowhere else: the paste layer, the manifest, the CPL and, through tools/gen_bom.py,
 the assembly BOM beside it all take their references from there.
@@ -185,6 +187,40 @@ def paste_board(src, dst, keep_refs):
     board.Save(str(dst))
 
 
+def board_origin_nm(src):
+    """Run under KiCad's Python: the lower-left corner of the board outline, in
+    KiCad page coordinates (nanometres, Y down, so the corner has the largest Y).
+
+    The outline is the Edge.Cuts centreline, the line the fabricator routes
+    along: it is what the designed 58 x 36 mm is measured on. pcbnew's
+    GetBoardEdgesBoundingBox() includes the stroke width of the Edge.Cuts shapes,
+    half of it on every side, so the box is 0.1 mm larger each way than the board
+    and would move every CPL coordinate by half the line width (0.05 mm). The
+    half width is taken back here. The compensation holds only for one width
+    throughout; a board whose Edge.Cuts shapes differ in width is refused."""
+    import pcbnew
+    board = pcbnew.LoadBoard(str(src))
+    widths = {d.GetWidth() for d in board.GetDrawings() if d.GetLayer() == pcbnew.Edge_Cuts}
+    if not widths:
+        raise SystemExit("the board has no Edge.Cuts outline")
+    if len(widths) != 1 or 0 in widths:
+        raise SystemExit(f"Edge.Cuts shapes have line widths {sorted(widths)} nm; the "
+                         "centreline cannot be recovered from the bounding box")
+    half = widths.pop() // 2
+    box = board.GetBoardEdgesBoundingBox()
+    return box.GetLeft() + half, box.GetBottom() - half
+
+
+def board_origin(board=PCB):
+    """(x, y) in mm of the board's lower-left corner in KiCad page coordinates
+    (Y down), read from the board's Edge.Cuts by `board_origin_nm` under KiCad's
+    Python. The board's own drill/place origin is not set, so the position export
+    is in page coordinates and this is the translation that undoes that."""
+    out = run([KIPY, __file__, "--board-origin", board]).stdout
+    x_nm, y_nm = (int(v) for v in out.split())
+    return x_nm / 1e6, y_nm / 1e6
+
+
 def export_drc(board, report):
     run([KICAD_CLI, "pcb", "drc", "--severity-all", "--refill-zones", "--output", report, board])
 
@@ -243,18 +279,24 @@ def export_set(out_dir, drc_problems, board=PCB, dru=DRU, pro=PRO, refs=None):
 
 
 def write_cpl(path, board=PCB, refs=None):
-    """CPL for `refs` in the gerber coordinate system: KiCad's own position
-    export (Y up, as in the gerbers, origin at the page origin because the board
-    has no drill/place origin), renamed to the column heads PCBWay's sample
-    uses. Rotation is KiCad's footprint orientation; whether it is the right one
-    is checked against the pin-1 marking in tests/check_fab_release.py. `refs`
-    default to the parts the netlist marks for assembly (`assembled_refs()`)."""
+    """CPL for `refs` in board coordinates, the convention PCBWay documents
+    (ruling CC, the CPL one; fab/pcbway-source-excerpts.txt [6] and [7]): X to the right, Y up,
+    origin at the lower-left corner of the board outline. KiCad's position export
+    is in page coordinates because the board has no drill/place origin (Y up,
+    so page Y 103.0 arrives as -103.0); the origin of the outline, read from the
+    board by `board_origin`, is taken off: X = PosX - origin_x, Y = PosY +
+    origin_y (page). Column heads are those of PCBWay's sample. Rotation is
+    KiCad's footprint orientation, untouched by the translation; whether it is
+    the right one is checked against the pin-1 marking in
+    tests/check_fab_release.py. `refs` default to the parts the netlist marks for
+    assembly (`assembled_refs()`)."""
     refs = tuple(refs) if refs is not None else assembled_refs()
     with tempfile.TemporaryDirectory() as scratch:
         pos = Path(scratch) / "pos.csv"
         run([KICAD_CLI, "pcb", "export", "pos", "--format", "csv", "--units", "mm",
              "--side", "both", "--smd-only", "--output", pos, board])
         rows = {r["Ref"]: r for r in csv.DictReader(pos.read_text().splitlines())}
+    origin_x, origin_y = board_origin(board)
     missing = [r for r in refs if r not in rows]
     if missing:
         raise ExportFailed(f"not in the position export: {missing}")
@@ -263,8 +305,8 @@ def write_cpl(path, board=PCB, refs=None):
         w.writerow(["Designator", "Val", "Package", "Mid X", "Mid Y", "Rotation", "Layer"])
         for ref in refs:
             r = rows[ref]
-            w.writerow([ref, r["Val"], r["Package"], f"{float(r['PosX']):.4f}",
-                        f"{float(r['PosY']):.4f}", f"{float(r['Rot']):.0f}",
+            w.writerow([ref, r["Val"], r["Package"], f"{float(r['PosX']) - origin_x:.4f}",
+                        f"{float(r['PosY']) + origin_y:.4f}", f"{float(r['Rot']):.0f}",
                         r["Side"].capitalize()])
 
 
@@ -275,7 +317,12 @@ def main(argv=None):
     ap.add_argument("--assembly-bom", default=str(ASSEMBLY_BOM))
     ap.add_argument("--paste-board", nargs="+", metavar="ARG",
                     help="internal: SRC DST REF... (run under KiCad's Python)")
+    ap.add_argument("--board-origin", metavar="BOARD",
+                    help="internal: print the outline's lower-left corner in nm (run under KiCad's Python)")
     args = ap.parse_args(argv)
+    if args.board_origin:
+        print(*board_origin_nm(args.board_origin))
+        return 0
     if args.paste_board:
         src, dst, *refs = args.paste_board
         paste_board(src, dst, refs)

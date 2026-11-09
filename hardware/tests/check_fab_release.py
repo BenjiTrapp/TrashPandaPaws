@@ -3047,6 +3047,48 @@ def footprint_local_pad(block, number):
     return float(m.group(1)), float(m.group(2))
 
 
+def edge_cuts_outline(pcb_text):
+    """(x_min, y_min, x_max, y_max) in mm, KiCad page coordinates (Y down), of the
+    Edge.Cuts centreline, read from the board file's own gr_line items. This is the
+    outline the fabricator routes along and the one the designed 58 x 36 mm is
+    measured on; it is not pcbnew's GetBoardEdgesBoundingBox(), which adds half the
+    stroke width on every side. Refuses anything but straight lines, so a board
+    that gains an arc is not silently measured wrongly."""
+    lines = [b for b in re.findall(r"\n\t\(gr_line\n(.*?)\n\t\)", pcb_text, re.S)
+             if '(layer "Edge.Cuts")' in b]
+    if len(lines) != pcb_text.count('(layer "Edge.Cuts")') or not lines:
+        raise ValueError("Edge.Cuts holds something other than gr_line items")
+    xs, ys = [], []
+    for b in lines:
+        for tag in ("start", "end"):
+            x, y = re.search(rf"\({tag} ([-0-9.]+) ([-0-9.]+)\)", b).groups()
+            xs.append(float(x))
+            ys.append(float(y))
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def board_origin_of(pcb_text):
+    """The CPL origin (ruling CC) in page coordinates, Y down: the lower-left corner
+    of the Edge.Cuts centreline, i.e. the smallest X and the largest Y."""
+    x_min, _, _, y_max = edge_cuts_outline(pcb_text)
+    return x_min, y_max
+
+
+def gerber_to_board(point, pcb_text):
+    """A gerber coordinate (page X, Y up) in the CPL's board coordinates (origin at
+    the lower-left corner of the outline, Y up)."""
+    ox, oy = board_origin_of(pcb_text)
+    return point[0] - ox, point[1] + oy
+
+
+def footprint_board_position(pcb_text, ref):
+    """A footprint's (x, y) in board coordinates, computed from its `(at x y)` in the
+    board file and the outline, with no help from kicad-cli or the exporter."""
+    ox, oy = board_origin_of(pcb_text)
+    x, y = re.search(r"\n\t\t\(at ([-0-9.]+) ([-0-9.]+)", footprint_block(pcb_text, ref)).groups()
+    return float(x) - ox, oy - float(y)
+
+
 def footprint_silk_marker(block):
     """The pin-1 marking of a footprint in its own frame (Y down): the centre of
     the polygon on F.SilkS if there is one, else the corner where two silkscreen
@@ -3083,14 +3125,17 @@ def cpl_pin1_problems(rows, pcb_text, copper_gerber_text, tolerance_deg=0.5):
     coordinates in the board file are: the library pose). So the angle from the
     centre to the pad-1 flash in the gerber, less the angle of the library pad 1,
     is the rotation the part has been given. The gerber is what the fab will
-    see; the board-file angle is not used."""
+    see; the board-file angle is not used. The gerber is in page coordinates and the
+    CPL in board coordinates (origin at the lower-left corner of the outline, ruling
+    CC); the pad positions are translated, so rotations and distances are unaffected."""
     problems = []
     for row in rows:
         ref = row["Designator"]
         block = footprint_block(pcb_text, ref)
         centre = (float(row["Mid X"]), float(row["Mid Y"]))
         rotation = float(row["Rotation"])
-        pads = gerber_pad_positions(copper_gerber_text, ref)
+        pads = {n: gerber_to_board(pos, pcb_text)       # the CPL is in board coordinates,
+                for n, pos in gerber_pad_positions(copper_gerber_text, ref).items()}   # the gerber in page ones
         if "1" not in pads:
             problems.append(f"{ref}: pad 1 is not in the copper gerber")
             continue
@@ -3138,18 +3183,13 @@ class CplRotationIsVerifiedAgainstPinOne(unittest.TestCase):
     def test_u3_is_turned_180_degrees_pin_1_at_the_lower_right(self):
         u3 = {r["Designator"]: r for r in read_cpl()}["U3"]
         self.assertEqual(float(u3["Rotation"]) % 360, 180)
-        pads = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")
+        pad1 = gerber_to_board(gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"],
+                               PCB.read_text())
         cx, cy = float(u3["Mid X"]), float(u3["Mid Y"])
-        self.assertGreater(pads["1"][0], cx)      # right of the centre
-        self.assertLess(pads["1"][1], cy)         # below it (Y is up in the gerber)
-        self.assertAlmostEqual(pads["1"][0] - cx, 2.4375, places=4)
-        self.assertAlmostEqual(pads["1"][1] - cy, -1.8, places=4)
-
-    def test_position_is_the_footprint_position_in_gerber_coordinates(self):
-        text = PCB.read_text()
-        for row in read_cpl():
-            x, y = re.search(r"\n\t\t\(at ([-0-9.]+) ([-0-9.]+)", footprint_block(text, row["Designator"])).groups()
-            self.assertEqual((float(row["Mid X"]), float(row["Mid Y"])), (float(x), -float(y)))
+        self.assertGreater(pad1[0], cx)      # right of the centre
+        self.assertLess(pad1[1], cy)         # below it (Y is up in the CPL as in the gerber)
+        self.assertAlmostEqual(pad1[0] - cx, 2.4375, places=4)
+        self.assertAlmostEqual(pad1[1] - cy, -1.8, places=4)
 
     def test_a_cpl_with_the_wrong_rotation_is_caught(self):
         copper = (GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text()
@@ -3254,6 +3294,93 @@ class PasteIsOpenOnlyForTheAssembledParts(unittest.TestCase):
     def test_there_is_no_bottom_paste_layer_and_no_bottom_part_is_assembled(self):
         names = json.loads((GERBER_DIR / MANIFEST_NAME).read_text())["files"]
         self.assertFalse([n for n in names if n.endswith(("B_Paste.gbp",))])
+
+
+class CplIsInBoardCoordinatesFromTheLowerLeftCorner(unittest.TestCase):
+    """Ruling CC: the CPL follows PCBWay's documented convention (fab/pcbway-source-
+    excerpts.txt [6], [7]): origin at the lower-left corner of the board, Y up. The
+    corner is the Edge.Cuts centreline, 58 x 36 mm as designed, not the bounding box
+    that includes the 0.1 mm line width (that moves every coordinate by 0.05 mm).
+    The expected values are computed from the board file here, not copied from the
+    CPL; the exporter reads the same corner through pcbnew, so the two derivations
+    are independent. Rotation is untouched and checked by the pin-1 tests above."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.export = load_export_fab()
+        cls.pcb = PCB.read_text()
+
+    def edge_widths(self, text):
+        blocks = [b for b in re.findall(r"\n\t\(gr_line\n(.*?)\n\t\)", text, re.S)
+                  if '(layer "Edge.Cuts")' in b]
+        return [float(re.search(r"\(width ([0-9.]+)\)", b).group(1)) for b in blocks]
+
+    def scratch_board(self, directory, widths):
+        """A copy of the board whose four Edge.Cuts lines have the given stroke widths and
+        the same centreline. Nothing else changes."""
+        out, it = [], iter(widths)
+        for chunk in re.split(r"(?=\n\t\(gr_line\n)", self.pcb):
+            if chunk.startswith("\n\t(gr_line\n") and '(layer "Edge.Cuts")' in chunk.split("\n\t)")[0]:
+                chunk = re.sub(r"\(width [0-9.]+\)", f"(width {next(it)})", chunk, count=1)
+            out.append(chunk)
+        path = Path(directory) / "raccoon-tap.kicad_pcb"
+        path.write_text("".join(out))
+        return path
+
+    def test_the_outline_is_58_by_36_on_its_centreline_and_the_line_is_0_1_wide(self):
+        x0, y0, x1, y1 = edge_cuts_outline(self.pcb)
+        self.assertEqual((x1 - x0, y1 - y0), (58.0, 36.0))
+        self.assertEqual(set(self.edge_widths(self.pcb)), {0.1})
+
+    def test_the_cpl_is_the_footprint_position_less_the_outline_origin(self):
+        rows = read_cpl()
+        self.assertEqual([r["Designator"] for r in rows], list(ASSEMBLED_REFS))
+        for row in rows:
+            x, y = footprint_board_position(self.pcb, row["Designator"])
+            self.assertEqual((row["Mid X"], row["Mid Y"]), (f"{x:.4f}", f"{y:.4f}"), row["Designator"])
+
+    def test_every_cpl_coordinate_is_positive_and_on_the_board(self):
+        x0, y0, x1, y1 = edge_cuts_outline(self.pcb)
+        for row in read_cpl():
+            x, y = float(row["Mid X"]), float(row["Mid Y"])
+            self.assertGreater(x, 0, row["Designator"])
+            self.assertGreater(y, 0, row["Designator"])
+            self.assertLess(x, x1 - x0, row["Designator"])
+            self.assertLess(y, y1 - y0, row["Designator"])
+
+    def test_the_committed_cpl_is_what_the_exporter_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.export.write_cpl(Path(tmp) / "cpl.csv")
+            self.assertEqual((Path(tmp) / "cpl.csv").read_text(), CPL_PATH.read_text())
+
+    def test_the_origin_is_the_centreline_and_not_the_bounding_box_with_the_line_width(self):
+        # the defect this pins: the bounding box includes half the 0.1 mm line on each side,
+        # which puts the origin at (99.95, 116.05) and U3 at 24.05 / 13.05
+        ox, oy = board_origin_of(self.pcb)
+        self.assertEqual((ox, oy), (100.0, 116.0))
+        box_origin = (ox - 0.05, oy + 0.05)
+        u3 = {r["Designator"]: r for r in read_cpl()}["U3"]
+        self.assertEqual((float(u3["Mid X"]), float(u3["Mid Y"])), (24.0, 13.0))
+        self.assertNotEqual((float(u3["Mid X"]), float(u3["Mid Y"])),
+                            (round(124.0 - box_origin[0], 4), round(box_origin[1] - 103.0, 4)))
+        # and the exporter's own reading of the corner agrees, on the board and on boards whose
+        # lines are drawn wider (the bounding box would move by half the width, the centreline not)
+        self.assertEqual(self.export.board_origin(), (100.0, 116.0))
+        with tempfile.TemporaryDirectory() as tmp:
+            wide = self.scratch_board(tmp, [0.5] * 4)
+            self.assertEqual(self.edge_widths(wide.read_text()), [0.5] * 4)
+            self.assertEqual(self.export.board_origin(wide), (100.0, 116.0))
+            self.export.write_cpl(Path(tmp) / "cpl.csv", board=wide)
+            rows = {r["Designator"]: r for r in read_cpl(Path(tmp) / "cpl.csv")}
+            self.assertEqual((rows["U3"]["Mid X"], rows["U3"]["Mid Y"]), ("24.0000", "13.0000"))
+            self.assertEqual((rows["Y1"]["Mid X"], rows["Y1"]["Mid Y"]), ("24.0000", "5.0000"))
+
+    def test_an_outline_of_mixed_line_widths_is_refused(self):
+        # the half-width correction is exact only for one width throughout
+        with tempfile.TemporaryDirectory() as tmp:
+            mixed = self.scratch_board(tmp, [0.1, 0.1, 0.1, 0.3])
+            with self.assertRaises(self.export.ExportFailed):
+                self.export.board_origin(mixed)
 
 
 ASSEMBLY_BOM = FAB / "raccoon-tap-assembly-bom.csv"
@@ -3494,9 +3621,10 @@ class AssemblyBomIsTheTwoMachinePlacedParts(unittest.TestCase):
         self.assertRegex(u3, r"(?i)toward J2")
         self.assertNotRegex(u3, r"(?i)\b(left|right|above|below|upper|lower)\b")
         cpl = {r["Designator"]: r for r in read_cpl()}["U3"]
-        pad1 = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"]
+        pad1 = gerber_to_board(gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"],
+                               PCB.read_text())
         self.assertGreater(pad1[0], float(cpl["Mid X"]))        # right
-        self.assertLess(pad1[1], float(cpl["Mid Y"]))           # lower (Y is up in the gerber)
+        self.assertLess(pad1[1], float(cpl["Mid Y"]))           # lower (Y is up in the CPL)
         self.assertEqual(float(cpl["Rotation"]) % 360, 180)
         # Y1: pads 1 and 3 are the crystal terminals, 2 and 4 ground; no fixed pin-1 mark
         y1 = by_ref["Y1"]["Part Description"]
@@ -3621,7 +3749,6 @@ class OrderingStatesEveryRuledRequirement(unittest.TestCase):
         for needed, what in ((r"hard gate", "a hard gate"), (r"before I pay", "before payment"),
                              (r"`Layer`.{0,20}`Top`", "the Layer value Top"), (r"`T`", "T / B"),
                              (r"without.{0,10}unit suffix|unit suffix", "the missing mm suffix"),
-                             (r"negative", "the negative Mid Y"),
                              (r"Designator, Val, Package, Mid X, Mid Y, Rotation, Layer", "the column set"),
                              (r"rotation convention", "the rotation convention")):
             self.assertRegex(q10, rf"(?i){needed}", f"Question 10 does not state: {what}")
@@ -3630,7 +3757,8 @@ class OrderingStatesEveryRuledRequirement(unittest.TestCase):
         header = CPL_PATH.read_text().splitlines()[0].split(",")
         self.assertIn(", ".join(header), self.flat)               # the column set stated is the file's
         self.assertEqual({r["Layer"] for r in read_cpl()}, {"Top"})
-        self.assertTrue(float([r for r in read_cpl() if r["Designator"] == "U3"][0]["Mid Y"]) < 0)
+        for settled in (r"negative", r"page origin"):
+            self.assertNotRegex(q10, rf"(?i){settled}", "settled by ruling CC, no longer a question")
 
     def test_the_narrow_via_is_flagged_as_possibly_out_of_process_in_the_table(self):
         row = next(l for l in self.text.splitlines() if l.startswith("| 0.56 / 0.3"))
@@ -3996,7 +4124,8 @@ class PinOneGateIsRotationIndependent(unittest.TestCase):
         cpl = {r["Designator"]: r for r in read_cpl()}
         u3 = (float(cpl["U3"]["Mid X"]), float(cpl["U3"]["Mid Y"]))
         y1 = (float(cpl["Y1"]["Mid X"]), float(cpl["Y1"]["Mid Y"]))
-        pad1 = gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"]
+        pcb = PCB.read_text()
+        pad1 = gerber_to_board(gerber_pad_positions((GERBER_DIR / "raccoon-tap-F_Cu.gtl").read_text(), "U3")["1"], pcb)
         half = 2.5                                          # QFN-40 5 x 5 mm
         corners = [(u3[0] + sx * half, u3[1] + sy * half) for sx in (-1, 1) for sy in (-1, 1)]
         pin1 = min(corners, key=lambda c: math.dist(c, pad1))
@@ -4005,10 +4134,7 @@ class PinOneGateIsRotationIndependent(unittest.TestCase):
         self.assertAlmostEqual(math.dist(by_y1[0], y1), math.dist(by_y1[1], y1), places=6)
         self.assertLess(math.dist(by_y1[1], y1), math.dist(by_y1[2], y1))
         self.assertIn(pin1, by_y1[:2])
-        pcb = PCB.read_text()
-        def at(ref):
-            x, y = re.search(r"\n\t\t\(at ([-0-9.]+) ([-0-9.]+)", footprint_block(pcb, ref)).groups()
-            return float(x), -float(y)                      # board Y down, CPL and gerber Y up
+        at = lambda ref: footprint_board_position(pcb, ref)        # board file Y down, CPL Y up
         other = by_y1[1] if pin1 == by_y1[0] else by_y1[0]
         self.assertLess(math.dist(pin1, at("J2")), math.dist(other, at("J2")))
         self.assertGreater(math.dist(pin1, at("J3")), math.dist(other, at("J3")))
@@ -4030,7 +4156,9 @@ class OrderingCitesItsPcbwayConventions(unittest.TestCase):
         text = re.sub(r"\s+", " ", ORDERING.read_text())
         self.assertNotIn("PCBWay's own KiCad instruction says to put the origin at the lower-left corner; the", text)
         self.assertRegex(text, r"excerpt \[6\]")
-        self.assertRegex(text, r"(?i)is an assumption to confirm in the quote\**\s*\(Question 10 \(d\)\)")
+        self.assertRegex(text, r"excerpt \[7\]")
+        self.assertNotRegex(text, r"(?i)is an assumption to confirm in the quote\**\s*\(Question 10 \(d\)\)")
+        self.assertRegex(text, r"(?i)ruling CC")
 
 
 class U3ThermalIsNotLeftSilent(unittest.TestCase):

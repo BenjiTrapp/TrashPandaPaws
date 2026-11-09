@@ -199,31 +199,35 @@ board with parts on both sides is soldered on both sides by hand.
 
 | Part | Mid X | Mid Y | Rotation | Layer |
 |---|---|---|---|---|
-| U3 | 124.0000 | -103.0000 | 180 | Top |
-| Y1 | 124.0000 | -111.0000 | 0 | Top |
+| U3 | 24.0000 | 13.0000 | 180 | Top |
+| Y1 | 24.0000 | 5.0000 | 0 | Top |
 
-* **Coordinate system: the gerbers'.** X to the right, **Y up**, origin at the
-  page origin of the KiCad file, because the board has no drill/place origin.
-  Hence Mid Y is negative. The board outline runs from X 100 to 158 and Y -80 to
-  -116. Measured from the board's **lower-left corner**, U3's centre is at
-  (24.0, 13.0) mm and Y1's at (24.0, 5.0) mm.
-* **This departs from PCBWay's own KiCad instruction.** PCBWay's help-centre page
-  "Generate Position File Centroid File(pick place) in Kicad" (last updated
-  16/07/2024; fetched 2026-11-03, excerpt [6] in `pcbway-source-excerpts.txt`)
-  says: "Select the menu bar Place-> Drilling and Position Offset, place the
-  origin at the bottom left corner of the PCB board frame". PCBWay's general
-  centroid article (excerpt [7]) says: "The board's origin is defined as the (0,
-  0) value and is located at the lower left corner of the board from a top point
-  of view." The board file is frozen, so its origin was not moved and the CPL
-  keeps the page origin. Whether PCBWay accepts that, or wants the lower-left
-  values above, **is an assumption to confirm in the quote** (Question 10 (d)).
-  **The placement preview is a gate before payment, not a courtesy** (Question 10,
-  and the box below).
+* **Coordinate system: PCBWay's, board coordinates (ruling CC, the CPL one).** X to
+  the right, **Y up**, origin at the **lower-left corner of the board**, both
+  coordinates positive. PCBWay's help-centre page "Generate Position File Centroid
+  File(pick place) in Kicad" (last updated 16/07/2024; fetched 2026-11-03, excerpt [6]
+  in `pcbway-source-excerpts.txt`) says: "Select the menu bar Place-> Drilling and
+  Position Offset, place the origin at the bottom left corner of the PCB board
+  frame". PCBWay's general centroid article (excerpt [7]) says: "The board's origin
+  is defined as the (0, 0) value and is located at the lower left corner of the
+  board from a top point of view." The CPL follows that, rather than asking PCBWay to
+  accept ours. The board file is frozen and has no drill/place origin, so the exporter
+  (`write_cpl`) translates KiCad's position export, which is in page coordinates:
+  X = PosX - 100, Y = PosY + 116 (page Y 103.0 arrives as -103.0). Those two numbers
+  are not typed anywhere: the exporter reads the corner from the board's Edge.Cuts.
+  The corner is the Edge.Cuts **centreline** (X 100..158, Y 80..116 on the page, the
+  designed 58 x 36 mm), not the bounding box, which includes the 0.1 mm line width and
+  would shift every coordinate by 0.05 mm (24.05 / 13.05). Rotation is unchanged.
+  The gerbers keep the page origin (the board has no aux origin), so the CPL and the
+  gerbers differ by that fixed offset (100, -116 in gerber terms). That PCBWay's
+  tooling puts its own origin at the outline's corner when it reads the gerbers is
+  taken from the two excerpts, not tested: the preview shows it. **The placement
+  preview is a gate before payment, not a courtesy** (Question 10, and the box below).
 * **U3 rotation 180**: U3's library pose (rotation 0) has pin 1 at the upper
   left; the board has it turned half a turn. Pad 1 is at (+2.4375, -1.8) mm
-  from the centre in the gerber (Y up), and the pin-1 triangle on the silkscreen
-  is just outside the pad column at the height of pin 1. **To check a picture, do
-  not use "left" or "right"**: a preview may be turned or mirrored. Use ruling
+  from the centre in the gerber (Y up, as in the CPL), and the pin-1 triangle on the
+  silkscreen is just outside the pad column at the height of pin 1. **To check a
+  picture, do not use "left" or "right"**: a preview may be turned or mirrored. Use ruling
   CB: the pin-1 dot sits on the corner carrying the silkscreen triangle, the
   corner nearest Y1 (of the two corners that face Y1, the one toward J2, the RJ45).
   The board's F.Fab outline has its chamfer at the same corner.
@@ -245,8 +249,7 @@ board with parts on both sides is soldered on both sides by hand.
 * **The CPL's format is unverified against PCBWay, not only its rotation.** Nobody has
   checked these against PCBWay's template or an accepted file: the `Layer` value `Top`
   (against `T` / `B`), the absence of a unit suffix (`mm`) on Mid X and Mid Y, the
-  negative Mid Y (a consequence of the page origin), the column set and order
-  (Designator, Val, Package, Mid X, Mid Y, Rotation, Layer). The column names follow what
+  column set and order (Designator, Val, Package, Mid X, Mid Y, Rotation, Layer). The column names follow what
   the exporter calls PCBWay's sample; no PCBWay template was fetched or checked in this
   task. All of it goes to Question 10.
 * **The CPL's rotation convention may not be PCBWay's.** KiCad's rotation is
@@ -460,12 +463,10 @@ Not yet asked. Answers go into the order and, where they change a number, into
     this CPL, whether you accept: (a) the rotation convention (KiCad's, counter-clockwise
     from the library pose); (b) the `Layer` value `Top`, or do you need `T` / `Top` /
     `TopLayer`; (c) Mid X and Mid Y as plain millimetre numbers **without** a unit
-    suffix; (d) a **negative** Mid Y and an origin that is the page origin, not the
-    board's corner, although your KiCad instruction puts the origin at the bottom
-    left corner of the board (positions from the lower-left corner: U3 24.0 / 13.0 mm,
-    Y1 24.0 / 5.0 mm); (e)
-    the columns Designator, Val, Package, Mid X, Mid Y, Rotation, Layer, in that
-    order; or send me your template.
+    suffix; (d) the columns Designator, Val, Package, Mid X, Mid Y, Rotation, Layer, in
+    that order; or send me your template. The origin is the board's lower-left corner as
+    your KiCad instruction says (U3 24.0 / 13.0 mm, Y1 24.0 / 5.0 mm), so I am not
+    asking about it; the preview will show whether it was read that way.
 11. **Surface finish:** ENIG is ruled (ruling CA) and goes on the order form. Confirm
     that your ENIG is available for this build (4 layers, 1.6 mm, 5 pieces, 0.15 mm
     minimum track) and give the price against lead-free HASL, for the record only.
