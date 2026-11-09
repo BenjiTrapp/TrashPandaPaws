@@ -21,8 +21,11 @@ Two things it adds, and what each costs:
 
   * **A local server is asked for its models.** The commonest local failure
     is a model that was never pulled, and it is invisible until the first
-    call of the first turn, which is mid-engagement. Reading the tag list is
-    free, so it always happens for a local link.
+    call of the first turn, which is mid-engagement. Reading the list is
+    free, so it always happens for a local link. The two local names are
+    different servers: `ollama` is asked for `/api/tags`, `local` (LM Studio,
+    llama.cpp) for the OpenAI-compatible `/v1/models`. One endpoint per
+    name, so a working LM Studio link is not reported as down.
   * **`--ping` sends one tiny completion per link.** Opt-in, because it
     spends tokens on a metered provider, and a health check that costs money
     is one nobody runs. Without it nothing here calls a model, and a hosted
@@ -79,15 +82,52 @@ def _endpoint(name: str, base_url: Optional[str]) -> str:
     return (base_url or provider._PROVIDERS[name][1] or "").rstrip("/")
 
 
-def tags_url(base_url: str) -> str:
-    """Ollama's model list, from the OpenAI-compatible base URL.
-
-    The client talks to `<root>/v1`; the tag list lives at `<root>/api/tags`.
-    """
+def _strip_v1(base_url: str) -> str:
     root = base_url.rstrip("/")
-    if root.endswith("/v1"):
-        root = root[:-len("/v1")]
-    return root + "/api/tags"
+    return root[:-len("/v1")] if root.endswith("/v1") else root
+
+
+def _ollama_url(base_url: str) -> str:
+    # The client talks to `<root>/v1`; Ollama's own tag list is at
+    # `<root>/api/tags`.
+    return _strip_v1(base_url) + "/api/tags"
+
+
+def _openai_url(base_url: str) -> str:
+    # LM Studio and llama.cpp serve the OpenAI-compatible `<root>/v1/models`.
+    # The base URL usually ends in /v1 already; stripping and re-adding it
+    # takes either spelling to the same URL without doubling the segment.
+    return _strip_v1(base_url) + "/v1/models"
+
+
+def _ollama_names(payload: Any) -> Optional[List[str]]:
+    """Ollama: {"models": [{"name": "qwen2.5:14b"}, ...]}"""
+    return _names(payload, "models", "name")
+
+
+def _openai_names(payload: Any) -> Optional[List[str]]:
+    """OpenAI-compatible: {"data": [{"id": "qwen2.5-14b"}, ...]}"""
+    return _names(payload, "data", "id")
+
+
+def _is_pulled_ollama(model: str, names: List[str]) -> bool:
+    # `ollama pull llama3.2` is stored, and listed, as `llama3.2:latest`.
+    return (model if ":" in model else model + ":latest") in names
+
+
+def _is_listed(model: str, names: List[str]) -> bool:
+    return model in names
+
+
+# One endpoint per provider name, chosen by the name: (URL from the base URL,
+# path shown in a report, reader for the list it returns, "is this model
+# there"). The two servers differ in all four, which is why "local" cannot
+# borrow Ollama's.
+_LOCAL_LISTS = {
+    "ollama": (_ollama_url, "/api/tags", _ollama_names, _is_pulled_ollama),
+    "local": (_openai_url, "/v1/models", _openai_names, _is_listed),
+}  # type: Dict[str, Tuple[Callable, str, Callable, Callable]]
+assert set(_LOCAL_LISTS) == set(provider.LOCAL_PROVIDERS)
 
 
 def _host_port(url: str) -> str:
@@ -100,53 +140,53 @@ def _host_port(url: str) -> str:
     return "%s:%d" % (host, port) if port else host
 
 
-def _model_names(payload: Any) -> Optional[List[str]]:
-    """The names in a tag list, or None if it is not one."""
-    models = payload.get("models") if isinstance(payload, dict) else None
-    if not isinstance(models, list):
+def _names(payload: Any, list_key: str, name_key: str) -> Optional[List[str]]:
+    """The names in a model list, or None if it is not the expected shape."""
+    entries = payload.get(list_key) if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
         return None
     names = []
-    for entry in models:
-        name = entry.get("name") if isinstance(entry, dict) else None
+    for entry in entries:
+        name = entry.get(name_key) if isinstance(entry, dict) else None
         if not isinstance(name, str):
             return None
         names.append(name)
     return names
 
 
-def _is_pulled(model: str, names: List[str]) -> bool:
-    # `ollama pull llama3.2` is stored, and listed, as `llama3.2:latest`.
-    wanted = model if ":" in model else model + ":latest"
-    return wanted in names
-
-
-def _probe_failure(exc: Exception, where: str) -> str:
+def _probe_failure(exc: Exception, where: str, path: str) -> str:
     """What a failed GET means, without the URL or the exception's text."""
     if isinstance(exc, urllib.error.HTTPError):
-        return ("%s answered HTTP %d for the model list; is it an Ollama "
-                "server?" % (where, exc.code))
+        return "%s answered HTTP %d for %s" % (where, exc.code, path)
     if isinstance(exc, ValueError):
-        return "%s answered, but not with JSON" % where
+        return ("reachable at %s, but its model list is unreadable "
+                "(%s was not JSON)" % (where, path))
     return "no server answering at %s (%s)" % (where, type(exc).__name__)
 
 
-def _check_local(client, endpoint: str,
+def _check_local(client, name: str, endpoint: str,
                  probe: Probe) -> Tuple[bool, str]:
+    url_for, path, read_names, is_there = _LOCAL_LISTS[name]
     where = _host_port(endpoint)
     try:
-        payload = probe(tags_url(endpoint), PROBE_TIMEOUT)
+        payload = probe(url_for(endpoint), PROBE_TIMEOUT)
     except Exception as exc:
-        return False, _probe_failure(exc, where)
-    names = _model_names(payload)
+        return False, _probe_failure(exc, where, path)
+    names = read_names(payload)
     if names is None:
-        return False, "%s answered, but not with a model list" % where
-    if _is_pulled(client.model, names):
-        return True, "server at %s has %r" % (where, client.model)
+        # Reachable is not the same as healthy, and an answer this code
+        # cannot read must not pass as a model being there.
+        return False, ("reachable at %s, but its model list is unreadable "
+                       "(%s was not the expected shape)" % (where, path))
+    if is_there(client.model, names):
+        return True, "server at %s lists %r" % (where, client.model)
     shown = ", ".join(repr(n[:60]) for n in names[:_LISTED_MODELS])
     if len(names) > _LISTED_MODELS:
         shown += ", ..."
-    return False, ("server at %s is up, but %r is not pulled (it has: %s)"
-                   % (where, client.model, shown or "nothing"))
+    absent = ("not pulled" if name == "ollama"
+              else "not in its model list")
+    return False, ("server at %s is up, but %r is %s (it has: %s)"
+                   % (where, client.model, absent, shown or "nothing"))
 
 
 def _ping(client) -> Tuple[bool, str]:
@@ -204,8 +244,8 @@ def check(cfg, *, ping: bool = False,
             ok, detail = False, str(exc)
         else:
             if name in provider.LOCAL_PROVIDERS:
-                ok, detail = _check_local(client, _endpoint(name, base_url),
-                                          probe)
+                ok, detail = _check_local(client, name,
+                                          _endpoint(name, base_url), probe)
                 if ok and ping:
                     ok, said = _ping(client)
                     detail = "%s; %s" % (detail, said)

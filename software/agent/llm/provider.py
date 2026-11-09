@@ -567,6 +567,9 @@ def vertex_base_url(project: Any, location: Any) -> str:
                                  project)
     location = _vertex_identifier("vertex_location", "AGENT_VERTEX_LOCATION",
                                   location, _VERTEX_MAX_LOCATION)
+    # Google's documented global endpoint is
+    # https://aiplatform.googleapis.com/v1/projects/P/locations/global/
+    # endpoints/openapi: the unprefixed host, with "global" only in the path.
     host = ("aiplatform.googleapis.com" if location == _VERTEX_GLOBAL
             else location + _VERTEX_HOST_SUFFIX + ".googleapis.com")
     return ("https://%s/v1/projects/%s/locations/%s/endpoints/openapi"

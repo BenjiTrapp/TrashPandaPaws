@@ -24,6 +24,11 @@ from software.agent.llm import preflight, provider
 _KEY = "sk-live-0123456789abcdef"
 _OTHER_KEY = "sk-other-fedcba9876543210"
 _TAGS = {"models": [{"name": "qwen2.5:14b"}, {"name": "llama3.2:latest"}]}
+# What LM Studio and llama.cpp return from /v1/models: a different list key
+# and a different name key from Ollama's tags.
+_MODELS = {"object": "list",
+           "data": [{"id": "qwen2.5-14b-instruct", "object": "model"},
+                    {"id": "llama-3.2-3b", "object": "model"}]}
 
 
 def _cfg(**kw):
@@ -54,8 +59,11 @@ class _Probe:
         return self.payload
 
 
-def _by_provider(rows):
-    return {r["provider"]: r for r in rows}
+def _local(**kw):
+    values = dict(provider="local", model="qwen2.5-14b-instruct",
+                  api_key=None)
+    values.update(kw)
+    return _cfg(**values)
 
 
 class TestEveryLinkIsReported(unittest.TestCase):
@@ -162,12 +170,17 @@ class TestALocalServerIsAskedForItsModels(unittest.TestCase):
 
     def test_a_fallback_links_own_base_url_is_the_one_probed(self):
         cfg = _cfg(fallbacks=(config.FallbackLink(
-            provider="local", model="qwen2.5:14b",
-            base_url="http://127.0.0.1:1234/v1"),))
+            provider="ollama", model="qwen2.5:14b",
+            base_url="http://127.0.0.1:9999/v1"),))
         probe = _Probe(_TAGS)
         preflight.check(cfg, probe=probe)
         self.assertEqual([c[0] for c in probe.calls],
-                         ["http://127.0.0.1:1234/api/tags"])
+                         ["http://127.0.0.1:9999/api/tags"])
+
+    def test_ollama_is_never_asked_for_the_openai_list(self):
+        probe = _Probe(_TAGS)
+        preflight.check(_ollama(), probe=probe)
+        self.assertNotIn("/models", probe.calls[0][0])
 
     def test_the_request_has_a_short_timeout(self):
         probe = _Probe(_TAGS)
@@ -178,6 +191,120 @@ class TestALocalServerIsAskedForItsModels(unittest.TestCase):
         probe = _Probe(_TAGS)
         preflight.check(_cfg(), probe=probe)
         self.assertEqual(probe.calls, [])
+
+
+class TestLocalIsAskedForTheOpenAiList(unittest.TestCase):
+    """`local` is LM Studio and llama.cpp. They have no /api/tags, so
+    routing them there reports a working server as down."""
+
+    def test_a_local_link_whose_model_is_listed_is_ok(self):
+        probe = _Probe(_MODELS)
+        row = preflight.check(_local(), probe=probe)[0]
+        self.assertTrue(row["ok"], row)
+        self.assertIn("qwen2.5-14b-instruct", row["detail"])
+
+    def test_a_local_link_whose_model_is_absent_names_it(self):
+        row = preflight.check(_local(model="mistral-7b"),
+                              probe=_Probe(_MODELS))[0]
+        self.assertFalse(row["ok"])
+        self.assertIn("mistral-7b", row["detail"])
+        self.assertIn("not in its model list", row["detail"])
+        self.assertIn("llama-3.2-3b", row["detail"])
+
+    def test_the_models_url_is_the_same_with_or_without_v1(self):
+        for base in ("http://127.0.0.1:1234/v1", "http://127.0.0.1:1234/v1/",
+                     "http://127.0.0.1:1234", "http://127.0.0.1:1234/"):
+            with self.subTest(base_url=base):
+                probe = _Probe(_MODELS)
+                preflight.check(_local(base_url=base), probe=probe)
+                self.assertEqual([c[0] for c in probe.calls],
+                                 ["http://127.0.0.1:1234/v1/models"])
+
+    def test_the_default_endpoint_is_used_when_none_is_configured(self):
+        probe = _Probe(_MODELS)
+        preflight.check(_local(base_url=None), probe=probe)
+        self.assertEqual(probe.calls[0][0],
+                         "http://127.0.0.1:11434/v1/models")
+
+    def test_local_is_never_asked_for_ollamas_tags(self):
+        probe = _Probe(_MODELS)
+        preflight.check(_local(), probe=probe)
+        self.assertNotIn("/api/tags", probe.calls[0][0])
+
+    def test_a_fallback_local_link_is_probed_at_its_own_url(self):
+        cfg = _cfg(fallbacks=(config.FallbackLink(
+            provider="local", model="qwen2.5-14b-instruct",
+            base_url="http://127.0.0.1:1234/v1"),))
+        probe = _Probe(_MODELS)
+        rows = preflight.check(cfg, probe=probe)
+        self.assertTrue(rows[1]["ok"], rows)
+        self.assertEqual([c[0] for c in probe.calls],
+                         ["http://127.0.0.1:1234/v1/models"])
+
+    def test_the_name_is_matched_exactly_with_no_latest_rule(self):
+        # Ollama's `llama3.2` means `llama3.2:latest`; an OpenAI-style id is
+        # just a string.
+        row = preflight.check(_local(model="llama-3.2"),
+                              probe=_Probe(_MODELS))[0]
+        self.assertFalse(row["ok"])
+
+    def test_each_provider_reads_only_its_own_shape(self):
+        # The tags shape from a `local` server, and the models shape from an
+        # `ollama` one, are answers neither can read: not a pass.
+        self.assertFalse(preflight.check(_local(), probe=_Probe(_TAGS))[0]["ok"])
+        self.assertFalse(
+            preflight.check(_ollama(), probe=_Probe(_MODELS))[0]["ok"])
+
+    def test_an_unreachable_local_server_is_not_ok_and_does_not_raise(self):
+        row = preflight.check(
+            _local(), probe=_Probe(raises=ConnectionRefusedError()))[0]
+        self.assertFalse(row["ok"])
+        self.assertIn("127.0.0.1:11434", row["detail"])
+
+    def test_a_local_link_that_is_ok_can_be_pinged(self):
+        with unittest.mock.patch.object(provider, "http_post_json",
+                                        _a_completion):
+            row = preflight.check(_local(), ping=True,
+                                  probe=_Probe(_MODELS))[0]
+        self.assertTrue(row["ok"], row)
+        self.assertIn("answered", row["detail"])
+
+
+class TestAnUnreadableListIsSaidDistinctly(unittest.TestCase):
+    """Reachable, model list unreadable: neither a crash nor a pass, and
+    not the same line as a server that is down or a model that is absent."""
+
+    def _unreadable(self):
+        return ({}, {"models": "x"}, {"data": "x"}, [], None,
+                {"models": [1, None]}, {"data": [{"name": "x"}]})
+
+    def test_an_unreadable_payload_says_reachable_and_unreadable(self):
+        for make in (_ollama, _local):
+            for payload in self._unreadable():
+                with self.subTest(provider=make().provider, payload=payload):
+                    row = preflight.check(make(), probe=_Probe(payload))[0]
+                    self.assertFalse(row["ok"])
+                    self.assertIn("reachable", row["detail"])
+                    self.assertIn("unreadable", row["detail"])
+
+    def test_non_json_says_unreadable_too(self):
+        for make in (_ollama, _local):
+            with self.subTest(provider=make().provider):
+                row = preflight.check(
+                    make(), probe=_Probe(raises=ValueError("nope")))[0]
+                self.assertFalse(row["ok"])
+                self.assertIn("unreadable", row["detail"])
+
+    def test_it_is_not_the_line_for_a_down_server_or_a_missing_model(self):
+        unreadable = preflight.check(_local(), probe=_Probe({}))[0]["detail"]
+        down = preflight.check(
+            _local(), probe=_Probe(raises=OSError("x")))[0]["detail"]
+        missing = preflight.check(
+            _local(model="nope"), probe=_Probe(_MODELS))[0]["detail"]
+        self.assertNotIn("no server answering", unreadable)
+        self.assertNotIn("not in its model list", unreadable)
+        self.assertNotIn("unreadable", down)
+        self.assertNotIn("unreadable", missing)
 
 
 class TestADeadServerIsAReport(unittest.TestCase):
@@ -197,14 +324,16 @@ class TestADeadServerIsAReport(unittest.TestCase):
         row = preflight.check(_ollama(), probe=_Probe(raises=exc))[0]
         self.assertFalse(row["ok"])
         self.assertIn("404", row["detail"])
+        self.assertIn("/api/tags", row["detail"])
 
-    def test_an_answer_that_is_not_a_model_list_is_not_ok(self):
-        for payload in ({}, {"models": "x"}, [], {"models": [1, None]},
-                        None):
-            with self.subTest(payload=payload):
-                row = preflight.check(_ollama(),
-                                      probe=_Probe(payload))[0]
-                self.assertFalse(row["ok"])
+    def test_an_http_error_from_local_names_its_own_endpoint(self):
+        import urllib.error
+        exc = urllib.error.HTTPError("http://x/v1/models", 404, "Not Found",
+                                     {}, None)
+        row = preflight.check(_local(), probe=_Probe(raises=exc))[0]
+        self.assertFalse(row["ok"])
+        self.assertIn("404", row["detail"])
+        self.assertIn("/v1/models", row["detail"])
 
     def test_an_unreachable_link_does_not_hide_the_next(self):
         cfg = _ollama(fallbacks=(
