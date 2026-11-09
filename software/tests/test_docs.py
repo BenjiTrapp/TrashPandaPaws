@@ -14,6 +14,7 @@ surrounding sentences are unchanged -- the prose is free, the facts are not.
 """
 
 import argparse
+import asyncio
 import inspect
 import json
 import os
@@ -610,6 +611,46 @@ def _smb_and_quic_double_serialise():
             and len(re.findall(r"self\._encrypt\(json\.dumps\(", text)) == 3)
 
 
+class _StubLink(provider.LlmClient):
+    """A chain link that fails or answers, wearing a real link's identity."""
+
+    def __init__(self, provider_name, model, fails):
+        self.provider = provider_name
+        self.model = model
+        self._fails = fails
+
+    async def complete(self, system, messages, tools, max_tokens, temperature):
+        if self._fails:
+            raise provider.ProviderError("down")
+        return provider.Completion("ok", [], 1, 1, 2, "end_turn")
+
+
+def _a_failover_keeps_the_primarys_tier():
+    # Behavioural, on the public surface: a configuration whose primary is a
+    # `full` model and whose last link is a small local one, and a chain in
+    # which the primary fails and that last link answers. Open while the
+    # limits the run holds are the primary's and are looser than the answering
+    # link's own tier would give it.
+    link = {"provider": "ollama", "model": "qwen2.5:7b"}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "raccoon.yaml"
+        path.write_text(yaml.safe_dump(
+            {"agent": {"llm": {"fallbacks": [link]}}}))
+        cfg = config.load(
+            [], yaml_path=str(path),
+            env={"AGENT_PROVIDER": "anthropic",
+                 "AGENT_MODEL": "claude-sonnet-4-5"})
+    chain = failover.FailoverClient([
+        _StubLink(cfg.provider, cfg.model, fails=True),
+        _StubLink(link["provider"], link["model"], fails=False)])
+    asyncio.run(chain.complete("", [], [], 16, 0.0))
+    answering = provider.capability_tier(chain.model, chain.provider)
+    return (cfg.capability_tier
+            == provider.capability_tier(cfg.model, cfg.provider)
+            and provider.TIER_LIMITS[cfg.capability_tier]["max_phase"]
+            > provider.TIER_LIMITS[answering]["max_phase"])
+
+
 # group -> [(phrase the entry must contain, True-while-open or None)].
 # None means nothing in the working tree can show it: the six commits are on
 # a GitHub reference, and the deferred minors are properties of tests, of
@@ -714,6 +755,38 @@ class TestTheKnownLimitsRecordTheOpenFindings(_DocCase):
         self.assertEqual(
             len(_OPEN_FINDINGS["Minor, deferred"]) + _DEFERRED_MERGED,
             _DEFERRED_FINDINGS, "the merge count and the entry count differ")
+
+
+# The entries under "The agent layer" that the code can answer for. They are
+# kept apart from _OPEN_FINDINGS, whose groups are the hardening pass's and
+# are counted against it; this list is counted against nothing.
+#
+# READ THIS WHEN ONE OF THEM FAILS. The assertion states a limitation as
+# true. It fails when the limitation stops being true, which means the fix
+# has landed: delete the entry from Known limits, delete its predicate here,
+# and delete this record. Do not "fix" the test by changing what it asserts.
+_OPEN_AGENT_LIMITS = [
+    ("A failover does not re-derive the capability tier",
+     _a_failover_keeps_the_primarys_tier),
+]
+
+
+class TestTheAgentLayerLimitsAreStillOpen(_DocCase):
+    def _section(self):
+        return self.doc.split("\n### The agent layer\n", 1)[1].split(
+            "\n### ", 1)[0]
+
+    def test_each_tied_entry_is_listed_and_still_true_of_the_code(self):
+        flat = " ".join(self._section().split()).lower()
+        for phrase, still_open in _OPEN_AGENT_LIMITS:
+            with self.subTest(entry=phrase):
+                self.assertIn(" ".join(phrase.split()).lower(), flat,
+                              "%r is not under 'The agent layer'" % phrase)
+                self.assertTrue(
+                    still_open(),
+                    "%r is no longer true of the code: it has been fixed. "
+                    "Delete it from Known limits and from "
+                    "_OPEN_AGENT_LIMITS." % phrase)
 
 
 class _ParserReached(Exception):
