@@ -4,11 +4,12 @@ Unit tests for the tunnel's Noise primitives in `software/c2/beacon.py`:
 X25519 key agreement and the Noise-flavoured HKDF.
 
 Both primitives have two backends, as AES-256-GCM in the same module
-already does -- OpenSSL through ctypes where libcrypto loads, and a pure
-Python fallback where it does not (macOS Library Validation). A
+already does -- OpenSSL through ctypes where libcrypto offers the EVP
+raw-key API, and a pure Python fallback where it does not (macOS Library
+Validation denying libcrypto entirely, or an OpenSSL older than 1.1.1). A
 cryptographic fallback that quietly disagrees with the fast path is worse
 than no fallback, so every vector here is run against the pure code
-explicitly and, where libcrypto is present, against both.
+explicitly and, where the OpenSSL path is usable, against both.
 
 The arbiter for X25519 is the RFC 7748 §5.2 test vector. The arbiter for
 HKDF is RFC 5869 test case 1, adapted to Noise's calling convention: the
@@ -46,6 +47,21 @@ NOISE_OUT_2 = bytes.fromhex(
 NOISE_OUT_3 = bytes.fromhex(
     "5734f7dda6560fdac61bc17a37fe5a0394aa9d554fa28df55a05db4da8f42c08")
 
+# Low-order points on Curve25519: u = 0, and u = 1 which has order 4. Both
+# yield an all-zero shared secret for every scalar, so a peer that sends
+# one knows the secret before we derive it.
+LOW_ORDER_U = (b"\x00" * 32, b"\x01" + b"\x00" * 31)
+
+# Whether the module chose the pure backend when it was imported, which is
+# the only honest way to ask whether the OpenSSL path is usable here. Not
+# `_crypto is None`: libcrypto 1.0.2 loads and serves AES-256-GCM while
+# exporting no EVP_PKEY_new_raw_private_key, so the module falls back to
+# pure with a perfectly non-None handle. Gating on the handle would force
+# the ctypes path on such a host and error on the missing symbol instead
+# of skipping. Snapshotted because the context managers below assign to
+# the live flag.
+_IMPORT_PURE = beacon_mod._USE_PURE_PYTHON_X25519
+
 
 @contextmanager
 def _pure_backend():
@@ -60,15 +76,30 @@ def _pure_backend():
 
 @contextmanager
 def _ctypes_backend():
-    """Force the OpenSSL X25519 path. Skips when libcrypto did not load."""
-    if beacon_mod._crypto is None:
-        raise unittest.SkipTest("libcrypto unavailable on this machine")
+    """Force the OpenSSL X25519 path. Skips where that path is unusable."""
+    if _IMPORT_PURE:
+        raise unittest.SkipTest(
+            "no OpenSSL X25519 on this machine: libcrypto is absent or "
+            "predates the EVP_PKEY raw-key API")
     original = beacon_mod._USE_PURE_PYTHON_X25519
     beacon_mod._USE_PURE_PYTHON_X25519 = False
     try:
         yield
     finally:
         beacon_mod._USE_PURE_PYTHON_X25519 = original
+
+
+def _available_backends():
+    """Every backend this machine can actually run, as context managers.
+
+    The pure path is always one of them; the OpenSSL path joins it only
+    where the module would have used it. A vector that has to hold on both
+    is run through all of these.
+    """
+    backends = [_pure_backend()]
+    if not _IMPORT_PURE:
+        backends.append(_ctypes_backend())
+    return backends
 
 
 class TestX25519(unittest.TestCase):
@@ -82,7 +113,7 @@ class TestX25519(unittest.TestCase):
         with _pure_backend():
             self.assertEqual(beacon_mod._x25519(RFC7748_SCALAR, RFC7748_U),
                              RFC7748_OUT)
-        if beacon_mod._crypto is not None:
+        if not _IMPORT_PURE:
             with _ctypes_backend():
                 self.assertEqual(
                     beacon_mod._x25519(RFC7748_SCALAR, RFC7748_U),
@@ -123,16 +154,33 @@ class TestX25519(unittest.TestCase):
         # A 31- or 33-byte key is a framing bug upstream. The pure ladder
         # would silently reinterpret it and return a shared secret the
         # other end cannot reach, so both backends refuse it instead.
-        backends = [_pure_backend()]
-        if beacon_mod._crypto is not None:
-            backends.append(_ctypes_backend())
-        for backend in backends:
+        for backend in _available_backends():
             with backend:
                 for length in (31, 33):
                     with self.assertRaises(ValueError):
                         beacon_mod._x25519(b"\x01" * length, RFC7748_U)
                     with self.assertRaises(ValueError):
                         beacon_mod._x25519(RFC7748_SCALAR, b"\x01" * length)
+
+    def test_x25519_rejects_low_order_peer_key(self):
+        # A peer public key of low order drives the shared secret to all
+        # zeroes for any scalar, so whoever sent it knows the secret we
+        # are about to key the tunnel with. OpenSSL refuses to derive one;
+        # the pure ladder would happily return the zeroes, so it refuses
+        # too. Both backends are held to that here, because the value of
+        # the check is precisely that they agree -- a fallback that
+        # accepts what the fast path rejects is the gap being closed.
+        for backend in _available_backends():
+            with backend:
+                for peer_public in LOW_ORDER_U:
+                    with self.assertRaises(ValueError):
+                        beacon_mod._x25519(RFC7748_SCALAR, peer_public)
+                # The scalar is fine and an honest peer key still works,
+                # so the rejection is about the peer key and not a blanket
+                # failure of the backend under test.
+                self.assertEqual(
+                    beacon_mod._x25519(RFC7748_SCALAR, RFC7748_U),
+                    RFC7748_OUT)
 
 
 class TestHkdf(unittest.TestCase):
@@ -157,6 +205,17 @@ class TestHkdf(unittest.TestCase):
                             two)
         for output in three:
             self.assertEqual(len(output), 32)
+
+    def test_hkdf_rejects_other_output_counts(self):
+        # Noise defines two and three outputs and nothing else, and this
+        # implementation narrows the contract to exactly those. That
+        # narrowing is a decision, so it is recorded here rather than left
+        # as an untested branch in a function the handshake depends on: a
+        # caller that one day needs one output fails a test here instead
+        # of raising inside a delivered beacon.
+        for num_outputs in (1, 4):
+            with self.assertRaises(ValueError):
+                beacon_mod._hkdf(RFC5869_SALT, RFC5869_IKM, num_outputs)
 
 
 if __name__ == "__main__":
