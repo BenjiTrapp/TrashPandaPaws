@@ -99,18 +99,19 @@ Fetcher = Callable[[], Tuple[Any, Any]]
 
 
 def _lifetime(raw: Any) -> int:
-    """Seconds this token may be cached, clamped into a safe range.
+    """Seconds this token may be cached: what the source said, capped.
 
-    The floor keeps a token from being refetched on every call; the ceiling
-    keeps a wrong `expires_in` from outliving the real token. A value that is
-    missing, not a number, or not positive says nothing usable about the
-    token, so it gets the assumed lifetime rather than either extreme.
+    The ceiling keeps a wrong `expires_in` from outliving the real token. A
+    value that is missing, not a number, or not positive says nothing usable
+    about the token, so it gets the short assumed lifetime.
 
-    Zero and negative values are deliberately not clamped up to the floor.
-    A floor of SKEW_SECONDS + 1 is cached for one second, which for a value
-    the server got wrong is a fetch on every call, the very thing the clamp
-    is there to prevent. Only a positive number is believed, and it is
-    clamped into [SKEW_SECONDS + 1, 3600].
+    There is no floor. A token reported with less than SKEW_SECONDS left is
+    returned to the caller that fetched it and fetched again on the next
+    call, which costs a fetch per call for the few minutes until the issuer
+    renews it. Raising it to a floor instead would record an expiry later
+    than the real one, and the fallback after a failed refresh, which hands
+    out a cached token until its recorded expiry, would then hand out a dead
+    one.
     """
     seconds = None
     if not isinstance(raw, bool):
@@ -120,7 +121,7 @@ def _lifetime(raw: Any) -> int:
             seconds = None
     if seconds is None or seconds <= 0:
         seconds = GCLOUD_ASSUMED_LIFETIME
-    return max(SKEW_SECONDS + 1, min(_MAX_LIFETIME, seconds))
+    return min(_MAX_LIFETIME, seconds)
 
 
 # ── Sources ──

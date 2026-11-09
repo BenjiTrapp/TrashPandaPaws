@@ -344,46 +344,52 @@ class TestCaching(unittest.TestCase):
 
 
 class TestLifetimeClamp(unittest.TestCase):
-    def _cached_for(self, raw):
-        """Seconds a token reported with `raw` stays usable: the first
-        instant at which a second call fetches again, plus the skew."""
-        def refetches_at(t):
-            clock = _Clock()
-            fetcher = _Counting(lifetime=raw)
-            src = _with(fetcher, clock=clock)
-            src.bearer()
-            clock.t = t
-            src.bearer()
-            return fetcher.calls == 2
+    def _recorded(self, raw):
+        """The expiry the cache records for a token reported with `raw`,
+        fetched at t=0."""
+        src = _with(_Counting(lifetime=raw), clock=_Clock())
+        src.bearer()
+        return src._cached[1]
 
-        low, high = 0, 10 ** 10
-        while high - low > 1:
-            mid = (low + high) // 2
-            if refetches_at(mid):
-                high = mid
-            else:
-                low = mid
-        return high + _SKEW
-
-    def test_lifetimes_are_clamped_into_the_safe_range(self):
-        for raw in (None, 0, -5, "soon", 10 ** 9, True, float("nan"),
-                    float("inf"), 1, _SKEW, 3600, "3000", 1800.7):
+    def test_a_reported_lifetime_is_believed_up_to_an_hour(self):
+        for raw, recorded in ((1, 1), (_SKEW, _SKEW), (_SKEW + 1, _SKEW + 1),
+                              (3000, 3000), ("3000", 3000), (1800.7, 1800),
+                              (3600, 3600), (10 ** 9, 3600)):
             with self.subTest(raw=raw):
-                lifetime = self._cached_for(raw)
-                self.assertGreaterEqual(lifetime, _SKEW + 1)
-                self.assertLessEqual(lifetime, 3600)
-
-    def test_a_huge_lifetime_is_capped_at_an_hour(self):
-        self.assertEqual(self._cached_for(10 ** 9), 3600)
-
-    def test_a_tiny_lifetime_still_leaves_a_token_usable_for_a_moment(self):
-        self.assertEqual(self._cached_for(1), _SKEW + 1)
+                self.assertEqual(self._recorded(raw), recorded)
 
     def test_an_unreadable_lifetime_gets_the_assumed_one(self):
-        for raw in (None, 0, -5, "soon"):
+        for raw in (None, 0, -5, "soon", True, float("nan"), float("inf")):
             with self.subTest(raw=raw):
-                self.assertEqual(self._cached_for(raw),
+                self.assertEqual(self._recorded(raw),
                                  gcp_token.GCLOUD_ASSUMED_LIFETIME)
+
+    def test_a_short_lived_token_is_never_returned_past_its_real_expiry(self):
+        # A token reported with a minute left, and a refresh that fails.
+        # The fallback hands out the cached token while it is alive and not
+        # after: a floor that recorded five minutes would hand it out dead.
+        clock = _Clock()
+        outcomes = [("tok-1", 60)]
+
+        def fetch():
+            if outcomes:
+                return outcomes.pop(0)
+            raise gcp_token.TokenUnavailable("down")
+
+        src = _with(fetch, clock=clock)
+        self.assertEqual(src.bearer(), "tok-1")
+        clock.t = 59
+        self.assertEqual(src.bearer(), "tok-1")
+        clock.t = 60
+        with self.assertRaises(gcp_token.TokenUnavailable):
+            src.bearer()
+
+    def test_a_short_lived_token_is_fetched_again_on_the_next_call(self):
+        fetcher = _Counting(lifetime=_SKEW)
+        src = _with(fetcher, clock=_Clock())
+        self.assertEqual(src.bearer(), "tok-1")
+        self.assertEqual(src.bearer(), "tok-2")
+        self.assertEqual(fetcher.calls, 2)
 
 
 class TestMetadata(unittest.TestCase):
