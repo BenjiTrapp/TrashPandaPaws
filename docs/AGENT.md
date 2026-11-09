@@ -119,7 +119,7 @@ comes with a `reason`.
 | `bedrock` | `AWS_BEARER_TOKEN_BEDROCK` is read if no key is set; the endpoint follows `AWS_REGION` |
 | `openrouter` | `AGENT_API_KEY`, a `vendor/model` name |
 | `opencode` | `AGENT_API_KEY` **and** `AGENT_BASE_URL` — there is no built-in endpoint |
-| `local` | a `AGENT_BASE_URL` (LM Studio, llama.cpp); no key |
+| `local` | `AGENT_BASE_URL` for LM Studio or llama.cpp; no key; endpoint defaults to `http://127.0.0.1:11434/v1` |
 | `ollama` | a model that is pulled (`ollama pull`); no key; endpoint defaults to `http://127.0.0.1:11434/v1` |
 | `gemini` | `AGENT_API_KEY`, a bare model id (`gemini-3-pro`); no endpoint to set |
 | `vertex` | `AGENT_VERTEX_PROJECT`, a publisher-prefixed model id (`google/gemini-3-pro`); no key, the token comes from `AGENT_TOKEN_SOURCE` (default `auto`); the endpoint follows `AGENT_VERTEX_LOCATION` (default `europe-west4`) |
@@ -127,6 +127,32 @@ comes with a `reason`.
 A Bedrock model id carries its own region prefix (`eu.`, `us.`). An EU id
 against a US endpoint fails at the first call rather than at configuration,
 so set `AWS_REGION` to match the prefix.
+
+Vertex has the same trap with a different prefix. Its model id carries a
+publisher, `google/gemini-3-pro` and not `gemini-3-pro`, and a bare id is
+refused at configuration instead of becoming a 404 at the first call, which
+on an unattended run nobody is there to read. There is no `AGENT_BASE_URL` to
+set either: the endpoint is computed from `AGENT_VERTEX_PROJECT` and
+`AGENT_VERTEX_LOCATION`, because the location appears **twice** in the URL,
+in the host (`europe-west4-aiplatform.googleapis.com`) and again in the path
+(`/locations/europe-west4/`), and a mismatch between the two is a silent 404.
+One value written twice by the code cannot disagree with itself; two values
+typed by a person can. A blank location means `europe-west4`, EU first as
+Bedrock's default region is. `global` is the one location whose host has no
+regional prefix: it is `aiplatform.googleapis.com`, and
+`global-aiplatform.googleapis.com` does not exist. Both values are checked
+against Google's identifier shape (lowercase letters, digits, hyphens) before
+they go into a URL, because the bearer is sent wherever that URL points.
+
+The credential is the part that differs from Bedrock, and it has its own
+section: [Vertex AI: the token, and where it runs](#vertex-ai-the-token-and-where-it-runs).
+
+`local` and `ollama` both default to Ollama's port, so `local` with no
+`AGENT_BASE_URL` still works against an Ollama on the same machine. Use
+`ollama` for it anyway: that name is what the
+[pre-engagement check](#checking-the-chain-before-an-engagement) knows how to
+audit, and `local` is the name for LM Studio and llama.cpp, whose model list
+it reads from a different endpoint.
 
 The **capability tier** is derived from the model name and limits what a run
 may do. A model nobody recognises gets `reduced`, which is the safe
@@ -152,6 +178,110 @@ not handed the most consequential actions. Override with
 
 ---
 
+## Vertex AI: the token, and where it runs
+
+Every other provider here authenticates with a key that is good until someone
+revokes it. Vertex's credential is an OAuth **access token that lives about an
+hour**, and a campaign runs up to two (`max_runtime_seconds`, 7200). A token
+pasted into `AGENT_API_KEY` works until the hour is up and is then refused on
+every turn, partway through a run. That is why Vertex has a *token source*
+instead of a key: the agent holds the current token and fetches another when
+less than 5 minutes of the old one remain.
+
+| `AGENT_TOKEN_SOURCE` | Needs | What trying it costs |
+|---|---|---|
+| `auto` (default) | nothing of its own: tries `metadata`, then `gcloud`, then `file`, in that order, and if none works names all three | the sum of those it has to try |
+| `metadata` | to run on one of Google's own machines (a GCE VM) with a service account allowed to call Vertex | up to a 1-second timeout anywhere else |
+| `gcloud` | `gcloud` on `PATH`, already logged in; the agent runs `gcloud auth print-access-token` | a subprocess, with a 30-second timeout |
+| `file` | `AGENT_API_KEY_FILE` naming a file holding a current token, mode `600` | a read |
+
+The order is by cost, cheapest first. `gcloud` does not say how old the token
+it prints is, so the agent assumes half an hour and runs it again after about
+25 minutes. A `file` is re-read, so a token rewritten underneath a running
+agent is picked up within ten minutes.
+
+**A key beats `auto`.** If `AGENT_API_KEY` or `AGENT_API_KEY_FILE` is set and
+the source is left at `auto`, that value is used as it stands and is never
+refreshed. `/api/ai/status` says so, but it is easy to read past. Name the
+source (`file`, for the container below) and the explicit choice wins.
+
+**Whether a token can be had is not checked at startup.** `gcloud` is checked
+for being on `PATH` and a `file` for its mode, but `auto` always passes, since
+the metadata server cannot be ruled out without asking it. A host with no
+working source therefore reports `available: true` and fails at the first
+model call. [`--ping`](#checking-the-chain-before-an-engagement) is the way to
+find out before then.
+
+### On the host
+
+This is the documented path. An agent started directly inherits your shell's
+`PATH`, so `gcloud` is there and `auto` finds a token with nothing to set up
+beyond being logged in:
+
+```bash
+gcloud auth login
+export AGENT_PROVIDER=vertex
+export AGENT_MODEL=google/gemini-3-pro
+export AGENT_VERTEX_PROJECT=my-project      # AGENT_VERTEX_LOCATION if not europe-west4
+python3 -m software.agent
+```
+
+### In the container
+
+Supported, through the `file` source. `gcloud` is **not** in the agent image,
+and that is deliberate. The Dockerfile keeps this image slim for a reason that
+applies here without change: what another place already provides is weight
+and one more thing to keep patched, and the Cloud SDK is a large install next
+to a handful of small Python packages, in the one image that holds an API key
+and the C2 token. The host already has `gcloud` and a login, so the host
+refreshes and the container reads:
+
+```bash
+# On the host. umask 077 makes the file mode 600, which the agent insists on.
+umask 077
+while :; do
+  gcloud auth print-access-token > /etc/raccoon/vertex.token.new \
+    && mv /etc/raccoon/vertex.token.new /etc/raccoon/vertex.token
+  sleep 1800
+done
+```
+
+```bash
+export AGENT_PROVIDER=vertex AGENT_MODEL=google/gemini-3-pro
+export AGENT_VERTEX_PROJECT=my-project
+export AGENT_TOKEN_SOURCE=file
+export AGENT_API_KEY_FILE=/etc/raccoon/vertex.token
+```
+
+Three things that are not obvious:
+
+- **Mount the directory, not the file.** `docker-compose.yml` mounts nothing
+  for the key file; add `- /etc/raccoon:/etc/raccoon:ro` under the agent's
+  `volumes`. A single-file bind mount follows the inode it was created
+  against, and the `mv` above replaces the inode, so the container would keep
+  reading the first token for ever.
+- **The file must exist before the agent starts**, and cannot be empty: the
+  configuration reads it once at startup and refuses a missing, empty or
+  group-readable file. Run the refresher once first.
+- **The container's user has to own it.** Mode `600` means only the owner can
+  read the file, and the owner is a uid on the host. The container runs as the
+  unprivileged `raccoon` user; `docker compose run --rm --entrypoint id agent`
+  says which uid that is, and the file, and the directory the refresher
+  writes into, need to belong to it.
+
+The refresher writes every 30 minutes against a token that lives about an
+hour, so the file always holds a token with at least half its life left. If
+the refresher dies, the agent carries on with the last token until it expires,
+at most an hour later, and then fails; nothing warns beforehand.
+
+### On GCE
+
+Nothing above is needed. The container shares the host's network, so the
+metadata server answers there as it does on the host, and `auto` tries it
+first.
+
+---
+
 ## If a provider goes down
 
 One provider and one key is the normal case. A campaign runs unattended
@@ -172,7 +302,7 @@ agent:
       - provider: anthropic
         model: claude-sonnet-4-5
         api_key_env: ANTHROPIC_API_KEY
-      - provider: local
+      - provider: ollama
         model: qwen2.5-coder
         base_url: http://127.0.0.1:11434/v1
       - provider: gemini
@@ -182,11 +312,37 @@ agent:
 
 An entry takes `provider`, `model`, and optionally `base_url` and
 `api_key_env`. A literal `api_key` is refused — by name, without the value
-being echoed into the error. A `local` link needs no key at all, which
-makes a model on the box itself a sensible late link: it cannot be
+being echoed into the error. A `local` or `ollama` link needs no key at all,
+which makes a model on the box itself a sensible late link: it cannot be
 rate-limited and it cannot have its key revoked. `gemini` goes last because
-its free tier cannot be relied on for a whole campaign, but it cannot run
-out of credit either.
+its free tier has quota limits, so it cannot be relied on for a whole
+campaign. What it lacks is a *balance*: there is no credit to run out and no
+bill whose failure to be paid ends the key. A quota resets, so the link
+returns on its own after its cooldown, where an empty balance stays empty
+until someone tops it up.
+
+**A `vertex` link is the exception to everything above.** A chain link
+carries four fields (`provider`, `model`, `api_key_env`, `base_url`) and no
+more, so it has no project, no location and no token source of its own. Two
+things follow, both by design and neither visible until it bites:
+
+- It always uses `token_source: auto`, whatever `AGENT_TOKEN_SOURCE` says for
+  the primary, and never a static bearer. Naming an `api_key_env` on a
+  `vertex` link is refused. In the container that means a `vertex` fallback
+  finds a token only where the metadata server answers (GCE): `auto` would
+  reach for a key file, and a link has none to name. A `vertex` *primary*
+  has no such limit.
+- It needs an explicit `base_url`, the whole endpoint, since there is
+  nothing to compute it from. Leave it out and startup says so; it does not
+  say "set `AGENT_VERTEX_PROJECT`", which is probably already set.
+
+```yaml
+      - provider: vertex
+        model: google/gemini-3-pro
+        base_url: https://europe-west4-aiplatform.googleapis.com/v1/projects/my-project/locations/europe-west4/endpoints/openapi
+```
+
+The location appears twice here too, and the same mismatch is a silent 404.
 
 **How it behaves.** Any failure moves to the next link. The HTTP status is
 not consulted, because a 401 is a revoked key *or* a header this code got
@@ -195,6 +351,15 @@ since every attempt is written to `llm_interactions` and the final error
 names every link that was tried. A link that fails **twice in a row** is
 skipped for **2 minutes**; after that it gets one attempt, not a fresh
 allowance, because a revoked key is still revoked.
+
+**Why a chain matters most for `vertex`.** The token is fetched before every
+model call, and a failed fetch is not cached. While `gcloud` is failing
+slowly, a lone `vertex` client pays up to 30 seconds inside that fetch on each
+turn (the `gcloud` timeout, after the metadata server's one second under
+`auto`) and then fails. The campaign is not lost, since nothing wraps a model
+call in a deadline, but twenty orchestrator turns of that is ten minutes spent
+waiting for nothing. With a chain the failover counts those failures like any
+other, trips the link after two, and the later turns do not pay for it.
 
 Every link is built at startup, so a fallback that cannot be constructed is
 a configuration error reported then — `/api/ai/status` says so and no
@@ -210,6 +375,93 @@ silently attributed to the model you configured first.
 The same panel carries the **Report** button for every campaign, running or
 finished — which is what makes the deliverable reachable without knowing a
 URL.
+
+---
+
+## Checking the chain before an engagement
+
+```bash
+python3 -m software.agent.llm.preflight [--ping] [-c configs/raccoon.yaml]
+```
+
+It loads the configuration exactly as the service does, builds every link in
+the chain, and prints one line each. Exit status is 0 if all are fine, 1 if
+any is not, and 2 if the configuration will not load. It reports every link in
+one run, where startup stops at the first it cannot build:
+
+```
+ok     vertex google/gemini-3-pro built; nothing was sent (--ping sends one request)
+NOT OK ollama llama3.2            no server answering at 127.0.0.1:11434 (URLError)
+```
+
+What a line means depends on the link:
+
+- **A local link (`local`, `ollama`) is asked for its model list**, always,
+  because the commonest local failure is a model that was never pulled, which
+  is otherwise invisible until the first turn of the first campaign. `ollama`
+  is asked `/api/tags` and `local` is asked `/v1/models`: they are different
+  servers with different lists, and one endpoint for both would report a
+  working LM Studio as down. A server that is up but lacks your model prints
+  what it does have. One that answers 401 or 403 is up and wants a
+  credential, which the probe never sends; the line is ok only if the link has
+  a key to send, and `--ping` is what tests it.
+- **A hosted link without `--ping` is only "built".** The key, the model id,
+  the endpoint and, for `vertex`, the project, location and source choice are
+  well-formed; nothing was sent. For `vertex` that is the weakest answer it
+  can give, because a broken `gcloud` passes it.
+- **`--ping` sends one tiny completion per link**, capped at 16 output
+  tokens, and for `vertex` it fetches a real token first, which is the only
+  step that tests the source. It is opt-in because it spends tokens on a
+  metered provider, and a health check that costs money is one nobody runs.
+
+This is a separate command, not part of `/api/ai/status`, on purpose. The
+status endpoint is polled by the interface and must not do I/O: probing a
+local server that is not running would sit out its timeout on every poll and
+stall the page that is only meant to say "not configured". Do not move the
+probes into it.
+
+---
+
+## A model on the Pi
+
+The implant is a Raspberry Pi, and an Ollama on it is a chain link today with
+no code: a `fallbacks` entry carrying the Pi's LAN address.
+
+```yaml
+      - provider: ollama
+        model: qwen2.5:7b
+        base_url: http://10.0.1.50:11434/v1
+```
+
+Read the whole bill before you do. It is a last resort that keeps a run alive,
+not a second brain.
+
+- **Prompts and tool output cross the LAN in cleartext, to the implant.** The
+  link has no key, so nothing stops it going over `http://`, and a link to a
+  non-loopback address does. That traffic is everything the agent has learned
+  about the target, flowing toward the one host on that network you least want
+  associated with it. The agent host also has to reach that address, which
+  means being on the implant's segment or tunnelling to it.
+- **Power.** The Pi is PoE-powered at about 13 W while bridging and
+  capturing. That figure is without inference, which adds to it by an amount
+  that has not been measured here.
+- **It is a large forensic artefact on a device built to look like an IP
+  phone.** An inference server, listening on the network with no
+  authentication of its own (Ollama has none), and a model blob of several
+  gigabytes on disk, are the opposite of what the cover identity is for.
+- **A turn can take a long time.** The transport allows a local link 300
+  seconds per call, against 120 for a hosted one. How much of that a Pi uses
+  has not been measured for this page.
+- **The tier does not follow the failover.** The capability tier is fixed once,
+  at startup, from the *primary* model. A run that begins on a `full` model and
+  fails over to the Pi keeps `full` limits (20 orchestrator turns, 4000
+  characters of output kept, phase 5, every tool) in the hands of a 7B model.
+  The gate and the scope still stand between that model and a bad action; the
+  limits that were meant to fit the model do not. A local model named with a size under 30 billion
+  parameters (`qwen2.5:7b`) *is* `minimal` and stops at phase 3 when it is
+  the primary; a local model whose name states no size is `reduced`. If a
+  chain ends on a small model, set `AGENT_CAPABILITY_TIER` for the whole run
+  to what that model can bear, knowing the primary is held to it too.
 
 ---
 

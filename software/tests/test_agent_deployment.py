@@ -205,6 +205,23 @@ class TestCompose(unittest.TestCase):
             self.assertIn(key, env, key)
             self.assertRegex(env[key], r"^\$\{[A-Z_]+(:-[^}]*)?\}$", key)
 
+    def test_the_vertex_settings_reach_the_container(self):
+        # Without these the container cannot run the vertex provider at all:
+        # compose passes through only what it lists, so a variable exported
+        # on the host never arrives. Blank when unset, because a blank
+        # value falls through to the defaults (europe-west4, auto) while a
+        # written-in default here would stand in for the operator's choice.
+        env = _env_map(self.services["agent"])
+        for key in ("AGENT_VERTEX_PROJECT", "AGENT_VERTEX_LOCATION",
+                    "AGENT_TOKEN_SOURCE"):
+            self.assertIn(key, env, key)
+            self.assertEqual(env[key], "${%s:-}" % key, key)
+
+    def test_the_file_says_why_gcloud_is_not_in_the_container(self):
+        # The slim image has no gcloud on purpose; without the comment the
+        # next reader adds it, or wonders why `auto` finds nothing.
+        self.assertRegex(self.raw, r"(?is)gcloud.{0,300}(absent|not in|no )")
+
     def test_the_fixed_token_requirement_is_written_down(self):
         # Without a fixed RACCOON_TOKEN the C2 invents one at startup and the
         # agent cannot authenticate -- the failure looks like "0 beacons",

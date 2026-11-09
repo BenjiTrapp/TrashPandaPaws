@@ -82,7 +82,8 @@ services:
       # Same value as the C2's above; that is the point of it.
       - RACCOON_TOKEN=${RACCOON_TOKEN:-}
       - RACCOON_AGENT_TOKEN=${RACCOON_AGENT_TOKEN:-}
-      # anthropic | openrouter | opencode | local | bedrock
+      # anthropic | bedrock | openrouter | opencode | local | ollama | gemini
+      # | vertex
       - AGENT_PROVIDER=${AGENT_PROVIDER:-}
       - AGENT_MODEL=${AGENT_MODEL:-}
       # Never a literal here. Put it in a .env file that is not committed,
@@ -92,6 +93,17 @@ services:
       # readable by its owner only.
       - AGENT_API_KEY=${AGENT_API_KEY:-}
       - AGENT_API_KEY_FILE=${AGENT_API_KEY_FILE:-}
+      # vertex only. gcloud is deliberately absent from this image (it is
+      # slim on purpose), so inside the container the token comes from the
+      # metadata server on GCE, or from a chmod 600 file that a refresher on
+      # the host rewrites: AGENT_TOKEN_SOURCE=file with AGENT_API_KEY_FILE
+      # pointing at it. Mount the file's directory, not the file, or a
+      # refresher that writes by rename is invisible in here. All three stay
+      # blank when unset so that the defaults (europe-west4, auto) apply.
+      # docs/AGENT.md, "Where it runs".
+      - AGENT_VERTEX_PROJECT=${AGENT_VERTEX_PROJECT:-}
+      - AGENT_VERTEX_LOCATION=${AGENT_VERTEX_LOCATION:-}
+      - AGENT_TOKEN_SOURCE=${AGENT_TOKEN_SOURCE:-}
 
 volumes:
   raccoon-data:
