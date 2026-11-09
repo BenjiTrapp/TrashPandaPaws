@@ -9,11 +9,16 @@ caches it, and fetches a new one shortly before the old one expires. The
 HTTP client awaits it off the event loop through asyncio.to_thread.
 
 Where the token comes from is a choice of source, ordered by what it costs to
-try: the metadata server (a one-second timeout; answers only on Google's own
-machines), the `gcloud` command line (a subprocess, up to thirty seconds), and
-a key file (a read). "auto" tries them in that order and, when none works,
-names all three, because "no token" tells an operator nothing about which of
-the three they were supposed to have.
+try: the metadata server (a name lookup, then a one-second timeout; answers
+only on Google's own machines), the `gcloud` command line (a subprocess, up to
+thirty seconds), and a key file (a read). "auto" tries them in that order and,
+when none works, names all three, because "no token" tells an operator nothing
+about which of the three they were supposed to have.
+
+The one second does not cover the lookup of `metadata.google.internal`: the
+system resolver is asked first, with its own timeout, so off Google's
+machines each try costs whatever that resolver takes to say no, and it hears
+the name on every `auto` refresh.
 
 Each source says how long its token lives where it can: the metadata server
 in `expires_in`, `gcloud config config-helper` in `token_expiry`. Where it

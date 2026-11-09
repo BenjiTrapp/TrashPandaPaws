@@ -191,7 +191,7 @@ less than 5 minutes of the old one remain.
 | `AGENT_TOKEN_SOURCE` | Needs | What trying it costs |
 |---|---|---|
 | `auto` (default) | nothing of its own: tries `metadata`, then `gcloud`, then `file`, in that order, and if none works names all three | the sum of those it has to try |
-| `metadata` | to run on one of Google's own machines (a GCE VM) with a service account allowed to call Vertex | up to a 1-second timeout anywhere else |
+| `metadata` | to run on one of Google's own machines (a GCE VM) with a service account allowed to call Vertex | a name lookup of `metadata.google.internal`, then a 1-second timeout. The lookup goes to the system resolver before the timeout applies, so off GCE it takes as long as your resolver takes to say no, and every `auto` refresh sends that query to it |
 | `gcloud` | `gcloud` on `PATH`, already logged in; the agent runs `gcloud config config-helper --format=json`, and `gcloud auth print-access-token` if that fails | a subprocess, with a 30-second timeout |
 | `file` | `AGENT_API_KEY_FILE` naming a file holding a current token, mode `600` | a read |
 
@@ -376,11 +376,12 @@ allowance, because a revoked key is still revoked.
 **Why a chain matters most for `vertex`.** The token is fetched before every
 model call, and a failed fetch is not cached. While `gcloud` is failing
 slowly, a lone `vertex` client pays up to 30 seconds inside that fetch on each
-turn (the `gcloud` timeout, after the metadata server's one second under
-`auto`) and then fails. The campaign is not lost, since nothing wraps a model
-call in a deadline, but twenty orchestrator turns of that is ten minutes spent
-waiting for nothing. With a chain the failover counts those failures like any
-other, trips the link after two, and the later turns do not pay for it.
+turn (the `gcloud` timeout, after the metadata server's name lookup and one
+second under `auto`) and then fails. The campaign is not lost, since nothing
+wraps a model call in a deadline, but twenty orchestrator turns of that is ten
+minutes spent waiting for nothing. With a chain the failover counts those
+failures like any other, trips the link after two, and the later turns do not
+pay for it.
 
 The chain is written in the YAML only; there is no environment form for it.
 The agent image does not contain `configs/raccoon.yaml`, so a container has no
