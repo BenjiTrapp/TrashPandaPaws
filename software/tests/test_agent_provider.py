@@ -14,6 +14,7 @@ import asyncio
 import copy
 import json
 import sys
+import threading
 import traceback
 import types
 import unittest
@@ -22,7 +23,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from software.agent.llm import bedrock_client, anthropic_client, openai_client, provider
+from software.agent.llm import (bedrock_client, anthropic_client, gcp_token,
+                                openai_client, provider)
 
 _KEY = "sk-live-SECRET-0123456789abcdef"
 
@@ -1014,6 +1016,98 @@ class TestRealTransport(unittest.TestCase):
             provider="ollama", model="m", api_key=None,
             base_url="http://127.0.0.1:11434/v1", timeout=7)
         self.assertEqual(self._timeout_on_the_wire(c), 7)
+
+
+class _FakeSource:
+    kind = "fake"
+
+    def __init__(self, *tokens):
+        self.tokens = list(tokens)
+        self.calls = 0
+        self.threads = []
+
+    def bearer(self):
+        self.calls += 1
+        self.threads.append(threading.get_ident())
+        if isinstance(self.tokens[0], BaseException):
+            raise self.tokens[0]
+        return self.tokens.pop(0) if len(self.tokens) > 1 else self.tokens[0]
+
+
+def _vertex(source, stub):
+    return openai_client.OpenAiCompatibleClient(
+        provider="vertex", model="google/gemini-3-pro", api_key=None,
+        base_url="https://x-aiplatform.googleapis.com/v1/p/openapi",
+        transport=stub, token_source=source)
+
+
+_TURN = ("", [{"role": "user", "content": "x"}], [], 16, 0.0)
+
+
+class TestATokenSourceSuppliesTheCredential(unittest.TestCase):
+    def test_a_token_source_supplies_the_authorization_header(self):
+        src = _FakeSource("tok-first", "tok-second")
+        stub = _Stub({"choices": [{"message": {"content": "a"}}]},
+                     {"choices": [{"message": {"content": "b"}}]})
+        c = _vertex(src, stub)
+        _run(c.complete(*_TURN))
+        _run(c.complete(*_TURN))
+        self.assertEqual(stub.calls[0][1]["Authorization"], "Bearer tok-first")
+        self.assertEqual(stub.calls[1][1]["Authorization"],
+                         "Bearer tok-second")
+
+    def test_the_token_is_resolved_off_the_event_loop(self):
+        src = _FakeSource("tok")
+        c = _vertex(src, _Stub({"choices": [{"message": {"content": "a"}}]}))
+        _run(c.complete(*_TURN))
+        self.assertNotEqual(src.threads, [threading.get_ident()])
+
+    def test_the_resolved_token_stays_out_of_the_repr(self):
+        src = _FakeSource("tok-SECRET-value")
+        c = _vertex(src, _Stub({"choices": [{"message": {"content": "a"}}]}))
+        _run(c.complete(*_TURN))
+        self.assertNotIn("tok-SECRET-value", repr(c))
+        self.assertNotIn("tok-SECRET-value", repr(c._bearer))
+
+    def test_a_token_source_failure_is_a_provider_error_naming_the_model(self):
+        src = _FakeSource(gcp_token.TokenUnavailable("no source answered"))
+        stub = _Stub()
+        c = _vertex(src, stub)
+        with self.assertRaises(provider.ProviderError) as cm:
+            _run(c.complete(*_TURN))
+        self.assertIn("google/gemini-3-pro", str(cm.exception))
+        self.assertEqual(
+            _walk_chain(cm.exception).count("no source answered"), 1)
+        self.assertEqual(stub.calls, [])
+
+    def test_a_token_source_failure_leaves_no_exception_chain(self):
+        for failure in (gcp_token.TokenUnavailable("no source answered"),
+                        RuntimeError("Bearer tok-LEAK in a library message")):
+            with self.subTest(failure=type(failure).__name__):
+                c = _vertex(_FakeSource(failure), _Stub())
+                with self.assertRaises(provider.ProviderError) as cm:
+                    _run(c.complete(*_TURN))
+                self.assertIsNone(cm.exception.__context__)
+                self.assertIsNone(cm.exception.__cause__)
+                self.assertNotIn("tok-LEAK", _walk_chain(cm.exception))
+
+    def test_a_client_without_a_token_source_keeps_its_key(self):
+        stub = _Stub({"choices": [{"message": {"content": "a"}}]})
+        _run(_openai(stub).complete(*_TURN))
+        self.assertEqual(stub.calls[0][1]["Authorization"], "Bearer " + _KEY)
+
+
+class TestCleartextGuardCountsATokenSource(unittest.TestCase):
+    def test_a_token_source_counts_as_a_credential_for_the_cleartext_guard(
+            self):
+        with self.assertRaises(provider.ProviderError) as cm:
+            provider._checked_base_url("vertex", "http://proxy.example/v1",
+                                       has_credential=True)
+        self.assertIn("https", str(cm.exception))
+
+    def test_no_credential_at_all_may_use_plain_http(self):
+        url = "http://proxy.example/v1"
+        self.assertEqual(provider._checked_base_url("local", url, has_credential=False), url)
 
 
 # ── Status quo: no SDK, no new dependency, no import-time cost ──

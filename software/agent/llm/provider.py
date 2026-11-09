@@ -41,6 +41,7 @@ import re
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import urlparse
 
+from software.agent.llm import gcp_token
 from software.agent.secret import Secret
 
 # ── Shapes ──
@@ -247,14 +248,17 @@ class HttpLlmClient(LlmClient):
     def __init__(self, provider: str, model: str, api_key: Optional[str],
                  base_url: str, transport: Optional[Transport] = None,
                  supports_tools: bool = True,
-                 timeout: Optional[float] = None):
+                 timeout: Optional[float] = None,
+                 token_source: Optional[Any] = None):
         self.provider = provider
         self.model = model
         self.supports_tools = supports_tools
         self._base_url = base_url.rstrip("/")
-        # The credential currently in use. A token source may replace it
-        # between turns.
+        # The credential currently in use. A token source replaces it before
+        # each turn, which is why the subclasses read it at request-build
+        # time and never keep a copy.
         self._bearer = Secret(api_key)
+        self._token_source = token_source
         self._timeout = _TIMEOUT_SECONDS if timeout is None else timeout
         if transport is None:
             # The timeout is bound into the default transport rather than
@@ -284,6 +288,26 @@ class HttpLlmClient(LlmClient):
         """Turn the vendor's reply into a Completion."""
 
     async def complete(self, system, messages, tools, max_tokens, temperature):
+        if self._token_source is not None:
+            # Off the event loop: bearer() may run gcloud or fetch from the
+            # metadata server. Nothing is awaited between storing the token
+            # and _build_request reading it, so two turns on one client
+            # cannot swap each other's credential.
+            #
+            # Captured and raised outside the except, as below. A token
+            # source's failure is a library exception whose message may hold
+            # a URL or a response, so only a TokenUnavailable message (built
+            # to be safe) is shown and anything else is named by class.
+            failure = None
+            try:
+                token = await asyncio.to_thread(self._token_source.bearer)
+            except gcp_token.TokenUnavailable as exc:
+                failure = "no access token: %s" % exc
+            except Exception as exc:
+                failure = "no access token (%s)" % type(exc).__name__
+            if failure is not None:
+                raise self._fail(failure)
+            self._bearer = Secret(token)
         url, headers, body = self._build_request(
             system, messages, list(tools) if self.supports_tools else [],
             max_tokens, temperature)
@@ -446,17 +470,18 @@ def _is_loopback(host: Optional[str]) -> bool:
         return False
 
 
-def _checked_base_url(name: str, url: str, has_key: bool) -> str:
+def _checked_base_url(name: str, url: str, has_credential: bool) -> str:
     parts = urlparse(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ProviderError(
             "provider %r: base_url must be an http(s) URL" % name)
-    # The key goes wherever base_url points. Over cleartext HTTP to anything
-    # but this machine it would cross the network readable.
-    if has_key and parts.scheme == "http" and not _is_loopback(parts.hostname):
+    # The credential goes wherever base_url points. Over cleartext HTTP to
+    # anything but this machine it would cross the network readable.
+    if (has_credential and parts.scheme == "http"
+            and not _is_loopback(parts.hostname)):
         raise ProviderError(
-            "provider %r: refusing to send an API key over plain http to %s; "
-            "use https" % (name, parts.hostname))
+            "provider %r: refusing to send a credential over plain http to "
+            "%s; use https" % (name, parts.hostname))
     return url
 
 
@@ -512,7 +537,13 @@ def create_client(cfg) -> LlmClient:
         raise ProviderError(
             "provider %r has no default endpoint; set base_url to its "
             "OpenAI-compatible endpoint" % name)
-    base_url = _checked_base_url(name, base_url, bool(api_key))
+    # Nothing builds a token source yet; the vertex provider will.
+    token_source = None
+    # A token source is a credential too. Without counting it, a provider
+    # with no key at construction, such as vertex, would pass this guard on
+    # an http:// base URL and then be handed a live OAuth bearer in cleartext.
+    base_url = _checked_base_url(
+        name, base_url, bool(api_key) or token_source is not None)
 
     if kind == "anthropic":
         return anthropic_client.AnthropicClient(
@@ -522,4 +553,5 @@ def create_client(cfg) -> LlmClient:
             model=model, api_key=api_key, base_url=base_url)
     return openai_client.OpenAiCompatibleClient(
         provider=name, model=model, api_key=api_key, base_url=base_url,
-        timeout=LOCAL_TIMEOUT_SECONDS if name in LOCAL_PROVIDERS else None)
+        timeout=LOCAL_TIMEOUT_SECONDS if name in LOCAL_PROVIDERS else None,
+        token_source=token_source)
