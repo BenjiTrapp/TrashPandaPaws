@@ -72,6 +72,10 @@ def main(argv=None) -> int:
     if ok:
         logger.info("model: %s / %s, capability tier %s", cfg.provider,
                     cfg.model, cfg.capability_tier)
+        if reason:
+            # Usable, with a caveat the operator must hear now: the only
+            # other place it shows is the status endpoint.
+            logger.warning("%s", reason)
     else:
         logger.warning("no campaign can start: %s", reason)
     if not cfg.agent_token:

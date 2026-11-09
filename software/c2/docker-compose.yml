@@ -70,6 +70,23 @@ services:
       # across restarts: the service marks unfinished runs aborted on the
       # way up, and that record is the audit trail.
       - raccoon-agent-data:/data/raccoon-agent
+      # vertex in this container: the directory that holds the token file the
+      # host's refresher rewrites, with AGENT_TOKEN_SOURCE=file and
+      # AGENT_API_KEY_FILE=<that path>. Edit the host side and uncomment.
+      # Mount the directory, not the file. The file inside must be chmod 600
+      # and owned by the container's user, or the agent refuses to start.
+      # Left commented: a mount of a path that does not exist would stop
+      # `docker compose up` for everyone who does not use vertex.
+      # - /etc/raccoon:/etc/raccoon:ro
+      #
+      # A provider chain (agent.llm.fallbacks) can only be written in YAML,
+      # and this image contains no configs/raccoon.yaml. The service reads
+      # /opt/raccoon/configs/raccoon.yaml if it exists; the alternative is
+      # `command: ["-c", "<path in the container>"]` on this service with the
+      # file mounted anywhere. Edit the host side and uncomment. The shipped
+      # file works, with c2.sliver.enabled set to false as docs/AGENT.md says
+      # at the top. Commented out for the same reason as the line above.
+      # - ../../configs/raccoon.yaml:/opt/raccoon/configs/raccoon.yaml:ro
     environment:
       # Loopback only. This API starts campaigns and runs commands; it has
       # no business being reachable from the network, and no port is
@@ -82,9 +99,19 @@ services:
       # Same value as the C2's above; that is the point of it.
       - RACCOON_TOKEN=${RACCOON_TOKEN:-}
       - RACCOON_AGENT_TOKEN=${RACCOON_AGENT_TOKEN:-}
-      # anthropic | openrouter | opencode | local | bedrock
+      # anthropic | bedrock | openrouter | opencode | local | ollama | gemini
+      # | vertex
       - AGENT_PROVIDER=${AGENT_PROVIDER:-}
       - AGENT_MODEL=${AGENT_MODEL:-}
+      # Blank takes the provider's own endpoint. Needed for opencode, which
+      # has none, and for a local or ollama server that is not on this host's
+      # 127.0.0.1:11434. Set, it also overrides the endpoint that bedrock and
+      # vertex compute from their region and project.
+      - AGENT_BASE_URL=${AGENT_BASE_URL:-}
+      # Blank derives the tier from the model. Set it to force one: it is the
+      # documented way to hold a whole run to a small model's limits (see
+      # "Known limits" in docs/AGENT.md), so the container has to pass it.
+      - AGENT_CAPABILITY_TIER=${AGENT_CAPABILITY_TIER:-}
       # Never a literal here. Put it in a .env file that is not committed,
       # or export it before `docker compose up`; this repository has a
       # pre-commit hook that refuses credential material in a diff.
@@ -92,6 +119,17 @@ services:
       # readable by its owner only.
       - AGENT_API_KEY=${AGENT_API_KEY:-}
       - AGENT_API_KEY_FILE=${AGENT_API_KEY_FILE:-}
+      # vertex only. gcloud is deliberately absent from this image (it is
+      # slim on purpose), so inside the container the token comes from the
+      # metadata server on GCE, or from a chmod 600 file that a refresher on
+      # the host rewrites: AGENT_TOKEN_SOURCE=file with AGENT_API_KEY_FILE
+      # pointing at it. Mount the file's directory, not the file, or a
+      # refresher that writes by rename is invisible in here. All three stay
+      # blank when unset so that the defaults (europe-west4, auto) apply.
+      # docs/AGENT.md, "Vertex AI: the token, and where it runs".
+      - AGENT_VERTEX_PROJECT=${AGENT_VERTEX_PROJECT:-}
+      - AGENT_VERTEX_LOCATION=${AGENT_VERTEX_LOCATION:-}
+      - AGENT_TOKEN_SOURCE=${AGENT_TOKEN_SOURCE:-}
 
   # ── Listeners ──
   #

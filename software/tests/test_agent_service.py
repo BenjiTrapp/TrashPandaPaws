@@ -34,7 +34,7 @@ from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, make_mocked_request
 
 from software.agent import config, orchestrator, safety, service
-from software.agent.llm import mock
+from software.agent.llm import failover, mock
 from software.agent.llm.provider import ProviderError
 from software.agent.store import db, queries
 from software.tests import test_agent_orchestrator as _orch
@@ -214,6 +214,28 @@ class TestStatusWithoutProvider(_ServiceCase):
     async def test_beacons_are_still_listed(self):
         body = await (await self.get("/beacons")).json()
         self.assertEqual([b["id"] for b in body["beacons"]], ["raccoon-fox"])
+
+
+class TestStatusOfAUsableServiceWithACaveat(_ServiceCase):
+    """available together with a reason: a static Google key, usable but
+    not refreshed. The combination the GUI has to show and not discard."""
+
+    async def get_application(self):
+        # Vertex is not a provider the client factory knows yet, so the
+        # chain that would be built is stood in for.
+        self.rig = _rig(client=mock.MockClient([]), provider="vertex",
+                        model="google/m", static_bearer=True)
+        return self.rig.app
+
+    async def test_status_is_available_and_still_carries_the_reason(self):
+        with unittest.mock.patch.object(failover, "create_chain"):
+            resp = await self.get("/status")
+            text = await resp.text()
+        body = json.loads(text)
+        self.assertEqual(resp.status, 200)
+        self.assertIs(body["available"], True)
+        self.assertIn("will not be refreshed", body["reason"])
+        self.assertNotIn(_API_KEY, text)
 
 
 class TestStatusWithProvider(_ServiceCase):

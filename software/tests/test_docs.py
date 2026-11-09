@@ -14,6 +14,7 @@ surrounding sentences are unchanged -- the prose is free, the facts are not.
 """
 
 import argparse
+import asyncio
 import inspect
 import json
 import os
@@ -29,9 +30,9 @@ import yaml
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from software.agent import config, prompts
-from software.agent.llm import failover
-from software.agent.store import queries  # noqa: E402
+from software.agent import config, orchestrator, prompts
+from software.agent.llm import failover, mock
+from software.agent.store import db, queries  # noqa: E402
 from software.agent import safety  # noqa: E402
 from software.agent.executor import server_tool  # noqa: E402
 from software.agent.llm import provider  # noqa: E402
@@ -610,6 +611,82 @@ def _there_is_no_licence_file():
                    for p in REPO.iterdir() if p.is_file())
 
 
+class _StubLink(provider.LlmClient):
+    """A chain link that fails, or keeps calling a tool, under a given name."""
+
+    def __init__(self, provider_name, model, fails):
+        self.provider = provider_name
+        self.model = model
+        self._fails = fails
+
+    async def complete(self, system, messages, tools, max_tokens, temperature):
+        if self._fails:
+            raise provider.ProviderError("down")
+        return mock.calls(("set_phase", {"phase": 1}))
+
+
+class _StubC2:
+    """Just enough of the C2 for a campaign to start, run and wind up."""
+
+    async def get_agent(self, agent_id):
+        return {"id": agent_id, "status": "online", "caps": []}
+
+    async def set_beacon_interval(self, agent_id, seconds, jitter):
+        return None
+
+
+def _a_failover_keeps_the_primarys_tier():
+    # Behavioural, at the point of use: a campaign is run over a chain whose
+    # primary is down and which has already failed over to a `local` link
+    # (never above `reduced`), and the model never stops calling tools. The
+    # report says how many orchestrator turns it was allowed, which is the
+    # limit the run actually held. Open while that is the primary's figure
+    # and the answering link's own tier would have allowed fewer.
+    #
+    # The tier the run is given comes from config.load, from a YAML naming
+    # the same chain, and not from an AgentConfig built by hand: a fix that
+    # derives the tier at load from the weakest link would otherwise leave
+    # this green and the entry stale. So both places a fix could land, the
+    # load and the run, are watched.
+    async def turns_allowed():
+        chain = failover.FailoverClient([
+            _StubLink("anthropic", "claude-sonnet-4-5", fails=True),
+            _StubLink("local", "small-local-model", fails=False)])
+        # Failed over before the campaign is built, so a fix that reads the
+        # answering link when the campaign starts sees the small one too.
+        await chain.complete("", [], [], 16, 0.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "raccoon.yaml")
+            with open(path, "w") as handle:
+                yaml.safe_dump({"agent": {"llm": {
+                    "provider": "anthropic", "model": "claude-sonnet-4-5",
+                    "fallbacks": [{"provider": "local",
+                                   "model": "small-local-model",
+                                   "base_url": "http://127.0.0.1:1/v1"}],
+                }}}, handle)
+            agent_cfg = config.load(argv=[], yaml_path=path,
+                                    env={"AGENT_API_KEY": "sk-fake-tier"})
+        campaign_cfg = config.CampaignConfig.from_form(
+            {"beacons": ["b1"], "scope_allow": ["10.0.1.0/24"],
+             "mode": "auto"}, tier=agent_cfg.capability_tier)
+        conn = db.open_store(":memory:")
+        try:
+            campaign = orchestrator.Campaign(
+                agent_cfg, campaign_cfg, conn, _StubC2(), chain)
+            await campaign.start()
+            report = await campaign.wait()
+        finally:
+            conn.close()
+        found = re.search(r"MAX_TURNS reached after (\d+) turns", report)
+        answering = provider.capability_tier(chain.model, chain.provider)
+        return (int(found.group(1)) if found else None,
+                provider.TIER_LIMITS["full"]["orchestrator_turns"],
+                provider.TIER_LIMITS[answering]["orchestrator_turns"])
+
+    allowed, primarys, answerings = asyncio.run(turns_allowed())
+    return allowed == primarys and answerings < primarys
+
+
 # group -> [(phrase the entry must contain, True-while-open or None)].
 # None means nothing in the working tree can show it: the six commits are on
 # a GitHub reference, and the deferred minors are properties of tests, of
@@ -952,6 +1029,76 @@ class TestTheKnownLimitsRecordTheOpenFindings(_DocCase):
         self.assertEqual(
             len(_OPEN_FINDINGS["Minor, deferred"]) + _DEFERRED_MERGED,
             _DEFERRED_FINDINGS, "the merge count and the entry count differ")
+
+
+# The entries under "The agent layer" that the code can answer for. They are
+# kept apart from _OPEN_FINDINGS, whose groups are the hardening pass's and
+# are counted against it; these are counted, with those, against the README's
+# sentence about how many entries have a test.
+#
+# READ THIS WHEN ONE OF THEM FAILS. The assertion states a limitation as
+# true. It fails when the limitation stops being true, which means the fix
+# has landed: delete the entry from Known limits, delete its predicate here,
+# and delete this record. Do not "fix" the test by changing what it asserts.
+#
+# One exception, and the tier entry is it. Its predicate watches the
+# orchestrator-turn limit only, with the tier taken from config.load and the
+# run driven through a failover, so a fix at either place turns it red. The
+# two fixes close different amounts, and the entry says which:
+#   * the run's tier made the weakest link's in config.load closes both
+#     halves, phases included -- delete the entry as usual;
+#   * the tier re-read per active link closes the turn limit only. The phase
+#     ceiling, fixed when the form becomes a CampaignConfig, stays open, so
+#     if nothing caps or aborts a run at failover, cut the entry down to the
+#     phase ceiling instead, and say there that no test ties it.
+# The failover note in config.available() is not a fix and leaves this green.
+_OPEN_AGENT_LIMITS = [
+    ("A failover does not re-derive the capability tier",
+     _a_failover_keeps_the_primarys_tier),
+]
+
+
+class TestTheAgentLayerLimitsAreStillOpen(_DocCase):
+    def _section(self):
+        return self.doc.split("\n### The agent layer\n", 1)[1].split(
+            "\n### ", 1)[0]
+
+    def test_each_tied_entry_is_listed_and_still_true_of_the_code(self):
+        flat = " ".join(self._section().split()).lower()
+        for phrase, still_open in _OPEN_AGENT_LIMITS:
+            with self.subTest(entry=phrase):
+                self.assertIn(" ".join(phrase.split()).lower(), flat,
+                              "%r is not under 'The agent layer'" % phrase)
+                self.assertTrue(
+                    still_open(),
+                    "%r is no longer true of the code: it has been fixed. "
+                    "Delete it from Known limits and from "
+                    "_OPEN_AGENT_LIMITS." % phrase)
+
+
+_NUMBER_WORDS = ("zero one two three four five six seven eight nine ten eleven "
+                 "twelve thirteen fourteen fifteen sixteen seventeen eighteen "
+                 "nineteen twenty").split()
+
+
+class TestTheReadmeCountsTheTiedLimits(unittest.TestCase):
+    """The README promises a test for every limit the code can answer for.
+
+    It says how many, in words. The number was written once and drifted by
+    one when an entry was added, so it is derived here: whoever ties another
+    limit is sent to the sentence by this test failing.
+    """
+
+    def test_the_sentence_states_how_many_entries_are_tied(self):
+        tied = (sum(1 for entries in _OPEN_FINDINGS.values()
+                    for _, still_open in entries if still_open is not None)
+                + len(_OPEN_AGENT_LIMITS))
+        found = re.search(r"for the (\w+) of those the code can answer for",
+                          README.read_text())
+        self.assertIsNotNone(found, "README.md no longer states the count")
+        self.assertEqual(found.group(1), _NUMBER_WORDS[tied],
+                         "README.md says %r; %d entries have a test tied to "
+                         "the code" % (found.group(1), tied))
 
 
 class _ParserReached(Exception):

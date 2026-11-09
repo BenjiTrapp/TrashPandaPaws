@@ -48,7 +48,7 @@ const DEFAULT_MAX_PHASE = 5;
 
 const A = {
   avail: "unknown",      // "unknown" | "ok" | "down" — the button's three states
-  reason: "",            // why "down", as the service or the proxy put it
+  reason: "",            // why "down", as the service or the proxy put it; when "ok", a caveat the service attaches
   status: null,          // last /status body
   rid: null,             // run id being watched
   gen: 0,                // bumped on every attach/teardown; stale timers check it
@@ -215,7 +215,13 @@ async function agentLoadStatus(){
   const r = await aiCall("status");
   const d = r.ok && r.data && typeof r.data === "object" ? r.data : null;
   A.status = d;
-  if(d && d.available === true){ A.avail = "ok"; A.reason = ""; }
+  // An available service may still carry a reason: a caveat, such as a
+  // static Google key that will not be refreshed. Clearing it here is how
+  // the operator would learn that at the token's hour and not before.
+  if(d && d.available === true){
+    A.avail = "ok";
+    A.reason = typeof d.reason === "string" ? d.reason : "";
+  }
   else { A.avail = "down"; A.reason = reasonOf(r); }
   renderButtons();
   if(d) attachFromStatus();
@@ -256,7 +262,8 @@ function renderButton(b){
     const s = A.status || {};
     title = "Automated Attack - " + (s.provider || "?") + " / " + (s.model || "?")
       + " (capability tier " + (s.tier || "?") + ")"
-      + (warns ? ". " + warns + " OpSec warning(s); click for details." : "");
+      + (warns ? ". " + warns + " OpSec warning(s); click for details." : "")
+      + (A.reason ? ". Note: " + A.reason : "");
   } else if(A.avail === "down"){
     title = "Automated Attack is unavailable: " + A.reason + ". Click to check again.";
   } else {
@@ -345,6 +352,10 @@ function agentOpenPanel(){
       // it matters is the moment a campaign is running on the fallback
       // and the token counts are filed under a model this panel would
       // otherwise still show as the only one.
+      if(A.reason){
+        root.appendChild(h("div", {class: "ai-warns"}, h("b", {text: "Heads-up"}),
+          h("p", {text: A.reason})));
+      }
       const chain = Array.isArray(s.fallbacks) ? s.fallbacks : [];
       if(chain.length){
         root.appendChild(h("h4", {text: "Fallback providers"}));
@@ -401,7 +412,8 @@ function agentOpenPanel(){
   });
   // No agent open means no side panel; say it where the operator is looking.
   if(!shown){
-    if(A.avail === "ok") notify("info", "Automated Attack", "The agent service is available.", 4000);
+    if(A.avail === "ok" && A.reason) notify("warning", "Automated Attack is available, with a caveat", A.reason, 9000);
+    else if(A.avail === "ok") notify("info", "Automated Attack", "The agent service is available.", 4000);
     else notify("warning", "Automated Attack unavailable", A.reason, 7000);
   }
 }
@@ -1515,6 +1527,13 @@ function renderForm(){
           }))
         : null));
 
+  // The form is where the button lands when the service is available, so a
+  // caveat that only the status panel showed would reach nobody who starts
+  // a run.
+  if(A.reason){
+    root.appendChild(h("div", {class: "ai-warns"}, h("b", {text: "Heads-up"}),
+      h("p", {text: A.reason})));
+  }
   FORM_SECTIONS.forEach(function(name){ if(S[name]) root.appendChild(S[name]); });
   root.appendChild(presetBar());
   root.appendChild(submitBar());

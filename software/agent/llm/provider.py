@@ -41,6 +41,7 @@ import re
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import urlparse
 
+from software.agent.llm import gcp_token
 from software.agent.secret import Secret
 
 # ── Shapes ──
@@ -91,7 +92,15 @@ class TransportError(Exception):
     The transport knows neither provider nor model, so the client adds them
     when it turns this into a ProviderError. Anyone writing a replacement
     transport raises this, with a message that holds no URL, header or body.
+
+    `status` is the HTTP status when there was one. The client reads it for
+    a single purpose, to tell a token source that its token was refused;
+    parsing it back out of the message would tie that to the wording.
     """
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
 
 
 # (url, headers, json_body) -> parsed JSON object. Blocking; run in a thread.
@@ -157,6 +166,10 @@ def normalize_tool_call(entry: dict, index: int = 0) -> ToolCall:
 # ── Transport ──
 
 _TIMEOUT_SECONDS = 120
+# A 14B model answering from a CPU over Ollama routinely takes longer than
+# two minutes. That is the normal case for a local endpoint, not a fault, so
+# a timeout there would fail answers that were working.
+LOCAL_TIMEOUT_SECONDS = 300
 _STATUS_HINTS = {
     401: " (the API key was rejected)",
     403: " (the API key was rejected or lacks access)",
@@ -164,7 +177,8 @@ _STATUS_HINTS = {
 }
 
 
-def http_post_json(url: str, headers: Dict[str, str], body: dict) -> dict:
+def http_post_json(url: str, headers: Dict[str, str], body: dict, *,
+                   timeout: float = _TIMEOUT_SECONDS) -> dict:
     """POST a JSON body, return the JSON object that answers.
 
     Every message raised here is built from the status code or the exception
@@ -193,14 +207,15 @@ def http_post_json(url: str, headers: Dict[str, str], body: dict) -> dict:
         # such as x-api-key to whichever host answered. requests only strips
         # the standard Authorization header on a cross-host redirect.
         resp = requests.post(url, headers=headers, json=body,
-                             timeout=_TIMEOUT_SECONDS, allow_redirects=False)
+                             timeout=timeout, allow_redirects=False)
     except requests.RequestException as exc:
         failure = "request failed (%s)" % type(exc).__name__
     if failure is not None:
         raise TransportError(failure)
     if resp.status_code != 200:
         raise TransportError("HTTP %d%s" % (
-            resp.status_code, _STATUS_HINTS.get(resp.status_code, "")))
+            resp.status_code, _STATUS_HINTS.get(resp.status_code, "")),
+            status=resp.status_code)
     try:
         payload = resp.json()
     except ValueError:
@@ -241,13 +256,27 @@ class HttpLlmClient(LlmClient):
 
     def __init__(self, provider: str, model: str, api_key: Optional[str],
                  base_url: str, transport: Optional[Transport] = None,
-                 supports_tools: bool = True):
+                 supports_tools: bool = True,
+                 timeout: Optional[float] = None,
+                 token_source: Optional[Any] = None):
         self.provider = provider
         self.model = model
         self.supports_tools = supports_tools
         self._base_url = base_url.rstrip("/")
-        self._api_key = Secret(api_key)
-        self._transport = transport or http_post_json
+        # The credential currently in use. A token source replaces it before
+        # each turn, which is why the subclasses read it at request-build
+        # time and never keep a copy.
+        self._bearer = Secret(api_key)
+        self._token_source = token_source
+        self._timeout = _TIMEOUT_SECONDS if timeout is None else timeout
+        if transport is None:
+            # The timeout is bound into the default transport rather than
+            # passed through the Transport signature, which stubs depend on.
+            # An injected transport is the caller's own, so it is kept as is.
+            transport = (lambda url, headers, body:
+                         http_post_json(url, headers, body,
+                                        timeout=self._timeout))
+        self._transport = transport
 
     def __repr__(self) -> str:
         return "<%s provider=%r model=%r>" % (
@@ -268,6 +297,27 @@ class HttpLlmClient(LlmClient):
         """Turn the vendor's reply into a Completion."""
 
     async def complete(self, system, messages, tools, max_tokens, temperature):
+        token = None
+        if self._token_source is not None:
+            # Off the event loop: bearer() may run gcloud or fetch from the
+            # metadata server. Nothing is awaited between storing the token
+            # and _build_request reading it, so two turns on one client
+            # cannot swap each other's credential.
+            #
+            # Captured and raised outside the except, as below. A token
+            # source's failure is a library exception whose message may hold
+            # a URL or a response, so only a TokenUnavailable message (built
+            # to be safe) is shown and anything else is named by class.
+            failure = None
+            try:
+                token = await asyncio.to_thread(self._token_source.bearer)
+            except gcp_token.TokenUnavailable as exc:
+                failure = "no access token: %s" % exc
+            except Exception as exc:
+                failure = "no access token (%s)" % type(exc).__name__
+            if failure is not None:
+                raise self._fail(failure)
+            self._bearer = Secret(token)
         url, headers, body = self._build_request(
             system, messages, list(tools) if self.supports_tools else [],
             max_tokens, temperature)
@@ -277,11 +327,13 @@ class HttpLlmClient(LlmClient):
         # every normal path but leaves it reachable on the object, and a
         # transport exception can hold the request headers.
         failure = None
+        refused = False
         try:
             payload = await asyncio.to_thread(
                 self._transport, url, headers, body)
         except TransportError as exc:
             failure = str(exc)
+            refused = getattr(exc, "status", None) == 401
         except ProviderError:
             raise
         except Exception as exc:
@@ -289,6 +341,14 @@ class HttpLlmClient(LlmClient):
             # the library under it, may hold the URL or the headers.
             failure = "request failed (%s)" % type(exc).__name__
         if failure is not None:
+            invalidate = getattr(self._token_source, "invalidate", None)
+            if refused and token is not None and invalidate is not None:
+                # The token the source vouched for was refused, so its idea
+                # of the expiry was wrong. Without this the next turn would
+                # be handed the same token, and so would every turn until
+                # the cache let go of it. The local `token`, not
+                # self._bearer: another turn may have replaced that since.
+                await asyncio.to_thread(invalidate, token)
             raise self._fail(failure)
         bad_shape = False
         try:
@@ -379,7 +439,7 @@ def _on_full_allowlist(model: str) -> bool:
 def capability_tier(model, provider_name) -> str:
     """"full", "reduced" or "minimal" for the model driving the agent."""
     name = (model or "").strip().lower()
-    local = (provider_name or "").strip().lower() == "local"
+    local = (provider_name or "").strip().lower() in LOCAL_PROVIDERS
     # A local endpoint never reaches "full" on its name alone. The name is
     # whatever the operator typed; the server behind it may be anything,
     # while openrouter and opencode route to the model they are asked for.
@@ -407,7 +467,22 @@ _PROVIDERS = {
     "openrouter": ("openai", "https://openrouter.ai/api/v1", True, False),
     "opencode":   ("openai", None, True, True),
     "local":      ("openai", "http://127.0.0.1:11434/v1", False, False),
+    "ollama":     ("openai", "http://127.0.0.1:11434/v1", False, False),
+    "gemini":     ("openai",
+                   "https://generativelanguage.googleapis.com/v1beta/openai",
+                   True, False),
+    # Computed from the project and location, like bedrock's; see
+    # vertex_base_url. No key: the bearer is a short-lived token that a
+    # token source supplies.
+    "vertex":     ("openai", None, False, False),
 }
+
+# Providers whose endpoint is whatever the operator typed, so the model name
+# vouches for nothing: a server named "gpt-4o" may be a 7B model. openrouter
+# and opencode route to the model they are asked for and are not in here.
+# "local" is LM Studio and llama.cpp; "ollama" is its own name for the same
+# shape of endpoint.
+LOCAL_PROVIDERS = frozenset(("local", "ollama"))
 
 
 def _is_loopback(host: Optional[str]) -> bool:
@@ -419,17 +494,18 @@ def _is_loopback(host: Optional[str]) -> bool:
         return False
 
 
-def _checked_base_url(name: str, url: str, has_key: bool) -> str:
+def _checked_base_url(name: str, url: str, has_credential: bool) -> str:
     parts = urlparse(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ProviderError(
             "provider %r: base_url must be an http(s) URL" % name)
-    # The key goes wherever base_url points. Over cleartext HTTP to anything
-    # but this machine it would cross the network readable.
-    if has_key and parts.scheme == "http" and not _is_loopback(parts.hostname):
+    # The credential goes wherever base_url points. Over cleartext HTTP to
+    # anything but this machine it would cross the network readable.
+    if (has_credential and parts.scheme == "http"
+            and not _is_loopback(parts.hostname)):
         raise ProviderError(
-            "provider %r: refusing to send an API key over plain http to %s; "
-            "use https" % (name, parts.hostname))
+            "provider %r: refusing to send a credential over plain http to "
+            "%s; use https" % (name, parts.hostname))
     return url
 
 
@@ -454,6 +530,129 @@ def bedrock_base_url(region=None) -> str:
                   or os.environ.get("AWS_DEFAULT_REGION")
                   or _BEDROCK_DEFAULT_REGION)
     return "https://bedrock-runtime.%s.amazonaws.com" % region
+
+
+# ── Vertex's per-project, per-region endpoint ──
+
+# Google's own shape for a project id and for a location: lowercase letters,
+# digits and hyphens, starting and ending with a letter or digit. Both values
+# are interpolated into a URL, and the bearer goes wherever that URL points,
+# so this is a credential boundary and not a tidiness check. A dot in the
+# location moves the host ("europe-west4.evil.example"), a slash or "?" in
+# the project moves the path, an "@" turns the host into userinfo. \Z and
+# not $: "$" also matches before a trailing newline.
+_GCP_IDENTIFIER = re.compile(r"\A[a-z0-9][a-z0-9-]{0,61}[a-z0-9]\Z")
+
+# The location is also the front of a host label, "<location>-aiplatform",
+# and a DNS label is at most 63 characters. The project is only ever a path
+# segment, so it keeps the identifier's own limit.
+_VERTEX_HOST_SUFFIX = "-aiplatform"
+_VERTEX_MAX_LOCATION = 63 - len(_VERTEX_HOST_SUFFIX)
+
+# EU first, as the Bedrock endpoint here already is: a default that sent an
+# operator's findings to a US region without being asked would be the quiet
+# kind of surprise this project avoids. config.py's default is this one.
+VERTEX_DEFAULT_LOCATION = "europe-west4"
+
+# The API version on Vertex's openapi path; see vertex_base_url.
+VERTEX_API_VERSION = "v1"
+
+# Google's non-regional location. Its host has no regional prefix:
+# "global-aiplatform.googleapis.com" does not exist.
+_VERTEX_GLOBAL = "global"
+
+
+def _vertex_identifier(field: str, env: str, value: Any,
+                       longest: int = 63) -> str:
+    if value is None or value == "":
+        raise ProviderError(
+            "provider 'vertex': %s is not set; set %s" % (field, env))
+    if (not isinstance(value, str) or not _GCP_IDENTIFIER.match(value)
+            or len(value) > longest):
+        raise ProviderError(
+            "provider 'vertex': %s (%s) must be 2 to %d lowercase letters, "
+            "digits or hyphens, starting and ending with a letter or digit; "
+            "got %.40r" % (field, env, longest, value))
+    return value
+
+
+def vertex_base_url(project: Any, location: Any) -> str:
+    """The OpenAI-compatible endpoint for a project in a location.
+
+    Computed rather than written, as bedrock_base_url is, because the
+    location appears twice (in the host and in the path) and the two must
+    agree: a mismatch is a 404 at the first call, not a configuration error.
+
+    "global" is mapped to the unprefixed host rather than refused: it is a
+    real location that Google documents, some models are served only from
+    it, and an operator who typed it meant exactly that host.
+
+    "v1" is the stable path. "v1beta1" is the documented alternative on this
+    endpoint if tool calling misbehaves on v1. The code takes the version
+    from VERTEX_API_VERSION, here and in the fallback hint failover gives,
+    so switching it is a one-word change there; a hand-typed base_url, and
+    the examples in docs/AGENT.md, spell it out and would change with it.
+    """
+    project = _vertex_identifier("vertex_project", "AGENT_VERTEX_PROJECT",
+                                 project)
+    location = _vertex_identifier("vertex_location", "AGENT_VERTEX_LOCATION",
+                                  location, _VERTEX_MAX_LOCATION)
+    # Google's documented global endpoint is
+    # https://aiplatform.googleapis.com/v1/projects/P/locations/global/
+    # endpoints/openapi: the unprefixed host, with "global" only in the path.
+    host = ("aiplatform.googleapis.com" if location == _VERTEX_GLOBAL
+            else location + _VERTEX_HOST_SUFFIX + ".googleapis.com")
+    return ("https://%s/%s/projects/%s/locations/%s/endpoints/openapi"
+            % (host, VERTEX_API_VERSION, project, location))
+
+
+# Vertex's openapi endpoint takes "publisher/model". A bare id is a 404 at
+# the first call, which on an unattended run nobody is there to see.
+_VERTEX_MODEL = re.compile(r"\A[a-z0-9][a-z0-9-]*/[^/\s][^\s]*\Z")
+
+_VERTEX_GLOBAL_HOST = "aiplatform.googleapis.com"
+_VERTEX_REGIONAL_SUFFIX = "-aiplatform.googleapis.com"
+
+
+def _check_vertex_host(name: str, base_url: str) -> None:
+    """Refuse a base_url whose host is not Vertex, when a token source feeds it.
+
+    The computed URL is validated because the bearer goes wherever the URL
+    points; one typed by hand needs the same, and a fallback link must type
+    it. A token from the operator's own gcloud login carries their account's
+    cloud-platform scope for an hour, so a typo such as
+    `aiplatform.googleapis.co` would hand that to whoever holds the name.
+    There is deliberately no way to turn this off: a Vertex token goes to
+    Vertex, and a gateway in front of it is what `opencode` with the
+    gateway's own key is for.
+    """
+    host = (urlparse(base_url).hostname or "").lower()
+    if host == _VERTEX_GLOBAL_HOST or host.endswith(_VERTEX_REGIONAL_SUFFIX):
+        return
+    raise ProviderError(
+        "provider %r: base_url host %.80r is not Vertex AI; a token from the "
+        "Google token source is sent only to %s or LOCATION%s. To reach a "
+        "gateway or proxy, use provider 'opencode' with that gateway's own "
+        "key instead" % (name, host, _VERTEX_GLOBAL_HOST,
+                         _VERTEX_REGIONAL_SUFFIX))
+
+
+def _vertex_token_source(kind: str, key_file: Optional[str]):
+    # The failure is captured and raised once the except has exited, as in
+    # http_post_json, so the ProviderError has no __context__ to walk.
+    failure = None
+    try:
+        gcp_token.validate(kind, key_file=key_file)
+    except gcp_token.TokenUnavailable as exc:
+        failure = str(exc)
+    if failure is not None:
+        hint = ""
+        if kind == "file" and not key_file:
+            hint = "; set api_key_file (AGENT_API_KEY_FILE)"
+        raise ProviderError(
+            "provider 'vertex': token_source %r cannot be used: %s%s"
+            % (kind, failure, hint))
+    return gcp_token.source(kind, key_file=key_file)
 
 
 def create_client(cfg) -> LlmClient:
@@ -481,11 +680,41 @@ def create_client(cfg) -> LlmClient:
         raise ProviderError("provider %r requires an api_key" % name)
     if not model:
         raise ProviderError("provider %r requires an explicit model" % name)
+    token_source = None
+    if name == "vertex":
+        if not _VERTEX_MODEL.match(model):
+            raise ProviderError(
+                "provider 'vertex': model %.60r needs a publisher prefix, "
+                "as in google/gemini-3-pro; a bare id is a 404 at the first "
+                "call" % model)
+        if not base_url:
+            base_url = vertex_base_url(
+                getattr(cfg, "vertex_project", None),
+                getattr(cfg, "vertex_location", None)
+                or VERTEX_DEFAULT_LOCATION)
+        # A fixed key, which the configuration has already labelled for the
+        # operator as one that will not be refreshed, is used as it stands.
+        # Otherwise the token comes from a source, and that choice is checked
+        # now: `file` with no api_key_file would load cleanly and fail at
+        # the first model call.
+        if not getattr(cfg, "static_bearer", False):
+            token_source = _vertex_token_source(
+                getattr(cfg, "token_source", None) or "auto",
+                getattr(cfg, "api_key_file", None) or None)
     if needs_url and not base_url:
         raise ProviderError(
             "provider %r has no default endpoint; set base_url to its "
             "OpenAI-compatible endpoint" % name)
-    base_url = _checked_base_url(name, base_url, bool(api_key))
+    # A token source is a credential too. Without counting it, a provider
+    # with no key at construction, such as vertex, would pass this guard on
+    # an http:// base URL and then be handed a live OAuth bearer in cleartext.
+    base_url = _checked_base_url(
+        name, base_url, bool(api_key) or token_source is not None)
+    if token_source is not None:
+        _check_vertex_host(name, base_url)
+        # The source's token replaces the key before every turn; keeping both
+        # would leave a credential the operator has superseded in memory.
+        api_key = None
 
     if kind == "anthropic":
         return anthropic_client.AnthropicClient(
@@ -494,4 +723,6 @@ def create_client(cfg) -> LlmClient:
         return bedrock_client.BedrockClient(
             model=model, api_key=api_key, base_url=base_url)
     return openai_client.OpenAiCompatibleClient(
-        provider=name, model=model, api_key=api_key, base_url=base_url)
+        provider=name, model=model, api_key=api_key, base_url=base_url,
+        timeout=LOCAL_TIMEOUT_SECONDS if name in LOCAL_PROVIDERS else None,
+        token_source=token_source)

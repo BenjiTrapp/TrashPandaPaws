@@ -205,6 +205,50 @@ class TestCompose(unittest.TestCase):
             self.assertIn(key, env, key)
             self.assertRegex(env[key], r"^\$\{[A-Z_]+(:-[^}]*)?\}$", key)
 
+    def test_the_vertex_settings_reach_the_container(self):
+        # Without these the container cannot run the vertex provider at all:
+        # compose passes through only what it lists, so a variable exported
+        # on the host never arrives. Blank when unset, because a blank
+        # value falls through to the defaults (europe-west4, auto) while a
+        # written-in default here would stand in for the operator's choice.
+        env = _env_map(self.services["agent"])
+        for key in ("AGENT_VERTEX_PROJECT", "AGENT_VERTEX_LOCATION",
+                    "AGENT_TOKEN_SOURCE"):
+            self.assertIn(key, env, key)
+            self.assertEqual(env[key], "${%s:-}" % key, key)
+
+    def test_a_custom_endpoint_reaches_the_container(self):
+        # opencode has no default endpoint at all, so without this it cannot
+        # start in the container; a local server elsewhere needs it too.
+        env = _env_map(self.services["agent"])
+        self.assertEqual(env.get("AGENT_BASE_URL"), "${AGENT_BASE_URL:-}")
+
+    def test_the_provider_chain_has_a_commented_mount_to_edit(self):
+        # The chain is YAML-only and the image has no YAML. The mount is
+        # commented out: an uncommented one for a path that may not exist
+        # would stop `docker compose up` for everybody, so the file offers
+        # the line and the test checks it stays a comment.
+        self.assertRegex(
+            self.raw, r"(?m)^\s*# - \S*raccoon\.yaml:"
+                      r"/opt/raccoon/configs/raccoon\.yaml:ro$")
+        agent_volumes = self.services["agent"].get("volumes") or []
+        self.assertFalse([v for v in agent_volumes if "raccoon.yaml" in str(v)],
+                         agent_volumes)
+
+    def test_the_tier_override_reaches_the_container(self):
+        # The documented workaround for a chain that ends on a small model is
+        # AGENT_CAPABILITY_TIER, and it is a safety limit. A document that
+        # tells the operator to set it while the container drops it is worse
+        # than saying nothing.
+        env = _env_map(self.services["agent"])
+        self.assertEqual(env.get("AGENT_CAPABILITY_TIER"),
+                         "${AGENT_CAPABILITY_TIER:-}")
+
+    def test_the_file_says_why_gcloud_is_not_in_the_container(self):
+        # The slim image has no gcloud on purpose; without the comment the
+        # next reader adds it, or wonders why `auto` finds nothing.
+        self.assertRegex(self.raw, r"(?is)gcloud.{0,300}(absent|not in)")
+
     def test_the_fixed_token_requirement_is_written_down(self):
         # Without a fixed RACCOON_TOKEN the C2 invents one at startup and the
         # agent cannot authenticate -- the failure looks like "0 beacons",

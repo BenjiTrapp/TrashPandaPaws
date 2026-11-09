@@ -367,6 +367,44 @@ def _js_table_flags(js, name):
     return {int(k): v == "true" for k, v in re.findall(r"(\d):\s*(true|false)", m.group(1))}
 
 
+class TestACaveatOnAnAvailableServiceIsShown(unittest.TestCase):
+    """available:true with a reason is a caveat (a static key that will not
+    refresh), not a failure. Discarding it is how an operator learns at the
+    token's hour what the service knew at startup."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.js = AGENT_JS.read_text()
+
+    def test_status_load_keeps_the_reason_of_an_available_service(self):
+        load = self.js[self.js.index("async function agentLoadStatus"):]
+        load = load[:load.index("\n}\n")]
+        self.assertNotRegex(load, r'A\.avail = "ok";\s*A\.reason = "";')
+        self.assertRegex(load, r'A\.avail = "ok";\s*A\.reason = typeof d\.reason')
+
+    def test_it_is_shown_where_the_button_lands_and_in_the_status_panel(self):
+        # The button lands on the form when the service is available, so a
+        # caveat only the status panel showed would reach nobody starting a run.
+        form = self.js[self.js.index("function renderForm"):]
+        form = form[:form.index("\nfunction tagEditor")]
+        panel = self.js[self.js.index("function agentOpenPanel"):]
+        panel = panel[:panel.index("\n}\n")]
+        for where in (form, panel):
+            self.assertRegex(where, r"if\(A\.reason\)")
+            self.assertIn("ai-warns", where)
+
+    def test_it_is_rendered_as_an_advisory_not_as_an_error(self):
+        # The class the OpSec warnings use, and a warning toast; never the
+        # "Unavailable:" block or an error toast, which mean it is down.
+        advisory = self.js[self.js.index("if(A.reason){"):]
+        advisory = advisory[:advisory.index("}\n")]
+        self.assertNotIn("Unavailable", advisory)
+        self.assertRegex(self.js, r'A\.avail === "ok" && A\.reason\) notify\("warning"')
+
+    def test_the_button_title_carries_it(self):
+        self.assertRegex(self.js, r'\(A\.reason \? "\. Note: " \+ A\.reason : ""\)')
+
+
 class TestFormStyles(unittest.TestCase):
     def test_form_classes_are_styled(self):
         css = AGENT_CSS.read_text()

@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import tempfile
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -24,7 +25,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from software.agent import config, gate, safety
-from software.agent.llm import provider
+from software.agent.llm import failover, gcp_token, provider
 from software.agent.store import db, queries
 
 _FAKE_KEY = "sk-not-a-real-key"
@@ -341,6 +342,25 @@ class TestSecrets(unittest.TestCase):
         path = _keyfile("\n")
         with self.assertRaises(config.ConfigError):
             _load(argv=["--api-key-file", path])
+
+    def test_undecodable_keyfile_leaves_no_key_bytes_on_the_chain(self):
+        # A UnicodeDecodeError holds the bytes it failed on in `.object`,
+        # and here those are the key. Nothing on the ConfigError's chain may
+        # reach them, however an error serialiser walks it.
+        handle, path = tempfile.mkstemp(dir=_tmp.name, suffix=".key")
+        with os.fdopen(handle, "wb") as f:
+            f.write(_FAKE_KEY.encode() + b"\xff\xfe")
+        os.chmod(path, 0o600)
+        with self.assertRaises(config.ConfigError) as ctx:
+            config._read_keyfile(path)
+        seen, current = [], ctx.exception
+        while current is not None:
+            seen.append(current)
+            self.assertNotIn(_FAKE_KEY, repr(current))
+            self.assertNotIn(_FAKE_KEY, repr(vars(current)))
+            self.assertNotIn(_FAKE_KEY, repr(getattr(current, "object", "")))
+            current = current.__context__ or current.__cause__
+        self.assertEqual(len(seen), 1, "the chain should hold nothing else")
 
     def test_directory_as_keyfile_is_refused(self):
         with self.assertRaises(config.ConfigError):
@@ -933,6 +953,21 @@ class TestOpsecWarningsSayWhatIsNotDelivered(unittest.TestCase):
     def test_quiet_with_a_local_model_is_silent(self):
         self.assertEqual(self._warnings("local", "quiet"), [])
 
+    def test_a_quiet_profile_does_not_warn_about_any_local_provider(self):
+        # "local" and "ollama" both keep the conversation on the box; telling
+        # an ollama operator to "set provider to local" sends them where
+        # they already are.
+        campaign = types.SimpleNamespace(opsec_profile="quiet")
+        for name in sorted(provider.LOCAL_PROVIDERS):
+            with self.subTest(provider=name):
+                agent = types.SimpleNamespace(provider=name)
+                self.assertEqual(
+                    [w for w in config.opsec_warnings(agent, campaign)
+                     if "goes to it" in w], [])
+        hosted = types.SimpleNamespace(provider="anthropic")
+        self.assertTrue(any("goes to it" in w
+                            for w in config.opsec_warnings(hosted, campaign)))
+
     def test_yolo_warns_about_the_scan_rate_and_says_what_is_untouched(self):
         warnings = self._warnings("local", "yolo")
         self.assertEqual(len(warnings), 1)
@@ -1089,6 +1124,283 @@ class TestAFallbackChainIsReadFromYaml(unittest.TestCase):
         with self.assertRaises(config.ConfigError) as caught:
             self._load([{"provider": "bedrock", "model": "m"}])
         self.assertIn("primary", str(caught.exception))
+
+
+class TestAWeakerFallbackIsANoteNotADowngrade(unittest.TestCase):
+    """The tier is the primary's for the whole run (Known limits), so a
+    fallback weaker than it is labelled, the way a static bearer is. The run
+    keeps its tier: lowering it to the weakest link was decided against."""
+
+    _PI = {"provider": "ollama", "model": "qwen2.5:7b",
+           "base_url": "http://10.0.1.50:11434/v1"}
+
+    def _load(self, fallbacks, env=None):
+        data = {"agent": {"llm": {"provider": "anthropic",
+                                  "model": "claude-sonnet-4-5",
+                                  "fallbacks": fallbacks}}}
+        return _load(data=data, env=dict(env or {}, AGENT_API_KEY=_FAKE_KEY))
+
+    def test_a_weaker_fallback_is_named_with_both_tiers(self):
+        cfg = self._load([self._PI])
+        ok, reason = cfg.available()
+        self.assertTrue(ok, reason)
+        self.assertEqual(cfg.capability_tier, "full")
+        for said in ("fallback 1", "ollama / qwen2.5:7b", "'minimal'",
+                     "'full'", "highest phase 5", "AGENT_CAPABILITY_TIER"):
+            self.assertIn(said, reason)
+        self.assertNotIn(_FAKE_KEY, reason)
+
+    def test_the_weakest_link_is_the_one_named(self):
+        cfg = self._load([
+            {"provider": "ollama", "model": "qwen2.5-coder",
+             "base_url": "http://127.0.0.1:11434/v1"},          # reduced
+            self._PI,                                           # minimal
+            {"provider": "gemini", "model": "gemini-3-flash",
+             "api_key_env": "GEMINI_API_KEY"}],                 # reduced
+            env={"GEMINI_API_KEY": "gm-fake-0123456789"})
+        reason = cfg.available()[1]
+        self.assertIn("fallback 2", reason)
+        self.assertNotIn("fallback 1", reason)
+        self.assertNotIn("fallback 3", reason)
+
+    def test_the_note_changes_nothing_about_the_run(self):
+        cfg = self._load([self._PI])
+        self.assertEqual(cfg.capability_tier, "full")
+        campaign = config.CampaignConfig.from_form(
+            dict(_FORM, phases=[1, 2, 3, 4, 5]), tier=cfg.capability_tier)
+        self.assertIn(5, campaign.phases)
+
+    def test_no_weaker_fallback_is_no_note(self):
+        for fallbacks in ((), [{"provider": "openrouter",
+                                "model": "openai/gpt-5",
+                                "api_key_env": "OR_KEY"}]):
+            with self.subTest(fallbacks=fallbacks):
+                cfg = self._load(list(fallbacks),
+                                 env={"OR_KEY": "or-fake-0123456789"})
+                self.assertEqual(cfg.available(), (True, ""))
+
+    def test_a_tier_set_to_the_weakest_link_is_no_note(self):
+        # The remedy the note names is what silences it.
+        cfg = self._load([self._PI],
+                         env={"AGENT_CAPABILITY_TIER": "minimal"})
+        self.assertEqual(cfg.available(), (True, ""))
+
+    def test_it_rides_beside_the_other_reasons(self):
+        cfg = self._load([self._PI, {"provider": "anthropic",
+                                     "model": "claude-x",
+                                     "api_key_env": "MISSING_KEY"}])
+        ok, reason = cfg.available()
+        self.assertFalse(ok)
+        self.assertIn("requires an api_key", reason)
+        self.assertIn("fallback 1 (ollama / qwen2.5:7b) is 'minimal'", reason)
+
+
+# ── Vertex ──
+
+_VERTEX = {"AGENT_PROVIDER": "vertex", "AGENT_MODEL": "google/m",
+           "AGENT_VERTEX_PROJECT": "proj"}
+
+
+class TestVertexFieldsResolveThroughTheCascade(unittest.TestCase):
+    """The three Vertex settings, none of them a credential."""
+
+    # (field, command-line flag, YAML key, environment variable, default)
+    FIELDS = (
+        ("vertex_project", "--vertex-project", "vertex_project",
+         "AGENT_VERTEX_PROJECT", None),
+        ("vertex_location", "--vertex-location", "vertex_location",
+         "AGENT_VERTEX_LOCATION", "europe-west4"),
+        ("token_source", "--token-source", "token_source",
+         "AGENT_TOKEN_SOURCE", "auto"),
+    )
+    VALUES = {"vertex_project": ("from-cli", "from-yaml", "from-env"),
+              "vertex_location": ("us-east5", "asia-east1", "europe-west1"),
+              "token_source": ("gcloud", "metadata", "file")}
+
+    def test_the_defaults(self):
+        cfg = _load()
+        for name, _flag, _key, _env, default in self.FIELDS:
+            with self.subTest(field=name):
+                self.assertEqual(getattr(cfg, name), default)
+
+    def test_each_level_supplies_its_field(self):
+        for name, flag, key, env, _default in self.FIELDS:
+            cli_value, yaml_value, env_value = self.VALUES[name]
+            with self.subTest(field=name, level="command line"):
+                self.assertEqual(
+                    getattr(_load(argv=[flag, cli_value]), name), cli_value)
+            with self.subTest(field=name, level="yaml"):
+                cfg = _load(data={"agent": {"llm": {key: yaml_value}}})
+                self.assertEqual(getattr(cfg, name), yaml_value)
+            with self.subTest(field=name, level="environment"):
+                cfg = _load(env={env: env_value})
+                self.assertEqual(getattr(cfg, name), env_value)
+
+    def test_the_levels_rank_command_line_yaml_environment(self):
+        for name, flag, key, env, _default in self.FIELDS:
+            cli_value, yaml_value, env_value = self.VALUES[name]
+            with self.subTest(field=name):
+                data = {"agent": {"llm": {key: yaml_value}}}
+                cfg = _load(argv=[flag, cli_value], data=data,
+                            env={env: env_value})
+                self.assertEqual(getattr(cfg, name), cli_value)
+                cfg = _load(data=data, env={env: env_value})
+                self.assertEqual(getattr(cfg, name), yaml_value)
+
+    def test_an_unknown_token_source_is_a_configuration_error(self):
+        with self.assertRaises(config.ConfigError) as caught:
+            _load(env={"AGENT_TOKEN_SOURCE": "magic"})
+        message = str(caught.exception)
+        self.assertIn("token_source", message)
+        for kind in ("auto", "metadata", "gcloud", "file"):
+            self.assertIn(kind, message)
+
+
+class TestTheKeyfilePathSurvivesLoad(unittest.TestCase):
+    """The `file` token source re-reads the path; startup still reads it once."""
+
+    def test_the_api_key_file_path_survives_load(self):
+        path = _keyfile(_FAKE_KEY)
+        cfg = _load(env={"AGENT_API_KEY_FILE": path})
+        self.assertEqual(cfg.api_key_file, path)
+        self.assertEqual(cfg.api_key, _FAKE_KEY)
+
+    def test_no_path_is_none(self):
+        self.assertIsNone(_load().api_key_file)
+
+    def test_the_path_is_not_the_key_and_the_key_stays_out_of_repr(self):
+        path = _keyfile(_FAKE_KEY)
+        cfg = _load(env={"AGENT_API_KEY_FILE": path})
+        self.assertNotIn(_FAKE_KEY, repr(cfg))
+
+
+class TestWhichVertexCredentialIsUsed(unittest.TestCase):
+    """An explicit token source, else a present key as a labelled static
+    bearer, else `auto`. The middle case is a deliberate opt-in for a quick
+    supervised run; the point is that it is labelled and not discovered."""
+
+    NOTE = "will not be refreshed"
+
+    def setUp(self):
+        # token_source="gcloud" is checked against PATH when the client is
+        # built, and the machine running the suite may have no gcloud.
+        patch = unittest.mock.patch.object(
+            gcp_token.shutil, "which", return_value="/usr/bin/gcloud")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_an_explicit_token_source_beats_a_present_key(self):
+        cfg = _load(env=dict(_VERTEX, AGENT_API_KEY=_FAKE_KEY,
+                             AGENT_TOKEN_SOURCE="gcloud"))
+        self.assertFalse(cfg.static_bearer)
+        # Equal to the whole answer, not "lacks the note": a provider the
+        # client factory refuses would also lack the note.
+        self.assertEqual(cfg.available(), (True, ""))
+
+    def test_a_key_with_vertex_and_auto_is_a_labelled_static_bearer(self):
+        cfg = _load(env=dict(_VERTEX, AGENT_API_KEY=_FAKE_KEY))
+        self.assertTrue(cfg.static_bearer)
+        ok, reason = cfg.available()
+        self.assertTrue(ok)
+        self.assertIn(self.NOTE, reason)
+        self.assertIn("hour", reason)
+        self.assertNotIn(_FAKE_KEY, reason)
+
+    def test_the_note_names_the_knobs_and_says_an_explicit_value_wins(self):
+        reason = _load(env=dict(_VERTEX, AGENT_API_KEY=_FAKE_KEY)
+                       ).available()[1]
+        for knob in ("AGENT_TOKEN_SOURCE", "agent.llm.token_source",
+                     "--token-source", "takes precedence"):
+            self.assertIn(knob, reason)
+        # Derived from the module, so the list cannot drift from it.
+        for kind in gcp_token.KINDS:
+            if kind != "auto":
+                self.assertIn(kind, reason)
+
+    def test_a_keyfile_with_vertex_and_auto_is_a_static_bearer_too(self):
+        path = _keyfile(_FAKE_KEY)
+        cfg = _load(env=dict(_VERTEX, AGENT_API_KEY_FILE=path))
+        self.assertTrue(cfg.static_bearer)
+        ok, reason = cfg.available()
+        self.assertTrue(ok)
+        self.assertIn(self.NOTE, reason)
+
+    def test_no_key_leaves_auto_to_walk_its_sources(self):
+        cfg = _load(env=dict(_VERTEX))
+        self.assertFalse(cfg.static_bearer)
+        self.assertEqual(cfg.available(), (True, ""))
+
+    def test_another_provider_with_a_key_is_not_a_static_bearer(self):
+        cfg = _load(env={"AGENT_PROVIDER": "anthropic", "AGENT_MODEL": "m",
+                         "AGENT_API_KEY": _FAKE_KEY})
+        self.assertFalse(cfg.static_bearer)
+        self.assertEqual(cfg.available(), (True, ""))
+
+    def test_the_label_does_not_make_a_usable_run_unusable(self):
+        # The label rides beside a usable answer: refusing the run would
+        # turn the opt-in into a prohibition. The chain is built for real.
+        cfg = _load(env=dict(_VERTEX, AGENT_API_KEY=_FAKE_KEY))
+        ok, reason = cfg.available()
+        self.assertTrue(ok)
+        self.assertIn(self.NOTE, reason)
+        self.assertNotIn(_FAKE_KEY, reason)
+
+    def test_the_file_source_without_a_key_file_is_reported_at_startup(self):
+        cfg = _load(env=dict(_VERTEX, AGENT_TOKEN_SOURCE="file"))
+        ok, reason = cfg.available()
+        self.assertFalse(ok)
+        self.assertIn("token_source", reason)
+        self.assertIn("api_key_file", reason)
+
+    def test_a_vertex_run_without_a_project_says_what_to_set(self):
+        env = dict(_VERTEX)
+        del env["AGENT_VERTEX_PROJECT"]
+        ok, reason = _load(env=env).available()
+        self.assertFalse(ok)
+        self.assertIn("AGENT_VERTEX_PROJECT", reason)
+
+    def test_the_label_is_reported_beside_other_problems(self):
+        cfg = _load(data={"c2": {"sliver": {"enabled": True}}},
+                    env=dict(_VERTEX, AGENT_API_KEY=_FAKE_KEY))
+        ok, reason = cfg.available()
+        self.assertFalse(ok)
+        self.assertIn(self.NOTE, reason)
+        self.assertIn("sliver", reason.lower())
+
+
+class TestAVertexFallbackLinkRefusesAStaticBearer(unittest.TestCase):
+    def _data(self, link):
+        return {"agent": {"llm": {
+            "provider": "anthropic", "model": "claude-sonnet-4",
+            "fallbacks": [link]}}}
+
+    def test_a_vertex_fallback_link_refuses_api_key_env(self):
+        with self.assertRaises(config.ConfigError) as caught:
+            _load(data=self._data({
+                "provider": "vertex", "model": "google/m",
+                "base_url": "https://x.googleapis.com/v1/p/openapi",
+                "api_key_env": "SOME_TOKEN"}),
+                env={"SOME_TOKEN": _FAKE_KEY})
+        message = str(caught.exception)
+        self.assertIn("api_key_env", message)
+        self.assertIn("vertex", message)
+        self.assertIn("expir", message)
+        self.assertNotIn(_FAKE_KEY, message)
+
+    def test_a_vertex_link_without_api_key_env_is_read(self):
+        cfg = _load(data=self._data({
+            "provider": "vertex", "model": "google/m",
+            "base_url": "https://x.googleapis.com/v1/p/openapi"}))
+        link = cfg.fallbacks[0]
+        self.assertEqual((link.provider, link.model), ("vertex", "google/m"))
+        self.assertIsNone(link.api_key)
+
+    def test_other_providers_still_name_their_key_variable(self):
+        cfg = _load(data=self._data({
+            "provider": "openrouter", "model": "m",
+            "api_key_env": "SOME_TOKEN"}), env={"SOME_TOKEN": "second"})
+        self.assertEqual(cfg.fallbacks[0].api_key, "second")
+
 
 if __name__ == "__main__":
     unittest.main()

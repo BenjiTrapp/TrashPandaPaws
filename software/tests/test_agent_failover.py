@@ -14,6 +14,7 @@ every link fails it raises rather than returning something empty.
 
 import asyncio
 import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -263,6 +264,70 @@ class TestTheChainIsBuiltFromTheConfig(unittest.TestCase):
         chain = failover.create_chain(cfg)
         self.assertEqual([h["provider"] for h in chain.health()],
                          ["bedrock", "local"])
+
+    def test_a_vertex_link_without_a_base_url_says_it_needs_one(self):
+        # A link carries provider, model, key and base_url and nothing else,
+        # so it cannot inherit the primary's project. The old message said
+        # "set AGENT_VERTEX_PROJECT", which is already set in this case.
+        from software.agent import config
+        from software.agent.llm.provider import ProviderError
+        cfg = self._cfg(vertex_project="my-proj", fallbacks=(
+            config.FallbackLink(provider="vertex",
+                                model="google/gemini-3-pro"),))
+        with self.assertRaises(ProviderError) as caught:
+            failover.create_chain(cfg)
+        message = str(caught.exception)
+        self.assertIn("explicit base_url", message)
+        self.assertIn("fallback 1", message)
+        self.assertNotIn("AGENT_VERTEX_PROJECT", message)
+        # A reader copying the shape must not build the one URL that does
+        # not resolve.
+        self.assertIn("global", message)
+        self.assertIn("no prefix", message)
+
+    def test_the_hint_and_the_builder_share_one_api_version(self):
+        # vertex_base_url's docstring says the version is switched in one
+        # place; the hint a fallback gets must follow it.
+        import unittest.mock
+        from software.agent.llm import provider
+        from software.agent.llm.provider import ProviderError
+        link = types.SimpleNamespace(provider="vertex", model="google/m",
+                                     api_key=None, base_url=None)
+        with unittest.mock.patch.object(provider, "VERTEX_API_VERSION",
+                                        "v1beta1"):
+            with self.assertRaises(ProviderError) as caught:
+                failover.link_client(link, 1)
+            built = provider.vertex_base_url("proj", "europe-west4")
+        self.assertIn("googleapis.com/v1beta1/projects", str(caught.exception))
+        self.assertIn("googleapis.com/v1beta1/projects", built)
+
+    def test_link_client_takes_the_link_and_its_place(self):
+        from software.agent import config
+        from software.agent.llm.provider import ProviderError
+        link = config.FallbackLink(provider="anthropic", model="claude",
+                                   api_key=None)
+        with self.assertRaises(ProviderError) as caught:
+            failover.link_client(link, 3)
+        self.assertIn("fallback 3 (anthropic / claude)", str(caught.exception))
+        built = failover.link_client(
+            config.FallbackLink(provider="anthropic", model="claude",
+                                api_key="k"), 1)
+        self.assertEqual(built.provider, "anthropic")
+
+    def test_a_vertex_link_with_a_base_url_is_built(self):
+        import unittest.mock
+        from software.agent import config
+        from software.agent.llm import gcp_token, provider
+        base = provider.vertex_base_url("my-proj", "europe-west4")
+        cfg = self._cfg(token_source="gcloud", fallbacks=(
+            config.FallbackLink(provider="vertex",
+                                model="google/gemini-3-pro",
+                                base_url=base),))
+        with unittest.mock.patch.object(gcp_token.shutil, "which",
+                                        return_value="/usr/bin/gcloud"):
+            chain = failover.create_chain(cfg)
+        self.assertEqual([h["provider"] for h in chain.health()],
+                         ["bedrock", "vertex"])
 
 
 if __name__ == "__main__":

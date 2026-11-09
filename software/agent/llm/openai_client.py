@@ -71,9 +71,10 @@ def _translate(messages: List[dict]) -> List[dict]:
 
 class OpenAiCompatibleClient(provider.HttpLlmClient):
     def __init__(self, provider: str, model: str, api_key: Optional[str],
-                 base_url: str, transport=None, supports_tools: bool = True):
+                 base_url: str, transport=None, supports_tools: bool = True,
+                 timeout: Optional[float] = None, token_source=None):
         super().__init__(provider, model, api_key, base_url, transport,
-                         supports_tools)
+                         supports_tools, timeout, token_source)
 
     def _build_request(self, system: str, messages: List[dict],
                        tools: List[ToolSpec], max_tokens: int,
@@ -95,7 +96,7 @@ class OpenAiCompatibleClient(provider.HttpLlmClient):
                  "function": {"name": t.name, "description": t.description,
                               "parameters": t.parameters}} for t in tools]
         headers = {"Content-Type": "application/json"}
-        key = self._api_key.reveal()
+        key = self._bearer.reveal()
         if key:
             headers["Authorization"] = "Bearer " + key
         return self._base_url + "/chat/completions", headers, body
