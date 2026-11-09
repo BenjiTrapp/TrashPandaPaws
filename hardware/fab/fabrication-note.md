@@ -18,7 +18,8 @@ stencil.
 
 Every via is 0.6 / 0.3 mm (pad / drill) but two: J3 pin 1's +5V via, 0.8 /
 0.4 mm (current), and U3 pin 3's +1V0 via at (28.31, 24.375) mm, **0.56 / 0.3
-mm** (0.13 mm annular ring, the board's minimum): it sits between two MDI
+mm** (0.13 mm annular ring, the board's minimum; kept by the operator's decision, ruling CN, and put to
+PCBWay as Question 7 of `ORDERING.md`): it sits between two MDI
 pairs 1.56 mm apart and the smaller pad keeps In1's hole round it 0.11 mm from
 both.
 

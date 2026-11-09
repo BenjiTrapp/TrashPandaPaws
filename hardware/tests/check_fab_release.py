@@ -3808,12 +3808,86 @@ class OrderingStatesEveryRuledRequirement(unittest.TestCase):
         for settled in (r"negative", r"page origin"):
             self.assertNotRegex(q10, rf"(?i){settled}", "settled by ruling CC, no longer a question")
 
-    def test_the_narrow_via_is_flagged_as_possibly_out_of_process_in_the_table(self):
+    def test_the_narrow_via_row_states_the_measured_ring_and_the_decision(self):
         row = next(l for l in self.text.splitlines() if l.startswith("| 0.56 / 0.3"))
-        self.assertRegex(row, r"(?i)annular ring 0\.13 mm")
-        self.assertRegex(row, r"(?i)may be below PCBWay.s published minimum")
-        self.assertRegex(row, r"(?i)0\.15 mm")
+        self.assertRegex(row, r"(?i)annular ring \*\*0\.130 mm\*\*")
+        self.assertRegex(row, r"(?i)below the 0\.15 mm that PCBWay.s own capabilities page lists for its Standard PCB")
+        self.assertRegex(row, r"(?i)not below the 5 mil \(0\.127 mm\) of its Advanced table")
         self.assertRegex(row, r"(?i)not confirmed")
+        self.assertRegex(row, r"(?i)operator.s decision \(ruling CN\)")
+        self.assertNotRegex(self.flat, r"(?i)believed to be 0\.15")             # the framing ruling CN replaced
+        self.assertNotRegex(self.flat, r"(?i)may be below PCBWay.s published minimum")
+
+    def annular_note(self):
+        return re.sub(r"\s+", " ", self.text.split("**Annular ring: what is measured", 1)[1].split("\n\n**Tented", 1)[0])
+
+    def test_the_rings_it_states_are_the_boards(self):
+        rings = {}
+        for size, drill, _ in board_vias(PCB.read_text()):
+            rings[round((size - drill) / 2, 3)] = rings.get(round((size - drill) / 2, 3), 0) + 1
+        self.assertEqual(rings, {0.13: 1, 0.15: 121, 0.2: 1})
+        note = self.annular_note()
+        self.assertIn("1 via at 0.56 / 0.30 mm has **0.130 mm**", note)
+        self.assertIn("**121 vias at 0.60 / 0.30 mm have 0.150 mm exactly**", note)
+        self.assertIn("1 via at 0.80 / 0.40 mm has 0.200 mm", note)
+        self.assertRegex(note, r"no margin")
+        q7 = self.question(7)
+        self.assertRegex(q7, r"121 at 0\.60 / 0\.30 mm \(annular ring 0\.150 mm exactly\)")
+        self.assertRegex(q7, r"1 at 0\.80 / 0\.40 mm \(0\.200 mm\)")
+        self.assertRegex(q7, r"1 at 0\.56 / 0\.30 mm \(0\.130 mm\)")
+
+    def question(self, number):
+        questions = self.text.split("## Questions for PCBWay", 1)[1]
+        return re.sub(r"\s+", " ", questions.split(f"\n{number}. ", 1)[1].split(f"\n{number + 1}. ", 1)[0])
+
+    def test_question_7_is_a_yes_or_no_that_carries_what_is_known_and_what_is_not(self):
+        q7 = self.question(7)
+        self.assertRegex(q7, r"(?i)a yes or no before I pay")
+        self.assertRegex(q7, r"(?i)I am \*\*not changing the vias\*\*")
+        self.assertRegex(q7, r"(?i)Standard PCB table \(1-14 layers\)")
+        self.assertRegex(q7, r"(?i)I found no separate 4-layer figure")
+        self.assertRegex(q7, r"(?i)5 mil normal / 4 mil medium difficulty")
+        self.assertRegex(q7, r"(?i)acceptable on this 4-layer board")
+        self.assertRegex(q7, r"(?i)which via sizes do you need")
+        for stale in (r"believed", r"inside your normal process\?\*\*$"):
+            self.assertNotRegex(q7, stale)
+
+    def test_the_vendored_summary_is_described_as_what_it_is_and_what_it_says(self):
+        note = self.annular_note()
+        self.assertRegex(note, r"third-party capability summary kept in this repository, not a PCBWay page")
+        self.assertRegex(note, r"Nothing here rests on it")
+        self.assertRegex(note, r"PCBWay.s own Standard table covers 1-14 layers")
+        # and what it says about the summary is true of the file
+        skill = (REPO_ROOT / "vendor" / "kicad-happy" / "skills" / "pcbway" / "SKILL.md").read_text()
+        standard = skill.split("### Standard PCB (1-2 layers)", 1)[1].split("### Multi-layer (4+ layers)", 1)[0]
+        multilayer = skill.split("### Multi-layer (4+ layers)", 1)[1].split("###", 1)[0]
+        self.assertIn("Annular ring | 0.15mm (6mil)", standard)
+        self.assertNotRegex(multilayer, r"(?i)annular")
+
+    def test_what_it_quotes_about_the_ring_is_in_the_pcbway_excerpts(self):
+        excerpts = re.sub(r"\s+", " ", __import__("html").unescape((FAB / "pcbway-source-excerpts.txt").read_text()))
+        section = excerpts.split("[8] https://www.pcbway.com/capabilities.html", 1)[1]
+        for quote in ("Number of Layers | - | 1-14 layers",
+                      "Min Width of Annular Ring | | 0.15mm(6mil)",
+                      "Typically, the minimum width of the annular ring is 0.15mm (6mil)",
+                      "Minimum weld ring (outer layer)",
+                      "<td>via hole</td> <td>\u22655mil</td> <td>\u22654mil</td>"):
+            self.assertIn(quote, section, quote)
+        note = self.annular_note()
+        self.assertIn('"Min Width of Annular Ring: 0.15mm(6mil)"', note)
+        self.assertIn('"Typically, the minimum width of the annular ring is 0.15mm (6mil)"', note)
+        self.assertIn('"1-14 layers"', note)
+        self.assertRegex(note, r"gives \"\u22655mil\" in its normal-process column and \"\u22654mil\" in its medium-difficulty one")
+        self.assertRegex(note, r"(?i)no separate annular-ring figure for 4-layer boards")
+        self.assertRegex(note, r"(?i)assume so, the page does not say")
+        self.assertRegex(note, r"5\.91 mil")
+
+    def test_the_text_sent_to_pcbway_says_the_vias_stay_and_asks_for_sizes(self):
+        block_a = re.sub(r"\s+", " ", self.text.split("### Block A", 1)[1].split("### Block B", 1)[0])
+        self.assertIn("121 x 0.6/0.3 mm (annular ring 0.150 mm), 1 x 0.8/0.4 mm, and 1 x 0.56/0.30 mm (annular ring 0.130 mm)", block_a)
+        self.assertRegex(block_a, r"I am not changing the vias: please confirm both sizes are within your process, "
+                                  r"or tell me before production which sizes you need")
+        self.assertNotRegex(block_a, r"\bruling\b")
 
     def test_controlled_impedance_with_targets_and_the_mask_pass_question_first(self):
         self.assertStated(r"90\s*(ohm|Ω)", "90 ohm differential")

@@ -1,6 +1,7 @@
 PCBWay source excerpts for hardware/fab/stackup-note.md
 =====================================================
-(and, sections [5] to [7], for hardware/fab/ORDERING.md: retrieved 2026-11-03)
+(and, sections [5] to [7], for hardware/fab/ORDERING.md: retrieved 2026-11-03;
+section [8], annular ring, retrieved 2026-11-09)
 Retrieved 2026-11-02 with curl from www.pcbway.com. These are VERBATIM
 excerpts of the pages as served that day: "raw" sections are the page's own
 source lines; "text" sections have HTML tags removed and whitespace collapsed.
@@ -786,3 +787,32 @@ Note:You can export the pick and place file directly through the PCBWay plugin 1
     passage on location
 ----------------------------------------------------------------------
 Location Location: the X and Y Locations refer to the values that identify the horizontal and vertical location of a PCB component with respect to the board's origin. The location is measured from the origin to the component's center. The board's origin is defined as the (0, 0) value and is located at the lower left corner of the board from a top point of view. Even the reverse side of the board uses the lower left corner as the origin’s reference point. The X and Y location values are measured to the ten thousandth of an inch (0.000). Rotation Rotation is the direction of rotation of a PCB component's placement orientation referenced from a top point of view. The rotation is a 0 to 360 degree value from the origin. Both the top and reserve side components use a top point of view as their reference point.
+
+----------------------------------------------------------------------
+[8] https://www.pcbway.com/capabilities.html and
+    https://www.pcbway.com/pcb_prototype/Annular_rings.html
+    added for hardware/fab/ORDERING.md (annular ring, ruling CN); retrieved
+    2026-11-09 with curl. Full pages as fetched: capabilities.html md5
+    0da328781e698c95412ef84c87f121db (250650 bytes) -- the same URL as [3],
+    whose md5 and size differ (the page changes between fetches); Annular_rings.html
+    md5 2cc44df2ead3ca8f5a66de279df62993 (193027 bytes). Table rows below are
+    the cell texts of one <tr>, joined with " | ", HTML entities decoded.
+----------------------------------------------------------------------
+-- capabilities.html, "PCB Capabilities - Standard PCB" table: the layer row
+Number of Layers | - | 1-14 layers | For orders above 14 layers, please view the below "Advanced PCB" or contact our sales rep.
+
+-- the same table: the annular ring row
+Min Width of Annular Ring |  | 0.15mm(6mil) | For pads with vias in the middle, Min width for Annular Ring is 0.15mm(6mil).
+
+-- capabilities.html, "Advanced PCB Capabilities - Advanced PCB": the column heads (raw, whitespace collapsed)
+<th width="20%" rowspan="2"> Normal process </th> <th width="20%" rowspan="2"> Medium difficulty </th> <th colspan="2" width="60%"> High difficulty </th> ... <th width="10%"> Non-standard review </th> <th width="10%">Unable to make</th>
+
+-- the same table, row 17 (raw, whitespace collapsed): "Minimum weld ring (outer layer)", copper thickness 35um, via hole
+<tr> <td rowspan="2">copper thickness 35um</td> <td>via hole</td> <td>≥5mil</td> <td>≥4mil</td> <td><3 mil</td> <td></td> <td></td> </tr>
+(the row's first cells, for 18um: <td rowspan="8">17</td> <td rowspan="8">Minimum weld ring (outer layer)</td> <td rowspan="2">copper thickness 18um</td> <td>via hole</td> <td>≥5mil</td> <td>≥4mil</td> <td><3 mil</td>)
+
+-- Annular_rings.html, text (tags removed, whitespace collapsed)
+Typically, the minimum width of the annular ring is 0.15mm (6mil), and the drill size (CNC) ranges from 0.2mm to 6.3mm.
+
+-- what this section does NOT contain: any annular-ring figure for 4-layer boards that differs from the
+Standard row above, and any statement that "weld ring" (row 17) and "annular ring" are the same quantity.

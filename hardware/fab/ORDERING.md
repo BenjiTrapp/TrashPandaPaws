@@ -124,9 +124,41 @@ The board has 123 vias (pad / drill, mm):
 |---|---|---|
 | 0.6 / 0.3 | 121 | everywhere by default |
 | 0.8 / 0.4 | 1 | J3 pin 1's +5V via (current) |
-| 0.56 / 0.3 | 1 | **the board's minimum via**: U3 pin 3's +1V0 via at (28.31, 24.375) mm from the top-left corner (128.31, 104.375 on the page). Annular ring 0.13 mm, **which may be below PCBWay's published minimum for an annular ring (believed to be 0.15 mm), i.e. out of process; not confirmed**. The smaller pad is what keeps In1's hole round it 0.11 mm from both MDI pairs (ruling BP). Ask Question 7. |
+| 0.56 / 0.3 | 1 | **the board's minimum via**: U3 pin 3's +1V0 via at (28.31, 24.375) mm from the top-left corner (128.31, 104.375 on the page). Annular ring **0.130 mm**: below the 0.15 mm that PCBWay's own capabilities page lists for its Standard PCB, not below the 5 mil (0.127 mm) of its Advanced table; which of them applies to this order is **not confirmed**. **Kept as it is by the operator's decision (ruling CN).** The smaller pad is what keeps In1's hole round it 0.11 mm from both MDI pairs (ruling BP). See "Annular ring" below and Question 7. |
 
 That is three via sizes on two drill diameters (0.3 and 0.4 mm).
+
+**Annular ring: what is measured, what is published, what is not known.**
+
+* **Measured** on the committed board (pcbnew, 2026-11-09; ring = (pad - drill) / 2):
+  1 via at 0.56 / 0.30 mm has **0.130 mm**, **121 vias at 0.60 / 0.30 mm have 0.150 mm
+  exactly**, 1 via at 0.80 / 0.40 mm has 0.200 mm. So one via is 0.020 mm below
+  0.15 mm, and the other 121 are on it with **no margin**. The second fact is the one
+  that matters more to a fabricator: it is nearly every via on the board.
+* **Published by PCBWay itself** (`pcbway-source-excerpts.txt` [8], fetched 2026-11-09):
+  the "Standard PCB" table of `capabilities.html`, whose layer row reads "1-14
+  layers", lists "Min Width of Annular Ring: 0.15mm(6mil)"; `Annular_rings.html` says
+  "Typically, the minimum width of the annular ring is 0.15mm (6mil)"; and the
+  "Advanced PCB" table, row 17, "Minimum weld ring (outer layer)", copper 35um, via hole,
+  gives "≥5mil" in its normal-process column and "≥4mil" in its medium-difficulty one.
+  We found **no separate annular-ring figure for 4-layer boards** on either page.
+* **Not established:** which table PCBWay applies to this order (the 0.15 mm in the
+  first, the 5 mil, 0.127 mm, in the second); whether "weld ring" in row 17 is the
+  same quantity as "annular ring" (we assume so, the page does not say); and that
+  0.150 mm is 5.91 mil, i.e. exactly the millimetre figure but a hair under "6mil".
+* **The vendored reference does not settle it.**
+  `vendor/kicad-happy/skills/pcbway/SKILL.md` has "Annular ring | 0.15mm (6mil)" only
+  in a table headed "Standard PCB (1-2 layers)" and none in its "Multi-layer (4+
+  layers)" table. It is a third-party capability summary kept in this repository, not
+  a PCBWay page, and PCBWay's own Standard table covers 1-14 layers, so its 1-2 layer
+  heading is not PCBWay's. Nothing here rests on it.
+* **Decision (ruling CN): the via is not changed, and no via is.** The pad of the 0.56 mm
+  via was made smaller so that In1's hole round it keeps 0.11 mm from the MDI pairs on
+  both sides (`tools/route_pcb.py`, `stage_pin3_via`, states the reason; measured here:
+  the via centre is 0.686 and 0.690 mm from the edges of the nearest MDI tracks). A
+  0.60 mm pad has a radius 0.02 mm larger, and the hole round it follows, so the 0.11 mm
+  would become 0.09 mm, under the 0.1 mm the routing keeps there, on a board whose DRC is
+  clean today. The risk is put to PCBWay before payment instead (Question 7).
 
 **Tented from the back** (B.Mask covers them; ten vias, rulings BA and BP):
 
@@ -415,7 +447,7 @@ quote page).
     Stackup: your standard 4-layer 1.6MM stackup, entry 1 (7628 RC46% prepreg, 0.1855 mm after lamination, DK 4.74; core 1.03 mm). The job file in the zip carries the same stackup.
     IMPEDANCE CONTROL, L1 (top) referenced to L2 (GND): 90 ohm differential +/-10% at 0.20 mm track / 0.17 mm gap (nets USB3_*, USB2_*); 100 ohm differential +/-10% at 0.18 mm / 0.21 mm gap (nets MDI0..MDI3). The geometry already allows 8 ohm for ONE pass of solder mask. Before production, tell me how many mask passes you print and the widths you calculate. Do not change any trace width or gap without asking me first. Please supply an impedance test coupon and report.
     Minimum track 0.15 mm (5.9 mil); minimum spacing 0.15 mm (between QFN pads).
-    Vias: 121 x 0.6/0.3 mm, 1 x 0.8/0.4 mm, and 1 x 0.56/0.30 mm (0.13 mm annular ring): please confirm it is within your process.
+    Vias: 121 x 0.6/0.3 mm (annular ring 0.150 mm), 1 x 0.8/0.4 mm, and 1 x 0.56/0.30 mm (annular ring 0.130 mm). I am not changing the vias: please confirm both sizes are within your process, or tell me before production which sizes you need.
     Via covering as in the mask gerbers: all vias tented on both sides, except 10 vias inside pads (9 in U3's exposed pad, 1 in U8 pin 2) that are open on top and must stay tented on the bottom.
     2 PLATED SLOTS, 1.0 x 2.5 mm, for J3 (G85 in the PTH drill file): please make them as slots, not round holes.
     Partial assembly, top side only: U3 and Y1, nothing else (BOM and CPL attached). Three parts on the bottom are soldered by hand later: no bottom stencil, no bottom assembly.
@@ -471,8 +503,15 @@ Not yet asked. Answers go into the order and, where they change a number, into
    what cost?
 6. **Vias covered from the back (ten, listed above):** confirm they are tented,
    not left open by a default.
-7. **Is the 0.56 / 0.3 mm via (0.13 mm annular ring) inside your normal process?**
-   Same for the 0.3 mm drill generally.
+7. **Annular ring: a yes or no before I pay.** The board has 123 vias: 121 at 0.60 / 0.30 mm
+   (annular ring 0.150 mm exactly), 1 at 0.80 / 0.40 mm (0.200 mm) and 1 at 0.56 / 0.30 mm
+   (0.130 mm). Your capabilities page lists a minimum annular ring of 0.15 mm (6 mil) in the
+   Standard PCB table (1-14 layers) and, in the Advanced table, a minimum weld ring for vias of
+   5 mil normal / 4 mil medium difficulty on 35 um outer copper; I found no separate 4-layer
+   figure. I am **not changing the vias**. Is this acceptable on this 4-layer board at your
+   normal process and price, including the 121 vias that sit exactly on 0.150 mm and the one
+   at 0.130 mm? If not, which via sizes do you need? Is the ring measured against the drill
+   size or the finished hole? Same for the 0.3 mm drill generally.
 8. **Resin-filled and capped vias for the whole board: the price difference** for 5
    boards (ruling BD). Operator decides.
 9. **Assembly, U3 and Y1 only:** setup / engineering fee; whether the assembly
