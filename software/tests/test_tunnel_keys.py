@@ -16,6 +16,19 @@ store's 0600 and 0700 are then demonstrably its own doing.
 **The mode is read back with `stat`**, from the file on disk, not inferred
 from the call that was supposed to set it.
 
+**The store is the file, not a copy of it.** A server that cached its PSK
+list at start-up would make "retire the build" silently not mean
+retirement, so these tests open two `KeyStore` objects over one path and
+check that a change made through one is what the other answers with on its
+next call, with no reload for anybody to remember.
+
+**Atomicity is argued, not observed.** A reader cannot be raced against a
+writer deterministically in a unit test. What is checked instead is the
+mechanism that makes the argument: the write goes to a complete scratch
+file and is moved over the target with `os.replace`, at which instant the
+target is still the complete old document; afterwards the scratch is gone
+and the target is a different inode.
+
 **A malformed store is checked field by field.** Each case writes a file
 that is wrong in exactly one way and asserts the error names both the file
 and the field, because "something is wrong with your keys" is not a message
@@ -28,6 +41,7 @@ import os
 import stat
 import tempfile
 import unittest
+from unittest import mock
 
 from software.c2 import beacon as beacon_mod
 from software.c2.tunnel.keys import KeyStore
@@ -225,6 +239,176 @@ class TestBuilds(KeyStoreTestCase):
         store.register_build("build-a", os.urandom(32))
         store.psks().clear()
         self.assertEqual(len(store.psks()), 1)
+
+
+class TestTheFileIsTheTruth(KeyStoreTestCase):
+    def _two(self):
+        return KeyStore(self.path), KeyStore(self.path)
+
+    def _document(self):
+        with open(self.path) as handle:
+            return json.load(handle)
+
+    @staticmethod
+    def _entry(identity, psk):
+        return {
+            "identity": identity,
+            "psk": base64.b64encode(psk).decode(),
+            "created": "2026-11-09T00:00:00Z",
+        }
+
+    def test_a_registration_by_another_instance_is_offered(self):
+        running, operator = self._two()
+        self.assertEqual(running.psks(), [])
+        psk = os.urandom(32)
+        operator.register_build("build-a", psk)
+        self.assertEqual(running.psks(), [psk])
+        self.assertEqual(running.identity_for(psk), "build-a")
+        self.assertEqual([b["identity"] for b in running.builds()], ["build-a"])
+
+    def test_a_retirement_by_another_instance_is_effective_at_once(self):
+        running, operator = self._two()
+        psk_a, psk_b = os.urandom(32), os.urandom(32)
+        operator.register_build("build-a", psk_a)
+        operator.register_build("build-b", psk_b)
+        self.assertEqual(running.identity_for(psk_a), "build-a")
+
+        self.assertTrue(operator.retire_build("build-a"))
+
+        self.assertIsNone(running.identity_for(psk_a))
+        self.assertEqual(running.psks(), [psk_b])
+        self.assertEqual([b["identity"] for b in running.builds()], ["build-b"])
+
+    def test_interleaved_registrations_keep_each_others_work(self):
+        first, second = self._two()
+        psk_a, psk_b = os.urandom(32), os.urandom(32)
+        first.register_build("build-a", psk_a)
+        # `second` has not been asked anything since; it must not write
+        # back the empty list it opened with.
+        second.register_build("build-b", psk_b)
+        self.assertEqual(KeyStore(self.path).psks(), [psk_a, psk_b])
+        self.assertEqual(first.psks(), [psk_a, psk_b])
+
+    def test_a_duplicate_is_caught_against_another_instances_registration(self):
+        first, second = self._two()
+        psk = os.urandom(32)
+        first.register_build("build-a", psk)
+        with self.assertRaises(ValueError):
+            second.register_build("build-a", os.urandom(32))
+        with self.assertRaises(ValueError):
+            second.register_build("build-b", psk)
+
+    def test_an_unchanged_file_is_not_re_read(self):
+        store = KeyStore(self.path)
+        store.register_build("build-a", os.urandom(32))
+        with mock.patch.object(KeyStore, "_load", autospec=True) as load:
+            for _ in range(3):
+                store.psks()
+                store.identity_for(os.urandom(32))
+                store.builds()
+                store.static_public()
+        load.assert_not_called()
+
+    def test_a_file_edited_in_place_is_noticed_by_its_mtime(self):
+        store = KeyStore(self.path)
+        inode = os.stat(self.path).st_ino
+        document = self._document()
+        psk = os.urandom(32)
+        document["builds"].append(self._entry("hand-edited", psk))
+        before = os.stat(self.path)
+        with open(self.path, "r+") as handle:
+            handle.seek(0)
+            handle.truncate()
+            json.dump(document, handle)
+        os.utime(self.path, ns=(before.st_atime_ns, before.st_mtime_ns + 5_000_000_000))
+        self.assertEqual(os.stat(self.path).st_ino, inode)
+        self.assertEqual(store.psks(), [psk])
+
+    def test_a_file_replaced_with_the_same_mtime_is_noticed_by_its_inode(self):
+        store = KeyStore(self.path)
+        before = os.stat(self.path)
+        document = self._document()
+        psk = os.urandom(32)
+        document["builds"].append(self._entry("swapped-in", psk))
+        scratch = self.path + ".swap"
+        with open(scratch, "w") as handle:
+            json.dump(document, handle)
+        os.utime(scratch, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(scratch, self.path)
+        after = os.stat(self.path)
+        self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+        self.assertNotEqual(after.st_ino, before.st_ino)
+        self.assertEqual(store.psks(), [psk])
+
+    def test_a_store_damaged_while_running_is_an_error_naming_the_file(self):
+        store = KeyStore(self.path)
+        store.register_build("build-a", os.urandom(32))
+        before = os.stat(self.path)
+        with open(self.path, "w") as handle:
+            handle.write("{ truncated")
+        os.utime(self.path, ns=(before.st_atime_ns, before.st_mtime_ns + 5_000_000_000))
+        with self.assertRaises(ValueError) as caught:
+            store.psks()
+        self.assertIn(self.path, str(caught.exception))
+        # Still an error on the next call: nothing quietly serves the
+        # last good copy once the file on disk has stopped saying so.
+        with self.assertRaises(ValueError):
+            store.identity_for(os.urandom(32))
+
+    def test_a_store_deleted_while_running_is_an_error_not_a_new_keypair(self):
+        store = KeyStore(self.path)
+        os.unlink(self.path)
+        with self.assertRaises(FileNotFoundError):
+            store.psks()
+        self.assertFalse(os.path.exists(self.path))
+
+
+class TestWritesAreMovedIntoPlace(KeyStoreTestCase):
+    def test_a_rewrite_is_a_complete_scratch_file_moved_over_the_target(self):
+        self.open_permissive_umask()
+        store = KeyStore(self.path)
+        inode_before = os.stat(self.path).st_ino
+        real_replace = os.replace
+        seen = {}
+
+        def spy(src, dst):
+            seen["calls"] = seen.get("calls", 0) + 1
+            seen["src"], seen["dst"] = src, dst
+            # At the instant of the move the target is still the whole old
+            # document, and the scratch is already the whole new one.
+            with open(dst) as handle:
+                seen["target_before"] = json.load(handle)
+            with open(src) as handle:
+                seen["scratch"] = json.load(handle)
+            seen["scratch_mode"] = _mode(src)
+            return real_replace(src, dst)
+
+        with mock.patch("os.replace", side_effect=spy):
+            store.register_build("build-a", os.urandom(32))
+
+        self.assertEqual(seen["calls"], 1)
+        self.assertEqual(seen["dst"], self.path)
+        self.assertEqual(os.path.dirname(seen["src"]), self.dir)
+        self.assertNotEqual(seen["src"], self.path)
+        self.assertEqual(seen["target_before"]["builds"], [])
+        self.assertEqual(len(seen["scratch"]["builds"]), 1)
+        self.assertEqual(seen["scratch_mode"], 0o600)
+        self.assertFalse(os.path.exists(seen["src"]))
+        self.assertNotEqual(os.stat(self.path).st_ino, inode_before)
+        self.assertEqual(os.listdir(self.dir), [os.path.basename(self.path)])
+
+    def test_a_failed_write_changes_nothing_and_leaves_no_scratch(self):
+        store = KeyStore(self.path)
+        keep = os.urandom(32)
+        store.register_build("build-a", keep)
+        with mock.patch("os.replace", side_effect=OSError("disk went away")):
+            with self.assertRaises(OSError):
+                store.register_build("build-b", os.urandom(32))
+            with self.assertRaises(OSError):
+                store.retire_build("build-a")
+        self.assertEqual(store.psks(), [keep])
+        self.assertEqual(KeyStore(self.path).psks(), [keep])
+        self.assertEqual(os.listdir(self.dir), [os.path.basename(self.path)])
 
 
 class TestMalformedStore(KeyStoreTestCase):
