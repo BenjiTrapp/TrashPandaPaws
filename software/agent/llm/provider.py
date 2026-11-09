@@ -523,16 +523,28 @@ def bedrock_base_url(region=None) -> str:
 # not $: "$" also matches before a trailing newline.
 _GCP_IDENTIFIER = re.compile(r"\A[a-z0-9][a-z0-9-]{0,61}[a-z0-9]\Z")
 
+# The location is also the front of a host label, "<location>-aiplatform",
+# and a DNS label is at most 63 characters. The project is only ever a path
+# segment, so it keeps the identifier's own limit.
+_VERTEX_HOST_SUFFIX = "-aiplatform"
+_VERTEX_MAX_LOCATION = 63 - len(_VERTEX_HOST_SUFFIX)
 
-def _vertex_identifier(field: str, env: str, value: Any) -> str:
+# Google's non-regional location. Its host has no regional prefix:
+# "global-aiplatform.googleapis.com" does not exist.
+_VERTEX_GLOBAL = "global"
+
+
+def _vertex_identifier(field: str, env: str, value: Any,
+                       longest: int = 63) -> str:
     if value is None or value == "":
         raise ProviderError(
             "provider 'vertex': %s is not set; set %s" % (field, env))
-    if not isinstance(value, str) or not _GCP_IDENTIFIER.match(value):
+    if (not isinstance(value, str) or not _GCP_IDENTIFIER.match(value)
+            or len(value) > longest):
         raise ProviderError(
-            "provider 'vertex': %s (%s) must be 2 to 63 lowercase letters, "
+            "provider 'vertex': %s (%s) must be 2 to %d lowercase letters, "
             "digits or hyphens, starting and ending with a letter or digit; "
-            "got %.40r" % (field, env, value))
+            "got %.40r" % (field, env, longest, value))
     return value
 
 
@@ -543,6 +555,10 @@ def vertex_base_url(project: Any, location: Any) -> str:
     location appears twice (in the host and in the path) and the two must
     agree: a mismatch is a 404 at the first call, not a configuration error.
 
+    "global" is mapped to the unprefixed host rather than refused: it is a
+    real location that Google documents, some models are served only from
+    it, and an operator who typed it meant exactly that host.
+
     "v1" is the stable path. "v1beta1" is the documented alternative on this
     endpoint if tool calling misbehaves on v1; this is the only place the
     version appears, so switching is a one-word change here.
@@ -550,9 +566,11 @@ def vertex_base_url(project: Any, location: Any) -> str:
     project = _vertex_identifier("vertex_project", "AGENT_VERTEX_PROJECT",
                                  project)
     location = _vertex_identifier("vertex_location", "AGENT_VERTEX_LOCATION",
-                                  location)
-    return ("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/"
-            "%s/endpoints/openapi" % (location, project, location))
+                                  location, _VERTEX_MAX_LOCATION)
+    host = ("aiplatform.googleapis.com" if location == _VERTEX_GLOBAL
+            else location + _VERTEX_HOST_SUFFIX + ".googleapis.com")
+    return ("https://%s/v1/projects/%s/locations/%s/endpoints/openapi"
+            % (host, project, location))
 
 
 # Vertex's openapi endpoint takes "publisher/model". A bare id is a 404 at

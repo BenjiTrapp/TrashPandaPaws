@@ -264,6 +264,37 @@ class TestTheChainIsBuiltFromTheConfig(unittest.TestCase):
         self.assertEqual([h["provider"] for h in chain.health()],
                          ["bedrock", "local"])
 
+    def test_a_vertex_link_without_a_base_url_says_it_needs_one(self):
+        # A link carries provider, model, key and base_url and nothing else,
+        # so it cannot inherit the primary's project. The old message said
+        # "set AGENT_VERTEX_PROJECT", which is already set in this case.
+        from software.agent import config
+        from software.agent.llm.provider import ProviderError
+        cfg = self._cfg(vertex_project="my-proj", fallbacks=(
+            config.FallbackLink(provider="vertex",
+                                model="google/gemini-3-pro"),))
+        with self.assertRaises(ProviderError) as caught:
+            failover.create_chain(cfg)
+        message = str(caught.exception)
+        self.assertIn("explicit base_url", message)
+        self.assertIn("fallback 1", message)
+        self.assertNotIn("AGENT_VERTEX_PROJECT", message)
+
+    def test_a_vertex_link_with_a_base_url_is_built(self):
+        import unittest.mock
+        from software.agent import config
+        from software.agent.llm import gcp_token, provider
+        base = provider.vertex_base_url("my-proj", "europe-west4")
+        cfg = self._cfg(token_source="gcloud", fallbacks=(
+            config.FallbackLink(provider="vertex",
+                                model="google/gemini-3-pro",
+                                base_url=base),))
+        with unittest.mock.patch.object(gcp_token.shutil, "which",
+                                        return_value="/usr/bin/gcloud"):
+            chain = failover.create_chain(cfg)
+        self.assertEqual([h["provider"] for h in chain.health()],
+                         ["bedrock", "vertex"])
+
 
 if __name__ == "__main__":
     unittest.main()

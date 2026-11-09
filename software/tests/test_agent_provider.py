@@ -1167,8 +1167,43 @@ class TestTheVertexEndpointIsComputedAndValidated(unittest.TestCase):
         self.assertNotIn("europe", url)
 
     def test_the_longest_and_shortest_identifiers_are_accepted(self):
-        for ok in ("ab", "x" * 63, "a1-b2", "0abc"):
+        for ok in ("ab", "x" * 52, "a1-b2", "0abc"):
             provider.vertex_base_url(ok, ok)
+        provider.vertex_base_url("x" * 63, "europe-west4")
+
+    def test_global_is_reached_at_the_host_with_no_regional_prefix(self):
+        # "global-aiplatform.googleapis.com" does not exist. It passed the
+        # shape check and failed only at the first model call, which on an
+        # unattended run is mid-campaign.
+        url = provider.vertex_base_url("my-proj", "global")
+        self.assertEqual(
+            url,
+            "https://aiplatform.googleapis.com/v1/projects/my-proj/"
+            "locations/global/endpoints/openapi")
+        self.assertEqual(provider.urlparse(url).hostname,
+                         "aiplatform.googleapis.com")
+
+    def test_only_global_loses_its_prefix(self):
+        for region in ("europe-west4", "globalx", "global-1"):
+            with self.subTest(location=region):
+                self.assertEqual(
+                    provider.urlparse(
+                        provider.vertex_base_url("p1", region)).hostname,
+                    region + "-aiplatform.googleapis.com")
+
+    def test_a_location_that_would_overflow_a_dns_label_is_refused(self):
+        # The host label is "<location>-aiplatform", and a DNS label is at
+        # most 63 characters, so 52 is the last location that can resolve.
+        # 63 passed the identifier check and built a 74-character label.
+        label = lambda url: provider.urlparse(url).hostname.split(".")[0]
+        self.assertEqual(
+            len(label(provider.vertex_base_url("proj", "x" * 52))), 63)
+        for too_long in ("x" * 53, "x" * 63):
+            with self.subTest(length=len(too_long)):
+                with self.assertRaises(provider.ProviderError) as cm:
+                    provider.vertex_base_url("proj", too_long)
+                self.assertIn("vertex_location", str(cm.exception))
+                self.assertIn("52", str(cm.exception))
 
     def test_a_location_that_would_move_the_host_is_refused(self):
         for bad in _HOSTILE_IDENTIFIERS:
@@ -1195,7 +1230,7 @@ class TestTheVertexEndpointIsComputedAndValidated(unittest.TestCase):
     def test_nothing_accepted_can_change_the_host_or_leave_the_path(self):
         # The property the validation exists for, checked on what it lets
         # through rather than on a list of what it should stop.
-        for value in ("a1", "us-central1", "x" * 63, "0-0"):
+        for value in ("a1", "us-central1", "x" * 52, "0-0"):
             parts = provider.urlparse(provider.vertex_base_url(value, value))
             self.assertEqual(parts.hostname, value + "-aiplatform.googleapis.com")
             self.assertEqual(parts.scheme, "https")
