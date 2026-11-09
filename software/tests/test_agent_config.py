@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import tempfile
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -24,7 +25,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from software.agent import config, gate, safety
-from software.agent.llm import provider
+from software.agent.llm import failover, provider
 from software.agent.store import db, queries
 
 _FAKE_KEY = "sk-not-a-real-key"
@@ -952,6 +953,21 @@ class TestOpsecWarningsSayWhatIsNotDelivered(unittest.TestCase):
     def test_quiet_with_a_local_model_is_silent(self):
         self.assertEqual(self._warnings("local", "quiet"), [])
 
+    def test_a_quiet_profile_does_not_warn_about_any_local_provider(self):
+        # "local" and "ollama" both keep the conversation on the box; telling
+        # an ollama operator to "set provider to local" sends them where
+        # they already are.
+        campaign = types.SimpleNamespace(opsec_profile="quiet")
+        for name in sorted(provider.LOCAL_PROVIDERS):
+            with self.subTest(provider=name):
+                agent = types.SimpleNamespace(provider=name)
+                self.assertEqual(
+                    [w for w in config.opsec_warnings(agent, campaign)
+                     if "goes to it" in w], [])
+        hosted = types.SimpleNamespace(provider="anthropic")
+        self.assertTrue(any("goes to it" in w
+                            for w in config.opsec_warnings(hosted, campaign)))
+
     def test_yolo_warns_about_the_scan_rate_and_says_what_is_untouched(self):
         warnings = self._warnings("local", "yolo")
         self.assertEqual(len(warnings), 1)
@@ -1108,6 +1124,178 @@ class TestAFallbackChainIsReadFromYaml(unittest.TestCase):
         with self.assertRaises(config.ConfigError) as caught:
             self._load([{"provider": "bedrock", "model": "m"}])
         self.assertIn("primary", str(caught.exception))
+
+
+# ── Vertex ──
+
+_VERTEX = {"AGENT_PROVIDER": "vertex", "AGENT_MODEL": "google/m",
+           "AGENT_VERTEX_PROJECT": "proj"}
+
+
+class TestVertexFieldsResolveThroughTheCascade(unittest.TestCase):
+    """The three Vertex settings, none of them a credential."""
+
+    # (field, command-line flag, YAML key, environment variable, default)
+    FIELDS = (
+        ("vertex_project", "--vertex-project", "vertex_project",
+         "AGENT_VERTEX_PROJECT", None),
+        ("vertex_location", "--vertex-location", "vertex_location",
+         "AGENT_VERTEX_LOCATION", "europe-west4"),
+        ("token_source", "--token-source", "token_source",
+         "AGENT_TOKEN_SOURCE", "auto"),
+    )
+    VALUES = {"vertex_project": ("from-cli", "from-yaml", "from-env"),
+              "vertex_location": ("us-east5", "asia-east1", "europe-west1"),
+              "token_source": ("gcloud", "metadata", "file")}
+
+    def test_the_defaults(self):
+        cfg = _load()
+        for name, _flag, _key, _env, default in self.FIELDS:
+            with self.subTest(field=name):
+                self.assertEqual(getattr(cfg, name), default)
+
+    def test_each_level_supplies_its_field(self):
+        for name, flag, key, env, _default in self.FIELDS:
+            cli_value, yaml_value, env_value = self.VALUES[name]
+            with self.subTest(field=name, level="command line"):
+                self.assertEqual(
+                    getattr(_load(argv=[flag, cli_value]), name), cli_value)
+            with self.subTest(field=name, level="yaml"):
+                cfg = _load(data={"agent": {"llm": {key: yaml_value}}})
+                self.assertEqual(getattr(cfg, name), yaml_value)
+            with self.subTest(field=name, level="environment"):
+                cfg = _load(env={env: env_value})
+                self.assertEqual(getattr(cfg, name), env_value)
+
+    def test_the_levels_rank_command_line_yaml_environment(self):
+        for name, flag, key, env, _default in self.FIELDS:
+            cli_value, yaml_value, env_value = self.VALUES[name]
+            with self.subTest(field=name):
+                data = {"agent": {"llm": {key: yaml_value}}}
+                cfg = _load(argv=[flag, cli_value], data=data,
+                            env={env: env_value})
+                self.assertEqual(getattr(cfg, name), cli_value)
+                cfg = _load(data=data, env={env: env_value})
+                self.assertEqual(getattr(cfg, name), yaml_value)
+
+    def test_an_unknown_token_source_is_a_configuration_error(self):
+        with self.assertRaises(config.ConfigError) as caught:
+            _load(env={"AGENT_TOKEN_SOURCE": "magic"})
+        message = str(caught.exception)
+        self.assertIn("token_source", message)
+        for kind in ("auto", "metadata", "gcloud", "file"):
+            self.assertIn(kind, message)
+
+
+class TestTheKeyfilePathSurvivesLoad(unittest.TestCase):
+    """The `file` token source re-reads the path; startup still reads it once."""
+
+    def test_the_api_key_file_path_survives_load(self):
+        path = _keyfile(_FAKE_KEY)
+        cfg = _load(env={"AGENT_API_KEY_FILE": path})
+        self.assertEqual(cfg.api_key_file, path)
+        self.assertEqual(cfg.api_key, _FAKE_KEY)
+
+    def test_no_path_is_none(self):
+        self.assertIsNone(_load().api_key_file)
+
+    def test_the_path_is_not_the_key_and_the_key_stays_out_of_repr(self):
+        path = _keyfile(_FAKE_KEY)
+        cfg = _load(env={"AGENT_API_KEY_FILE": path})
+        self.assertNotIn(_FAKE_KEY, repr(cfg))
+
+
+class TestWhichVertexCredentialIsUsed(unittest.TestCase):
+    """An explicit token source, else a present key as a labelled static
+    bearer, else `auto`. The middle case is a deliberate opt-in for a quick
+    supervised run; the point is that it is labelled and not discovered."""
+
+    NOTE = "will not be refreshed"
+
+    def test_an_explicit_token_source_beats_a_present_key(self):
+        cfg = _load(env=dict(_VERTEX, AGENT_API_KEY=_FAKE_KEY,
+                             AGENT_TOKEN_SOURCE="gcloud"))
+        self.assertFalse(cfg.static_bearer)
+        self.assertNotIn(self.NOTE, cfg.available()[1])
+
+    def test_a_key_with_vertex_and_auto_is_a_labelled_static_bearer(self):
+        cfg = _load(env=dict(_VERTEX, AGENT_API_KEY=_FAKE_KEY))
+        self.assertTrue(cfg.static_bearer)
+        ok, reason = cfg.available()
+        self.assertIn(self.NOTE, reason)
+        self.assertIn("hour", reason)
+        self.assertNotIn(_FAKE_KEY, reason)
+
+    def test_a_keyfile_with_vertex_and_auto_is_a_static_bearer_too(self):
+        path = _keyfile(_FAKE_KEY)
+        cfg = _load(env=dict(_VERTEX, AGENT_API_KEY_FILE=path))
+        self.assertTrue(cfg.static_bearer)
+
+    def test_no_key_leaves_auto_to_walk_its_sources(self):
+        cfg = _load(env=dict(_VERTEX))
+        self.assertFalse(cfg.static_bearer)
+        self.assertNotIn(self.NOTE, cfg.available()[1])
+
+    def test_another_provider_with_a_key_is_not_a_static_bearer(self):
+        cfg = _load(env={"AGENT_PROVIDER": "anthropic", "AGENT_MODEL": "m",
+                         "AGENT_API_KEY": _FAKE_KEY})
+        self.assertFalse(cfg.static_bearer)
+        self.assertEqual(cfg.available(), (True, ""))
+
+    def test_the_label_does_not_make_a_usable_run_unusable(self):
+        # Vertex is not a provider the client factory knows yet, so a chain
+        # that builds is stood in for. What is pinned is that the label
+        # rides beside a usable answer: refusing the run would turn the
+        # opt-in into a prohibition.
+        cfg = _load(env=dict(_VERTEX, AGENT_API_KEY=_FAKE_KEY))
+        with unittest.mock.patch.object(failover, "create_chain"):
+            ok, reason = cfg.available()
+        self.assertTrue(ok)
+        self.assertIn(self.NOTE, reason)
+        self.assertNotIn(_FAKE_KEY, reason)
+
+    def test_the_label_is_reported_beside_other_problems(self):
+        cfg = _load(data={"c2": {"sliver": {"enabled": True}}},
+                    env=dict(_VERTEX, AGENT_API_KEY=_FAKE_KEY))
+        ok, reason = cfg.available()
+        self.assertFalse(ok)
+        self.assertIn(self.NOTE, reason)
+        self.assertIn("sliver", reason.lower())
+
+
+class TestAVertexFallbackLinkRefusesAStaticBearer(unittest.TestCase):
+    def _data(self, link):
+        return {"agent": {"llm": {
+            "provider": "anthropic", "model": "claude-sonnet-4",
+            "fallbacks": [link]}}}
+
+    def test_a_vertex_fallback_link_refuses_api_key_env(self):
+        with self.assertRaises(config.ConfigError) as caught:
+            _load(data=self._data({
+                "provider": "vertex", "model": "google/m",
+                "base_url": "https://x.googleapis.com/v1/p/openapi",
+                "api_key_env": "SOME_TOKEN"}),
+                env={"SOME_TOKEN": _FAKE_KEY})
+        message = str(caught.exception)
+        self.assertIn("api_key_env", message)
+        self.assertIn("vertex", message)
+        self.assertIn("expir", message)
+        self.assertNotIn(_FAKE_KEY, message)
+
+    def test_a_vertex_link_without_api_key_env_is_read(self):
+        cfg = _load(data=self._data({
+            "provider": "vertex", "model": "google/m",
+            "base_url": "https://x.googleapis.com/v1/p/openapi"}))
+        link = cfg.fallbacks[0]
+        self.assertEqual((link.provider, link.model), ("vertex", "google/m"))
+        self.assertIsNone(link.api_key)
+
+    def test_other_providers_still_name_their_key_variable(self):
+        cfg = _load(data=self._data({
+            "provider": "openrouter", "model": "m",
+            "api_key_env": "SOME_TOKEN"}), env={"SOME_TOKEN": "second"})
+        self.assertEqual(cfg.fallbacks[0].api_key, "second")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple
 import yaml
 
 from software.agent import scope, secret
+from software.agent.llm import gcp_token
 from software.agent.llm import provider as llm_provider
 
 
@@ -133,12 +134,22 @@ _DEFAULT_BIND_HOST = "127.0.0.1"
 _DEFAULT_BIND_PORT = 8099
 _DEFAULT_MAX_EXECUTORS = 4
 _DEFAULT_APPROVAL_TIMEOUT = 300.0
+# EU first, as the Bedrock endpoint here already is: a default that sent an
+# operator's findings to a US region without being asked would be the quiet
+# kind of surprise this project avoids.
+_DEFAULT_VERTEX_LOCATION = "europe-west4"
 
 _SLIVER_REASON = (
     "Sliver is enabled (c2.sliver.enabled in raccoon.yaml): a Sliver-managed "
     "drop-box runs the Sliver implant and never checks in to the Raccoon C2 "
     "server, so the agent would see no beacons. Set c2.sliver.enabled to "
     "false and restart the drop-box to run the Python beacon the agent drives")
+
+_STATIC_BEARER_NOTE = (
+    "the Vertex credential is a static key (AGENT_API_KEY or api_key_file) "
+    "and will not be refreshed: a run that outlasts the token's hour will "
+    "fail. Set token_source (%s) for a token that renews itself"
+    % ", ".join(k for k in gcp_token.KINDS if k != "auto"))
 
 # Shorter than this, a replace() would mangle the reason around a coincidental
 # match; a real key is far longer.
@@ -212,6 +223,17 @@ def _read_fallbacks(data, env, primary_provider, primary_model, yaml_path):
                 "the two links would be counted separately when it trips"
                 % (number, provider, model))
         key_env = entry.get("api_key_env")
+        if key_env and provider == "vertex":
+            # A static bearer on the link that exists to catch the primary's
+            # failure brings back the one-hour expiry the token source
+            # removes, and it does so unattended, after the primary has
+            # already gone. The link draws on the shared token source.
+            raise ConfigError(
+                "agent.llm.fallbacks[%d] (vertex) names an api_key_env; a "
+                "vertex link takes its bearer from the token source, because "
+                "a static key on the link that catches a failure would bring "
+                "back the one-hour expiry that design removes"
+                % number)
         links.append(FallbackLink(
             provider=provider, model=model,
             base_url=entry.get("base_url") or None,
@@ -241,11 +263,24 @@ class AgentConfig:
     # Not an agent setting but a fact about the drop-box, read from the C2
     # block of the same file, because available() has to answer for it.
     sliver_enabled: bool = False
+    # Google Vertex AI. None of these is a credential, so they come through
+    # the cascade like any other setting.
+    vertex_project: Optional[str] = None
+    vertex_location: str = _DEFAULT_VERTEX_LOCATION
+    token_source: str = "auto"
+    # The path, kept beside the key read from it: the `file` token source
+    # re-reads it, and a key rotated underneath a two-hour run is picked up.
+    api_key_file: Optional[str] = None
+    # A vertex run whose bearer is a fixed key and so will not be refreshed.
+    static_bearer: bool = False
     # The providers tried, in order, after the primary one fails.
     fallbacks: Tuple["FallbackLink", ...] = ()
 
     def available(self) -> Tuple[bool, str]:
-        """(usable, reason) for the status endpoint; reason is "" when usable.
+        """(usable, reason) for the status endpoint.
+
+        The reason is "" when usable, with one exception: a note that a
+        vertex run is on a static key is carried beside a usable answer.
 
         Every problem is reported, not the first: an operator who fixes the
         provider only to meet the Sliver conflict next has been sent round
@@ -271,14 +306,19 @@ class AgentConfig:
         # with no explanation.
         if self.sliver_enabled:
             problems.append(_SLIVER_REASON)
-        if not problems:
+        # A label, not a refusal: a static key for a quick supervised run is
+        # a choice the operator may make, but one they must be able to see,
+        # since nothing else says the run will die at the token's hour. So it
+        # rides beside a usable answer and does not turn it into a refusal.
+        notes = [_STATIC_BEARER_NOTE] if self.static_bearer else []
+        if not problems and not notes:
             return True, ""
-        reason = "; ".join(problems)
+        reason = "; ".join(problems + notes)
         # ProviderError promises not to carry the key, and this is not the
         # place to find out it broke that promise.
         if self.api_key and len(self.api_key) >= _SCRUB_MIN_LENGTH:
             reason = reason.replace(self.api_key, "<redacted>")
-        return False, reason
+        return not problems, reason
 
 
 class _Field(NamedTuple):
@@ -304,6 +344,16 @@ _FIELDS = (
     _Field("capability_tier", ("agent", "llm", "capability_tier"),
            "AGENT_CAPABILITY_TIER", _enum(*llm_provider.TIER_LIMITS), None,
            "force a capability tier instead of deriving it from the model"),
+    _Field("vertex_project", ("agent", "llm", "vertex_project"),
+           "AGENT_VERTEX_PROJECT", _text, None,
+           "Google Cloud project for the vertex provider"),
+    _Field("vertex_location", ("agent", "llm", "vertex_location"),
+           "AGENT_VERTEX_LOCATION", _text, _DEFAULT_VERTEX_LOCATION,
+           "Google Cloud region for the vertex provider"),
+    _Field("token_source", ("agent", "llm", "token_source"),
+           "AGENT_TOKEN_SOURCE", _enum(*gcp_token.KINDS), "auto",
+           "where the vertex bearer token comes from (%s)"
+           % ", ".join(gcp_token.KINDS)),
     _Field("api_key_file", ("agent", "llm", "api_key_file"),
            "AGENT_API_KEY_FILE", _text, None,
            "file holding the API key; must be readable by its owner only"),
@@ -449,10 +499,20 @@ def load(argv=None, yaml_path=None, env=None) -> AgentConfig:
 
     values = {f.name: _resolve(f, cli, data, env) for f in _FIELDS}
 
-    key_file = values.pop("api_key_file")
+    # The path stays in `values` for the config to keep; the key is still
+    # read here, once, so a bad file stops the service at startup.
+    key_file = values["api_key_file"]
     api_key = _read_keyfile(key_file) if key_file else _from_env(env, _API_KEY_ENV)
     if not api_key and str(values.get("provider") or "").lower() == "bedrock":
         api_key = _from_env(env, _BEDROCK_KEY_ENV)
+
+    # An explicit token_source wins outright; otherwise a key already
+    # present is used as it stands and the config says so (available()),
+    # because nothing about it will be refreshed; otherwise `auto` walks the
+    # sources.
+    static_bearer = bool(
+        api_key and values["token_source"] == "auto"
+        and str(values.get("provider") or "").lower() == "vertex")
 
     tier = values.pop("capability_tier") or llm_provider.capability_tier(
         values["model"], values["provider"])
@@ -466,6 +526,7 @@ def load(argv=None, yaml_path=None, env=None) -> AgentConfig:
 
     return AgentConfig(
         api_key=api_key, capability_tier=tier, fallbacks=fallbacks,
+        static_bearer=static_bearer,
         c2_token=_from_env(env, _C2_TOKEN_ENV),
         agent_token=_from_env(env, _AGENT_TOKEN_ENV),
         sliver_enabled=sliver_enabled, **values)
@@ -532,12 +593,15 @@ def opsec_warnings(agent, campaign) -> List[str]:
     """
     out = []
     profile = getattr(campaign, "opsec_profile", "normal")
-    if profile == "quiet" and getattr(agent, "provider", None) != "local":
+    if (profile == "quiet"
+            and getattr(agent, "provider", None) not in
+            llm_provider.LOCAL_PROVIDERS):
         out.append(
             "opsec_profile is quiet, but the model provider is %r: every "
             "finding, hostname and recovered credential still goes to it. "
-            "Set provider to local for a run that leaves nothing."
-            % (getattr(agent, "provider", None),))
+            "Set provider to one of %s for a run that leaves nothing."
+            % (getattr(agent, "provider", None),
+               ", ".join(sorted(llm_provider.LOCAL_PROVIDERS))))
     if not OPSEC_PROFILES.get(profile, {}).get("limit_scan_rate", True):
         out.append(
             "opsec_profile is %s: scan rate limits are not applied, so scans "
