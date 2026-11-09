@@ -359,6 +359,32 @@ class TestTheGeneratorBakesATunnelBlock(_GeneratorCase):
                          "the undelivered build is still registered")
 
 
+    def test_a_gist_upload_that_times_out_leaves_no_credential_behind(self):
+        # The live failure mode the guard above was written for and
+        # missed: `gh gist create` carries `timeout=30`, which raises
+        # rather than returning a non-zero code, so a check on the return
+        # code alone never runs.
+        import subprocess
+
+        def fake_run(args, **kwargs):
+            args = list(args)
+            if args[:2] == ["gh", "auth"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[:3] == ["gh", "gist", "create"]:
+                raise subprocess.TimeoutExpired(args, 30)
+            raise AssertionError("unexpected command: %r" % (args,))
+
+        with mock.patch.object(server_mod.subprocess, "run", fake_run):
+            response = self.client.post("/api/server/beacon-gist",
+                                        json=self.request_body(
+                                            self.asked_for()),
+                                        headers=_AUTH)
+        self.assertEqual(response.status_code, 504, response.data[:400])
+        self.assertEqual(self.store().builds(), [],
+                         "a build whose upload timed out is still "
+                         "registered")
+
+
 class TestTheYamlPath(unittest.TestCase):
     """`c2.tunnel` read from a config file, for a host with no beacon.
 
@@ -493,7 +519,8 @@ class TestTheYamlPath(unittest.TestCase):
         is the function `main.py` and `beacon_standalone.py` build their
         beacon from, and a drop-box that stopped calling home over a typo
         in a block nobody had switched on yet would be a box lost. So the
-        block is left out and the reason is logged -- not swallowed.
+        block is left out and the reason is kept where the operator's own
+        question will find it.
         """
         lines = self.enabled_lines(_b64(os.urandom(32)))
         lines = lines.replace("    port: 8446\n", "    port: 0\n")
@@ -509,9 +536,54 @@ class TestTheYamlPath(unittest.TestCase):
         self.assertEqual(built["c2"]["dns"], {})
         self.assertIn("c2.tunnel.port", "\n".join(logged.output),
                       "the reason the block was dropped was not logged")
-        # And the operator who tasks `tunnel start` on that host is told
-        # why by the predicate the beacon already asks.
-        self.assertIsNotNone(tunnel_mode_problem(built))
+        self.assertIn("c2.tunnel.port", built["c2"]["tunnel_problem"],
+                      "the reason was not kept for the consumer that asks")
+
+    def test_a_psk_in_the_file_reaches_the_operator_who_tasks_tunnel_start(self):
+        """The case that otherwise has no channel at all.
+
+        A Sliver-primary or `fallback.enabled: false` drop-box never
+        reaches `beacon_config_from_fallback`, and when it does the ERROR
+        goes to a rotating log file rather than anywhere an operator is
+        looking. `tunnel start` is the question they ask, so that is where
+        the reason has to be -- and it has to be the real one: the generic
+        arm of `tunnel_mode_problem` tells them to generate a build with
+        the tunnel enabled, which is not what is wrong and not something
+        they can do about a key in a YAML file.
+        """
+        psk = _b64(os.urandom(32))
+        config = self.fixture(
+            self.enabled_lines(_b64(os.urandom(32)))
+            + "    psk: \"%s\"\n" % psk)
+        with self.assertLogs(beacon_mod.logger, level="ERROR"):
+            built = beacon_config_from_fallback(
+                config["c2"], env={beacon_mod._TUNNEL_PSK_ENV: psk})
+
+        # The only block there was is the one holding the file's secret,
+        # so it must not be passed on: `tunnel start` would dial with the
+        # value this rule exists to refuse.
+        self.assertIsNone(built["c2"].get("tunnel"))
+
+        answer = beacon_mod.Beacon(built)._tunnel_start()
+        self.assertIn("c2.tunnel.psk", answer)
+        self.assertIn(beacon_mod._TUNNEL_PSK_ENV, answer)
+        self.assertNotIn(
+            "Generate the build with the tunnel enabled", answer,
+            "the operator was told to generate a build for a tunnel that "
+            "came from a config file")
+        self.assertNotIn(psk, answer, "the answer quotes the secret")
+
+    def test_a_build_with_no_tunnel_still_gets_the_generate_a_build_advice(self):
+        # The other arm, which is correct for the case it is for: an
+        # artifact generated before anybody asked for a tunnel. Carrying
+        # the file's reason must not have replaced it.
+        built = beacon_config_from_fallback(
+            {"encryption_key": _b64(os.urandom(32)),
+             "fallback": {"enabled": True}}, env={})
+        self.assertIsNone(built["c2"].get("tunnel_problem"))
+
+        answer = beacon_mod.Beacon(built)._tunnel_start()
+        self.assertIn("Generate the build with the tunnel enabled", answer)
 
 
 class TestTheShippedConfig(unittest.TestCase):
@@ -642,9 +714,13 @@ class TestTheStandaloneEndpoint(unittest.TestCase):
     else is the deployed path, `main()` included.
     """
 
-    # The range the server assigns loopback SOCKS ports from. Nothing here
-    # binds one, so this is a pair of numbers in a JSON file; the server's
-    # own port is 0 and read back.
+    # The range the server assigns loopback SOCKS ports from. Inert here:
+    # this task records an assignment in a JSON file and binds nothing,
+    # and the server's own port is 0 and read back. **A later task binds
+    # these**, and when it does this pair stops being two numbers and
+    # becomes a hundred fixed loopback ports a test would take -- so the
+    # no-hardcoded-port rule has to be applied to it again then, not
+    # assumed to have been settled here.
     _PORT_RANGE = (40400, 40499)
 
     def setUp(self):

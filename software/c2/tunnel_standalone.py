@@ -60,20 +60,22 @@ def main() -> int:
     if not c2_cfg.get("enabled"):
         return _refuse("c2.enabled is not set in configs/raccoon.yaml")
 
+    # The strict read, and this process's refusal: the endpoint *is* this
+    # process, so a block it cannot make leaves nothing to run. The
+    # answer is discarded because the shared mapping below produces the
+    # same one; what is wanted here is the exception.
+    # `beacon_config_from_fallback` makes the opposite choice for this
+    # same error, because there the beacon has to start regardless.
     try:
-        tunnel = tunnel_config_from_yaml(c2_cfg)
+        tunnel_config_from_yaml(c2_cfg)
     except ValueError as exc:
         return _refuse(str(exc))
 
     # The rest of the beacon config, for `c2.proxy`: one host has one way
     # out, and the endpoint reads the same block the beacon's transports
-    # do. Built by the one function that maps this file onto that shape.
-    # The tunnel block is put back from the strict read above, so that
-    # what this process runs is what was validated and not that
-    # function's more forgiving answer.
+    # do. Built by the one function that maps this file onto that shape,
+    # which puts `c2.tunnel` there itself.
     beacon_cfg = beacon_config_from_fallback(c2_cfg)
-    if tunnel is not None:
-        beacon_cfg["c2"]["tunnel"] = tunnel
 
     # The same predicate the generated artifact's bootstrap uses, so a
     # host with no tunnel configured and a build with none refuse in the

@@ -288,12 +288,12 @@ def _tunnel_config_for_build(body: dict, data_dir) -> Optional[dict]:
     """
     # Imported here, not at the top: the container ships server.py and
     # beacon.py side by side with no `tunnel` package beside them, and a
-    # deployment that generates no tunnel should not need one. `_PSK_LEN`
+    # deployment that generates no tunnel should not need one. `PSK_LEN`
     # and `_DEFAULT_KEEPALIVE` are read rather than repeated -- the store
     # refuses a PSK of the wrong length, and the endpoint's own default is
     # what a build with no explicit interval should get.
     from software.c2.beacon import _DEFAULT_KEEPALIVE, tunnel_config_problem
-    from software.c2.tunnel.keys import _PSK_LEN, KeyStore
+    from software.c2.tunnel.keys import PSK_LEN, KeyStore
 
     asked = body.get("tunnel") or {}
     if not isinstance(asked, dict):
@@ -332,7 +332,7 @@ def _tunnel_config_for_build(body: dict, data_dir) -> Optional[dict]:
     # was wrong while the file named in the message says otherwise.
     path = _tunnel_keystore_path(data_dir)
     identity = "tun-" + os.urandom(_TUNNEL_IDENTITY_BYTES).hex()
-    psk = os.urandom(_PSK_LEN)
+    psk = os.urandom(PSK_LEN)
     try:
         store = KeyStore(path)
         store.register_build(identity, psk)
@@ -1482,17 +1482,33 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         tmp.write(stage)
         tmp.close()
 
+        # The credential was registered before `gh` ran, so every way the
+        # upload can fail to deliver the artifact has to take it back out
+        # again: a non-zero exit, and the `timeout` below, which raises
+        # rather than returning. Every PSK in the store is tried on every
+        # incoming handshake, so one left for a build nobody received is a
+        # candidate walked for ever. `delivered` is set at the last point
+        # from which the artifact is certainly out; nothing after it is
+        # this guard's business.
+        delivered = False
         try:
-            r = subprocess.run(
-                ["gh", "gist", "create", "--public=false", "--filename", filename, tmp.name],
-                capture_output=True, text=True, timeout=30,
-            )
-        finally:
-            os.unlink(tmp.name)
+            try:
+                r = subprocess.run(
+                    ["gh", "gist", "create", "--public=false", "--filename", filename, tmp.name],
+                    capture_output=True, text=True, timeout=30,
+                )
+            finally:
+                os.unlink(tmp.name)
 
-        if r.returncode != 0:
-            _retire_generated_tunnel(gen_cfg, data_dir)
-            return jsonify({"error": f"gh gist create failed: {r.stderr.strip()}"}), 500
+            if r.returncode != 0:
+                return jsonify({"error": f"gh gist create failed: {r.stderr.strip()}"}), 500
+            delivered = True
+        except subprocess.TimeoutExpired:
+            return jsonify({"error": "gh gist create timed out after 30s; "
+                                     "no gist was created"}), 504
+        finally:
+            if not delivered:
+                _retire_generated_tunnel(gen_cfg, data_dir)
 
         gist_url = r.stdout.strip()
         gist_id = gist_url.rstrip("/").split("/")[-1]

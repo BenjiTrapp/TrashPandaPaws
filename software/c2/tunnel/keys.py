@@ -73,7 +73,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from software.c2.beacon import _X25519_BASEPOINT, _x25519, _x25519_keypair
 
 _KEY_LEN = 32
-_PSK_LEN = 32
+
+# How long a PSK is. Public, unlike the rest of this module's constants:
+# whoever mints a build's key has to agree with `register_build`, which
+# refuses any other length, and the generator reads this rather than
+# repeating the number.
+PSK_LEN = 32
 
 _DIR_MODE = 0o700
 _FILE_MODE = 0o600
@@ -116,10 +121,10 @@ class KeyStore:
         self._refresh()
         if not isinstance(identity, str) or not identity:
             raise ValueError("a build identity must be a non-empty string")
-        if not isinstance(psk, bytes) or len(psk) != _PSK_LEN:
+        if not isinstance(psk, bytes) or len(psk) != PSK_LEN:
             got = "%d bytes" % len(psk) if isinstance(psk, bytes) else type(psk).__name__
             raise ValueError(
-                "a PSK must be exactly %d bytes, got %s" % (_PSK_LEN, got)
+                "a PSK must be exactly %d bytes, got %s" % (PSK_LEN, got)
             )
         for build in self._builds:
             if build["identity"] == identity:
@@ -232,7 +237,7 @@ class KeyStore:
                 raise self._fail(where + ".identity", "must be a non-empty string")
             if "psk" not in entry:
                 raise self._fail(where + ".psk", "is missing")
-            psk = self._decode(where + ".psk", entry["psk"], _PSK_LEN)
+            psk = self._decode(where + ".psk", entry["psk"], PSK_LEN)
             created = entry.get("created")
             if not isinstance(created, str) or not created:
                 raise self._fail(where + ".created", "must be a non-empty string")

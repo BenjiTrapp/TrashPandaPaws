@@ -1764,15 +1764,23 @@ def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True,
     `c2.tunnel` of the config this returns, which is where both `Beacon`
     and `TunnelEndpoint` look for it.
 
-    **A tunnel this host cannot run does not cost it its beacon.** That
-    loader refuses a block it cannot make, naming the field; here the
-    refusal is logged at ERROR and the block is left out, because the
-    beacon is the access and the tunnel is the convenience -- a drop-box
-    that stopped calling home over a typo in `c2.tunnel` would be a box
-    lost for a feature nobody had switched on yet. Nothing is silent
-    about it: the reason is in the log, and `tunnel start` answers the
-    operator with `tunnel_mode_problem`'s own words. The host that exists
-    to run the endpoint is `tunnel_standalone`, and it exits instead.
+    **A tunnel this host cannot run does not cost it its beacon, and does
+    not lose its reason either.** That loader refuses a block it cannot
+    make, naming the field. Here the block is left out -- it is the only
+    one there is, and in the `psk`-in-the-file case it is the one holding
+    the file's secret, so handing it on would let `tunnel start` dial
+    with the value this rule exists to refuse. What is kept is the
+    reason, at `c2.tunnel_problem`, which `Beacon._tunnel_start` answers
+    the operator with. Without it `tunnel_mode_problem` would take its
+    no-block arm and say "generate the build with the tunnel enabled",
+    which is false and unactionable advice for a host whose tunnel came
+    from a file.
+
+    The beacon starts either way, because it is the access and the tunnel
+    is the convenience. The log line is a second channel and not the only
+    one: this function is reached only when Sliver is unavailable and
+    `c2.fallback.enabled` is true, and it writes to a rotating file, so a
+    refusal that lived only there would be a refusal nobody saw.
     """
     fallback = c2_cfg.get("fallback") or {}
     block = {
@@ -1789,6 +1797,7 @@ def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True,
     except ValueError as exc:
         logger.error("c2.tunnel cannot be used and has been left out of "
                      "this config: %s", exc)
+        block["tunnel_problem"] = str(exc)
         tunnel = None
     if tunnel is not None:
         block["tunnel"] = tunnel
@@ -4026,6 +4035,13 @@ class Beacon:
         # DEVNULL, so without this the operator's whole diagnosis is
         # `exit_code: 1` at the next check-in.
         self._tunnel_cfg = c2.get("tunnel")
+        # Why there is no block, when a config file had one this host
+        # could not use. `tunnel_mode_problem` cannot tell that case from
+        # a build generated without a tunnel, and its answer for the
+        # latter -- "generate the build with the tunnel enabled" -- is
+        # advice nobody can act on when the tunnel came from
+        # `configs/raccoon.yaml`. See `beacon_config_from_fallback`.
+        self._tunnel_problem = c2.get("tunnel_problem") or ""
         # `_exec_tunnel` runs on the beacon thread and `stop` on whichever
         # thread owns the process, so the two meet over this.
         self._tunnel_lock = threading.Lock()
@@ -5960,7 +5976,15 @@ class Beacon:
             # that currently reaches them as `exit_code: 1` and nothing
             # else. Same predicate as the bootstrap's, wrapped in the
             # config shape it reads.
-            problem = tunnel_mode_problem({"c2": {"tunnel": self._tunnel_cfg}})
+            #
+            # `_tunnel_problem` first, when there is one: the config file
+            # had a tunnel block and it was refused, so the predicate
+            # below would take its no-block arm and tell the operator to
+            # generate a build, which is not what is wrong and not
+            # something they can do about a YAML typo.
+            problem = (self._tunnel_problem
+                       or tunnel_mode_problem(
+                           {"c2": {"tunnel": self._tunnel_cfg}}))
             if problem:
                 return "[error] Not starting a tunnel child: %s" % problem
             try:
