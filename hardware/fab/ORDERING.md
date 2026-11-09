@@ -67,11 +67,14 @@ time are removed (`_normalised` in `tests/check_fab_release.py`). So "git shows 
 whole set modified" and "the hashes changed" say nothing about the board; the
 freshness check compares the normalised content, and the board's own SHA-256 in the
 manifest is what binds the set to a board. A different KiCad version may change the
-content itself; that was not measured. `_normalised` also strips the lines that name the
-generating software (`TF.GenerationSoftware`, "Created by KiCad", "DRILL file KiCad"), so
-a KiCad version change is invisible to the freshness check; the only trace is the
-version the manifest records under `kicad`, which no test compares with the version
-that is running, so whoever rebuilds has to compare it by eye. If
+content itself; that was not measured. The gerber and drill comparison cannot see a
+KiCad version change: `_normalised` strips the lines that name the generating software
+(`TF.GenerationSoftware`, "Created by KiCad", "DRILL file KiCad"). The job-file comparison
+can: it drops only `CreationDate` from the header and compares the rest, including
+`Header.GenerationSoftware.Version`, so a rebuild with another KiCad version fails
+`test_the_job_file_is_what_a_new_export_gives` (shown on 2026-11-09 by editing the
+committed version to 10.0.5). The manifest's `kicad` field records the version, but no
+test compares it with the running one. If
 you rebuild only to refresh the CPL or the assembly BOM, restore the gerber folder
 afterwards (`git checkout hardware/fab/gerber`): the exporter always rewrites it, and a
 new time stamp is churn, not a change.

@@ -2733,6 +2733,7 @@ def pair_coupling_problems(probe, targets=None):
 # ---------------------------------------------------------------------------
 
 import hashlib
+import inspect
 import os
 
 FAB = HARDWARE / "fab"
@@ -3362,16 +3363,23 @@ class CplIsInBoardCoordinatesFromTheLowerLeftCorner(unittest.TestCase):
         self.assertAlmostEqual(pad1[1], float(u3["Mid Y"]) - 116.0 - 1.8, places=4)
         self.assertIn("(124.000, -103.000)", text)
 
-    def test_ordering_says_the_freshness_check_cannot_see_a_kicad_version_change(self):
+    def test_ordering_says_which_comparison_is_blind_to_a_kicad_version_change(self):
         text = re.sub(r"\s+", " ", ORDERING.read_text())
-        self.assertRegex(text, r"TF\.GenerationSoftware.{0,120}invisible to the freshness check")
-        self.assertRegex(text, r"no test compares")
-        # and it is true: the strip list of `_normalised` has the generator lines in it
+        self.assertRegex(text, r"gerber and drill comparison cannot see a KiCad version change")
+        self.assertRegex(text, r"job-file comparison can: it drops only `CreationDate` from the header")
+        self.assertNotRegex(text, r"invisible to the freshness check")      # ruling CL's sentence, which was untrue
+        self.assertRegex(text, r"no test compares it with the running one")
+        # the two claims, against the code they describe
         with tempfile.TemporaryDirectory() as tmp:
             sample = Path(tmp) / "x.gtl"
             sample.write_text("%TF.GenerationSoftware,KiCad,Pcbnew,10.0.6*%\nX1Y1D03*\n")
             self.assertEqual(_normalised(sample), "X1Y1D03*")
-        self.assertEqual(json.loads((GERBER_DIR / MANIFEST_NAME).read_text())["kicad"], "10.0.6")
+        job = json.loads((GERBER_DIR / JOB_NAME).read_text())
+        self.assertIn("Version", job["Header"]["GenerationSoftware"])         # the field the job comparison sees
+        compare = inspect.getsource(GerberSetIsTheExportOfTheBoard.test_the_job_file_is_what_a_new_export_gives)
+        self.assertEqual(re.findall(r'\["Header"\]\.pop\("(\w+)"', compare), ["CreationDate"])
+        self.assertEqual(json.loads((GERBER_DIR / MANIFEST_NAME).read_text())["kicad"],
+                         job["Header"]["GenerationSoftware"]["Version"])
 
     def test_question_10_asks_about_the_cpl_to_gerber_frame_as_well(self):
         questions = ORDERING.read_text().split("## Questions for PCBWay", 1)[1]
@@ -4306,12 +4314,21 @@ class NoOperatorPathIsCommitted(unittest.TestCase):
         self.assertEqual(refused.returncode, 1)
         self.assertIn(H + "alice", refused.stdout)
 
-    def test_the_exemption_comment_does_not_claim_a_platform_guarantee(self):
-        # the first two versions of the comment asserted facts that were false; the true basis is the
-        # fixture, and the source for "no default pi user" is cited next to it
+    def test_the_exemption_comment_cites_its_sources_and_both_hedges(self):
+        # presence, not proof: the comment must carry the source for "no default pi user", the
+        # source for "the software does not assume pi", and the two facts that stop a reader
+        # over-correcting (existing installs keep pi; pi can still be chosen at first boot)
         source = RELATIVIZE.read_text()
-        self.assertIn("raspberry-pi-bullseye-update-april-2022", source)
-        self.assertIn("SUDO_USER", source)
+        flat = re.sub(r"\s*\n#\s*", " ", source)
+        for needed in ("https://www.raspberrypi.com/news/raspberry-pi-bullseye-update-april-2022/", "SUDO_USER",
+                       "existing installs keep their pi user", "may still choose pi at first boot"):
+            self.assertIn(needed, flat)
+
+    def test_four_retired_phrases_are_gone_from_the_exemption_comment(self):
+        # deliberately narrow: it pins four specific sentences of earlier drafts out of existence.
+        # A rephrasing of the same false claim would pass it; the sources test above and review
+        # are what guard the meaning
+        source = RELATIVIZE.read_text()
         for claim in ("same on every deployment", "identifies no one", "long-standing default", "the one the software"):
             self.assertNotIn(claim, source)
 

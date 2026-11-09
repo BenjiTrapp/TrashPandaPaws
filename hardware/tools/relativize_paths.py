@@ -52,7 +52,11 @@ HOME_PATH = re.compile(rf"{_MAC}/{_NAME}|/home/{_NAME}|[A-Za-z]:\\+Users\\+{_NAM
 # instead you will create a user the first time you boot a newly-flashed Raspberry Pi OS
 # image" (https://www.raspberrypi.com/news/raspberry-pi-bullseye-update-april-2022/,
 # fetched 2026-11-09), so on a current install the home directory may carry the operator's
-# own name. And this repository's software does not assume "pi" either:
+# own name. The same page adds two things that stop this being over-read: existing installs
+# keep their pi user (its "Existing installations" section offers a rename tool; a Raspberry
+# Pi staff reply in the comments says it outright), and a user may still choose pi at first
+# boot ("you can set these to "pi" and "raspberry" as before"). So pi is neither guaranteed nor
+# excluded; nothing can be inferred from the name. And this repository's software does not assume "pi" either:
 # software/setup/bootstrap.sh takes the account from ACTUAL_USER="${SUDO_USER:-$USER}".
 # So the same strings anywhere else (hardware/fab/, a README, a committed analyzer output)
 # stay leaks, and so does every other name under software/tests/.
