@@ -48,11 +48,19 @@ target, so the reasons live in this docstring; see this package's own for
 the rule. There are two deliberate exceptions. The refusal messages: a
 stager that gave up silently is the shape in which this feature would
 die quietly on an engagement, and no line of them names this project.
-And one comment in the PowerShell template, on the stream redirection in
-its probe -- that template's behaviour is verified on a real Windows host
-rather than here, so a reader is the only check it gets before then, and
-the redirection is the kind that somebody tidies into `2>&1` and thereby
-breaks.
+And one comment in the PowerShell template, on its probe, which is there
+because of a trap that cannot be reproduced anywhere but on a real
+Windows host: in Windows PowerShell 5.1, redirecting a native command's
+standard error at all -- `2>&1` and `2>$null` behave identically here --
+routes its stderr lines through the command runtime as
+`NativeCommandError` records, and under `$ErrorActionPreference = 'Stop'`
+the first one throws. The probe would read that as a failed version
+check, so an interpreter at or above the floor that printed a single
+warning line would be judged unusable and a bundle fetched onto a host
+that already had a Python -- the one outcome probing first exists to
+prevent. So that line redirects **only stdout** and leaves stderr alone,
+which removes the capture instead of compensating for it, and the
+comment says so where somebody would otherwise add a `2>` back.
 """
 
 import pathlib
@@ -85,10 +93,14 @@ _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 # somewhere nobody asked for.
 _PLAIN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
-# A location has to be fetchable by `curl` and by `Net.WebClient`, and it
-# is interpolated into a single-quoted string in both templates and read
-# back by `read -r url sha` in one of them. Whitespace and quotes are
-# refused rather than escaped: a URL needing either is a mistake upstream.
+# A location has to be fetchable by `curl` and by `HttpWebRequest`, and
+# it is interpolated into a single-quoted string in both templates and
+# read back by `read -r url sha` in one of them. Whitespace and quotes
+# are refused rather than escaped: a URL needing either is a mistake
+# upstream. The `https?` anchor is also what makes the PowerShell
+# template's `[Net.HttpWebRequest]` cast of `[Net.WebRequest]::Create`
+# safe -- another scheme would hand back a different WebRequest subclass
+# and the cast would throw.
 _URL = re.compile(r"^https?://[^\s'\"\\]+$")
 
 

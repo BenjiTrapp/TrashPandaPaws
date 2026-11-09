@@ -636,6 +636,23 @@ class TestWhatTheRenderedTextCarries(unittest.TestCase):
             with self.subTest(platform=platform):
                 self.assertNotIn(".dll", self.render(platform).lower())
 
+    def test_the_windows_probe_redirects_no_standard_error(self):
+        """A regression guard for a trap no shell here can reproduce.
+
+        In Windows PowerShell 5.1 any `2>` on a native command turns its
+        stderr into `NativeCommandError` records that `'Stop'` throws on,
+        so the probe would read a warning-printing interpreter as one
+        below the floor. Nothing on this machine can run that, which is
+        why the shape is pinned here as well as explained in the
+        template: a later tidy-up that adds `2>$null` back fails this.
+        """
+        probe = [line for line in self.render("windows").splitlines()
+                 if "sys.version_info" in line]
+        self.assertEqual(len(probe), 1,
+                         "expected exactly one probe line: %r" % (probe,))
+        self.assertIn("1>$null", probe[0])
+        self.assertNotIn("2>", probe[0])
+
     def test_both_templates_parse_in_their_own_shell(self):
         """A syntax check, which is *not* a run of either stager.
 

