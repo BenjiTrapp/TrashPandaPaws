@@ -43,6 +43,19 @@ class TestTierOne(unittest.TestCase):
         for cmd in ("kill", "unpersist auto", "reconfig"):
             self.assertEqual(self._c(cmd).tier, safety.TIER_HARD, cmd)
 
+    def test_the_tunnel_verb_is_hard_blocked(self):
+        # `tunnel` reached the agent's vocabulary as a side effect rather
+        # than as a decision: `test_agent_prompts` compares the beacon's
+        # own dispatch table against `executor/beacon.py`'s copy for
+        # equality, so adding the verb to the implant forced it into the
+        # list the executor is prompted with. What it does is open or
+        # close a SOCKS route into the target network, which an operator
+        # drives from the panel. Until an agent doing that is a scoped
+        # feature, it fails closed.
+        for cmd in ("tunnel start", "tunnel stop", "tunnel", "TUNNEL start",
+                    "sudo tunnel start"):
+            self.assertEqual(self._c(cmd).tier, safety.TIER_HARD, cmd)
+
     def test_long_sleep_is_hard_blocked(self):
         self.assertEqual(self._c("sleep 7200 20").tier, safety.TIER_HARD)
         self.assertNotEqual(self._c("sleep 15 20").tier, safety.TIER_HARD)
@@ -163,7 +176,7 @@ class TestTierOneSpellings(unittest.TestCase):
 
     def test_beacon_verbs_hard_whatever_the_arguments(self):
         self._hard(("kill now", "reconfig {}", "unpersist crontab", "sudo kill",
-                    "KILL", "  kill  "))
+                    "KILL", "  kill  ", "tunnel start", "  tunnel  stop  "))
 
     def test_sleep_hostile_arguments_are_hard(self):
         self._hard(("sleep 3600", "sleep 99999 0", "sleep inf", "sleep 1e9",

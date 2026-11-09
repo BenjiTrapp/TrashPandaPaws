@@ -57,12 +57,15 @@ the production path.
 """
 
 import base64
+import logging
 import os
 import platform
 import re
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -70,7 +73,7 @@ from unittest import mock
 
 from software.c2 import beacon as beacon_mod
 from software.c2 import server as server_mod
-from software.c2.beacon import Beacon
+from software.c2.beacon import Beacon, tunnel_mode_problem
 from software.c2.server import ServerCrypto, create_app
 from software.c2.tunnel.keys import KeyStore
 from software.c2.tunnel.server import TunnelServer
@@ -154,21 +157,64 @@ def _dash_children():
     return found
 
 
-def _beacon_config():
-    """A beacon that dials nothing: every transport is off."""
-    return {
-        "c2": {
-            "beacon_interval_seconds": 10,
-            "jitter_percent": 0,
-            "encryption_key": base64.b64encode(os.urandom(32)).decode(),
-            "proxy": {"mode": "none"},
-            "https": {"enabled": False, "callback_url": "",
-                      "verify_ssl": False},
-        }
+def _free_port():
+    """A loopback port with nothing on it: bound, read back, released.
+
+    Inherently racy, and that is why nothing here connects to one. The
+    tunnel block a beacon is configured with has to name a port for
+    `tunnel_mode_problem` to accept it, and the stub children these tests
+    spawn never dial it.
+    """
+    probe = socket.socket()
+    try:
+        probe.bind((_LOOPBACK, 0))
+        return probe.getsockname()[1]
+    finally:
+        probe.close()
+
+
+def _tunnel_block(port=None, **overrides):
+    """A complete `c2.tunnel` block, built by hand.
+
+    By hand because Task 9, not this one, teaches the generator to bake
+    one: there is no route that can produce a build with a tunnel yet,
+    and both the parent's pre-flight check and the child's bootstrap
+    refuse without one.
+    """
+    block = {
+        "enabled": True,
+        "server": _LOOPBACK,
+        "port": _free_port() if port is None else port,
+        "public_key": base64.b64encode(b"\x01" * 32).decode("ascii"),
+        "psk": base64.b64encode(b"\x02" * 32).decode("ascii"),
+        "identity": "build-under-test",
     }
+    block.update(overrides)
+    return block
 
 
-def _gen_cfg(tunnel=None):
+def _beacon_config(tunnel=_ABSENT):
+    """A beacon that dials nothing: every transport is off.
+
+    The tunnel block is present by default, because `tunnel start`
+    refuses a build that has none and nearly every test here is about
+    what happens after it does not refuse. `tunnel=None` is the build
+    that was generated without one.
+    """
+    c2 = {
+        "beacon_interval_seconds": 10,
+        "jitter_percent": 0,
+        "encryption_key": base64.b64encode(os.urandom(32)).decode(),
+        "proxy": {"mode": "none"},
+        "https": {"enabled": False, "callback_url": "", "verify_ssl": False},
+    }
+    c2["tunnel"] = _tunnel_block() if tunnel is _ABSENT else tunnel
+    if c2["tunnel"] is None:
+        del c2["tunnel"]
+    return {"c2": c2}
+
+
+def _gen_cfg(tunnel=None, callback="http://127.0.0.1:1/x"):
     """A generator config of the shape both routes build.
 
     `tunnel` is passed by hand because Task 9, not this one, adds that key
@@ -176,7 +222,7 @@ def _gen_cfg(tunnel=None):
     be reachable without going through a generator that cannot make one.
     """
     cfg = {
-        "https": {"enabled": True, "callback_url": "http://127.0.0.1:1/x",
+        "https": {"enabled": True, "callback_url": callback,
                   "verify_ssl": False},
         "dns": {"enabled": False, "domain": "", "resolver": "8.8.8.8"},
         "smb": {"enabled": False, "pipe_name": "msrpc_6e2f", "server": ""},
@@ -187,6 +233,60 @@ def _gen_cfg(tunnel=None):
     if tunnel is not None:
         cfg["tunnel"] = tunnel
     return cfg
+
+
+class _Callback(object):
+    """A listener that records that a beacon called back, and nothing more.
+
+    Deliberately not an HTTP server: that a connection was accepted on
+    the configured callback is the whole of what the non-tunnel branch of
+    the bootstrap has to prove, and a 404 is enough of an answer for the
+    beacon to go round its loop again rather than wedge.
+    """
+
+    def __init__(self):
+        self._listener = socket.socket()
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind((_LOOPBACK, 0))
+        self._listener.listen(8)
+        self._listener.settimeout(0.2)
+        self.port = self._listener.getsockname()[1]
+        self._calls = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._accept, daemon=True,
+                                        name="callback-accept")
+        self._thread.start()
+
+    @property
+    def calls(self):
+        return len(self._calls)
+
+    def _accept(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            self._calls.append(True)
+            try:
+                conn.recv(65535)
+                conn.sendall(b"HTTP/1.1 404 Not Found\r\n"
+                             b"Content-Length: 0\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=5.0)
+
 
 
 # A child that proves what it was given. Written as three pieces so a
@@ -586,11 +686,18 @@ class TestTheTunnelChild(SpawnTestCase):
         self.assertIn(str(pid), output)
         self.assertIn("stopped", output.lower())
         if os.name == "posix":
-            # SIGTERM, not SIGKILL. An endpoint that is asked to go gets
-            # to close its command channel; one that is killed leaves the
-            # tunnel server holding a dead channel until its idle timeout,
-            # and the operator's port with it. -15 in the reported exit
-            # code is the whole evidence that it was asked first.
+            # SIGTERM first and SIGKILL only if it does not go. What -15
+            # holds is the *order*, and only that: `beacon.py` installs
+            # no SIGTERM handler -- there is no `import signal` in it --
+            # so the child dies on the default disposition with no Python
+            # cleanup, as abruptly as a SIGKILL would have killed it. The
+            # order is still the right one. It is the signal a process can
+            # be given a handler for, so an endpoint that later learns to
+            # close its command channel on the way out needs this call to
+            # already be a terminate; and asking before killing is the
+            # convention every init system and container runtime follows,
+            # so a stop that opened with SIGKILL would be the odd one out
+            # with nothing gained.
             self.assertEqual(proc.returncode, -15,
                              "the child was killed rather than terminated")
             self.assertIn("exit -15", output)
@@ -750,6 +857,174 @@ class TestTheTunnelChild(SpawnTestCase):
         called.assert_called_once_with("stop")
 
 
+class TestStartRefusesBeforeItSpawns(SpawnTestCase):
+    """The pre-flight check: a build that cannot run one is told so.
+
+    The child's bootstrap refuses too -- a build can be launched by hand
+    or by a systemd unit with no parent -- but its stderr goes to DEVNULL,
+    so a child is the one place the operator cannot be told why. Without
+    this the whole diagnosis is `exit_code: 1` at the next check-in, and
+    the most likely cause by far is a build generated before the
+    generator learned to bake a tunnel block at all.
+    """
+
+    def beacon_with(self, tunnel):
+        self.beacon = Beacon(_beacon_config(tunnel))
+        self.set_src(_proof_source("h", "t"))
+        return self.beacon
+
+    def assert_refused(self, output, *named):
+        self.assertIn("[error]", output)
+        for text in named:
+            self.assertIn(text, output)
+        self.assertIsNone(self.beacon._tunnel_proc,
+                          "a refusal recorded a child")
+        self.assertEqual(_dash_children(), [],
+                         "a refusal spawned a process anyway")
+        # And nothing to report at the next check-in either: a refusal is
+        # not a tunnel that once existed.
+        self.assertNotIn("tunnel", self.beacon._system_info())
+
+    def test_a_build_with_no_tunnel_block_is_refused_and_told_why(self):
+        output = self.beacon_with(None)._exec_tunnel("start")
+        self.assert_refused(output, "c2.tunnel", "Generate the build with "
+                                                 "the tunnel enabled")
+
+    def test_a_disabled_tunnel_block_is_refused(self):
+        # A dict with `enabled: false` is truthy, which is the way this
+        # goes wrong: the block is there and cannot be run.
+        output = self.beacon_with(
+            _tunnel_block(enabled=False))._exec_tunnel("start")
+        self.assert_refused(output, "c2.tunnel")
+
+    def test_a_half_filled_block_is_refused_by_the_name_of_the_field(self):
+        block = _tunnel_block()
+        del block["psk"]
+        output = self.beacon_with(block)._exec_tunnel("start")
+        self.assert_refused(output, "c2.tunnel.psk")
+
+    def test_a_refusal_never_echoes_the_pre_shared_key(self):
+        # The refusal is a task result that goes back over the channel and
+        # into the operator's log. It names the field and never the value;
+        # this is the assertion that keeps it that way now that the
+        # parent, and not only the child, produces the sentence.
+        secret = base64.b64encode(b"\x07" * 32).decode("ascii")
+        block = _tunnel_block(psk=secret + "!not-base64")
+        output = self.beacon_with(block)._exec_tunnel("start")
+        self.assert_refused(output, "c2.tunnel.psk")
+        self.assertNotIn(secret, output)
+
+    def test_a_complete_block_is_not_refused(self):
+        # The other side of the check: every other test in this file
+        # depends on a complete block getting past it.
+        self.assertIsNone(tunnel_mode_problem(_beacon_config()))
+
+    def test_tunnel_mode_asks_a_different_question_from_the_config_check(self):
+        # `tunnel_config_problem` answers None for a build with no
+        # tunnel, because most builds have none and demanding a PSK of
+        # those would break them. Running as the endpoint is the question
+        # the other way round, and conflating the two is what would make
+        # a plain build spawn a child that cannot do anything.
+        plain = _beacon_config(None)
+        self.assertIsNone(beacon_mod.tunnel_config_problem(plain))
+        self.assertIsNotNone(tunnel_mode_problem(plain))
+        disabled = _beacon_config(_tunnel_block(enabled=False))
+        self.assertIsNone(beacon_mod.tunnel_config_problem(disabled))
+        self.assertIsNotNone(tunnel_mode_problem(disabled))
+
+
+class TestAChildThatWillNotGo(SpawnTestCase):
+    """`subprocess.TimeoutExpired` must never leave the tunnel code.
+
+    Out of `_tunnel_start` it would reach an operator as
+    `[exception: ...]` from `_process_tasking`'s catch-all with no child
+    recorded; out of `_tunnel_stop` it would abort the rest of
+    `Beacon.stop` before it had finished, including the line that says
+    the beacon stopped. It needs a child that has been signalled and is
+    still there -- stuck in the kernel in an uninterruptible state --
+    which no test can produce on demand. So the condition is injected at
+    the one call that raises it, `Popen.wait`, which belongs to the
+    standard library and not to this file.
+    """
+
+    def test_the_helper_reports_a_child_that_will_not_go(self):
+        class _WillNotGo(object):
+            pid = 4242
+
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="python -",
+                                                timeout=timeout)
+
+        code, ending = Beacon._child_ending(_WillNotGo())
+        self.assertIsNone(code, "a child that did not go reported an exit")
+        self.assertIn("4242", ending)
+        self.assertIn("unreaped", ending,
+                      "the residue a killed-but-unreaped child leaves is "
+                      "not named")
+
+    def test_the_helper_reports_an_ordinary_child_by_its_exit_code(self):
+        self.set_src("raise SystemExit(5)\n")
+        self.beacon._exec_tunnel("start")
+        code, ending = Beacon._child_ending(self.beacon._tunnel_proc)
+        self.assertEqual(code, 5)
+        self.assertEqual(ending, "exit 5")
+
+    def test_stop_reports_a_child_that_survives_both_signals(self):
+        self.set_src(_proof_source("h", "t"))
+        path = self.proof_path()
+        self.beacon._exec_tunnel("start")
+        proc = self.beacon._tunnel_proc
+        self.wait_for_file(path)
+        # The warning this path logs is expected, and `raccoon.c2` has no
+        # handler in a test run, so without one of its own it would reach
+        # stderr through logging's last resort and dirty the output.
+        quiet = logging.NullHandler()
+        logging.getLogger("raccoon.c2").addHandler(quiet)
+        self.addCleanup(logging.getLogger("raccoon.c2").removeHandler, quiet)
+
+        # The child is really terminated and really killed. Only the wait
+        # is made to answer as it would for a process the kernel is not
+        # letting go of.
+        with mock.patch.object(
+                proc, "wait",
+                side_effect=subprocess.TimeoutExpired("python -", 5.0)):
+            output = self.beacon._exec_tunnel("stop")
+
+        self.assertIn("[error]", output)
+        self.assertIn("could not be stopped", output)
+        self.assertIn(str(proc.pid), output)
+        self.assertIn("unreaped", output)
+        # The kill really landed: with the real `wait` back, `poll` reaps
+        # the child and reports the signal. Until something reaps it the
+        # pid is still in the process table as a zombie, which is the
+        # residue the message names and the reason this asserts on the
+        # exit code rather than on the pid being gone. The wait is for
+        # the kill's delivery, which is asynchronous.
+        self.wait_for(lambda: proc.poll() is not None, timeout=10.0,
+                      what="the signalled child being reaped")
+        # Signalled and gone. Which of the two signals finished it is a
+        # race the test must not pin: the mocked wait returns instantly,
+        # so the terminate that preceded it is usually what lands first
+        # and -15 is as correct an answer here as -9. What is being held
+        # is that the method reported instead of raising, and that it did
+        # not give up without signalling.
+        self.assertIn(proc.returncode, (-15, -9),
+                      "the child was given up on rather than signalled")
+
+    def test_neither_path_waits_outside_the_guard(self):
+        # The start path's child is created inside the method, so a test
+        # has no handle to inject a stuck wait into. What holds that path
+        # is structural: there is one `wait(timeout=` in the whole tunnel
+        # section and it is the one inside `_child_ending`.
+        text = Path(beacon_mod.__file__).read_text(encoding="utf-8")
+        section = text[text.index("    def _tunnel_source("):
+                       text.index("    # ── Persistence ──")]
+        self.assertIn("def _child_ending", section)
+        self.assertEqual(len(re.findall(r"\w+\.wait\(timeout=", section)), 1,
+                         "the tunnel section waits on a child outside "
+                         "_child_ending, where a TimeoutExpired propagates")
+
+
 class TestWhereTheSourceComesFrom(SpawnTestCase):
     """`_src`, and the fallback for a checkout that has no `_src`."""
 
@@ -798,8 +1073,11 @@ class TestTheBootstrapBranch(unittest.TestCase):
             _gen_cfg(tunnel), 300, 20,
             base64.b64encode(os.urandom(32)).decode())
 
-    def artifact(self, tunnel=None):
-        return self.beacon_source + "\n" + self.block(tunnel)
+    def artifact(self, tunnel=None, callback="http://127.0.0.1:1/x"):
+        return (self.beacon_source + "\n"
+                + server_mod._beacon_config_block(
+                    _gen_cfg(tunnel, callback), 300, 20,
+                    base64.b64encode(os.urandom(32)).decode()))
 
     def run_in_tunnel_mode(self, source, timeout=120):
         env = dict(os.environ)
@@ -827,8 +1105,16 @@ class TestTheBootstrapBranch(unittest.TestCase):
         block = self.block()
         self.assertIn("TunnelEndpoint(", block)
         self.assertIn("Beacon(", block)
+        # The refusal is the beacon's own predicate, not a sentence
+        # written again here: the parent checks the same rule before it
+        # spawns, and two spellings would be the two ends disagreeing
+        # about whether a build has a runnable tunnel.
+        self.assertIn("tunnel_mode_problem(_cfg)", block)
+        self.assertNotIn("public_key or psk", block,
+                         "the refusal's wording is repeated in the config "
+                         "block instead of coming from the predicate")
         # Compiled, not exec'd: the non-tunnel branch of this block ends in
-        # an endless sleep, and the tunnel branch is run for real below.
+        # an endless sleep, and both branches are run for real below.
         compile(self.artifact(), "<artifact>", "exec")
 
     def test_tunnel_mode_without_a_tunnel_block_refuses_and_names_it(self):
@@ -841,23 +1127,84 @@ class TestTheBootstrapBranch(unittest.TestCase):
         message = done.stderr.decode("utf-8", "replace")
         self.assertIn("c2.tunnel", message)
         self.assertIn("RACCOON_TUNNEL_MODE", message)
+        self.assertIn("Generate the build with the tunnel enabled", message)
         self.assertEqual(done.stdout, b"")
 
     def test_a_disabled_tunnel_block_is_refused_the_same_way(self):
+        # Literally the same way, which is the point of the assertion on
+        # the wording: a dict with `enabled: false` is truthy, so a guard
+        # on the block's presence would let this through to
+        # `TunnelEndpoint`, whose own ValueError also mentions
+        # `c2.tunnel` -- and the test would pass for a reason its name
+        # does not claim. That sentence is this predicate's and no other.
         done = self.run_in_tunnel_mode(
-            self.artifact({"enabled": False, "server": _LOOPBACK}))
+            self.artifact(_tunnel_block(enabled=False)))
         self.assertNotEqual(done.returncode, 0)
-        self.assertIn("c2.tunnel",
-                      done.stderr.decode("utf-8", "replace"))
+        message = done.stderr.decode("utf-8", "replace")
+        self.assertIn("no enabled c2.tunnel block", message)
+        self.assertIn("Generate the build with the tunnel enabled", message)
+        self.assertNotIn("c2.tunnel.enabled is not set", message,
+                         "the refusal came from TunnelEndpoint, so the "
+                         "bootstrap let a disabled block through")
 
     def test_a_half_filled_tunnel_block_names_the_missing_field(self):
-        done = self.run_in_tunnel_mode(self.artifact({
-            "enabled": True, "server": _LOOPBACK, "identity": "build-alpha",
-            "port": 1, "public_key": base64.b64encode(b"\x00" * 32).decode(),
-        }))
+        block = _tunnel_block()
+        del block["psk"]
+        done = self.run_in_tunnel_mode(self.artifact(block))
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("c2.tunnel.psk",
                       done.stderr.decode("utf-8", "replace"))
+
+    def test_without_the_mode_the_bootstrap_runs_the_beacon(self):
+        """The branch every artifact this repository produces takes.
+
+        This task moved `b=Beacon(_cfg);b.start()` and its `try/except
+        KeyboardInterrupt` into an `else:`, and nothing else here runs
+        it: the three tests above set the mode and take the other branch,
+        and the generator tests exec the artifact under a name that is
+        not `__main__` so the block does not run at all. A
+        mis-indentation that still compiles -- `b.start()` landing inside
+        the tunnel branch, the `try` wrapping the wrong statement --
+        would pass every one of them.
+
+        So this starts the artifact for real and waits for it to call
+        back to a listener on a port read off the socket. A callback is
+        the only thing a started beacon does that can be seen from
+        outside, and it is what distinguishes a beacon that was
+        constructed from one that was constructed *and started*. The
+        child staying alive afterwards is the second half: the endless
+        sleep is what keeps the process up once the beacon thread, which
+        is a daemon, is the only other one left.
+        """
+        callback = _Callback()
+        self.addCleanup(callback.close)
+        source = self.artifact(
+            callback="http://%s:%d/api/v1/beacon" % (_LOOPBACK, callback.port))
+        env = dict(os.environ)
+        env.pop(beacon_mod._TUNNEL_MODE_ENV, None)
+        child = subprocess.Popen([sys.executable, "-"],
+                                 stdin=subprocess.PIPE,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 env=env)
+        self.addCleanup(child.wait, 30)
+        self.addCleanup(child.kill)
+        child.stdin.write(source.encode("utf-8"))
+        child.stdin.close()
+
+        deadline = time.time() + 60.0
+        while time.time() < deadline and not callback.calls:
+            if child.poll() is not None:
+                self.fail("the artifact exited with %s instead of running as "
+                          "a beacon; the non-tunnel branch of the bootstrap "
+                          "does not run" % child.returncode)
+            time.sleep(0.05)
+        self.assertTrue(callback.calls,
+                        "the artifact never called back, so the beacon was "
+                        "not started")
+        self.assertIsNone(child.poll(),
+                          "the artifact exited after starting the beacon; "
+                          "the bootstrap's own wait is gone")
 
 
 # ── End to end: the child really is an endpoint ──
@@ -895,18 +1242,18 @@ class TestTheChildReachesTheTunnelServer(SpawnTestCase):
         return {"identity": self.identity, "state": "absent"}
 
     def test_the_child_connects_as_the_tunnel_endpoint(self):
-        tunnel = {
-            "enabled": True,
-            "server": _LOOPBACK,
-            "port": self.server.port,
-            "public_key": base64.b64encode(
+        tunnel = _tunnel_block(
+            port=self.server.port,
+            public_key=base64.b64encode(
                 self.store.static_public()).decode("ascii"),
-            "psk": base64.b64encode(self.psk).decode("ascii"),
-            "identity": self.identity,
+            psk=base64.b64encode(self.psk).decode("ascii"),
+            identity=self.identity,
             # This machine may have no libcrypto; a tunnel on the slow
             # path is still a tunnel, and the refusal is Task 7's test.
-            "allow_slow_crypto": True,
-        }
+            allow_slow_crypto=True)
+        # The parent holds the same block the child is given, which is
+        # what a generated artifact has: one config, two readers.
+        self.beacon = Beacon(_beacon_config(tunnel))
         block = server_mod._beacon_config_block(
             _gen_cfg(tunnel), 300, 20,
             base64.b64encode(os.urandom(32)).decode())

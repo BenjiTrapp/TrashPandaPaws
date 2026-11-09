@@ -889,7 +889,19 @@ def _disk_verdict(effective):
 _MALFORMED = _row(TIER_HARD, "malformed", "input",
                   "command is not a string and cannot be classified")
 
-_BEACON_HARD_VERBS = ("kill", "unpersist", "reconfig")
+# The beacon verbs the agent may never send. Each is a lifeline: `kill`
+# ends the implant, `unpersist` removes the way back, `reconfig` can move
+# the callback, and `tunnel` opens or closes a SOCKS route into the
+# target network. `tunnel` is here because it reached the agent's
+# vocabulary as a side effect and not as a decision: the beacon's
+# dispatch table and `executor/beacon.py`'s copy of it are compared for
+# equality by a test, so adding the verb to the implant forced it into
+# the list the executor is prompted with. An operator drives tunnels from
+# the panel; an agent doing it should be a deliberate feature, and until
+# it is one this fails closed. The verb stays in `VERB_HINTS` and is
+# still described to the model, exactly as `kill`, `unpersist` and
+# `reconfig` are.
+_BEACON_HARD_VERBS = ("kill", "unpersist", "reconfig", "tunnel")
 _SLEEP_LIMIT_SECONDS = 3600
 
 # The two halves of _RULES are consulted at different points in classify, so

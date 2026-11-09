@@ -308,10 +308,15 @@ def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
     JSON booleans, both of which corrupt a quoted-literal embedding.
 
     Two names are read out of the beacon source this block is appended to
-    rather than repeated here -- `_TUNNEL_MODE_ENV` and `TunnelEndpoint`.
-    The environment variable in particular is a fact the parent and the
-    child have to agree on exactly, and the two are the same file, so
-    there is no reason for the string to exist twice.
+    rather than repeated here -- `_TUNNEL_MODE_ENV` and
+    `tunnel_mode_problem` -- plus `TunnelEndpoint` and `Beacon`
+    themselves. The environment variable and the rule for what counts as
+    a runnable tunnel block are both facts the parent and the child have
+    to agree on exactly, and the two are the same file, so neither is
+    written twice. `tunnel_mode_problem` is also what makes a block with
+    `enabled: false` refused here: a dict is truthy whatever is in it, so
+    the lift below says only that a block was baked in, not that it can
+    be run.
     """
     import textwrap
 
@@ -329,11 +334,10 @@ def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
         _t=_p.get("tunnel")
         if _t: _cfg["c2"]["tunnel"]=_t
         if _os.environ.get(_TUNNEL_MODE_ENV):
-            if not _t: raise SystemExit(
+            _problem=tunnel_mode_problem(_cfg)
+            if _problem: raise SystemExit(
                 _TUNNEL_MODE_ENV+" is set, so this process is the tunnel "
-                "child, but the build it came from carries no c2.tunnel "
-                "block: there is no server, port, public_key or psk to dial "
-                "with. Generate the build with the tunnel enabled.")
+                "child, but "+_problem)
             TunnelEndpoint(_cfg).run()
         else:
             b=Beacon(_cfg);b.start()

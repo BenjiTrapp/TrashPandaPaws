@@ -146,6 +146,28 @@ class TestGating(IsolatedAsyncioTestCase):
         self.assertIsNotNone(res.blocked_reason)
         self.assertTrue(c2.nothing_ran())
 
+    async def test_the_tunnel_verb_never_reaches_the_beacon(self):
+        # The verb exists in the beacon's dispatch table, so it is in the
+        # executor's vocabulary too -- a test compares the two for
+        # equality. What it does is open a SOCKS route into the target
+        # network, which is the operator's decision and not the agent's.
+        #
+        # The reason is asserted and not only the refusal: `tunnel start`
+        # names no host, so with the verb absent from the hard list it is
+        # still refused -- by the scope check, for having no target -- and
+        # a test that asked only whether it was blocked would pass against
+        # a build where the agent could run `tunnel start 10.0.1.5`.
+        # Read off the risk table rather than quoted, so a reworded
+        # reason does not need editing here.
+        expected = safety.RISK_TABLE["beacon_control"].reason
+        for command in ("tunnel start", "tunnel stop"):
+            with self.subTest(command=command):
+                r, c2 = _router()
+                res = await r.run_command(command, beacon_id="raccoon-fox")
+                self.assertFalse(res.success)
+                self.assertEqual(res.blocked_reason, expected)
+                self.assertTrue(c2.nothing_ran())
+
     async def test_out_of_scope_target_is_blocked_before_execution(self):
         r, c2 = _router()
         res = await r.run_command("nmap -sV 172.16.0.5", beacon_id="raccoon-fox")
