@@ -11,6 +11,7 @@ import base64
 import ctypes
 import ctypes.util
 import hashlib
+import hmac
 import io
 import json
 import logging
@@ -31,7 +32,7 @@ import urllib.error
 import zipfile
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 logger = logging.getLogger("raccoon.c2")
 
@@ -446,6 +447,206 @@ def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> by
         return out.raw[:pt_len]
     finally:
         _crypto.EVP_CIPHER_CTX_free(ctx)
+
+
+# ── X25519 key agreement via OpenSSL ctypes ──
+
+_X25519_KEY_LEN = 32
+# obj_mac.h. X25519 has no EVP_PKEY_CTX_new_id of its own: the raw-key
+# constructors take the NID directly.
+_NID_X25519 = 1034
+# RFC 7748 §4.1: u = 9. A public key is the private scalar applied to it,
+# so the keypair needs no separate OpenSSL code path.
+_X25519_BASEPOINT = b"\x09" + b"\x00" * 31
+
+# The raw-key API arrived in OpenSSL 1.1.1. An older libcrypto loads and
+# serves AES-256-GCM perfectly well, so this flag is its own measurement
+# and not a copy of _USE_PURE_PYTHON_AES -- and it is read at call time,
+# so a test can force either backend.
+_USE_PURE_PYTHON_X25519 = (
+    _crypto is None
+    or not hasattr(_crypto, "EVP_PKEY_new_raw_private_key")
+    or not hasattr(_crypto, "EVP_PKEY_derive"))
+
+if not _USE_PURE_PYTHON_X25519:
+    _crypto.EVP_PKEY_new_raw_private_key.argtypes = [
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+    ]
+    _crypto.EVP_PKEY_new_raw_private_key.restype = ctypes.c_void_p
+    _crypto.EVP_PKEY_new_raw_public_key.argtypes = [
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+    ]
+    _crypto.EVP_PKEY_new_raw_public_key.restype = ctypes.c_void_p
+    _crypto.EVP_PKEY_free.argtypes = [ctypes.c_void_p]
+    _crypto.EVP_PKEY_CTX_new.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _crypto.EVP_PKEY_CTX_new.restype = ctypes.c_void_p
+    _crypto.EVP_PKEY_CTX_free.argtypes = [ctypes.c_void_p]
+    _crypto.EVP_PKEY_derive_init.argtypes = [ctypes.c_void_p]
+    _crypto.EVP_PKEY_derive_init.restype = ctypes.c_int
+    _crypto.EVP_PKEY_derive_set_peer.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    _crypto.EVP_PKEY_derive_set_peer.restype = ctypes.c_int
+    _crypto.EVP_PKEY_derive.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t),
+    ]
+    _crypto.EVP_PKEY_derive.restype = ctypes.c_int
+
+
+# ── Pure-Python X25519 (stdlib only, no ctypes) ──
+# Used as fallback when libcrypto is unavailable or predates the raw-key
+# API. Not constant-time -- the conditional swap below is a Python `if`,
+# as the pure AES above is also not constant-time. Both are a fallback
+# for a host that denies us libcrypto, not a claim of side-channel
+# resistance; the key is ephemeral and used for one handshake.
+
+_X25519_P = 2 ** 255 - 19
+_X25519_A24 = 121665
+
+
+def _x25519_clamp(scalar: bytes) -> int:
+    """The scalar as RFC 7748 §5 decodes it: low three bits and the top
+    bit cleared, bit 254 set. Clearing the low bits confines the result to
+    the prime-order subgroup; setting bit 254 fixes the ladder's length.
+    """
+    k = bytearray(scalar)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    return int.from_bytes(k, "little")
+
+
+def _pure_x25519(private: bytes, peer_public: bytes) -> bytes:
+    """Pure-Python X25519. The RFC 7748 §5 Montgomery ladder verbatim.
+
+    255 iterations from bit 254 down, each a conditional swap followed by
+    one differential add-and-double, then a single inversion by Fermat's
+    little theorem. The top bit of the u-coordinate is masked off before
+    use, which RFC 7748 §5 requires of every receiver.
+    """
+    p = _X25519_P
+    k = _x25519_clamp(private)
+    x1 = int.from_bytes(peer_public, "little") & ((1 << 255) - 1)
+    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+    for t in range(254, -1, -1):
+        k_t = (k >> t) & 1
+        swap ^= k_t
+        if swap:
+            x2, x3 = x3, x2
+            z2, z3 = z3, z2
+        swap = k_t
+        a = (x2 + z2) % p
+        aa = (a * a) % p
+        b = (x2 - z2) % p
+        bb = (b * b) % p
+        e = (aa - bb) % p
+        c = (x3 + z3) % p
+        d = (x3 - z3) % p
+        da = (d * a) % p
+        cb = (c * b) % p
+        x3 = pow(da + cb, 2, p)
+        z3 = (x1 * pow(da - cb, 2, p)) % p
+        x2 = (aa * bb) % p
+        z2 = (e * (aa + _X25519_A24 * e)) % p
+    if swap:
+        x2, x3 = x3, x2
+        z2, z3 = z3, z2
+    shared = (x2 * pow(z2, p - 2, p)) % p
+    return shared.to_bytes(_X25519_KEY_LEN, "little")
+
+
+def _x25519_keypair() -> Tuple[bytes, bytes]:
+    """A fresh (private, public) X25519 keypair, 32 bytes each.
+
+    The private key is 32 random bytes as RFC 7748 §6.1 specifies;
+    clamping happens inside the scalar multiplication, so there is nothing
+    to normalise here. The public key is derived through whichever backend
+    is active, which keeps a keypair from one backend usable by the other.
+    """
+    private = os.urandom(_X25519_KEY_LEN)
+    return private, _x25519(private, _X25519_BASEPOINT)
+
+
+def _x25519(private: bytes, peer_public: bytes) -> bytes:
+    """The 32-byte X25519 shared secret for `private` and `peer_public`.
+
+    Both arguments must be exactly 32 bytes: a short or long key is a
+    framing bug upstream, and the ladder would otherwise reinterpret it
+    and return a secret the far end cannot reach. An all-zero result means
+    the peer sent a low-order point, which yields a shared secret an
+    attacker already knows; OpenSSL refuses to derive one and so does the
+    pure path, so the two backends agree on the rejection too.
+    """
+    if len(private) != _X25519_KEY_LEN:
+        raise ValueError("X25519 private key is %d bytes; it must be "
+                         "exactly %d" % (len(private), _X25519_KEY_LEN))
+    if len(peer_public) != _X25519_KEY_LEN:
+        raise ValueError("X25519 peer public key is %d bytes; it must be "
+                         "exactly %d" % (len(peer_public), _X25519_KEY_LEN))
+
+    if _USE_PURE_PYTHON_X25519:
+        shared = _pure_x25519(private, peer_public)
+        if shared == b"\x00" * _X25519_KEY_LEN:
+            raise ValueError("X25519 derivation failed — peer public key "
+                             "is a low-order point")
+        return shared
+
+    pkey = _crypto.EVP_PKEY_new_raw_private_key(
+        _NID_X25519, None, private, len(private))
+    if not pkey:
+        raise RuntimeError("EVP_PKEY_new_raw_private_key failed")
+    peer = None
+    ctx = None
+    try:
+        peer = _crypto.EVP_PKEY_new_raw_public_key(
+            _NID_X25519, None, peer_public, len(peer_public))
+        if not peer:
+            raise RuntimeError("EVP_PKEY_new_raw_public_key failed")
+        ctx = _crypto.EVP_PKEY_CTX_new(pkey, None)
+        if not ctx:
+            raise RuntimeError("EVP_PKEY_CTX_new failed")
+        if _crypto.EVP_PKEY_derive_init(ctx) != 1:
+            raise RuntimeError("EVP_PKEY_derive_init failed")
+        if _crypto.EVP_PKEY_derive_set_peer(ctx, peer) != 1:
+            raise RuntimeError("EVP_PKEY_derive_set_peer failed")
+        outlen = ctypes.c_size_t(_X25519_KEY_LEN)
+        out = ctypes.create_string_buffer(_X25519_KEY_LEN)
+        if _crypto.EVP_PKEY_derive(ctx, out, ctypes.byref(outlen)) != 1:
+            raise ValueError("X25519 derivation failed — peer public key "
+                             "is a low-order point")
+        return out.raw[:outlen.value]
+    finally:
+        if ctx:
+            _crypto.EVP_PKEY_CTX_free(ctx)
+        if peer:
+            _crypto.EVP_PKEY_free(peer)
+        _crypto.EVP_PKEY_free(pkey)
+
+
+# ── HKDF, Noise's flavour ──
+
+def _hkdf(chaining_key: bytes, input_material: bytes,
+          num_outputs: int) -> Tuple[bytes, ...]:
+    """Noise §4.3 HKDF: `num_outputs` 32-byte keys from a chaining key.
+
+    This is RFC 5869 with the arguments Noise names and no `info`: the
+    chaining key is the salt, so `temp_key = HMAC(chaining_key, ikm)` is
+    RFC 5869's extract step, and each output is the expand step's next
+    block, `HMAC(temp_key, previous || i)`. Signature follows Noise rather
+    than RFC 5869 because the handshake state is what calls it -- with two
+    outputs after a DH, three when it also needs a handshake hash.
+    """
+    if num_outputs not in (2, 3):
+        raise ValueError("HKDF produces two or three outputs, not %r"
+                         % (num_outputs,))
+    temp_key = hmac.new(chaining_key, input_material, hashlib.sha256).digest()
+    outputs = []
+    previous = b""
+    for i in range(1, num_outputs + 1):
+        previous = hmac.new(temp_key, previous + bytes([i]),
+                            hashlib.sha256).digest()
+        outputs.append(previous)
+    return tuple(outputs)
 
 
 # ── Stdlib DNS resolver (TXT + A records) ──
