@@ -54,9 +54,21 @@ name, every one carries the same fixed timestamp and the same mode,
 directory entries are not written at all, and each `ZipInfo` is built
 fresh instead of being carried over from the distribution -- so none of
 the source archive's extra fields, host attributes or timestamps reach
-the output. What is left varying is the deflate stream itself, which
-belongs to zlib and not to this tool; the level is pinned, and two builds
-on the same zlib give byte-identical files.
+the output.
+
+**The limit of that, stated rather than implied.** What is pinned here is
+the archive: its member list, their names, their order, their timestamps,
+their modes and their contents, and the deflate level. What is not pinned
+is the deflate stream itself, which belongs to zlib: a build against a
+differently compressing zlib -- zlib-ng is the live case -- can produce a
+different bundle from byte-identical inputs. The consequence is a false
+alarm between two operators comparing hashes, and nothing more. It is
+never a weakening of what the stager verifies, because the stager
+verifies the hash of the file the operator actually uploaded, which this
+tool computes over the file it has just written. `ZIP_STORED` would
+remove even the false alarm, at the cost of roughly doubling a dead drop
+that is already about 11 MB, and that is the wrong trade for a
+convenience cross-check.
 
     python3 tools/build_interpreter_bundle.py \\
         --distribution python-3.11.9-embed-amd64.zip \\
@@ -133,7 +145,7 @@ def verify_distribution(path, expect_sha256: str) -> str:
     expected = (expect_sha256 or "").strip().lower()
     if not _SHA256.match(expected):
         raise ValueError(
-            "--expect-sha256 must be 64 lowercase hex digits, not %r: the "
+            "--expect-sha256 must be 64 hex digits, not %r: the "
             "pinned hash of the upstream distribution is the only thing "
             "this build trusts and there is no way to skip it"
             % (expect_sha256,))
@@ -223,9 +235,36 @@ def build_bundle(distribution_zip, payload_source, *, base_dir,
     payload_path = pathlib.Path(str(payload_source))
     payload_name = payload_name or payload_path.name
 
-    # Rendered first: it validates the payload name and the gate, so a
-    # build that could not produce a working hook fails before it reads
-    # 11 MB and hashes it.
+    # Checked here as well as by `render_sitecustomize`, which holds the
+    # name to the same shape for its own reason. The renderer's regex is
+    # not this tool's archive-path safety: a later relaxation of it would
+    # loosen these member names with nothing here noticing. The two
+    # reserved names below are the reason this block is one place rather
+    # than spread between here and the collision check: everything the
+    # payload may not be called is in front of whoever relaxes one of
+    # them, and all of it refuses before 11 MB is read and hashed.
+    if not _PLAIN_NAME.match(payload_name):
+        raise ValueError(
+            "payload_name must be one plain file name made of letters, "
+            "digits, dot, dash and underscore, not %r: it becomes a member "
+            "name in the archive the stager unpacks" % (payload_name,))
+    if payload_name == HOOK_DIR:
+        raise ValueError(
+            "payload_name may not be %r: that is the directory the hook "
+            "goes in, so the archive would carry a file and a directory "
+            "under one name and would not extract on the target"
+            % (HOOK_DIR,))
+    if payload_name == HOOK_NAME:
+        raise ValueError(
+            "payload_name may not be %r: the rewritten ._pth puts the "
+            "interpreter root on the path ahead of %s/, so `site` would "
+            "import the payload under that name and the real hook would "
+            "never run -- the bundle would look built and do nothing"
+            % (HOOK_NAME, HOOK_DIR))
+
+    # Rendered after the name is validated, and before anything is read:
+    # it validates the gate, so a build that could not produce a working
+    # hook fails before it reads 11 MB and hashes it.
     hook = render_sitecustomize(payload_name, gate)
 
     verify_distribution(distribution_zip, expect_sha256)
@@ -236,7 +275,16 @@ def build_bundle(distribution_zip, payload_source, *, base_dir,
         infos = [info for info in distribution.infolist() if not info.is_dir()]
         for info in infos:
             _check_member_name(info.filename, distribution_zip)
-            members[info.filename] = distribution.read(info.filename)
+            if info.filename in members:
+                raise ValueError(
+                    "%s carries more than one member named %r, and one of "
+                    "them would be dropped from the bundle rather than "
+                    "refused" % (distribution_zip, info.filename))
+            # Read through the ZipInfo rather than the name: with a
+            # duplicated member name, the name-to-info map resolves to
+            # the last occurrence, so reading by name would hand back
+            # the same bytes for every one of them.
+            members[info.filename] = distribution.read(info)
 
     pth_names = sorted(name for name in members
                        if "/" not in name and name.endswith("._pth"))
@@ -272,15 +320,18 @@ def build_bundle(distribution_zip, payload_source, *, base_dir,
 
     # Staged and renamed, so a bundle on disk is either complete or
     # absent: an interrupted write that left a short file under the
-    # operator's chosen name is the one shape nobody would re-check.
+    # operator's chosen name is the one shape nobody would re-check. The
+    # rename is inside the guard too -- a directory in the way, a
+    # cross-device destination or a permission refusal all fail there,
+    # and a `.partial` left behind is litter the operator did not ask for.
     staged = pathlib.Path("%s.partial" % (out_path,))
     try:
         _write_reproducible_zip(staged, laid_out)
+        staged.replace(str(out_path))
     except Exception:
         if staged.exists():
             staged.unlink()
         raise
-    staged.replace(str(out_path))
 
     digest = sha256_file(out_path)
     return {"path": str(out_path), "sha256": digest,

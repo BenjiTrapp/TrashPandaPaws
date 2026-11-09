@@ -43,6 +43,7 @@ import posixpath
 import socket
 import time
 import unittest
+import warnings
 import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -224,12 +225,36 @@ class TestTheDistributionIsVerifiedBeforeItIsOpened(_BundleCase):
                 with self.assertRaises(ValueError):
                     self.build(expect_sha256=bad)
 
+    def test_a_pin_copied_in_uppercase_is_the_same_pin(self):
+        # A published digest is often printed in uppercase, and it is the
+        # same pin. The refusal message must not claim otherwise, or an
+        # operator reads it and starts editing a hash by hand.
+        result = self.build(expect_sha256=_sha256(self.distribution).upper())
+        self.assertTrue(Path(result["path"]).is_file())
+
+        with self.assertRaises(ValueError) as raised:
+            self.build(expect_sha256="not a digest")
+        self.assertNotIn("lowercase", str(raised.exception))
+
     def test_an_earlier_bundle_is_not_truncated_by_a_refused_build(self):
         self.out.write_bytes(b"the bundle from the last good build")
         with self.assertRaises(ValueError):
             self.build(expect_sha256="0" * 64)
         self.assertEqual(self.out.read_bytes(),
                          b"the bundle from the last good build")
+
+    def test_a_write_that_cannot_be_renamed_leaves_nothing_behind(self):
+        # The archive is staged beside its destination and renamed, so a
+        # bundle on disk is complete or absent. A directory in the way is
+        # the reachable way to make the rename itself fail, and the
+        # staged file must not survive it.
+        destination = self.tmp / "something-is-already-here"
+        destination.mkdir()
+        with self.assertRaises(OSError):
+            self.build(out_path=str(destination))
+        self.assertFalse(Path(str(destination) + ".partial").exists(),
+                         "a half-written bundle was left beside the "
+                         "destination")
 
 
 class TestTheLayoutTheHookNeeds(_BundleCase):
@@ -308,6 +333,50 @@ class TestTheLayoutTheHookNeeds(_BundleCase):
                     self.build(payload_name=bad)
         self.assertFalse(self.out.exists())
 
+    def test_this_tool_holds_the_payload_name_itself(self):
+        # `render_sitecustomize` holds the name to the same shape for its
+        # own reason -- the hook joins it to a directory -- but this
+        # tool's member names must not rest on somebody else's regex: a
+        # relaxation there would loosen the archive's paths with nothing
+        # here noticing. With the renderer replaced by one that accepts
+        # anything, a name that would escape must still be refused.
+        with mock.patch.object(builder, "render_sitecustomize",
+                               lambda name, gate: "# anything\n"):
+            for bad in ("../escape.py", "sub/dir.py", "quote'.py",
+                        ".hidden.py"):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(ValueError):
+                        self.build(payload_name=bad)
+        self.assertFalse(self.out.exists())
+
+    def test_a_payload_named_for_the_hooks_directory_is_refused(self):
+        # `Lib` passes every name check there is, and would put a file
+        # and a directory under one name in the archive -- which does not
+        # extract on the target.
+        with self.assertRaises(ValueError) as raised:
+            self.build(payload_name=builder.HOOK_DIR)
+        self.assertIn("directory", str(raised.exception))
+        self.assertFalse(self.out.exists())
+
+    def test_a_payload_that_would_shadow_the_hook_is_refused(self):
+        # The name to get right. The rewritten `._pth` puts the
+        # interpreter root on the path ahead of `Lib/`, so a payload
+        # called `sitecustomize.py` is what `site` would import: the real
+        # hook would never run, and the bundle would look built and do
+        # nothing -- the exact failure the whole `._pth` handling exists
+        # to prevent. Nothing upstream stops it, as the first assertion
+        # shows, so the refusal has to be here and must not be relaxed.
+        self.assertTrue(render_sitecustomize(builder.HOOK_NAME),
+                        "the renderer refuses this name now, so this tool's "
+                        "own check may look redundant -- it is not, see "
+                        "test_this_tool_holds_the_payload_name_itself")
+
+        with self.assertRaises(ValueError) as raised:
+            self.build(payload_name=builder.HOOK_NAME)
+        message = str(raised.exception)
+        self.assertIn("never run", message, message)
+        self.assertFalse(self.out.exists())
+
     def test_a_gate_nobody_implements_is_refused(self):
         with self.assertRaises(ValueError):
             self.build(gate="sideload")
@@ -331,6 +400,27 @@ class TestTheLayoutTheHookNeeds(_BundleCase):
         with self.assertRaises(ValueError) as raised:
             self.build(distribution=str(path), expect_sha256=_sha256(path))
         self.assertIn("sitecustomize", str(raised.exception))
+
+    def test_a_distribution_with_a_duplicated_member_name_is_refused(self):
+        # A zip may carry one name twice, and the name-to-info map keeps
+        # only the last of them -- so one of the two would land in the
+        # bundle and the other would vanish without a word. Refused
+        # instead, for the same reason the member names are checked at
+        # all: what comes out of here is unpacked on a target.
+        path = self.tmp / "duplicated.zip"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(str(path), "w", zipfile.ZIP_DEFLATED) as out:
+                entries = list(_DISTRIBUTION.items())
+                entries.append(("python311.dll", b"MZ\x90 a second one"))
+                for name, data in entries:
+                    out.writestr(
+                        zipfile.ZipInfo(name, (2024, 6, 1, 12, 0, 0)), data)
+
+        with self.assertRaises(ValueError) as raised:
+            self.build(distribution=str(path), expect_sha256=_sha256(path))
+        self.assertIn("python311.dll", str(raised.exception))
+        self.assertFalse(self.out.exists())
 
 
 class TestThePthIsRewrittenAndItsShapeIsChecked(_BundleCase):
@@ -364,6 +454,16 @@ class TestThePthIsRewrittenAndItsShapeIsChecked(_BundleCase):
         lines = [line.strip() for line in self.pth().splitlines()]
         self.assertIn("python311.zip", lines, self.pth())
         self.assertIn(".", lines, self.pth())
+
+    def test_the_interpreter_root_comes_before_the_hooks_directory(self):
+        # Why a payload may not be called `sitecustomize.py`: the root
+        # keeps the position the distribution gave it and `Lib` is
+        # appended after it, so a module present in both places is
+        # imported from the root. See
+        # test_a_payload_that_would_shadow_the_hook_is_refused.
+        self.build()
+        lines = [line.strip() for line in self.pth().splitlines()]
+        self.assertLess(lines.index("."), lines.index("Lib"), self.pth())
 
     def test_a_pth_that_already_imports_site_is_left_as_it_is(self):
         text = "python311.zip\r\n.\r\nLib\r\nimport site\r\n"
