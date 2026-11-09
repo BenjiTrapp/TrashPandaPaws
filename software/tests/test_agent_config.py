@@ -1212,16 +1212,27 @@ class TestWhichVertexCredentialIsUsed(unittest.TestCase):
 
     NOTE = "will not be refreshed"
 
+    def setUp(self):
+        # token_source="gcloud" is checked against PATH when the client is
+        # built, and the machine running the suite may have no gcloud.
+        patch = unittest.mock.patch.object(
+            gcp_token.shutil, "which", return_value="/usr/bin/gcloud")
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_an_explicit_token_source_beats_a_present_key(self):
         cfg = _load(env=dict(_VERTEX, AGENT_API_KEY=_FAKE_KEY,
                              AGENT_TOKEN_SOURCE="gcloud"))
         self.assertFalse(cfg.static_bearer)
-        self.assertNotIn(self.NOTE, cfg.available()[1])
+        # Equal to the whole answer, not "lacks the note": a provider the
+        # client factory refuses would also lack the note.
+        self.assertEqual(cfg.available(), (True, ""))
 
     def test_a_key_with_vertex_and_auto_is_a_labelled_static_bearer(self):
         cfg = _load(env=dict(_VERTEX, AGENT_API_KEY=_FAKE_KEY))
         self.assertTrue(cfg.static_bearer)
         ok, reason = cfg.available()
+        self.assertTrue(ok)
         self.assertIn(self.NOTE, reason)
         self.assertIn("hour", reason)
         self.assertNotIn(_FAKE_KEY, reason)
@@ -1241,11 +1252,14 @@ class TestWhichVertexCredentialIsUsed(unittest.TestCase):
         path = _keyfile(_FAKE_KEY)
         cfg = _load(env=dict(_VERTEX, AGENT_API_KEY_FILE=path))
         self.assertTrue(cfg.static_bearer)
+        ok, reason = cfg.available()
+        self.assertTrue(ok)
+        self.assertIn(self.NOTE, reason)
 
     def test_no_key_leaves_auto_to_walk_its_sources(self):
         cfg = _load(env=dict(_VERTEX))
         self.assertFalse(cfg.static_bearer)
-        self.assertNotIn(self.NOTE, cfg.available()[1])
+        self.assertEqual(cfg.available(), (True, ""))
 
     def test_another_provider_with_a_key_is_not_a_static_bearer(self):
         cfg = _load(env={"AGENT_PROVIDER": "anthropic", "AGENT_MODEL": "m",
@@ -1254,16 +1268,27 @@ class TestWhichVertexCredentialIsUsed(unittest.TestCase):
         self.assertEqual(cfg.available(), (True, ""))
 
     def test_the_label_does_not_make_a_usable_run_unusable(self):
-        # Vertex is not a provider the client factory knows yet, so a chain
-        # that builds is stood in for. What is pinned is that the label
-        # rides beside a usable answer: refusing the run would turn the
-        # opt-in into a prohibition.
+        # The label rides beside a usable answer: refusing the run would
+        # turn the opt-in into a prohibition. The chain is built for real.
         cfg = _load(env=dict(_VERTEX, AGENT_API_KEY=_FAKE_KEY))
-        with unittest.mock.patch.object(failover, "create_chain"):
-            ok, reason = cfg.available()
+        ok, reason = cfg.available()
         self.assertTrue(ok)
         self.assertIn(self.NOTE, reason)
         self.assertNotIn(_FAKE_KEY, reason)
+
+    def test_the_file_source_without_a_key_file_is_reported_at_startup(self):
+        cfg = _load(env=dict(_VERTEX, AGENT_TOKEN_SOURCE="file"))
+        ok, reason = cfg.available()
+        self.assertFalse(ok)
+        self.assertIn("token_source", reason)
+        self.assertIn("api_key_file", reason)
+
+    def test_a_vertex_run_without_a_project_says_what_to_set(self):
+        env = dict(_VERTEX)
+        del env["AGENT_VERTEX_PROJECT"]
+        ok, reason = _load(env=env).available()
+        self.assertFalse(ok)
+        self.assertIn("AGENT_VERTEX_PROJECT", reason)
 
     def test_the_label_is_reported_beside_other_problems(self):
         cfg = _load(data={"c2": {"sliver": {"enabled": True}}},

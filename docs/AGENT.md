@@ -122,6 +122,7 @@ comes with a `reason`.
 | `local` | a `AGENT_BASE_URL` (LM Studio, llama.cpp); no key |
 | `ollama` | a model that is pulled (`ollama pull`); no key; endpoint defaults to `http://127.0.0.1:11434/v1` |
 | `gemini` | `AGENT_API_KEY`, a bare model id (`gemini-3-pro`); no endpoint to set |
+| `vertex` | `AGENT_VERTEX_PROJECT`, a publisher-prefixed model id (`google/gemini-3-pro`); no key, the token comes from `AGENT_TOKEN_SOURCE` (default `auto`); the endpoint follows `AGENT_VERTEX_LOCATION` (default `europe-west4`) |
 
 A Bedrock model id carries its own region prefix (`eu.`, `us.`). An EU id
 against a US endpoint fails at the first call rather than at configuration,

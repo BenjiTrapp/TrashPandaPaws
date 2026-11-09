@@ -451,6 +451,10 @@ _PROVIDERS = {
     "gemini":     ("openai",
                    "https://generativelanguage.googleapis.com/v1beta/openai",
                    True, False),
+    # Computed from the project and location, like bedrock's; see
+    # vertex_base_url. No key: the bearer is a short-lived token that a
+    # token source supplies.
+    "vertex":     ("openai", None, False, False),
 }
 
 # Providers whose endpoint is whatever the operator typed, so the model name
@@ -508,6 +512,72 @@ def bedrock_base_url(region=None) -> str:
     return "https://bedrock-runtime.%s.amazonaws.com" % region
 
 
+# ── Vertex's per-project, per-region endpoint ──
+
+# Google's own shape for a project id and for a location: lowercase letters,
+# digits and hyphens, starting and ending with a letter or digit. Both values
+# are interpolated into a URL, and the bearer goes wherever that URL points,
+# so this is a credential boundary and not a tidiness check. A dot in the
+# location moves the host ("europe-west4.evil.example"), a slash or "?" in
+# the project moves the path, an "@" turns the host into userinfo. \Z and
+# not $: "$" also matches before a trailing newline.
+_GCP_IDENTIFIER = re.compile(r"\A[a-z0-9][a-z0-9-]{0,61}[a-z0-9]\Z")
+
+
+def _vertex_identifier(field: str, env: str, value: Any) -> str:
+    if value is None or value == "":
+        raise ProviderError(
+            "provider 'vertex': %s is not set; set %s" % (field, env))
+    if not isinstance(value, str) or not _GCP_IDENTIFIER.match(value):
+        raise ProviderError(
+            "provider 'vertex': %s (%s) must be 2 to 63 lowercase letters, "
+            "digits or hyphens, starting and ending with a letter or digit; "
+            "got %.40r" % (field, env, value))
+    return value
+
+
+def vertex_base_url(project: Any, location: Any) -> str:
+    """The OpenAI-compatible endpoint for a project in a location.
+
+    Computed rather than written, as bedrock_base_url is, because the
+    location appears twice (in the host and in the path) and the two must
+    agree: a mismatch is a 404 at the first call, not a configuration error.
+
+    "v1" is the stable path. "v1beta1" is the documented alternative on this
+    endpoint if tool calling misbehaves on v1; this is the only place the
+    version appears, so switching is a one-word change here.
+    """
+    project = _vertex_identifier("vertex_project", "AGENT_VERTEX_PROJECT",
+                                 project)
+    location = _vertex_identifier("vertex_location", "AGENT_VERTEX_LOCATION",
+                                  location)
+    return ("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/"
+            "%s/endpoints/openapi" % (location, project, location))
+
+
+# Vertex's openapi endpoint takes "publisher/model". A bare id is a 404 at
+# the first call, which on an unattended run nobody is there to see.
+_VERTEX_MODEL = re.compile(r"\A[a-z0-9][a-z0-9-]*/[^/\s][^\s]*\Z")
+
+
+def _vertex_token_source(kind: str, key_file: Optional[str]):
+    # The failure is captured and raised once the except has exited, as in
+    # http_post_json, so the ProviderError has no __context__ to walk.
+    failure = None
+    try:
+        gcp_token.validate(kind, key_file=key_file)
+    except gcp_token.TokenUnavailable as exc:
+        failure = str(exc)
+    if failure is not None:
+        hint = ""
+        if kind == "file" and not key_file:
+            hint = "; set api_key_file (AGENT_API_KEY_FILE)"
+        raise ProviderError(
+            "provider 'vertex': token_source %r cannot be used: %s%s"
+            % (kind, failure, hint))
+    return gcp_token.source(kind, key_file=key_file)
+
+
 def create_client(cfg) -> LlmClient:
     """Build the client for cfg.provider, or raise ProviderError."""
     # Imported here: the client modules import this one for the shared types.
@@ -533,17 +603,39 @@ def create_client(cfg) -> LlmClient:
         raise ProviderError("provider %r requires an api_key" % name)
     if not model:
         raise ProviderError("provider %r requires an explicit model" % name)
+    token_source = None
+    if name == "vertex":
+        if not _VERTEX_MODEL.match(model):
+            raise ProviderError(
+                "provider 'vertex': model %.60r needs a publisher prefix, "
+                "as in google/gemini-3-pro; a bare id is a 404 at the first "
+                "call" % model)
+        if not base_url:
+            base_url = vertex_base_url(
+                getattr(cfg, "vertex_project", None),
+                getattr(cfg, "vertex_location", None) or "europe-west4")
+        # A fixed key, which the configuration has already labelled for the
+        # operator as one that will not be refreshed, is used as it stands.
+        # Otherwise the token comes from a source, and that choice is checked
+        # now: `file` with no api_key_file would load cleanly and fail at
+        # the first model call.
+        if not getattr(cfg, "static_bearer", False):
+            token_source = _vertex_token_source(
+                getattr(cfg, "token_source", None) or "auto",
+                getattr(cfg, "api_key_file", None) or None)
     if needs_url and not base_url:
         raise ProviderError(
             "provider %r has no default endpoint; set base_url to its "
             "OpenAI-compatible endpoint" % name)
-    # Nothing builds a token source yet; the vertex provider will.
-    token_source = None
     # A token source is a credential too. Without counting it, a provider
     # with no key at construction, such as vertex, would pass this guard on
     # an http:// base URL and then be handed a live OAuth bearer in cleartext.
     base_url = _checked_base_url(
         name, base_url, bool(api_key) or token_source is not None)
+    if token_source is not None:
+        # The source's token replaces the key before every turn; keeping both
+        # would leave a credential the operator has superseded in memory.
+        api_key = None
 
     if kind == "anthropic":
         return anthropic_client.AnthropicClient(

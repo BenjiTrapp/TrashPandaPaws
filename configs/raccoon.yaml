@@ -202,6 +202,7 @@ agent:
   # C2 and agent tokens come from RACCOON_TOKEN and RACCOON_AGENT_TOKEN.
   llm:
     # anthropic | bedrock | openrouter | opencode | local | ollama | gemini
+    #          | vertex
     #
     # gemini takes the bare model id (gemini-3-pro) and a key; it needs no
     # base_url. Its free tier suits the last link of a fallbacks chain.
@@ -209,6 +210,10 @@ agent:
     # bedrock reads AWS_BEARER_TOKEN_BEDROCK if no key is configured, and its
     # endpoint follows AWS_REGION; the model id carries its own region prefix
     # (eu., us.), so an EU id against a US endpoint fails at the first call.
+    #
+    # vertex takes a publisher-prefixed model id (google/gemini-3-pro) and no
+    # key: it authenticates with a short-lived Google token. Its endpoint is
+    # built from vertex_project and vertex_location below, so set no base_url.
     provider: ""
     # Required for every provider; there is no default that would not go stale.
     model: ""
@@ -216,6 +221,21 @@ agent:
     base_url: ""
     # e.g. /etc/raccoon/agent.key, outside the repository
     api_key_file: ""
+    # vertex only. The Google Cloud project id; required.
+    vertex_project: ""
+    # vertex only. The region, which appears in both the host and the path of
+    # the endpoint. Lowercase letters, digits and hyphens. Blank means
+    # europe-west4. Left blank, not written out, because a value here outranks
+    # AGENT_VERTEX_LOCATION in the environment.
+    vertex_location: ""
+    # vertex only. Where the access token comes from:
+    #   auto | metadata | gcloud | file
+    # auto tries the metadata server, then gcloud, then api_key_file. "file"
+    # needs api_key_file and re-reads it, so a rotated token is picked up. A
+    # key given with token_source left at auto is used as it stands and is
+    # not refreshed: Google's tokens last about an hour. Blank means auto,
+    # and is left blank for the same reason as vertex_location.
+    token_source: ""
     # off  = token counts, latency and status only
     # full = also store prompt and response text (may contain scan results)
     llm_log_level: "off"

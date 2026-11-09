@@ -13,7 +13,9 @@ import ast
 import asyncio
 import copy
 import json
+import os
 import sys
+import tempfile
 import threading
 import traceback
 import types
@@ -29,9 +31,14 @@ from software.agent.llm import (bedrock_client, anthropic_client, gcp_token,
 _KEY = "sk-live-SECRET-0123456789abcdef"
 
 
-def _cfg(provider=None, api_key=None, model=None, base_url=None):
+def _cfg(provider=None, api_key=None, model=None, base_url=None,
+         vertex_project=None, vertex_location="europe-west4",
+         token_source="auto", api_key_file=None, static_bearer=False):
     return types.SimpleNamespace(
-        provider=provider, api_key=api_key, model=model, base_url=base_url)
+        provider=provider, api_key=api_key, model=model, base_url=base_url,
+        vertex_project=vertex_project, vertex_location=vertex_location,
+        token_source=token_source, api_key_file=api_key_file,
+        static_bearer=static_bearer)
 
 
 class _Stub:
@@ -1096,6 +1103,31 @@ class TestATokenSourceSuppliesTheCredential(unittest.TestCase):
         _run(_openai(stub).complete(*_TURN))
         self.assertEqual(stub.calls[0][1]["Authorization"], "Bearer " + _KEY)
 
+    def test_the_token_wins_over_a_key_given_to_the_same_client(self):
+        # A key and a source together is a configuration that happens (an
+        # explicit token_source beats a key that was left in the environment),
+        # and a stale key winning would send a credential the operator had
+        # replaced.
+        stub = _Stub({"choices": [{"message": {"content": "a"}}]})
+        c = openai_client.OpenAiCompatibleClient(
+            provider="vertex", model="google/m", api_key=_KEY,
+            base_url="https://x-aiplatform.googleapis.com/v1/p/openapi",
+            transport=stub, token_source=_FakeSource("tok-from-source"))
+        _run(c.complete(*_TURN))
+        self.assertEqual(stub.calls[0][1]["Authorization"],
+                         "Bearer tok-from-source")
+
+    def test_a_failed_resolution_keeps_the_previous_bearer(self):
+        # Not cleared: the next turn gets a fresh try, and nothing between
+        # the two may find the client holding an empty credential.
+        src = _FakeSource("tok-first")
+        c = _vertex(src, _Stub({"choices": [{"message": {"content": "a"}}]}))
+        _run(c.complete(*_TURN))
+        src.tokens = [gcp_token.TokenUnavailable("gone")]
+        with self.assertRaises(provider.ProviderError):
+            _run(c.complete(*_TURN))
+        self.assertEqual(c._bearer.reveal(), "tok-first")
+
 
 class TestCleartextGuardCountsATokenSource(unittest.TestCase):
     def test_a_token_source_counts_as_a_credential_for_the_cleartext_guard(
@@ -1108,6 +1140,251 @@ class TestCleartextGuardCountsATokenSource(unittest.TestCase):
     def test_no_credential_at_all_may_use_plain_http(self):
         url = "http://proxy.example/v1"
         self.assertEqual(provider._checked_base_url("local", url, has_credential=False), url)
+
+
+# ── vertex ──
+
+_HOSTILE_IDENTIFIERS = (
+    "", " ", "a", "-proj", "proj-", "Proj", "EU_WEST", "eu west4", "eu\twest4",
+    "proj\n", "proj\nx", "\nproj", "proj\r\nHost: evil.example",
+    "proj.evil.example", "europe-west4.evil.example", "proj/x", "eu/../x",
+    "../../admin", "..", "proj?x=1", "proj#x", "proj@evil.example",
+    "evil.example@proj", "proj:8443", "proj\\x", "proj%2fx", "proj%2e%2e",
+    "proj\x00", "pr\u043ej", "\uff50roj", "proj\u2024evil", "x" * 64,
+)
+
+
+class TestTheVertexEndpointIsComputedAndValidated(unittest.TestCase):
+    def test_the_vertex_endpoint_is_computed_from_project_and_location(self):
+        self.assertEqual(
+            provider.vertex_base_url("my-proj", "europe-west4"),
+            "https://europe-west4-aiplatform.googleapis.com/v1/projects/"
+            "my-proj/locations/europe-west4/endpoints/openapi")
+
+    def test_a_different_location_moves_both_places_it_appears(self):
+        url = provider.vertex_base_url("my-proj", "us-central1")
+        self.assertEqual(url.count("us-central1"), 2)
+        self.assertNotIn("europe", url)
+
+    def test_the_longest_and_shortest_identifiers_are_accepted(self):
+        for ok in ("ab", "x" * 63, "a1-b2", "0abc"):
+            provider.vertex_base_url(ok, ok)
+
+    def test_a_location_that_would_move_the_host_is_refused(self):
+        for bad in _HOSTILE_IDENTIFIERS:
+            with self.subTest(location=bad):
+                with self.assertRaises(provider.ProviderError) as cm:
+                    provider.vertex_base_url("proj", bad)
+                self.assertIn("vertex_location", str(cm.exception))
+
+    def test_a_project_that_would_move_the_path_is_refused(self):
+        for bad in _HOSTILE_IDENTIFIERS:
+            with self.subTest(project=bad):
+                with self.assertRaises(provider.ProviderError) as cm:
+                    provider.vertex_base_url(bad, "europe-west4")
+                self.assertIn("vertex_project", str(cm.exception))
+
+    def test_a_value_that_is_not_a_string_is_refused(self):
+        for bad in (None, 7, b"proj", ["proj"]):
+            with self.subTest(value=bad):
+                with self.assertRaises(provider.ProviderError):
+                    provider.vertex_base_url(bad, "europe-west4")
+                with self.assertRaises(provider.ProviderError):
+                    provider.vertex_base_url("proj", bad)
+
+    def test_nothing_accepted_can_change_the_host_or_leave_the_path(self):
+        # The property the validation exists for, checked on what it lets
+        # through rather than on a list of what it should stop.
+        for value in ("a1", "us-central1", "x" * 63, "0-0"):
+            parts = provider.urlparse(provider.vertex_base_url(value, value))
+            self.assertEqual(parts.hostname, value + "-aiplatform.googleapis.com")
+            self.assertEqual(parts.scheme, "https")
+            self.assertEqual(parts.path.split("/")[1:6],
+                             ["v1", "projects", value, "locations", value])
+            self.assertEqual((parts.query, parts.fragment, parts.username,
+                              parts.port), ("", "", None, None))
+
+
+class TestCreateClientBuildsVertex(unittest.TestCase):
+    def setUp(self):
+        # token_source="gcloud" is checked against PATH at construction, and
+        # the machine running the suite may have no gcloud.
+        patch = unittest.mock.patch.object(
+            gcp_token.shutil, "which", return_value="/usr/bin/gcloud")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _vertex(self, **kw):
+        values = dict(provider="vertex", model="google/gemini-3-pro",
+                      vertex_project="proj", token_source="gcloud")
+        values.update(kw)
+        return provider.create_client(_cfg(**values))
+
+    def test_a_vertex_model_without_a_publisher_prefix_is_refused(self):
+        for bare in ("gemini-3-pro", "/gemini-3-pro", "google/", "google",
+                     "Google/gemini", "g o/x", "google//x"):
+            with self.subTest(model=bare):
+                with self.assertRaises(provider.ProviderError) as cm:
+                    self._vertex(model=bare)
+                self.assertIn("google/", str(cm.exception))
+
+    def test_other_publishers_are_accepted(self):
+        for model in ("meta/llama-3.3-70b-instruct-maas",
+                      "anthropic/claude-sonnet-4@20250514"):
+            with self.subTest(model=model):
+                self.assertEqual(self._vertex(model=model).model, model)
+
+    def test_vertex_without_a_project_says_what_to_set(self):
+        for missing in (None, ""):
+            with self.subTest(project=missing):
+                with self.assertRaises(provider.ProviderError) as cm:
+                    self._vertex(vertex_project=missing)
+                self.assertIn("AGENT_VERTEX_PROJECT", str(cm.exception))
+
+    def test_a_config_without_the_vertex_attributes_still_says_what_to_set(
+            self):
+        # create_client reads them with getattr, as it reads everything: a
+        # config object that has never heard of vertex must not raise
+        # AttributeError.
+        bare = types.SimpleNamespace(provider="vertex", model="google/m",
+                                     api_key=None, base_url=None)
+        with self.assertRaises(provider.ProviderError) as cm:
+            provider.create_client(bare)
+        self.assertIn("AGENT_VERTEX_PROJECT", str(cm.exception))
+
+    def test_a_bad_location_or_project_is_refused_by_create_client_too(self):
+        for field, bad in (("vertex_location", "eu.evil.example"),
+                           ("vertex_project", "proj/x")):
+            with self.subTest(field=field):
+                with self.assertRaises(provider.ProviderError) as cm:
+                    self._vertex(**{field: bad})
+                self.assertIn(field, str(cm.exception))
+
+    def test_vertex_builds_a_client_with_a_token_source_and_no_key(self):
+        c = self._vertex(vertex_location="europe-west4")
+        self.assertEqual(c.provider, "vertex")
+        self.assertIsNotNone(c._token_source)
+        self.assertFalse(bool(c._bearer))
+        self.assertEqual(
+            c._base_url, provider.vertex_base_url("proj", "europe-west4"))
+
+    def test_an_explicit_base_url_is_used_instead_of_the_computed_one(self):
+        c = self._vertex(vertex_project=None,
+                         base_url="https://gateway.example/v1")
+        self.assertEqual(c._base_url, "https://gateway.example/v1")
+
+    def test_the_token_source_is_the_shared_one_for_that_kind(self):
+        a, b = self._vertex(), self._vertex()
+        self.assertIs(a._token_source, b._token_source)
+        self.assertIs(a._token_source, gcp_token.source("gcloud"))
+
+    def test_a_key_does_not_ride_along_with_a_token_source(self):
+        c = self._vertex(api_key=_KEY)
+        self.assertIsNotNone(c._token_source)
+        self.assertFalse(bool(c._bearer))
+
+    def test_a_static_bearer_gets_no_source_and_keeps_its_key(self):
+        c = self._vertex(api_key=_KEY, token_source="auto", static_bearer=True)
+        self.assertIsNone(c._token_source)
+        self.assertEqual(c._bearer.reveal(), _KEY)
+
+    def test_the_static_bearer_still_counts_as_a_credential_for_the_guard(
+            self):
+        with self.assertRaises(provider.ProviderError) as cm:
+            self._vertex(api_key=_KEY, token_source="auto", static_bearer=True,
+                         base_url="http://proxy.example/v1")
+        self.assertNotIn(_KEY, str(cm.exception))
+
+    def test_a_vertex_client_over_plain_http_is_refused_though_it_has_no_key(
+            self):
+        # It is about to be handed a live OAuth bearer. Without counting the
+        # token source the guard sees no credential and lets it through.
+        for source in ("auto", "gcloud"):
+            with self.subTest(token_source=source):
+                with self.assertRaises(provider.ProviderError) as cm:
+                    self._vertex(token_source=source,
+                                 base_url="http://proxy.example/v1")
+                self.assertIn("https", str(cm.exception))
+
+    def test_a_vertex_client_may_use_loopback_http(self):
+        c = self._vertex(base_url="http://127.0.0.1:9000/v1")
+        self.assertEqual(c._base_url, "http://127.0.0.1:9000/v1")
+
+
+class TestCreateClientChecksTheTokenSourceAtStartup(unittest.TestCase):
+    def _vertex(self, **kw):
+        values = dict(provider="vertex", model="google/gemini-3-pro",
+                      vertex_project="proj")
+        values.update(kw)
+        return provider.create_client(_cfg(**values))
+
+    def test_the_file_source_without_a_key_file_is_a_configuration_error(self):
+        with self.assertRaises(provider.ProviderError) as cm:
+            self._vertex(token_source="file", api_key_file=None)
+        message = str(cm.exception)
+        self.assertIn("token_source", message)
+        self.assertIn("api_key_file", message)
+        self.assertIn("vertex", message)
+
+    def test_a_key_file_that_is_missing_is_refused_at_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(provider.ProviderError):
+                self._vertex(token_source="file",
+                             api_key_file=os.path.join(tmp, "absent"))
+
+    def test_a_key_file_that_others_can_read_is_refused_at_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "k")
+            with open(path, "w") as handle:
+                handle.write(_KEY)
+            os.chmod(path, 0o644)
+            with self.assertRaises(provider.ProviderError) as cm:
+                self._vertex(token_source="file", api_key_file=path)
+            self.assertNotIn(_KEY, _walk_chain(cm.exception))
+
+    def test_a_usable_key_file_builds_a_client_on_the_file_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "k")
+            with open(path, "w") as handle:
+                handle.write(_KEY)
+            os.chmod(path, 0o600)
+            c = self._vertex(token_source="file", api_key_file=path)
+            self.assertIs(c._token_source,
+                          gcp_token.source("file", key_file=path))
+
+    def test_gcloud_that_is_not_installed_is_refused_at_startup(self):
+        with unittest.mock.patch.object(gcp_token.shutil, "which",
+                                        return_value=None):
+            with self.assertRaises(provider.ProviderError) as cm:
+                self._vertex(token_source="gcloud")
+        self.assertIn("gcloud", str(cm.exception))
+
+    def test_an_unknown_token_source_is_refused_naming_the_valid_ones(self):
+        with self.assertRaises(provider.ProviderError) as cm:
+            self._vertex(token_source="magic")
+        for kind in gcp_token.KINDS:
+            self.assertIn(kind, str(cm.exception))
+
+    def test_the_refusal_leaves_no_exception_chain(self):
+        with self.assertRaises(provider.ProviderError) as cm:
+            self._vertex(token_source="file", api_key_file=None)
+        self.assertIsNone(cm.exception.__context__)
+        self.assertIsNone(cm.exception.__cause__)
+
+    def test_auto_passes_startup_without_touching_the_network(self):
+        with unittest.mock.patch.object(
+                gcp_token, "_fetch_metadata",
+                side_effect=AssertionError("network")), \
+                unittest.mock.patch.object(
+                    gcp_token, "_fetch_gcloud",
+                    side_effect=AssertionError("subprocess")):
+            self.assertIsNotNone(self._vertex(token_source="auto"))
+
+    def test_a_provider_that_is_not_vertex_ignores_the_token_source(self):
+        c = provider.create_client(_cfg(
+            provider="openrouter", api_key="k", model="m",
+            token_source="file", api_key_file=None))
+        self.assertIsNone(c._token_source)
 
 
 # ── Status quo: no SDK, no new dependency, no import-time cost ──
