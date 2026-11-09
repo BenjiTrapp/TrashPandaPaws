@@ -87,12 +87,19 @@ def read_keyfile(path: str) -> str:
         raise SecretError("api_key_file %s cannot be opened (%s)"
                           % (path, exc.strerror)) from None
     # fstat before fdopen: opening a directory as text raises at fdopen.
+    # Each failure closes the descriptor, which nothing else would: until
+    # fdopen has taken it, no `with` owns it.
+    failure = None
     try:
         check_keyfile_mode(path, os.fstat(fd).st_mode)
-    except SecretError:
+    except SecretError as exc:
+        failure = str(exc)
+    except OSError as exc:
+        failure = ("api_key_file %s cannot be checked (%s)"
+                   % (path, exc.strerror))
+    if failure is not None:
         os.close(fd)
-        raise
-    failure = None
+        raise SecretError(failure)
     key = ""
     with os.fdopen(fd, "r", encoding="utf-8") as handle:
         try:

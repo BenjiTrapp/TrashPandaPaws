@@ -1054,6 +1054,36 @@ class TestReadKeyfile(unittest.TestCase):
         self.assertIsNone(caught.exception.__cause__)
         self.assertNotIn("SECRET", _chain(caught.exception))
 
+    def test_a_failing_fstat_is_a_secret_error_and_closes_the_descriptor(self):
+        opened, closed = [], []
+        real_open, real_close = os.open, os.close
+
+        def spy_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        def spy_close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "key")
+            with open(path, "w") as f:
+                f.write("tok-fake")
+            os.chmod(path, 0o600)
+            with unittest.mock.patch.object(secret.os, "open", spy_open), \
+                    unittest.mock.patch.object(secret.os, "close", spy_close), \
+                    unittest.mock.patch.object(
+                        secret.os, "fstat",
+                        side_effect=OSError(5, "Input/output error")):
+                with self.assertRaises(secret.SecretError) as caught:
+                    secret.read_keyfile(path)
+        self.assertIn("cannot be checked", str(caught.exception))
+        self.assertIsNone(caught.exception.__context__)
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(closed, opened)
+
 
 if __name__ == "__main__":
     unittest.main()
