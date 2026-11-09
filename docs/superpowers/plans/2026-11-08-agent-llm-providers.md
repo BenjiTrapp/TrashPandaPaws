@@ -496,7 +496,7 @@ git commit -m "feat(agent): clients refresh a bearer from a token source"
 ### Task 7: Configuration — Vertex fields, the keyfile path, precedence
 
 **Files:**
-- Modify: `software/agent/config.py` (`_FIELDS`, `AgentConfig`, `load`, `_read_fallbacks`, `available`)
+- Modify: `software/agent/config.py` (`_FIELDS`, `AgentConfig`, `load`, `_read_fallbacks`, `available`, `opsec_warnings`)
 - Test: `software/tests/test_agent_config.py`
 
 **Interfaces:**
@@ -539,7 +539,20 @@ def test_a_vertex_fallback_link_refuses_api_key_env(self):
                            "api_key_env": "SOME_TOKEN"}]}}})
     self.assertIn("api_key_env", str(cm.exception))
     self.assertIn("vertex", str(cm.exception))
+
+def test_a_quiet_profile_does_not_warn_about_any_local_provider(self):
+    campaign = types.SimpleNamespace(opsec_profile="quiet")
+    for name in sorted(provider.LOCAL_PROVIDERS):
+        agent = types.SimpleNamespace(provider=name)
+        self.assertEqual(
+            [w for w in config.opsec_warnings(agent, campaign)
+             if "goes to it" in w], [])
+    hosted = types.SimpleNamespace(provider="anthropic")
+    self.assertTrue(any("goes to it" in w
+                        for w in config.opsec_warnings(hosted, campaign)))
 ```
+
+**Routed finding (Task 1's review).** `opsec_warnings` compares `getattr(agent, "provider", None) != "local"`, so `opsec_profile: quiet` with `provider: ollama` warns that every finding goes to a hosted model and advises "Set provider to local" — where the operator already is. Same drift Task 1 removed from `capability_tier`, one file further on. Fix it here: compare against `provider.LOCAL_PROVIDERS` (the module is already imported as `llm_provider`), and reword the closing sentence so it names the set rather than one value.
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -553,6 +566,8 @@ Three `_Field` entries: `vertex_project` / `agent.llm.vertex_project` / `AGENT_V
 In `load`, stop popping `api_key_file`: keep the path on the config and go on reading the key eagerly, so the existing keyfile tests are untouched. Compute `static_bearer`: provider is `vertex`, `token_source` is `auto`, and a key came from `AGENT_API_KEY` or the file.
 
 `available()` appends a line when `static_bearer` is set — that the credential will not be refreshed and a run past the token's hour will fail. It is a *reason*, reported beside any others, and the existing scrub at the end of the method already covers it.
+
+In `opsec_warnings`, replace the `!= "local"` comparison with a membership test against `llm_provider.LOCAL_PROVIDERS` and reword the advice accordingly.
 
 In `_read_fallbacks`, refuse `api_key_env` on a link whose provider is `vertex`, by name, with the reason: a static bearer on the link that exists to catch the primary's failure brings back the expiry this design removed.
 
