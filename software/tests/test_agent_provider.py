@@ -930,16 +930,6 @@ class TestRealTransport(unittest.TestCase):
         with self.assertRaises(provider.TransportError):
             self._post(post)
 
-    def test_the_client_default_transport_sends_the_clients_timeout(self):
-        c = anthropic_client.AnthropicClient(model="m", api_key="k")
-        self.assertIsNot(c._transport, provider.http_post_json)
-        with unittest.mock.patch.object(provider, "http_post_json",
-                                        return_value={}) as real:
-            c._transport("https://x", {"k": "v"}, {"a": 1})
-        self.assertEqual(real.call_args[0], ("https://x", {"k": "v"}, {"a": 1}))
-        self.assertEqual(real.call_args[1],
-                         {"timeout": provider._TIMEOUT_SECONDS})
-
     def test_the_transport_timeout_is_per_client(self):
         seen = {}
 
@@ -959,6 +949,42 @@ class TestRealTransport(unittest.TestCase):
                 provider.http_post_json("https://x.example", {}, {},
                                         timeout=7)
         self.assertEqual(seen["timeout"], 7)
+
+    def _timeout_on_the_wire(self, client):
+        """The timeout `requests.post` receives for one client turn."""
+        seen = {}
+
+        class _FakeRequests:
+            class RequestException(Exception):
+                pass
+
+            @staticmethod
+            def post(url, headers=None, json=None, timeout=None,
+                     allow_redirects=None):
+                seen["timeout"] = timeout
+                raise _FakeRequests.RequestException()
+
+        with unittest.mock.patch.dict(sys.modules,
+                                      {"requests": _FakeRequests}):
+            with self.assertRaises(provider.ProviderError):
+                _run(client.complete("", [{"role": "user", "content": "x"}],
+                                     [], 16, 0.0))
+        return seen["timeout"]
+
+    def test_a_local_client_sends_300_seconds_on_the_wire(self):
+        c = provider.create_client(_cfg(provider="ollama", model="qwen2.5:14b"))
+        self.assertEqual(self._timeout_on_the_wire(c), 300)
+
+    def test_a_remote_client_sends_120_seconds_on_the_wire(self):
+        c = provider.create_client(_cfg(provider="openrouter", api_key="k",
+                                        model="vendor/model"))
+        self.assertEqual(self._timeout_on_the_wire(c), 120)
+
+    def test_a_client_sends_its_own_timeout_on_the_wire(self):
+        c = openai_client.OpenAiCompatibleClient(
+            provider="ollama", model="m", api_key=None,
+            base_url="http://127.0.0.1:11434/v1", timeout=7)
+        self.assertEqual(self._timeout_on_the_wire(c), 7)
 
 
 # ── Status quo: no SDK, no new dependency, no import-time cost ──
