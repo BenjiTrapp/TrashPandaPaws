@@ -67,7 +67,11 @@ time are removed (`_normalised` in `tests/check_fab_release.py`). So "git shows 
 whole set modified" and "the hashes changed" say nothing about the board; the
 freshness check compares the normalised content, and the board's own SHA-256 in the
 manifest is what binds the set to a board. A different KiCad version may change the
-content itself; that was not measured, and the manifest records the version used. If
+content itself; that was not measured. `_normalised` also strips the lines that name the
+generating software (`TF.GenerationSoftware`, "Created by KiCad", "DRILL file KiCad"), so
+a KiCad version change is invisible to the freshness check; the only trace is the
+version the manifest records under `kicad`, which no test compares with the version
+that is running, so whoever rebuilds has to compare it by eye. If
 you rebuild only to refresh the CPL or the assembly BOM, restore the gerber folder
 afterwards (`git checkout hardware/fab/gerber`): the exporter always rewrites it, and a
 new time stamp is churn, not a change.
@@ -487,7 +491,9 @@ Not yet asked. Answers go into the order and, where they change a number, into
     suffix; (d) the columns Designator, Val, Package, Mid X, Mid Y, Rotation, Layer, in
     that order; or send me your template. The origin is the board's lower-left corner as
     your KiCad instruction says (U3 24.0 / 13.0 mm, Y1 24.0 / 5.0 mm), so I am not
-    asking about it; the preview will show whether it was read that way.
+    asking about the convention, but I do ask you to confirm that your tooling places
+    these against the gerbers' outline corner, which in the gerbers (KiCad page
+    coordinates) is at X 100.000, Y -116.000; the preview will show it.
 11. **Surface finish:** ENIG is ruled (ruling CA) and goes on the order form. Confirm
     that your ENIG is available for this build (4 layers, 1.6 mm, 5 pieces, 0.15 mm
     minimum track) and give the price against lead-free HASL, for the record only.

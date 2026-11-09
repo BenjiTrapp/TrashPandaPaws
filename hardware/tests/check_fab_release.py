@@ -3362,6 +3362,24 @@ class CplIsInBoardCoordinatesFromTheLowerLeftCorner(unittest.TestCase):
         self.assertAlmostEqual(pad1[1], float(u3["Mid Y"]) - 116.0 - 1.8, places=4)
         self.assertIn("(124.000, -103.000)", text)
 
+    def test_ordering_says_the_freshness_check_cannot_see_a_kicad_version_change(self):
+        text = re.sub(r"\s+", " ", ORDERING.read_text())
+        self.assertRegex(text, r"TF\.GenerationSoftware.{0,120}invisible to the freshness check")
+        self.assertRegex(text, r"no test compares")
+        # and it is true: the strip list of `_normalised` has the generator lines in it
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = Path(tmp) / "x.gtl"
+            sample.write_text("%TF.GenerationSoftware,KiCad,Pcbnew,10.0.6*%\nX1Y1D03*\n")
+            self.assertEqual(_normalised(sample), "X1Y1D03*")
+        self.assertEqual(json.loads((GERBER_DIR / MANIFEST_NAME).read_text())["kicad"], "10.0.6")
+
+    def test_question_10_asks_about_the_cpl_to_gerber_frame_as_well(self):
+        questions = ORDERING.read_text().split("## Questions for PCBWay", 1)[1]
+        q10 = re.sub(r"\s+", " ", questions.split("\n10. ", 1)[1].split("\n11. ", 1)[0])
+        self.assertRegex(q10, r"(?i)confirm that your tooling places these against the gerbers. outline corner")
+        self.assertIn("X 100.000, Y -116.000", q10)
+        self.assertRegex(q10, r"(?i)I am not asking about the convention")
+
     def test_ordering_says_a_rebuild_changes_every_file_and_why_that_is_not_staleness(self):
         text = re.sub(r"\s+", " ", ORDERING.read_text())
         self.assertRegex(text, r"(?i)before concluding the package is stale")
@@ -4223,14 +4241,13 @@ class NoOperatorPathIsCommitted(unittest.TestCase):
         return [n for n in names if not n.startswith("vendor/kicad-happy/")]
 
     def test_no_tracked_file_contains_an_absolute_user_path(self):
-        pattern = _relativize_module().HOME_PATH
+        tool = _relativize_module()
         found = {}
         for name in self.tracked_files():
             path = REPO_ROOT / name
             if not path.is_file():                     # a submodule or a deleted-but-staged entry
                 continue
-            hits = sorted(set(m.decode("utf-8", "replace")
-                              for m in re.findall(pattern.pattern.encode(), path.read_bytes())))
+            hits = tool.leaks(path.read_bytes().decode("utf-8", "replace"), name)
             if hits:
                 found[name] = hits
         self.assertEqual(found, {}, "absolute user paths are committed (run hardware/tools/relativize_paths.py)")
@@ -4248,26 +4265,55 @@ class NoOperatorPathIsCommitted(unittest.TestCase):
             self.assertTrue(tool.leaks(f'"{leak}"'), leak)
             self.assertTrue(tool.HOME_PATH.search(leak), leak)
 
-    def test_the_platform_generic_home_directories_are_not_a_leak(self):
+    def test_the_two_fixture_strings_are_exempt_under_software_tests_and_only_there(self):
+        # ruling CL: the exemption is for strings in test fixtures that describe a command,
+        # not for any platform's home directory, so it is scoped to software/tests/
         tool = _relativize_module()
-        for fine in ("/home/pi", "/home/pi/.ssh", 'chown -R "$ACTUAL_USER" /home/pi/.ssh',
-                     "shell tee -a /home/u/.ssh/authorized_keys", "write /home/u/.bashrc", '"/home/u"'):
-            self.assertEqual(tool.leaks(fine), [], fine)
+        H = "/" + "home/"      # split so that this file does not match its own scan
+        fixtures = ('chown -R "$ACTUAL_USER" ' + H + "pi/.ssh", "shell tee -a " + H + "u/.ssh/authorized_keys",
+                    "write " + H + "u/.bashrc", '"' + H + 'u"', H + "pi")
+        for text in fixtures:
+            self.assertEqual(tool.leaks(text, "software/tests/test_agent_safety.py"), [], text)
+            self.assertEqual(tool.leaks(text, "software/tests/sub/test_x.py"), [], text)
+            for outside in ("hardware/fab/ORDERING.md", "hardware/review/x/pcb.json", "README.md",
+                            "software/agent/safety.py", "software/tests_extra/x.py",     # not the same directory
+                            "software/tests/../../hardware/fab/x.md",                 # resolves outside it
+                            None):                                                    # no path: no exemption
+                self.assertTrue(tool.leaks(text, outside), (text, outside))
 
-    def test_the_exempt_names_are_pinned_and_the_tool_agrees_with_the_scan(self):
+    def test_other_names_are_not_exempt_even_under_software_tests(self):
         tool = _relativize_module()
         H = "/" + "home/"
-        self.assertEqual(tool.GENERIC_HOME_NAMES, ("pi", "u"))      # a new name needs an argument and this line
+        for text in (H + "alice/x", H + "pierre/x", H + "pi2/x", H + "u2/x", H + "ubuntu/x",
+                     "/" + "Users" + "/pi/x", "/" + "Users" + "/u/x", "C:\\" + "Users\\pi\\x"):
+            self.assertTrue(tool.leaks(text, "software/tests/test_x.py"), text)
+
+    def test_the_exempt_names_are_pinned_and_the_tool_applies_the_scope(self):
+        tool = _relativize_module()
+        H = "/" + "home/"
+        self.assertEqual(tool.FIXTURE_HOME_NAMES, ("pi", "u"))      # a new name needs an argument and this line
+        self.assertEqual(tool.FIXTURE_DIR, "software/tests/")
+        self.assertEqual(tool.repo_relative(REPO_ROOT / "software" / "tests" / "x.py"), "software/tests/x.py")
+        self.assertIsNone(tool.repo_relative("/tmp/x.json"))
         with tempfile.TemporaryDirectory() as tmp:
-            fine, bad = Path(tmp) / "fine.txt", Path(tmp) / "bad.txt"
-            fine.write_text("cd /home/pi/.ssh && cat /home/u/.bashrc\n")
-            bad.write_text("cd /home/pi/.ssh && cat " + H + "alice/.bashrc\n")
-            ok = subprocess.run([sys.executable, str(RELATIVIZE), "--check", str(fine)], capture_output=True, text=True)
+            outside, bad = Path(tmp) / "outside.txt", Path(tmp) / "bad.txt"
+            outside.write_text("cd " + H + "pi/.ssh\n")          # not under software/tests/: a leak
+            bad.write_text("cd " + H + "alice/.ssh\n")
+            refused_pi = subprocess.run([sys.executable, str(RELATIVIZE), "--check", str(outside)], capture_output=True, text=True)
             refused = subprocess.run([sys.executable, str(RELATIVIZE), "--check", str(bad)], capture_output=True, text=True)
-        self.assertEqual(ok.returncode, 0, ok.stdout)
+        self.assertEqual(refused_pi.returncode, 1)
+        self.assertIn(H + "pi", refused_pi.stdout)
         self.assertEqual(refused.returncode, 1)
         self.assertIn(H + "alice", refused.stdout)
-        self.assertNotIn("/home/pi", refused.stdout)
+
+    def test_the_exemption_comment_does_not_claim_a_platform_guarantee(self):
+        # the first two versions of the comment asserted facts that were false; the true basis is the
+        # fixture, and the source for "no default pi user" is cited next to it
+        source = RELATIVIZE.read_text()
+        self.assertIn("raspberry-pi-bullseye-update-april-2022", source)
+        self.assertIn("SUDO_USER", source)
+        for claim in ("same on every deployment", "identifies no one", "long-standing default", "the one the software"):
+            self.assertNotIn(claim, source)
 
     def test_analyzer_json_records_repository_relative_sources(self):
         files = sorted((HARDWARE / "review").glob("*/schematic.json")) + sorted((HARDWARE / "review").glob("*/pcb.json"))
