@@ -49,6 +49,7 @@ import hashlib
 import io
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -107,6 +108,19 @@ class _DropHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.requested.append(self.path)
+        stalled = self.server.stalls.get(self.path)
+        if stalled is not None:
+            # Headers and a few bytes, then hold the connection open: a
+            # fetch that is reliably still in progress when the test
+            # signals the script.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(stalled)))
+            self.end_headers()
+            self.wfile.write(stalled[:64])
+            self.wfile.flush()
+            self.server.released.wait(timeout=30)
+            return
         answer = self.server.answers.get(self.path)
         if answer is None:
             self.send_error(404)
@@ -185,12 +199,15 @@ class _StagerCase(unittest.TestCase):
     def _start_drop_server(self):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _DropHandler)
         self.server.answers = {}
+        self.server.stalls = {}
         self.server.requested = []
+        self.server.released = threading.Event()
         thread = threading.Thread(target=self.server.serve_forever,
                                   kwargs={"poll_interval": 0.05}, daemon=True)
         thread.start()
 
         def stop():
+            self.server.released.set()
             self.server.shutdown()
             self.server.server_close()
             thread.join(timeout=5)
@@ -202,6 +219,11 @@ class _StagerCase(unittest.TestCase):
               content_type="application/octet-stream"):
         """Answer `path` with `body`; return its URL."""
         self.server.answers[path] = (status, body, content_type)
+        return "http://%s%s" % (self.drop_host, path)
+
+    def serve_and_stall(self, path, body):
+        """Answer `path` with a few bytes and then never finish."""
+        self.server.stalls[path] = body
         return "http://%s%s" % (self.drop_host, path)
 
     @property
@@ -237,18 +259,25 @@ class _StagerCase(unittest.TestCase):
         return ("python3 -c 'open(\"%s\",\"w\").write(\"one-liner\")'"
                 % (self.oneliner_marker,))
 
-    def run_stager(self, drops, oneliner=None, base_dir=_BASE_DIR,
-                   timeout=120):
+    def stager_script(self, drops, oneliner=None, base_dir=_BASE_DIR):
+        """The rendered posix stager, on disk and ready to run."""
         text = render_stager("posix", oneliner=oneliner or self.oneliner(),
                              drops=drops, base_dir=base_dir)
         script = self.root / "stage.sh"
         script.write_text(text, encoding="utf-8")
+        return script
+
+    def stager_env(self):
+        """A sandboxed environment: no interpreter, and nothing shared."""
+        return {"PATH": str(self.bin), "HOME": str(self.home),
+                "TMPDIR": str(self.scratch), "LC_ALL": "C"}
+
+    def run_stager(self, drops, oneliner=None, base_dir=_BASE_DIR,
+                   timeout=120):
         return subprocess.run(
-            ["/bin/sh", str(script)],
-            env={"PATH": str(self.bin), "HOME": str(self.home),
-                 "TMPDIR": str(self.scratch), "LC_ALL": "C"},
-            stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            timeout=timeout)
+            ["/bin/sh", str(self.stager_script(drops, oneliner, base_dir))],
+            env=self.stager_env(), stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, timeout=timeout)
 
     # ── what to look for afterwards ──
 
@@ -474,6 +503,52 @@ class TestADeadDropThatAnswersWithTheWrongBytes(_StagerCase):
         self.assertIsNotNone(self.await_marker(),
                              "the fixture's interpreter never runs, so the "
                              "assertion above tested nothing")
+
+
+class TestAnInterruptedRun(_StagerCase):
+    """What a Ctrl-C during a fetch leaves behind.
+
+    An 11 MB download in an operator's hands is the realistic place for
+    one. A handler installed on `INT` that merely cleans up and returns
+    resumes the script *after the interrupted command* with its path
+    variables emptied, and the next loop iteration then writes relative
+    to the filesystem root.
+    """
+
+    def test_an_interrupt_during_a_fetch_stops_rather_than_resuming(self):
+        body = self.bundle()
+        stalling = self.drop(self.serve_and_stall("/slow.zip", body),
+                             hashlib.sha256(body).hexdigest())
+        following = self.good_drop("/second.zip")
+
+        script = self.stager_script([stalling, following])
+        process = subprocess.Popen(
+            ["/bin/sh", str(script)], env=self.stager_env(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline and "/slow.zip" not in self.requested:
+                time.sleep(0.02)
+            self.assertIn("/slow.zip", self.requested,
+                          "the stalling drop was never fetched, so nothing "
+                          "was interrupted")
+            # The fetch cannot complete while the handler holds the
+            # connection, so the signal lands mid-transfer. The group, not
+            # the pid: the shell is waiting on its fetch child.
+            os.killpg(os.getpgid(process.pid), signal.SIGINT)
+            process.communicate(timeout=60)
+        finally:
+            self.server.released.set()
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+        self.assertNotEqual(process.returncode, 0)
+        self.assertEqual(self.requested, ["/slow.zip"],
+                         "the script resumed after the interrupt and walked "
+                         "on to the next drop")
+        self.assertNothingWritten()
 
 
 class TestWhatTheRenderedTextCarries(unittest.TestCase):

@@ -43,11 +43,16 @@ a second copy of that logic in two shell languages is a copy that would
 drift. The stager's last act is to start the brought interpreter bare,
 which is what runs the hook under either gate.
 
-**The emitted text carries no comments.** It ships verbatim to a target,
-so the reasons live in this docstring; see this package's own for the
-rule. The two refusal messages are the deliberate exception -- a stager
-that gave up silently is the shape in which this feature would die
-quietly on an engagement, and neither line names this project.
+**The emitted text carries almost no comments.** It ships verbatim to a
+target, so the reasons live in this docstring; see this package's own for
+the rule. There are two deliberate exceptions. The refusal messages: a
+stager that gave up silently is the shape in which this feature would
+die quietly on an engagement, and no line of them names this project.
+And one comment in the PowerShell template, on the stream redirection in
+its probe -- that template's behaviour is verified on a real Windows host
+rather than here, so a reader is the only check it gets before then, and
+the redirection is the kind that somebody tidies into `2>&1` and thereby
+breaks.
 """
 
 import pathlib

@@ -15,7 +15,12 @@ function sProbe {
         if (-not $sPath) { continue }
         $sCode = 1
         try {
-            & $sPath -c 'import sys;sys.exit(0 if sys.version_info[:2] >= (@@MIN_MAJOR@@, @@MIN_MINOR@@) else 1)' 2>&1 | Out-Null
+            # Both streams go to $null rather than being merged with 2>&1:
+            # under 'Stop', a merged stderr line from a native command is a
+            # terminating NativeCommandError in 5.1, so an interpreter above
+            # the floor that printed one warning would be judged unusable and
+            # a bundle fetched onto a host that already had a Python.
+            & $sPath -c 'import sys;sys.exit(0 if sys.version_info[:2] >= (@@MIN_MAJOR@@, @@MIN_MINOR@@) else 1)' 1>$null 2>$null
             $sCode = $LASTEXITCODE
         } catch { $sCode = 1 }
         if ($sCode -eq 0) { return $sPath }
@@ -35,7 +40,30 @@ if ($sFound) {
 
 if ($sDrops.Count -eq 0) { exit 2 }
 
+if (-not $sParent) {
+    [Console]::Error.WriteLine('no per-user directory here: refusing')
+    exit 4
+}
+
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+
+function sFetch($sUrl, $sOut) {
+    $sReq = [Net.HttpWebRequest][Net.WebRequest]::Create($sUrl)
+    $sReq.Timeout = 600000
+    $sReq.ReadWriteTimeout = 600000
+    $sProxy = [Net.WebRequest]::GetSystemWebProxy()
+    if ($sProxy) {
+        $sProxy.Credentials = [Net.CredentialCache]::DefaultCredentials
+        $sReq.Proxy = $sProxy
+    }
+    $sRes = $sReq.GetResponse()
+    try {
+        $sIn = $sRes.GetResponseStream()
+        $sOutStream = [IO.File]::Create($sOut)
+        try { $sIn.CopyTo($sOutStream) }
+        finally { $sOutStream.Close(); $sIn.Close() }
+    } finally { $sRes.Close() }
+}
 
 function sSum($sFile) {
     $sAlg = [Security.Cryptography.SHA256]::Create()
@@ -51,14 +79,15 @@ try {
     $sOk = $false
     foreach ($sDrop in $sDrops) {
         if (Test-Path $sFile) { Remove-Item -Force $sFile }
-        try { (New-Object Net.WebClient).DownloadFile($sDrop.u, $sFile) }
+        try { sFetch $sDrop.u $sFile }
         catch { continue }
         if (-not (Test-Path $sFile)) { continue }
         $sGot = ''
         try { $sGot = sSum $sFile } catch { $sGot = '' }
         if ($sGot.Length -ne 64) {
-            [Console]::Error.WriteLine('no usable digest here: refusing')
-            break
+            [Console]::Error.WriteLine('this file could not be hashed: refused')
+            Remove-Item -Force $sFile
+            continue
         }
         if ($sGot -ne $sDrop.h) {
             [Console]::Error.WriteLine('digest does not match the pin: refused')

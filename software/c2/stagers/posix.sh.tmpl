@@ -3,7 +3,7 @@ set -u
 
 sbase='@@BASE_DIR@@'
 sdrops='@@DROPS@@'
-sparent="${HOME:-.}"
+sparent="${HOME:-}"
 stmp=''
 sstage=''
 
@@ -13,7 +13,8 @@ sclean() {
     stmp=''
     sstage=''
 }
-trap sclean EXIT HUP INT TERM
+trap sclean EXIT
+trap 'sclean; exit 3' HUP INT TERM
 
 sprobe() {
     for sname in python3 python; do
@@ -37,6 +38,11 @@ fi
 
 if [ -z "$sdrops" ]; then
     exit 2
+fi
+
+if [ -z "$sparent" ]; then
+    echo 'no home directory here: refusing' >&2
+    exit 4
 fi
 
 if command -v sha256sum >/dev/null 2>&1; then
@@ -97,8 +103,11 @@ sunpack() {
 
 stmp=$(mktemp -d 2>/dev/null) || stmp=''
 if [ -z "$stmp" ]; then
+    stmp=$(mktemp -d "${TMPDIR:-/tmp}/.sXXXXXX" 2>/dev/null) || stmp=''
+fi
+if [ -z "$stmp" ]; then
     stmp="${TMPDIR:-/tmp}/.s$$"
-    mkdir "$stmp" 2>/dev/null || exit 4
+    mkdir -m 700 "$stmp" 2>/dev/null || exit 4
 fi
 
 sok=0
@@ -109,8 +118,9 @@ while read -r surl ssha; do
     [ -s "$stmp/b" ] || continue
     sgot=$(ssum "$stmp/b") || sgot=''
     if [ -z "$sgot" ]; then
-        echo 'no usable digest here: refusing' >&2
-        break
+        echo 'this file could not be hashed: refused' >&2
+        rm -f "$stmp/b"
+        continue
     fi
     if [ "$sgot" != "$ssha" ]; then
         echo 'digest does not match the pin: refused' >&2
