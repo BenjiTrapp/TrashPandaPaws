@@ -157,6 +157,10 @@ def normalize_tool_call(entry: dict, index: int = 0) -> ToolCall:
 # ── Transport ──
 
 _TIMEOUT_SECONDS = 120
+# A 14B model answering from a CPU over Ollama routinely takes longer than
+# two minutes. That is the normal case for a local endpoint, not a fault, so
+# a timeout there would fail answers that were working.
+LOCAL_TIMEOUT_SECONDS = 300
 _STATUS_HINTS = {
     401: " (the API key was rejected)",
     403: " (the API key was rejected or lacks access)",
@@ -164,7 +168,8 @@ _STATUS_HINTS = {
 }
 
 
-def http_post_json(url: str, headers: Dict[str, str], body: dict) -> dict:
+def http_post_json(url: str, headers: Dict[str, str], body: dict, *,
+                   timeout: float = _TIMEOUT_SECONDS) -> dict:
     """POST a JSON body, return the JSON object that answers.
 
     Every message raised here is built from the status code or the exception
@@ -193,7 +198,7 @@ def http_post_json(url: str, headers: Dict[str, str], body: dict) -> dict:
         # such as x-api-key to whichever host answered. requests only strips
         # the standard Authorization header on a cross-host redirect.
         resp = requests.post(url, headers=headers, json=body,
-                             timeout=_TIMEOUT_SECONDS, allow_redirects=False)
+                             timeout=timeout, allow_redirects=False)
     except requests.RequestException as exc:
         failure = "request failed (%s)" % type(exc).__name__
     if failure is not None:
@@ -241,13 +246,22 @@ class HttpLlmClient(LlmClient):
 
     def __init__(self, provider: str, model: str, api_key: Optional[str],
                  base_url: str, transport: Optional[Transport] = None,
-                 supports_tools: bool = True):
+                 supports_tools: bool = True,
+                 timeout: Optional[float] = None):
         self.provider = provider
         self.model = model
         self.supports_tools = supports_tools
         self._base_url = base_url.rstrip("/")
         self._api_key = Secret(api_key)
-        self._transport = transport or http_post_json
+        self._timeout = _TIMEOUT_SECONDS if timeout is None else timeout
+        if transport is None:
+            # The timeout is bound into the default transport rather than
+            # passed through the Transport signature, which stubs depend on.
+            # An injected transport is the caller's own, so it is kept as is.
+            transport = (lambda url, headers, body:
+                         http_post_json(url, headers, body,
+                                        timeout=self._timeout))
+        self._transport = transport
 
     def __repr__(self) -> str:
         return "<%s provider=%r model=%r>" % (
@@ -502,4 +516,5 @@ def create_client(cfg) -> LlmClient:
         return bedrock_client.BedrockClient(
             model=model, api_key=api_key, base_url=base_url)
     return openai_client.OpenAiCompatibleClient(
-        provider=name, model=model, api_key=api_key, base_url=base_url)
+        provider=name, model=model, api_key=api_key, base_url=base_url,
+        timeout=LOCAL_TIMEOUT_SECONDS if name in LOCAL_PROVIDERS else None)

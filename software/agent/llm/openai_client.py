@@ -71,9 +71,10 @@ def _translate(messages: List[dict]) -> List[dict]:
 
 class OpenAiCompatibleClient(provider.HttpLlmClient):
     def __init__(self, provider: str, model: str, api_key: Optional[str],
-                 base_url: str, transport=None, supports_tools: bool = True):
+                 base_url: str, transport=None, supports_tools: bool = True,
+                 timeout: Optional[float] = None):
         super().__init__(provider, model, api_key, base_url, transport,
-                         supports_tools)
+                         supports_tools, timeout)
 
     def _build_request(self, system: str, messages: List[dict],
                        tools: List[ToolSpec], max_tokens: int,
