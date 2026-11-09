@@ -25,7 +25,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from software.agent import config, gate, safety
-from software.agent.llm import failover, provider
+from software.agent.llm import failover, gcp_token, provider
 from software.agent.store import db, queries
 
 _FAKE_KEY = "sk-not-a-real-key"
@@ -1225,6 +1225,17 @@ class TestWhichVertexCredentialIsUsed(unittest.TestCase):
         self.assertIn(self.NOTE, reason)
         self.assertIn("hour", reason)
         self.assertNotIn(_FAKE_KEY, reason)
+
+    def test_the_note_names_the_knobs_and_says_an_explicit_value_wins(self):
+        reason = _load(env=dict(_VERTEX, AGENT_API_KEY=_FAKE_KEY)
+                       ).available()[1]
+        for knob in ("AGENT_TOKEN_SOURCE", "agent.llm.token_source",
+                     "--token-source", "takes precedence"):
+            self.assertIn(knob, reason)
+        # Derived from the module, so the list cannot drift from it.
+        for kind in gcp_token.KINDS:
+            if kind != "auto":
+                self.assertIn(kind, reason)
 
     def test_a_keyfile_with_vertex_and_auto_is_a_static_bearer_too(self):
         path = _keyfile(_FAKE_KEY)

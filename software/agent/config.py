@@ -148,7 +148,10 @@ _SLIVER_REASON = (
 _STATIC_BEARER_NOTE = (
     "the Vertex credential is a static key (AGENT_API_KEY or api_key_file) "
     "and will not be refreshed: a run that outlasts the token's hour will "
-    "fail. Set token_source (%s) for a token that renews itself"
+    "fail. To have the token renew itself, set token_source to one of %s "
+    "(AGENT_TOKEN_SOURCE, agent.llm.token_source in the YAML, or "
+    "--token-source); an explicit value takes precedence over the key, "
+    "which need not be removed"
     % ", ".join(k for k in gcp_token.KINDS if k != "auto"))
 
 # Shorter than this, a replace() would mangle the reason around a coincidental
