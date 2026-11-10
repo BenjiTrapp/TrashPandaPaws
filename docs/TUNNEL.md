@@ -272,18 +272,31 @@ host staged from it. Revocation is deleting the drop; the liveness check
 beside `beacon-gist` is reused only to ask "is this drop still
 answering", never as an upload path.
 
-Build the bundle locally and upload it by hand:
+Build the bundle locally and upload it by hand. The three per-build
+values on that command line come back in the generator's response —
+`base_dir`, `payload_name` and `gate`, beside `tunnel_identity` — so
+they are read off the build that produced the payload rather than
+guessed:
 
 ```sh
 python3 tools/build_interpreter_bundle.py \
     --distribution python-3.11.9-embed-amd64.zip \
     --expect-sha256 <the hash published for that file> \
     --payload <the build's generated artifact> \
-    --payload-name <the build's generated payload name> \
-    --base-dir <the build's base_dir> \
-    --gate path \
+    --payload-name <the response's payload_name> \
+    --base-dir <the response's base_dir> \
+    --gate <the response's gate> \
     --out bundle.zip
 ```
+
+**A mismatch here is silent, which is why the values come from the
+response.** The startup hook runs whatever payload name the bundle was
+built with, so the payload still starts; it is the `argc` gate that then
+looks for a payload which is not there and falls back to the `path`
+gate — reversing the telemetry choice the `gate` flag was set to make.
+None of the three is a secret: all three are already inside the artifact
+and inside the rendered stager. The PSK is the value that never comes
+back out of the team server, and it is not in the response.
 
 It renders the startup hook itself, verifies the distribution **before**
 it opens it, writes one zip, and prints the `{url, sha256}` entry to

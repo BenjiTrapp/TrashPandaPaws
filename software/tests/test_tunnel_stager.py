@@ -753,6 +753,30 @@ class TestTheGeneratorEmitsStagers(_StagerGeneratorCase):
                 self.assertIn(body["oneliner_win"],
                               body["stager_win"].replace("''", "'"))
 
+    def test_both_routes_report_the_layout_the_bundle_builder_requires(self):
+        # `tools/build_interpreter_bundle.py` requires `--base-dir` and
+        # takes `--payload-name` and `--gate`; all three are minted per
+        # build with `secrets` and nothing else reported them, so an
+        # operator could not build a bundle for the artifact they had
+        # just generated without decoding the config blob out of a
+        # truncated `deob` preview. A mismatch is silent: the hook runs
+        # the name the bundle carries, and it is the `argc` gate that
+        # then finds no payload and falls back to `path`.
+        for route in ("gen", "gist"):
+            with self.subTest(route=route):
+                body, gen_cfg = self.generate(route)
+                block = gen_cfg["persistence"]
+                for field in ("base_dir", "payload_name", "gate"):
+                    self.assertEqual(
+                        body.get(field), block[field],
+                        "the %s route does not report %s, which the bundle "
+                        "builder needs on its command line" % (route, field))
+                # And the credential still does not come back out.
+                self.assertNotIn("psk", body)
+                self.assertNotIn("persistence", body,
+                                 "the response carries the whole block, "
+                                 "which is more than the three facts")
+
     def test_rendered_stager_contains_no_psk_and_no_private_key(self):
         for route in ("gen", "gist"):
             with self.subTest(route=route):
