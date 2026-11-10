@@ -2791,6 +2791,26 @@ class TestHowAChildIsHandled(unittest.TestCase):
     left behind or a team server blocked for ever.
     """
 
+    def test_child_can_be_imported_without_loading_a_listener(self):
+        # The reading-level claim in `child.py`'s docstring, made real.
+        # `tunnel/supervisor.py` imports this module and must not get a
+        # transport with it, and the shape that would break it is one
+        # `from .supervisor import ...` -- which pulls `registry`, which
+        # imports all three listener classes. In a subprocess because
+        # this process has imported them already.
+        root = str(Path(__file__).resolve().parents[2])
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, software.c2.listeners.child as c;"
+             "print(sorted(m for m in sys.modules"
+             " if m.startswith('software.c2.listeners.')"
+             " and m.rsplit('.', 1)[-1] not in ('child', 'errors')))"],
+            cwd=root, capture_output=True, text=True, timeout=60)
+        self.assertEqual(probe.returncode, 0, probe.stderr[-400:])
+        self.assertEqual(probe.stdout.strip(), "[]",
+                         "importing listeners/child.py loaded a listener "
+                         "module with it")
+
     def test_a_child_that_ignores_sigterm_is_killed(self):
         from software.c2.listeners import supervisor as sup
 
@@ -2822,7 +2842,11 @@ class TestHowAChildIsHandled(unittest.TestCase):
                         "the escalation took %.1fs" % took)
 
     def test_a_child_that_never_prints_is_given_up_on(self):
-        from software.c2.listeners import supervisor as sup
+        # The helper moved to `listeners/child.py` when the tunnel
+        # supervisor started sharing it, and is driven there rather than
+        # through a re-export: a module that no longer calls a function
+        # should not keep importing it so that a test can reach it.
+        from software.c2.listeners import child as sup
 
         read_fd, write_fd = os.pipe()
         stream = os.fdopen(read_fd)
@@ -2838,7 +2862,7 @@ class TestHowAChildIsHandled(unittest.TestCase):
         self.addCleanup(os.close, write_fd)
 
         started = time.monotonic()
-        line = sup._read_line_with_timeout(stream, 0.5)
+        line = sup.read_line_with_timeout(stream, 0.5)
         took = time.monotonic() - started
 
         self.assertIsNone(line)
@@ -3654,7 +3678,7 @@ class TestThePayloadFieldsAgree(unittest.TestCase):
         # it. The AST knows the difference.
         for module in ("relay.py", "dns.py", "quic.py", "smb.py",
                        "registry.py", "supervisor.py", "__main__.py",
-                       "errors.py"):
+                       "errors.py", "child.py"):
             with self.subTest(module=module):
                 imported, _used = _imports_and_names(
                     "software", "c2", "listeners", module)

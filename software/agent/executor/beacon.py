@@ -40,7 +40,7 @@ BEACON_VERBS = (
     "shell", "ls", "lsjson", "cat", "pwd", "cd", "cp", "mv", "rm", "mkdir",
     "chmod", "write", "upload", "download", "loot", "exfil", "netscan",
     "arptable", "proxyinfo", "avenum", "smbloot", "persist", "unpersist",
-    "sleep", "reconfig", "kill",
+    "tunnel", "sleep", "reconfig", "kill",
 )
 
 # Only where the name does not say it. Kept short on purpose: this goes into
@@ -55,6 +55,7 @@ VERB_HINTS = {
     "proxyinfo": "the host's proxy configuration",
     "avenum": "enumerate AV, EDR and SIEM agents",
     "smbloot": "browse SMB shares without impacket",
+    "tunnel": "start or stop the SOCKS tunnel child: tunnel start, tunnel stop",
     "sleep": "set the check-in interval and jitter",
 }
 

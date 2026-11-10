@@ -27,6 +27,16 @@ something this arrangement introduces.
 Two tests hold it for every listener module, and the container image is
 built so that `beacon.py` and `server.py` are not even present.
 
+**One thing in this repository inverts this property, and it is not a
+listener.** The reverse SOCKS tunnel server mints and holds an X25519
+static private key and every build's pre-shared key — see *The one
+property that is different here* in [`docs/TUNNEL.md`](TUNNEL.md). That
+is why it is a separate package with its own panel and its own
+configuration block rather than a fourth entry in `c2.listeners`: filing
+it here would have left this section reading like a guarantee for the
+whole project. It runs on the team server host, not on a forwarding host
+you do not mind losing.
+
 ---
 
 ## The three transports
@@ -276,5 +286,8 @@ rather than only looked at.
 
 - [`docs/REDIRECTOR.md`](REDIRECTOR.md) — the same shape for HTTPS: a
   front host that carries traffic and holds no key.
+- [`docs/TUNNEL.md`](TUNNEL.md) — the reverse SOCKS tunnel, which is the
+  opposite shape: a process that holds key material and must stay on the
+  team server host.
 - [`docs/AGENT.md`](AGENT.md#known-limits) — *Known limits*, held by a
   test that fails if an entry is fixed and left in the list.
