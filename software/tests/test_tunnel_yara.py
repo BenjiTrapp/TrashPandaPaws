@@ -20,15 +20,26 @@ in `software/requirements.txt` and that file may not grow.
    matches. A rule can match on a string nobody listed here, and a string
    can survive in a form a substring search does not see.
 
-**Tier 1 would pass even on a leak, and a positive control is why that is
-not fatal.** Both published rules are bounded by `filesize < 60KB` and the
-generated artifact is roughly five times that, so neither rule can fire on
-it whatever it contains. That makes a bare "no match" worth nothing on its
-own, so `test_the_checked_in_rules_still_match_what_they_were_written_for`
-synthesises a small file out of the marker list and requires both rules to
-match it. The engine works, the rule files compile and their conditions
-fire; tier 2 is then what carries the claim about the artifact's bytes,
-and `docs/TUNNEL.md` says so in those words.
+**A bare tier-1 pass would prove nothing, and two tests beside it are why
+it does.** Both published rules are bounded by `filesize < 60KB` and the
+generated artifact is roughly five times that, so neither rule can fire
+on it whatever it contains — a "no match" has two independent causes and
+only one of them is about our bytes. So:
+
+* `test_the_checked_in_rules_still_match_what_they_were_written_for`
+  synthesises a small file out of the marker list and requires both rules
+  to match it. That rules out the other explanation for silence: a rule
+  file that compiled to nothing, or a missing engine.
+* `test_the_rules_do_not_match_even_without_their_filesize_bound` strips
+  the `filesize` clause at run time, into a temporary directory, and
+  scans the artifact again. **This is the strongest claim in this file.**
+  It passes, which means the artifact escapes the published rules on
+  their *strings* and not merely by being too large to be looked at —
+  and it is this test, not tier 2, that carries the claim about the
+  artifact's bytes. Tier 2 is the guard that still runs when the engine
+  is absent.
+
+`docs/TUNNEL.md` says the same thing in the same order.
 
 **The marker list is the rules' distinctive strings, not all of them.**
 Four of the rule's exception names -- `ConnectionResetError`,
@@ -123,6 +134,15 @@ _MARKERS = _RULE_STRINGS + _PROVENANCE_NAMES
 def _has_yara():
     """The engine, as a binary on PATH, following the `node` precedent."""
     return shutil.which("yara") is not None
+
+
+# Named so that a green run is self-describing. `skipped=4` beside a
+# reason that only states the cause reads like any other skip; this says
+# which claim was not made, because the whole point of tier 1 is that it
+# is the real one.
+_NO_YARA = ("yara binary not on PATH: tier 1, the real claim -- that the "
+            "published rules do not match the artifact -- was NOT "
+            "verified. Only the tier-2 marker assertion ran.")
 
 
 def _scan(rules, target):
@@ -229,6 +249,16 @@ class TestTheArtifactCarriesNoPublishedMarker(_ArtifactCase):
             "this file's comments verbatim into every build"
             % ", ".join(repr(name) for name in offenders))
 
+    def test_the_artifact_is_past_the_filesize_bound_both_rules_carry(self):
+        # Stated as a number rather than as prose, because it is the
+        # second independent reason a bare tier-1 pass proves nothing,
+        # and `docs/TUNNEL.md` has to keep saying so. Deliberately *not*
+        # in the yara-gated class below: it needs no engine, and a run
+        # without one should still record the fact that makes the skip
+        # matter.
+        _delivered, expanded = self.artifact()
+        self.assertGreater(len(expanded.encode("utf-8")), 60 * 1024)
+
 
 class TestTheCheckedInRules(unittest.TestCase):
     """The checked-in copies, and the marker list measured against them."""
@@ -289,7 +319,7 @@ class TestTheCheckedInRules(unittest.TestCase):
                          "rules do not look for: %s" % missing)
 
 
-@unittest.skipUnless(_has_yara(), "yara engine not installed")
+@unittest.skipUnless(_has_yara(), _NO_YARA)
 class TestTheRulesDoNotMatch(_ArtifactCase):
     """Tier 1: the real claim, when the engine is here to make it.
 
@@ -331,13 +361,6 @@ class TestTheRulesDoNotMatch(_ArtifactCase):
                         matched, [],
                         "%s fires on nothing, so its companion test "
                         "proves nothing either" % name)
-
-    def test_the_artifact_is_past_the_filesize_bound_both_rules_carry(self):
-        # Stated as a number rather than as prose, because it is the
-        # second independent reason the test above cannot fail and
-        # `docs/TUNNEL.md` has to keep saying so.
-        _delivered, expanded = self.artifact()
-        self.assertGreater(len(expanded.encode("utf-8")), 60 * 1024)
 
     def test_the_rules_do_not_match_even_without_their_filesize_bound(self):
         """The same scan with the second reason it cannot fail removed.
@@ -435,6 +458,27 @@ class TestTheTunnelDocumentation(unittest.TestCase):
         self.present("50-200 KB/s", "the measured throughput")
         self.present("refuses to start", "what the endpoint does about it")
         self.present("network fault", "what it would be mistaken for")
+
+    def test_the_doc_says_where_the_crypto_override_actually_lives(self):
+        # The one section an operator reaches in a failure state. A
+        # generated build carries `allow_slow_crypto` baked in and reads
+        # no config file, so "edit raccoon.yaml" is the wrong remedy for
+        # the common artifact -- and the document held both halves of
+        # that 130 lines apart without connecting them.
+        self.present("regenerate the build",
+                     "what a generated build's operator must actually do")
+        self.present("generation time",
+                     "when the field is chosen for a generated build")
+        self.present("Editing `raccoon.yaml` on the target changes "
+                     "nothing",
+                     "the remedy that does not work, said plainly")
+        self.present("raccoon-tunnel.service",
+                     "which kind of endpoint the YAML block is for")
+
+    def test_the_doc_assembles_the_happy_path_into_one_sequence(self):
+        # Four steps that were each documented and never ordered.
+        for claim in ("the happy path", "tunnel start", "proxychains"):
+            self.present(claim, "the ordered sequence")
 
     def test_the_doc_states_the_drop_list_and_the_mandatory_hash(self):
         self.present("sha256", "what pins a drop")

