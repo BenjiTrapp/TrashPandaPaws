@@ -138,7 +138,13 @@ def _endpoint(identity="a1b2c3d4e5f6", **over):
         "bytes_out": 2048,
         "last_seen_age": 3.0,
         "connected_for": 120.0,
-        "crypto": "openssl",
+        # Two processes, two paths, and the row carries both: the
+        # endpoint's as its HELLO reported it, this team server's as the
+        # tunnel-server process read its own. A row that carried one
+        # under the name `crypto` said the server's and was read as the
+        # endpoint's.
+        "endpoint_crypto": "pure-python",
+        "server_crypto": "openssl",
         "socks": {"identity": identity, "port": 19050, "serving": True,
                   "sessions": 2, "max_sessions": 64, "pending": 0,
                   "max_pending": 64, "accepted": 9, "carried": 7,
@@ -538,7 +544,7 @@ class TestTheSupervisor(unittest.TestCase):
 class TestTheTunnelRoutes(_RouteCase):
     """What `/api/server/tunnel` tells an operator, and what it refuses."""
 
-    def test_get_tunnel_lists_endpoints_with_port_sessions_and_crypto_path(self):
+    def test_get_tunnel_lists_endpoints_with_port_sessions_and_crypto_paths(self):
         supervisor = _FakeTunnelSupervisor(endpoints=[_endpoint()])
         name = self.agent("implant-a1b2c3d4e5f6")
         reply = self.client(supervisor).get("/api/server/tunnel",
@@ -555,10 +561,14 @@ class TestTheTunnelRoutes(_RouteCase):
         self.assertEqual(row["port"], 19050)
         self.assertEqual(row["sessions"], 2)
         self.assertEqual(row["socks"]["max_sessions"], 64)
-        # The crypto path, on the row. A tunnel on the pure-Python cipher
-        # runs at 50-200 KB/s, and without this the operator debugs a
-        # network fault for an afternoon.
-        self.assertEqual(row["crypto"], "openssl")
+        # Both crypto paths, on the row, and not folded into one. A
+        # tunnel on the pure-Python cipher runs at 50-200 KB/s, and
+        # without this the operator debugs a network fault for an
+        # afternoon -- which is what a row saying `openssl` about the
+        # *server* did in exactly the case an `allow_slow_crypto` build
+        # creates.
+        self.assertEqual(row["endpoint_crypto"], "pure-python")
+        self.assertEqual(row["server_crypto"], "openssl")
         # And the fleet link the child could not make for itself.
         self.assertEqual(row["agent"], name)
         self.assertTrue(row["linked"])
@@ -885,13 +895,22 @@ class TestTheTunnelPanel(unittest.TestCase):
                         self.body.index("data-tunnel-endpoint"),
                         "the endpoints are drawn above the server block")
 
-    def test_the_row_shows_the_crypto_path_and_any_refusal(self):
-        self.assertIn("esc(row.crypto)", self.body)
+    def test_the_row_shows_both_crypto_paths_and_any_refusal(self):
+        # Both halves encrypt every relayed byte, so either one bounds
+        # the throughput and the row has to name which is which. The
+        # endpoint's is the one an `allow_slow_crypto` build is about and
+        # the one this process cannot know for itself.
+        self.assertIn("esc(String(row.endpoint_crypto", self.body)
+        self.assertIn("esc(String(row.server_crypto", self.body)
         self.assertIn("esc(row.refusal)", self.body)
-        slow = self.body[self.body.index("esc(row.crypto)") - 400:
-                         self.body.index("esc(row.crypto)") + 400]
+        anchor = self.body.index("esc(String(row.endpoint_crypto")
+        slow = self.body[anchor - 900:anchor + 900]
         self.assertIn("pure-python", slow,
                       "the panel never says which path is the slow one")
+        self.assertIn("endpoint", slow,
+                      "the panel does not say which half a path belongs to")
+        self.assertIn("server", slow,
+                      "the panel does not say which half a path belongs to")
 
     def test_every_value_an_endpoint_influences_is_escaped(self):
         # A row's hostname, OS and peer come from a HELLO written by
@@ -899,8 +918,14 @@ class TestTheTunnelPanel(unittest.TestCase):
         # child process. Each goes through esc(), and the handlers are
         # attached in JavaScript rather than built into an attribute.
         for field in ("identity", "state", "hostname", "os", "peer",
-                      "refusal", "crypto"):
+                      "refusal"):
             self.assertIn("esc(row.%s)" % field, self.body,
+                          "row.%s reaches the page unescaped" % field)
+        # These two carry a default, so they are escaped through String()
+        # rather than directly -- `endpoint_crypto` is a HELLO field and
+        # so is written by the far end of the tunnel like the five above.
+        for field in ("endpoint_crypto", "server_crypto"):
+            self.assertIn("esc(String(row.%s" % field, self.body,
                           "row.%s reaches the page unescaped" % field)
         self.assertNotIn('onclick="tunnel', self.body,
                          "a handler body is built as a string")

@@ -554,6 +554,18 @@ class TestTheTunnelDocumentation(unittest.TestCase):
         self.present("refuses to start", "what the endpoint does about it")
         self.present("network fault", "what it would be mistaken for")
 
+    def test_the_doc_says_the_row_names_both_crypto_paths(self):
+        # Two tasks called a field `crypto` and meant different
+        # processes. The endpoint's path never leaves the target unless
+        # the HELLO carries it, and the row an operator reads in the one
+        # case the display exists for -- a build with `allow_slow_crypto`
+        # set because the target has no libcrypto -- used to report the
+        # team server's `openssl`.
+        self.present("endpoint_crypto", "the implant's own cipher path")
+        self.present("server_crypto", "this process's")
+        self.present("decrypts and re-encrypts every relayed byte",
+                     "why the server's path matters to throughput too")
+
     def test_the_doc_says_where_the_crypto_override_actually_lives(self):
         # The one section an operator reaches in a failure state. A
         # generated build carries `allow_slow_crypto` baked in and reads

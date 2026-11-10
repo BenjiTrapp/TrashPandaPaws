@@ -7148,16 +7148,29 @@ async function drawTunnel(panel){
       + ' &middot; in ' + esc(bytes(row.bytes_in))
       + ' out ' + esc(bytes(row.bytes_out))
       + '</div>'
-      // The crypto path, per row. A tunnel on the pure-Python cipher
-      // moves roughly 50-200 KB/s, and an operator who cannot see that
-      // spends the afternoon looking for a network fault that is not
-      // there.
+      // The crypto path of both halves, per row. A tunnel on the
+      // pure-Python cipher moves roughly 50-200 KB/s, and an operator
+      // who cannot see that spends the afternoon looking for a network
+      // fault that is not there. Two values because they are two
+      // processes on two hosts and either one bounds the throughput:
+      // `endpoint_crypto` comes from the endpoint's own HELLO and is the
+      // one an `allow_slow_crypto` build is about, `server_crypto` is
+      // this team server, which encrypts every relayed byte as well.
       + '<div style="font-size:11px;color:'
-      + (row.crypto === "pure-python" ? 'var(--yellow,#d7ba7d)' : 'var(--dim)') + '">'
-      + 'crypto ' + esc(row.crypto)
-      + (row.crypto === "pure-python"
-         ? ' &mdash; pure-python AES-GCM, roughly 50-200 KB/s: a scan through '
-           + 'this tunnel is slow because of the cipher, not the network'
+      + ((row.endpoint_crypto === "pure-python"
+          || row.server_crypto === "pure-python")
+         ? 'var(--yellow,#d7ba7d)' : 'var(--dim)') + '">'
+      + 'crypto endpoint ' + esc(String(row.endpoint_crypto || "unreported"))
+      + ' &middot; server ' + esc(String(row.server_crypto || "unknown"))
+      + (row.endpoint_crypto === "pure-python"
+         ? ' &mdash; the endpoint is on pure-python AES-GCM, roughly '
+           + '50-200 KB/s: a scan through this tunnel is slow because of '
+           + 'the cipher, not the network'
+         : '')
+      + (row.server_crypto === "pure-python"
+         ? ' &mdash; this team server is on pure-python AES-GCM, roughly '
+           + '50-200 KB/s: it encrypts every relayed byte, so the tunnel '
+           + 'is slow because of the cipher, not the network'
          : '')
       + '</div>'
       + (socks && socks.refused

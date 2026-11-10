@@ -121,7 +121,8 @@ stopped there.
 
 Per row the panel shows state, the fixed SOCKS port, the hostname, OS and
 peer address the endpoint reported, open sessions against the cap, bytes
-each way, the crypto path, the SOCKS credential, how many connections the
+each way, **both crypto paths** — the endpoint's, from its own `HELLO`,
+and this team server's — the SOCKS credential, how many connections the
 port refused and why, and whether the row is linked or unlinked. The
 `/api/server/tunnel` row carries two more the panel does not draw:
 `last_seen_age`, the age of the last keep-alive, and `connected_for`.
@@ -201,12 +202,22 @@ against the table above rather than literally. The same split applies to
 all eight `c2.tunnel` fields; see *Configuring it* below.
 
 A tunnel at 100 KB/s still beats no tunnel when that is the decision you
-want to make, so the override exists. When it is used, the panel shows
-`crypto pure-python` on that row in warning colour with the number
-beside it, so the slow case is visible where it would otherwise be
-mistaken for the network. The refusal itself reaches the panel too: the
-tunnel child's stderr is closed, so the row's refusal line is where that
+want to make, so the override exists. When it is used, the row shows
+`crypto endpoint pure-python` in warning colour with the number beside
+it, so the slow case is visible where it would otherwise be mistaken for
+the network. The refusal itself reaches the panel too: the tunnel
+child's stderr is closed, so the row's refusal line is where that
 sentence arrives or nowhere.
+
+**The row names two crypto paths, because there are two.**
+`endpoint_crypto` is the implant's, reported in its `HELLO` — that is the
+one an `allow_slow_crypto` build is about, and the one nothing else on
+the team server can know. `server_crypto` is this process: the tunnel
+server decrypts and re-encrypts every relayed byte, so a fast endpoint
+behind a pure-Python team server is just as slow. Either value in
+warning colour means the cipher bounds the throughput. A disconnected
+row shows the endpoint's as `unreported`, because it arrives with the
+`HELLO` and leaves with the channel.
 
 On a brought-interpreter host the gate is satisfied for free — the
 Windows embeddable distribution ships a real `libcrypto`.

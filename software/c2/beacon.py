@@ -3263,10 +3263,19 @@ class TunnelEndpoint(object):
         believes. `implant_id` is sent only when the config carries one --
         an endpoint started from systemd has no beacon above it, and the
         server reports that as unlinked rather than hiding the row.
+
+        `crypto` is here because it is the one performance fact that
+        never leaves this host otherwise, and the panel is where it is
+        read. An endpoint running on the pure-Python cipher -- which
+        takes an explicit override to reach -- moves roughly 50-200 KB/s,
+        and "a scan through this tunnel is slow" is otherwise debugged as
+        a fault in the target's own network for an afternoon. The server
+        knows its own path and cannot know this one.
         """
         body = {"identity": self.identity,
                 "hostname": platform.node(),
-                "os": "%s %s" % (platform.system(), platform.release())}
+                "os": "%s %s" % (platform.system(), platform.release()),
+                "crypto": self._crypto_path()}
         if self.implant_id:
             body["implant_id"] = self.implant_id
         return body

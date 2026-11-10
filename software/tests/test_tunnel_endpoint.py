@@ -972,10 +972,34 @@ class TestTheThroughputGate(TunnelEndpointTestCase):
             self.config_for(server.port, allow_slow_crypto=True))
 
         row = self.wait_connected(server)
-        self.assertEqual(row["crypto"], "pure-python")
+        # The endpoint's own path, carried in its HELLO. `server_crypto`
+        # is this process and is a different fact: on a target with no
+        # libcrypto the two disagree, and a row that reported only the
+        # server's would say `openssl` in exactly the case the display
+        # exists for.
+        self.assertEqual(row["endpoint_crypto"], "pure-python")
+        self.assertIn(row["server_crypto"], ("openssl", "pure-python"))
         status = endpoint.status()
         self.assertEqual(status["crypto"], "pure-python")
         self.assertTrue(status["slow_crypto_allowed"])
+
+    def test_a_row_with_no_endpoint_on_it_reports_no_endpoint_crypto(self):
+        # It arrives with the HELLO and leaves with the channel: the
+        # server cannot know a disconnected endpoint's cipher, and a row
+        # that kept the last value would be asserting something about a
+        # host it has not heard from.
+        self.fast_retries()
+        server = self.start_server()
+        endpoint = self.start_endpoint(self.config_for(server.port))
+        self.wait_connected(server)
+        endpoint.stop()
+
+        self.wait_for(
+            lambda: self.row(server, "build-alpha")["state"] == "disconnected",
+            what="the server noticing the endpoint went")
+        row = self.row(server, "build-alpha")
+        self.assertIsNone(row["endpoint_crypto"])
+        self.assertIn(row["server_crypto"], ("openssl", "pure-python"))
 
     def test_the_fast_path_needs_no_override(self):
         if beacon_mod._USE_PURE_PYTHON_AES:

