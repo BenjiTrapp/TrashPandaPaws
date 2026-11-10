@@ -2791,6 +2791,26 @@ class TestHowAChildIsHandled(unittest.TestCase):
     left behind or a team server blocked for ever.
     """
 
+    def test_child_can_be_imported_without_loading_a_listener(self):
+        # The reading-level claim in `child.py`'s docstring, made real.
+        # `tunnel/supervisor.py` imports this module and must not get a
+        # transport with it, and the shape that would break it is one
+        # `from .supervisor import ...` -- which pulls `registry`, which
+        # imports all three listener classes. In a subprocess because
+        # this process has imported them already.
+        root = str(Path(__file__).resolve().parents[2])
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, software.c2.listeners.child as c;"
+             "print(sorted(m for m in sys.modules"
+             " if m.startswith('software.c2.listeners.')"
+             " and m.rsplit('.', 1)[-1] not in ('child', 'errors')))"],
+            cwd=root, capture_output=True, text=True, timeout=60)
+        self.assertEqual(probe.returncode, 0, probe.stderr[-400:])
+        self.assertEqual(probe.stdout.strip(), "[]",
+                         "importing listeners/child.py loaded a listener "
+                         "module with it")
+
     def test_a_child_that_ignores_sigterm_is_killed(self):
         from software.c2.listeners import supervisor as sup
 

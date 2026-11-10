@@ -15,13 +15,25 @@ both cases the better version was the one fewer people read. So it lives
 here once.
 
 **This module imports no listener and no transport.** It is in this
-package beside `errors.py`, which is here for the same reason: importing
-`supervisor` to reach either of them would pull in `registry`, and
-`registry` imports all three listener classes, so the DNS parser, the
-QUIC reassembler and the hand-written SMB2 parser would come with them.
-A module anything may import must therefore import nothing from this
+package beside `errors.py`, which is here for the same reason: a module
+that `tunnel/supervisor.py` may import must not have to reach
+`supervisor` to be reached, because `supervisor` pulls in `registry` and
+`registry` imports all three listener classes -- so the DNS parser, the
+QUIC reassembler and the hand-written SMB2 parser would come with it. A
+module anything may import must therefore import nothing from this
 package, and this one imports nothing at all beyond the standard library
-and `errors`.
+and `errors`. `test_child_can_be_imported_without_loading_a_listener`
+holds that.
+
+**What that property is, exactly, because the obvious reading is too
+strong.** It is not a claim that a tunnel-only deployment loads no
+protocol parser. `_build_supervisor` in `server.py` imports
+`listeners.registry` whenever `--config` is given, and a `--config` is
+what configures a tunnel server, so the three parsers are loaded in
+every deployment that can have one. The property is about this module's
+own import graph: anything in the tree can import it without acquiring a
+transport, which is what makes it safe to share between two supervisors
+that know nothing about each other.
 
 Three properties the callers depend on, each learned from a failure:
 
