@@ -84,6 +84,16 @@ _WRITE_UP_ARTEFACTS = (_WRITE_UP_DIR, _WRITE_UP_PAYLOAD_EXT)
 # review diffs, and this file, which asserts their absence and so has to
 # name them. Binary suffixes are skipped because a substring gate over a
 # PNG proves nothing and costs 60 MB of reads.
+#
+# The list is taken from `git ls-files`, so a file `.gitignore` names is
+# not read at all. That is not tidiness: `.gitignore` carries
+# `.history/`, which is VS Code's Local History, and a developer who had
+# edited `beacon.py` before the burned name was removed from it carries a
+# pre-fix copy there -- making this test assert that the branch ships a
+# burned indicator, on the branch's own central safety claim. `.venv/`,
+# `build/`, `dist/`, `logs/`, `captures/` and `.openchamber/` are the
+# same class of false alarm, and `vendor/` stops being read along with
+# them. The walk is kept as a fallback for a tree that is not a checkout.
 _LEAK_SKIP_DIRS = frozenset({".git", "__pycache__", ".superpowers",
                              ".worktrees", "node_modules"})
 _LEAK_SKIP_SUFFIXES = frozenset({
@@ -94,15 +104,49 @@ _LEAK_SKIP_SUFFIXES = frozenset({
 _LEAK_SKIP_PREFIXES = (os.path.join("docs", "superpowers"),)
 
 
-def _shipped_files():
-    """Every text file in the tree that is shipped rather than discussed."""
-    here = Path(__file__).resolve()
-    for path in sorted(_REPO.rglob("*")):
-        if not path.is_file() or path.resolve() == here:
+def _tracked_files(root):
+    """Every path `git ls-files` reports, or None outside a checkout."""
+    try:
+        listed = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listed.returncode != 0:
+        return None
+    names = [name for name in listed.stdout.decode("utf-8", "replace").split("\0")
+             if name]
+    return names or None
+
+
+def _walked_files(root):
+    """Every path under the tree, for a copy that is not a git checkout."""
+    names = []
+    for path in sorted(Path(root).rglob("*")):
+        if not path.is_file():
             continue
-        relative = str(path.relative_to(_REPO))
-        if any(part in _LEAK_SKIP_DIRS
-               for part in Path(relative).parts):
+        relative = str(path.relative_to(root))
+        if any(part in _LEAK_SKIP_DIRS for part in Path(relative).parts):
+            continue
+        names.append(relative)
+    return names
+
+
+def _shipped_files(root=_REPO):
+    """Every text file in the tree that is shipped rather than discussed.
+
+    `root` is a parameter so the selection itself can be tested against a
+    tree a test owns, rather than only against this checkout.
+    """
+    here = Path(__file__).resolve()
+    names = _tracked_files(root)
+    if names is None:
+        names = _walked_files(root)
+    for relative in sorted(names):
+        path = Path(root) / relative
+        # A tracked path can be absent in a sparse or mid-rebase tree,
+        # and a submodule entry is a directory.
+        if not path.is_file() or path.resolve() == here:
             continue
         if relative.startswith(_LEAK_SKIP_PREFIXES):
             continue
@@ -318,6 +362,41 @@ class TestTheAutorunNameComesFromTheBuild(_PersistenceCase):
         second = self.beacon()._persist_name
         self.assertEqual(first, second)
         self.assertTrue(first)
+
+    def test_the_leak_walk_reads_tracked_files_and_not_ignored_ones(self):
+        # The selection, against a tree this test owns. `.gitignore`
+        # names `.history/`, which is VS Code's Local History: a
+        # developer who edited `beacon.py` before the burned name came
+        # out of it carries a pre-fix copy there, and a walk that read it
+        # would make the test above assert that this branch ships a
+        # burned indicator -- the most alarming possible false alarm, on
+        # this branch's own central safety claim.
+        with tempfile.TemporaryDirectory() as root:
+            tree = Path(root)
+            (tree / ".gitignore").write_text(".history/\n", encoding="utf-8")
+            (tree / "shipped.md").write_text("ordinary text\n",
+                                             encoding="utf-8")
+            history = tree / ".history"
+            history.mkdir()
+            (history / "beacon.py").write_text(
+                "value = %r\n" % (_BURNED_NAME,), encoding="utf-8")
+
+            # Not a checkout yet: the fallback reads everything, which is
+            # what makes the assertion after `git add` mean something.
+            walked = dict(_shipped_files(root=tree))
+            self.assertIn(".history/beacon.py",
+                          [name.replace(os.sep, "/") for name in walked])
+
+            for argv in (["git", "init", "-q"],
+                         ["git", "add", ".gitignore", "shipped.md"]):
+                done = subprocess.run(argv, cwd=str(tree),
+                                      capture_output=True)
+                self.assertEqual(done.returncode, 0, done.stderr[:200])
+
+            tracked = dict(_shipped_files(root=tree))
+            self.assertEqual(sorted(tracked), [".gitignore", "shipped.md"])
+            for name, text in tracked.items():
+                self.assertNotIn(_BURNED_NAME, text, name)
 
     def test_the_burned_name_and_the_write_ups_are_in_no_shipped_file(self):
         # Past `software/` and past `*.py`: the generator ships comments
