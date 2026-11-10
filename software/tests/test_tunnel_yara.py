@@ -130,6 +130,32 @@ _PROVENANCE_NAMES = (
 
 _MARKERS = _RULE_STRINGS + _PROVENANCE_NAMES
 
+# Phrasings that frame this code as a port of something else, rather than
+# naming it. The three provenance names above are not the only way to tell
+# an analyst the artifact is derived from a published tool: "the original",
+# "the inherited keep-alive" and "the protocol this derives from" all say
+# it without naming anything, and all three shipped in `beacon.py` until
+# this was written.
+#
+# **This exists because a case-sensitive grep is what let three of them
+# through.** A one-time sweep for `the original` missed `The original
+# dropped it` on a capital letter, and two of the three survivors were
+# exception message strings -- which ship in the artifact as data as well
+# as text. So the sweep is a test, it is case-insensitive, and it runs on
+# every commit.
+#
+# Deliberately narrow. `beacon.py` legitimately says "derive" twenty-odd
+# times (X25519 and `EVP_PKEY_derive`), "derived from" about generated
+# names, and "published" about the *Noise specification's* test vectors.
+# None of that frames this code against another tool, so the patterns
+# match the comparative construction and not the bare words.
+_LINEAGE_PATTERNS = (
+    r"\bthe original\b",            # "The original dropped it"
+    r"\binherit",                   # "the inherited keep-alive"
+    r"this\s+(?:\w+\s+){0,3}deriv",  # "the protocol this derives from"
+    r"published\s+original",        # "The published original did a bare"
+)
+
 
 def _has_yara():
     """The engine, as a binary on PATH, following the `node` precedent."""
@@ -163,6 +189,45 @@ def _scan(rules, target):
 def _flat(path):
     """One whitespace-normalised lowercase line, for prose assertions."""
     return " ".join(path.read_text(encoding="utf-8").split()).lower()
+
+
+def _flattened_with_lines(path):
+    """`(one normalised string, [(offset, line number, raw line)])`.
+
+    Prose wraps, so a comparative phrase is routinely split across a
+    line break. The site this was written for had `zero. The` ending one
+    comment line and `original dropped it` starting the next, so a
+    line-by-line search could not see "the original" at all -- which is
+    the second way a sweep for this misses something, after case. Lines
+    are flattened before matching for the same reason `test_docs.py`
+    normalises before asserting on prose: the search is about the
+    phrase, not the column it broke at.
+
+    A leading `#` is stripped so a comment reads as its sentence.
+    Strings are left exactly as they are, because an exception message
+    ships in the artifact as data as well as text and is the thing most
+    worth catching.
+    """
+    chunks, index, offset = [], [], 0
+    for number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), 1):
+        text = line.strip()
+        if text.startswith("#"):
+            text = text[1:].strip()
+        index.append((offset, number, line.strip()))
+        chunks.append(text)
+        offset += len(text) + 1
+    return " ".join(chunks), index
+
+
+def _line_at(index, position):
+    """The `(number, raw line)` whose flattened text covers `position`."""
+    found = index[0]
+    for entry in index:
+        if entry[0] > position:
+            break
+        found = entry
+    return found[1], found[2]
 
 
 def _uncommented(text):
@@ -248,6 +313,36 @@ class TestTheArtifactCarriesNoPublishedMarker(_ArtifactCase):
             "software/c2/beacon.py carries %s, and `api_beacon_gen` ships "
             "this file's comments verbatim into every build"
             % ", ".join(repr(name) for name in offenders))
+
+    def test_beacon_source_frames_this_code_against_no_other_tool(self):
+        """No comparative framing in the one file that is delivered.
+
+        The marker list above catches the three *names*. This catches
+        saying the same thing without them -- "the original", "the
+        inherited keep-alive", "the protocol this derives from" -- which
+        tells a reader of the artifact it is a port of a published tool
+        just as plainly.
+
+        Scoped to `beacon.py` on purpose, and not to the tree. The
+        lineage belongs in `software/c2/tunnel/protocol.py`,
+        `tunnel/server.py`, `docs/TUNNEL.md` and the protocol tests,
+        none of which is ever delivered to a host. This file is.
+        """
+        offenders = []
+        text, index = _flattened_with_lines(_BEACON)
+        for pattern in _LINEAGE_PATTERNS:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                number, line = _line_at(index, match.start())
+                offenders.append("beacon.py:%d: %r in %r"
+                                 % (number, match.group(0), line))
+        offenders.sort()
+        self.assertEqual(
+            offenders, [],
+            "beacon.py frames itself against another tool, and every "
+            "comment and message string in it ships verbatim to a host. "
+            "State the property of this code instead, and put the "
+            "comparison in software/c2/tunnel/protocol.py:\n%s"
+            % "\n".join(offenders))
 
     def test_the_artifact_is_past_the_filesize_bound_both_rules_carry(self):
         # Stated as a number rather than as prose, because it is the

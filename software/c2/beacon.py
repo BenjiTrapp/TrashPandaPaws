@@ -1171,8 +1171,8 @@ def write_frame(sock: socket.socket, payload: bytes) -> None:
     """
     if not payload:
         raise ValueError(
-            "an empty frame is the two bytes 00 00 on the wire, which is "
-            "the inherited keep-alive this protocol exists not to send")
+            "an empty frame is the two bytes 00 00 on the wire; this "
+            "protocol never sends one")
     if len(payload) > MAX_FRAME_LEN:
         raise ValueError(
             "frame payload is %d bytes; a `>H` prefix tops out at %d"
@@ -1192,8 +1192,8 @@ def read_frame(sock: socket.socket) -> bytes:
     (length,) = _BE_UINT16.unpack(prefix)
     if length == 0:
         raise ValueError(
-            "a frame of length 0 is the inherited `00 00` keep-alive; this "
-            "protocol does not send it and does not accept it")
+            "a frame of length 0 is the two bytes 00 00; this protocol "
+            "neither sends nor accepts one")
     return _read_exactly(sock, length, "frame body")
 
 
@@ -1299,8 +1299,8 @@ def decode_message(raw: bytes) -> Tuple[int, dict]:
 
 SOCKS_VERSION = 5
 
-# RFC 1928 reserves byte 3 of both messages and fixes it at zero. The
-# original dropped it; a non-zero one here is a malformed message.
+# RFC 1928 reserves byte 3 of both messages and fixes it at zero, so a
+# non-zero one here is a malformed message.
 _SOCKS_RESERVED = 0
 
 # ver | cmd-or-rep | rsv | atyp, before the address.
