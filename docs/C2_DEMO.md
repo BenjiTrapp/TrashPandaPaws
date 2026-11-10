@@ -80,9 +80,11 @@ The main view after login. All connected agents are listed in the left sidebar w
 
 ### Header Bar
 
-The top bar shows the Raccoon C2 logo with a green server status dot, plus quick-access buttons for Beacon Generator, Listeners, Loot Vault, Server Log, Notifications, and Server Settings. Everything is one click away.
+The top bar shows the Raccoon C2 logo with a green server status dot, plus quick-access buttons for Beacon Generator, Listeners, Tunnel, Loot Vault, Server Log, Notifications, and Server Settings. Everything is one click away.
 
 The **Listeners** panel (📡) lists the processes that terminate the beacon's non-HTTPS transports — SMB, QUIC and DNS — with their state, pid and traffic counters, and starts or stops one. Where it cannot act it says why instead of offering a button that does nothing. See [`docs/LISTENERS.md`](LISTENERS.md).
+
+The **Tunnel** panel (🔌) holds two objects and keeps them visually apart, because their buttons do not mean the same thing. The tunnel **server** is a supervised process: it takes the endpoints' connections and opens one loopback SOCKS port for each, and stopping it is immediate and drops every endpoint at once — the panel says so, with the count, before it acts. An **endpoint** is one agent's own tunnel, so starting or stopping one queues a task that takes effect at that agent's next check-in; until the agent confirms, the row's button reads `pending until ~HH:MM`. Each row carries the fixed SOCKS port and its RFC 1929 credential, the sessions and bytes each way, whether the tunnel is linked to a fleet agent or unlinked, the crypto path — a tunnel on the pure-Python cipher moves roughly 50–200 KB/s, which is otherwise diagnosed as a network fault — and the reason the endpoint refused to start, if it did.
 
 ### Agent Sidebar (left)
 

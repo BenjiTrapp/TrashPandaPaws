@@ -1,0 +1,55 @@
+[Unit]
+Description=Raccoon reverse SOCKS tunnel endpoint
+# The near end of the tunnel: it dials out. It opens no socket, so it
+# requires no .socket unit -- unlike the listeners, which inherit a bound
+# descriptor from one.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Unprivileged. The endpoint connects out and relays to targets; nothing
+# it does needs a privileged port or a capability.
+User=nobody
+Group=nogroup
+WorkingDirectory=/opt/raccoon
+# The client side, on purpose. `python -m software.c2.tunnel` is the
+# server side -- it opens the socket endpoints dial in to and holds every
+# build's PSK -- and a drop-box must never run that one.
+ExecStart=/opt/raccoon/venv/bin/python -m software.c2.tunnel_standalone
+Restart=always
+RestartSec=10
+
+# No secret on this command line: a unit file is world-readable and so is
+# /proc/<pid>/cmdline. The pre-shared key is the whole credential under
+# Noise_NKpsk0, so it is not written here in any form. It comes from
+# RACCOON_TUNNEL_PSK in a file that is not world-readable, the way the DNS
+# listener takes RACCOON_LISTENER_TOKEN. The rest of the configuration --
+# server, port, public key, identity -- is c2.tunnel in
+# /opt/raccoon/configs/raccoon.yaml.
+EnvironmentFile=-/etc/raccoon/tunnel.env
+Environment="PYTHONPATH=/opt/raccoon"
+Environment="PATH=/opt/raccoon/venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/raccoon
+# It parses bytes from the tunnel server and from every target it relays
+# to, so it gets the same small surface the listeners get.
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# The journal, not /dev/null: a refusal naming the field that is wrong is
+# the whole reason this process says anything at all, and on a host the
+# operator owns there is nobody to hide it from.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=raccoon-tunnel
+
+[Install]
+WantedBy=multi-user.target

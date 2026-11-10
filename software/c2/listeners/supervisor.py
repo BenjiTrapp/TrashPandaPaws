@@ -34,17 +34,14 @@ arrangement, and one that held the operator token could task the whole
 fleet the moment it could reach the operator socket.
 """
 
-import json
 import os
 import secrets
-import socket
-import subprocess
 import sys
-import tempfile
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from .child import SupervisedChild, discard, launch, read_control_port
 from .errors import SupervisorError
 from .registry import ListenerSpec
 
@@ -56,9 +53,11 @@ _START_TIMEOUT = 20.0
 # its socket and joins its serving thread, which is quick; a child that
 # needs longer than this is wedged, and leaving it running would hold the
 # port against the next start.
+#
+# Kept here rather than read from `child.py` so that a test can patch the
+# escalation in the module it is testing; `_Child.term_grace` resolves it
+# when it is asked.
 _TERM_GRACE = 5.0
-
-_CONTROL_TIMEOUT = 5.0
 
 
 class Supervisor:
@@ -193,14 +192,14 @@ class Supervisor:
         return entry
 
 
-class _Child:
-    """One listener process, and what is known about how it ended."""
+class _Child(SupervisedChild):
+    """One listener process. Its command line, and nothing else.
 
-    def __init__(self, process, control_port, stderr_path):
-        self.process = process
-        self.control_port = control_port
-        self.stderr_path = stderr_path
-        self.pid = process.pid
+    Spawning, the control-port read, the SIGTERM/SIGKILL escalation and
+    the status question all live in `child.py`, which `tunnel/supervisor.py`
+    shares: two copies of that had already drifted, and in both cases the
+    better version was the one fewer people read.
+    """
 
     @classmethod
     def spawn(cls, spec: ListenerSpec, supervisor: "Supervisor") -> "_Child":
@@ -225,156 +224,23 @@ class _Child:
         environment["PYTHONPATH"] = supervisor.cwd
         environment["PYTHONUNBUFFERED"] = "1"
 
-        # stderr to a file rather than a pipe. A pipe nobody drains fills
-        # its buffer and then blocks the child mid-log, which would look
-        # exactly like a listener that hung.
-        handle = tempfile.NamedTemporaryFile(
-            prefix="raccoon-listener-%s-" % spec.name, suffix=".log",
-            delete=False)
-        process = subprocess.Popen(
-            command, cwd=supervisor.cwd, env=environment,
-            stdout=subprocess.PIPE, stderr=handle, stdin=subprocess.DEVNULL,
-            text=True)
-        handle.close()
-
-        port = cls._read_control_port(process, handle.name, spec)
-        return cls(process, port, handle.name)
+        process, stderr_path = launch(
+            command, supervisor.cwd, environment,
+            "raccoon-listener-%s-" % spec.name)
+        try:
+            port = cls._read_control_port(process, stderr_path, spec)
+        except SupervisorError:
+            discard(stderr_path)
+            raise
+        return cls(process, port, stderr_path, owned=True)
 
     @staticmethod
     def _read_control_port(process, stderr_path, spec):
         """Read the one line the child prints, or raise with its stderr."""
-        line = _read_line_with_timeout(process.stdout, _START_TIMEOUT)
-        if line is None:
-            _kill(process)
-            raise SupervisorError(
-                "listener %r did not come up within %gs. Its output was: %s"
-                % (spec.name, _START_TIMEOUT, _tail(stderr_path)))
-        if not line.startswith("control-port "):
-            _kill(process)
-            raise SupervisorError(
-                "listener %r printed %r instead of its control port. Its "
-                "output was: %s" % (spec.name, line[:120],
-                                    _tail(stderr_path)))
-        value = line.split(" ", 1)[1].strip()
-        if value == "none":
-            return None
-        try:
-            return int(value)
-        except ValueError:
-            _kill(process)
-            raise SupervisorError(
-                "listener %r printed an unreadable control port %r"
-                % (spec.name, value))
+        return read_control_port(process, stderr_path,
+                                 "listener %r" % spec.name, _START_TIMEOUT)
 
-    def alive(self) -> bool:
-        return self.process.poll() is None
-
-    def reap(self) -> None:
-        try:
-            self.process.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            pass
-
-    def death_detail(self) -> str:
-        code = self.process.returncode
-        if code is None:
-            return "exit status unknown"
-        if code < 0:
-            reason = "exited on signal %d" % -code
-        else:
-            reason = "exit code %d" % code
-        tail = _tail(self.stderr_path)
-        return "%s; its output was: %s" % (reason, tail) if tail else reason
-
-    def terminate(self) -> None:
-        """SIGTERM, then SIGKILL, then reap. No child is left behind.
-
-        Reaped rather than merely signalled: an unreaped child is a zombie,
-        its pid still answers `kill -0`, and `status` would keep reporting
-        it as running.
-        """
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=_TERM_GRACE)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                try:
-                    self.process.wait(timeout=_TERM_GRACE)
-                except subprocess.TimeoutExpired:
-                    pass
-        if self.process.stdout is not None:
-            try:
-                self.process.stdout.close()
-            except OSError:
-                pass
-
-    def ask_status(self, token: str) -> Optional[dict]:
-        """One question over the control socket, or None if it did not answer."""
-        if self.control_port is None:
-            return None
-        try:
-            with socket.create_connection(("127.0.0.1", self.control_port),
-                                          timeout=_CONTROL_TIMEOUT) as sock:
-                sock.sendall(json.dumps({"token": token,
-                                         "verb": "status"}).encode() + b"\n")
-                sock.settimeout(_CONTROL_TIMEOUT)
-                raw = b""
-                while b"\n" not in raw and len(raw) < 65536:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    raw += chunk
-        except (OSError, socket.timeout):
-            return None
-        try:
-            answer = json.loads(raw.split(b"\n", 1)[0] or b"{}")
-        except ValueError:
-            return None
-        return answer if isinstance(answer, dict) and "error" not in answer \
-            else None
-
-
-def _read_line_with_timeout(stream, timeout):
-    """Read one line, giving up after `timeout`.
-
-    A blocking readline on a child that never prints would hang the team
-    server, so the read happens on a thread the caller can abandon. The
-    thread is a daemon: if the child is killed its stdout closes and the
-    read returns, and if it is not, the thread costs nothing.
-    """
-    if stream is None:
-        return None
-    out = {}
-
-    def _read():
-        try:
-            out["line"] = stream.readline()
-        except (OSError, ValueError):
-            out["line"] = ""
-
-    worker = threading.Thread(target=_read, daemon=True)
-    worker.start()
-    worker.join(timeout)
-    line = out.get("line")
-    if not line:
-        return None
-    return line.strip()
-
-
-def _tail(path, limit=400):
-    try:
-        with open(path) as handle:
-            text = handle.read()
-    except OSError:
-        return ""
-    text = " ".join(text.split())
-    return text[-limit:]
-
-
-def _kill(process):
-    try:
-        process.kill()
-        process.wait(timeout=5.0)
-    except Exception:
-        pass
+    def term_grace(self):
+        # Resolved here, from this module, so that patching
+        # `_TERM_GRACE` in it reaches the escalation.
+        return _TERM_GRACE

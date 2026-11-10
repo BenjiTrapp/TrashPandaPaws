@@ -344,6 +344,17 @@ RISK_TABLE = {
     "beacon_control": _row(
         TIER_HARD, "beacon_control", "lifecycle",
         "beacon lifecycle control is irreversible without an operator"),
+    # Its own row, because `beacon_control`'s sentence is not true of this
+    # verb. A tunnel is reversible -- `tunnel stop` ends it and the next
+    # `tunnel start` brings it back -- so refusing it under "irreversible
+    # without an operator" told the reader something false about the one
+    # thing the refusal is for. What it is for: the verb opens or closes a
+    # SOCKS route into the target network, which an operator drives from
+    # the panel. The verb stays hard-refused.
+    "tunnel_control": _row(
+        TIER_HARD, "tunnel_control", "lifecycle",
+        "opens or closes a SOCKS route into the target network, which is "
+        "the operator's call and not the agent's"),
     "sleep_too_long": _row(
         TIER_HARD, "sleep_too_long", "lifecycle",
         "a sleep this long takes the beacon out of reach for hours"),
@@ -889,7 +900,24 @@ def _disk_verdict(effective):
 _MALFORMED = _row(TIER_HARD, "malformed", "input",
                   "command is not a string and cannot be classified")
 
+# The beacon verbs the agent may never send. Each is a lifeline: `kill`
+# ends the implant, `unpersist` removes the way back, and `reconfig` can
+# move the callback. `tunnel` is refused too, under its own
+# `tunnel_control` row rather than this one: it reached the agent's
+# vocabulary as a side effect and not as a decision -- the beacon's
+# dispatch table and `executor/beacon.py`'s copy of it are compared for
+# equality by a test, so adding the verb to the implant forced it into
+# the list the executor is prompted with. What it does is open or close a
+# SOCKS route into the target network, which an operator drives from the
+# panel; an agent doing it should be a deliberate feature, and until it is
+# one this fails closed. Unlike the three here it is reversible, which is
+# why it does not borrow their reason. The verb stays in `VERB_HINTS` and
+# is still described to the model, exactly as `kill`, `unpersist` and
+# `reconfig` are.
 _BEACON_HARD_VERBS = ("kill", "unpersist", "reconfig")
+
+# Refused like the three above and for its own stated reason.
+_TUNNEL_VERBS = ("tunnel",)
 _SLEEP_LIMIT_SECONDS = 3600
 
 # The two halves of _RULES are consulted at different points in classify, so
@@ -1017,6 +1045,8 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
 
     if first_token in _BEACON_HARD_VERBS:
         return RISK_TABLE["beacon_control"]
+    if first_token in _TUNNEL_VERBS:
+        return RISK_TABLE["tunnel_control"]
     if first_token == "sleep":
         return _classify_sleep(effective[0])
 

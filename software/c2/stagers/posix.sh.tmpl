@@ -1,0 +1,169 @@
+#!/bin/sh
+set -u
+
+sbase='@@BASE_DIR@@'
+sdrops='@@DROPS@@'
+sparent="${HOME:-}"
+stmp=''
+sstage=''
+
+sclean() {
+    if [ -n "$stmp" ] && [ -d "$stmp" ]; then rm -rf "$stmp"; fi
+    if [ -n "$sstage" ] && [ -d "$sstage" ]; then rm -rf "$sstage"; fi
+    stmp=''
+    sstage=''
+}
+trap sclean EXIT
+trap 'sclean; exit 3' HUP INT TERM
+
+sprobe() {
+    for sname in python3 python; do
+        spath=$(command -v "$sname" 2>/dev/null) || continue
+        [ -n "$spath" ] || continue
+        if "$spath" -c 'import sys;sys.exit(0 if sys.version_info[:2] >= (@@MIN_MAJOR@@, @@MIN_MINOR@@) else 1)' >/dev/null 2>&1; then
+            printf '%s' "$spath"
+            return 0
+        fi
+    done
+    return 1
+}
+
+sfound=$(sprobe) || sfound=''
+if [ -n "$sfound" ]; then
+    python3() { "$sfound" "$@"; }
+    python() { "$sfound" "$@"; }
+    eval '@@ONELINER@@'
+    exit $?
+fi
+
+if [ -z "$sdrops" ]; then
+    exit 2
+fi
+
+if [ -z "$sparent" ]; then
+    echo 'no home directory here: refusing' >&2
+    exit 4
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+    shash=sha256sum
+elif command -v shasum >/dev/null 2>&1; then
+    shash=shasum
+elif command -v openssl >/dev/null 2>&1; then
+    shash=openssl
+else
+    echo 'no digest tool here: refusing' >&2
+    exit 4
+fi
+
+if command -v curl >/dev/null 2>&1; then
+    sget=curl
+elif command -v wget >/dev/null 2>&1; then
+    sget=wget
+else
+    exit 4
+fi
+
+if command -v unzip >/dev/null 2>&1; then
+    szip=unzip
+elif command -v tar >/dev/null 2>&1; then
+    szip=tar
+else
+    exit 4
+fi
+
+ssum() {
+    ssv=''
+    case "$shash" in
+        sha256sum) ssv=$(sha256sum "$1" 2>/dev/null | cut -d ' ' -f 1) ;;
+        shasum) ssv=$(shasum -a 256 "$1" 2>/dev/null | cut -d ' ' -f 1) ;;
+        openssl) ssv=$(openssl dgst -sha256 "$1" 2>/dev/null | sed 's/^.*= *//') ;;
+    esac
+    ssv=$(printf '%s' "$ssv" | tr 'ABCDEF' 'abcdef')
+    [ ${#ssv} -eq 64 ] || return 1
+    case "$ssv" in
+        *[!0-9a-f]*) return 1 ;;
+    esac
+    printf '%s' "$ssv"
+}
+
+sfetch() {
+    case "$sget" in
+        curl) curl -fsSL --max-time 600 -o "$2" -- "$1" >/dev/null 2>&1 ;;
+        wget) wget -q -T 600 -O "$2" -- "$1" >/dev/null 2>&1 ;;
+    esac
+}
+
+sunpack() {
+    case "$szip" in
+        unzip) unzip -q -o "$1" -d "$2" >/dev/null 2>&1 ;;
+        tar) tar -x -f "$1" -C "$2" >/dev/null 2>&1 ;;
+    esac
+}
+
+stmp=$(mktemp -d 2>/dev/null) || stmp=''
+if [ -z "$stmp" ]; then
+    stmp=$(mktemp -d "${TMPDIR:-/tmp}/.sXXXXXX" 2>/dev/null) || stmp=''
+fi
+if [ -z "$stmp" ]; then
+    stmp="${TMPDIR:-/tmp}/.s$$"
+    mkdir -m 700 "$stmp" 2>/dev/null || exit 4
+fi
+
+sok=0
+while read -r surl ssha; do
+    [ -n "$surl" ] || continue
+    rm -f "$stmp/b"
+    sfetch "$surl" "$stmp/b" || continue
+    [ -s "$stmp/b" ] || continue
+    sgot=$(ssum "$stmp/b") || sgot=''
+    if [ -z "$sgot" ]; then
+        echo 'this file could not be hashed: refused' >&2
+        rm -f "$stmp/b"
+        continue
+    fi
+    if [ "$sgot" != "$ssha" ]; then
+        echo 'digest does not match the pin: refused' >&2
+        rm -f "$stmp/b"
+        continue
+    fi
+    sok=1
+    break
+done <<SDROPS
+$sdrops
+SDROPS
+
+if [ "$sok" != 1 ]; then
+    echo 'no location answered with what was pinned' >&2
+    exit 3
+fi
+
+mkdir -p "$sparent" 2>/dev/null || exit 5
+sstage="$sparent/.$sbase.s$$"
+rm -rf "$sstage"
+mkdir "$sstage" 2>/dev/null || { sstage=''; exit 5; }
+sunpack "$stmp/b" "$sstage" || exit 5
+[ -d "$sstage/$sbase" ] || exit 5
+
+sexe=''
+for sname in python3 python pythonw; do
+    if [ -f "$sstage/$sbase/$sname" ]; then
+        sexe="$sname"
+        break
+    fi
+done
+[ -n "$sexe" ] || exit 5
+chmod -R u+rwX "$sstage/$sbase" 2>/dev/null
+chmod u+x "$sstage/$sbase/$sexe" || exit 5
+
+rm -rf "$sparent/$sbase"
+mv "$sstage/$sbase" "$sparent/$sbase" || exit 5
+rm -rf "$sstage"
+sstage=''
+
+if command -v setsid >/dev/null 2>&1; then
+    setsid "$sparent/$sbase/$sexe" </dev/null >/dev/null 2>&1 &
+else
+    "$sparent/$sbase/$sexe" </dev/null >/dev/null 2>&1 &
+fi
+exit 0

