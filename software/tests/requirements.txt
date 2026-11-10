@@ -36,7 +36,8 @@
 # test_beacon_caps, test_c2_agent_gui, test_c2_agent_support, test_agent_e2e)
 # import it. Flask's test client and routing are the thing under test;
 # there is no stand-in worth writing. No floor, for the reason given in
-# tools/requirements.txt: none can be argued from the code.
+# tools/requirements.txt: none can be argued from the code, and the suite has
+# only ever run against Flask 3.1.3.
 flask
 
 # Imported directly, not only through Flask: test_c2_hardening.py and
@@ -51,11 +52,16 @@ werkzeug
 
 # server.py's AES-GCM message layer, and test_c2_hardening.py's checks that
 # tampered ciphertext is refused (InvalidTag). Hand-rolling authenticated
-# encryption is the one thing a security tool must not do. Same package and
-# floor as software/requirements.txt, so the tests exercise what the C2 runs.
+# encryption is the one thing a security tool must not do. The floor is
+# software/requirements.txt's, copied so the two declarations agree
+# (test_requirements_floors.py fails if they stop). It was not chosen or tested
+# here: the suite has run against cryptography 50.0.2 only, not at 41.0.0, and
+# the C2's own environment installs it unpinned.
 cryptography>=41.0.0
 
 # test_sniffer.py builds Ether/IP/TCP/UDP/DNS packets with scapy to feed the
-# sniffer, whose protocol parsing is the thing under test. Floor as in
-# software/requirements.txt.
+# sniffer, whose protocol parsing is the thing under test. The floor is
+# software/requirements.txt's, copied and kept in step by
+# test_requirements_floors.py; the suite has run against scapy 2.7.0 and 2.8.0,
+# not at 2.5.0.
 scapy>=2.5.0

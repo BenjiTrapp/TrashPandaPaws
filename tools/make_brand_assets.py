@@ -14,8 +14,9 @@ the best one available is the face in the wallpaper.
 **Nothing here is redrawn or invented.** The master is a crop at the
 wallpaper's own resolution -- the same pixels, moved -- and every smaller
 size is an exact 2x2 average of the one above it, halving 256 to 16. That
-averaging is written out here rather than handed to a library so the
-property is provable: `tools/` has no image dependency, and
+averaging is written out here rather than handed to an image library so
+the property is provable: Pillow, below, decodes the source and does the
+one upscale and takes no part in the chain, and
 `software/tests/test_brand_assets.py` re-derives the chain with its own
 PNG reader and compares.
 

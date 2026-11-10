@@ -15,8 +15,8 @@ Steps run in the order given on the command line. `--clip` takes the final
 shot of one element instead of the viewport, which is how a panel is
 captured legibly without cropping a larger image.
 
-Needs nothing that is not already here: Chrome is on the machine, and
-aiohttp is the agent's own dependency. The GUI authenticates itself --
+Needs Chrome, which is on the machine, and aiohttp, which is the agent's
+own dependency and is declared again in tools/requirements.txt. The GUI authenticates itself --
 the server injects the operator token into the page it serves -- so there
 is no credential to pass in and none to leak into a file.
 """

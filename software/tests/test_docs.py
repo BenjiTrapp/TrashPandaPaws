@@ -541,7 +541,9 @@ def _file_browser_names_reach_onclick_strings():
 
 def _nothing_is_pinned():
     reqs = [_read("software", "requirements.txt"),
-            _read("software", "agent", "requirements.txt")]
+            _read("software", "agent", "requirements.txt"),
+            _read("tools", "requirements.txt"),
+            _read("software", "tests", "requirements.txt")]
     image = _read("software", "c2", "Dockerfile")
     pip_block = image.split("RUN pip install", 1)[1].split("\n\n", 1)[0]
     return (not any("==" in line for text in reqs

@@ -20,8 +20,8 @@ everything else, rather than drawn onto the PNG afterwards -- which would
 need a font file and would come out at a different weight from the UI
 around it.
 
-Needs nothing that is not already here: Chrome is on the machine and
-aiohttp is the agent's own dependency. The GUI authenticates itself.
+Needs Chrome, which is on the machine, and aiohttp, which is the agent's
+own dependency and is declared again in tools/requirements.txt. The GUI authenticates itself.
 """
 
 import argparse
