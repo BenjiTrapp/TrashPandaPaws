@@ -226,7 +226,7 @@ Windows embeddable distribution ships a real `libcrypto`.
 
 ## Staging onto a host with no Python
 
-The ordinary artifact is `python3 -c '…'`, and a one-liner cannot install
+The ordinary artifact is `python3 -c "…"`, and a one-liner cannot install
 Python. The second artifact shape from the same generator is a **stager**
 — a POSIX shell script and a PowerShell script — which:
 
@@ -240,6 +240,18 @@ Python. The second artifact shape from the same generator is a **stager**
 
 "Optional" is a runtime property, not a build flag: it brings something
 only when it finds nothing.
+
+**On Windows the stager is the route, and the inline one-liner is not.**
+At roughly 115 KB the generated `python -c "…"` exceeds both the 8191
+character `cmd.exe` command line and the 32767 character `CreateProcess`
+limit, so it cannot be delivered on that platform at any quoting. It is
+still emitted, because it is the text the Windows stager runs through
+`Invoke-Expression` when its probe finds a Python — where there is no
+length limit — and because an operator may paste it into something that
+does not go through `cmd.exe`. Both one-liners are therefore
+double-quoted with single quotes inside, and the stage carries no `$`,
+backtick, backslash or `"`, so one text survives `sh -c`, `cmd.exe` and
+`Invoke-Expression` alike.
 
 ### The dead-drop list, and the hash that has no override
 

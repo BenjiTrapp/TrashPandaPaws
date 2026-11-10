@@ -61,6 +61,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -412,6 +413,38 @@ class SpawnTestCase(unittest.TestCase):
 # ── The generator: an artifact that can hand over its own source ──
 
 
+def _argv_w(command):
+    """`CommandLineToArgvW` over text with no backslash in it.
+
+    The two rules that decide whether a one-liner arrives intact on
+    Windows: a double quote toggles quoting and is itself removed, and
+    whitespace outside quotes separates arguments. `cmd.exe` and
+    PowerShell's argument-mode parser both behave this way, which is why
+    an inner double quote closes the outer one and the segments are
+    concatenated with their quotes gone.
+
+    Backslash handling is deliberately left out rather than approximated:
+    neither one-liner may contain one, and the test above is what holds
+    that.
+    """
+    assert "\\" not in command, "this splitter does not model backslashes"
+    args, current, quoted, in_token = [], [], False, False
+    for char in command:
+        if char == '"':
+            quoted = not quoted
+            in_token = True
+        elif char in " \t" and not quoted:
+            if in_token:
+                args.append("".join(current))
+                current, in_token = [], False
+        else:
+            current.append(char)
+            in_token = True
+    if in_token:
+        args.append("".join(current))
+    return args
+
+
 class TestGeneratedArtifactKeepsItsSource(unittest.TestCase):
     """The one-liner binds the source it decompressed to `_src`.
 
@@ -447,10 +480,10 @@ class TestGeneratedArtifactKeepsItsSource(unittest.TestCase):
 
     @staticmethod
     def artifact(body):
-        """The Python inside `python3 -c '...'`, without the quoting."""
-        prefix = "python3 -c '"
+        """The Python inside `python3 -c "..."`, without the quoting."""
+        prefix = 'python3 -c "'
         one = body["oneliner_unix"]
-        assert one.startswith(prefix) and one.endswith("'"), one[:80]
+        assert one.startswith(prefix) and one.endswith('"'), one[:80]
         return one[len(prefix):-1]
 
     @staticmethod
@@ -493,6 +526,74 @@ class TestGeneratedArtifactKeepsItsSource(unittest.TestCase):
                          "layer and not the source")
 
     # ── tests ──
+
+    def test_the_one_liners_reach_a_minus_c_through_three_parsers(self):
+        """One text that `sh -c`, `cmd.exe` and `Invoke-Expression` agree on.
+
+        The defect this holds: the stage used to carry
+        `globals()["_src"]` and `b64decode("...")` while the Windows
+        one-liner wrapped it in double quotes, so the inner quotes closed
+        the outer ones. `CommandLineToArgvW` and PowerShell's
+        argument-mode parser both concatenate the segments and strip the
+        quotes, which handed `-c` an unquoted `globals()[_src]=...` and a
+        `NameError`. The Windows stager is the first Windows consumer for
+        which length is not the blocker, so this is what its
+        probe-found-a-Python path runs.
+        """
+        body = self.generate(1)
+        for key, program in (("oneliner_unix", "python3"),
+                             ("oneliner_win", "python")):
+            with self.subTest(key=key):
+                one = body[key]
+                prefix = program + ' -c "'
+                self.assertTrue(one.startswith(prefix) and one.endswith('"'),
+                                "%s is not a double-quoted -c: %s"
+                                % (key, one[:80]))
+                stage = one[len(prefix):-1]
+                # What makes the double-quoted form safe in all three
+                # languages. base64's alphabet has none of these and
+                # neither does the alias, so this is a property the
+                # emitter can keep rather than escape around. Asserted
+                # on the set rather than with `assertNotIn`, which would
+                # print the whole 115 KB stage on failure.
+                hostile = sorted(set(stage) & set('"$`\\\n'))
+                self.assertEqual(hostile, [],
+                                 "%s carries %r, which one of the three "
+                                 "parsers would act on" % (key, hostile))
+                for what, argv in (("a POSIX shell", shlex.split(one)),
+                                   ("CommandLineToArgvW", _argv_w(one))):
+                    # `assertTrue`, not `assertEqual`: the stage is 115 KB
+                    # and a diff of it is not a readable failure.
+                    self.assertTrue(
+                        argv == [program, "-c", stage],
+                        "%s does not hand %s over as one -c argument: %d "
+                        "arguments, the last of them %d characters against "
+                        "the stage's %d"
+                        % (what, key, len(argv), len(argv[-1]), len(stage)))
+
+    def test_a_real_shell_hands_the_stage_over_as_one_argument(self):
+        # The simulation above, done for real on this platform: the
+        # one-liner with its program replaced by a script that writes its
+        # arguments out, run through `sh -c` exactly as a C2 task would
+        # deliver it.
+        body = self.generate(1)
+        one = body["oneliner_unix"]
+        stage = one[len('python3 -c "'):-1]
+        with tempfile.TemporaryDirectory() as root:
+            echo = Path(root) / "argv"
+            out = Path(root) / "out"
+            echo.write_text('#!/bin/sh\nprintf "%%s" "$2" > "%s"\n' % (out,),
+                            encoding="utf-8")
+            echo.chmod(0o700)
+            command = str(echo) + one[len("python3"):]
+            result = subprocess.run(["sh", "-c", command],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr[:400])
+            passed = out.read_text(encoding="utf-8")
+            self.assertTrue(passed == stage,
+                            "`sh -c` did not pass the stage to -c intact: %d "
+                            "characters arrived against the stage's %d"
+                            % (len(passed), len(stage)))
 
     def test_generated_artifact_exposes_its_own_source_as__src(self):
         body = self.generate(3)
@@ -582,7 +683,7 @@ class TestGeneratedArtifactKeepsItsSource(unittest.TestCase):
                          "function")
         self.assertEqual(len(re.findall(r"def _obfuscate_layer\(", text)), 1,
                          "a route carries a layer builder of its own again")
-        self.assertEqual(text.count('globals()["_src"]=zlib'), 1,
+        self.assertEqual(text.count("globals()['_src']=zlib"), 1,
                          "the emitted wrapper is written in more than one "
                          "place")
         for route in ("api_beacon_gen", "api_beacon_gist"):

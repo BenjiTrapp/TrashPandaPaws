@@ -74,8 +74,8 @@ _AUTH = {"Authorization": "Bearer " + _TOKEN}
 # fails this file rather than passing against something it never read.
 _LAYER = re.compile(
     r'^import base64 as (\w+),zlib;'
-    r'globals\(\)\["_src"\]=zlib\.decompress\('
-    r'\1\.b64decode\("([A-Za-z0-9+/=]*)"\)\);'
+    r"globals\(\)\['_src'\]=zlib\.decompress\("
+    r"\1\.b64decode\('([A-Za-z0-9+/=]*)'\)\);"
     r'exec\(_src\)$')
 
 # The base64 JSON blob `_beacon_config_block` has the bootstrap decode.
@@ -184,9 +184,9 @@ class _GeneratorCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.data[:400])
         body = response.get_json()
         if route == "gen":
-            prefix = "python3 -c '"
+            prefix = 'python3 -c "'
             one = body["oneliner_unix"]
-            self.assertTrue(one.startswith(prefix) and one.endswith("'"),
+            self.assertTrue(one.startswith(prefix) and one.endswith('"'),
                             one[:80])
             stage = one[len(prefix):-1]
         else:
@@ -849,7 +849,7 @@ class TestTheTwoPathsAgree(unittest.TestCase):
                              "port": 8446}},
             headers=_AUTH)
         self.assertEqual(response.status_code, 200, response.data[:400])
-        prefix = "python3 -c '"
+        prefix = 'python3 -c "'
         stage = response.get_json()["oneliner_unix"][len(prefix):-1]
         baked = _baked_config(_innermost(stage))["tunnel"]
 

