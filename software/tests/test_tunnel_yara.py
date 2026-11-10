@@ -566,6 +566,43 @@ class TestTheTunnelDocumentation(unittest.TestCase):
         self.present("decrypts and re-encrypts every relayed byte",
                      "why the server's path matters to throughput too")
 
+    def test_the_doc_separates_the_stable_port_from_the_rotating_password(
+            self):
+        # They sat one below the other -- "stable across restarts" about
+        # the port, "held in memory, never written to disk" about the
+        # password -- and read as one line about one credential.
+        # `_Fronts.reconcile` mints a new password per identity on every
+        # tunnel-server start, so after a restart the port is the same
+        # and the password is not.
+        self.present("the port is stable across restarts and the password "
+                     "is not",
+                     "the two facts, said apart")
+        self.present("re-read the password off the row",
+                     "what to do after a restart")
+
+    def test_the_doc_makes_persist_a_step_in_the_staging_sequence(self):
+        # A staged host's only Python is the one the stager brought,
+        # under a generated `base_dir`, so "staged, not persisted, then
+        # rebooted" leaves nothing running and nothing to find.
+        self.present("task `persist` to the agent as soon as it checks in",
+                     "the step, in the sequence rather than in a note")
+        self.present("leaves nothing running",
+                     "what staging without it costs")
+
+    def test_the_doc_shows_a_request_that_asks_for_a_tunnel_and_drops(self):
+        # `runBeaconGen` posts neither key and renders neither stager, so
+        # the only way to either today is a request by hand. The
+        # documentation told the operator to "ask for a tunnel in the
+        # generation request" and never showed one.
+        self.present("api/server/beacon-gen", "the route")
+        self.present("the Beacon Gen form cannot do yet",
+                     "that the panel cannot ask for this")
+        for key in ('"tunnel"', '"drops"', '"enabled": true',
+                    "stager_nix", "stager_win"):
+            self.present(key, "part of the request or its answer")
+        for field in ("base_dir", "payload_name", "gate"):
+            self.present(field, "a response field the bundle builder needs")
+
     def test_the_doc_says_where_the_crypto_override_actually_lives(self):
         # The one section an operator reaches in a failure state. A
         # generated build carries `allow_slow_crypto` baked in and reads

