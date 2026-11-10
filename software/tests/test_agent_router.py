@@ -159,7 +159,7 @@ class TestGating(IsolatedAsyncioTestCase):
         # a build where the agent could run `tunnel start 10.0.1.5`.
         # Read off the risk table rather than quoted, so a reworded
         # reason does not need editing here.
-        expected = safety.RISK_TABLE["beacon_control"].reason
+        expected = safety.RISK_TABLE["tunnel_control"].reason
         for command in ("tunnel start", "tunnel stop"):
             with self.subTest(command=command):
                 r, c2 = _router()

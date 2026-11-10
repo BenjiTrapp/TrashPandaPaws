@@ -56,6 +56,23 @@ class TestTierOne(unittest.TestCase):
                     "sudo tunnel start"):
             self.assertEqual(self._c(cmd).tier, safety.TIER_HARD, cmd)
 
+    def test_the_tunnel_verb_is_refused_for_a_reason_that_is_true_of_it(self):
+        # It was refused under `beacon_control`, whose sentence is
+        # "beacon lifecycle control is irreversible without an operator".
+        # A tunnel is reversible -- `tunnel stop` ends it and the next
+        # `tunnel start` brings it back -- so the refusal an operator or
+        # a model reads was false about the verb it refused. Its own row,
+        # same tier.
+        row = self._c("tunnel start")
+        self.assertEqual(row.action_key, "tunnel_control")
+        self.assertEqual(row.tier, safety.TIER_HARD)
+        self.assertNotEqual(row.reason,
+                            safety.RISK_TABLE["beacon_control"].reason)
+        self.assertNotIn("irreversible", row.reason)
+        # And the three verbs that *are* irreversible keep theirs.
+        for cmd in ("kill", "unpersist auto", "reconfig"):
+            self.assertEqual(self._c(cmd).action_key, "beacon_control", cmd)
+
     def test_long_sleep_is_hard_blocked(self):
         self.assertEqual(self._c("sleep 7200 20").tier, safety.TIER_HARD)
         self.assertNotEqual(self._c("sleep 15 20").tier, safety.TIER_HARD)

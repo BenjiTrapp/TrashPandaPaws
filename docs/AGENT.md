@@ -404,13 +404,15 @@ recorded it:      yes, as a finding
 
 ### Never permitted, in any mode
 
-Eight actions are refused outright and cannot be approved, by you or by the
-expected-value check. They are irreversible and, from a drop-box, not
-correctable:
+Nine actions are refused outright and cannot be approved, by you or by the
+expected-value check. Eight are irreversible and, from a drop-box, not
+correctable; the ninth, `tunnel_control`, is reversible and refused
+because it is the operator's call:
 
 | Key | Why |
 |---|---|
 | `beacon_control` | beacon lifecycle control is irreversible without an operator |
+| `tunnel_control` | opens or closes a SOCKS route into the target network, which is the operator's call and not the agent's |
 | `sleep_too_long` | a sleep this long takes the beacon out of reach for hours |
 | `dropbox_lifeline` | touches the bridge, NAC bypass, cover identity or tunnel |
 | `power_off` | reboot or shutdown of the host carrying the beacon |
