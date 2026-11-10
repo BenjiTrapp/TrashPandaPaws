@@ -1061,7 +1061,10 @@ more.
   file written before that change. The fix is to attach handlers in
   JavaScript instead of building them as strings. That is a GUI refactor,
   which is why it was scoped out. Read from the code, not run in a browser.
-- **Nothing is pinned.** Both requirements files use lower bounds only. The
+- **Nothing is pinned.** All four requirements files
+  (`software/requirements.txt`, `software/agent/requirements.txt`,
+  `tools/requirements.txt` and `software/tests/requirements.txt`) use lower
+  bounds or none at all, and no file pins an exact version. The
   server image installs six packages with no version constraint at all and
   builds NetExec, Responder and RelayKing from moving git branches with no
   tag. A rebuild a month later is a different image.

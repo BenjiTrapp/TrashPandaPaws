@@ -14,8 +14,9 @@ the best one available is the face in the wallpaper.
 **Nothing here is redrawn or invented.** The master is a crop at the
 wallpaper's own resolution -- the same pixels, moved -- and every smaller
 size is an exact 2x2 average of the one above it, halving 256 to 16. That
-averaging is written out here rather than handed to a library so the
-property is provable: `tools/` has no image dependency, and
+averaging is written out here rather than handed to an image library so
+the property is provable: Pillow, below, decodes the source and does the
+one upscale and takes no part in the chain, and
 `software/tests/test_brand_assets.py` re-derives the chain with its own
 PNG reader and compares.
 
@@ -25,9 +26,9 @@ such, and it carries no detail the 256 does not: 256x256 is all there is.
 
 Pillow is used for two things only -- decoding the source JPEG, which
 cannot be done in the standard library, and that upscale. It is a
-development dependency and deliberately not declared in either
-requirements file: this script generates committed assets and nothing at
-runtime needs it.
+development dependency, declared in tools/requirements.txt and
+deliberately in neither of the runtime requirements files: this script
+generates committed assets and nothing at runtime needs it.
 """
 
 import argparse
@@ -72,7 +73,8 @@ def main(argv=None):
         from PIL import Image
     except ImportError:
         print("This script needs Pillow, which is a development dependency "
-              "and is deliberately not in either requirements file:\n"
+              "declared in tools/requirements.txt, and deliberately in "
+              "neither runtime requirements file:\n"
               "    python3 -m pip install --user Pillow\n"
               "Nothing at runtime needs it; the assets it writes are "
               "committed.", file=sys.stderr)

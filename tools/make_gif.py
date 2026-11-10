@@ -20,9 +20,9 @@ afterwards. One frame per screen, any hold time, no repeats.
 The manifest is one line per frame, `name.png <seconds>`, resolved next to
 the manifest itself -- which is what the capture step writes out.
 
-Needs nothing that is not already here: ffmpeg is on the machine and
-Pillow comes with the capture tooling. gifsicle would optimise further and
-is deliberately not required.
+Needs ffmpeg, which is on the machine, and Pillow, which is declared in
+tools/requirements.txt. gifsicle would optimise further and is
+deliberately not required.
 """
 
 import argparse

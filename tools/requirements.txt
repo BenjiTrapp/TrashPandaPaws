@@ -1,0 +1,49 @@
+# Dependencies of the operator-side tooling in this directory only.
+#
+# Deliberately separate from software/requirements.txt, which is the C2's and
+# must not grow: the project's hard promise is that the existing C2 and beacon
+# keep working with nothing new installed. Nothing here runs on the drop box or
+# in the C2 or agent images; these scripts make the committed screenshots, GIFs
+# and brand assets on the operator's own machine, so what they need is their
+# own business.
+#
+#     python3 -m venv tools/.venv && tools/.venv/bin/pip install -r tools/requirements.txt
+#
+# Pillow has no floor, on purpose: the code uses only Image.open, Image.new,
+# resize, paste, crop and Image.LANCZOS, which are long-standing, and no
+# floor can be argued from that. It was only ever run against Pillow 11.3.0;
+# nothing was tested at an old release, and a floor nobody tested is worse
+# than none. `pip` picks the newest release that supports the interpreter.
+#
+# Not listed, and why: tools/demo_env.py starts the real C2 in-process, so it
+# needs Flask, Werkzeug and `cryptography` -- but those are the C2's, installed
+# by software/c2/start_server.sh into software/c2/.venv, and declaring the C2 a
+# second time here would give it a second place to drift. Run demo_env.py with
+# that interpreter. Checked once, 2026-11-10: `software/c2/.venv/bin/python
+# tools/demo_env.py --port 18510 --operator-port 18511 --token demo-token` came
+# up, printed the C2 and beacon addresses, and a beacon registered and answered
+# sync/track/status over https for the 25 s it was left running, then was
+# killed by `timeout`. Not checked: that venv has no PyYAML or requests, and
+# beacon.py imports yaml lazily (`_configured_capture_dir`), so a run that
+# reaches that path may fail with ModuleNotFoundError. Nothing here tests it.
+
+# make_gif.py and trim_browser_chrome.py decode, resize and crop PNG
+# screenshots; make_brand_assets.py decodes the source JPEG and does one
+# Lanczos upscale. Writing a JPEG decoder is not a small job and a resampling
+# filter written by hand would be a different filter that happened to look
+# similar, so the committed assets would stop being reproducible from the
+# source. Before this file Pillow was declared nowhere: the scripts printed a
+# hint, and make_gif.py's docstring said it "comes with the capture tooling",
+# which was not true of anything in the repository.
+Pillow
+
+# capture_gui.py and capture_sequence.py talk to headless Chrome over the
+# DevTools Protocol, which is a WebSocket. Hand-rolling WebSocket framing
+# (masking, fragmentation, ping/pong) to avoid one dependency is the kind of
+# code that works until the first large frame. Same package, same reason, as
+# in software/agent/requirements.txt, listed again so this file stands alone,
+# with the agent's floor. That the two files carry the same floor is checked,
+# not assumed: software/tests/test_requirements_floors.py fails if they differ.
+# The floor is the agent's, copied, not chosen or tested here: the scripts have
+# only run against aiohttp 3.13.5.
+aiohttp>=3.9.0
