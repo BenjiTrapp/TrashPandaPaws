@@ -1,0 +1,61 @@
+# Dependencies of the test suite only.
+#
+# Deliberately separate from software/requirements.txt, which is the C2's and
+# must not grow: the project's hard promise is that the existing C2 and beacon
+# keep working with nothing new installed. This file provisions the interpreter
+# the suite runs in (software/.venv, Python 3.9):
+#
+#     software/.venv/bin/pip install -r software/tests/requirements.txt
+#     software/.venv/bin/python -m unittest discover -s software/tests -t .
+#
+# It is not "software/requirements.txt plus a few", for a reason that matters:
+# that file carries pyaudio, which compiles against PortAudio headers and so
+# fails to install on a machine without them, and numpy, and no test imports
+# either. A test environment that cannot be built without a system library
+# nothing exercises is not one people will build.
+#
+# Two things a reader would otherwise get wrong. First, the suite imports the
+# real C2 server in-process rather than faking it, which is why Flask and
+# Werkzeug are here although software/requirements.txt never mentions them (the
+# C2 gets Flask from the pip line in software/c2/start_server.sh and the
+# Dockerfile). Second, a missing package here is not reported by name: a test
+# module that cannot import fails as one "_FailedTest" and takes every test in
+# it down, so 26 reported errors hid 968 tests that never ran. If the
+# count of tests drops, check this file before blaming the code.
+
+# The agent's own set (aiohttp, croniter, requests, pyyaml): the agent tests
+# import all four. Included, not copied, so there is one place to change them.
+-r ../agent/requirements.txt
+
+# The operator tooling's set (Pillow, aiohttp): test_make_gif.py,
+# test_trim_browser_chrome.py and test_capture_sequence.py run those scripts.
+-r ../../tools/requirements.txt
+
+# server.py is a Flask application, and ten test modules (test_c2_server,
+# test_c2_hardening, test_listeners, test_docs, test_status_quo, test_beacon,
+# test_beacon_caps, test_c2_agent_gui, test_c2_agent_support, test_agent_e2e)
+# import it. Flask's test client and routing are the thing under test;
+# there is no stand-in worth writing. No floor, for the reason given in
+# tools/requirements.txt: none can be argued from the code.
+flask
+
+# Imported directly, not only through Flask: test_c2_hardening.py and
+# test_listeners.py use werkzeug.serving.make_server to bind real operator and
+# agent listeners on ephemeral ports, because what they check (which listener
+# answers which request, what arrives over an actual socket) cannot be seen
+# through Flask's in-process test client. A direct import is declared directly
+# rather than left to arrive by accident. server.py and tools/demo_env.py
+# import it too, so this is the C2's dependency, not a test-only one; it is
+# declared here because software/requirements.txt may not grow.
+werkzeug
+
+# server.py's AES-GCM message layer, and test_c2_hardening.py's checks that
+# tampered ciphertext is refused (InvalidTag). Hand-rolling authenticated
+# encryption is the one thing a security tool must not do. Same package and
+# floor as software/requirements.txt, so the tests exercise what the C2 runs.
+cryptography>=41.0.0
+
+# test_sniffer.py builds Ether/IP/TCP/UDP/DNS packets with scapy to feed the
+# sniffer, whose protocol parsing is the thing under test. Floor as in
+# software/requirements.txt.
+scapy>=2.5.0

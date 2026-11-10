@@ -1,0 +1,37 @@
+# Dependencies of the operator-side tooling in this directory only.
+#
+# Deliberately separate from software/requirements.txt, which is the C2's and
+# must not grow: the project's hard promise is that the existing C2 and beacon
+# keep working with nothing new installed. Nothing here runs on the drop box or
+# in the C2 or agent images; these scripts make the committed screenshots, GIFs
+# and brand assets on the operator's own machine, so what they need is their
+# own business.
+#
+#     python3 -m venv tools/.venv && tools/.venv/bin/pip install -r tools/requirements.txt
+#
+# Pillow has no floor, on purpose: nothing in the code needs a specific
+# version (Image.LANCZOS, Image.open, resize and paste exist in every release
+# this could meet), and a floor nobody can argue is worse than none. `pip`
+# picks the newest release that supports the interpreter in use.
+#
+# Not listed, and why: tools/demo_env.py starts the real C2 in-process, so it
+# needs Flask, Werkzeug and `cryptography` -- but those are the C2's, installed
+# by software/c2/start_server.sh into software/c2/.venv. Run demo_env.py with
+# that interpreter instead of declaring the C2 a second time here.
+
+# make_gif.py and trim_browser_chrome.py decode, resize and crop PNG
+# screenshots; make_brand_assets.py decodes the source JPEG and does one
+# Lanczos upscale. Writing a JPEG decoder is not a small job and a resampling
+# filter written by hand would be a different filter that happened to look
+# similar, so the committed assets would stop being reproducible from the
+# source. Before this file Pillow was declared nowhere: the scripts printed a
+# hint, and make_gif.py's docstring claimed it "comes with the capture tooling".
+Pillow
+
+# capture_gui.py and capture_sequence.py talk to headless Chrome over the
+# DevTools Protocol, which is a WebSocket. Hand-rolling WebSocket framing
+# (masking, fragmentation, ping/pong) to avoid one dependency is the kind of
+# code that works until the first large frame. Same package, same reason, as
+# in software/agent/requirements.txt, listed again so this file stands alone,
+# with the agent's floor so the two cannot disagree.
+aiohttp>=3.9.0

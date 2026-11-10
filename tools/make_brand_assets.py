@@ -25,9 +25,9 @@ such, and it carries no detail the 256 does not: 256x256 is all there is.
 
 Pillow is used for two things only -- decoding the source JPEG, which
 cannot be done in the standard library, and that upscale. It is a
-development dependency and deliberately not declared in either
-requirements file: this script generates committed assets and nothing at
-runtime needs it.
+development dependency, declared in tools/requirements.txt and
+deliberately in neither of the runtime requirements files: this script
+generates committed assets and nothing at runtime needs it.
 """
 
 import argparse
@@ -72,7 +72,8 @@ def main(argv=None):
         from PIL import Image
     except ImportError:
         print("This script needs Pillow, which is a development dependency "
-              "and is deliberately not in either requirements file:\n"
+              "declared in tools/requirements.txt, and deliberately in "
+              "neither runtime requirements file:\n"
               "    python3 -m pip install --user Pillow\n"
               "Nothing at runtime needs it; the assets it writes are "
               "committed.", file=sys.stderr)
