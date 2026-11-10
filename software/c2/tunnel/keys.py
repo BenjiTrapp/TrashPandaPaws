@@ -68,6 +68,7 @@ import hmac
 import json
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from software.c2.beacon import _X25519_BASEPOINT, _x25519, _x25519_keypair
@@ -79,6 +80,21 @@ _KEY_LEN = 32
 # refuses any other length, and the generator reads this rather than
 # repeating the number.
 PSK_LEN = 32
+
+# Where the store lives under a team-server data directory, as the one
+# spelling of it. The generator and the tunnel server's supervisor each
+# built this path for themselves, and both docstrings claimed to be "the
+# one path the generator and the tunnel server share" -- which is the
+# shape in which two copies drift. The cost of drift is specific: the
+# generator registers each build's PSK in a file the tunnel server never
+# reads, and the symptom is every build failing to authenticate, which
+# reads as a wrong PSK rather than as a wrong path.
+KEYSTORE_RELPATH = ("tunnel", "keys.json")
+
+
+def keystore_path(data_dir) -> Path:
+    """The store's path under `data_dir`: the one both sides ask for."""
+    return Path(data_dir).joinpath(*KEYSTORE_RELPATH)
 
 _DIR_MODE = 0o700
 _FILE_MODE = 0o600

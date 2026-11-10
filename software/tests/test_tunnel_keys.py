@@ -41,10 +41,13 @@ import os
 import stat
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from software.c2 import beacon as beacon_mod
-from software.c2.tunnel.keys import KeyStore
+from software.c2.tunnel.keys import KEYSTORE_RELPATH, KeyStore, keystore_path
+
+_REPO = Path(__file__).resolve().parent.parent.parent
 
 
 def _mode(path):
@@ -530,6 +533,51 @@ class TestMalformedStore(KeyStoreTestCase):
             KeyStore(self.path)
         with open(self.path) as handle:
             self.assertEqual(handle.read(), "{ broken")
+
+
+class TestTheOnePathBothSidesUse(unittest.TestCase):
+    """The store's location, which was spelled independently twice.
+
+    The generator writes each build's PSK into this file and the tunnel
+    server reads its candidates out of it, so the two have to name the
+    same file. They used to build the path separately while both
+    docstrings claimed to be "the one path the generator and the tunnel
+    server share", and the cost of drift is not obvious from either side:
+    every build fails to authenticate, which reads as a wrong PSK.
+    """
+
+    def test_the_generator_and_the_supervisor_name_the_same_file(self):
+        from software.c2.server import _tunnel_keystore_path
+        from software.c2.tunnel.supervisor import TunnelSupervisor
+
+        with tempfile.TemporaryDirectory() as root:
+            data_dir = os.path.join(root, "data")
+            block = {"enabled": True, "bind_host": "127.0.0.1",
+                     "bind_port": 8446, "socks_port_first": 19050,
+                     "socks_port_last": 19099, "keepalive_seconds": 30.0}
+            supervisor = TunnelSupervisor(block, Path(data_dir),
+                                          managed=False)
+            self.assertEqual(Path(_tunnel_keystore_path(data_dir)),
+                             Path(supervisor.key_store_path()))
+            self.assertEqual(
+                Path(keystore_path(data_dir)),
+                Path(supervisor.key_store_path()),
+                "the shared spelling is not what either side uses")
+
+    def test_only_the_key_module_spells_the_file_name(self):
+        # The duplication itself and not only its two outputs: two paths
+        # that agree today are two paths, and this is the assertion a
+        # third copy would fail.
+        for module in ("software/c2/server.py",
+                       "software/c2/tunnel/supervisor.py"):
+            text = (_REPO / module).read_text(encoding="utf-8")
+            self.assertNotIn(
+                KEYSTORE_RELPATH[-1], text,
+                "%s spells the key store's file name instead of asking "
+                "tunnel/keys.py for it" % module)
+        self.assertIn(KEYSTORE_RELPATH[-1],
+                      (_REPO / "software/c2/tunnel/keys.py").read_text(
+                          encoding="utf-8"))
 
 
 if __name__ == "__main__":

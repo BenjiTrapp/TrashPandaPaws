@@ -245,16 +245,6 @@ def _load_state(data_dir: Path):
 
 # ── Beacon generator helpers ──
 
-# Where the tunnel server's key material lives, relative to the team
-# server's data directory.
-#
-# One file with two readers: the generator registers each build's PSK in
-# it, and the tunnel server reads its candidate PSKs out of it. `KeyStore`
-# is built for exactly that -- it re-reads the file whenever it is asked,
-# so a build registered here is accepted by a tunnel server that is
-# already running, and retiring one takes effect without a restart.
-_TUNNEL_KEYSTORE_RELPATH = ("tunnel", "keys.json")
-
 # How many random bytes a build's tunnel identity is made of.
 #
 # Random, and deliberately not `_assign_name`'s word list and counter.
@@ -267,8 +257,26 @@ _TUNNEL_IDENTITY_BYTES = 6
 
 
 def _tunnel_keystore_path(data_dir) -> Path:
-    """The one path the generator and the tunnel server share."""
-    return Path(data_dir).joinpath(*_TUNNEL_KEYSTORE_RELPATH)
+    """The one path the generator and the tunnel server share.
+
+    One file with two readers: the generator registers each build's PSK
+    in it, and the tunnel server reads its candidate PSKs out of it.
+    `KeyStore` is built for exactly that -- it re-reads the file whenever
+    it is asked, so a build registered here is accepted by a tunnel
+    server that is already running, and retiring one takes effect without
+    a restart.
+
+    The path itself is spelled once, in `tunnel/keys.py`, and both this
+    and `TunnelSupervisor.key_store_path` ask that module for it. They
+    used to build it separately while each claiming to be the shared one.
+    Imported inside the function for the reason every other reach into
+    `software.c2.tunnel` from this module is: a deployment that generates
+    no tunnel ships `server.py` and `beacon.py` with no tunnel package
+    beside them.
+    """
+    from software.c2.tunnel.keys import keystore_path
+
+    return keystore_path(data_dir)
 
 
 def _tunnel_config_for_build(body: dict, data_dir) -> Optional[dict]:

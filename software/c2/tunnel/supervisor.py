@@ -262,8 +262,19 @@ class TunnelSupervisor:
                 "started." % action)
 
     def key_store_path(self) -> Path:
-        """The PSK registry, which the generator writes and the child reads."""
-        return self.data_dir / "tunnel" / "keys.json"
+        """The PSK registry, which the generator writes and the child reads.
+
+        Asked of `tunnel/keys.py` rather than spelled here: this and the
+        generator's `_tunnel_keystore_path` each used to build the path
+        and each claimed to be the one both sides share, which is how two
+        copies of a path drift into a generator registering PSKs in a
+        file the server never reads. Imported inside the method so this
+        module keeps holding no key material and no crypto import of its
+        own; it spawns a child and that is all.
+        """
+        from .keys import keystore_path
+
+        return keystore_path(self.data_dir)
 
     def state_path(self) -> Path:
         """The port table, so an identity keeps its SOCKS port."""
