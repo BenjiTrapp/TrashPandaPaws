@@ -346,6 +346,15 @@ so a single `CONNECT` rule is enough to cross a corporate proxy. That is
 also why the endpoint can get out at all: it reuses the beacon's own
 proxy discovery and its NTLM `CONNECT` relay.
 
+**Every relay goes to the port the build was configured with**, never to
+the port the tunnel server bound locally. The two differ whenever
+anything translates ports in between — a redirector, a NAT — and the
+configured one is the only one the target can reach, which the command
+channel has just demonstrated. So `tunnel.server`/`tunnel.port` in the
+generation request is the address as the target's network sees it, and
+`bind_port` in `c2.tunnel_server` is this host's own; they are allowed to
+disagree and nothing on the endpoint reads the server's number.
+
 ---
 
 ## Running it

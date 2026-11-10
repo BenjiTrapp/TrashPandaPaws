@@ -3405,21 +3405,32 @@ class TunnelEndpoint(object):
     # ── relays ──
 
     def _spawn_relay(self, body: dict) -> None:
-        """Dial the relay the server has just asked for, on its own thread."""
+        """Dial the relay the server has just asked for, on its own thread.
+
+        The port in the message is **not** where the relay goes. The
+        server names the port it bound locally, and that is only the port
+        this host can reach when nothing sits in between: behind a
+        redirector, a NAT or any port translation, the configured port is
+        443 and the server's own is something else, so dialling what was
+        advertised would fail every relay while the command channel
+        stayed healthy -- the panel reading `connected` and every session
+        timing out. The port this endpoint was configured with is the one
+        that demonstrably works, because the handshake that carried this
+        message came back through it. One destination is also what makes
+        a single `CONNECT` rule enough, which is the whole reason the
+        protocol has one port. So the field is read and logged when it
+        differs, and never acted on.
+        """
         token = body.get("token")
-        port = body.get("port")
+        advertised = body.get("port")
         if not isinstance(token, str) or not token:
             logger.warning("tunnel: an OPEN_RELAY carrying no token; ignored")
             return
-        if (isinstance(port, bool) or not isinstance(port, int)
-                or not 1 <= port <= 0xFFFF):
-            # Including zero: this protocol keeps its keep-alive in
-            # PING/PONG and has no use for a port that is not one, so a
-            # zero here is a malformed message and not a special case.
-            logger.warning("tunnel: an OPEN_RELAY naming %r, which is not a "
-                           "port; ignored", port)
-            return
-        thread = threading.Thread(target=self._relay, args=(port, token),
+        if advertised != self.port:
+            logger.debug("tunnel: an OPEN_RELAY advertised port %r; this "
+                         "endpoint dials its configured %d",
+                         advertised, self.port)
+        thread = threading.Thread(target=self._relay, args=(token,),
                                   name="tunnel-relay", daemon=True)
         with self._lock:
             self._relay_threads = [t for t in self._relay_threads
@@ -3437,11 +3448,11 @@ class TunnelEndpoint(object):
             logger.warning("tunnel: no thread could be started for a relay: "
                            "%s", exc)
 
-    def _relay(self, port: int, token: str) -> None:
+    def _relay(self, token: str) -> None:
         """One relay: dial the same port, claim it with the token, serve it."""
         sock = None
         try:
-            sock = self._dial(port)
+            sock = self._dial(self.port)
             self._register_socket(sock)
             noise = self._handshake(
                 sock, encode_message(MSG_RELAY, {"token": token}))
@@ -3453,7 +3464,7 @@ class TunnelEndpoint(object):
             # operator's end learns of it from the session never pairing
             # or from the stream ending.
             logger.info("tunnel: a relay to %s:%d ended: %s",
-                        self.server, port, exc)
+                        self.server, self.port, exc)
         except Exception:
             logger.exception("tunnel: unexpected error on a relay")
         finally:

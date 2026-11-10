@@ -322,6 +322,113 @@ class _ConnectProxy(object):
         self._thread.join(timeout=3.0)
 
 
+class _Redirector(object):
+    """A plain TCP forwarder on loopback, the way a redirector sits in front.
+
+    Everything it accepts is bridged to one fixed address, so the port the
+    endpoint is configured with and the port the tunnel server bound are
+    two different numbers -- which is the deployment the one-port design
+    exists for and the one case in which the two values can disagree.
+    `connections` is what the test asserts on: a relay that went straight
+    to the server's own port never passed through here.
+    """
+
+    def __init__(self, target_host, target_port):
+        self._target = (target_host, target_port)
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind((_LOOPBACK, 0))
+        self._listener.listen(8)
+        self._listener.settimeout(0.2)
+        self.port = self._listener.getsockname()[1]
+        self._lock = threading.Lock()
+        self._connections = 0
+        self._socks = []
+        self._stop = threading.Event()
+        self.errors = []
+        self._thread = threading.Thread(target=self._accept, daemon=True,
+                                        name="redirector-accept")
+        self._thread.start()
+
+    @property
+    def connections(self):
+        with self._lock:
+            return self._connections
+
+    def _accept(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with self._lock:
+                self._connections += 1
+                self._socks.append(conn)
+            threading.Thread(target=self._serve, args=(conn,), daemon=True,
+                             name="redirector-conn").start()
+
+    def _serve(self, client):
+        try:
+            upstream = socket.create_connection(self._target, timeout=10.0)
+        except OSError:
+            try:
+                client.close()
+            except OSError:
+                pass
+            return
+        with self._lock:
+            self._socks.append(upstream)
+        try:
+            self._bridge(client, upstream)
+        except OSError:
+            return
+        except Exception:
+            self.errors.append(traceback.format_exc())
+
+    @staticmethod
+    def _bridge(one, two):
+        def forward(src, dst):
+            try:
+                while True:
+                    data = src.recv(65535)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except OSError:
+                pass
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+        back = threading.Thread(target=forward, args=(two, one), daemon=True,
+                                name="redirector-down")
+        back.start()
+        forward(one, two)
+        back.join(timeout=3.0)
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+        with self._lock:
+            socks, self._socks = self._socks, []
+        for sock in socks:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        self._thread.join(timeout=3.0)
+
+
 class _UnreachableEndpoint(TunnelEndpoint):
     """An endpoint whose target network always answers with one error.
 
@@ -664,6 +771,31 @@ class TestCarryingAConnect(TunnelEndpointTestCase):
 
 
 class TestEgress(TunnelEndpointTestCase):
+    def test_a_relay_dials_the_port_the_endpoint_was_configured_with(self):
+        # The one case in which the server's bound port and the
+        # endpoint's configured port differ -- a redirector in front of
+        # the tunnel server, which is the deployment the one-port design
+        # exists for. Every other test in this file runs both halves on
+        # one real port, so the two values are never allowed to disagree
+        # and a relay that dialled the server-advertised number would
+        # pass them all.
+        server = self.start_server()
+        redirector = _Redirector(_LOOPBACK, server.port)
+        self.addCleanup(redirector.close)
+        self.assertNotEqual(redirector.port, server.port)
+
+        self.start_endpoint(self.config_for(redirector.port))
+        self.wait_connected(server)
+        self.relay(server)
+
+        # The command channel and the relay, both through the front: a
+        # relay that went to `server.port` direct would leave this at one
+        # while every other assertion in the suite still passed.
+        self.assertEqual(redirector.connections, 2,
+                         "the relay did not go through the port the "
+                         "endpoint was configured with")
+        self.assertEqual(redirector.errors, [])
+
     def test_endpoint_connects_through_a_local_connect_proxy(self):
         server = self.start_server()
         proxy = _ConnectProxy()

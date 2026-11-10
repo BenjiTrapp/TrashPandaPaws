@@ -605,9 +605,13 @@ class TunnelServer(object):
         The token goes down the command channel inside `OPEN_RELAY`, which
         is already authenticated and confidential, so it is never on the
         wire in clear. The port in that message is this server's own
-        listening port -- the one the endpoint is already connected to --
-        named explicitly rather than inferred, because the whole design
-        turns on there being exactly one.
+        listening port, and it is **advisory**: the endpoint dials the
+        port it was configured with, because that is the one it can
+        reach. Behind a redirector or any port translation the two
+        differ, and a server that expected its own number to be dialled
+        would fail every relay while its command channels stayed up. The
+        field is kept because a difference between the two is worth
+        seeing in a log on either side.
         """
         with self._lock:
             channel = self._channels.get(identity)
