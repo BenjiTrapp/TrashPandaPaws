@@ -37,6 +37,7 @@ anybody can act on at the moment a tunnel fails to start.
 
 import base64
 import json
+import logging
 import os
 import stat
 import tempfile
@@ -96,6 +97,29 @@ class TestFirstUse(KeyStoreTestCase):
         self.assertNotEqual(
             KeyStore(self.path).static_public(), KeyStore(other).static_public()
         )
+
+    def test_minting_a_keypair_says_so_and_reopening_does_not(self):
+        # Silence here is the worst diagnostic in the system. A store
+        # that has gone missing strands every deployed build -- each one
+        # carries a public key this server no longer has and a PSK it has
+        # never seen -- and the only other symptom is a panel reporting
+        # "0 builds registered" while endpoints fail to authenticate for
+        # reasons nothing on either side explains.
+        with self.assertLogs("raccoon.tunnel.keys", level="WARNING") as caught:
+            KeyStore(self.path)
+        said = "\n".join(caught.output)
+        self.assertIn(self.path, said)
+        self.assertIn("authenticate", said)
+
+        # And not on every open afterwards, or the line stops being read.
+        logger = logging.getLogger("raccoon.tunnel.keys")
+        records = []
+        handler = logging.Handler(level=logging.WARNING)
+        handler.emit = records.append
+        logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
+        KeyStore(self.path)
+        self.assertEqual([record.getMessage() for record in records], [])
 
 
 class TestPermissions(KeyStoreTestCase):

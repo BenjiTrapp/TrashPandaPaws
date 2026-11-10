@@ -320,6 +320,27 @@ class TestTheGeneratorBakesATunnelBlock(_GeneratorCase):
                     self.assertEqual(self.store().builds(), [])
 
 
+    def test_a_server_that_cannot_be_dialled_is_refused_before_the_build(self):
+        # `port` beside it has had a range check all along; `server` was
+        # accepted on non-emptiness alone. A pasted URL or a trailing
+        # space therefore shipped a build that could never connect, and
+        # the endpoint's explanation of why goes to `DEVNULL` -- so this
+        # is the only place it can be said.
+        for value in ("https://c2.example.com", "c2.example.com/",
+                      "c2.example.com:8446/path", "c2 example.com",
+                      "c2.example.com\tx"):
+            for route in ("gen", "gist"):
+                with self.subTest(value=value, route=route):
+                    response = getattr(self, "post_" + route)(
+                        self.asked_for(server=value))
+                    self.assertEqual(response.status_code, 400,
+                                     response.data[:400])
+                    self.assertIn("tunnel.server",
+                                  response.get_json()["error"])
+                    self.assertEqual(self.store().builds(), [],
+                                     "a build that cannot connect left a "
+                                     "PSK in the store")
+
     def test_a_damaged_key_store_is_the_servers_fault_and_says_so(self):
         # Not a 400. A request that was fine, answered as if it were not,
         # sends the operator to look at their own form while the message

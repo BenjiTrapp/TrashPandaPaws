@@ -406,7 +406,10 @@ class SocksFront(object):
             except Exception:
                 # The accept loop is the one thread that must not die: an
                 # operator whose port stopped answering has no tunnel.
+                # Backed off on the stop flag like the `OSError` arm
+                # above, so a fault that persists cannot spin a core.
                 logger.exception("socks: unexpected error in the accept loop")
+                self._stopping.wait(0.05)
                 continue
             peer = "%s:%d" % address[:2]
             worker = threading.Thread(target=self._serve, args=(conn, peer),

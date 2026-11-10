@@ -671,7 +671,12 @@ class TunnelServer(object):
             except Exception:
                 # The accept loop is the one thread that must not die: an
                 # endpoint that cannot reconnect is the whole tunnel gone.
+                # Backed off like the `OSError` arm above it, and for the
+                # same reason: a fault that persists would otherwise spin
+                # a core here, where there is no `accept` blocking to
+                # pace the loop.
                 logger.exception("tunnel: unexpected error in the accept loop")
+                time.sleep(0.05)
                 continue
             peer = "%s:%d" % address[:2]
             worker = threading.Thread(target=self._serve, args=(conn, peer),

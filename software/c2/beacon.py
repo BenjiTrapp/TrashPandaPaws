@@ -1165,9 +1165,19 @@ def write_frame(sock: socket.socket, payload: bytes) -> None:
 
     Both refusals happen before any byte goes out, because a prefix on the
     wire with nothing behind it leaves the peer unable to read the stream
-    ever again and there is no way to take it back. The prefix and the body
-    go in one `sendall` for the same reason -- two calls can interleave
-    with another thread's frame on the same socket.
+    ever again and there is no way to take it back. That is also why the
+    prefix and the body go in one `sendall` rather than two: one call
+    cannot leave a prefix written and a body unwritten by returning
+    between them.
+
+    It is **not** a claim that a frame is atomic against another thread.
+    `sendall` loops over partial sends and releases the GIL in each of
+    them, so two threads writing one socket could still interleave. That
+    is sound here because every socket in this protocol has exactly one
+    writer -- the command channel's `send` holds a lock, and a relay
+    stream holds one that also orders the nonce -- and a future caller
+    that wants a second writer has to bring its own lock rather than read
+    one into this function.
     """
     if not payload:
         raise ValueError(

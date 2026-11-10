@@ -66,12 +66,15 @@ import base64
 import binascii
 import hmac
 import json
+import logging
 import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from software.c2.beacon import _X25519_BASEPOINT, _x25519, _x25519_keypair
+
+logger = logging.getLogger("raccoon.tunnel.keys")
 
 _KEY_LEN = 32
 
@@ -284,6 +287,20 @@ class KeyStore:
             return
         self._private, self._public, self._builds = private, public, []
         self._signature = signature
+        # Said out loud, because the alternative diagnostic is the worst
+        # in the system. On a first start this line is routine; on any
+        # other start it means the file that held this deployment's
+        # static private key and every build's PSK is gone, so every
+        # build already out there presents a public key this server no
+        # longer has and a PSK it has never seen. The only other symptom
+        # is a panel reporting "0 builds registered" while endpoints fail
+        # to authenticate for reasons nothing on either side explains.
+        logger.warning(
+            "tunnel: no key store at %s, so a new static keypair was "
+            "minted. On a first start that is expected. Otherwise every "
+            "build generated against the previous store can no longer "
+            "authenticate: restore that file rather than regenerating "
+            "builds.", self._path)
 
     def _write(self, builds: List[Dict[str, Any]], exclusive: bool, private: Optional[bytes] = None) -> Tuple[int, int]:
         """Write the document atomically; return the (mtime_ns, inode) it has on disk."""

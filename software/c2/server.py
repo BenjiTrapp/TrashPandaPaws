@@ -330,6 +330,19 @@ def _tunnel_config_for_build(body: dict, data_dir) -> Optional[dict]:
         raise ValueError(
             "tunnel.server is required: it is the host the endpoint dials "
             "out to, written as the target's network can reach it")
+    if any(char.isspace() for char in server) or "/" in server:
+        # A bare host or IP, because that is what it is used as: it goes
+        # to `socket.create_connection` and into a `CONNECT <server>:<port>`
+        # line. A pasted `https://c2.example.com`, a trailing fragment of
+        # a path or an embedded space therefore ships a build that can
+        # never connect -- and the endpoint's explanation of why goes to
+        # `DEVNULL`, so the refusal has to happen here. Checked beside
+        # `port`, which has had a range check all along.
+        raise ValueError(
+            "tunnel.server must be a bare hostname or IP address, not %r: "
+            "it is dialled directly and written into a CONNECT line, so a "
+            "URL, a path or a stray space is a build that cannot connect "
+            "and cannot say why" % (server,))
     port = asked.get("port")
     try:
         port = 0 if isinstance(port, bool) else int(port)
