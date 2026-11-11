@@ -1577,7 +1577,18 @@ class TestAShellSession(TunnelEndpointTestCase):
 
         stream.close()
 
-        grace = beacon_mod._SHELL_TERM_GRACE + 1.0
+        # A deadline sized to the endpoint's *own* worst case, not to one
+        # grace window. `_end_shell` can spend up to `_SHELL_TERM_GRACE`
+        # waiting out SIGHUP and then, if the shell did not go, another
+        # `_SHELL_TERM_GRACE` waiting out SIGKILL -- and the stream close
+        # has to propagate to that teardown first. The old budget of one
+        # grace plus a second was below that sum, so under load, where the
+        # SIGHUP wait actually times out, the reap outran the deadline and
+        # the test flaked. This covers both grace windows with slack for
+        # the dispatch and the scheduler; its teeth are unchanged, because
+        # a child that is never reaped stays in the table past any
+        # deadline and the `else` still fires.
+        grace = 2 * beacon_mod._SHELL_TERM_GRACE + 5.0
         deadline = time.time() + grace
         while time.time() < deadline:
             if not _alive(pid):
@@ -1649,14 +1660,37 @@ class TestAShellSession(TunnelEndpointTestCase):
         for stream in held:
             stream.close()
 
-        # `sessions` is the panel's counter, not the cap's, so waiting on
-        # it says the endpoint has finished with all four without
-        # assuming the thing under test.
-        self.wait_for(lambda: self.endpoint.status()["sessions"] == 0,
-                      what="the endpoint letting go of its four sessions")
-
-        fifth = self.ask_for_a_shell()
-        self.run_in_the_shell(fifth, b'echo "F""IFTH"\n', b"FIFTH")
+        # The slot is released in an outer `finally`, after `_end_shell`'s
+        # signal-and-grace, while the panel counter (`status()["sessions"]`)
+        # is released in an inner one -- so a wait on the counter can
+        # return with the four slots still held and the fifth attach
+        # refused, which is the flake this test used to carry under load.
+        # The thing this test is really about is that a fifth session
+        # eventually runs, so it retries the fifth attach until one does,
+        # rather than timing the slot release. Its teeth are intact: if the
+        # slot were never given back, no attempt would ever carry `FIFTH`
+        # and the deadline below would fail.
+        deadline = time.time() + 30.0
+        last = b""
+        while time.time() < deadline:
+            fifth = self.ask_for_a_shell()
+            # A refused attach still dials back, but with a line of text
+            # rather than a shell: `raccoon: ...`. A real shell carries
+            # the command's output instead, so one read for either tells
+            # them apart. The marker is split so the terminal's echo of
+            # what was typed cannot satisfy it -- only the shell's own
+            # output can, exactly as `run_in_the_shell` does it.
+            fifth.send(b'echo "F""IFTH"\n')
+            data = fifth.read_until_match(
+                re.compile(rb"FIFTH|raccoon:"), timeout=5.0)
+            if data is not None and b"FIFTH" in data:
+                return
+            last = fifth.buffer[-200:]
+            fifth.close()
+            time.sleep(0.05)
+        self.fail("a fifth shell session never ran after the first four were "
+                  "closed; the slot is not being given back. Last attempt "
+                  "read: %r" % (last,))
 
     @unittest.skipUnless(_HAS_PTY, _NO_PTY)
     @unittest.skipUnless(_HAS_BASH, _NO_BASH)
