@@ -40,6 +40,13 @@ resolves through a resolver this process does not own, so `localhost` is
 not proof of anything at bind time, and it is refused with a message
 saying so.
 
+**Three of this module's helpers are public**, and that is deliberate:
+`shell.py` is the second operator-facing port, it binds under the same
+rule and authenticates under the same one, so `loopback_bind`,
+`credential` and `positive` are shared from here rather than copied
+there. Two implementations of a check like these is one implementation
+and one latent hole.
+
 **`max_sessions` defaults to 256.** One session costs a relay TCP
 connection, a Noise session on the endpoint and two threads here, so the
 cap is what stops an operator's own tooling from exhausting the team
@@ -151,7 +158,8 @@ from .protocol import (
 
 logger = logging.getLogger("raccoon.tunnel.socks")
 
-__all__ = ["SocksFront", "DEFAULT_MAX_SESSIONS"]
+__all__ = ["SocksFront", "DEFAULT_MAX_SESSIONS", "loopback_bind",
+           "credential", "positive"]
 
 # See the module docstring: above what a connect scan holds open, and
 # about 512 threads at full stretch.
@@ -231,12 +239,12 @@ class SocksFront(object):
         self.identity = str(identity)
         if not self.identity:
             raise ValueError("a SOCKS front serves one named identity")
-        self.bind_host, self._family = _loopback(bind_host)
+        self.bind_host, self._family = loopback_bind(bind_host)
         self.bind_port = int(bind_port)
         if not 0 <= self.bind_port <= 0xFFFF:
             raise ValueError("bind_port %r is not a port" % (bind_port,))
-        self._username = _credential(username, "username")
-        self._password = _credential(password, "password")
+        self._username = credential(username, "SOCKS username")
+        self._password = credential(password, "SOCKS password")
         self.max_sessions = int(max_sessions)
         if self.max_sessions < 1:
             raise ValueError("max_sessions must be at least 1, got %r"
@@ -251,9 +259,9 @@ class SocksFront(object):
         if self.max_pending < 1:
             raise ValueError("max_pending must be at least 1, got %r"
                              % (max_pending,))
-        self.handshake_timeout = _positive(handshake_timeout,
-                                           "handshake_timeout")
-        self.connect_timeout = _positive(connect_timeout, "connect_timeout")
+        self.handshake_timeout = positive(handshake_timeout,
+                                          "handshake_timeout")
+        self.connect_timeout = positive(connect_timeout, "connect_timeout")
         self.backlog = int(backlog)
 
         self.port = None            # type: Optional[int]
@@ -882,42 +890,55 @@ def _say(sock: socket.socket, data: bytes) -> None:
     sock.sendall(data)
 
 
-def _loopback(value) -> Tuple[str, int]:
+def loopback_bind(value) -> Tuple[str, int]:
     """`(host, family)` for a loopback literal; `ValueError` for anything else.
 
     A name is refused rather than resolved. The resolver belongs to the
     host, not to this process: `localhost` is whatever `/etc/hosts` says
-    today, and a SOCKS port that is reachable from off-box is a pivot into
-    the target network for whoever finds it.
+    today, and an operator port that is reachable from off-box is a pivot
+    into the target network -- or a root shell on the implant host -- for
+    whoever finds it.
+
+    Public, with `credential` and `positive`, because `shell.py` is the
+    second operator-facing port and binds under the same rule. Two
+    implementations of this check would be one implementation and one
+    latent hole.
     """
     host = str(value)
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
         raise ValueError(
-            "a SOCKS bind address must be a loopback IP literal such as "
-            "127.0.0.1 or ::1, and %r is a name, whose resolution is not "
-            "this process's to trust" % (host,))
+            "an operator port's bind address must be a loopback IP literal "
+            "such as 127.0.0.1 or ::1, and %r is a name, whose resolution "
+            "is not this process's to trust" % (host,))
     if not address.is_loopback:
         raise ValueError("%r is not a loopback address, and this port must "
                          "not be reachable from another host" % (host,))
     return host, (socket.AF_INET6 if address.version == 6 else socket.AF_INET)
 
 
-def _credential(value, what: str) -> bytes:
-    """One RFC 1929 field as the bytes it is compared as."""
+def credential(value, what: str) -> bytes:
+    """One authentication field as the bytes it is compared as.
+
+    `what` names the field in every refusal, because this module is no
+    longer the only caller: the shell port has one password where RFC 1929
+    has a pair, and an operator reading the reason has to be told which
+    secret was wrong.
+    """
     if not isinstance(value, str) or not value:
-        raise ValueError("the SOCKS %s is a non-empty string; this port "
+        raise ValueError("the %s is a non-empty string; this port "
                          "authenticates and has no anonymous mode" % what)
     raw = value.encode("utf-8")
     if len(raw) > _MAX_CREDENTIAL_LEN:
-        raise ValueError("RFC 1929 gives the %s one length byte, so it is at "
-                         "most %d bytes; this one is %d"
-                         % (what, _MAX_CREDENTIAL_LEN, len(raw)))
+        raise ValueError("a credential is at most %d bytes -- RFC 1929 gives "
+                         "a SOCKS username and password one length byte each "
+                         "and both operator ports share the bound -- and the "
+                         "%s is %d" % (_MAX_CREDENTIAL_LEN, what, len(raw)))
     return raw
 
 
-def _positive(value, what: str) -> float:
+def positive(value, what: str) -> float:
     seconds = float(value)
     if seconds <= 0:
         raise ValueError("%s must be a positive number of seconds, got %r"
