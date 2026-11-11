@@ -348,7 +348,7 @@ git commit -m "feat(tunnel): shell sessions, kind-matched claims, and a feature 
   - `ShellFront(tunnel_server, identity: str, bind_port: int, password: str, *, max_sessions: int = 4, max_pending: Optional[int] = None, bind_host: str = "127.0.0.1", handshake_timeout: float = 15.0, backlog: int = 16, transcripts=None)` with `.start()`, `.stop()`, `.stats() -> dict`, `.port`, `.identity`.
   - `DEFAULT_MAX_SESSIONS = 4` and `PROMPT = b"password: "`. The geometry values are imported from `protocol` (Task 1), never redefined.
   - `parse_auth_line(line: str) -> Tuple[str, int, int]` — module-level and tested on its own.
-  - `stats()` keys: `live`, `accepted`, `carried`, `bytes_in`, `bytes_out`, and `refused` as a dict over `auth`, `capacity`, `pending`, `tunnel`, `timeout`, `threads`, `unsupported`.
+  - `stats()` **conforms to `SocksFront.stats()` key for key**: the live count is `sessions`, `refused` is an integer total, and the detail is one `refused_<why>` key per kind over `auth`, `capacity`, `pending`, `tunnel`, `timeout`, `threads`, `unsupported`. The panel's reader is generic over the `refused_` prefix and already ships against the SOCKS row, so the new row conforms to it rather than the reverse. *(Ruled 2026-11-11, after the first draft of this plan said `live` and a nested dict.)*
 
 - [ ] **Step 1: Write the failing tests**
 
