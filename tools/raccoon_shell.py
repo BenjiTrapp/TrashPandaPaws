@@ -205,13 +205,26 @@ def _resized(fd: int) -> Tuple[int, int]:
 
 
 def _winsize(fd: Optional[int]):
-    """What the descriptor says it is, or None if it is not a terminal."""
+    """What the descriptor says it is, or None when it has no real answer.
+
+    None covers both "not a terminal" and a terminal reporting a zero in
+    either dimension: `os.terminal_size((0, 0))` is truthy and would be
+    kept by `geometry`'s `or` and by `_resized`'s `is None`, clamped up
+    to a 1x1 session, where returning None here lets each fall back the
+    way it does for no terminal at all -- `shutil.get_terminal_size`'s
+    own answer for `geometry` (the exported variables, the real
+    `sys.__stdout__`, then `_DEFAULT_SIZE`), and `geometry` itself for
+    `_resized`.
+    """
     if fd is None:
         return None
     try:
-        return os.get_terminal_size(fd)
+        size = os.get_terminal_size(fd)
     except OSError:
         return None
+    if size.columns <= 0 or size.lines <= 0:
+        return None
+    return size
 
 
 def _exported(name: str) -> int:

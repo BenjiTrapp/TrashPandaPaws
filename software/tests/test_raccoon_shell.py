@@ -637,6 +637,51 @@ class ResizeNoticeTests(_Environment, unittest.TestCase):
             os.kill(os.getpid(), signal.SIGWINCH)
         self.assertEqual(self._said(timeout=0.5), b"")
 
+    def test_a_terminal_reporting_zero_falls_back_like_no_terminal(self):
+        """A 0x0 ioctl is no answer, not a 0x0 session.
+
+        `os.terminal_size((0, 0))` is truthy, so without treating a zero
+        as "no answer" `geometry`'s `or` would keep it and `_digits`
+        would clamp it to a 1x1 session -- where the fallback
+        `shutil.get_terminal_size` provides would have been used instead.
+        The environment is cleared so the ioctl is the only source left,
+        which is exactly the window a terminal in an odd state produces,
+        and `shutil.get_terminal_size` is pinned so the fallback does not
+        ride on whatever `sys.__stdout__` is under the runner.
+        """
+        self._unset("COLUMNS")
+        self._unset("LINES")
+        self._resize(0, 0)
+        self._pin_fallback(132, 43)
+
+        # Not (1, 1): the zero was treated as no answer and the fallback
+        # applied, for both the auth line and the resize note.
+        self.assertEqual(raccoon_shell.geometry(self.terminal), (132, 43))
+        self.assertEqual(raccoon_shell._resized(self.terminal), (132, 43))
+
+    def test_a_real_terminal_size_is_still_read_from_the_ioctl(self):
+        # The control for the test above: a non-zero window still reaches
+        # both, so the zero check did not swallow a size a terminal really
+        # reported. The fallback is pinned to a different pair so that a
+        # result reading the ioctl is told apart from one that fell back.
+        self._unset("COLUMNS")
+        self._unset("LINES")
+        self._resize(100, 30)
+        self._pin_fallback(132, 43)
+
+        self.assertEqual(raccoon_shell.geometry(self.terminal), (100, 30))
+        self.assertEqual(raccoon_shell._resized(self.terminal), (100, 30))
+
+    def _pin_fallback(self, cols, rows):
+        """Pin `shutil.get_terminal_size`, which `geometry` asks when the
+        ioctl has no answer, so the test does not depend on what
+        `sys.__stdout__` happens to be under the runner."""
+        saved = raccoon_shell.shutil.get_terminal_size
+        self.addCleanup(setattr, raccoon_shell.shutil,
+                        "get_terminal_size", saved)
+        raccoon_shell.shutil.get_terminal_size = (
+            lambda *a, **k: os.terminal_size((cols, rows)))
+
 
 if __name__ == "__main__":
     unittest.main()
