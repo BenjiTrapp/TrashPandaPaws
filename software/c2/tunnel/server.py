@@ -94,13 +94,17 @@ from .protocol import (
     MSG_CLOSE,
     MSG_HELLO,
     MSG_OPEN_RELAY,
+    MSG_OPEN_SHELL,
     MSG_PING,
     MSG_PONG,
     MSG_RELAY,
+    MSG_SHELL,
     MESSAGE_KIND_NAMES,
     NoiseSession,
     decode_message,
     encode_message,
+    SHELL_DEFAULT_COLS,
+    SHELL_DEFAULT_ROWS,
     read_frame,
     write_frame,
 )
@@ -276,17 +280,20 @@ class RelayStream(object):
 
 
 class RelaySession(object):
-    """One relay the operator has asked for, before and after it is paired.
+    """One session the operator has asked for, before and after it is paired.
 
     `token` is what the endpoint has to present on its second connection.
-    `sock` is the paired, decrypted stream, and it is `None` until
-    `wait_paired` returns True.
+    `kind` is `"relay"` or `"shell"`, and the token only claims the kind it
+    was minted for. `sock` is the paired, decrypted stream, and it is `None`
+    until `wait_paired` returns True.
     """
 
-    def __init__(self, number: int, identity: str, token: bytes):
+    def __init__(self, number: int, identity: str, token: bytes,
+                 kind: str = "relay"):
         self.number = number
         self.identity = identity
         self.token = token
+        self.kind = kind
         self.sock = None            # type: Optional[RelayStream]
         self.created = time.time()
         self.paired_at = None       # type: Optional[float]
@@ -344,6 +351,10 @@ class _CommandChannel(object):
         # Not this process's: `crypto_path()` answers for the server, and
         # the two halves are different hosts with different libcrypto.
         self.crypto = None          # type: Optional[str]
+        # What the endpoint said it can do beyond the relay. Empty for a
+        # build that sends no `features`, which is also what makes that
+        # build safe: a kind it does not know ends its control loop.
+        self.features = ()          # type: Tuple[str, ...]
         self.connected_at = time.time()
         self.last_seen = self.connected_at
         self.last_ping = self.connected_at
@@ -620,6 +631,8 @@ class TunnelServer(object):
                 "server_crypto": crypto_path(),
                 "endpoint_crypto": (channel.crypto
                                     if channel is not None else None),
+                "features": (list(channel.features)
+                             if channel is not None else []),
             })
         return rows
 
@@ -637,6 +650,7 @@ class TunnelServer(object):
         return [{
             "session": session.number,
             "identity": session.identity,
+            "kind": session.kind,
             "state": session.state,
             "age": now - session.created,
             "bytes_in": session.sock.bytes_in if session.sock else 0,
@@ -679,6 +693,51 @@ class TunnelServer(object):
             raise ValueError("could not ask %r to open a relay: %s"
                              % (identity, exc))
         logger.info("tunnel: asked %r for relay session %d",
+                    identity, session.number)
+        return session
+
+    def open_shell_session(self, identity: str,
+                           cols: int = SHELL_DEFAULT_COLS,
+                           rows: int = SHELL_DEFAULT_ROWS) -> RelaySession:
+        """Ask `identity` for a terminal, and return the session to wait on.
+
+        Same shape as `open_session`, with one check it does not need: the
+        endpoint must have advertised `shell` in its `HELLO`, and that is
+        decided **before** a token is minted or a frame is written. An
+        endpoint built before the shell meets kind 7 in the last branch of
+        its control loop, which logs and returns -- the command channel
+        drops, and `_forget` closes every session that rode on it, live
+        SOCKS pivots included. A refusal here therefore has to cost the
+        channel nothing, which means sending nothing.
+        """
+        with self._lock:
+            channel = self._channels.get(identity)
+            if channel is None or not channel.ready:
+                raise ValueError(
+                    "no endpoint is connected for identity %r" % identity)
+            if "shell" not in channel.features:
+                raise ValueError(
+                    "the endpoint for identity %r did not advertise the "
+                    "'shell' feature (it advertised %s); it predates shell "
+                    "sessions and would drop its command channel on the "
+                    "request, so none was sent"
+                    % (identity, list(channel.features) or "none"))
+            self._session_count += 1
+            session = RelaySession(self._session_count, identity,
+                                   os.urandom(TOKEN_LEN), kind="shell")
+            self._sessions.append(session)
+        try:
+            channel.send(MSG_OPEN_SHELL, {"port": self.port,
+                                          "token": session.token.hex(),
+                                          "cols": cols, "rows": rows})
+        except (OSError, ValueError) as exc:
+            session._expire("closed")
+            with self._lock:
+                if session in self._sessions:
+                    self._sessions.remove(session)
+            raise ValueError("could not ask %r to open a shell: %s"
+                             % (identity, exc))
+        logger.info("tunnel: asked %r for shell session %d",
                     identity, session.number)
         return session
 
@@ -776,8 +835,10 @@ class TunnelServer(object):
             return False
         if kind == MSG_RELAY:
             return self._serve_relay(conn, peer, noise, identity, body)
-        logger.debug("tunnel: %s opened with %s, which is neither HELLO nor "
-                     "RELAY", peer, MESSAGE_KIND_NAMES.get(kind, kind))
+        if kind == MSG_SHELL:
+            return self._serve_shell(conn, peer, noise, identity, body)
+        logger.debug("tunnel: %s opened with %s, which is not HELLO, RELAY "
+                     "or SHELL", peer, MESSAGE_KIND_NAMES.get(kind, kind))
         return False
 
     # ── the command channel ──
@@ -796,6 +857,7 @@ class TunnelServer(object):
         channel.os_name = _text(body.get("os"))
         channel.implant_id = _text(body.get("implant_id"))
         channel.crypto = _text(body.get("crypto"))
+        channel.features = _features(body.get("features"))
 
         with self._lock:
             present = self._channels.get(identity)
@@ -914,8 +976,8 @@ class TunnelServer(object):
                             channel.identity)
                 return
             else:
-                # HELLO, RELAY and OPEN_RELAY all mean the far end has lost
-                # track of which direction it is talking in.
+                # HELLO, RELAY, SHELL, OPEN_RELAY and OPEN_SHELL all mean the
+                # far end has lost track of which direction it is talking in.
                 logger.debug("tunnel: %r sent %s on an established channel",
                              channel.identity,
                              MESSAGE_KIND_NAMES.get(kind, kind))
@@ -959,9 +1021,25 @@ class TunnelServer(object):
 
     def _serve_relay(self, conn: socket.socket, peer: str,
                      noise: NoiseSession, identity: str, body: dict) -> bool:
+        return self._serve_claimed(conn, peer, noise, identity, body, "relay")
+
+    def _serve_shell(self, conn: socket.socket, peer: str,
+                     noise: NoiseSession, identity: str, body: dict) -> bool:
+        return self._serve_claimed(conn, peer, noise, identity, body, "shell")
+
+    def _serve_claimed(self, conn: socket.socket, peer: str,
+                       noise: NoiseSession, identity: str, body: dict,
+                       kind: str) -> bool:
+        """Claim the session this token opened, answer, and pair it.
+
+        What a relay and a shell share: both arrive as a second connection
+        carrying a one-time token, and both end as a `RelayStream` the
+        operator side reads. `kind` is the kind the first payload said it
+        was, and the token has to have been minted for that kind.
+        """
         self._authenticated(conn)
         token = _token_bytes(body.get("token"))
-        session = self._claim(token, identity, peer)
+        session = self._claim(token, identity, peer, kind)
         if session is None:
             return False
         try:
@@ -980,17 +1058,20 @@ class TunnelServer(object):
         conn.settimeout(None)
         stream = RelayStream(conn, noise, peer, on_close=session._stream_closed)
         session._pair(stream)
-        logger.info("tunnel: %s paired relay session %d for %r",
-                    peer, session.number, identity)
+        logger.info("tunnel: %s paired %s session %d for %r",
+                    peer, kind, session.number, identity)
         return True
 
-    def _claim(self, token: bytes, identity: str,
-               peer: str) -> Optional[RelaySession]:
+    def _claim(self, token: bytes, identity: str, peer: str,
+               kind: str) -> Optional[RelaySession]:
         """The pending session this token belongs to, or None.
 
         Compared with `compare_digest` against every pending session, and
         the state moves out of `pending` the moment one matches, so a
-        token cannot pair twice.
+        token cannot pair twice. A match has to be the right identity *and*
+        the right kind: a refused claim leaves the session pending, so a
+        wrong guess by a build that holds a valid token cannot cost the
+        operator the session it was minted for.
         """
         with self._lock:
             for session in self._sessions:
@@ -1001,13 +1082,19 @@ class TunnelServer(object):
                 if session.identity != identity:
                     logger.warning(
                         "tunnel: %s authenticated as %r and presented the "
-                        "relay token of %r; refused", peer, identity,
+                        "%s token of %r; refused", peer, identity, kind,
                         session.identity)
+                    return None
+                if session.kind != kind:
+                    logger.warning(
+                        "tunnel: %s authenticated as %r and presented a "
+                        "%s claim with the token of a %s session; refused",
+                        peer, identity, kind, session.kind)
                     return None
                 session._claim()
                 return session
-        logger.info("tunnel: %s presented a relay token matching no open "
-                    "session", peer)
+        logger.info("tunnel: %s presented a %s token matching no open "
+                    "session", peer, kind)
         return None
 
     # ── keep-alive and expiry ──
@@ -1344,6 +1431,17 @@ def _text(value) -> Optional[str]:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _features(value) -> Tuple[str, ...]:
+    """The strings of a `HELLO`'s `features` list, `()` for anything else.
+
+    An absent key is the endpoint that predates features, and a value of
+    the wrong shape is read the same way: it advertised nothing usable.
+    """
+    if not isinstance(value, list):
+        return ()
+    return tuple(item for item in value if isinstance(item, str))
 
 
 def _token_bytes(value) -> bytes:

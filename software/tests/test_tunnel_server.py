@@ -58,12 +58,17 @@ from software.c2.tunnel.protocol import (
     MSG_CLOSE,
     MSG_HELLO,
     MSG_OPEN_RELAY,
+    MSG_OPEN_SHELL,
     MSG_PING,
     MSG_PONG,
     MSG_RELAY,
+    MSG_SHELL,
     NoiseSession,
     decode_message,
     encode_message,
+    SHELL_DEFAULT_COLS,
+    SHELL_DEFAULT_ROWS,
+    TUNNEL_FEATURES,
     read_frame,
     write_frame,
 )
@@ -153,14 +158,19 @@ class _CommandPeer(_Peer):
     def __init__(self, *args, **kwargs):
         _Peer.__init__(self, *args, **kwargs)
         self.opens = queue.Queue()
+        self.shells = queue.Queue()
         self._stop = threading.Event()
         self._thread = None
 
     def hello(self, identity, implant_id=None, hostname="raccoon-host",
-              os_name="Linux-6.1"):
+              os_name="Linux-6.1", features=None):
         body = {"identity": identity, "hostname": hostname, "os": os_name}
         if implant_id is not None:
             body["implant_id"] = implant_id
+        # Left out entirely when None: an endpoint built before the shell
+        # sends no `features` key at all, and that is the case to cover.
+        if features is not None:
+            body["features"] = features
         self.handshake(encode_message(MSG_HELLO, body))
 
     def start_pump(self):
@@ -170,6 +180,9 @@ class _CommandPeer(_Peer):
 
     def next_open_relay(self, timeout=5.0):
         return self.opens.get(timeout=timeout)
+
+    def next_open_shell(self, timeout=5.0):
+        return self.shells.get(timeout=timeout)
 
     def _run(self):
         while not self._stop.is_set():
@@ -195,6 +208,8 @@ class _CommandPeer(_Peer):
                     return
             elif kind == MSG_OPEN_RELAY:
                 self.opens.put(body)
+            elif kind == MSG_OPEN_SHELL:
+                self.shells.put(body)
 
     def close(self):
         self._stop.set()
@@ -281,6 +296,12 @@ class TunnelServerTestCase(unittest.TestCase):
         peer = _Peer("127.0.0.1", server.port, self.public, self.psks[identity])
         self.addCleanup(peer.close)
         peer.handshake(encode_message(MSG_RELAY, {"token": token.hex()}))
+        return peer
+
+    def shell_peer(self, server, identity, token):
+        peer = _Peer("127.0.0.1", server.port, self.public, self.psks[identity])
+        self.addCleanup(peer.close)
+        peer.handshake(encode_message(MSG_SHELL, {"token": token.hex()}))
         return peer
 
     def dial_relay(self, server, identity, token):
@@ -939,6 +960,179 @@ class TestRelayPairing(TunnelServerTestCase):
         row = self.row(server, "build-alpha")
         self.assertEqual((row["bytes_out"], row["bytes_in"]), (107, 40))
         self.assertEqual(row["sessions"], 1)
+
+
+class TestShellSessions(TunnelServerTestCase):
+    def shell_endpoint(self, server, identity="build-alpha", **hello):
+        hello.setdefault("features", TUNNEL_FEATURES)
+        return self.command_peer(server, identity, pump=True, **hello)
+
+    def test_open_shell_session_sends_open_shell_with_a_token_and_the_geometry(self):
+        server = self.start_server()
+        peer = self.shell_endpoint(server)
+
+        session = server.open_shell_session("build-alpha", cols=100, rows=30)
+        self.assertEqual(session.kind, "shell")
+        self.assertEqual(len(session.token), 32)
+        instruction = peer.next_open_shell()
+        self.assertEqual(instruction["token"], session.token.hex())
+        self.assertEqual((instruction["cols"], instruction["rows"]), (100, 30))
+        # The same advisory port a relay is told: one destination.
+        self.assertEqual(instruction["port"], server.port)
+
+        # Named by the codec's constants, so the defaults here are the
+        # endpoint's and not a second pair that can drift.
+        server.open_shell_session("build-alpha")
+        instruction = peer.next_open_shell()
+        self.assertEqual((instruction["cols"], instruction["rows"]),
+                         (SHELL_DEFAULT_COLS, SHELL_DEFAULT_ROWS))
+        # And nothing was sent as a relay.
+        self.assertTrue(peer.opens.empty())
+
+    def test_a_shell_claim_pairs_the_session_and_bytes_flow_both_ways(self):
+        server = self.start_server()
+        peer = self.shell_endpoint(server)
+        session = server.open_shell_session("build-alpha")
+        peer.next_open_shell()
+
+        shell = self.shell_peer(server, "build-alpha", session.token)
+        self.assertTrue(session.wait_paired(5.0))
+        self.assertEqual(session.state, "paired")
+
+        session.sock.sendall(b"ls -la\n")
+        self.assertEqual(shell.recv_raw(), b"ls -la\n")
+        shell.send_raw(b"total 0\n")
+        self.assertEqual(session.sock.recv(64), b"total 0\n")
+
+        self.assertEqual(self.row(server, "build-alpha")["sessions"], 1)
+        session.close()
+        self.wait_for(lambda: self.row(server, "build-alpha")["sessions"] == 0)
+
+    def test_a_relay_token_cannot_claim_a_shell_session(self):
+        server = self.start_server()
+        peer = self.shell_endpoint(server)
+        session = server.open_shell_session("build-alpha")
+        peer.next_open_shell()
+
+        impostor = _Peer("127.0.0.1", server.port, self.public,
+                         self.psks["build-alpha"])
+        self.addCleanup(impostor.close)
+        with self.assertLogs("raccoon.tunnel.server", level="WARNING") as caught:
+            impostor.send_first(
+                encode_message(MSG_RELAY, {"token": session.token.hex()}))
+            received, closed = _drain(impostor.sock, timeout=2.0)
+        self.assertEqual(received, b"")
+        self.assertTrue(closed)
+        self.assertFalse(session.wait_paired(0.2))
+        self.assertEqual(session.state, "pending")
+        self.assertTrue(any("shell" in line and "relay" in line
+                            for line in caught.output), caught.output)
+
+        # The refusal did not spend the token: its own kind still takes it.
+        shell = self.shell_peer(server, "build-alpha", session.token)
+        self.assertTrue(session.wait_paired(5.0))
+        session.sock.sendall(b"mine")
+        self.assertEqual(shell.recv_raw(), b"mine")
+
+    def test_a_shell_token_cannot_claim_a_relay(self):
+        server = self.start_server()
+        peer = self.shell_endpoint(server)
+        session = server.open_session("build-alpha")
+        peer.next_open_relay()
+
+        impostor = _Peer("127.0.0.1", server.port, self.public,
+                         self.psks["build-alpha"])
+        self.addCleanup(impostor.close)
+        with self.assertLogs("raccoon.tunnel.server", level="WARNING") as caught:
+            impostor.send_first(
+                encode_message(MSG_SHELL, {"token": session.token.hex()}))
+            received, closed = _drain(impostor.sock, timeout=2.0)
+        self.assertEqual(received, b"")
+        self.assertTrue(closed)
+        self.assertFalse(session.wait_paired(0.2))
+        self.assertEqual(session.state, "pending")
+        self.assertTrue(any("shell" in line and "relay" in line
+                            for line in caught.output), caught.output)
+
+        relay = self.relay_peer(server, "build-alpha", session.token)
+        self.assertTrue(session.wait_paired(5.0))
+        session.sock.sendall(b"mine")
+        self.assertEqual(relay.recv_raw(), b"mine")
+
+    def test_an_endpoint_that_advertised_no_shell_feature_is_refused(self):
+        server = self.start_server()
+        # No `features` key at all: an endpoint built before the shell.
+        self.command_peer(server, "build-alpha", pump=True)
+        with self.assertRaises(ValueError) as caught:
+            server.open_shell_session("build-alpha")
+        message = str(caught.exception)
+        self.assertIn("build-alpha", message)
+        self.assertIn("shell", message)
+
+        # A features list that does not name it is the same answer.
+        self.command_peer(server, "build-beta", pump=True, features=["other"])
+        with self.assertRaises(ValueError) as caught:
+            server.open_shell_session("build-beta")
+        self.assertIn("shell", str(caught.exception))
+
+    def test_open_shell_session_for_an_identity_with_no_channel_is_refused(self):
+        server = self.start_server()
+        with self.assertRaises(ValueError) as caught:
+            server.open_shell_session("build-alpha")
+        self.assertIn("build-alpha", str(caught.exception))
+
+    def test_the_refusal_sends_nothing_on_the_command_channel(self):
+        # An endpoint that meets a kind it does not know ends its control
+        # loop, which drops the command channel and every session that
+        # rode on it. So the property is on the channel itself: after the
+        # refusal the next frame the endpoint reads is the answer to the
+        # next thing *it* asks, not a stray OPEN_SHELL.
+        server = self.start_server()
+        # No pump: this peer reads the channel itself.
+        peer = self.command_peer(server, "build-alpha")
+        with self.assertRaises(ValueError):
+            server.open_shell_session("build-alpha")
+
+        peer.send_message(MSG_PING, {})
+        peer.sock.settimeout(5.0)
+        self.assertEqual(peer.recv_message(), (MSG_PONG, {}))
+
+        # No token was minted either, so there is no session to expire.
+        self.assertEqual(server.status(), [])
+        self.assertEqual(self.row(server, "build-alpha")["state"], "connected")
+
+    def test_a_hello_without_features_leaves_the_tuple_empty(self):
+        server = self.start_server()
+        old = self.command_peer(server, "build-alpha")
+        self.command_peer(server, "build-beta", features=["shell"])
+        self.assertEqual(self.row(server, "build-alpha")["features"], [])
+        self.assertEqual(self.row(server, "build-beta")["features"], ["shell"])
+        with server._lock:
+            channel = server._channels["build-alpha"]
+        self.assertEqual(channel.features, ())
+
+        # A disconnected row reports no features: nothing here knows them.
+        old.close()
+        self.wait_for(
+            lambda: self.row(server, "build-alpha")["state"] == "disconnected")
+        self.assertEqual(self.row(server, "build-alpha")["features"], [])
+
+    def test_a_malformed_features_value_reads_as_none(self):
+        server = self.start_server()
+        self.command_peer(server, "build-alpha", features="shell")
+        with server._lock:
+            channel = server._channels["build-alpha"]
+        self.assertEqual(channel.features, ())
+
+    def test_the_status_row_names_the_kind(self):
+        server = self.start_server()
+        peer = self.shell_endpoint(server)
+        server.open_session("build-alpha")
+        peer.next_open_relay()
+        server.open_shell_session("build-alpha")
+        peer.next_open_shell()
+        self.assertEqual([row["kind"] for row in server.status()],
+                         ["relay", "shell"])
 
 
 class TestKeepAlive(TunnelServerTestCase):
