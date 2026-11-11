@@ -7218,7 +7218,13 @@ async function drawTunnel(panel){
   const srv = data.server || {};
   const rows = data.endpoints || [];
   const running = srv.state === "running";
-  const recording = rows.some(r => r.shell_recording);
+  // Whether this deployment records shell sessions, read off the server
+  // block. It needs both a shell range and a transcript directory, the
+  // way the tunnel process decides `recording`: a directory with no
+  // range records nothing, because there is nothing to record.
+  const recording = !!(srv.shell_transcripts
+                       && srv.shell_port_first != null
+                       && srv.shell_port_last != null);
   const bytes = n => n >= 1048576 ? (n/1048576).toFixed(1)+" MB"
                    : n >= 1024 ? (n/1024).toFixed(1)+" KB" : (n||0)+" B";
   // Every refusal kind that is not zero, read off the keys rather than
@@ -7272,8 +7278,8 @@ async function drawTunnel(panel){
       + 'and Ctrl-] leaves the session:</div>'
       + line('socat -,raw,echo=0,escape=0x1d TCP:127.0.0.1:' + port)
       + '<div style="font-size:11px;color:var(--dim)">'
-      + 'Shell password (this port only &mdash; not the SOCKS password '
-      + 'above; enter it at the password prompt): '
+      + 'Shell password (this port only &mdash; not the SOCKS5 password; '
+      + 'enter it at the password prompt): '
       + esc(row.shell_password) + '</div>'
       + (shell.refused
          ? '<div style="font-size:11px;color:var(--dim)">'
@@ -7323,12 +7329,15 @@ async function drawTunnel(panel){
        '<span style="font-size:11px;color:var(--dim);margin-left:8px">'
        + esc(String(data.detail||srv.detail||"")) + '</span>')
     + '</div>'
-    // `shell_recording` is the deployment's answer ("a transcript
-    // directory and a shell range are configured") and is copied onto
-    // every row, a disconnected one and one that failed to bind
-    // included. So it is shown here, once, about the server, and not
-    // beside a row that may have nothing to record: that row's own story
-    // is its `shell` and its `shell_detail`.
+    // Recording is a fact about the deployment, not about a row: a
+    // transcript directory and a shell range are configured. A row's
+    // `shell_recording` is that same fact copied onto it, so reading it
+    // back off the rows would be a round trip through the wrong object,
+    // and one that loses exactly the cases with no row: no endpoint yet,
+    // the server stopped, unmanaged or died. The status block carries the
+    // range and the directory in every one of those states, so the badge
+    // comes from there, once, and no row says "recording": a row's own
+    // story is its `shell` and its `shell_detail`.
     + (recording
        ? '<div id="tunnel-recording-badge" style="font-size:11px;margin-top:6px">'
          + '<span style="color:var(--red,#ff1a1a)">&#9679; recording</span> '

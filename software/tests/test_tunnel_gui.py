@@ -27,6 +27,7 @@ binding those ports has to apply that rule again, and this is that task.
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -1505,9 +1506,11 @@ class TestTheTunnelPanel(unittest.TestCase):
         """
         self.assertIn("esc(String(shell.port))", self.body)
         self.assertIn("esc(row.shell_password)", self.body)
-        anchor = self.body.index("esc(row.shell_password)")
-        label = self.body[anchor - 400:anchor]
-        self.assertIn("not the SOCKS password", label)
+        flat = " ".join(self.body.split())
+        label = flat.index("not the SOCKS5 password")
+        self.assertLess(label, flat.index("esc(row.shell_password)"))
+        self.assertLess(flat.index("esc(row.shell_password)") - label, 300,
+                        "the label is not beside the credential")
         self.assertIn("refusals(shell)", self.body)
         self.assertEqual(self.body.count('indexOf("refused_")'), 1,
                          "the shell half grew its own refusal reader")
@@ -1553,25 +1556,42 @@ class TestTheTunnelPanel(unittest.TestCase):
         never shown beside a reason it does not have, and escaped: it
         carries an OS error string from a bind that failed.
         """
-        self.assertIn("esc(row.shell_detail)", self.body)
-        anchor = self.body.index("esc(row.shell_detail)")
-        guard = self.body[anchor - 400:anchor]
-        self.assertIn("row.shell\n", guard)
-        self.assertIn("? shellBlock(row)", guard)
-        self.assertLess(guard.index("? shellBlock(row)"),
-                        guard.index("row.shell_detail"),
-                        "the reason is not the else branch of the port")
+        self.assertRegex(
+            self.body,
+            r"(?s)row\.shell\s*\?\s*shellBlock\(row\)\s*:\s*"
+            r"\(row\.shell_detail\s*\?.{0,200}?esc\(row\.shell_detail\)",
+            "the reason is not the else branch of the port")
 
     def test_the_panel_shows_a_recording_badge_only_when_recording_is_on(self):
-        """A badge about the deployment, in the server block.
+        """A badge about the deployment, read off the server block.
 
-        `shell_recording` is the same on every row, a disconnected one
-        and one whose front never bound included, so a badge beside a
-        row would say "recording" about a row with nothing to record. It
-        is read once off the rows, drawn above them, and no row's own
-        markup mentions recording at all.
+        Recording is the deployment's answer -- a transcript directory
+        and a shell range are configured -- so it comes from the status
+        block, which carries both in every state the server can be in. A
+        value read back off the rows loses exactly the cases with no row:
+        no endpoint yet, the server stopped, unmanaged or died. Both
+        halves are required, because a directory with no range records
+        nothing.
+
+        The test cannot run the JavaScript, so it cannot prove the
+        empty-endpoints case; what it can hold is that the condition is
+        computed before the rows loop and names no `rows` at all.
         """
-        self.assertIn("rows.some(r => r.shell_recording)", self.body)
+        match = re.search(r"const recording = (.*?);", self.body, re.S)
+        self.assertIsNotNone(match, "no recording condition is computed")
+        condition = match.group(1)
+        for key in ("shell_transcripts", "shell_port_first",
+                    "shell_port_last"):
+            self.assertIn("srv.%s" % key, condition)
+        self.assertRegex(condition, r"srv\.shell_port_first\s*!=\s*null")
+        self.assertRegex(condition, r"srv\.shell_port_last\s*!=\s*null")
+        self.assertNotIn("rows", condition,
+                         "the condition is derived from the rows")
+        self.assertNotIn("rows.some", self.body)
+        self.assertNotIn("r.shell_recording", self.body)
+        self.assertLess(match.start(), self.body.index("rows.forEach(row"),
+                        "the condition is computed after the rows loop")
+
         self.assertRegex(
             self.body,
             r'\(recording\s*\?\s*\'<div id="tunnel-recording-badge"')
