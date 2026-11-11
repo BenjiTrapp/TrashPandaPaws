@@ -44,6 +44,19 @@ Bodies are compact JSON with sorted keys, because this channel carries a
 handful of messages an hour and reading a capture of our own test rig is
 worth more than the bytes.
 
+The two kinds that open a session for the operator rather than a relay:
+
+| Kind | Direction | Body |
+|---|---|---|
+| `MSG_OPEN_SHELL = 7` | server → endpoint, on the command channel | `{"port": <advisory>, "token": hex, "cols": int, "rows": int}` |
+| `MSG_SHELL = 8` | endpoint → server, first message of a new connection | `{"token": hex}` |
+
+`port` is advisory and ignored by the endpoint, as for `MSG_OPEN_RELAY`.
+`HELLO` carries `features`, a list of strings — `["shell"]` on a build that
+has this code. An absent `features` reads as "no shell": an endpoint that
+predates kind 7 would end its control loop on meeting one, so the server
+asks `HELLO` before it sends one.
+
 The two size ceilings are both aliases of `NoiseSession`'s own, so there
 is one number for each and not a second that can go stale:
 `MAX_FRAME_LEN` is 65535, the largest Noise message and exactly what a
@@ -76,9 +89,11 @@ from ..beacon import (                                      # noqa: F401
     MSG_CLOSE,
     MSG_HELLO,
     MSG_OPEN_RELAY,
+    MSG_OPEN_SHELL,
     MSG_PING,
     MSG_PONG,
     MSG_RELAY,
+    MSG_SHELL,
     REPLY_ADDRESS_TYPE_NOT_SUPPORTED,
     REPLY_COMMAND_NOT_SUPPORTED,
     REPLY_CONNECTION_REFUSED,
@@ -88,11 +103,15 @@ from ..beacon import (                                      # noqa: F401
     REPLY_NOT_ALLOWED,
     REPLY_SUCCEEDED,
     REPLY_TTL_EXPIRED,
+    SHELL_DEFAULT_COLS,
+    SHELL_DEFAULT_ROWS,
+    SHELL_GEOMETRY_MAX,
     SOCKS_ADDRESS_TYPE_NAMES,
     SOCKS_COMMAND_NAMES,
     SOCKS_REPLY_NAMES,
     SOCKS_VERSION,
     SUPPORTED_COMMANDS,
+    TUNNEL_FEATURES,
     NoiseSession,
     decode_message,
     decode_socks_reply,
@@ -120,9 +139,11 @@ __all__ = [
     "MSG_CLOSE",
     "MSG_HELLO",
     "MSG_OPEN_RELAY",
+    "MSG_OPEN_SHELL",
     "MSG_PING",
     "MSG_PONG",
     "MSG_RELAY",
+    "MSG_SHELL",
     "NoiseSession",
     "REPLY_ADDRESS_TYPE_NOT_SUPPORTED",
     "REPLY_COMMAND_NOT_SUPPORTED",
@@ -133,11 +154,15 @@ __all__ = [
     "REPLY_NOT_ALLOWED",
     "REPLY_SUCCEEDED",
     "REPLY_TTL_EXPIRED",
+    "SHELL_DEFAULT_COLS",
+    "SHELL_DEFAULT_ROWS",
+    "SHELL_GEOMETRY_MAX",
     "SOCKS_ADDRESS_TYPE_NAMES",
     "SOCKS_COMMAND_NAMES",
     "SOCKS_REPLY_NAMES",
     "SOCKS_VERSION",
     "SUPPORTED_COMMANDS",
+    "TUNNEL_FEATURES",
     "decode_message",
     "decode_socks_reply",
     "decode_socks_request",

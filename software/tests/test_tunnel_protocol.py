@@ -240,6 +240,9 @@ class TestMessageCodec(unittest.TestCase):
         protocol.MSG_PING: {"seq": 7},
         protocol.MSG_PONG: {"seq": 7},
         protocol.MSG_CLOSE: {"reason": "operator stopped the tunnel"},
+        protocol.MSG_OPEN_SHELL: {"port": 8446, "token": "ab" * 32,
+                                  "cols": 120, "rows": 40},
+        protocol.MSG_SHELL: {"token": "ab" * 32},
     }
 
     def test_message_round_trip_for_every_kind(self):
@@ -250,14 +253,21 @@ class TestMessageCodec(unittest.TestCase):
                 self.assertEqual(raw[0], kind)
                 self.assertEqual(protocol.decode_message(raw), (kind, body))
 
-    def test_the_six_kinds_have_the_numbers_the_protocol_fixes(self):
+    def test_the_eight_kinds_have_the_numbers_the_protocol_fixes(self):
         self.assertEqual(
             (protocol.MSG_HELLO, protocol.MSG_RELAY, protocol.MSG_OPEN_RELAY,
-             protocol.MSG_PING, protocol.MSG_PONG, protocol.MSG_CLOSE),
-            (1, 2, 3, 4, 5, 6))
+             protocol.MSG_PING, protocol.MSG_PONG, protocol.MSG_CLOSE,
+             protocol.MSG_OPEN_SHELL, protocol.MSG_SHELL),
+            (1, 2, 3, 4, 5, 6, 7, 8))
+
+    def test_the_names_of_the_two_shell_kinds(self):
+        self.assertEqual(protocol.MESSAGE_KIND_NAMES[protocol.MSG_OPEN_SHELL],
+                         "OPEN_SHELL")
+        self.assertEqual(protocol.MESSAGE_KIND_NAMES[protocol.MSG_SHELL],
+                         "SHELL")
 
     def test_unknown_message_kind_raises(self):
-        for kind in (0, 7, 255):
+        for kind in (0, 9, 255):
             with self.subTest(kind=kind):
                 with self.assertRaises(ValueError):
                     protocol.encode_message(kind, {})
@@ -572,6 +582,22 @@ class TestTheReExport(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIs(getattr(protocol, name),
                               getattr(beacon_mod, name))
+
+    def test_the_shell_constants_are_the_beacons_own(self):
+        from software.c2 import beacon as beacon_mod
+        for name in ("MSG_OPEN_SHELL", "MSG_SHELL", "TUNNEL_FEATURES",
+                     "SHELL_DEFAULT_COLS", "SHELL_DEFAULT_ROWS",
+                     "SHELL_GEOMETRY_MAX"):
+            with self.subTest(name=name):
+                self.assertIn(name, protocol.__all__)
+                self.assertEqual(getattr(protocol, name),
+                                 getattr(beacon_mod, name))
+
+    def test_the_shell_geometry_has_the_values_the_spec_fixes(self):
+        self.assertEqual((protocol.SHELL_DEFAULT_COLS,
+                          protocol.SHELL_DEFAULT_ROWS,
+                          protocol.SHELL_GEOMETRY_MAX), (120, 40, 1000))
+        self.assertEqual(protocol.TUNNEL_FEATURES, ("shell",))
 
 
 if __name__ == "__main__":

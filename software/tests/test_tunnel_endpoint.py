@@ -74,8 +74,11 @@ from software.c2.beacon import (
     REPLY_NETWORK_UNREACHABLE,
     REPLY_SUCCEEDED,
     REPLY_TTL_EXPIRED,
+    MSG_HELLO,
     TunnelEndpoint,
+    decode_message,
     decode_socks_reply,
+    encode_message,
     encode_socks_request,
     tunnel_config_problem,
 )
@@ -638,6 +641,20 @@ class TestRegistration(TunnelEndpointTestCase):
 
         row = self.wait_connected(server)
         self.assertEqual(row["implant_id"], "implant-abcd")
+
+    def test_hello_advertises_the_shell_feature(self):
+        # Port 1234 is never dialled: nothing here runs the endpoint.
+        endpoint = TunnelEndpoint(self.config_for(1234))
+        self.addCleanup(endpoint.stop)
+
+        self.assertEqual(endpoint._hello()["features"], ["shell"])
+
+    def test_a_hello_without_features_still_decodes(self):
+        # What an endpoint built before this field existed sends.
+        kind, body = decode_message(encode_message(MSG_HELLO,
+                                                   {"identity": "x"}))
+        self.assertEqual(kind, MSG_HELLO)
+        self.assertNotIn("features", body)
 
     def test_endpoint_answers_ping_with_pong(self):
         # The server drops an endpoint that is silent for a whole idle
