@@ -1759,6 +1759,16 @@ class TestTheBeaconGenTunnelForm(unittest.TestCase):
                     "around the helper that leaves it out" % name)
         for source in (self.collect, self.attach):
             self.assertNotRegex(source, r"enabled\s*:\s*false")
+        # And the switch itself, positively. The route reads this key and
+        # nothing else to decide whether a build gets a tunnel at all --
+        # `if not asked.get("enabled"): return None` -- so the negative
+        # above passes just as happily on a block that lost the key as on
+        # one that sets it. A dropped or renamed `enabled` would make
+        # every tunnel build a successful build with no tunnel: no
+        # `tunnel_identity` comes back, so the result line omits itself
+        # and the page says nothing was wrong. The pair pins both
+        # directions.
+        self.assertRegex(self.collect, r"enabled\s*:\s*true")
 
     def test_a_url_shaped_server_is_refused_before_the_request(self):
         # The route refuses a URL, a path or an embedded space, because
@@ -1774,6 +1784,17 @@ class TestTheBeaconGenTunnelForm(unittest.TestCase):
             self.assertNotIn(invented, self.validate,
                              "the form invents a refusal of its own: %r"
                              % invented)
+        # A blacklist cannot catch a refusal written with the same idiom
+        # as the legitimate one -- a host-name grammar as
+        # `/^[a-z0-9.-]+$/i.test(server)` would pass every line above --
+        # so the counts are pinned as well: one pattern tested, and
+        # exactly the route's three refusals.
+        self.assertEqual(self.validate.count(".test("), 1,
+                         "the form tests a pattern besides the one the "
+                         "route refuses")
+        self.assertEqual(self.validate.count("return false"), 3,
+                         "the form refuses something the route does not, "
+                         "or stopped refusing something it does")
 
         # Asked before anything is sent, on both paths.
         for name, source in (("runBeaconGen", self.gen),

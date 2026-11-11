@@ -147,14 +147,26 @@ class _GeneratorCase(unittest.TestCase):
             body["tunnel"] = tunnel
         return body
 
-    def post_gen(self, tunnel=None, body=None):
+    def _json_to_post(self, tunnel, posted):
+        """The body to post: a whole one, or this file's minimal one.
+
+        Both at once cannot be honoured -- a whole body already contains
+        whatever tunnel block it wants -- so it is an error here rather
+        than a silently dropped `tunnel`.
+        """
+        if tunnel is not None and posted is not None:
+            raise AssertionError(
+                "pass a tunnel block or a whole request body, not both: "
+                "the tunnel block would be ignored")
+        return self.request_body(tunnel) if posted is None else posted
+
+    def post_gen(self, tunnel=None, posted=None):
         response = self.client.post("/api/server/beacon-gen",
-                                    json=self.request_body(tunnel)
-                                    if body is None else body,
+                                    json=self._json_to_post(tunnel, posted),
                                     headers=_AUTH)
         return response
 
-    def post_gist(self, tunnel=None, body=None):
+    def post_gist(self, tunnel=None, posted=None):
         """The gist route, with `gh` replaced and its upload captured."""
         uploaded = {}
 
@@ -173,20 +185,19 @@ class _GeneratorCase(unittest.TestCase):
             raise AssertionError("unexpected command: %r" % (args,))
 
         with mock.patch.object(server_mod.subprocess, "run", fake_run):
-            response = self.client.post("/api/server/beacon-gist",
-                                        json=self.request_body(tunnel)
-                                        if body is None else body,
-                                        headers=_AUTH)
+            response = self.client.post(
+                "/api/server/beacon-gist",
+                json=self._json_to_post(tunnel, posted), headers=_AUTH)
         self._uploaded = uploaded.get("stage")
         return response
 
-    def generate(self, route, tunnel=None, body=None):
+    def generate(self, route, tunnel=None, posted=None):
         """`(response_json, gen_cfg)` for one build from one route.
 
-        `body` is the whole request, for the one test that posts what the
-        Beacon Gen form posts rather than this file's minimal body.
+        `posted` is the whole request, for the one test that posts what
+        the Beacon Gen form posts rather than this file's minimal body.
         """
-        response = getattr(self, "post_" + route)(tunnel, body)
+        response = getattr(self, "post_" + route)(tunnel, posted)
         self.assertEqual(response.status_code, 200, response.data[:400])
         body = response.get_json()
         if route == "gen":
@@ -281,7 +292,7 @@ class TestTheGeneratorBakesATunnelBlock(_GeneratorCase):
                 }
                 if route == "gist":
                     posted["filename"] = "update.py"
-                body, gen_cfg = self.generate(route, body=posted)
+                body, gen_cfg = self.generate(route, posted=posted)
 
                 baked = gen_cfg.get("tunnel")
                 self.assertIsInstance(
