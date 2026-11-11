@@ -164,6 +164,17 @@ def _endpoint(identity="a1b2c3d4e5f6", **over):
         "socks_detail": "",
         "username": identity,
         "password": "socks-password-for-tests",
+        # The sibling port that carries a terminal. Its own secret, and
+        # distinct from the SOCKS one on purpose: a fixture that reused
+        # the value could not tell a panel that printed the wrong one.
+        "shell": {"identity": identity, "port": 40300, "serving": True,
+                  "sessions": 1, "max_sessions": 4, "pending": 0,
+                  "max_pending": 8, "accepted": 3, "carried": 2,
+                  "bytes_in": 512, "bytes_out": 1024, "refused": 2,
+                  "refused_auth": 2},
+        "shell_password": "shell-password-for-tests",
+        "shell_detail": "",
+        "shell_recording": False,
     }
     row.update(over)
     return row
@@ -1083,6 +1094,43 @@ class TestTheTunnelRoutes(_RouteCase):
         self.assertTrue(row["linked"])
         self.assertEqual(row["interval"], 300)
 
+    def test_the_row_carries_the_shell_fields_through_unchanged(self):
+        """Four fields the panel reads, all of them copied and none made.
+
+        Three rows, because the three states are three different stories
+        and a copy that special-cased any of them would pass on one: an
+        open shell port, a disconnected endpoint, and one whose front
+        could not bind. `shell_recording` is the same on all three -- it
+        is the deployment's answer and not the row's -- and is pinned
+        here as received so that a route which "tidied" it per row would
+        fail.
+        """
+        opened = _endpoint("open-one", shell_recording=True)
+        away = _endpoint("away-one", port=19051, state="disconnected",
+                         shell=None, shell_password=None,
+                         shell_detail="no shell port is open yet",
+                         shell_recording=True)
+        failed = _endpoint("failed-one", port=19052, shell=None,
+                           shell_password=None,
+                           shell_detail="the shell port 40301 could not be "
+                                        "opened: address already in use",
+                           shell_recording=True)
+        sent = [opened, away, failed]
+        supervisor = _FakeTunnelSupervisor(endpoints=sent)
+        body = self.client(supervisor).get(
+            "/api/server/tunnel", headers=self.auth()).get_json()
+
+        got = {row["identity"]: row for row in body["endpoints"]}
+        for row in sent:
+            for key in ("shell", "shell_password", "shell_detail",
+                        "shell_recording"):
+                with self.subTest(identity=row["identity"], key=key):
+                    self.assertIn(key, got[row["identity"]])
+                    self.assertEqual(got[row["identity"]][key], row[key])
+        # And the two credentials arrive as two credentials.
+        self.assertNotEqual(got["open-one"]["shell_password"],
+                            got["open-one"]["password"])
+
     def test_server_stop_is_immediate_and_the_response_says_it_drops_every_endpoint(self):
         supervisor = _FakeTunnelSupervisor(
             endpoints=[_endpoint("aaa"), _endpoint("bbb", port=19051)])
@@ -1445,6 +1493,99 @@ class TestTheTunnelPanel(unittest.TestCase):
         # credential where they are looking at the port.
         self.assertIn("esc(row.username)", self.body)
         self.assertIn("esc(row.password)", self.body)
+
+    def test_the_panel_shows_the_shell_port_and_its_password(self):
+        """The port from the `shell` object, the credential from its own field.
+
+        And the label saying the credential is not the SOCKS one: the two
+        sit a few lines apart on one row, and copying the wrong one would
+        be refused with nothing to say why. The refusal detail goes
+        through the reader the SOCKS half uses; a second one is a second
+        place to get the nine kinds wrong.
+        """
+        self.assertIn("esc(String(shell.port))", self.body)
+        self.assertIn("esc(row.shell_password)", self.body)
+        anchor = self.body.index("esc(row.shell_password)")
+        label = self.body[anchor - 400:anchor]
+        self.assertIn("not the SOCKS password", label)
+        self.assertIn("refusals(shell)", self.body)
+        self.assertEqual(self.body.count('indexOf("refused_")'), 1,
+                         "the shell half grew its own refusal reader")
+
+    def test_the_panel_shows_the_ssh_forward_before_the_attach_command(self):
+        # The port is on the team server and the panel is reached over a
+        # forward, so a command that opens with the attach line sends the
+        # operator to a port their workstation does not have.
+        forward = self.body.index("ssh -L ")
+        attach = self.body.index("python3 tools/raccoon_shell.py 127.0.0.1 ")
+        self.assertLess(forward, attach)
+        self.assertIn("not on your workstation", self.body)
+        self.assertLess(self.body.index("not on your workstation"), forward)
+        self.assertIn("' + port + ':127.0.0.1:' + port", self.body,
+                      "the forward does not name the shell port at both ends")
+
+    def test_the_panel_names_the_attach_client_and_the_socat_fallback(self):
+        socat = ("socat -,raw,echo=0,escape=0x1d TCP:127.0.0.1:' + port")
+        self.assertIn(socat, self.body)
+        client = self.body.index("python3 tools/raccoon_shell.py 127.0.0.1 ")
+        self.assertLess(client, self.body.index(socat),
+                        "the fallback is offered before the client")
+        self.assertIn("Fallback", self.body)
+        # What each one does about the way out, which is different and
+        # which an operator cannot guess: the client has no escape key
+        # and the socat line's is Ctrl-].
+        self.assertIn("sends your terminal size", self.body)
+        self.assertIn("no escape key", self.body)
+        self.assertIn("Ctrl-]", self.body)
+        self.assertIn("socat cannot send a terminal size", self.body)
+
+    def test_the_panel_says_the_session_is_a_root_shell_on_the_implant_host(self):
+        self.assertIn("root shell on the implant host", self.body)
+        warning = self.body.index("root shell on the implant host")
+        window = self.body[warning:warning + 300]
+        self.assertIn("Forwarding the port", window)
+        self.assertIn("loopback", window)
+
+    def test_a_row_without_a_shell_port_shows_the_reason(self):
+        """`shell_detail` stands in for the port when there is none.
+
+        Guarded on the absence of the `shell` object, so an open port is
+        never shown beside a reason it does not have, and escaped: it
+        carries an OS error string from a bind that failed.
+        """
+        self.assertIn("esc(row.shell_detail)", self.body)
+        anchor = self.body.index("esc(row.shell_detail)")
+        guard = self.body[anchor - 400:anchor]
+        self.assertIn("row.shell\n", guard)
+        self.assertIn("? shellBlock(row)", guard)
+        self.assertLess(guard.index("? shellBlock(row)"),
+                        guard.index("row.shell_detail"),
+                        "the reason is not the else branch of the port")
+
+    def test_the_panel_shows_a_recording_badge_only_when_recording_is_on(self):
+        """A badge about the deployment, in the server block.
+
+        `shell_recording` is the same on every row, a disconnected one
+        and one whose front never bound included, so a badge beside a
+        row would say "recording" about a row with nothing to record. It
+        is read once off the rows, drawn above them, and no row's own
+        markup mentions recording at all.
+        """
+        self.assertIn("rows.some(r => r.shell_recording)", self.body)
+        self.assertRegex(
+            self.body,
+            r'\(recording\s*\?\s*\'<div id="tunnel-recording-badge"')
+        badge = self.body.index("tunnel-recording-badge")
+        rows = self.body.index("rows.forEach(row")
+        self.assertLess(badge, rows,
+                        "the badge is drawn inside the per-row markup")
+        per_row = self.body[rows:self.body.index("panel.innerHTML = html;",
+                                                 rows)]
+        shell_half = self.body[self.body.index("const shellBlock"):
+                               self.body.index("let html = head")]
+        for name, text in (("a row", per_row), ("the shell half", shell_half)):
+            self.assertNotIn("record", text.lower(),
+                             "%s says it is recording" % name)
 
 
 # New test classes belong above this guard; never append below it.

