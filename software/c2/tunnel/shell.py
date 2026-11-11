@@ -1167,10 +1167,12 @@ class ShellFront(object):
                 # closed first, because its sidecar is what a reader comes
                 # back for and it should be on the disk before the session
                 # is let go of; and the session is torn down regardless of
-                # what closing the transcript did. `Recorder.close` is
-                # written not to raise, and this is what makes that a
-                # property of the session rather than a promise one class
-                # makes about itself.
+                # what closing the transcript did. There is no `except`
+                # here, so this rests on `Recorder.close` not raising --
+                # which it does not: every call inside it is guarded, so
+                # it sets the recorder aside rather than propagating. Were
+                # that to change, a raising close would end this thread
+                # with a traceback after the session was already down.
                 stream.close()
                 shutdown_both(conn)
 

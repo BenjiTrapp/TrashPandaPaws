@@ -1,11 +1,13 @@
-"""The implant-facing side of the tunnel: one port, two kinds of connection.
+"""The implant-facing side of the tunnel: one port, three kinds of connection.
 
 Every connection an endpoint makes arrives here, and **which kind it is
 comes from inside the encryption.** The responder completes the Noise
 handshake, reads the payload that came with message 1, and dispatches on
-it: a `HELLO` becomes a command channel this server holds open, a
-`RELAY(token)` is matched against the sessions it has outstanding and
-spliced to the one whose token it carries.
+it: a `HELLO` becomes a command channel this server holds open, and a
+`RELAY(token)` or a `SHELL(token)` is matched against the sessions it has
+outstanding and spliced to the one whose token it carries -- a token only
+claims the kind it was minted for, so a `SHELL` token cannot take a relay
+session nor the reverse.
 
 **One port, and that is not an implementation shortcut.** The protocol
 this is derived from allocated a fresh high port per pending session and
@@ -1061,7 +1063,7 @@ class TunnelServer(object):
         was, and the token has to have been minted for that kind.
         """
         self._authenticated(conn)
-        token = _token_bytes(body.get("token"))
+        token = _token_bytes(body.get("token"), kind)
         session = self._claim(token, identity, peer, kind)
         if session is None:
             return False
@@ -1459,15 +1461,21 @@ def _features(value) -> Tuple[str, ...]:
     return tuple(item for item in value if isinstance(item, str))
 
 
-def _token_bytes(value) -> bytes:
-    """The 32 bytes a `RELAY` message's hex token stands for."""
+def _token_bytes(value, kind: str) -> bytes:
+    """The 32 bytes a `RELAY` or `SHELL` message's hex token stands for.
+
+    `kind` is `"relay"` or `"shell"`: both arrive through this one path,
+    so a refusal has to name the kind it was actually given rather than
+    always say `RELAY`.
+    """
     if not isinstance(value, str):
-        raise ValueError("a RELAY message carries its token as a hex string")
+        raise ValueError("a %s message carries its token as a hex string"
+                         % kind.upper())
     try:
         token = bytes.fromhex(value)
     except ValueError:
-        raise ValueError("a RELAY token must be hex")
+        raise ValueError("a %s token must be hex" % kind.upper())
     if len(token) != TOKEN_LEN:
-        raise ValueError("a RELAY token is %d bytes, got %d"
-                         % (TOKEN_LEN, len(token)))
+        raise ValueError("a %s token is %d bytes, got %d"
+                         % (kind.upper(), TOKEN_LEN, len(token)))
     return token
