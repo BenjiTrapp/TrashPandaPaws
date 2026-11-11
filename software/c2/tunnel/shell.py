@@ -62,6 +62,22 @@ so a fifth admitted here could only be refused at the far end, after the
 operator had already been told they were through. The cap matches the
 endpoint's deliberately.
 
+**One thing this port has that `socks.py` does not: it can record.** What
+a transcript holds is the output direction, byte for byte -- what the
+terminal showed, which is a typescript in `script(1)`'s sense. That
+already contains everything the operator typed, because the terminal
+echoes it, so there is no second keystroke file to write and no second
+one to protect. Recording is off unless a directory is configured, and
+`Transcripts.open` is called at the pairing: by then the password line
+has been read and compared, so the attach password cannot reach a
+transcript. What can reach one is a credential the operator types
+*inside* a session, unavoidably -- which is why these are 0600 files in a
+0700 directory and why the documentation says so in those words. And
+because a transcript is still only a log file, nothing about it may cost
+a session: a directory that cannot be created, a write that fails, a
+session past the ceiling -- each is logged once with its reason, sets the
+recorder aside, and leaves the shell running.
+
 One sharp edge of this wire, handled in `_read_line`: the bytes after the
 newline are already input for the shell. An attach client is free to put
 the password line and the first keystrokes in one segment, so what
@@ -75,7 +91,9 @@ this package's own `server` module either: a duck-typed
 """
 
 import hmac
+import json
 import logging
+import os
 import re
 import socket
 import threading
@@ -99,7 +117,8 @@ from .socks import (
 
 logger = logging.getLogger("raccoon.tunnel.shell")
 
-__all__ = ["ShellFront", "DEFAULT_MAX_SESSIONS", "PROMPT", "parse_auth_line"]
+__all__ = ["ShellFront", "DEFAULT_MAX_SESSIONS", "PROMPT", "Recorder",
+           "TRANSCRIPT_MAX_BYTES", "Transcripts", "parse_auth_line"]
 
 # Four, because the endpoint holds four shell sessions at once: see the
 # module docstring.
@@ -157,6 +176,22 @@ _JOIN_TIMEOUT = 5.0
 # chose and this port does not get to trim it.
 _GEOMETRY = re.compile(r"\A(\d{1,5})x(\d{1,5})\Z")
 
+# The most one session will record, after which recording stops and the
+# session carries on. A ceiling rather than a disk quota, because what
+# this bounds is one `tcpdump` or one `yes` inside a shell: 16 MiB is far
+# more terminal output than an engagement reads back, and far less than a
+# team server's disk.
+TRANSCRIPT_MAX_BYTES = 16 * 1024 * 1024
+
+# A transcript is evidence and a secret at the same time, so the same two
+# modes the key store uses.
+_DIR_MODE = 0o700
+_FILE_MODE = 0o600
+
+# Everything a build identity may not contribute to a path component:
+# see `_folder_name`.
+_UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
+
 # Everything outside printable ASCII, which is what a refusal is reduced
 # to before it is written: see `_line`.
 _UNPRINTABLE = re.compile(r"[^\x20-\x7e]")
@@ -195,6 +230,257 @@ def _clamp(value: int) -> int:
     return max(1, min(SHELL_GEOMETRY_MAX, value))
 
 
+class Recorder(object):
+    """One session's typescript, and the sidecar written when it closes.
+
+    Owned by the one thread that pumps the output direction: that thread
+    opens it, writes every byte it sends to the operator, and closes it
+    in its own teardown. So there is no lock here, and no lifetime
+    question for anything else to get wrong.
+
+    **Nothing this object does raises.** A transcript is a log file and
+    the thing it is logging is an operator's shell: a failed write, a
+    descriptor that has gone, a full disk -- each is logged once with its
+    reason, sets this recorder aside, and leaves the session running.
+    `truncated` is then true, because that is exactly what it means: the
+    transcript is short of the session, whether it stopped at the ceiling
+    or because the disk said no.
+    """
+
+    def __init__(self, path: str, handle, facts: dict, max_bytes: int):
+        self.path = path
+        self.truncated = False
+        self.bytes = 0
+        self._handle = handle
+        self._sidecar = path + ".json"
+        self._facts = facts
+        self._max = max_bytes
+        self._closed = False
+
+    def write(self, data: bytes) -> None:
+        """Record what the operator's terminal was shown."""
+        handle = self._handle
+        if handle is None or not data:
+            return
+        room = self._max - self.bytes
+        if room <= 0:
+            # Exactly at the ceiling with more to show. Nothing had been
+            # dropped until this call, so this is where it stops rather
+            # than where it stopped.
+            self._stop("reached its %d-byte ceiling" % self._max)
+            return
+        chunk = data if len(data) <= room else data[:room]
+        try:
+            handle.write(chunk)
+            # Flushed per chunk rather than left in a buffer. This is
+            # evidence, and the bytes of a session whose team server was
+            # killed are worth more on the disk than in a buffer that
+            # died with it. One write per chunk, and a chunk already cost
+            # a read and a send.
+            handle.flush()
+        except Exception as exc:
+            self._stop("could not be written: %s" % exc)
+            return
+        self.bytes += len(chunk)
+        if len(chunk) < len(data):
+            self._stop("reached its %d-byte ceiling" % self._max)
+
+    def close(self, reason: str) -> None:
+        """Close the transcript and write the sidecar beside it.
+
+        `reason` is why the recording stopped, in this module's words, and
+        is the one field of the sidecar that is not a measurement. Safe
+        twice: this is called from a teardown.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception as exc:
+                logger.warning("shell: the transcript %s could not be "
+                               "closed: %s", self.path, exc)
+        facts = dict(self._facts)
+        facts.update({
+            "ended": _stamp(time.time()),
+            "bytes": self.bytes,
+            "truncated": self.truncated,
+            "reason": " ".join(str(reason).split()),
+        })
+        try:
+            _write_private_json(self._sidecar, facts)
+        except Exception as exc:
+            # The transcript itself is already on the disk and closed, so
+            # this costs a reader the facts about it and nothing else.
+            logger.warning("shell: the sidecar %s could not be written: %s. "
+                           "The transcript it describes is %s, %d bytes%s.",
+                           self._sidecar, exc, self.path, self.bytes,
+                           ", truncated" if self.truncated else "")
+            return
+        logger.info("shell: the transcript %s is closed after %d bytes%s: %s",
+                    self.path, self.bytes,
+                    " (truncated)" if self.truncated else "", facts["reason"])
+
+    def _stop(self, what: str) -> None:
+        """Set this recorder aside, saying why, and say it once."""
+        handle, self._handle = self._handle, None
+        self.truncated = True
+        logger.warning("shell: the transcript %s %s, so the rest of this "
+                       "session is not recorded. The session itself is "
+                       "untouched.", self.path, what)
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                # Already reported above, and a descriptor this end can do
+                # nothing more with is not worth a second line.
+                pass
+
+
+class Transcripts(object):
+    """Where sessions are recorded, when a directory is configured.
+
+    `directory` absent -- `None`, or the empty string a configuration key
+    that is present and blank produces -- is recording switched off:
+    `enabled` is False, `open` answers None, no directory is created and
+    no byte is written. That is the default, and it is one answer for the
+    whole deployment rather than one per identity, because "is this
+    engagement recorded" is how the question is actually asked.
+
+    When it is on, one session is one `<identity>/<when>-<n>.typescript`
+    under this directory, created 0600 in directories created 0700, with a
+    `.json` sibling written at the close carrying `identity`, `session`,
+    `peer`, `started`, `ended`, `bytes`, `truncated` and `reason`.
+    `bytes` is what the transcript holds -- the file's own size -- and
+    `truncated` says whether the session had more to show than that.
+
+    `max_bytes` is the per-session ceiling. A parameter so that a test can
+    reach it without pushing 16 MiB through a session; nothing in
+    production passes it.
+    """
+
+    def __init__(self, directory=None, *,
+                 max_bytes: int = TRANSCRIPT_MAX_BYTES):
+        self.directory = (os.path.abspath(os.fspath(directory))
+                          if directory else None)  # type: Optional[str]
+        self.enabled = self.directory is not None
+        self.max_bytes = int(max_bytes)
+        if self.max_bytes < 1:
+            raise ValueError("max_bytes must be at least 1, got %r"
+                             % (max_bytes,))
+
+    def open(self, identity: str, session: int,
+             peer: str) -> Optional[Recorder]:
+        """A recorder for one session, or None if nothing will be recorded.
+
+        Never raises. A directory that cannot be created, a name already
+        taken, a file that cannot be opened: each costs this recording,
+        is logged once with its reason, and leaves the caller a None it
+        can carry a session with. The operator's shell must not die
+        because a log file could not be opened.
+        """
+        if self.directory is None:
+            return None
+        started = time.time()
+        folder = os.path.join(self.directory, _folder_name(identity))
+        # Basic ISO-8601 rather than extended: a colon is hostile in a
+        # filename on one of the filesystems an engagement's evidence
+        # gets copied to, and awkward in every shell. The sidecar's own
+        # `started` is the extended spelling, for reading.
+        path = os.path.join(folder, "%s-%d.typescript" % (
+            time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(started)), session))
+        try:
+            _private_dir(folder)
+            # `O_EXCL`, so a name already taken is a refusal and never an
+            # overwrite: the one file this must not damage is a transcript
+            # somebody already has. 0600 from the instant it exists rather
+            # than tightened afterwards.
+            descriptor = os.open(path,
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                 _FILE_MODE)
+            handle = os.fdopen(descriptor, "wb")
+        except Exception as exc:
+            logger.warning("shell: %r's session %d for %s is not being "
+                           "recorded: %s could not be opened: %s",
+                           identity, session, peer, path, exc)
+            return None
+        logger.info("shell: recording %r's session %d for %s to %s",
+                    identity, session, peer, path)
+        return Recorder(path, handle, {
+            "identity": str(identity),
+            "session": int(session),
+            "peer": str(peer),
+            "started": _stamp(started),
+        }, self.max_bytes)
+
+
+def _folder_name(identity: str) -> str:
+    """One path component for a build identity, whatever it is made of.
+
+    An identity is an operator-chosen string, and this is the only place
+    one becomes a path: `../..` and a leading dot are flattened rather
+    than trusted. Two identities can therefore share a folder, which is
+    the lesser of the two evils and costs nothing a reader needs -- every
+    sidecar in it carries the identity verbatim.
+    """
+    flat = _UNSAFE_NAME.sub("_", str(identity)).lstrip(".")
+    return flat or "unnamed"
+
+
+def _private_dir(path: str) -> None:
+    """Create `path` and any parent it needs, each 0700.
+
+    Not `os.makedirs(mode=_DIR_MODE)`: that applies the mode to the leaf
+    alone and leaves any parent it had to create at the process umask,
+    which for this tree would be 0600 transcripts under a directory
+    anybody can list. A directory that already exists is left exactly as
+    it is, as the key store leaves its own: it may be one this module
+    does not own.
+    """
+    parent = os.path.dirname(path)
+    if parent and parent != path and not os.path.isdir(parent):
+        _private_dir(parent)
+    try:
+        os.mkdir(path, _DIR_MODE)
+    except FileExistsError:
+        pass
+
+
+def _write_private_json(path: str, document: dict) -> None:
+    """Write one small JSON file 0600: all of it, or none of it.
+
+    A scratch file in the same directory, created 0600, fsynced and moved
+    over the target -- the shape `keys.py` writes the key store with, for
+    the same two reasons. Whoever reads a sidecar never sees half of one,
+    and the file is private from the instant it exists.
+    """
+    data = (json.dumps(document, indent=2, sort_keys=True)
+            + "\n").encode("utf-8")
+    directory, name = os.path.split(path)
+    scratch = os.path.join(directory,
+                           ".%s.%s.tmp" % (name, os.urandom(6).hex()))
+    descriptor = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                         _FILE_MODE)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(scratch, path)
+    finally:
+        try:
+            os.unlink(scratch)
+        except FileNotFoundError:
+            pass
+
+
+def _stamp(when: float) -> str:
+    """One instant, UTC, as the key store spells its own timestamps."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when))
+
+
 class ShellFront(object):
     """The operator-facing shell listener for one endpoint identity.
 
@@ -206,8 +492,9 @@ class ShellFront(object):
     shell port table. 0 binds an ephemeral port, which is what the tests
     use; `port` reports what was actually bound.
 
-    `transcripts` is where a later task records a session. It is stored
-    and nothing is asked of it here.
+    `transcripts` is a `Transcripts`, or None for a deployment that
+    records nothing. Only the output direction of a session is recorded,
+    and only from its pairing onward: see the module docstring.
     """
 
     def __init__(self, tunnel_server, identity: str, bind_port: int,
@@ -269,6 +556,11 @@ class ShellFront(object):
         self._live = 0
         self._accepted = 0
         self._carried = 0
+        # The number in a transcript's name: the nth session this port has
+        # started recording. Not in `stats`, which is the SOCKS row's
+        # shape and read generically by the panel; this is here so that two
+        # sessions paired in the same second are still two files.
+        self._recorded = 0
         self._bytes_in = 0
         self._bytes_out = 0
         self._refusals = {"auth": 0, "capacity": 0, "pending": 0,
@@ -621,13 +913,14 @@ class ShellFront(object):
                 return
             logger.info("shell: %s is attached to %r, %dx%d", peer,
                         self.identity, cols, rows)
-            self._pump(conn, session.sock, pipelined)
+            self._pump(conn, session.sock, pipelined, peer)
         finally:
             with self._lock:
                 self._sessions.discard(session)
             session.close()
 
-    def _pump(self, conn: socket.socket, stream, pipelined: bytes) -> None:
+    def _pump(self, conn: socket.socket, stream, pipelined: bytes,
+              peer: str) -> None:
         """Carry bytes until either side is finished.
 
         Both descriptors lose their timeout here. The auth line had a
@@ -649,7 +942,8 @@ class ShellFront(object):
         """
         conn.settimeout(None)
         stream.settimeout(None)
-        back = threading.Thread(target=self._downstream, args=(conn, stream),
+        back = threading.Thread(target=self._downstream,
+                                args=(conn, stream, peer),
                                 name="shell-relay", daemon=True)
         try:
             self._start(back)
@@ -707,19 +1001,71 @@ class ShellFront(object):
             with self._lock:
                 self._bytes_out += len(data)
 
-    def _downstream(self, conn: socket.socket, stream) -> None:
-        """What the terminal prints, back to the operator."""
-        try:
-            self._downstream_loop(conn, stream)
-        finally:
-            # This direction ending means the shell has gone, so the
-            # session goes with it: the operator's client is sent the FIN
-            # it is waiting for and the other direction's blocked `recv` is
-            # unparked.
-            stream.close()
-            shutdown_both(conn)
+    def _downstream(self, conn: socket.socket, stream, peer: str) -> None:
+        """What the terminal prints, back to the operator -- and recorded.
 
-    def _downstream_loop(self, conn: socket.socket, stream) -> None:
+        The transcript is opened here and closed here, on the one thread
+        that writes to it. This direction is all a transcript holds, and a
+        recorder that is created and destroyed by the thread that owns it
+        has no lifetime for anything else to get wrong. It is opened after
+        the pairing, which is after the password line was read and
+        compared, so the attach password cannot reach a transcript.
+        """
+        recorder = self._record(peer)
+        # A default, so that this is still answerable if the loop below
+        # leaves by a way it has no name for.
+        reason = "the output direction of the session ended"
+        try:
+            reason = self._downstream_loop(conn, stream, recorder)
+        finally:
+            try:
+                if recorder is not None:
+                    recorder.close(reason)
+            finally:
+                # This direction ending means the shell has gone, so the
+                # session goes with it: the operator's client is sent the
+                # FIN it is waiting for and the other direction's blocked
+                # `recv` is unparked.
+                #
+                # In a `finally` of its own so that the ordering and the
+                # guarantee can both hold at once. The transcript is
+                # closed first, because its sidecar is what a reader comes
+                # back for and it should be on the disk before the session
+                # is let go of; and the session is torn down regardless of
+                # what closing the transcript did. `Recorder.close` is
+                # written not to raise, and this is what makes that a
+                # property of the session rather than a promise one class
+                # makes about itself.
+                stream.close()
+                shutdown_both(conn)
+
+    def _record(self, peer: str) -> Optional[Recorder]:
+        """A recorder for one session's output, or None for no recording.
+
+        None is the ordinary answer: recording is off unless a directory
+        was configured, and `Transcripts.open` answers None for every
+        failure it meets as well.
+        """
+        transcripts = self._transcripts
+        if transcripts is None:
+            return None
+        with self._lock:
+            self._recorded += 1
+            number = self._recorded
+        try:
+            return transcripts.open(self.identity, number, peer)
+        except Exception:
+            # Belt and braces: `Transcripts.open` reports its own
+            # failures, so reaching here is the object this port was
+            # handed rather than a disk that filled. Even that costs the
+            # recording and never the operator's shell.
+            logger.exception("shell: %r's session %d could not be recorded",
+                             self.identity, number)
+            return None
+
+    def _downstream_loop(self, conn: socket.socket, stream,
+                         recorder: Optional[Recorder]) -> str:
+        """Carry this direction until it ends, and say why it ended."""
         while True:
             try:
                 data = stream.recv(_CHUNK)
@@ -728,21 +1074,27 @@ class ShellFront(object):
                 # already closed itself over it, per Noise §5.1.
                 logger.warning("shell: a frame for %r did not authenticate; "
                                "the session is over", self.identity)
-                return
+                return "a frame of this session did not authenticate"
             except OSError:
-                return
+                return "the terminal's stream ended"
             # `b""` is the far end finished, and which of the three ways it
             # finished -- an orderly teardown, a truncated frame, a dead
             # socket -- is not knowable here, nor worth knowing: the one
             # thing to do about any of them is to end the session.
             if not data:
-                return
+                return "the terminal closed"
             try:
                 conn.sendall(data)
             except OSError:
-                return
+                return "the operator's connection ended"
             with self._lock:
                 self._bytes_in += len(data)
+            if recorder is not None:
+                # After the send, so a transcript is what the operator's
+                # terminal was shown, and outside the lock, because a disk
+                # write under it would serialise every session on this
+                # port behind this one.
+                recorder.write(data)
 
     # ── refusals ──
 

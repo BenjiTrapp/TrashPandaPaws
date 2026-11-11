@@ -4,7 +4,7 @@ Unit tests for the operator-facing shell port: one authenticated loopback
 port per build identity, which pairs a connection with a terminal session
 on the endpoint.
 
-Five things these tests are careful about.
+Six things these tests are careful about.
 
 **Both sides are real.** The server end is a real `TunnelServer` with a
 real `KeyStore`, and the far end is a stub endpoint that speaks the
@@ -33,6 +33,14 @@ geometry it was asked for, so a crossed pair shows up as one session
 holding the other's terminal size rather than as a count that still adds
 up. Both are still live when the assertions run.
 
+**A transcript is read back off the disk.** Every assertion about a
+recording opens the file the port wrote and looks at its bytes, its mode
+and its sidecar, rather than at a recorder that was handed in: what is
+being checked is that an operator who comes back to this directory after
+the engagement finds the session in it, and that the attach password is
+not in it. The one exception is the ceiling, whose 16 MiB is passed in
+smaller rather than pushed through a session.
+
 **No thread may die quietly.** `setUp` installs a `threading.excepthook`
 and a handler on both tunnel loggers, and the last cleanup to run asserts
 that no thread raised and that nothing was logged at ERROR or above. A
@@ -40,6 +48,7 @@ port that survives a hostile client by crashing a worker would otherwise
 pass every assertion in this file.
 """
 
+import json
 import logging
 import os
 import queue
@@ -200,6 +209,25 @@ def tagged_echo(shell, cols, rows):
         if not data:
             return
         shell.send(tag + data)
+
+
+def quiet_terminal(shell, cols, rows):
+    """A terminal that prints one line of its own and never echoes.
+
+    `tagged_echo` cannot tell a transcript's two directions apart, because
+    everything it prints is the input coming back. This one prints
+    something the operator never typed and swallows everything they did.
+    """
+    shell.send(SHOWN_BY_THE_TERMINAL)
+    while True:
+        if not shell.receive():
+            return
+
+
+# What `quiet_terminal` prints, and what it is answering: a transcript
+# holds the first and not the second.
+SHOWN_BY_THE_TERMINAL = b"shown-by-the-terminal\r\n"
+TYPED_BY_THE_OPERATOR = b"typed-by-the-operator\n"
 
 
 class _StubEndpoint(object):
@@ -1106,18 +1134,417 @@ class TestWhatTheOperatorPanelReads(ShellFrontTestCase):
         self.assertEqual(front.stats()["accepted"], 3)
         self.assertEqual(front.stats()["carried"], 0)
 
-    def test_a_transcripts_object_is_accepted_and_otherwise_untouched(self):
-        # Task 6 fills this parameter in. Until then it is stored and
-        # nothing is asked of it, which is what this asserts: a session
-        # carries bytes with an object that would raise on any call.
-        class Explodes(object):
-            def __getattr__(self, name):
-                raise AssertionError("nothing may be asked of transcripts "
-                                     "yet, and %r was" % name)
-
-        _, front, endpoint = self.rig(transcripts=Explodes())
+    def test_a_transcripts_object_is_what_the_recording_switch_passes(self):
+        # The parameter is a `Transcripts`; `TestTranscripts` below covers
+        # what it then writes. Here it is only that an off one -- which is
+        # what a deployment with no configured directory has -- changes
+        # nothing about a session.
+        _, front, endpoint = self.rig(transcripts=shell_mod.Transcripts(None))
         self.carried(front)
         self.assertEqual(front.stats()["carried"], 1)
+        self.assert_endpoint_healthy(endpoint)
+
+
+class _BrokenWrites(shell_mod.Transcripts):
+    """Transcripts whose recorder loses its file the instant it is opened.
+
+    A real file object raising a real `ValueError` on the first write,
+    which is what a revoked descriptor looks like from here and is the
+    nearest a test gets to a full disk. The point is that the session must
+    not notice.
+    """
+
+    def open(self, identity, session, peer):
+        recorder = shell_mod.Transcripts.open(self, identity, session, peer)
+        if recorder is not None:
+            recorder._handle.close()
+        return recorder
+
+
+class TestTranscripts(ShellFrontTestCase):
+    """Review Focus: recording is off unless a directory is configured, and
+    a recording that fails costs the recording and never the session.
+    """
+
+    # ── harness ──
+
+    def recording(self, **kwargs):
+        """A `Transcripts` under a directory that does not exist yet.
+
+        Two levels deep on purpose: `os.makedirs(mode=0o700)` applies the
+        mode to the leaf alone, so a parent left at the process umask
+        would be a listable directory holding 0600 files.
+        """
+        directory = os.path.join(self.root, "recordings", "shell")
+        return shell_mod.Transcripts(directory, **kwargs), directory
+
+    def tree(self):
+        """Every path under the test's root, for a before-and-after."""
+        found = []
+        for base, directories, files in os.walk(self.root):
+            for name in list(directories) + list(files):
+                found.append(os.path.relpath(os.path.join(base, name),
+                                             self.root))
+        return sorted(found)
+
+    def mode(self, path):
+        return os.stat(path).st_mode & 0o777
+
+    def folder(self, directory):
+        return os.path.join(directory, self.identity)
+
+    def written(self, directory, count=2):
+        """The one session's files under `directory`, as paths.
+
+        `count` is how many are expected, so a missing sidecar is a named
+        failure rather than an `IndexError` three lines later.
+        """
+        folder = self.folder(directory)
+        self.assertTrue(os.path.isdir(folder),
+                        "no directory was made for %r" % self.identity)
+        names = sorted(os.listdir(folder))
+        self.assertEqual(len(names), count,
+                         "expected %d file(s) under %s, found %r"
+                         % (count, folder, names))
+        return [os.path.join(folder, name) for name in names]
+
+    def ended(self, front, client):
+        """Close a client and wait until its session is finished.
+
+        A session's slot is given back after the output direction has been
+        joined, and the recorder is closed by that direction's own
+        teardown -- so a port reporting no live session has written the
+        sidecar already, and nothing here has to poll for the file.
+        """
+        client.close()
+        self.wait_for(lambda: front.stats()["sessions"] == 0)
+
+    def degradations(self):
+        """This port's warnings, which is where a degradation says why.
+
+        Every failure to record is logged once with its reason, so every
+        test below that provokes one reads it back rather than trusting
+        that it happened.
+        """
+        return self.assertLogs("raccoon.tunnel.shell", level="WARNING")
+
+    # ── off unless switched on ──
+
+    def test_no_directory_records_nothing(self):
+        off = shell_mod.Transcripts(None)
+        self.assertFalse(off.enabled)
+        self.assertIsNone(off.open(self.identity, 1, "127.0.0.1:1"))
+        # An empty string is the same answer: a configuration key that is
+        # present and blank is not a directory.
+        self.assertFalse(shell_mod.Transcripts("").enabled)
+        self.assertTrue(self.recording()[0].enabled)
+
+        for transcripts in (None, off):
+            _, front, endpoint = self.rig(transcripts=transcripts)
+            before = self.tree()
+            self.carried(front)
+            self.assertEqual(front.stats()["carried"], 1)
+            # No directory created, nothing written: off means off.
+            self.assertEqual(self.tree(), before)
+            self.assert_endpoint_healthy(endpoint)
+
+    # ── what a recording is ──
+
+    def test_a_session_writes_a_typescript_and_a_sidecar(self):
+        transcripts, directory = self.recording()
+        _, front, endpoint = self.rig(transcripts=transcripts)
+        client = self.carried(front)
+        self.ended(front, client)
+
+        path, sidecar = self.written(directory)
+        name = os.path.basename(path)
+        self.assertRegex(name, r"\A\d{8}T\d{6}Z-1\.typescript\Z")
+        self.assertEqual(os.path.basename(sidecar), name + ".json")
+        with open(path, "rb") as handle:
+            content = handle.read()
+        # Byte for byte what the terminal showed, which here is the stub's
+        # tag and the probe `carried` sent.
+        self.assertEqual(content, b"120x40|echo\n")
+
+        with open(sidecar, "rb") as handle:
+            facts = json.loads(handle.read().decode("utf-8"))
+        self.assertEqual(sorted(facts),
+                         ["bytes", "ended", "identity", "peer", "reason",
+                          "session", "started", "truncated"])
+        self.assertEqual(facts["identity"], self.identity)
+        self.assertEqual(facts["session"], 1)
+        self.assertTrue(facts["peer"].startswith(_LOOPBACK + ":"),
+                        "the sidecar must say which operator attached: %r"
+                        % (facts["peer"],))
+        self.assertFalse(facts["truncated"])
+        self.assertEqual(facts["bytes"], len(content))
+        self.assertEqual(facts["bytes"], os.path.getsize(path))
+        self.assertIsInstance(facts["reason"], str)
+        self.assertTrue(facts["reason"], "a closed transcript says why")
+        for when in (facts["started"], facts["ended"]):
+            self.assertRegex(when, r"\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
+
+        # The next session is the next number, so two recordings in the
+        # same second are still two files.
+        self.ended(front, self.carried(front))
+        second = self.written(directory, count=4)
+        self.assertRegex(os.path.basename(second[2]),
+                         r"\A\d{8}T\d{6}Z-2\.typescript\Z")
+        self.assert_endpoint_healthy(endpoint)
+
+    def test_the_typescript_is_0600_in_a_0700_directory(self):
+        # A transcript is evidence and a secret at the same time:
+        # credentials typed inside a session are in it.
+        transcripts, directory = self.recording()
+        _, front, endpoint = self.rig(transcripts=transcripts)
+        self.ended(front, self.carried(front))
+
+        for path in self.written(directory):
+            self.assertEqual(self.mode(path), 0o600, path)
+        self.assertEqual(self.mode(self.folder(directory)), 0o700)
+        # Both levels this module made, not just the leaf.
+        self.assertEqual(self.mode(directory), 0o700)
+        self.assertEqual(self.mode(os.path.dirname(directory)), 0o700)
+        self.assert_endpoint_healthy(endpoint)
+
+    def test_the_attach_password_is_in_neither_file(self):
+        # Recording opens at the pairing, which is after the password line
+        # has been read and compared, and it records the output direction
+        # only. Both halves of that are load-bearing here.
+        transcripts, directory = self.recording()
+        _, front, endpoint = self.rig(transcripts=transcripts)
+        client = self.attach(front)
+        typed = b"secret-typed-inside-the-session\n"
+        client.send(typed)
+        echo = b"120x40|" + typed
+        self.assertEqual(client.exactly(len(echo)), echo)
+        self.ended(front, client)
+
+        password = self.password.encode("utf-8")
+        for path in self.written(directory):
+            with open(path, "rb") as handle:
+                content = handle.read()
+            self.assertNotIn(password, content,
+                             "the attach password reached %s" % path)
+        with open(self.written(directory)[0], "rb") as handle:
+            content = handle.read()
+        # And the file is a real recording rather than an empty one that
+        # would pass every assertion above: what the operator typed is in
+        # it, because the terminal echoed it.
+        self.assertEqual(content, echo)
+
+    def test_only_the_output_direction_is_recorded(self):
+        transcripts, directory = self.recording()
+        _, front, endpoint = self.rig(handler=quiet_terminal,
+                                      transcripts=transcripts)
+        client = self.attach(front)
+        self.assertEqual(client.exactly(len(SHOWN_BY_THE_TERMINAL)),
+                         SHOWN_BY_THE_TERMINAL)
+        client.send(TYPED_BY_THE_OPERATOR)
+        self.wait_for(lambda: front.stats()["bytes_out"]
+                      == len(TYPED_BY_THE_OPERATOR))
+        self.ended(front, client)
+
+        path, sidecar = self.written(directory)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), SHOWN_BY_THE_TERMINAL)
+        # Nor in the sidecar, which is read by whoever reads the
+        # transcript and holds no session bytes at all.
+        with open(sidecar, "rb") as handle:
+            self.assertNotIn(TYPED_BY_THE_OPERATOR.strip(), handle.read())
+        self.assert_endpoint_healthy(endpoint)
+
+    def test_the_sidecar_is_written_when_the_session_ends(self):
+        transcripts, directory = self.recording()
+        _, front, endpoint = self.rig(transcripts=transcripts)
+        client = self.carried(front)
+
+        # While the session is live there is a typescript and no sidecar,
+        # and the bytes are already on the disk rather than in a buffer
+        # that would die with the process.
+        path = self.written(directory, count=1)[0]
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"120x40|echo\n")
+        self.assertFalse(os.path.exists(path + ".json"))
+
+        self.ended(front, client)
+        self.assertTrue(os.path.exists(path + ".json"))
+        with open(path + ".json", "rb") as handle:
+            facts = json.loads(handle.read().decode("utf-8"))
+        self.assertEqual(facts["bytes"], len(b"120x40|echo\n"))
+        self.assertFalse(facts["truncated"])
+        self.assertTrue(facts["ended"])
+        self.assert_endpoint_healthy(endpoint)
+
+    def test_a_recorder_closed_with_a_reason_puts_it_in_the_sidecar(self):
+        # Called directly, because which of the four ways a session can
+        # end a test sees is the scheduler's business, and the field is
+        # not: a sidecar an operator reads has to say why it stops.
+        transcripts, _ = self.recording()
+        recorder = transcripts.open(self.identity, 3, "127.0.0.1:9000")
+        self.assertFalse(recorder.truncated)
+        recorder.write(b"two words\n")
+        recorder.close("the operator's connection ended")
+
+        with open(recorder.path + ".json", "rb") as handle:
+            facts = json.loads(handle.read().decode("utf-8"))
+        self.assertEqual(facts["reason"], "the operator's connection ended")
+        self.assertEqual(facts["session"], 3)
+        self.assertEqual(facts["peer"], "127.0.0.1:9000")
+        self.assertEqual(facts["bytes"], len(b"two words\n"))
+        self.assertFalse(facts["truncated"])
+
+        # Closing is where the session's teardown ends up, so it is
+        # idempotent, and a write after it writes nothing.
+        recorder.close("something else entirely")
+        recorder.write(b"late")
+        with open(recorder.path + ".json", "rb") as handle:
+            self.assertEqual(
+                json.loads(handle.read().decode("utf-8"))["reason"],
+                "the operator's connection ended")
+        self.assertEqual(os.path.getsize(recorder.path), len(b"two words\n"))
+
+    def test_an_identity_that_is_not_a_filename_still_gets_one_directory(self):
+        # An identity is an operator-chosen string, and this is the only
+        # place one becomes a path.
+        transcripts, directory = self.recording()
+        recorder = transcripts.open("../../etc/raccoon", 7, "127.0.0.1:1")
+        self.addCleanup(recorder.close, "the test ended")
+        self.assertTrue(
+            os.path.realpath(recorder.path).startswith(
+                os.path.realpath(directory) + os.sep),
+            "%r escaped %r" % (recorder.path, directory))
+        self.assertTrue(os.path.basename(recorder.path)
+                        .endswith("-7.typescript"), recorder.path)
+
+    # ── a recording problem is never the session's problem ──
+
+    def test_the_ceiling_stops_recording_and_records_that_it_did(self):
+        # Review Focus. The shipped ceiling is 16 MiB; this one is 16
+        # bytes, so that what is tested is the behaviour and not the
+        # patience of whoever runs the suite.
+        self.assertEqual(shell_mod.TRANSCRIPT_MAX_BYTES, 16 * 1024 * 1024)
+        transcripts, directory = self.recording(max_bytes=16)
+        _, front, endpoint = self.rig(transcripts=transcripts)
+        client = self.attach(front)
+
+        with self.degradations() as caught:
+            first = b"0123456789abcdef\n"           # 7 + 17 bytes of output
+            client.send(first)
+            self.assertEqual(client.exactly(len(b"120x40|") + len(first)),
+                             b"120x40|" + first)
+            # Past the ceiling the session is untouched: it carries on
+            # printing to the operator's terminal.
+            client.send(b"more\n")
+            self.assertEqual(client.exactly(len(b"120x40|more\n")),
+                             b"120x40|more\n")
+        hit = [record.getMessage() for record in caught.records
+               if "ceiling" in record.getMessage()]
+        self.assertEqual(len(hit), 1,
+                         "the ceiling is logged once and not per write: %r"
+                         % (hit,))
+
+        path = self.written(directory, count=1)[0]
+        self.assertIn(path, hit[0])
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"120x40|012345678")
+        self.ended(front, client)
+
+        with open(path + ".json", "rb") as handle:
+            facts = json.loads(handle.read().decode("utf-8"))
+        self.assertTrue(facts["truncated"],
+                        "a reader of a short transcript has to be told")
+        self.assertEqual(facts["bytes"], 16)
+        self.assertEqual(facts["bytes"], os.path.getsize(path))
+        # And the session itself was carried in full, both ways.
+        stats = front.stats()
+        self.assertEqual(stats["carried"], 1)
+        self.assertEqual(stats["bytes_out"], len(first) + len(b"more\n"))
+        self.assertEqual(stats["bytes_in"],
+                         len(b"120x40|") * 2 + len(first) + len(b"more\n"))
+        self.assertEqual(stats["refused"], 0)
+        self.assert_endpoint_healthy(endpoint)
+
+    def test_exactly_filling_the_ceiling_is_not_truncated(self):
+        # The boundary, called directly: a session whose output lands
+        # exactly on the ceiling lost nothing, and must not be labelled as
+        # though it had. The byte after it is what truncates.
+        transcripts, _ = self.recording(max_bytes=4)
+        recorder = transcripts.open(self.identity, 1, "127.0.0.1:9000")
+        recorder.write(b"abcd")
+        self.assertFalse(recorder.truncated)
+        self.assertEqual(recorder.bytes, 4)
+
+        with self.degradations() as caught:
+            recorder.write(b"e")
+            recorder.write(b"f")
+        self.assertEqual(len([record for record in caught.records
+                              if "ceiling" in record.getMessage()]), 1)
+        self.assertTrue(recorder.truncated)
+        self.assertEqual(recorder.bytes, 4)
+        recorder.close("the test ended")
+        self.assertEqual(os.path.getsize(recorder.path), 4)
+
+    @unittest.skipIf(os.name == "posix" and os.geteuid() == 0,
+                     "root is not stopped by a directory's mode")
+    def test_an_unwritable_directory_costs_the_recording_not_the_session(self):
+        # Review Focus. The operator's shell must not die because a log
+        # file could not be opened.
+        transcripts, directory = self.recording()
+        os.makedirs(directory, mode=0o700)
+        os.chmod(directory, 0o500)
+        # Put it back, or the temporary directory cannot be cleaned up.
+        self.addCleanup(os.chmod, directory, 0o700)
+        _, front, endpoint = self.rig(transcripts=transcripts)
+
+        with self.degradations() as caught:
+            client = self.carried(front)
+        self.assertTrue(any(directory in record.getMessage()
+                            for record in caught.records),
+                        "a degradation says what it was: %r"
+                        % ([r.getMessage() for r in caught.records],))
+
+        # The session is carried, both ways, and nothing was written.
+        client.send(b"still here\n")
+        expected = b"120x40|still here\n"
+        self.assertEqual(client.exactly(len(expected)), expected)
+        self.assertEqual(os.listdir(directory), [])
+        stats = front.stats()
+        self.assertEqual(stats["carried"], 1)
+        self.assertEqual(stats["sessions"], 1)
+        self.assertEqual(stats["refused"], 0)
+        self.assertGreater(stats["bytes_out"], 0)
+        self.assertGreater(stats["bytes_in"], 0)
+        self.assert_endpoint_healthy(endpoint)
+
+    def test_a_failing_write_costs_the_recording_not_the_session(self):
+        _, directory = self.recording()
+        broken = _BrokenWrites(directory)
+        _, front, endpoint = self.rig(transcripts=broken)
+
+        with self.degradations() as caught:
+            client = self.carried(front)
+            client.send(b"and again\n")
+            expected = b"120x40|and again\n"
+            self.assertEqual(client.exactly(len(expected)), expected)
+        lost = [record.getMessage() for record in caught.records
+                if "could not be written" in record.getMessage()]
+        self.assertEqual(len(lost), 1,
+                         "a failing write is logged once and the recorder "
+                         "set aside: %r" % (lost,))
+
+        stats = front.stats()
+        self.assertEqual(stats["carried"], 1)
+        self.assertEqual(stats["refused"], 0)
+        self.ended(front, client)
+
+        path, sidecar = self.written(directory)
+        self.assertEqual(os.path.getsize(path), 0)
+        with open(sidecar, "rb") as handle:
+            facts = json.loads(handle.read().decode("utf-8"))
+        # Short of the session, which is what `truncated` says.
+        self.assertTrue(facts["truncated"])
+        self.assertEqual(facts["bytes"], 0)
         self.assert_endpoint_healthy(endpoint)
 
 
