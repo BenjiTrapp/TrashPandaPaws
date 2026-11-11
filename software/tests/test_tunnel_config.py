@@ -147,13 +147,14 @@ class _GeneratorCase(unittest.TestCase):
             body["tunnel"] = tunnel
         return body
 
-    def post_gen(self, tunnel=None):
+    def post_gen(self, tunnel=None, body=None):
         response = self.client.post("/api/server/beacon-gen",
-                                    json=self.request_body(tunnel),
+                                    json=self.request_body(tunnel)
+                                    if body is None else body,
                                     headers=_AUTH)
         return response
 
-    def post_gist(self, tunnel=None):
+    def post_gist(self, tunnel=None, body=None):
         """The gist route, with `gh` replaced and its upload captured."""
         uploaded = {}
 
@@ -173,14 +174,19 @@ class _GeneratorCase(unittest.TestCase):
 
         with mock.patch.object(server_mod.subprocess, "run", fake_run):
             response = self.client.post("/api/server/beacon-gist",
-                                        json=self.request_body(tunnel),
+                                        json=self.request_body(tunnel)
+                                        if body is None else body,
                                         headers=_AUTH)
         self._uploaded = uploaded.get("stage")
         return response
 
-    def generate(self, route, tunnel=None):
-        """`(response_json, gen_cfg)` for one build from one route."""
-        response = getattr(self, "post_" + route)(tunnel)
+    def generate(self, route, tunnel=None, body=None):
+        """`(response_json, gen_cfg)` for one build from one route.
+
+        `body` is the whole request, for the one test that posts what the
+        Beacon Gen form posts rather than this file's minimal body.
+        """
+        response = getattr(self, "post_" + route)(tunnel, body)
         self.assertEqual(response.status_code, 200, response.data[:400])
         body = response.get_json()
         if route == "gen":
@@ -243,6 +249,63 @@ class TestTheGeneratorBakesATunnelBlock(_GeneratorCase):
                                  tunnel["identity"])
                 self.assertNotIn(tunnel["psk"], json.dumps(body),
                                  "the response carries the build's PSK")
+
+    def test_a_body_shaped_as_the_form_builds_it_gets_a_tunnel(self):
+        # What the Beacon Gen form posts, field for field: strings out of
+        # the number inputs, the proxy object, a `tunnel` block with no
+        # `keepalive_seconds` because that input was left empty, and no
+        # `psk`, `identity` or `public_key` because the form has nowhere
+        # to type one. The route is the authority on that block, so this
+        # is the test that the form and the route agree on its shape --
+        # and it runs against both delivery paths, because the form has
+        # two and they build their request bodies separately.
+        callback = "http://127.0.0.1:1/api/v1/beacon"
+        for route in ("gen", "gist"):
+            with self.subTest(route=route):
+                posted = {
+                    "c2_url": callback,
+                    "enc_key": "", "interval": "300", "jitter": "20",
+                    "layers": "1",
+                    "protocols": {"https": {"enabled": True,
+                                            "callback_url": callback,
+                                            "verify_ssl": False}},
+                    "proxy": {"mode": "auto", "url": "",
+                              "ntlm": {"enabled": False, "host": "",
+                                       "port": 8080, "domain": "",
+                                       "username": "", "password": "",
+                                       "workstation": ""}},
+                    "tunnel": {"enabled": True,
+                               "server": "tunnel.example.com",
+                               "port": 8446,
+                               "allow_slow_crypto": False},
+                }
+                if route == "gist":
+                    posted["filename"] = "update.py"
+                body, gen_cfg = self.generate(route, body=posted)
+
+                baked = gen_cfg.get("tunnel")
+                self.assertIsInstance(
+                    baked, dict,
+                    "the %s route baked no tunnel block for the body the "
+                    "form posts" % route)
+                self.assertTrue(baked["enabled"])
+                self.assertEqual(baked["server"], "tunnel.example.com")
+                self.assertEqual(baked["port"], 8446)
+                self.assertFalse(baked["allow_slow_crypto"])
+                self.assertEqual(
+                    baked["keepalive_seconds"],
+                    beacon_mod._DEFAULT_KEEPALIVE,
+                    "an empty keepalive field did not fall back to the "
+                    "endpoint's own default")
+
+                # The identity the panel keys everything by reaches the
+                # operator, and names the build whose PSK was registered.
+                self.assertEqual(body.get("tunnel_identity"),
+                                 baked["identity"])
+                self.assertEqual(
+                    self.store().identity_for(
+                        base64.b64decode(baked["psk"])),
+                    baked["identity"])
 
     def test_beacon_gen_registers_the_psk_with_the_key_store(self):
         for route in ("gen", "gist"):

@@ -5263,6 +5263,18 @@ async function showBeaconGen(){
     +'<label style="flex:1">Password <input id="bg-ntlm-pass" type="password" placeholder="password"></label>'
     +'</div>'
     +'</div>'
+    +'<div class="nxc-section" style="padding:8px 0 4px">Tunnel</div>'
+    +'<label class="ave-check"><input type="checkbox" id="bg-tunnel" onchange="bgTunnelChanged()"> Carry a tunnel: SOCKS and shell ports back through this build</label>'
+    +'<div id="bg-tunnel-opts" style="display:none">'
+    +'<p style="font-size:10px;color:var(--text2);margin:2px 0 6px">The implant dials out to the tunnel server on a single port, which serves the command channel and every relay. Its identity and key are minted for this build and registered before it is delivered.</p>'
+    +'<div style="display:flex;gap:8px">'
+    +'<label style="flex:2">Tunnel Server <input id="bg-tunnel-server" placeholder="bare hostname or IP, as the target can reach it"></label>'
+    +'<label style="flex:1">Port <input id="bg-tunnel-port" type="number" min="1" max="65535" placeholder="1-65535"></label>'
+    +'</div>'
+    +'<label>Keepalive (sec) <input id="bg-tunnel-keepalive" type="number" placeholder="empty = the endpoint default"></label>'
+    +'<label class="ave-check" style="margin-top:4px"><input type="checkbox" id="bg-tunnel-slow"> Allow slow crypto</label>'
+    +'<p style="font-size:10px;color:var(--yellow);margin:2px 0 6px">&#9888; A host with no libcrypto runs AES-256-GCM in pure Python at roughly 50-200 KB/s. Without this the endpoint refuses to start there; with it the tunnel runs, slowly, and every session reads like a slow network.</p>'
+    +'</div>'
     +'<div class="nxc-section" style="padding:8px 0 4px">Delivery Method</div>'
     +'<div class="bgen-delivery">'
     +'<label class="bgen-dlabel"><input type="radio" name="bg-delivery" value="inline" checked> <span>Inline one-liner</span></label>'
@@ -5400,6 +5412,64 @@ function bgValidateProxy(proxy){
   return true;
 }
 
+function bgTunnelChanged(){
+  const opts = document.getElementById("bg-tunnel-opts");
+  if(opts) opts.style.display = document.getElementById("bg-tunnel")?.checked ? "block" : "none";
+}
+
+// The tunnel block as the generator route reads it, or null for a build
+// with no tunnel. Never a psk, identity or public_key: those are minted
+// per build and registered before the artifact goes out, and the route
+// refuses a request that supplies one -- so the form has nowhere to type
+// one. `keepalive_seconds` is left out when the field is empty, because
+// the route then fills in the endpoint's own default and this page has no
+// business repeating that number.
+function bgCollectTunnel(){
+  if(!document.getElementById("bg-tunnel")?.checked) return null;
+  const tunnel = {
+    enabled: true,
+    server: document.getElementById("bg-tunnel-server")?.value?.trim() || "",
+    port: parseInt(document.getElementById("bg-tunnel-port")?.value || "0", 10) || 0,
+    allow_slow_crypto: !!document.getElementById("bg-tunnel-slow")?.checked
+  };
+  const keepalive = parseInt(document.getElementById("bg-tunnel-keepalive")?.value || "", 10);
+  if(!isNaN(keepalive)) tunnel.keepalive_seconds = keepalive;
+  return tunnel;
+}
+
+// The route's own refusals, asked here so the operator reads them beside
+// the field instead of as a 400. Deliberately nothing else: anything this
+// does not catch comes back as the route's own message, unchanged, and a
+// check invented here would be a second authority disagreeing with the
+// one in `_tunnel_config_for_build`.
+function bgValidateTunnel(tunnel){
+  if(!tunnel) return true;
+  if(!tunnel.server){
+    toast("warn","Beacon Gen","The tunnel server is required: it is the host the build dials out to, written as the target's network can reach it",4000);
+    return false;
+  }
+  if(/\s/.test(tunnel.server) || tunnel.server.indexOf("/") !== -1){
+    toast("warn","Beacon Gen","The tunnel server must be a bare hostname or IP address: it is dialled directly and written into a CONNECT line, so a URL, a path or a stray space is a build that cannot connect",6000);
+    return false;
+  }
+  if(!(tunnel.port >= 1 && tunnel.port <= 65535)){
+    toast("warn","Beacon Gen","The tunnel port must be a port between 1 and 65535: it is the single port that serves the command channel and every relay",4000);
+    return false;
+  }
+  return true;
+}
+
+// The one place the `tunnel` key is written, called by both delivery
+// paths. A form with the box clear posts no key at all -- not an empty
+// object and not a disabled block -- because the route reads the key's
+// presence. Both paths build their own request body, and a tunnel added
+// to one of them only is a build that silently loses its tunnel the
+// moment an operator picks the other.
+function bgWithTunnel(body, tunnel){
+  if(tunnel) body.tunnel = tunnel;
+  return body;
+}
+
 async function runBeaconGen(){
   const protos = bgCollectProtos();
   if(Object.keys(protos).length===0){ toast("warn","Beacon Gen","Select at least one transport protocol",3000); return; }
@@ -5409,6 +5479,8 @@ async function runBeaconGen(){
   if(protos.quic && !protos.quic.server){ toast("warn","Beacon Gen","Enter the QUIC server address",3000); return; }
   const proxy = bgCollectProxy();
   if(!bgValidateProxy(proxy)) return;
+  const tunnel = bgCollectTunnel();
+  if(!bgValidateTunnel(tunnel)) return;
   const delivery = document.querySelector('input[name="bg-delivery"]:checked')?.value || "inline";
   if(delivery==="gist") return runBeaconGist();
   const key = document.getElementById("bg-key")?.value?.trim() || "";
@@ -5420,11 +5492,15 @@ async function runBeaconGen(){
   try{
     const data = await api("/api/server/beacon-gen", {
       method:"POST",
-      body:JSON.stringify({c2_url:protos.https?.callback_url||"", enc_key:key, interval, jitter, layers, protocols:protos, proxy:proxy})
+      body:JSON.stringify(bgWithTunnel({c2_url:protos.https?.callback_url||"", enc_key:key, interval, jitter, layers, protocols:protos, proxy:proxy}, tunnel))
     });
     if(data.error){ toast("err","Beacon Gen",data.error,4000); return; }
     const container = document.getElementById("bg-result");
     if(!container) return;
+    // Escaped once, here, because it comes back from the server and is
+    // rendered. Empty for a build with no tunnel, which is also what
+    // leaves the line out.
+    const tunId = esc(data.tunnel_identity);
     container.innerHTML =
       '<div class="bgen-result">'
       +'<div class="bgen-tab-bar">'
@@ -5439,6 +5515,7 @@ async function runBeaconGen(){
       +'<span>\u{1F4E6} '+Math.round(data.size/1024)+' KB payload</span>'
       +'<span>\u{1F4C4} '+Math.round(data.raw_size/1024)+' KB source</span>'
       +'</div>'
+      +(tunId ? '<div style="font-size:10px;color:var(--text2);padding:4px 0">Tunnel identity <code>'+tunId+'</code> &middot; the key of the SOCKS and shell port tables in the Tunnel panel, and what you delete from the key store to retire this build</div>' : '')
       +'<button class="bgen-copy" onclick="bgenCopy()">\u{1F4CB} Copy to Clipboard</button>'
       +'</div>';
     container._unix = data.oneliner_unix;
@@ -5462,16 +5539,21 @@ async function runBeaconGist(){
   const filename = document.getElementById("bg-gist-fn")?.value?.trim() || "update.py";
   const proxy = bgCollectProxy();
   if(!bgValidateProxy(proxy)) return;
+  const tunnel = bgCollectTunnel();
+  if(!bgValidateTunnel(tunnel)) return;
   const btn = document.querySelector(".ave-run");
   if(btn){ btn.disabled=true; btn.textContent="Creating Gist..."; }
   try{
     const data = await api("/api/server/beacon-gist", {
       method:"POST",
-      body:JSON.stringify({c2_url:url, enc_key:key, interval, jitter, layers, filename, protocols:protos, proxy:proxy})
+      body:JSON.stringify(bgWithTunnel({c2_url:url, enc_key:key, interval, jitter, layers, filename, protocols:protos, proxy:proxy}, tunnel))
     });
     if(data.error){ toast("err","Beacon Gist",data.error,5000); return; }
     const container = document.getElementById("bg-result");
     if(!container) return;
+    // As in `runBeaconGen`: escaped once, and empty for a build with no
+    // tunnel.
+    const tunId = esc(data.tunnel_identity);
     container.innerHTML =
       '<div class="bgen-result">'
       +'<div class="bgen-tab-bar">'
@@ -5490,6 +5572,7 @@ async function runBeaconGist(){
       +'<button class="bgen-copy" style="color:var(--orange);border-color:rgba(255,170,0,0.3)" onclick="bgenDeleteGist(\''+data.gist_id+'\')">\u{1F5D1}️ Delete Gist</button>'
       +'</div>'
       +'<div style="font-size:10px;color:var(--text2);padding:4px 0">Gist: <a href="'+esc(data.gist_url)+'" target="_blank" style="color:var(--blue)">'+esc(data.gist_id)+'</a> &middot; File: '+esc(data.filename)+'</div>'
+      +(tunId ? '<div style="font-size:10px;color:var(--text2);padding:4px 0">Tunnel identity <code>'+tunId+'</code> &middot; the key of the SOCKS and shell port tables in the Tunnel panel, and what you delete from the key store to retire this build</div>' : '')
       +'</div>';
     container._unix = data.oneliner_unix;
     container._win = data.oneliner_win;

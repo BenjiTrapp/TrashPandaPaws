@@ -1,6 +1,6 @@
-"""The tunnel server as a process, its two routes, and the panel.
+"""The tunnel server as a process, its two routes, and the operator page.
 
-Three things are under test here and they are deliberately kept apart,
+Four things are under test here and they are deliberately kept apart,
 because the whole point of this task is that the operator surface has
 **two objects and not one**:
 
@@ -14,10 +14,14 @@ because the whole point of this task is that the operator surface has
     `tunnel stop` task that takes effect at the next check-in and shows as
     pending with the expected time until the agent confirms.
   * the panel markup, read out of the page the server actually serves.
+  * the Beacon Gen form's tunnel section, read out of that same page: the
+    request each delivery path posts, and the one client-side check,
+    which mirrors the generator route's refusals and invents none.
 
 The page is a Python string and this project has no JavaScript runner, so
-the panel checks locate the construct they are about and assert on it --
-the shape `test_listeners.py` established for the Listeners panel.
+the panel and form checks locate the construct they are about and assert
+on it -- the shape `test_listeners.py` established for the Listeners
+panel.
 
 No test here binds a fixed port. The team server's sockets are bound on 0
 and read back, and the one SOCKS port range handed to a child comes from
@@ -1371,6 +1375,31 @@ class TestTheSocketPolicy(unittest.TestCase):
         self.assertEqual(status, 200)
 
 
+def _served_page():
+    """The operator page as the server actually serves it."""
+    import logging
+
+    from werkzeug.serving import make_server
+
+    quiet = logging.getLogger("werkzeug")
+    previous = quiet.level
+    quiet.setLevel(logging.ERROR)
+    tmp = tempfile.TemporaryDirectory()
+    server = make_server("127.0.0.1", 0, None, threaded=True)
+    server.app = create_app(ServerCrypto(b"k" * 32), "t", Path(tmp.name))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with urllib.request.urlopen(
+                "http://127.0.0.1:%d/" % server.server_port,
+                timeout=15) as response:
+            return response.read().decode("utf-8", "replace")
+    finally:
+        server.shutdown()
+        server.server_close()
+        tmp.cleanup()
+        quiet.setLevel(previous)
+
+
 class TestTheTunnelPanel(unittest.TestCase):
     """What the served page says about the two objects.
 
@@ -1380,27 +1409,7 @@ class TestTheTunnelPanel(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import logging
-
-        from werkzeug.serving import make_server
-
-        quiet = logging.getLogger("werkzeug")
-        previous = quiet.level
-        quiet.setLevel(logging.ERROR)
-        tmp = tempfile.TemporaryDirectory()
-        server = make_server("127.0.0.1", 0, None, threaded=True)
-        server.app = create_app(ServerCrypto(b"k" * 32), "t", Path(tmp.name))
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        try:
-            with urllib.request.urlopen(
-                    "http://127.0.0.1:%d/" % server.server_port,
-                    timeout=15) as response:
-                cls.page = response.read().decode("utf-8", "replace")
-        finally:
-            server.shutdown()
-            server.server_close()
-            tmp.cleanup()
-            quiet.setLevel(previous)
+        cls.page = _served_page()
         start = cls.page.index("function showTunnel()")
         cls.body = cls.page[start:cls.page.index("</script>", start)]
 
@@ -1606,6 +1615,197 @@ class TestTheTunnelPanel(unittest.TestCase):
         for name, text in (("a row", per_row), ("the shell half", shell_half)):
             self.assertNotIn("record", text.lower(),
                              "%s says it is recording" % name)
+
+
+def _js_function(page, name):
+    """The source of the top-level function `name`, up to the next one.
+
+    Cut at the next line that starts a top-level function rather than
+    matched on braces: the page is a Python string full of HTML in JS
+    strings, and counting braces through that is a parser this file does
+    not need to be.
+    """
+    start = re.search(r"^(?:async )?function %s\(" % re.escape(name),
+                      page, re.M)
+    if start is None:
+        raise AssertionError("the page has no function %s()" % name)
+    end = re.compile(r"^(?:async )?function \w+\(", re.M).search(
+        page, start.end())
+    return page[start.start():end.start() if end else len(page)]
+
+
+class TestTheBeaconGenTunnelForm(unittest.TestCase):
+    """The Beacon Gen form asking for a tunnel, on both delivery paths.
+
+    `_tunnel_config_for_build` is the authority on what a tunnel request
+    may say; these tests hold only that the form sends it, that the two
+    delivery paths each send it, and that the one client-side check
+    mirrors the route's refusals and adds none.
+
+    **What this cannot hold.** The page is a Python string and there is
+    no JavaScript runner in this repository, so every assertion is on the
+    served source: that a function calls another, that a key is written
+    in one place and not another, that a value passes through `esc()`.
+    None of it executes the form. A check whose condition is inverted, an
+    `||` where the code wants `&&`, or a field read from the wrong id
+    would pass. The route-level test in `test_tunnel_config.py` holds the
+    other half: a body shaped as this form builds it really does produce
+    a tunnel build.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.page = _served_page()
+
+    # Looked up per test rather than in `setUpClass`, so that a function
+    # the page lacks fails the test about it and not the whole class.
+    gen = property(lambda self: _js_function(self.page, "runBeaconGen"))
+    gist = property(lambda self: _js_function(self.page, "runBeaconGist"))
+    collect = property(lambda self: _js_function(self.page, "bgCollectTunnel"))
+    validate = property(
+        lambda self: _js_function(self.page, "bgValidateTunnel"))
+    attach = property(lambda self: _js_function(self.page, "bgWithTunnel"))
+
+    @staticmethod
+    def _request_body(function_source):
+        """The argument of the `JSON.stringify(` that builds the request."""
+        start = function_source.index("JSON.stringify(")
+        return function_source[start:function_source.index("\n", start)]
+
+    def test_the_form_has_a_tunnel_section_with_server_and_port(self):
+        # `assertIn` against the page would print the whole page on
+        # failure, so the needle is tested and the message names it.
+        for element in ("bg-tunnel", "bg-tunnel-server", "bg-tunnel-port",
+                        "bg-tunnel-keepalive", "bg-tunnel-slow"):
+            with self.subTest(element=element):
+                self.assertTrue('id="%s"' % element in self.page,
+                                "the form has no %s field" % element)
+
+        # A section of its own between the proxy and the delivery choice,
+        # drawn the way the Egress Proxy section beside it is.
+        proxy = self.page.index('>Egress Proxy</div>')
+        tunnel = self.page.index('>Tunnel</div>')
+        delivery = self.page.index('>Delivery Method</div>')
+        self.assertLess(proxy, tunnel)
+        self.assertLess(tunnel, delivery)
+        section = self.page[tunnel:delivery]
+
+        # Off until asked for, and the four fields stay hidden until then.
+        checkbox = re.search(r'<input[^>]*id="bg-tunnel"[^>]*>', section)
+        self.assertIsNotNone(checkbox)
+        self.assertNotIn("checked", checkbox.group(0),
+                         "the tunnel box is ticked before anyone asked")
+        self.assertRegex(
+            section,
+            r'id="bg-tunnel-opts"[^>]*style="display:none"')
+
+        # The route's own words as the hints, and the warning that the
+        # slow path is slow rather than broken.
+        flat = " ".join(section.split())
+        self.assertIn("bare hostname or IP", flat)
+        self.assertIn("as the target", flat)
+        self.assertIn("pure Python", flat)
+        self.assertIn("50-200 KB/s", flat)
+        # The shape of the keepalive field: empty means the endpoint's own
+        # default, which is the route's, so no number is repeated here.
+        self.assertRegex(
+            section, r'id="bg-tunnel-keepalive"[^>]*placeholder="[^"]*default')
+        self.assertNotRegex(section, r'id="bg-tunnel-keepalive"[^>]*value=')
+        # And nothing in it lets the operator type a credential: the PSK,
+        # identity and public key are minted per build.
+        for refused in ("psk", "public_key", "tunnel-identity"):
+            self.assertNotIn(refused, section.lower())
+
+    def test_both_delivery_paths_post_the_tunnel_block(self):
+        # A tunnel wired into only the first would vanish the moment an
+        # operator picked gist delivery: a build with no tunnel, and no
+        # indication why. So each function's own request body is read.
+        for name, source in (("runBeaconGen", self.gen),
+                             ("runBeaconGist", self.gist)):
+            with self.subTest(function=name):
+                self.assertIn("bgCollectTunnel()", source)
+                body = self._request_body(source)
+                self.assertIn("bgWithTunnel(", body,
+                              "%s builds a request body that cannot carry "
+                              "a tunnel" % name)
+                self.assertIn("tunnel", body.split("bgWithTunnel(", 1)[1])
+        # And both go to the routes that run the same config builder.
+        self.assertIn('"/api/server/beacon-gen"', self.gen)
+        self.assertIn('"/api/server/beacon-gist"', self.gist)
+        # What the helper adds is the collected block, under the key the
+        # route reads.
+        self.assertRegex(self.attach, r"\.tunnel\s*=\s*tunnel\b|"
+                                      r"\btunnel\s*:\s*tunnel\b")
+
+    def test_the_form_posts_no_tunnel_key_when_the_box_is_unchecked(self):
+        # Not an empty object and not `{enabled: false}`: the key is
+        # absent. Held at its two ends -- the collector answers null for a
+        # clear box, and the only place the key is ever written is behind
+        # a test of that answer.
+        self.assertRegex(
+            self.collect,
+            r'if\(!document\.getElementById\("bg-tunnel"\)\?\.checked\)'
+            r'\s*return null;')
+        self.assertRegex(self.attach, r"if\s*\(\s*tunnel\s*\)")
+        self.assertLess(self.attach.index("if"),
+                        self.attach.index(".tunnel"),
+                        "the key is written before the box is looked at")
+        for name, source in (("runBeaconGen", self.gen),
+                             ("runBeaconGist", self.gist)):
+            with self.subTest(function=name):
+                self.assertNotRegex(
+                    source, r"\btunnel\s*:",
+                    "%s writes a tunnel key into its body directly, "
+                    "around the helper that leaves it out" % name)
+        for source in (self.collect, self.attach):
+            self.assertNotRegex(source, r"enabled\s*:\s*false")
+
+    def test_a_url_shaped_server_is_refused_before_the_request(self):
+        # The route refuses a URL, a path or an embedded space, because
+        # the value is dialled directly and written into a CONNECT line.
+        # The form says so first. It mirrors that and nothing else: no
+        # host-name grammar, no port-class judgement of its own.
+        self.assertIn('"/"', self.validate.replace("'", '"'))
+        self.assertRegex(self.validate, r"\\s")
+        self.assertIn("bare hostname or IP address", self.validate)
+        self.assertRegex(self.validate, r"65535")
+        self.assertIn("required", self.validate)
+        for invented in ("://", "localhost", "127.", "match("):
+            self.assertNotIn(invented, self.validate,
+                             "the form invents a refusal of its own: %r"
+                             % invented)
+
+        # Asked before anything is sent, on both paths.
+        for name, source in (("runBeaconGen", self.gen),
+                             ("runBeaconGist", self.gist)):
+            with self.subTest(function=name):
+                self.assertIn("bgValidateTunnel(", source)
+                self.assertLess(source.index("bgValidateTunnel("),
+                                source.index("api("),
+                                "%s sends the request before it has "
+                                "checked the tunnel" % name)
+        # And a refusal the form did not catch is the route's text,
+        # unchanged: the existing error toast carries `data.error`.
+        self.assertIn("data.error", self.gen)
+        self.assertIn("data.error", self.gist)
+
+    def test_the_result_renders_the_tunnel_identity(self):
+        # Both result blocks, because both routes return it.
+        for name, source in (("runBeaconGen", self.gen),
+                             ("runBeaconGist", self.gist)):
+            with self.subTest(function=name):
+                # Every mention is the escaped one: it comes back from the
+                # server and is rendered.
+                self.assertIn("esc(data.tunnel_identity)", source)
+                self.assertEqual(source.count("data.tunnel_identity"),
+                                 source.count("esc(data.tunnel_identity)"),
+                                 "%s renders tunnel_identity unescaped"
+                                 % name)
+                flat = " ".join(source.split())
+                self.assertIn("SOCKS and shell port", flat)
+                self.assertIn("delete", flat.lower())
+                self.assertNotIn("psk", flat.lower(),
+                                 "the result talks about the credential")
 
 
 # New test classes belong above this guard; never append below it.
