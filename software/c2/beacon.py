@@ -3214,16 +3214,39 @@ def _shell_geometry(value, default: int) -> int:
     return max(1, min(SHELL_GEOMETRY_MAX, value))
 
 
-def _write_all(fd: int, data: bytes) -> None:
-    """Every byte of `data` to `fd`, which `os.write` does not promise.
+def _write_all(fd: int, data: bytes, live, select_mod) -> bool:
+    """Every byte of `data` to `fd`, or False once `live()` says stop.
 
-    `sendall`'s loop, which a socket has and a descriptor does not: a
-    write to a PTY master can be short, and a short write here is a
-    keystroke the shell never saw.
+    `sendall`'s loop, which a socket has and a descriptor does not --
+    plus a readiness wait a socket would not need here, which is the
+    other half of the asymmetry `_SHELL_POLL` describes.
+
+    Writing to a PTY master fills the *slave's input queue*, and that
+    queue is a few kilobytes that only the foreground command drains. A
+    command that is not reading its stdin -- a capture, a `sleep` --
+    leaves it full, so a blocking write of one pasted line would park
+    this thread until that command happened to read, which may be never.
+    It is also the thread that runs the session's teardown, so parking
+    here would mean a dead stream whose child, master and threads were
+    all still alive: exactly what must not outlive a session. Hence a
+    non-blocking master (`_serve_shell` sets it), `select` for room, and
+    `live()` on every pass, as the read direction does.
+
+    False means the session ended mid-write, and the rest of `data` is
+    dropped: the last keystrokes of a session that is already over.
     """
     view = memoryview(data)
     while view:
-        view = view[os.write(fd, view):]
+        if not live():
+            return False
+        if not select_mod.select([], [fd], [], _SHELL_POLL)[1]:
+            continue
+        try:
+            view = view[os.write(fd, view):]
+        except BlockingIOError:
+            # Readiness is not a reservation: another pass.
+            continue
+    return True
 
 
 def _close_fd(fd: int) -> None:
@@ -4060,7 +4083,8 @@ class TunnelEndpoint(object):
         outlive this method.
         """
         try:
-            pty_mod, fcntl_mod, termios_mod, _, signal_mod = _shell_modules()
+            pty_mod, fcntl_mod, termios_mod, select_mod, signal_mod = (
+                _shell_modules())
         except ImportError as exc:
             self._refuse_shell(
                 sock, noise,
@@ -4081,6 +4105,12 @@ class TunnelEndpoint(object):
         child = None
         try:
             master, slave = pty_mod.openpty()
+            # Non-blocking from here on, in both directions. Either call
+            # on a master can block for as long as the child chooses --
+            # see `_write_all` for the input queue, which is the one that
+            # bites -- and both pumps wait in `select` instead, where the
+            # end of the session is visible.
+            os.set_blocking(master, False)
             argv, env, child_fds = _shell_invocation(cols, rows)
             program = argv[0]
             leader = _setsid_program()
@@ -4114,7 +4144,7 @@ class TunnelEndpoint(object):
                         program, cols, rows, child.pid)
             self._count_session(1)
             try:
-                self._shell_bridge(sock, noise, master)
+                self._shell_bridge(sock, noise, master, select_mod)
             finally:
                 self._count_session(-1)
         finally:
@@ -4129,7 +4159,7 @@ class TunnelEndpoint(object):
             self._drop_shell_slot()
 
     def _shell_bridge(self, sock: socket.socket, noise: NoiseSession,
-                      master: int) -> None:
+                      master: int, select_mod) -> None:
         """Carry bytes until either the stream or the shell is finished.
 
         `_bridge`'s shape with the target socket replaced by the PTY
@@ -4143,13 +4173,11 @@ class TunnelEndpoint(object):
         master cannot be unparked by a shutdown the way a socket can, so
         the two directions share an event instead: whichever finishes
         first sets it, and the other sees it within `_SHELL_POLL`. That is
-        what keeps the output pump from sitting in `os.read` on a session
-        whose operator has gone -- which would end with a join that timed
-        out and a caller closing a master another thread is still parked
-        in a read on, the one way a descriptor number gets reused
-        underneath somebody.
+        what keeps either pump from sitting in a call on the master while
+        the session is over -- which would end with a join that timed out
+        and a caller closing a master another thread is still parked in,
+        the one way a descriptor number gets reused underneath somebody.
         """
-        select_mod = _shell_modules()[3]
         sock.settimeout(None)
         ended = threading.Event()
         back = threading.Thread(target=self._from_pty,
@@ -4165,7 +4193,7 @@ class TunnelEndpoint(object):
                            "a shell session; closing it: %s", exc)
             return
         try:
-            self._to_pty(sock, noise, master, ended)
+            self._to_pty(sock, noise, master, ended, select_mod)
         finally:
             # The event before the join, for the master, and the shutdown
             # for the stream: the other thread may be parked in either.
@@ -4187,6 +4215,10 @@ class TunnelEndpoint(object):
                     continue
                 try:
                     data = os.read(master, _TUNNEL_CHUNK)
+                except BlockingIOError:
+                    # Readiness is not a reservation, and the master is
+                    # non-blocking: another pass.
+                    continue
                 except OSError as exc:
                     # `EIO` on a master is the child having gone: that is
                     # how a slave with no process left on it reads on
@@ -4208,18 +4240,38 @@ class TunnelEndpoint(object):
             ended.set()
             _shutdown_socket(sock)
 
-    def _to_pty(self, sock: socket.socket, noise: NoiseSession,
-                master: int, ended: threading.Event) -> None:
+    def _to_pty(self, sock: socket.socket, noise: NoiseSession, master: int,
+                ended: threading.Event, select_mod) -> None:
         """The operator's keystrokes, toward the shell."""
         try:
-            self._to_pty_loop(sock, noise, master)
+            self._to_pty_loop(sock, noise, master, ended, select_mod)
         finally:
             ended.set()
             _shutdown_socket(sock)
 
     def _to_pty_loop(self, sock: socket.socket, noise: NoiseSession,
-                     master: int) -> None:
-        while True:
+                     master: int, ended: threading.Event, select_mod) -> None:
+        def live():
+            """Whether this session is still worth a byte on the master.
+
+            The flags, and the stream. While this thread is inside the
+            write loop it is not the one reading the socket, and the
+            other direction only touches it when the shell produces
+            output -- which a session blocked on a silent command does
+            not. So an operator who has gone is visible here and nowhere
+            else, and `_bytes_waiting`'s peek is how: readable with
+            nothing behind it is a FIN.
+            """
+            if ended.is_set() or self._stop.is_set():
+                return False
+            try:
+                if not select_mod.select([sock], [], [], 0)[0]:
+                    return True
+                return _bytes_waiting(sock)
+            except OSError:
+                return False
+
+        while live():
             try:
                 if not _bytes_waiting(sock):
                     # A FIN between frames: the operator's terminal is
@@ -4241,7 +4293,8 @@ class TunnelEndpoint(object):
                                "(%s); the session is over", exc)
                 return
             try:
-                _write_all(master, data)
+                if not _write_all(master, data, live, select_mod):
+                    return
             except OSError:
                 return
 
@@ -4268,13 +4321,21 @@ class TunnelEndpoint(object):
 
         The process group and not the process: the child leads a session
         of its own on both of `_serve_shell`'s paths -- `setsid(1)`
-        `exec`s in place rather than forking, so the pid `Popen` returned
-        is the session leader and the group id either way -- and an
-        operator's `tcpdump` is in that group too. `SIGHUP` first, because
-        losing a terminal is what a hangup is and an interactive shell
-        exits on it after hanging up its own jobs; `SIGKILL` after
-        `_SHELL_TERM_GRACE`, because a session whose stream has gone has
-        nothing left to negotiate with.
+        `exec`s in place rather than forking, so once it has run, the pid
+        `Popen` returned is the session leader and the group id on either
+        path -- and an operator's `tcpdump` is in that group too.
+        `SIGHUP` first, because losing a terminal is what a hangup is and
+        an interactive shell exits on it after hanging up its own jobs;
+        `SIGKILL` after `_SHELL_TERM_GRACE`, because a session whose
+        stream has gone has nothing left to negotiate with.
+
+        "Once it has run" is a real window: between `Popen` returning and
+        the wrapper reaching `setsid()`, the pid leads no group and
+        `killpg` answers `ESRCH`, which `_signal_shell` logs and swallows.
+        It is survivable rather than guarded against, because the session
+        cannot have carried a byte that early and because closing the
+        master below hangs up the terminal on exactly the path that has
+        one. The reap then collects the child whichever signal ended it.
 
         Reaped before returning -- `Popen.wait` is `waitpid` -- because a
         zombie root shell in the beacon's process table is the same

@@ -67,6 +67,7 @@ import errno
 import logging
 import os
 import re
+import select
 import shutil
 import socket
 import sys
@@ -1336,6 +1337,61 @@ class TestLifecycle(TunnelEndpointTestCase):
         self.assertFalse(endpoint.status()["connected"])
 
 
+@unittest.skipUnless(_HAS_PTY, _NO_PTY)
+class TestWritingToATerminal(unittest.TestCase):
+    """`_write_all`: the loop that must not outlast the session it serves.
+
+    Against a pipe rather than a PTY master, deliberately. A full pipe
+    applies back-pressure on every platform; a full tty input queue does
+    so only on Linux, because BSD discards the overflow instead -- so on
+    the machine this was written on a master write cannot be made to
+    block at all, and the end-to-end version of this test (in
+    `TestAShellSession`) can only bite on the deployment target. What is
+    under test here is the loop, which is the same loop either way.
+    """
+
+    def test_a_write_nobody_drains_ends_when_the_session_does(self):
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        os.set_blocking(write_fd, False)
+        # Filled the way a foreground command that never reads its stdin
+        # fills the slave's input queue.
+        while True:
+            try:
+                os.write(write_fd, b"x" * 65536)
+            except BlockingIOError:
+                break
+        over = threading.Event()
+        returned = []
+
+        def write():
+            returned.append(beacon_mod._write_all(
+                write_fd, b"y" * 4096, lambda: not over.is_set(), select))
+
+        thread = threading.Thread(target=write, name="write-all", daemon=True)
+        # Joined before the descriptors are closed under it: LIFO, so
+        # this cleanup runs first.
+        self.addCleanup(thread.join, 5.0)
+        thread.start()
+
+        thread.join(0.6)
+        self.assertTrue(thread.is_alive(),
+                        "the write returned although nothing had drained "
+                        "the pipe: a byte went somewhere it could not")
+        self.assertEqual(returned, [])
+
+        over.set()
+
+        thread.join(5.0)
+        self.assertFalse(thread.is_alive(),
+                         "the write did not end with its session; on a PTY "
+                         "master this is the thread that runs the teardown")
+        self.assertEqual(returned, [False],
+                         "a write cut short by the end of its session "
+                         "reported success")
+
+
 class TestAShellSession(TunnelEndpointTestCase):
     """`MSG_OPEN_SHELL`: a real PTY on the endpoint, dialled out like a relay.
 
@@ -1484,12 +1540,34 @@ class TestAShellSession(TunnelEndpointTestCase):
 
     @unittest.skipUnless(_HAS_PTY, _NO_PTY)
     def test_the_shell_is_reaped_when_the_stream_dies(self):
-        # Review Focus. The pid comes from the session itself -- `$$` in
-        # the shell -- and the verdict is read out of the process table,
-        # not out of a flag this code sets. An unreaped child is a zombie,
-        # and `os.kill(pid, 0)` succeeds on a zombie, so this fails on a
-        # teardown that signals without waiting as well as on one that
-        # does not signal at all.
+        # Review Focus.
+        self.assert_the_shell_is_reaped()
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    def test_a_wrapped_shell_is_reaped_when_the_stream_dies(self):
+        """The same, with the session spawned through `setsid -c`.
+
+        The teardown signals a process *group*, and on the preferred path
+        the claim that `Popen`'s pid is still that group's id rests on
+        `setsid(1)` exec'ing in place instead of forking. If that were
+        wrong, `_end_shell` would reap the wrapper and leave a live
+        `bash -i` on the target -- the exact defect this task exists to
+        prevent -- so the claim is executed here rather than left in a
+        docstring. The stand-in has the same no-fork shape; real
+        `setsid(1)`'s own behaviour is the first Linux run's to confirm.
+        """
+        self.a_setsid_stand_in()
+        self.assert_the_shell_is_reaped()
+
+    def assert_the_shell_is_reaped(self):
+        """A session's stream dies; its child leaves the process table.
+
+        The pid comes from the session itself -- `$$` in the shell -- and
+        the verdict is read out of the process table, not out of a flag
+        this code sets. An unreaped child is a zombie, and signal 0
+        succeeds on a zombie, so this fails on a teardown that signals
+        without waiting as well as on one that never signals.
+        """
         stream = self.ask_for_a_shell()
         data = self.run_in_the_shell(stream, b'echo "P""ID=$$"\n', b"PID=")
         found = re.search(rb"PID=(\d+)", data)
@@ -1502,9 +1580,7 @@ class TestAShellSession(TunnelEndpointTestCase):
         grace = beacon_mod._SHELL_TERM_GRACE + 1.0
         deadline = time.time() + grace
         while time.time() < deadline:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if not _alive(pid):
                 break
             time.sleep(0.02)
         else:
@@ -1514,6 +1590,73 @@ class TestAShellSession(TunnelEndpointTestCase):
                       % (pid, grace))
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    def test_input_the_shell_is_not_reading_does_not_hold_the_teardown(self):
+        """A paste during a capture must not wedge the session's teardown.
+
+        The slave's input queue is a few kilobytes that only the
+        foreground command drains, so a command which does not read its
+        stdin -- this `sleep`, or the `tcpdump` an operator would really
+        be running -- leaves a write to the master unable to complete.
+        That write is on the thread that runs the teardown, so a blocking
+        one would mean a dead stream whose child, master and threads were
+        all still alive, with nothing left to notice: the output
+        direction is silent, because the shell is producing nothing.
+
+        So: a sleeping foreground command, more input than the queue
+        holds, then the stream closes. The session has to survive the
+        paste and the child has to go with the stream.
+
+        Only Linux can make the write itself block, for the reason
+        `TestWritingToATerminal` gives, so on a BSD this is the weaker
+        half of the claim: that a paste a non-blocking master cannot
+        take is waited out rather than treated as a dead terminal.
+        """
+        stream = self.ask_for_a_shell()
+        data = self.run_in_the_shell(stream, b'echo "P""ID=$$"\n', b"PID=")
+        pid = int(re.search(rb"PID=(\d+)", data).group(1))
+        self.run_in_the_shell(
+            stream, b'echo "S""LEEPING"; sleep 300\n', b"SLEEPING")
+
+        # A comment, so that a session which somehow did read it runs
+        # nothing; 32 KB, so that no tty's input queue can hold it.
+        stream.send(b"#" + b"x" * 32000 + b"\n")
+
+        time.sleep(0.5)
+        self.assertTrue(_alive(pid),
+                        "the paste ended the session: input the terminal "
+                        "cannot take yet is not a terminal that has gone")
+
+        stream.close()
+
+        grace = beacon_mod._SHELL_TERM_GRACE + 2.0
+        self.wait_for(lambda: not _alive(pid), timeout=grace,
+                      what="the shell %d going after a paste it never read "
+                           "and a stream that then closed" % pid)
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    def test_a_closed_session_gives_its_slot_back(self):
+        # Without this, deleting `_drop_shell_slot` passes every other
+        # test in the file and produces an endpoint on which shell
+        # sessions stop working after the fourth, for as long as it runs.
+        held = []
+        for number in range(beacon_mod._SHELL_MAX_SESSIONS):
+            stream = self.ask_for_a_shell()
+            self.run_in_the_shell(stream, b'echo "H""ELD_%d"\n' % number,
+                                  b"HELD_%d" % number)
+            held.append(stream)
+        for stream in held:
+            stream.close()
+
+        # `sessions` is the panel's counter, not the cap's, so waiting on
+        # it says the endpoint has finished with all four without
+        # assuming the thing under test.
+        self.wait_for(lambda: self.endpoint.status()["sessions"] == 0,
+                      what="the endpoint letting go of its four sessions")
+
+        fifth = self.ask_for_a_shell()
+        self.run_in_the_shell(fifth, b'echo "F""IFTH"\n', b"FIFTH")
 
     @unittest.skipUnless(_HAS_PTY, _NO_PTY)
     @unittest.skipUnless(_HAS_BASH, _NO_BASH)
@@ -1604,8 +1747,15 @@ class TestAShellSession(TunnelEndpointTestCase):
     @unittest.skipUnless(_HAS_PTY, _NO_PTY)
     def test_bin_sh_is_used_when_bash_is_absent(self):
         # The probe is the seam: a host without bash is not something a
-        # test can arrange, and what is under test is the choice made from
-        # the probe's answer, not `os.access` itself.
+        # test can arrange, and what is under test is the choice made
+        # from the probe's answer, not `os.access` itself.
+        #
+        # It is the *shared* probe, so this host has no `setsid` either
+        # for the length of this test, and the session therefore takes
+        # the fallback spawn as well as the fallback shell. Both are
+        # wanted here -- a host stripped to `/bin/sh` is a host unlikely
+        # to carry util-linux -- and whoever maintains the setsid path
+        # should know that this test does not exercise it.
         self.patched("_shell_executable", lambda path: False)
         stream = self.ask_for_a_shell()
 
