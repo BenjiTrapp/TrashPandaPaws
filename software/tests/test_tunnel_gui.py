@@ -100,6 +100,13 @@ class _FakeTunnelSupervisor:
             "bind_port": 8446,
             "socks_port_first": 19050,
             "socks_port_last": 19099,
+            # The real `TunnelSupervisor.status()` reports these three
+            # beside the SOCKS pair, from the same block, so the fake the
+            # route tests use carries them too. Off here, which is how
+            # the feature ships; the real one's own tests cover it on.
+            "shell_port_first": None,
+            "shell_port_last": None,
+            "shell_transcripts": None,
             "crypto": "openssl" if self.state == "running" else None,
             "endpoints": [dict(row) for row in self.endpoints]
             if self.state == "running" else [],
@@ -442,12 +449,23 @@ class TestTheTunnelProcess(unittest.TestCase):
         Probed ports, because some of these rows are handed to the real
         fronts below and a literal would be a fixed number bound on a
         shared machine.
+
+        **The probes are deduplicated**, the way the two tests that spin
+        `while len(ports) < 3` already do: two consecutive probes can
+        return the same number, and a row whose SOCKS and shell ports
+        were equal would bind one, fail the other, and read as a wiring
+        bug rather than as the timing accident it is.
         """
+        ports = set()
+        while len(ports) < 2 * count:
+            ports.add(_free_port())
+        ports = sorted(ports)
         rows = []
         for number in range(count):
-            row = {"identity": "id-%d" % number, "port": _free_port(),
-                   "shell_port": _free_port(), "state": state,
-                   "shell_detail": shell_detail}
+            row = {"identity": "id-%d" % number,
+                   "port": ports[2 * number],
+                   "shell_port": ports[2 * number + 1],
+                   "state": state, "shell_detail": shell_detail}
             row.update(over)
             rows.append(row)
         return rows
@@ -650,6 +668,53 @@ class TestTheTunnelProcess(unittest.TestCase):
             self.assertNotEqual(row["shell_password"], row["identity"])
             self.assertGreaterEqual(len(row["shell_password"]), 16)
 
+    def test_the_recording_flag_is_the_deployments_answer_not_the_rows(self):
+        """`shell_recording` answers "is this engagement recorded".
+
+        Deliberately **not** "does this row have a session to record": it
+        is True on a row whose shell port failed to bind and on a
+        disconnected one, and `shell_detail` beside it says why there is
+        no port. Task 6's `Transcripts` owns that reading -- one answer
+        for the whole deployment, because "is this engagement recorded"
+        is how the question is actually asked, and an operator looking at
+        the panel before anybody has attached still needs the answer.
+        Pinned here because Task 9 renders this field per row, where the
+        other reading would be the natural guess.
+        """
+        from software.c2.tunnel import __main__ as tunnel_main
+        from software.c2.tunnel.shell import ShellFront, Transcripts
+
+        taken = socket.socket()
+        self.addCleanup(taken.close)
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+
+        directory = self.root / "transcripts"
+        fronts = tunnel_main._Fronts(
+            object(), factory=_FakeSocksFront, shell_factory=ShellFront,
+            shell_enabled=True, transcripts=Transcripts(str(directory)))
+        self.addCleanup(fronts.stop_all)
+        rows = self._rows(2)
+        rows[0]["shell_port"] = taken.getsockname()[1]
+        rows[1]["state"] = "disconnected"
+        with self.assertLogs(tunnel_main.logger, level="WARNING"):
+            fronts.reconcile(rows)
+
+        failed = fronts.decorate(rows[0])
+        self.assertIsNone(failed["shell"], "the held port was bound anyway")
+        self.assertTrue(
+            failed["shell_recording"],
+            "the flag was read as a property of this row's port rather "
+            "than of the deployment")
+        self.assertIn("could not be opened", failed["shell_detail"],
+                      "the row says the badge is on but not why there is "
+                      "nothing to record")
+
+        away = fronts.decorate(rows[1])
+        self.assertIsNone(away["shell"])
+        self.assertTrue(away["shell_recording"])
+        self.assertTrue(away["shell_detail"])
+
     def test_the_decorated_row_reports_recording_when_a_directory_is_configured(self):
         """Recording is one switch with a path behind it, and off is off.
 
@@ -851,16 +916,19 @@ class TestTheSupervisor(unittest.TestCase):
                     getattr(supervisor, action)()
                 self.assertIn("does not manage", str(caught.exception))
 
-    def test_a_configured_shell_range_and_transcript_dir_reach_the_child(self):
-        """The block the team server read, on the child's command line.
+    def test_a_configured_shell_range_and_transcript_dir_are_reported(self):
+        """The block the team server read, reported where the panel reads.
 
-        The one step `tunnel_server_config`'s own tests cannot hold: the
-        validated block has to become arguments, and the child has to
-        have been built from them. Read back out of the child's own
-        `status`, which is the only thing that knows -- `_child` is
-        reached for because no public method reports the child's view of
-        its own shell range, and the alternative is asserting on a
-        command line nobody ran.
+        `status()` is the only thing a deployment with no endpoint
+        connected can ask whether this feature is on at all, so the three
+        shell fields are reported there beside the SOCKS pair the panel
+        already renders -- before the child is started as well as after,
+        because "configured" is a fact about the block and not about a
+        process.
+
+        That `status()` answers is not the same as the child having been
+        built from the same numbers; the test below holds that half, by
+        handing the child a range it has to refuse.
         """
         ports = set()
         while len(ports) < 3:
@@ -871,29 +939,70 @@ class TestTheSupervisor(unittest.TestCase):
             socks_port_first=socks, socks_port_last=socks,
             shell_port_first=first, shell_port_last=last,
             shell_transcript_dir=str(directory))
-        self.assertEqual(supervisor.start()["state"], "running")
 
-        reported = supervisor._child.ask_status(supervisor.control_token)
-        self.assertIsNotNone(reported, "the child did not answer")
-        self.assertEqual([reported["shell_port_first"],
-                          reported["shell_port_last"]], [first, last])
-        self.assertEqual(reported["shell_transcripts"], str(directory))
+        stopped = supervisor.status()
+        self.assertEqual(stopped["state"], "stopped")
+        self.assertEqual([stopped["shell_port_first"],
+                          stopped["shell_port_last"]], [first, last],
+                         "a configured range is invisible until the "
+                         "process is running")
+
+        state = supervisor.start()
+        self.assertEqual(state["state"], "running")
+        self.assertEqual([state["shell_port_first"],
+                          state["shell_port_last"]], [first, last])
+        self.assertEqual(state["shell_transcripts"], str(directory))
+        # Beside the SOCKS pair, which the panel reads from the same
+        # block: two ranges, reported the same way.
+        self.assertEqual(state["socks_port_first"], socks)
         # Configured is not created: a deployment with recording on and
         # nobody attached writes nothing, so the directory appears with
         # the first session and not with the process.
         self.assertFalse(directory.exists())
 
-    def test_a_block_with_no_shell_keys_starts_a_child_with_no_shell_port(self):
-        # The shipped state, through the real supervisor: the two keys are
-        # absent from the block, so the command line carries neither and
-        # the child opens no shell port for anybody.
+    def test_a_shell_range_the_child_refuses_comes_back_in_its_own_words(self):
+        """The other half: the two numbers became arguments.
+
+        `status()` reports the block the team server read, and would
+        answer the same whether or not it ever reached a command line. A
+        shell range overlapping the SOCKS one is one the tunnel server
+        refuses to be built with, and that refusal is carried up from the
+        child's stderr -- so a child that refuses for that reason is a
+        child that was given those numbers.
+
+        A hand-made block: `tunnel_server_config` refuses an overlap by
+        field name long before a child is spawned.
+        """
+        from software.c2.tunnel.supervisor import SupervisorError
+
+        port = _free_port()
+        supervisor = self.supervisor(
+            socks_port_first=port, socks_port_last=port,
+            shell_port_first=port, shell_port_last=port)
+        with self.assertRaises(SupervisorError) as caught:
+            supervisor.start()
+        reason = str(caught.exception)
+        self.assertIn("overlaps", reason)
+        self.assertIn(str(port), reason)
+        # And nothing is left behind claiming to be running.
+        self.assertEqual(supervisor.status()["state"], "stopped")
+
+    def test_a_block_with_no_shell_keys_says_so_in_the_status_it_reports(self):
+        # The shipped state, through the real supervisor: the keys are
+        # absent from the block, so the command line carries none of them
+        # and the reported block says the feature is off. That the child
+        # then opens no shell port for anybody is
+        # `TestTheTunnelProcess.test_no_range_opens_no_shell_front_and_
+        # the_status_says_so`, which asks a real child directly.
         supervisor = self.supervisor()
-        self.assertEqual(supervisor.start()["state"], "running")
-        reported = supervisor._child.ask_status(supervisor.control_token)
-        self.assertIsNotNone(reported, "the child did not answer")
-        self.assertIsNone(reported["shell_port_first"])
-        self.assertIsNone(reported["shell_port_last"])
-        self.assertIsNone(reported["shell_transcripts"])
+        state = supervisor.start()
+        self.assertEqual(state["state"], "running")
+        self.assertIsNone(state["shell_port_first"])
+        self.assertIsNone(state["shell_port_last"])
+        self.assertIsNone(state["shell_transcripts"])
+        # The SOCKS pair is still reported, so this is the shell feature
+        # being off and not the block having gone missing.
+        self.assertTrue(state["socks_port_first"])
 
     def test_a_shell_range_with_one_end_is_refused_rather_than_dropped(self):
         from software.c2.tunnel.supervisor import SupervisorError

@@ -278,6 +278,16 @@ class TunnelSupervisor:
             "bind_port": self.config.get("bind_port"),
             "socks_port_first": self.config.get("socks_port_first"),
             "socks_port_last": self.config.get("socks_port_last"),
+            # The shell port range and the transcript directory, reported
+            # beside the SOCKS pair and from the same place: this is the
+            # process-level answer to "is the shell feature on here", and
+            # it has to be available before any endpoint has connected --
+            # a deployment with an empty endpoint list would otherwise
+            # have nowhere to learn it at all. Null for both ends is the
+            # feature off, which is how it ships.
+            "shell_port_first": self.config.get("shell_port_first"),
+            "shell_port_last": self.config.get("shell_port_last"),
+            "shell_transcripts": self.config.get("shell_transcript_dir"),
             "address": None,
             "crypto": None,
             "uptime_seconds": None,
