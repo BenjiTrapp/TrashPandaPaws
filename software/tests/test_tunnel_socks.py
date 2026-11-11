@@ -989,7 +989,7 @@ class TestWhatAnUnauthenticatedPeerCanHold(SocksFrontTestCase):
         self.wait_for(lambda: front.stats()["refused_threads"] == 2)
 
     def test_finish_stops_draining_at_its_deadline(self):
-        # `_finish` drains what a client sent and nobody wanted, so that
+        # `finish` drains what a client sent and nobody wanted, so that
         # closing cannot replace an already-written refusal with an RST.
         # Against a client that keeps sending, a timeout per read never
         # ends: only the deadline does. Called directly because there is
@@ -1022,14 +1022,14 @@ class TestWhatAnUnauthenticatedPeerCanHold(SocksFrontTestCase):
         done = threading.Event()
 
         def drain_it():
-            socks_mod._finish(right)
+            socks_mod.finish(right)
             done.set()
 
         runner = threading.Thread(target=drain_it, name="finish", daemon=True)
         runner.start()
         self.assertTrue(
             done.wait(3.0),
-            "_finish drained past its deadline; a client that keeps sending "
+            "finish drained past its deadline; a client that keeps sending "
             "pins the thread that is trying to close it")
         runner.join(timeout=5.0)
 

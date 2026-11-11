@@ -16,11 +16,11 @@ pair anywhere; an absolute deadline on the handshake rather than a
 timeout per `recv`; a cap on handshakes in flight separate from the cap
 on live sessions; exactly one thread writing to the client socket at a
 time; and a polite close that drains briefly so a refusal the client has
-not read yet is not discarded by an RST. The three argument helpers --
-`loopback_bind`, `credential`, `positive` -- and the three socket
-teardowns are imported from there rather than copied, because two
-implementations of a security property are one implementation and one
-latent hole.
+`socks.py`. The six helpers it shares with that module -- the three
+argument checks `loopback_bind`, `credential` and `positive`, and the
+three socket teardowns `shut`, `shutdown_both` and `finish` -- are
+imported from there rather than copied, because two implementations of a
+security property are one implementation and one latent hole.
 
 Four things are different here, and each one is a decision rather than an
 accident.
@@ -89,16 +89,11 @@ from .protocol import (
 )
 from .socks import (
     credential,
+    finish,
     loopback_bind,
     positive,
-    # The socket teardown this port shares with the SOCKS one, under the
-    # names it has there. A copy here would be a copy of the reasoning
-    # about an RST discarding a refusal and about what unparks a blocked
-    # pump, which is exactly the kind of duplication the two ports are
-    # meant not to have.
-    _finish,
-    _shut,
-    _shutdown,
+    shut,
+    shutdown_both,
 )
 
 logger = logging.getLogger("raccoon.tunnel.shell")
@@ -108,6 +103,11 @@ __all__ = ["ShellFront", "DEFAULT_MAX_SESSIONS", "PROMPT", "parse_auth_line"]
 # Four, because the endpoint holds four shell sessions at once: see the
 # module docstring.
 DEFAULT_MAX_SESSIONS = 4
+
+# The floor under `max_pending` when it is left unset: see `__init__`. The
+# session cap alone would let a handful of silent peers crowd the operator
+# out of a port whose whole purpose is that they can reach it.
+_MIN_PENDING = 8
 
 # What a client reads before it sends anything. Written first so that a
 # terminal shows the operator what is wanted instead of looking hung.
@@ -231,9 +231,15 @@ class ShellFront(object):
             raise ValueError("max_sessions must be at least 1, got %r"
                              % (max_sessions,))
         # A handshake that could never become a session is one this port
-        # has no use for, so the default is the session cap itself.
-        self.max_pending = (self.max_sessions if max_pending is None
-                            else int(max_pending))
+        # has no use for, so the floor is the session cap -- but four,
+        # which is what the endpoint will carry, is far too few to bound
+        # the pre-auth exposure with: four silent loopback sockets would
+        # then be able to turn the operator's own attach away for a whole
+        # handshake timeout. `SocksFront` inherits no such problem,
+        # because its cap is 256. Eight is a cheap floor: a handshake
+        # costs a thread and a socket until it is refused.
+        self.max_pending = (max(self.max_sessions, _MIN_PENDING)
+                            if max_pending is None else int(max_pending))
         if self.max_pending < 1:
             raise ValueError("max_pending must be at least 1, got %r"
                              % (max_pending,))
@@ -316,7 +322,7 @@ class ShellFront(object):
         for session in sessions:
             session.close()
         for client in clients:
-            _shut(client)
+            shut(client)
         for worker in workers:
             worker.join(timeout=_JOIN_TIMEOUT)
 
@@ -328,38 +334,47 @@ class ShellFront(object):
     def stats(self) -> dict:
         """One row's worth of what this port has done.
 
-        `accepted` counts connections and `refused` counts the ones this
-        port turned away, per kind; a client that vanished at the prompt is
-        neither, so they do not have to add up. `bytes_out` is toward the
-        implant's terminal and `bytes_in` is back from it, both plaintext
-        and both for the life of this object.
+        The same keys as `SocksFront.stats`, and deliberately so: the
+        operator panel's row reads the two generically -- `refused` is the
+        total and every `refused_<why>` is one kind of it, discovered by
+        prefix rather than named -- so a shell row that spelled any of
+        this differently would be a second rendering to write and a second
+        one to keep right.
+
+        `accepted` counts connections and the `refused_*` counters count
+        the ones this port turned away; a client that vanished at the
+        prompt is neither, so the three do not have to add up. `bytes_out`
+        is toward the implant's terminal and `bytes_in` is back from it,
+        both plaintext and both for the life of this object.
 
         The refusal keys are deliberately not interchangeable, because an
         operator who cannot attach has to be able to tell which of these
         it was:
 
-        * `auth` -- nobody proved they were the operator: a wrong
+        * `refused_auth` -- nobody proved they were the operator: a wrong
           password, an empty answer, or a line past its bound.
-        * `capacity` -- `max_sessions`, which is this port already
+        * `refused_capacity` -- `max_sessions`, which is this port already
           carrying all the terminals it will hold.
-        * `pending` -- `max_pending`, more handshakes in flight than this
-          port will hold open at once.
-        * `threads` -- no thread could be started, which is the process as
-          a whole out of room rather than either cap.
-        * `timeout` -- a line that did not arrive inside the deadline,
-          counted because it was cut off deliberately and not lost.
-        * `tunnel` -- there is no endpoint to carry it, or it never dialled
-          back.
-        * `unsupported` -- the endpoint is connected but advertised no
-          `shell` feature, which is a build older than this feature and a
-          different thing to do about it than a tunnel that is down.
+        * `refused_pending` -- `max_pending`, more handshakes in flight
+          than this port will hold open at once.
+        * `refused_threads` -- no thread could be started, which is the
+          process as a whole out of room rather than either cap.
+        * `refused_timeout` -- a handshake cut off at its deadline: a
+          password line that never arrived, or a prompt this client would
+          not read. Counted because it was ended deliberately, not lost.
+        * `refused_tunnel` -- there is no endpoint to carry it, or it never
+          dialled back.
+        * `refused_unsupported` -- the endpoint is connected but advertised
+          no `shell` feature, which is a build older than this feature and
+          a different thing to do about it than a tunnel that is down.
         """
         with self._lock:
-            return {
+            refusals = dict(self._refusals)
+            row = {
                 "identity": self.identity,
                 "port": self.port,
                 "serving": self._listener is not None,
-                "live": self._live,
+                "sessions": self._live,
                 "max_sessions": self.max_sessions,
                 "pending": len(self._pending),
                 "max_pending": self.max_pending,
@@ -367,8 +382,11 @@ class ShellFront(object):
                 "carried": self._carried,
                 "bytes_in": self._bytes_in,
                 "bytes_out": self._bytes_out,
-                "refused": dict(self._refusals),
+                "refused": sum(refusals.values()),
             }
+        for why, count in refusals.items():
+            row["refused_" + why] = count
+        return row
 
     # ── the accept loop ──
 
@@ -461,10 +479,10 @@ class ShellFront(object):
         try:
             self._handle(conn, peer, deadline)
         except socket.timeout:
-            # Only reachable from the auth line's reads, which are the
-            # only place a timeout is set on this socket for a read, and
-            # `_read_line` gives each of them no more than the deadline has
-            # left. So this is the deadline and not a per-read stall.
+            # The auth line's reads and nothing else: the prompt's write
+            # has its own arm in `_handle`, and `_read_line` gives each of
+            # its reads no more than the deadline has left. So this is the
+            # deadline and not a per-read stall.
             logger.warning("shell: %s did not send a password line within "
                            "%.1fs; closed", peer, self.handshake_timeout)
             self._refuse(conn, "no password line arrived within %.1f seconds, "
@@ -481,11 +499,23 @@ class ShellFront(object):
             with self._lock:
                 self._clients.discard(conn)
                 self._pending.discard(conn)
-            _finish(conn)
+            finish(conn)
 
     def _handle(self, conn: socket.socket, peer: str,
                 deadline: float) -> None:
-        _say(conn, PROMPT)
+        try:
+            _say(conn, PROMPT)
+        except socket.timeout:
+            # Its own arm, because `socket.timeout` is an `OSError` and
+            # this one is not the line's deadline: this client is not
+            # reading ten bytes, so telling it that no password line
+            # arrived would be the wrong reason, and writing a refusal to
+            # a socket that has just proved it is not read would only buy
+            # another stall. Counted, because it was ended here.
+            logger.warning("shell: %s would not read the prompt within "
+                           "%.1fs; closed", peer, _SAY_TIMEOUT)
+            self._refused("timeout")
+            return
         try:
             line, pipelined = _read_line(conn, deadline, _MAX_LINE)
         except _TooLong as exc:
@@ -554,12 +584,16 @@ class ShellFront(object):
             # is told "no shell" learns nothing about whether to rebuild
             # the implant or wait for it to call home.
             reason = str(exc)
-            # `unsupported` when the refusal is about the feature the
-            # endpoint did not advertise, because that is a build to
-            # replace and not a tunnel to wait for. Matched on the text
-            # because `open_shell_session` raises one exception type for
-            # every reason it has.
-            why = "unsupported" if "feature" in reason else "tunnel"
+            # The discriminator is an attribute the tunnel server sets on
+            # the one refusal that means "this build cannot do it", not a
+            # phrase in the text: an identity is an operator-chosen string
+            # that any word could appear in, and reading the reason out of
+            # the wording would misclassify a *different* refusal whose
+            # text happens to quote such an identity. An attribute rather
+            # than an exception type imported from there, because this
+            # port holds its tunnel server as a duck-typed collaborator.
+            why = ("unsupported" if getattr(exc, "shell_unsupported", False)
+                   else "tunnel")
             logger.warning("shell: %s asked %r for a terminal and there is "
                            "none to give: %s", peer, self.identity, reason)
             self._refuse(conn, reason, why)
@@ -567,6 +601,15 @@ class ShellFront(object):
         with self._lock:
             self._sessions.add(session)
         try:
+            if self._stopping.is_set():
+                # `stop` takes its list of sessions to close under the
+                # lock, so one added after that snapshot has nobody to
+                # close it: without this check a connection caught between
+                # `open_shell_session` returning and the add above would
+                # sit out the whole pair timeout after `stop` had returned.
+                logger.debug("shell: %r stopped while a session for %s was "
+                             "being opened; dropped it", self.identity, peer)
+                return
             if not session.wait_paired(_PAIR_TIMEOUT):
                 logger.warning("shell: %r did not open a terminal within "
                                "%.1fs; refused %s", self.identity,
@@ -575,28 +618,15 @@ class ShellFront(object):
                                    "terminal within %.1f seconds."
                              % (self.identity, _PAIR_TIMEOUT), "tunnel")
                 return
-            stream = session.sock
-            with self._lock:
-                self._carried += 1
             logger.info("shell: %s is attached to %r, %dx%d", peer,
                         self.identity, cols, rows)
-            if pipelined:
-                # Already input for the shell: see the module docstring.
-                try:
-                    stream.sendall(pipelined)
-                except (OSError, ValueError) as exc:
-                    logger.warning("shell: the terminal for %r went before "
-                                   "its first bytes: %s", self.identity, exc)
-                    return
-                with self._lock:
-                    self._bytes_out += len(pipelined)
-            self._pump(conn, stream)
+            self._pump(conn, session.sock, pipelined)
         finally:
             with self._lock:
                 self._sessions.discard(session)
             session.close()
 
-    def _pump(self, conn: socket.socket, stream) -> None:
+    def _pump(self, conn: socket.socket, stream, pipelined: bytes) -> None:
         """Carry bytes until either side is finished.
 
         Both descriptors lose their timeout here. The auth line had a
@@ -608,10 +638,13 @@ class ShellFront(object):
 
         This thread owns the operator-to-terminal direction and a second
         one owns the other, so each socket has exactly one writer: no
-        refusal is ever written after this point, which is what makes that
-        hold. Whichever direction ends first ends the session, because the
-        operator's terminal must not be left attached to a shell that has
-        exited.
+        refusal is ever written once that second thread is running, which
+        is what makes that hold. Whichever direction ends first ends the
+        session, because the operator's terminal must not be left attached
+        to a shell that has exited.
+
+        `carried` is counted here and not at the pairing, so that it means
+        a session that actually ran in both directions.
         """
         conn.settimeout(None)
         stream.settimeout(None)
@@ -622,19 +655,39 @@ class ShellFront(object):
         except RuntimeError as exc:
             # No thread for the output direction. A terminal that cannot
             # show what the shell says is worse than none, so the session
-            # ends here: the caller's `finally` closes it and the client
-            # sees the connection go.
+            # ends -- but it is refused in text and counted like the
+            # accept loop's twin branch, rather than closed silently: the
+            # one thing this port must never do is leave the operator
+            # unable to tell a refusal from a dead tunnel. `back` never
+            # started, so this thread is still the only writer on `conn`.
             logger.warning("shell: %r could not start the output direction "
                            "of a session; closing it: %s", self.identity, exc)
+            self._refuse(conn, "this team server has no thread left for the "
+                               "output half of a shell session, so the "
+                               "session was closed rather than run one way. "
+                               "Something else on it is holding far more "
+                               "than it should.", "threads")
             return
+        with self._lock:
+            self._carried += 1
         try:
+            if pipelined:
+                # Already input for the shell: see the module docstring.
+                try:
+                    stream.sendall(pipelined)
+                except (OSError, ValueError) as exc:
+                    logger.warning("shell: the terminal for %r went before "
+                                   "its first bytes: %s", self.identity, exc)
+                    return
+                with self._lock:
+                    self._bytes_out += len(pipelined)
             self._upstream(conn, stream)
         finally:
             # Shut both descriptors before the join: the other thread may
             # be parked in a read or in a send that TCP backpressure has
             # stopped, and neither wakes on its own.
             stream.close()
-            _shutdown(conn)
+            shutdown_both(conn)
             back.join(timeout=_JOIN_TIMEOUT)
 
     def _upstream(self, conn: socket.socket, stream) -> None:
@@ -663,7 +716,7 @@ class ShellFront(object):
             # it is waiting for and the other direction's blocked `recv` is
             # unparked.
             stream.close()
-            _shutdown(conn)
+            shutdown_both(conn)
 
     def _downstream_loop(self, conn: socket.socket, stream) -> None:
         while True:
@@ -747,7 +800,7 @@ def _refuse_now(sock: socket.socket, reason: str) -> None:
         sock.sendall(_line(reason))
     except OSError:
         pass
-    _shut(sock)
+    shut(sock)
 
 
 def _read_line(sock: socket.socket, deadline: float,

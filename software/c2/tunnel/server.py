@@ -108,6 +108,12 @@ from .protocol import (
     read_frame,
     write_frame,
 )
+# The argument check the operator-facing SOCKS port already owns. One
+# definition rather than a second identical one here: that module is this
+# package's home for the checks its two ports and this server share, and
+# the import runs the other way round from the one that is forbidden --
+# `socks.py` knows nothing about this module, and must not.
+from .socks import positive
 
 logger = logging.getLogger("raccoon.tunnel.server")
 
@@ -444,16 +450,16 @@ class TunnelServer(object):
                        self.first_port, self.last_port))
         self.state_path = os.path.abspath(os.fspath(state_path))
         self._agent_lookup = agent_lookup
-        self.keepalive_interval = _positive(keepalive_interval,
-                                            "keepalive_interval")
+        self.keepalive_interval = positive(keepalive_interval,
+                                           "keepalive_interval")
         # Three keep-alives missed before an endpoint is declared gone: one
         # lost PING on a bad link should not cost a tunnel.
-        self.idle_timeout = (_positive(idle_timeout, "idle_timeout")
+        self.idle_timeout = (positive(idle_timeout, "idle_timeout")
                              if idle_timeout is not None
                              else 3 * self.keepalive_interval)
-        self.handshake_timeout = _positive(handshake_timeout,
-                                           "handshake_timeout")
-        self.session_timeout = _positive(session_timeout, "session_timeout")
+        self.handshake_timeout = positive(handshake_timeout,
+                                          "handshake_timeout")
+        self.session_timeout = positive(session_timeout, "session_timeout")
         self.backlog = int(backlog)
 
         self.port = None            # type: Optional[int]
@@ -709,6 +715,12 @@ class TunnelServer(object):
         drops, and `_forget` closes every session that rode on it, live
         SOCKS pivots included. A refusal here therefore has to cost the
         channel nothing, which means sending nothing.
+
+        That one refusal carries `shell_unsupported = True` on the
+        `ValueError` it raises, so a caller can tell it from the others
+        without reading the text: an endpoint that cannot do this is a
+        build to replace, and one that is not connected is a build to wait
+        for.
         """
         with self._lock:
             channel = self._channels.get(identity)
@@ -716,12 +728,23 @@ class TunnelServer(object):
                 raise ValueError(
                     "no endpoint is connected for identity %r" % identity)
             if "shell" not in channel.features:
-                raise ValueError(
+                # The reason is carried as an attribute as well as in the
+                # text, because the operator-facing front has to tell this
+                # refusal from "no endpoint is connected" -- one says
+                # replace the build, the other says wait for it to call
+                # home -- and both are a `ValueError`. An attribute rather
+                # than an exception class of its own: `ShellFront` holds
+                # this server as a duck-typed collaborator ("anything with
+                # `open_shell_session`"), and importing a symbol from here
+                # into it would end that, for its test stubs too.
+                refusal = ValueError(
                     "the endpoint for identity %r did not advertise the "
                     "'shell' feature (it advertised %s); it predates shell "
                     "sessions and would drop its command channel on the "
                     "request, so none was sent"
                     % (identity, list(channel.features) or "none"))
+                refusal.shell_unsupported = True
+                raise refusal
             self._session_count += 1
             session = RelaySession(self._session_count, identity,
                                    os.urandom(TOKEN_LEN), kind="shell")
@@ -1411,14 +1434,6 @@ def _port_range(value) -> Tuple[int, int]:
             "port_range %d-%d is not an ascending range of ports"
             % (first, last))
     return first, last
-
-
-def _positive(value, what: str) -> float:
-    seconds = float(value)
-    if seconds <= 0:
-        raise ValueError("%s must be a positive number of seconds, got %r"
-                         % (what, value))
-    return seconds
 
 
 def _text(value) -> Optional[str]:

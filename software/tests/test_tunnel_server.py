@@ -1068,18 +1068,30 @@ class TestShellSessions(TunnelServerTestCase):
         message = str(caught.exception)
         self.assertIn("build-alpha", message)
         self.assertIn("shell", message)
+        # And marked, so the operator-facing front can tell this refusal
+        # from "no endpoint is connected" without reading the wording: one
+        # says replace the build, the other says wait for it to call home.
+        self.assertTrue(getattr(caught.exception, "shell_unsupported",
+                                False))
 
         # A features list that does not name it is the same answer.
         self.command_peer(server, "build-beta", pump=True, features=["other"])
         with self.assertRaises(ValueError) as caught:
             server.open_shell_session("build-beta")
         self.assertIn("shell", str(caught.exception))
+        self.assertTrue(getattr(caught.exception, "shell_unsupported",
+                                False))
 
     def test_open_shell_session_for_an_identity_with_no_channel_is_refused(self):
         server = self.start_server()
         with self.assertRaises(ValueError) as caught:
             server.open_shell_session("build-alpha")
         self.assertIn("build-alpha", str(caught.exception))
+        # Not the feature refusal: nothing is wrong with this build, and a
+        # front that treated the two alike would tell the operator to
+        # rebuild an implant that has simply not called home yet.
+        self.assertFalse(getattr(caught.exception, "shell_unsupported",
+                                 False))
 
     def test_the_refusal_sends_nothing_on_the_command_channel(self):
         # An endpoint that meets a kind it does not know ends its control

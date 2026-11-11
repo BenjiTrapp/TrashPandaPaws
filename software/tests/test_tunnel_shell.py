@@ -68,6 +68,7 @@ from software.c2.tunnel.protocol import (
     write_frame,
 )
 from software.c2.tunnel.server import TunnelServer
+from software.c2.tunnel.socks import SocksFront
 from software.c2.tunnel import shell as shell_mod
 from software.c2.tunnel.shell import (
     DEFAULT_MAX_SESSIONS,
@@ -302,16 +303,33 @@ class _StubEndpoint(object):
 
 
 class _NoThreads(ShellFront):
-    """A front whose per-connection threads cannot be started.
+    """A front whose threads stop being startable after `allowed` of them.
 
     `_start` is the seam `SocksFront` keeps for exactly this, and this
-    module inherits it. The branch under test is a process with no threads
-    left, and exhausting this machine's thread table to reach it would be
-    neither quick nor kind to the rest of the suite.
+    module inherits it. The branches under test are a process with no
+    threads left, and exhausting this machine's thread table to reach them
+    would be neither quick nor kind to the rest of the suite.
+
+    The count is what makes the *second* branch reachable: with
+    `allowed=1` the connection's own thread starts and the output
+    direction of its session is the one that cannot, which is a live
+    session that has to be refused in text rather than dropped.
     """
 
+    allowed = 0
+
+    def __init__(self, *args, **kwargs):
+        ShellFront.__init__(self, *args, **kwargs)
+        self._started = 0
+        self._start_lock = threading.Lock()
+
     def _start(self, thread):
-        raise RuntimeError("can't start new thread")
+        with self._start_lock:
+            self._started += 1
+            spent = self._started > self.allowed
+        if spent:
+            raise RuntimeError("can't start new thread")
+        thread.start()
 
 
 class TestTheAuthLine(unittest.TestCase):
@@ -537,8 +555,8 @@ class TestAttaching(ShellFrontTestCase):
         self.assertEqual(stats["port"], front.port)
         self.assertEqual(stats["accepted"], 1)
         self.assertEqual(stats["carried"], 1)
-        self.assertEqual(stats["live"], 1)
-        self.assertEqual(sum(stats["refused"].values()), 0)
+        self.assertEqual(stats["sessions"], 1)
+        self.assertEqual(stats["refused"], 0)
         self.assert_endpoint_healthy(endpoint)
 
     def test_a_wrong_password_is_refused_and_counted_under_auth(self):
@@ -550,9 +568,9 @@ class TestAttaching(ShellFrontTestCase):
         self.assertNotIn(self.password.encode("utf-8"), text,
                          "a refusal must not quote the password back")
         stats = front.stats()
-        self.assertEqual(stats["refused"]["auth"], 1)
+        self.assertEqual(stats["refused_auth"], 1)
         self.assertEqual(stats["carried"], 0)
-        self.assertEqual(stats["live"], 0)
+        self.assertEqual(stats["sessions"], 0)
 
     def test_an_empty_line_is_refused_and_counted_under_auth(self):
         # A bare newline is the client that pressed return at the prompt.
@@ -562,7 +580,7 @@ class TestAttaching(ShellFrontTestCase):
         client = self.attach(front, line="")
 
         self.assert_one_line(self.refusal(client), b"password")
-        self.assertEqual(front.stats()["refused"]["auth"], 1)
+        self.assertEqual(front.stats()["refused_auth"], 1)
 
     def test_a_password_with_a_space_in_it_is_accepted_over_the_wire(self):
         # The module-level test above proves the parse; this proves the
@@ -592,13 +610,13 @@ class TestAttaching(ShellFrontTestCase):
         self.addCleanup(client.close)
         self.assertEqual(client.prompt(), PROMPT)
 
-        self.wait_for(lambda: front.stats()["refused"]["timeout"] == 1,
+        self.wait_for(lambda: front.stats()["refused_timeout"] == 1,
                       timeout=10.0)
         self.assert_one_line(self.refusal(client), b"password")
         stats = front.stats()
-        self.assertEqual(stats["refused"]["auth"], 0)
+        self.assertEqual(stats["refused_auth"], 0)
         self.assertEqual(stats["pending"], 0)
-        self.assertEqual(stats["live"], 0)
+        self.assertEqual(stats["sessions"], 0)
 
     def test_a_drip_fed_line_is_cut_off_at_the_same_deadline(self):
         _, front, _ = self.rig(with_endpoint=False, handshake_timeout=0.5)
@@ -628,9 +646,9 @@ class TestAttaching(ShellFrontTestCase):
 
         self.addCleanup(unwind)
         thread.start()
-        self.wait_for(lambda: front.stats()["refused"]["timeout"] == 1,
+        self.wait_for(lambda: front.stats()["refused_timeout"] == 1,
                       timeout=10.0)
-        self.assertEqual(front.stats()["live"], 0)
+        self.assertEqual(front.stats()["sessions"], 0)
 
     def test_a_line_longer_than_the_bound_is_refused(self):
         _, front, _ = self.rig(with_endpoint=False)
@@ -642,7 +660,7 @@ class TestAttaching(ShellFrontTestCase):
         client.send(b"A" * 8192)
 
         self.assert_one_line(self.refusal(client), b"password")
-        self.assertEqual(front.stats()["refused"]["auth"], 1)
+        self.assertEqual(front.stats()["refused_auth"], 1)
 
     def test_input_pipelined_behind_the_auth_line_is_not_lost(self):
         # An attach client is free to put the line and the first keystrokes
@@ -749,37 +767,37 @@ class TestTwoOperators(ShellFrontTestCase):
                 % index)
 
         stats = front.stats()
-        self.assertEqual(stats["live"], 2,
+        self.assertEqual(stats["sessions"], 2,
                          "the two sessions did not overlap, so nothing about "
                          "crossed streams was proven")
         self.assertEqual(stats["carried"], 2)
-        self.assertEqual(sum(stats["refused"].values()), 0)
+        self.assertEqual(stats["refused"], 0)
         self.assert_endpoint_healthy(endpoint)
 
         release.set()
         for thread in threads:
             thread.join(timeout=30.0)
-        self.wait_for(lambda: front.stats()["live"] == 0)
+        self.wait_for(lambda: front.stats()["sessions"] == 0)
 
 
 class TestWhatIsRefusedInText(ShellFrontTestCase):
     def test_beyond_max_sessions_the_client_is_refused_in_text(self):
         _, front, endpoint = self.rig(max_sessions=1)
         held = self.carried(front)
-        self.assertEqual(front.stats()["live"], 1)
+        self.assertEqual(front.stats()["sessions"], 1)
 
         over = self.attach(front)
         self.assert_one_line(self.refusal(over), b"1")
         stats = front.stats()
-        self.assertEqual(stats["refused"]["capacity"], 1)
-        self.assertEqual(stats["live"], 1)
+        self.assertEqual(stats["refused_capacity"], 1)
+        self.assertEqual(stats["sessions"], 1)
         self.assertEqual(stats["max_sessions"], 1)
 
         # The slot is released, not leaked: closing one lets the next in.
         held.close()
-        self.wait_for(lambda: front.stats()["live"] == 0)
+        self.wait_for(lambda: front.stats()["sessions"] == 0)
         self.carried(front)
-        self.assertEqual(front.stats()["refused"]["capacity"], 1)
+        self.assertEqual(front.stats()["refused_capacity"], 1)
         self.assert_endpoint_healthy(endpoint)
 
     def test_an_endpoint_without_the_feature_is_refused_in_text_and_counted(self):
@@ -793,8 +811,8 @@ class TestWhatIsRefusedInText(ShellFrontTestCase):
         text = self.refusal(client)
         self.assert_one_line(text, b"shell", b"feature")
         stats = front.stats()
-        self.assertEqual(stats["refused"]["unsupported"], 1)
-        self.assertEqual(stats["refused"]["tunnel"], 0)
+        self.assertEqual(stats["refused_unsupported"], 1)
+        self.assertEqual(stats["refused_tunnel"], 0)
         self.assertEqual(stats["carried"], 0)
         # And the refusal cost the endpoint nothing: it is still connected.
         self.assertEqual([row["state"] for row in server.endpoints()],
@@ -807,8 +825,27 @@ class TestWhatIsRefusedInText(ShellFrontTestCase):
 
         self.assert_one_line(self.refusal(client), self.identity.encode())
         stats = front.stats()
-        self.assertEqual(stats["refused"]["tunnel"], 1)
-        self.assertEqual(stats["refused"]["unsupported"], 0)
+        self.assertEqual(stats["refused_tunnel"], 1)
+        self.assertEqual(stats["refused_unsupported"], 0)
+
+    def test_an_identity_that_reads_like_the_reason_is_still_a_tunnel(self):
+        # The two are told apart by a discriminator the tunnel server sets
+        # on the one refusal that means "this build cannot do it", not by a
+        # word in the text. An identity is an operator-chosen string, so
+        # one containing "feature" used to turn every *not connected yet*
+        # refusal into "replace the build" when the answer was "wait for it
+        # to call home".
+        server = self.start_server()
+        front = ShellFront(server, "feature-flag-build", 0, self.password)
+        front.start()
+        self.addCleanup(front.stop)
+        client = self.attach(front)
+
+        text = self.refusal(client)
+        self.assert_one_line(text, b"feature-flag-build")
+        stats = front.stats()
+        self.assertEqual(stats["refused_tunnel"], 1)
+        self.assertEqual(stats["refused_unsupported"], 0)
 
     def test_too_many_handshakes_in_flight_are_refused_and_counted(self):
         _, front, _ = self.rig(with_endpoint=False, max_pending=1,
@@ -829,8 +866,8 @@ class TestWhatIsRefusedInText(ShellFrontTestCase):
         self.assert_one_line(text, b"1")
         self.assertTrue(closed, "a connection past the cap was left open")
         stats = front.stats()
-        self.assertEqual(stats["refused"]["pending"], 1)
-        self.assertEqual(stats["refused"]["capacity"], 0)
+        self.assertEqual(stats["refused_pending"], 1)
+        self.assertEqual(stats["refused_capacity"], 0)
         self.assertEqual(stats["max_pending"], 1)
         self.assertEqual(stats["accepted"], 2)
 
@@ -839,7 +876,7 @@ class TestWhatIsRefusedInText(ShellFrontTestCase):
         # against this cap the moment it proves who it is.
         silent.send_line(self.password)
         self.wait_for(lambda: front.stats()["pending"] == 0)
-        self.assertEqual(front.stats()["refused"]["pending"], 1)
+        self.assertEqual(front.stats()["refused_pending"], 1)
 
     def test_a_connection_is_refused_and_counted_when_no_thread_can_start(self):
         server = self.start_server()
@@ -856,11 +893,11 @@ class TestWhatIsRefusedInText(ShellFrontTestCase):
         self.assertTrue(any("thread" in line for line in caught.output))
 
         stats = front.stats()
-        self.assertEqual(stats["refused"]["threads"], 1)
+        self.assertEqual(stats["refused_threads"], 1)
         # Its own key: the two caps are this port's policy and this is the
         # host having run out, which is a different thing to tune.
-        self.assertEqual(stats["refused"]["capacity"], 0)
-        self.assertEqual(stats["refused"]["pending"], 0)
+        self.assertEqual(stats["refused_capacity"], 0)
+        self.assertEqual(stats["refused_pending"], 0)
         self.assertEqual(stats["pending"], 0)
 
         # And the accept loop survived it, rather than dying and leaving
@@ -868,7 +905,38 @@ class TestWhatIsRefusedInText(ShellFrontTestCase):
         second = _ShellClient(front.port, timeout=10.0)
         self.addCleanup(second.close)
         self.assertTrue(_drain(second.sock)[1])
-        self.wait_for(lambda: front.stats()["refused"]["threads"] == 2)
+        self.wait_for(lambda: front.stats()["refused_threads"] == 2)
+
+    def test_a_session_whose_output_direction_cannot_start_is_told_so(self):
+        # The connection's own thread starts; the session's *output*
+        # direction is the one with no thread. A one-way terminal is worse
+        # than none, so the session ends -- but in text and counted, like
+        # every other refusal on this port, and not as a carried session
+        # that closed for no stated reason.
+        server = self.start_server()
+        front = _NoThreads(server, self.identity, 0, self.password)
+        front.allowed = 1
+        front.start()
+        self.addCleanup(front.stop)
+        endpoint = self.start_endpoint(server)
+
+        with self.assertLogs("raccoon.tunnel.shell", level="WARNING") as caught:
+            client = self.attach(front)
+            text, closed = _drain(client.sock)
+        self.assert_one_line(text, b"thread", b"output")
+        self.assertTrue(closed, "the session was left half-open")
+        self.assertTrue(any("output direction" in line
+                            for line in caught.output), caught.output)
+
+        stats = front.stats()
+        self.assertEqual(stats["refused_threads"], 1)
+        self.assertEqual(stats["refused"], 1)
+        # Not counted as carried: the session never ran in both
+        # directions, and a panel row showing one carried session and no
+        # refusal is the ambiguity this port exists not to produce.
+        self.assertEqual(stats["carried"], 0)
+        self.assertEqual(stats["sessions"], 0)
+        self.assert_endpoint_healthy(endpoint)
 
 
 class TestTheListener(ShellFrontTestCase):
@@ -908,7 +976,15 @@ class TestTheListener(ShellFrontTestCase):
         _, front, _ = self.rig(with_endpoint=False)
         stats = front.stats()
         self.assertEqual(stats["max_sessions"], 4)
-        self.assertEqual(stats["max_pending"], 4)
+        # And the handshakes in flight are *not* capped at four with it:
+        # four silent sockets would then be able to turn the operator's own
+        # attach away for a whole handshake timeout.
+        self.assertGreater(stats["max_pending"], stats["max_sessions"])
+        self.assertEqual(stats["max_pending"], 8)
+        # A front that carries more than the floor keeps its own number.
+        many = ShellFront(self.start_server(), self.identity, 0,
+                          self.password, max_sessions=20)
+        self.assertEqual(many.stats()["max_pending"], 20)
 
     def test_stop_is_safe_before_start_and_twice(self):
         server = self.start_server()
@@ -935,12 +1011,12 @@ class TestTheListener(ShellFrontTestCase):
     def test_stop_drops_a_live_session(self):
         _, front, endpoint = self.rig()
         client = self.carried(front)
-        self.assertEqual(front.stats()["live"], 1)
+        self.assertEqual(front.stats()["sessions"], 1)
 
         # `stop` while the endpoint is still connected and the session is
         # still live, so that what ends it is this call and nothing else.
         front.stop()
-        self.assertEqual(front.stats()["live"], 0)
+        self.assertEqual(front.stats()["sessions"], 0)
         self.assertFalse(front.stats()["serving"])
         self.assertTrue(_drain(client.sock)[1],
                         "a session outlived the port it arrived on")
@@ -954,11 +1030,11 @@ class TestTheListener(ShellFrontTestCase):
         client = self.carried(front)
 
         time.sleep(1.2)                       # three handshake deadlines
-        self.assertEqual(front.stats()["live"], 1)
+        self.assertEqual(front.stats()["sessions"], 1)
         client.send(b"date\n")
         self.assertEqual(client.exactly(len(b"120x40|date\n")),
                          b"120x40|date\n")
-        self.assertEqual(front.stats()["refused"]["timeout"], 0)
+        self.assertEqual(front.stats()["refused_timeout"], 0)
         self.assert_endpoint_healthy(endpoint)
 
 
@@ -977,38 +1053,56 @@ class TestWhatTheOperatorPanelReads(ShellFrontTestCase):
         self.assertEqual(stats["bytes_in"], len(expected))
         self.assertEqual(stats["accepted"], 1)
         self.assertEqual(stats["carried"], 1)
-        self.assertEqual(stats["live"], 1)
+        self.assertEqual(stats["sessions"], 1)
         self.assert_endpoint_healthy(endpoint)
 
-    def test_the_refusal_counters_are_one_dictionary_per_kind(self):
-        # `max_pending` is set apart from `max_sessions` here: with one of
-        # each, a client still at the prompt would make the next arrival a
-        # `pending` refusal rather than the one being provoked, and these
-        # three are sequenced on their own counter so the order is the
-        # test's and not the scheduler's.
+    def test_the_refusal_counters_are_the_socks_rows_own_shape(self):
+        # The panel reads both rows generically: `refused` is the total and
+        # the kinds are discovered by their `refused_` prefix. A shell row
+        # that spelled either differently would need a rendering of its
+        # own, so the shape is asserted here rather than left to Task 9 to
+        # find out.
+        #
+        # `max_pending` is set apart from `max_sessions` as well: with one
+        # of each, a client still at the prompt would make the next arrival
+        # a `pending` refusal rather than the one being provoked, and the
+        # three below are sequenced on their own counters so the order is
+        # this test's and not the scheduler's.
         _, front, _ = self.rig(with_endpoint=False, max_sessions=1,
                                max_pending=4)
+        stats = front.stats()
         self.assertEqual(
-            sorted(front.stats()["refused"]),
+            sorted(key[len("refused_"):] for key in stats
+                   if key.startswith("refused_")),
             ["auth", "capacity", "pending", "threads", "timeout", "tunnel",
              "unsupported"])
-        self.assertEqual(sum(front.stats()["refused"].values()), 0)
+        self.assertIsInstance(stats["refused"], int)
+        self.assertEqual(stats["refused"], 0)
+        # And outside its own refusal kinds, the row is the SOCKS row's: the
+        # two ports sit side by side on the panel and are read by the same
+        # code.
+        socks = SocksFront(self.start_server(), self.identity, 0, "operator",
+                           self.password).stats()
+        self.assertEqual(
+            sorted(key for key in socks if not key.startswith("refused_")),
+            sorted(key for key in stats if not key.startswith("refused_")))
 
         self.attach(front, line="wrong")
-        self.wait_for(lambda: front.stats()["refused"]["auth"] == 1)
+        self.wait_for(lambda: front.stats()["refused_auth"] == 1)
         self.attach(front, line="")
-        self.wait_for(lambda: front.stats()["refused"]["auth"] == 2)
+        self.wait_for(lambda: front.stats()["refused_auth"] == 2)
         self.attach(front)                      # no endpoint: tunnel
-        self.wait_for(lambda: front.stats()["refused"]["tunnel"] == 1)
+        self.wait_for(lambda: front.stats()["refused_tunnel"] == 1)
 
-        refused = front.stats()["refused"]
-        self.assertEqual(refused["auth"], 2)
-        self.assertEqual(refused["tunnel"], 1)
-        self.assertEqual(refused["capacity"], 0)
-        self.assertEqual(refused["unsupported"], 0)
-        self.assertEqual(refused["timeout"], 0)
-        self.assertEqual(refused["pending"], 0)
-        self.assertEqual(refused["threads"], 0)
+        stats = front.stats()
+        self.assertEqual(stats["refused_auth"], 2)
+        self.assertEqual(stats["refused_tunnel"], 1)
+        self.assertEqual(stats["refused_capacity"], 0)
+        self.assertEqual(stats["refused_unsupported"], 0)
+        self.assertEqual(stats["refused_timeout"], 0)
+        self.assertEqual(stats["refused_pending"], 0)
+        self.assertEqual(stats["refused_threads"], 0)
+        self.assertEqual(stats["refused"], 3)
         self.assertEqual(front.stats()["accepted"], 3)
         self.assertEqual(front.stats()["carried"], 0)
 

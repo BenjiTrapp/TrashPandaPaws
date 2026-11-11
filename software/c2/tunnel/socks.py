@@ -40,12 +40,15 @@ resolves through a resolver this process does not own, so `localhost` is
 not proof of anything at bind time, and it is refused with a message
 saying so.
 
-**Three of this module's helpers are public**, and that is deliberate:
+**Six of this module's helpers are public**, and that is deliberate:
 `shell.py` is the second operator-facing port, it binds under the same
-rule and authenticates under the same one, so `loopback_bind`,
-`credential` and `positive` are shared from here rather than copied
-there. Two implementations of a check like these is one implementation
-and one latent hole.
+rule, authenticates under the same one and tears a client socket down
+under the same one, so `loopback_bind`, `credential`, `positive`, `shut`,
+`shutdown_both` and `finish` are shared from here rather than copied
+there. Two implementations of a check or a teardown like these is one
+implementation and one latent hole -- and `finish` in particular is the
+difference between a refusal the client reads and a refusal an RST
+discards, which is not reasoning worth having twice.
 
 **`max_sessions` defaults to 256.** One session costs a relay TCP
 connection, a Noise session on the endpoint and two threads here, so the
@@ -110,7 +113,7 @@ socket timeout alone is not one:
   given what is left of it. A per-`recv` timeout bounds nothing: a peer
   that sends one byte just inside it, over and over, resets it every time
   and holds its thread for as long as it likes. The same deadline shape
-  is in `_finish`, whose drain would otherwise never end against a client
+  is in `finish`, whose drain would otherwise never end against a client
   that keeps sending.
 
 * **A cap on handshakes in flight**, separate from `max_sessions` and
@@ -159,7 +162,7 @@ from .protocol import (
 logger = logging.getLogger("raccoon.tunnel.socks")
 
 __all__ = ["SocksFront", "DEFAULT_MAX_SESSIONS", "loopback_bind",
-           "credential", "positive"]
+           "credential", "positive", "shut", "shutdown_both", "finish"]
 
 # See the module docstring: above what a connect scan holds open, and
 # about 512 threads at full stretch.
@@ -339,7 +342,7 @@ class SocksFront(object):
         for session in sessions:
             session.close()
         for client in clients:
-            _shut(client)
+            shut(client)
         for worker in workers:
             worker.join(timeout=_JOIN_TIMEOUT)
 
@@ -441,7 +444,7 @@ class SocksFront(object):
                     "socks: %r already has %d handshakes in flight, which is "
                     "its limit; closed %s", self.identity, self.max_pending,
                     peer)
-                _shut(conn)
+                shut(conn)
                 continue
             try:
                 self._start(worker)
@@ -461,7 +464,7 @@ class SocksFront(object):
                     self._refusals["threads"] += 1
                 logger.warning("socks: no thread could be started for %s: "
                                "%s", peer, exc)
-                _shut(conn)
+                shut(conn)
 
     def _start(self, thread: threading.Thread) -> None:
         """Start a thread that is already registered for teardown.
@@ -504,7 +507,7 @@ class SocksFront(object):
             with self._lock:
                 self._clients.discard(conn)
                 self._pending.discard(conn)
-            _finish(conn)
+            finish(conn)
 
     def _handle(self, conn: socket.socket, peer: str,
                 deadline: float) -> None:
@@ -762,7 +765,7 @@ class SocksFront(object):
             # be parked in a read or in a send that TCP backpressure has
             # stopped, and neither wakes on its own.
             stream.close()
-            _shutdown(conn)
+            shutdown_both(conn)
             back.join(timeout=_JOIN_TIMEOUT)
 
     def _upstream(self, conn: socket.socket, stream) -> None:
@@ -792,7 +795,7 @@ class SocksFront(object):
             # unparked. A half-open session kept here would leave an
             # operator's tool waiting on a relay that no longer exists.
             stream.close()
-            _shutdown(conn)
+            shutdown_both(conn)
 
     def _downstream_loop(self, conn: socket.socket, stream) -> None:
         while True:
@@ -946,7 +949,7 @@ def positive(value, what: str) -> float:
     return seconds
 
 
-def _shutdown(sock: socket.socket) -> None:
+def shutdown_both(sock: socket.socket) -> None:
     """Shut a socket down both ways without closing it.
 
     Without closing, because another thread may still be inside a `recv`
@@ -960,7 +963,7 @@ def _shutdown(sock: socket.socket) -> None:
         pass
 
 
-def _finish(sock: socket.socket) -> None:
+def finish(sock: socket.socket) -> None:
     """Close a client socket without losing the last thing written to it.
 
     `close` on a socket with unread bytes in its receive buffer sends an
@@ -995,7 +998,7 @@ def _finish(sock: socket.socket) -> None:
         pass
 
 
-def _shut(sock: socket.socket) -> None:
+def shut(sock: socket.socket) -> None:
     """Drop a socket now, waiting for nothing.
 
     `stop` promises to be immediate, so this is the teardown it uses: the
