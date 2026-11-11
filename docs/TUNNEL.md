@@ -20,10 +20,11 @@ and the module docstring on
 enabled.** A build with no enabled `c2.tunnel` block refuses `tunnel
 start` with "Generate the build with the tunnel enabled" — there is no
 server, port, public key or PSK in it to dial with, and no way to add
-one after the fact. Ask for a tunnel in the generation request — which
-the Beacon Gen form cannot do yet, so see
-[*Asking for a tunnel*](#asking-for-a-tunnel-which-the-beacon-gen-form-cannot-do-yet)
-for the request that can. The server mints that build's identity and PSK
+one after the fact. Ask for a tunnel in the generation request. The
+Beacon Gen form has a tunnel section that does this; the request body it
+posts, and the `drops` and stager fields it still cannot reach, are in
+[*The request the form does not cover*](#the-request-the-form-does-not-cover-drops-and-the-stagers).
+The server mints that build's identity and PSK
 then and registers them.
 
 Everything below is detail on one of these.
@@ -60,13 +61,18 @@ one.
 
 ---
 
-## Asking for a tunnel, which the Beacon Gen form cannot do yet
+## The request the form does not cover: `drops` and the stagers
 
-**The Beacon Gen panel posts no `tunnel` block and no `drops`, and never
-shows `stager_nix` or `stager_win`.** So a tunnel-enabled build and the
-stager are reachable today only by posting to the route yourself. This is
-an interim gap in the operator interface, not a property of the build:
-the generator accepts both keys and returns everything below.
+The Beacon Gen panel now has a tunnel section. It posts a `tunnel` block
+on both delivery paths — the inline one-liner and the gist — and renders
+the `tunnel_identity` the generator returns, so a tunnel-enabled build is
+a form away and the three refusals below are shown beside the field
+rather than returned as a 400. **What the form still cannot do is `drops`
+and the stagers:** it posts no `drops` and never shows `stager_nix` or
+`stager_win`, so a dead-drop list and the staged artifact are reachable
+only by posting to the route yourself. That is an interim gap in the
+operator interface, not a property of the build: the generator accepts
+`drops` and returns the stagers either way.
 
 ```sh
 curl -sS -X POST http://127.0.0.1:8444/api/server/beacon-gen \
@@ -92,22 +98,25 @@ curl -sS -X POST http://127.0.0.1:8444/api/server/beacon-gen \
   }'
 ```
 
-Four things about that body:
+The `tunnel` block is shown so the body is complete — the form posts the
+same one — and four things about that body:
 
 - **`tunnel.server` and `tunnel.port` are the address as the target's
   network reaches it**, which is not necessarily where the tunnel server
   binds — see *Configuring it*. A URL, a path or a space in `server` is
-  refused rather than baked in.
+  refused rather than baked in; the form asks the same three refusals
+  before it posts.
 - **`psk`, `identity` and `public_key` are refused if you supply them.**
   They are minted here, one per build, and registered with the tunnel
-  server before the artifact goes out.
+  server before the artifact goes out — which is why the form has nowhere
+  to type one.
 - **`drops` is optional and every entry is pinned.** An entry without 64
   hex digits of `sha256` is a 400 before any credential is registered.
 - **`persistence.gate` is `path` or `argc`**, and anything else becomes
   `path`.
 
-Out of the response, five fields matter here and are not shown anywhere
-in the interface:
+Out of the response, five fields matter here. `tunnel_identity` is the
+one the form now renders; the other four it does not show:
 
 | Field | What it is for |
 |---|---|
@@ -236,6 +245,151 @@ loopback is refused rather than trusted.
 
 The `proxychains.conf` line these two values go into is in
 [*The happy path*](#the-happy-path-in-four-steps) above.
+
+---
+
+## The shell session, and what it leaves on the host
+
+A build with a tunnel can also serve an **interactive terminal** over it.
+An operator attaches their own terminal to a port on the team server and
+lands in a shell on the implant host — the host's own shell, `bash` where
+there is one, with its completion and its tools. Like every other session
+on this tunnel it is **dialled out**: the endpoint opens a second
+connection to the same outbound port it already holds the command channel
+on, and **nothing listens on the implant** for it. There is no new port,
+no new socket and no new way in on the target side.
+
+**It is a shell as the user the endpoint runs as.** Under the shipped
+`services/raccoon-beacon.service` that is **root**, so the port grants a
+root shell on the implant host to whoever holds its password. It is a
+separate secret from the SOCKS credential, minted per identity: a SOCKS
+password handed out for a pivot does not also open this.
+
+### The two switches, both server-side
+
+Nothing opens a root shell port because a config file on the implant
+mentioned one. Both switches are on the **tunnel server**, in the
+`c2.tunnel_server` block or on its command line:
+
+- **The shell port range** (`shell_port_first` / `shell_port_last`, or
+  `--shell-port-first` / `--shell-port-last`) is the whole switch for the
+  feature. With a range, every connected identity gets one authenticated
+  loopback shell port, assigned and stable the way the SOCKS port is.
+  **Absent means no shell port at all** — not a default range, not a
+  disabled one. Both ends are required together, and the range must be
+  disjoint from the SOCKS range.
+- **The transcript directory** (`shell_transcript_dir`, or
+  `--shell-transcript-dir`) turns on recording. **Absent means no
+  recording and nothing written** — no directory is created and no byte
+  is written until a path is given. It is off by default, and it is one
+  answer for the whole deployment, not one per session.
+
+### Attaching to it
+
+The port is on the **team server's loopback**, and the panel is usually
+reached over a forward, so the forward comes first:
+
+```sh
+ssh -L <port>:127.0.0.1:<port> <user>@<team-server>
+```
+
+Then attach, and the recommended way is the client that ships with this
+repository, because it sends the local terminal's size so the far shell
+comes up the right shape:
+
+```sh
+python3 tools/raccoon_shell.py 127.0.0.1 <port>
+```
+
+The password is read from `RACCOON_SHELL_PASSWORD` or asked for at a
+prompt — never on the command line. The fallback, for a host that has
+only `socat`, attaches to the same port and sends no size (the session
+comes up at the port's default 120×40):
+
+```sh
+socat -,raw,echo=0,escape=0x1d TCP:127.0.0.1:<port>
+```
+
+**The attach client has no local escape key.** The way out of a session
+is to end the far shell — `exit`, or Ctrl-D. In the `socat` line,
+`escape=0x1d` is **Ctrl-]**, which drops `socat` locally. Forwarding this
+port onward to a workstation extends its reach to whatever can reach that
+workstation's loopback, so treat the forward as part of the exposure.
+
+**The geometry is set once, at attach.** This wire has no resize message;
+the far end sizes its pseudo-terminal at the moment it opens. A window
+resized mid-session is not renegotiated — the remedy is a single
+`stty rows … cols …` **inside the session**, which the attach client
+prints for you on `SIGWINCH` with the numbers already filled in. `socat`
+gives you no such note.
+
+**It needs a tunnel-enabled build whose endpoint advertises the feature.**
+An endpoint built before this branch does not advertise `shell` in its
+`HELLO`; an attach against it is **refused with a reason** — that the
+build predates shell sessions and should be replaced — rather than being
+asked for a terminal and having its command channel dropped. A build to
+replace reads differently from a build to wait for, and the refusal says
+which.
+
+### What a transcript holds
+
+A transcript records the **output direction, byte for byte** — what the
+terminal showed. That already contains everything you typed, because **the
+terminal echoes it**, so there is no separate keystroke log to write or to
+protect. **Credentials typed inside a session are in it, unavoidably.**
+Say that to anyone who will read one. The attach password
+itself is not: it is read and compared before any recording opens.
+
+A transcript is written as one of **0600 files in a 0700 directory**: one
+`<identity>/<when>-<n>.typescript` per session, with a `.json` sidecar
+written at the close carrying the identity, the peer, the timestamps, the
+byte count and why the session and the recording each ended. Four things
+to know when reading a directory of them:
+
+- A **directory that already exists wider than 0700 is used, not
+  tightened**, and a warning names it and the mode found — recording does
+  not silently `chmod` a directory an operator made. The transcripts in it
+  are still 0600; what a wide directory leaks is which builds were
+  attached to and when.
+- A session that runs **past the per-session ceiling keeps running**; the
+  recording is set aside, and its sidecar records that it was cut off.
+- A .typescript with no .json beside it is a session whose process
+  died — the team server was killed before the sidecar was written. The
+  absence means "cut off", not "empty".
+- Nothing about recording may cost a session: a directory that cannot be
+  made, a symlink in its place, a write that fails — each is logged once
+  and the shell runs on.
+
+### Two platform facts
+
+The shell is spawned through **`setsid -c`** where that binary exists,
+which gives the session its terminal as a *controlling* terminal — and
+that is what makes **Ctrl-C, Ctrl-Z and job control** work, so an operator
+can interrupt a capture they started through the session. `setsid -c`
+needs **util-linux ≥ 2.21**, which is everything current. Where there is
+no `setsid` at all — macOS has none — the session **still runs but has no
+controlling terminal**: job control is off, and Ctrl-C reaches only the
+shell's own line editing rather than the running command. The endpoint
+logs which path it took.
+
+### What it leaves on the host
+
+This project documents what its features leave behind so an operator can
+judge the risk. A live shell session shows, on the implant host:
+
+- a **`bash` child of the `python3 -` beacon process** — the beacon
+  already runs as `python -` with its source on stdin, and the shell is a
+  child of it;
+- a **pseudo-terminal** open on the host, for as long as the session is
+  attached;
+- a **second connection on the same outbound port** the command channel
+  already uses — the same shape a SOCKS relay makes, and for the same
+  reason: one port is all most egress proxies permit.
+
+The session starts in `/` rather than the install directory, so a prompt
+does not name where the implant lives, and `HISTFILE` is unset for the
+session — though the host's own rc files run and can set it again. The
+three artifacts above, though, are real and are the cost of the session.
 
 ---
 

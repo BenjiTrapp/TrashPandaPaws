@@ -915,6 +915,128 @@ class TestTheListenersGuide(_DocCase):
                         "the README never mentions the listeners")
 
 
+TUNNEL_DOC = REPO / "docs" / "TUNNEL.md"
+
+
+class TestTheTunnelPageDocumentsTheShellSession(unittest.TestCase):
+    """The shell session, which is recorded nowhere an operator reads.
+
+    The whole feature -- a terminal served over the tunnel, its two
+    server-side switches, the attach client, what a transcript holds, and
+    what the session leaves on the host -- was built across ten tasks and
+    documented in none of them. This is the page a reader has, so these
+    assert the facts they cannot get anywhere else. Claims, not sentences:
+    the prose is free, the facts are not.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = " ".join(TUNNEL_DOC.read_text().split()).lower()
+
+    def present(self, needle, what):
+        self.assertTrue(" ".join(needle.split()).lower() in self.doc,
+                        "%s: %r is not in docs/TUNNEL.md" % (what, needle))
+
+    def absent(self, needle, what):
+        self.assertFalse(" ".join(needle.split()).lower() in self.doc,
+                         "%s: %r should no longer be in docs/TUNNEL.md"
+                         % (what, needle))
+
+    def test_the_tunnel_page_documents_the_shell_switch_and_the_attach_command(
+            self):
+        # Two server-side switches and nothing on the implant. The shell
+        # port range opens the port at all; absent, there is none. The
+        # transcript directory is the second switch, off by default.
+        self.present("shell session", "what the feature is called")
+        self.present("nothing listens on the", "no port is opened on the "
+                     "implant itself")
+        self.present("shell_port_first", "the first half of the shell "
+                     "port range switch")
+        self.present("shell_port_last", "the second half of it")
+        self.present("shell_transcript_dir", "the transcript directory "
+                     "switch, the second of the two")
+        # The forward is first, then the recommended attach client, then
+        # the socat fallback with its Ctrl-] escape.
+        self.present("ssh -L", "the forward the port is reached over")
+        self.present("python3 tools/raccoon_shell.py 127.0.0.1",
+                     "the recommended attach client")
+        self.present("socat -,raw,echo=0,escape=0x1d TCP:127.0.0.1:",
+                     "the documented socat fallback")
+        self.present("Ctrl-]", "what the socat escape byte is")
+
+    def test_the_tunnel_page_says_the_session_is_root_and_how_to_resize(self):
+        # The port grants a shell as the user the endpoint runs as, which
+        # under the shipped unit is root. And the geometry is fixed at
+        # attach; the remedy for a resize is one stty line.
+        self.present("root", "the user the session runs as under the "
+                     "shipped unit")
+        self.present("set once", "that the geometry is fixed at attach")
+        self.present("stty rows", "the resize remedy the attach client "
+                     "prints")
+        self.present("SIGWINCH", "when the client prints that line")
+
+    def test_the_tunnel_page_says_what_a_transcript_holds(self):
+        # The output direction byte for byte, which already contains what
+        # the operator typed because the terminal echoes it -- so a
+        # credential typed inside a session is in it, unavoidably.
+        self.present("output direction", "what a transcript records")
+        self.present("the terminal echoes it", "why it also holds input")
+        self.present("credentials typed inside a session are in it",
+                     "the consequence, in those words")
+        self.present("0600 files in a 0700 directory", "the file modes")
+        self.present("a .typescript with no .json beside it",
+                     "the shape of an interrupted session's files")
+
+    def test_the_tunnel_page_states_the_platform_facts_about_setsid(self):
+        # setsid -c is what makes job control work, and util-linux >= 2.21
+        # is what it needs. Where it is absent the session still runs but
+        # has no controlling terminal.
+        self.present("setsid -c", "what the shell is spawned through")
+        self.present("util-linux", "what setsid -c needs")
+        self.present("2.21", "the version of it")
+        self.present("no controlling terminal", "what a host without "
+                     "setsid gives the session")
+        self.present("job control", "what is off without it")
+
+    def test_the_tunnel_page_says_it_needs_a_feature_advertising_build(self):
+        # A build older than this branch is refused with a reason, not
+        # asked for a shell and dropped.
+        self.present("advertise", "that the endpoint advertises the feature")
+        self.present("refused", "what happens to a build that does not")
+
+    def test_the_tunnel_page_lists_the_detection_indicators(self):
+        # What the session leaves on the host, in the voice this project
+        # already uses for such notes.
+        self.present("bash", "the shell child")
+        self.present("python3 -", "the process it is a child of")
+        self.present("pseudo-terminal", "the pty on the host")
+        self.present("second connection", "the extra connection on the "
+                     "same outbound port")
+
+    def test_the_curl_section_no_longer_claims_the_form_cannot_ask_for_a_tunnel(
+            self):
+        # Task 10 made that false: the Beacon Gen form now has a tunnel
+        # section, posts the block on both delivery paths, and renders the
+        # returned identity. The section keeps `drops` and the stagers,
+        # which are still curl-only, and loses its tunnel half.
+        self.absent("the Beacon Gen form cannot do yet",
+                    "the claim Task 10 made false")
+        self.absent("posts no `tunnel` block",
+                    "the stale half of the old sentence")
+        self.present("drops", "what the section still covers")
+        self.present("stager_nix", "the other thing it still covers")
+        self.present("stager_win", "and the other")
+
+    def test_the_readme_capability_table_names_the_shell_session(self):
+        rows = _rows_under(README.read_text(), "| Area | Capability |")
+        flat = " ".join(" ".join(rows).split()).lower()
+        self.assertIn("shell", flat,
+                      "the README capability table does not name the shell "
+                      "session")
+        self.assertIn("tunnel.md", flat,
+                      "the capability row does not point at docs/TUNNEL.md")
+
+
 class TestTheGuiTourKeepsUpWithTheHeader(unittest.TestCase):
     """The tour lists the header buttons; the page defines them.
 

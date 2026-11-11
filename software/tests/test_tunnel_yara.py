@@ -589,16 +589,18 @@ class TestTheTunnelDocumentation(unittest.TestCase):
         self.present("leaves nothing running",
                      "what staging without it costs")
 
-    def test_the_doc_shows_a_request_that_asks_for_a_tunnel_and_drops(self):
-        # `runBeaconGen` posts neither key and renders neither stager, so
-        # the only way to either today is a request by hand. The
-        # documentation told the operator to "ask for a tunnel in the
-        # generation request" and never showed one.
+    def test_the_doc_shows_a_request_that_asks_for_drops_and_the_stagers(self):
+        # `runBeaconGen` now posts the `tunnel` block and renders the
+        # returned identity, but it still posts no `drops` and renders
+        # neither stager, so the only way to either is a request by hand.
+        # The section keeps that purpose and no longer claims the form
+        # cannot ask for a tunnel -- Task 10 made that false.
         self.present("api/server/beacon-gen", "the route")
-        self.present("the Beacon Gen form cannot do yet",
-                     "that the panel cannot ask for this")
-        for key in ('"tunnel"', '"drops"', '"enabled": true',
-                    "stager_nix", "stager_win"):
+        self.assertTrue(
+            "the beacon gen form cannot do yet" not in self.doc,
+            "the section still says the form cannot ask for a tunnel, which "
+            "Task 10 made false")
+        for key in ('"drops"', "stager_nix", "stager_win"):
             self.present(key, "part of the request or its answer")
         for field in ("base_dir", "payload_name", "gate"):
             self.present(field, "a response field the bundle builder needs")

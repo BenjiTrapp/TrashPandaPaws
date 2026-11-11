@@ -46,6 +46,7 @@ or an HP network printer to blend into enterprise infrastructure.
 | **Operator GUI** | Flask-based team server with embedded SPA: terminal, file browser, pivot map (a visualisation of scan results, not a pivot), profile editor, 16 Impacket tools |
 | **Malleable C2** | 8 built-in traffic profiles (Slack, Google, Azure CDN, O365, …), Burp Suite import, real-time profile push |
 | **Reverse SOCKS tunnel** | The actual pivot: the implant dials out, the team server opens one authenticated loopback SOCKS5 port per build, and `proxychains`, `nmap` or a browser runs from inside the target network. Not the *pivot map*, which is a visualisation of scan results and carries no traffic. See [`docs/TUNNEL.md`](docs/TUNNEL.md) |
+| **Shell session** | An interactive root shell on the implant host, served over the same dialled-out tunnel — the endpoint opens no port for it. One authenticated loopback port per build on the team server; attach with `tools/raccoon_shell.py`. Optional per-session transcripts, off by default. See [`docs/TUNNEL.md`](docs/TUNNEL.md#the-shell-session-and-what-it-leaves-on-the-host) |
 | **NAC Bypass** | 802.1X EAPOL forwarding with passive discovery and L2/L3 rewriting |
 | **Egress Proxy** | Auto-discovery (env, registry, PAC/WPAD) plus pure-stdlib NTLMv2 proxy authentication via loopback relay |
 | **Persistence** | 5 independent autorun layers (systemd, crontab, rc.local, udev, watchdog timer) with PID lock dedup |
