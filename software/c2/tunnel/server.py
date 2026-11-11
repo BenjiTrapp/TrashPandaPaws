@@ -114,7 +114,7 @@ __all__ = ["RelaySession", "RelayStream", "TunnelServer", "crypto_path"]
 # nothing: one `os.urandom(32)` per session.
 TOKEN_LEN = 32
 
-_STATE_VERSION = 1
+_STATE_VERSION = 2
 _DIR_MODE = 0o700
 _FILE_MODE = 0o600
 
@@ -391,6 +391,10 @@ class TunnelServer(object):
     here binds one: this server records the assignment in `state_path` and
     reports it, and a later task opens the port.
 
+    `shell_port_range` is the same shape for a second, optional table of
+    loopback ports, one per identity, for a shell a later task opens. Absent
+    means no shell ports are assigned, and that costs nothing else.
+
     `agent_lookup` is an optional callable taking an `_implant_id` and
     returning the fleet's display name for that host, or `None`. It is
     optional because an endpoint started from systemd has no fleet row
@@ -400,6 +404,7 @@ class TunnelServer(object):
     def __init__(self, keystore, bind_host: str, bind_port: int,
                  port_range: Tuple[int, int], state_path,
                  agent_lookup: Optional[Callable[[str], Optional[str]]] = None,
+                 shell_port_range: Optional[Tuple[int, int]] = None,
                  keepalive_interval: float = 30.0,
                  idle_timeout: Optional[float] = None,
                  handshake_timeout: float = 10.0,
@@ -409,6 +414,11 @@ class TunnelServer(object):
         self.bind_host = bind_host
         self.bind_port = int(bind_port)
         self.first_port, self.last_port = _port_range(port_range)
+        if shell_port_range is None:
+            self.shell_first_port = self.shell_last_port = None
+        else:
+            self.shell_first_port, self.shell_last_port = _port_range(
+                shell_port_range)
         self.state_path = os.path.abspath(os.fspath(state_path))
         self._agent_lookup = agent_lookup
         self.keepalive_interval = _positive(keepalive_interval,
@@ -426,6 +436,12 @@ class TunnelServer(object):
         self.port = None            # type: Optional[int]
         self._lock = threading.RLock()
         self._ports = {}            # type: Dict[str, int]
+        # The second table: identity -> loopback port for a later task's
+        # shell. Failing to fill it never costs an endpoint anything; see
+        # `_assign_shell_port`. `_shell_why` is the reason an identity has
+        # no entry, per server run, for the panel's `shell_detail`.
+        self._shell_ports = {}      # type: Dict[str, int]
+        self._shell_why = {}        # type: Dict[str, str]
         self._channels = {}         # type: Dict[str, _CommandChannel]
         self._sessions = []         # type: List[RelaySession]
         self._session_count = 0
@@ -537,6 +553,10 @@ class TunnelServer(object):
         now = time.time()
         with self._lock:
             ports = dict(self._ports)
+            shell_ports = dict(self._shell_ports)
+            shell_details = {identity: self._shell_detail(identity)
+                             for identity in ports
+                             if identity not in shell_ports}
             channels = {identity: channel
                         for identity, channel in self._channels.items()
                         if channel.ready}
@@ -563,6 +583,8 @@ class TunnelServer(object):
             rows.append({
                 "identity": identity,
                 "port": ports[identity],
+                "shell_port": shell_ports.get(identity),
+                "shell_detail": shell_details.get(identity, ""),
                 "state": "connected" if channel is not None else "disconnected",
                 "implant_id": implant_id,
                 "agent": agent,
@@ -776,6 +798,9 @@ class TunnelServer(object):
                 logger.warning("tunnel: refused %s as %r: %s",
                                peer, identity, exc)
                 return
+            # After, and outside the refusal above: whatever happens to the
+            # shell port, this endpoint is already registered.
+            self._assign_shell_port(identity)
             # In the table before the handshake finishes, so that the
             # duplicate check above and this insertion are one atomic step;
             # `ready` keeps the keep-alive off it until it can be written to.
@@ -1048,7 +1073,7 @@ class TunnelServer(object):
         port = self._ports.get(identity)
         if port is not None:
             return port
-        taken = set(self._ports.values())
+        taken = set(self._ports.values()) | set(self._shell_ports.values())
         for candidate in range(self.first_port, self.last_port + 1):
             if candidate in taken:
                 continue
@@ -1062,6 +1087,64 @@ class TunnelServer(object):
         raise ValueError(
             "every port in %d-%d is assigned to another identity; widen the "
             "range or retire a build" % (self.first_port, self.last_port))
+
+    def _assign_shell_port(self, identity: str) -> Optional[int]:
+        """This identity's shell port, assigning and persisting one if new.
+
+        Called with the lock held, and it shares `_assign_port`'s rule that
+        an identity already in the table keeps its port even if the
+        configured range has since moved.
+
+        It differs in one way, and the difference is the point: this
+        **returns `None` instead of raising**. `_assign_port` is called
+        while an endpoint registers, and a `ValueError` there refuses the
+        whole registration, which is right for a SOCKS port -- without one
+        there is no tunnel. A shell port is a feature riding on a tunnel
+        that already works, so no range configured, none left, or a state
+        file that would not write must cost that identity its shell and
+        nothing else: not its registration, not its SOCKS port, not its
+        traffic. The reason is kept for `endpoints()` to report as
+        `shell_detail`.
+        """
+        port = self._shell_ports.get(identity)
+        if port is not None:
+            return port
+        if self.shell_first_port is None:
+            self._shell_why.pop(identity, None)
+            return None
+        taken = set(self._ports.values()) | set(self._shell_ports.values())
+        for candidate in range(self.shell_first_port, self.shell_last_port + 1):
+            if candidate in taken:
+                continue
+            self._shell_ports[identity] = candidate
+            try:
+                self._write_state()
+            except OSError as exc:
+                del self._shell_ports[identity]
+                self._shell_why[identity] = (
+                    "the shell port could not be recorded in %s: %s"
+                    % (self.state_path, exc))
+                logger.warning("tunnel: no shell port for %r: %s",
+                               identity, self._shell_why[identity])
+                return None
+            self._shell_why.pop(identity, None)
+            return candidate
+        self._shell_why[identity] = (
+            "every port in %d-%d is assigned to another identity; widen "
+            "shell_port_range or retire a build"
+            % (self.shell_first_port, self.shell_last_port))
+        logger.warning("tunnel: no shell port for %r: %s",
+                       identity, self._shell_why[identity])
+        return None
+
+    def _shell_detail(self, identity: str) -> str:
+        """Why this identity has no shell port. Called with the lock held."""
+        if self.shell_first_port is None:
+            return ("no shell_port_range is configured, so no shell port is "
+                    "assigned")
+        return self._shell_why.get(
+            identity, "no shell port assigned yet; one is assigned when the "
+                      "endpoint next registers")
 
     def _state_error(self, field: str, reason: str) -> ValueError:
         return ValueError("%s: %s: %s" % (self.state_path, field, reason))
@@ -1079,6 +1162,7 @@ class TunnelServer(object):
                 text = handle.read()
         except FileNotFoundError:
             self._ports = {}
+            self._shell_ports = {}
             return
         try:
             document = json.loads(text)
@@ -1089,12 +1173,31 @@ class TunnelServer(object):
         ports = document.get("ports")
         if not isinstance(ports, dict):
             raise self._state_error("ports", "expected an object")
+        table = self._read_table("ports", ports, {})
+        # A version 1 document predates the shell table and has no such key.
+        # That file is on disk at the moment of an upgrade, so it is an
+        # empty table and not an error -- refusing it would take a working
+        # deployment down for a feature it has not used yet.
+        shells = document.get("shell_ports", {})
+        if not isinstance(shells, dict):
+            raise self._state_error("shell_ports", "expected an object")
+        shell_table = self._read_table("shell_ports", shells, table)
+        self._ports = table
+        self._shell_ports = shell_table
+
+    def _read_table(self, name: str, entries: dict,
+                    other: Dict[str, int]) -> Dict[str, int]:
+        """Validate one identity-to-port table of the state document.
+
+        `other` is the table already read whose ports this one must not
+        share: a port is one listener, whichever table it came from.
+        """
         table = {}                  # type: Dict[str, int]
-        for identity in sorted(ports):
-            where = "ports[%r]" % identity
-            port = ports[identity]
+        for identity in sorted(entries):
+            where = "%s[%r]" % (name, identity)
+            port = entries[identity]
             if not identity:
-                raise self._state_error("ports", "has an empty identity")
+                raise self._state_error(name, "has an empty identity")
             if isinstance(port, bool) or not isinstance(port, int):
                 raise self._state_error(where, "expected an integer port")
             if not 1 <= port <= 65535:
@@ -1104,17 +1207,23 @@ class TunnelServer(object):
                     raise self._state_error(
                         where, "port %d is also assigned to %r"
                         % (port, earlier))
+            for earlier, assigned in other.items():
+                if assigned == port:
+                    raise self._state_error(
+                        where, "port %d is also the SOCKS port of %r"
+                        % (port, earlier))
             table[identity] = port
-        self._ports = table
+        return table
 
     def _write_state(self) -> None:
-        """Replace the port table atomically, 0600.
+        """Replace the port tables atomically, 0600.
 
-        A reader -- a restarting server, a panel -- sees the old table or
-        the new one and never half of either, which is the same rule
+        A reader -- a restarting server, a panel -- sees the old tables or
+        the new ones and never half of either, which is the same rule
         `keys.py` follows for the key store.
         """
-        document = {"version": _STATE_VERSION, "ports": dict(self._ports)}
+        document = {"version": _STATE_VERSION, "ports": dict(self._ports),
+                    "shell_ports": dict(self._shell_ports)}
         data = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
         directory = os.path.dirname(self.state_path)
         if directory:

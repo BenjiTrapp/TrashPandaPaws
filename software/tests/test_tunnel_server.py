@@ -46,10 +46,12 @@ import logging
 import os
 import queue
 import socket
+import stat
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 from software.c2.tunnel.keys import KeyStore
 from software.c2.tunnel.protocol import (
@@ -456,6 +458,166 @@ class TestRegistration(TunnelServerTestCase):
         self.assertTrue(closed)
         self.assertEqual([row["identity"] for row in server.endpoints()],
                          ["build-alpha"])
+
+
+_SHELL_RANGE = (40300, 40399)
+
+
+class TestTheShellPortTable(TunnelServerTestCase):
+    """A second table beside the SOCKS one, which must never cost it anything.
+
+    The SOCKS port is part of the registration -- no port, no tunnel. The
+    shell port is a feature on top of a tunnel that already works, so every
+    way it can be unavailable has to leave the registration, the SOCKS port
+    and the traffic exactly as they were.
+    """
+
+    def write_state(self, text):
+        os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+        with open(self.state_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def build(self, **kwargs):
+        return TunnelServer(self.store, "127.0.0.1", 0, _PORT_RANGE,
+                            self.state_path, **kwargs)
+
+    def test_a_shell_port_is_stable_across_a_restart(self):
+        first = self.start_server(shell_port_range=_SHELL_RANGE)
+        self.command_peer(first, "build-alpha")
+        self.command_peer(first, "build-beta")
+        rows = {row["identity"]: row for row in first.endpoints()}
+        alpha, beta = rows["build-alpha"], rows["build-beta"]
+        for row in (alpha, beta):
+            self.assertTrue(_SHELL_RANGE[0] <= row["shell_port"]
+                            <= _SHELL_RANGE[1])
+            self.assertEqual(row["shell_detail"], "")
+        self.assertNotEqual(alpha["shell_port"], beta["shell_port"])
+        first.stop()
+
+        # Even with the range moved away: an identity that has a port keeps
+        # it, the same rule the SOCKS table follows.
+        second = self.start_server(shell_port_range=(50300, 50399))
+        after = {row["identity"]: row for row in second.endpoints()}
+        self.assertEqual(after["build-alpha"]["shell_port"],
+                         alpha["shell_port"])
+        self.assertEqual(after["build-beta"]["shell_port"],
+                         beta["shell_port"])
+        self.command_peer(second, "build-alpha")
+        self.assertEqual(self.row(second, "build-alpha")["shell_port"],
+                         alpha["shell_port"])
+        with open(self.state_path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertEqual(document["version"], 2)
+        self.assertEqual(document["shell_ports"]["build-alpha"],
+                         alpha["shell_port"])
+        self.assertEqual(stat.S_IMODE(os.stat(self.state_path).st_mode), 0o600)
+
+    def test_a_server_with_no_shell_range_assigns_none_and_says_why(self):
+        server = self.build()
+        self.assertIsNone(server.shell_first_port)
+        self.assertIsNone(server.shell_last_port)
+        with server._lock:
+            self.assertIsNone(server._assign_shell_port("build-alpha"))
+
+        server = self.start_server()
+        self.command_peer(server, "build-alpha")
+        row = self.row(server, "build-alpha")
+        self.assertEqual(row["state"], "connected")
+        self.assertIsNotNone(row["port"])
+        self.assertIsNone(row["shell_port"])
+        self.assertIn("shell_port_range", row["shell_detail"])
+        with open(self.state_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["shell_ports"], {})
+
+    def test_an_exhausted_shell_range_leaves_registration_and_the_socks_port_intact(self):
+        server = self.start_server(shell_port_range=(40300, 40300))
+        self.command_peer(server, "build-alpha")
+        with self.assertLogs("raccoon.tunnel.server", level="WARNING") as caught:
+            peer = self.command_peer(server, "build-beta", pump=True)
+        self.assertTrue(any("shell port" in line and "build-beta" in line
+                            for line in caught.output))
+
+        alpha = self.row(server, "build-alpha")
+        beta = self.row(server, "build-beta")
+        self.assertEqual(alpha["shell_port"], 40300)
+        self.assertEqual(beta["state"], "connected")
+        self.assertTrue(_PORT_RANGE[0] <= beta["port"] <= _PORT_RANGE[1])
+        self.assertIsNone(beta["shell_port"])
+        self.assertIn("40300-40300", beta["shell_detail"])
+
+        # And the pivot still works end to end for the identity that lost
+        # out on the shell port.
+        session = server.open_session("build-beta")
+        self.assertEqual(peer.next_open_relay()["token"], session.token.hex())
+
+    def test_a_shell_port_that_cannot_be_written_does_not_raise(self):
+        server = self.build(shell_port_range=_SHELL_RANGE)
+        with server._lock:
+            server._ports["build-alpha"] = 40100
+            with mock.patch.object(server, "_write_state",
+                                   side_effect=OSError("disk full")):
+                self.assertIsNone(server._assign_shell_port("build-alpha"))
+            self.assertEqual(server._shell_ports, {})
+        self.assertIn("disk full", server.endpoints()[0]["shell_detail"])
+
+    def test_a_state_document_from_version_one_loads_with_an_empty_shell_table(self):
+        self.write_state('{"version": 1, "ports": {"build-alpha": 40100}}')
+        server = self.build(shell_port_range=_SHELL_RANGE)
+        rows = server.endpoints()
+        self.assertEqual([row["identity"] for row in rows], ["build-alpha"])
+        self.assertEqual(rows[0]["port"], 40100)
+        self.assertIsNone(rows[0]["shell_port"])
+        self.assertNotEqual(rows[0]["shell_detail"], "")
+
+        # And it upgrades in place the next time the identity registers.
+        server.start()
+        self.addCleanup(server.stop)
+        self.command_peer(server, "build-alpha")
+        row = self.row(server, "build-alpha")
+        self.assertEqual(row["port"], 40100)
+        self.assertTrue(_SHELL_RANGE[0] <= row["shell_port"] <= _SHELL_RANGE[1])
+
+    def test_a_shell_port_colliding_with_an_assigned_port_is_refused_by_field_name(self):
+        self.write_state('{"version": 2, "ports": {"build-alpha": 40100}, '
+                         '"shell_ports": {"build-beta": 40100}}')
+        with self.assertRaises(ValueError) as caught:
+            self.build()
+        message = str(caught.exception)
+        self.assertIn("shell_ports[", message)
+        self.assertIn("build-beta", message)
+        self.assertIn("40100", message)
+        self.assertIn(self.state_path, message)
+
+        self.write_state('{"version": 2, "ports": {}, "shell_ports": '
+                         '{"build-alpha": 40300, "build-beta": 40300}}')
+        with self.assertRaises(ValueError) as caught:
+            self.build()
+        self.assertIn("shell_ports[", str(caught.exception))
+        self.assertIn(self.state_path, str(caught.exception))
+
+    def test_a_damaged_shell_port_entry_is_refused_by_field_name(self):
+        for entry in ('70000', '"40300"', 'true', '0'):
+            self.write_state('{"version": 2, "ports": {}, '
+                             '"shell_ports": {"build-alpha": %s}}' % entry)
+            with self.assertRaises(ValueError) as caught:
+                self.build()
+            message = str(caught.exception)
+            self.assertIn("shell_ports[", message, entry)
+            self.assertIn("build-alpha", message, entry)
+            self.assertIn(self.state_path, message, entry)
+
+        self.write_state('{"version": 2, "ports": {}, "shell_ports": []}')
+        with self.assertRaises(ValueError) as caught:
+            self.build()
+        self.assertIn("shell_ports", str(caught.exception))
+        self.assertIn(self.state_path, str(caught.exception))
+
+    def test_a_socks_port_is_never_assigned_a_port_a_shell_already_holds(self):
+        self.write_state('{"version": 2, "ports": {}, '
+                         '"shell_ports": {"build-alpha": 40100}}')
+        server = self.build()
+        with server._lock:
+            self.assertEqual(server._assign_port("build-beta"), 40101)
 
 
 class TestAMalformedPortTable(TunnelServerTestCase):
