@@ -1161,6 +1161,41 @@ class _BrokenWrites(shell_mod.Transcripts):
         return recorder
 
 
+class _ExplodingWrite(shell_mod.Transcripts):
+    """Transcripts whose recorder fails somewhere `write` did not expect.
+
+    `_BrokenWrites` above breaks the file, which `Recorder._write`'s own
+    `except` is written for. This breaks `_write` itself, which is the
+    case the public `write` has to absorb for the guarantee to be a
+    property of the session rather than a promise about one method.
+    """
+
+    class _Recorder(shell_mod.Recorder):
+        def _write(self, data):
+            raise RuntimeError("the floor gave way")
+
+    def open(self, identity, session, peer):
+        recorder = shell_mod.Transcripts.open(self, identity, session, peer)
+        if recorder is None:
+            return None
+        recorder.__class__ = _ExplodingWrite._Recorder
+        return recorder
+
+
+class _Unnameable(object):
+    """An identity that cannot be turned into a string.
+
+    `repr` works, because that is what a refusal is allowed to log; only
+    `str` fails, which is what building a path out of one needs.
+    """
+
+    def __str__(self):
+        raise RuntimeError("this identity has no string")
+
+    def __repr__(self):
+        return "<unnameable>"
+
+
 class TestTranscripts(ShellFrontTestCase):
     """Review Focus: recording is off unless a directory is configured, and
     a recording that fails costs the recording and never the session.
@@ -1270,13 +1305,16 @@ class TestTranscripts(ShellFrontTestCase):
             facts = json.loads(handle.read().decode("utf-8"))
         self.assertEqual(sorted(facts),
                          ["bytes", "ended", "identity", "peer", "reason",
-                          "session", "started", "truncated"])
+                          "session", "started", "stopped", "truncated"])
         self.assertEqual(facts["identity"], self.identity)
         self.assertEqual(facts["session"], 1)
         self.assertTrue(facts["peer"].startswith(_LOOPBACK + ":"),
                         "the sidecar must say which operator attached: %r"
                         % (facts["peer"],))
         self.assertFalse(facts["truncated"])
+        self.assertIsNone(facts["stopped"],
+                          "a recording that ran to the end of its session "
+                          "stopped for no reason of its own")
         self.assertEqual(facts["bytes"], len(content))
         self.assertEqual(facts["bytes"], os.path.getsize(path))
         self.assertIsInstance(facts["reason"], str)
@@ -1456,6 +1494,17 @@ class TestTranscripts(ShellFrontTestCase):
                         "a reader of a short transcript has to be told")
         self.assertEqual(facts["bytes"], 16)
         self.assertEqual(facts["bytes"], os.path.getsize(path))
+        # And told *why* it is short, in the sidecar rather than only in
+        # the team server's log: the sidecar is what travels with the
+        # evidence, and `reason` answers a different question -- why the
+        # session ended, which here is the ordinary one.
+        self.assertIsNotNone(facts["stopped"],
+                             "a truncated transcript must say why")
+        self.assertIn("ceiling", facts["stopped"],
+                      "the sidecar must say why the transcript is short, "
+                      "not just that it is: %r" % (facts["stopped"],))
+        self.assertIn("16", facts["stopped"])
+        self.assertNotIn("ceiling", facts["reason"])
         # And the session itself was carried in full, both ways.
         stats = front.stats()
         self.assertEqual(stats["carried"], 1)
@@ -1545,7 +1594,214 @@ class TestTranscripts(ShellFrontTestCase):
         # Short of the session, which is what `truncated` says.
         self.assertTrue(facts["truncated"])
         self.assertEqual(facts["bytes"], 0)
+        # And `stopped` says it was the disk and not the ceiling, which is
+        # the whole difference between evidence that was capped and
+        # evidence that was lost.
+        self.assertIsNotNone(facts["stopped"],
+                             "a truncated transcript must say why")
+        self.assertIn("could not be written", facts["stopped"],
+                      "%r" % (facts["stopped"],))
+        self.assertNotIn("ceiling", facts["stopped"])
         self.assert_endpoint_healthy(endpoint)
+
+    # ── a directory this module did not create ──
+
+    @unittest.skipIf(os.name == "posix" and os.geteuid() == 0,
+                     "root is not stopped by a directory's mode")
+    def test_a_root_that_already_exists_wider_is_used_and_said_so(self):
+        # The ordinary case: an operator runs `mkdir -p` and then sets the
+        # key, so the configured root exists at 0755 before this module
+        # ever sees it. Recording must still happen -- the transcripts are
+        # 0600 regardless -- and the operator must be told, because
+        # "directories 0700" is not true of a directory they made and the
+        # filenames under it say which builds were attached to and when.
+        transcripts, directory = self.recording()
+        os.makedirs(directory, mode=0o700)
+        os.chmod(directory, 0o755)
+        self.addCleanup(os.chmod, directory, 0o700)
+        _, front, endpoint = self.rig(transcripts=transcripts)
+
+        with self.degradations() as caught:
+            client = self.carried(front)
+        said = [record.getMessage() for record in caught.records
+                if directory in record.getMessage()]
+        self.assertEqual(len(said), 1,
+                         "a wider directory is named once: %r" % (said,))
+        # The reason has to carry both facts an operator needs to act:
+        # which directory, and what mode it was found in.
+        self.assertIn("0755", said[0])
+        self.assertIn("0700", said[0])
+        self.ended(front, client)
+
+        # Recorded anyway, and what this module did create is still 0700.
+        path, _ = self.written(directory)
+        self.assertEqual(self.mode(path), 0o600,
+                         "the transcript is 0600 whatever the directory is")
+        self.assertEqual(self.mode(self.folder(directory)), 0o700)
+        # And not chmod-ed under the operator: it is theirs to fix.
+        self.assertEqual(self.mode(directory), 0o755,
+                         "a recorder must not silently chmod a directory an "
+                         "operator created")
+        self.assertEqual(front.stats()["carried"], 1)
+        self.assert_endpoint_healthy(endpoint)
+
+    def test_a_directory_that_is_a_symlink_is_refused(self):
+        # A planted directory symlink is not a mode an operator chose, so
+        # this one is a refusal rather than a warning: a 0600 transcript
+        # written through it would put an engagement's evidence wherever
+        # the link points. `O_EXCL` on the transcript covers the final
+        # component only, so the components above it are checked.
+        transcripts, directory = self.recording()
+        os.makedirs(directory, mode=0o700)
+        elsewhere = os.path.join(self.root, "elsewhere")
+        os.mkdir(elsewhere, 0o700)
+        os.symlink(elsewhere, os.path.join(directory, self.identity))
+        _, front, endpoint = self.rig(transcripts=transcripts)
+
+        with self.degradations() as caught:
+            client = self.carried(front)
+        refused = [record.getMessage() for record in caught.records
+                   if "symbolic link" in record.getMessage()]
+        self.assertEqual(len(refused), 1,
+                         "a symlinked component is refused with a reason: "
+                         "%r" % ([r.getMessage() for r in caught.records],))
+
+        # Nothing was written through the link, and the session carried on.
+        self.assertEqual(os.listdir(elsewhere), [],
+                         "a transcript was written through a symlink")
+        client.send(b"still here\n")
+        expected = b"120x40|still here\n"
+        self.assertEqual(client.exactly(len(expected)), expected)
+        stats = front.stats()
+        self.assertEqual(stats["carried"], 1)
+        self.assertEqual(stats["sessions"], 1)
+        self.assertEqual(stats["refused"], 0)
+        self.assert_endpoint_healthy(endpoint)
+
+    def test_a_component_that_is_not_a_directory_is_refused(self):
+        transcripts, directory = self.recording()
+        os.makedirs(directory, mode=0o700)
+        # A plain file where the identity's folder belongs.
+        with open(os.path.join(directory, self.identity), "wb") as handle:
+            handle.write(b"not a directory\n")
+
+        with self.degradations() as caught:
+            self.assertIsNone(transcripts.open(self.identity, 1, "p:1"))
+        # Named for what it is, rather than left to fail later as an
+        # ENOTDIR from opening a file under a file.
+        said = [record.getMessage() for record in caught.records
+                if "already exists and is not a directory"
+                in record.getMessage()]
+        self.assertEqual(len(said), 1,
+                         "%r" % ([r.getMessage() for r in caught.records],))
+
+    # ── the end of a recording can fail too ──
+
+    @unittest.skipIf(os.name == "posix" and os.geteuid() == 0,
+                     "root is not stopped by a directory's mode")
+    def test_a_sidecar_that_cannot_be_written_restates_what_it_described(self):
+        # A disk that fills at the end of a long session. The transcript
+        # is already closed on the disk, so this costs a reader the facts
+        # about it -- which is why the log line carries them instead.
+        transcripts, directory = self.recording()
+        recorder = transcripts.open(self.identity, 4, "127.0.0.1:9000")
+        recorder.write(b"evidence\n")
+        folder = self.folder(directory)
+        os.chmod(folder, 0o500)
+        self.addCleanup(os.chmod, folder, 0o700)
+
+        with self.degradations() as caught:
+            recorder.close("the terminal closed")
+        said = [record.getMessage() for record in caught.records
+                if "sidecar" in record.getMessage()]
+        self.assertEqual(len(said), 1, "%r" % (said,))
+        # The facts a reader has lost, in the one place that still has
+        # them: which transcript, and how much of it there is.
+        self.assertIn(recorder.path, said[0])
+        self.assertIn(str(len(b"evidence\n")), said[0])
+
+        self.assertFalse(os.path.exists(recorder.path + ".json"))
+        # The transcript itself survived intact, which is the point of
+        # writing the sidecar separately at all.
+        with open(recorder.path, "rb") as handle:
+            self.assertEqual(handle.read(), b"evidence\n")
+
+    def test_a_transcript_that_cannot_be_closed_still_leaves_a_sidecar(self):
+        # A revoked descriptor, which is the nearest a test gets to a
+        # filesystem disappearing under a live session. The bytes were
+        # flushed per chunk, so they are on the disk already; what fails
+        # is the close, and a reader must still get the sidecar.
+        transcripts, _ = self.recording()
+        recorder = transcripts.open(self.identity, 5, "127.0.0.1:9000")
+        recorder.write(b"evidence\n")
+        os.close(recorder._handle.fileno())
+
+        with self.degradations() as caught:
+            recorder.close("the terminal closed")
+        said = [record.getMessage() for record in caught.records
+                if "could not be closed" in record.getMessage()]
+        self.assertEqual(len(said), 1, "%r" % (said,))
+        self.assertIn(recorder.path, said[0])
+
+        with open(recorder.path + ".json", "rb") as handle:
+            facts = json.loads(handle.read().decode("utf-8"))
+        self.assertEqual(facts["bytes"], len(b"evidence\n"))
+        self.assertEqual(facts["session"], 5)
+        self.assertEqual(facts["reason"], "the terminal closed")
+        # A close that failed is not a truncated recording: every byte the
+        # session showed is in the file.
+        self.assertFalse(facts["truncated"])
+        self.assertIsNone(facts["stopped"])
+
+    def test_an_unexpected_failure_in_write_still_costs_only_the_recording(
+            self):
+        # `Recorder.write` guards itself as a whole, not only the two
+        # calls that were expected to fail: this runs on the thread
+        # carrying the session, so the guarantee must not depend on having
+        # predicted which line would raise.
+        _, directory = self.recording()
+        _, front, endpoint = self.rig(transcripts=_ExplodingWrite(directory))
+
+        with self.degradations() as caught:
+            client = self.carried(front)
+            client.send(b"and again\n")
+            expected = b"120x40|and again\n"
+            self.assertEqual(client.exactly(len(expected)), expected)
+        lost = [record.getMessage() for record in caught.records
+                if "the floor gave way" in record.getMessage()]
+        self.assertEqual(len(lost), 1,
+                         "an unexpected failure is logged once and the "
+                         "recorder set aside: %r" % (lost,))
+
+        stats = front.stats()
+        self.assertEqual(stats["carried"], 1)
+        self.assertEqual(stats["refused"], 0)
+        self.ended(front, client)
+
+        _, sidecar = self.written(directory)
+        with open(sidecar, "rb") as handle:
+            facts = json.loads(handle.read().decode("utf-8"))
+        self.assertTrue(facts["truncated"])
+        self.assertIn("could not be recorded", facts["stopped"])
+        self.assert_endpoint_healthy(endpoint)
+
+    def test_an_identity_that_cannot_be_turned_into_a_string_is_refused(self):
+        # `open` promises never to raise, and that has to cover building
+        # the path as well as using it: a failure before the `try` would
+        # reach `_record`'s outer guard, which logs at ERROR and is meant
+        # for nothing that can actually happen.
+        transcripts, directory = self.recording()
+
+        with self.degradations() as caught:
+            self.assertIsNone(transcripts.open(_Unnameable(), 1, "p:1"))
+        said = [record.getMessage() for record in caught.records
+                if "not being recorded" in record.getMessage()]
+        self.assertEqual(len(said), 1, "%r" % (said,))
+        # Named by the only path it got as far as knowing.
+        self.assertIn(directory, said[0])
+        self.assertFalse(os.path.exists(directory),
+                         "a refusal before the path was built must not have "
+                         "created anything")
 
 
 if __name__ == "__main__":

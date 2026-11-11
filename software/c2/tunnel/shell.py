@@ -74,9 +74,12 @@ transcript. What can reach one is a credential the operator types
 *inside* a session, unavoidably -- which is why these are 0600 files in a
 0700 directory and why the documentation says so in those words. And
 because a transcript is still only a log file, nothing about it may cost
-a session: a directory that cannot be created, a write that fails, a
-session past the ceiling -- each is logged once with its reason, sets the
-recorder aside, and leaves the shell running.
+a session: a directory that cannot be created, one that turns out to be
+a symlink, a write that fails, a session past the ceiling -- each is
+logged once with its reason, sets the recorder aside, and leaves the
+shell running. A directory this module did not create is checked rather
+than trusted, and a transcript with no sidecar beside it is a session
+that was interrupted: `Transcripts` has both in full.
 
 One sharp edge of this wire, handled in `_read_line`: the bytes after the
 newline are already input for the shell. An attach client is free to put
@@ -96,6 +99,7 @@ import logging
 import os
 import re
 import socket
+import stat
 import threading
 import time
 from typing import Dict, List, Optional, Set, Tuple
@@ -256,9 +260,26 @@ class Recorder(object):
         self._facts = facts
         self._max = max_bytes
         self._closed = False
+        # Why this recording stopped short, once it has. The sidecar's
+        # `stopped`, kept rather than only logged: see `close`.
+        self._stopped = None    # type: Optional[str]
 
     def write(self, data: bytes) -> None:
-        """Record what the operator's terminal was shown."""
+        """Record what the operator's terminal was shown.
+
+        Guarded as a whole, and not only around the two calls that were
+        expected to fail. This runs on the thread carrying the session,
+        so "a transcript cannot cost a session" should not rest on having
+        correctly predicted which line would raise -- the same reason
+        `ShellFront._downstream` closes a recorder inside a `finally` of
+        its own rather than trusting this class to behave.
+        """
+        try:
+            self._write(data)
+        except Exception as exc:
+            self._stop("could not be recorded: %s" % exc)
+
+    def _write(self, data: bytes) -> None:
         handle = self._handle
         if handle is None or not data:
             return
@@ -288,9 +309,17 @@ class Recorder(object):
     def close(self, reason: str) -> None:
         """Close the transcript and write the sidecar beside it.
 
-        `reason` is why the recording stopped, in this module's words, and
-        is the one field of the sidecar that is not a measurement. Safe
-        twice: this is called from a teardown.
+        `reason` is why the **session** ended, in the words of whichever
+        teardown called this. The sidecar's `stopped` is the other
+        question -- why the **recording** stopped short of the session --
+        and is None unless this recorder was set aside. They are
+        different facts, and conflating them would leave the one artifact
+        that travels with the evidence unable to say why it is short: a
+        transcript cut off at the ceiling would carry nothing but "the
+        terminal closed", and only the team server's log, which is not
+        what gets copied out, would know better.
+
+        Safe twice: this is called from a teardown.
         """
         if self._closed:
             return
@@ -308,28 +337,47 @@ class Recorder(object):
             "bytes": self.bytes,
             "truncated": self.truncated,
             "reason": " ".join(str(reason).split()),
+            "stopped": self._stopped,
         })
         try:
             _write_private_json(self._sidecar, facts)
         except Exception as exc:
             # The transcript itself is already on the disk and closed, so
-            # this costs a reader the facts about it and nothing else.
+            # this costs a reader the facts about it and nothing else --
+            # which is why they are restated here, in the one place left
+            # that still has them.
             logger.warning("shell: the sidecar %s could not be written: %s. "
                            "The transcript it describes is %s, %d bytes%s.",
                            self._sidecar, exc, self.path, self.bytes,
-                           ", truncated" if self.truncated else "")
+                           (", truncated: " + self._stopped)
+                           if self.truncated else "")
             return
         logger.info("shell: the transcript %s is closed after %d bytes%s: %s",
                     self.path, self.bytes,
-                    " (truncated)" if self.truncated else "", facts["reason"])
+                    (" (truncated: %s)" % self._stopped) if self.truncated
+                    else "", facts["reason"])
 
     def _stop(self, what: str) -> None:
-        """Set this recorder aside, saying why, and say it once."""
+        """Set this recorder aside, saying why, and say it once.
+
+        Once is enforced here rather than left to the fact that `_write`
+        returns early on a handle that has gone: `write` guards itself as
+        a whole, so an unexpected failure that recurs would otherwise be
+        reported per chunk for the rest of the session -- a degradation
+        is one line naming its reason, not a stream of them.
+
+        `what` is kept as well as logged, because it is the sidecar's
+        `stopped`: this log line stays on the team server, and the
+        sidecar is what travels with the transcript.
+        """
+        if self._stopped is not None:
+            return
         handle, self._handle = self._handle, None
         self.truncated = True
+        self._stopped = " ".join(str(what).split())
         logger.warning("shell: the transcript %s %s, so the rest of this "
                        "session is not recorded. The session itself is "
-                       "untouched.", self.path, what)
+                       "untouched.", self.path, self._stopped)
         if handle is not None:
             try:
                 handle.close()
@@ -352,9 +400,29 @@ class Transcripts(object):
     When it is on, one session is one `<identity>/<when>-<n>.typescript`
     under this directory, created 0600 in directories created 0700, with a
     `.json` sibling written at the close carrying `identity`, `session`,
-    `peer`, `started`, `ended`, `bytes`, `truncated` and `reason`.
-    `bytes` is what the transcript holds -- the file's own size -- and
-    `truncated` says whether the session had more to show than that.
+    `peer`, `started`, `ended`, `bytes`, `truncated`, `reason` and
+    `stopped`. `bytes` is what the transcript holds -- the file's own
+    size -- `truncated` says whether the session had more to show than
+    that, `reason` is why the session ended and `stopped` is why the
+    recording stopped short of it, or None when it did not.
+
+    **A transcript with no `.json` beside it is an interrupted session.**
+    The sidecar is written when the recording closes, so a team server
+    that was killed mid-session leaves the bytes that had been flushed
+    and nothing to describe them. That is the intended trade -- the
+    alternative is rewriting the sidecar on every chunk -- but whoever
+    reads one of these directories should know that the absence means
+    "cut off", not "empty".
+
+    One directory this module did not create is one it does not own:
+    an operator who ran `mkdir -p` before setting the key, or a path
+    shared with something else. Such a directory is verified rather than
+    assumed. A symlink is refused outright and costs the recording; a
+    real directory wider than 0700 is kept, used and logged once naming
+    it and the mode found, because silently `chmod`-ing an operator's
+    directory is a surprise in the wrong direction. The transcripts
+    inside are 0600 either way; what a wide directory leaks is which
+    builds were attached to and when.
 
     `max_bytes` is the per-session ceiling. A parameter so that a test can
     reach it without pushing 16 MiB through a session; nothing in
@@ -375,30 +443,48 @@ class Transcripts(object):
              peer: str) -> Optional[Recorder]:
         """A recorder for one session, or None if nothing will be recorded.
 
-        Never raises. A directory that cannot be created, a name already
-        taken, a file that cannot be opened: each costs this recording,
-        is logged once with its reason, and leaves the caller a None it
-        can carry a session with. The operator's shell must not die
-        because a log file could not be opened.
+        Never raises, and that covers building the path as well as using
+        it: a directory that cannot be created, one that turns out to be
+        a symlink, a name already taken, a file that cannot be opened.
+        Each costs this recording, is logged once with its reason, and
+        leaves the caller a None it can carry a session with. The
+        operator's shell must not die because a log file could not be
+        opened.
         """
         if self.directory is None:
             return None
         started = time.time()
-        folder = os.path.join(self.directory, _folder_name(identity))
-        # Basic ISO-8601 rather than extended: a colon is hostile in a
-        # filename on one of the filesystems an engagement's evidence
-        # gets copied to, and awkward in every shell. The sidecar's own
-        # `started` is the extended spelling, for reading.
-        path = os.path.join(folder, "%s-%d.typescript" % (
-            time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(started)), session))
+        # Named in the warning below if the path cannot even be built, so
+        # that the reason is never a `NameError` about a missing local.
+        folder = path = self.directory
         try:
+            folder = os.path.join(self.directory, _folder_name(identity))
+            # Basic ISO-8601 rather than extended: a colon is hostile in a
+            # filename on one of the filesystems an engagement's evidence
+            # gets copied to, and awkward in every shell. The sidecar's
+            # own `started` is the extended spelling, for reading.
+            path = os.path.join(folder, "%s-%d.typescript" % (
+                time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(started)),
+                session))
+            # The configured root first and the identity folder second,
+            # rather than one call for the leaf: the root is the component
+            # most likely to exist already, and therefore the one whose
+            # mode has to be checked rather than assumed. Verification
+            # starts there and not above it -- `/var/log` is 0755 on every
+            # host and saying so would be noise, not a finding.
+            _private_dir(self.directory)
             _private_dir(folder)
             # `O_EXCL`, so a name already taken is a refusal and never an
             # overwrite: the one file this must not damage is a transcript
-            # somebody already has. 0600 from the instant it exists rather
-            # than tightened afterwards.
+            # somebody already has. `O_NOFOLLOW` beside it for the same
+            # reason `_write_operator_token` in `c2/server.py` carries
+            # one -- a link planted in place of the name is refused rather
+            # than written through, and `O_EXCL` alone only covers the
+            # final component. 0600 from the instant it exists rather than
+            # tightened afterwards.
             descriptor = os.open(path,
-                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | getattr(os, "O_NOFOLLOW", 0),
                                  _FILE_MODE)
             handle = os.fdopen(descriptor, "wb")
         except Exception as exc:
@@ -430,22 +516,69 @@ def _folder_name(identity: str) -> str:
 
 
 def _private_dir(path: str) -> None:
-    """Create `path` and any parent it needs, each 0700.
+    """Make `path` exist as a 0700 directory, or say why it is not one.
 
     Not `os.makedirs(mode=_DIR_MODE)`: that applies the mode to the leaf
     alone and leaves any parent it had to create at the process umask,
     which for this tree would be 0600 transcripts under a directory
-    anybody can list. A directory that already exists is left exactly as
-    it is, as the key store leaves its own: it may be one this module
-    does not own.
+    anybody can list.
+
+    A component that already exists is one this module did not make, so
+    it is verified rather than assumed -- see `_verify_private_dir` for
+    which of the two outcomes each kind gets. The old behaviour here was
+    to swallow `FileExistsError` and carry on, which made "directories
+    0700" quietly untrue for the most ordinary case there is: an operator
+    who ran `mkdir -p` before setting the key.
     """
     parent = os.path.dirname(path)
     if parent and parent != path and not os.path.isdir(parent):
         _private_dir(parent)
     try:
         os.mkdir(path, _DIR_MODE)
+        return
     except FileExistsError:
         pass
+    _verify_private_dir(path)
+
+
+def _verify_private_dir(path: str) -> None:
+    """Check a directory this module found rather than created.
+
+    `os.lstat`, not `os.stat`: the question is what this name *is*, and
+    following it would answer about the target instead.
+
+    A symlink is refused, and that is deliberately not a warning. A
+    planted directory symlink is not a mode an operator chose, and
+    writing a 0600 transcript through one would put an engagement's
+    evidence wherever the link points; `O_NOFOLLOW` on the transcript
+    itself only covers the final component, so the components above it
+    are checked here. Anything that exists and is not a directory is
+    refused for the same reason.
+
+    A real directory wider than 0700 is kept, used, and logged once
+    naming it and the mode found. Not tightened: it may be a directory an
+    operator created, or one shared with something else, and a recorder
+    that silently `chmod`s somebody's directory is a worse surprise than
+    a wide one it told them about. The transcripts in it are 0600
+    regardless; what leaks is the identity folders and the session
+    filenames -- which builds were attached to, and when.
+    """
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        raise OSError("%s is a symbolic link, and a transcript is not "
+                      "written through one" % path)
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError("%s already exists and is not a directory" % path)
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & ~_DIR_MODE:
+        logger.warning(
+            "shell: %s already existed as mode 0%o, which is wider than "
+            "the 0%o this module creates, so the identity folders and "
+            "transcript names under it can be listed by others. The "
+            "transcripts themselves are still 0%o. This is not a directory "
+            "this module made, so its mode is yours to change: "
+            "chmod 0%o %s", path, mode, _DIR_MODE, _FILE_MODE, _DIR_MODE,
+            path)
 
 
 def _write_private_json(path: str, document: dict) -> None:
@@ -454,15 +587,17 @@ def _write_private_json(path: str, document: dict) -> None:
     A scratch file in the same directory, created 0600, fsynced and moved
     over the target -- the shape `keys.py` writes the key store with, for
     the same two reasons. Whoever reads a sidecar never sees half of one,
-    and the file is private from the instant it exists.
+    and the file is private from the instant it exists. `O_NOFOLLOW` as
+    well, because the directory this lands in is not always one this
+    module created: see `_verify_private_dir`.
     """
     data = (json.dumps(document, indent=2, sort_keys=True)
             + "\n").encode("utf-8")
     directory, name = os.path.split(path)
     scratch = os.path.join(directory,
                            ".%s.%s.tmp" % (name, os.urandom(6).hex()))
-    descriptor = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                         _FILE_MODE)
+    descriptor = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | getattr(os, "O_NOFOLLOW", 0), _FILE_MODE)
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
@@ -1094,6 +1229,13 @@ class ShellFront(object):
                 # terminal was shown, and outside the lock, because a disk
                 # write under it would serialise every session on this
                 # port behind this one.
+                #
+                # Unguarded here because `Recorder.write` guards itself as
+                # a whole: anything that goes wrong inside it sets the
+                # recorder aside and returns. A `try` around this call
+                # could not do better -- it could not drop the recorder
+                # without also losing the reference this session's
+                # teardown needs to close it and write its sidecar.
                 recorder.write(data)
 
     # ── refusals ──
