@@ -419,6 +419,18 @@ class TunnelServer(object):
         else:
             self.shell_first_port, self.shell_last_port = _port_range(
                 shell_port_range)
+            # Refused rather than narrowed: a shell port taken from the
+            # SOCKS pool would eventually leave a new build with no SOCKS
+            # port and so no registration, which is the one cost a shell
+            # port must never impose. The assigners still treat each
+            # other's ports as taken, for a hand-edited state file.
+            if (self.shell_first_port <= self.last_port
+                    and self.first_port <= self.shell_last_port):
+                raise ValueError(
+                    "shell_port_range %d-%d overlaps port_range %d-%d; the "
+                    "two ranges must be disjoint"
+                    % (self.shell_first_port, self.shell_last_port,
+                       self.first_port, self.last_port))
         self.state_path = os.path.abspath(os.fspath(state_path))
         self._agent_lookup = agent_lookup
         self.keepalive_interval = _positive(keepalive_interval,
@@ -1085,8 +1097,9 @@ class TunnelServer(object):
                 raise
             return candidate
         raise ValueError(
-            "every port in %d-%d is assigned to another identity; widen the "
-            "range or retire a build" % (self.first_port, self.last_port))
+            "every port in %d-%d is already taken by another identity's "
+            "SOCKS or shell port; widen port_range or retire a build"
+            % (self.first_port, self.last_port))
 
     def _assign_shell_port(self, identity: str) -> Optional[int]:
         """This identity's shell port, assigning and persisting one if new.
@@ -1130,8 +1143,8 @@ class TunnelServer(object):
             self._shell_why.pop(identity, None)
             return candidate
         self._shell_why[identity] = (
-            "every port in %d-%d is assigned to another identity; widen "
-            "shell_port_range or retire a build"
+            "every port in %d-%d is already taken by another identity's "
+            "SOCKS or shell port; widen shell_port_range or retire a build"
             % (self.shell_first_port, self.shell_last_port))
         logger.warning("tunnel: no shell port for %r: %s",
                        identity, self._shell_why[identity])

@@ -612,6 +612,40 @@ class TestTheShellPortTable(TunnelServerTestCase):
         self.assertIn("shell_ports", str(caught.exception))
         self.assertIn(self.state_path, str(caught.exception))
 
+    def test_overlapping_ranges_are_refused_naming_both_fields(self):
+        for shell_range in ((40150, 40250), (40000, 40100), (40199, 40300),
+                            (40120, 40130), (40000, 40500)):
+            with self.assertRaises(ValueError, msg=shell_range) as caught:
+                self.build(shell_port_range=shell_range)
+            message = str(caught.exception)
+            self.assertIn("shell_port_range", message)
+            self.assertIn("port_range", message)
+            self.assertIn("%d-%d" % shell_range, message)
+            self.assertIn("%d-%d" % _PORT_RANGE, message)
+        # Adjacent is not overlapping.
+        self.build(shell_port_range=(40200, 40299))
+        self.build(shell_port_range=(40000, 40099))
+
+    def test_every_identity_gets_both_ports_when_the_ranges_are_disjoint(self):
+        server = self.start_server(port_range=(40100, 40102),
+                                   shell_port_range=(40103, 40105))
+        for identity in ("build-alpha", "build-beta", "build-gamma"):
+            self.command_peer(server, identity)
+        rows = server.endpoints()
+        self.assertEqual([row["state"] for row in rows], ["connected"] * 3)
+        self.assertEqual(sorted(row["port"] for row in rows),
+                         [40100, 40101, 40102])
+        self.assertEqual(sorted(row["shell_port"] for row in rows),
+                         [40103, 40104, 40105])
+
+    def test_a_shell_port_is_never_assigned_a_port_a_socks_entry_holds(self):
+        self.write_state('{"version": 2, "ports": {"build-alpha": 40300}, '
+                         '"shell_ports": {}}')
+        server = self.build(shell_port_range=(40300, 40301))
+        with server._lock:
+            self.assertEqual(server._assign_shell_port("build-beta"), 40301)
+            self.assertIsNone(server._assign_shell_port("build-gamma"))
+
     def test_a_socks_port_is_never_assigned_a_port_a_shell_already_holds(self):
         self.write_state('{"version": 2, "ports": {}, '
                          '"shell_ports": {"build-alpha": 40100}}')
