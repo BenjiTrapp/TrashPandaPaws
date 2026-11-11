@@ -79,6 +79,28 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _child_command_line(pid: int) -> str:
+    """The child's argv as the OS shows it: `/proc` on Linux, `ps` elsewhere.
+
+    The same threat `test_no_secret_is_accepted_as_a_command_line_argument`
+    reads with, used here to read the opposite -- that an argument which is
+    *meant* to be on the line really is, so a mapping that silently dropped
+    it is caught.
+    """
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as handle:
+            return handle.read().replace(b"\x00", b" ").decode(
+                "utf-8", "replace").strip()
+    except OSError:
+        pass
+    try:
+        done = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return done.stdout.strip()
+
+
 class _FakeTunnelSupervisor:
     """A `TunnelSupervisor` that spawns nothing and records what it was asked.
 
@@ -1002,6 +1024,44 @@ class TestTheSupervisor(unittest.TestCase):
         self.assertIn(str(port), reason)
         # And nothing is left behind claiming to be running.
         self.assertEqual(supervisor.status()["state"], "stopped")
+
+    def test_the_transcript_dir_is_handed_to_the_child_as_an_argument(self):
+        """`--shell-transcript-dir` reaches the child, or nothing recorded.
+
+        `status()` reports `shell_transcripts` from the block the team
+        server read, so it answers the same whether or not that value ever
+        became a command-line argument -- the exact gap that let the
+        mapping lose its only coverage. The transcript dir carries no
+        refusal the child could raise on it the way an overlapping range
+        does (`Transcripts` accepts any path and only touches it, lazily,
+        when a session is recorded), so this reads it off the argv of the
+        running child instead: the directory the supervisor was configured
+        with has to appear after `--shell-transcript-dir` on the line the
+        child is actually running. Drop that pair from `_Child.spawn` and
+        the directory is nowhere on the line, and this fails.
+
+        A shell range is configured alongside it, because a transcript dir
+        with no range is the misconfiguration the child only warns about;
+        the two together are the shape a recording deployment runs.
+        """
+        ports = set()
+        while len(ports) < 3:
+            ports.add(_free_port())
+        socks, first, last = sorted(ports)
+        directory = self.data_dir / "transcripts-on-the-argv"
+        supervisor = self.supervisor(
+            socks_port_first=socks, socks_port_last=socks,
+            shell_port_first=first, shell_port_last=last,
+            shell_transcript_dir=str(directory))
+
+        pid = supervisor.start()["pid"]
+        command = _child_command_line(pid)
+        self.assertTrue(command, "the probe read no command line at all, so "
+                                 "finding the argument would prove nothing")
+        self.assertIn("--shell-transcript-dir %s" % directory, command,
+                      "the transcript directory did not reach the child's "
+                      "command line, so a deployment that configured "
+                      "recording would record nothing: %r" % command)
 
     def test_a_block_with_no_shell_keys_says_so_in_the_status_it_reports(self):
         # The shipped state, through the real supervisor: the keys are
