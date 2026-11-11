@@ -16,11 +16,12 @@ pair anywhere; an absolute deadline on the handshake rather than a
 timeout per `recv`; a cap on handshakes in flight separate from the cap
 on live sessions; exactly one thread writing to the client socket at a
 time; and a polite close that drains briefly so a refusal the client has
-`socks.py`. The six helpers it shares with that module -- the three
-argument checks `loopback_bind`, `credential` and `positive`, and the
-three socket teardowns `shut`, `shutdown_both` and `finish` -- are
-imported from there rather than copied, because two implementations of a
-security property are one implementation and one latent hole.
+not read yet is not discarded by an RST. The six helpers it shares with
+that module -- the three argument checks `loopback_bind`, `credential`
+and `positive`, and the three socket teardowns `shut`, `shutdown_both`
+and `finish` -- are imported from there rather than copied, because two
+implementations of a security property are one implementation and one
+latent hole.
 
 Four things are different here, and each one is a decision rather than an
 accident.
