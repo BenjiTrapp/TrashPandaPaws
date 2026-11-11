@@ -13,6 +13,17 @@ static private key and every build's PSK, opens the implant-facing port,
 and opens one loopback SOCKS port per connected endpoint -- all of which
 the operator interface must be able to lose without losing the fleet.
 
+**`--shell-port-first` / `--shell-port-last` are the whole switch for the
+shell feature, and absent means no shell port is opened at all.** With a
+range, every connected identity also gets one authenticated loopback port
+carrying a root PTY on its host, and `status` reports the range it was
+given; without one, `status` reports None and every endpoint row says so.
+Deliberately server-side: nothing opens a root shell port because a
+config file somewhere mentioned one, which is the reasoning behind the
+listeners' compose profile. `--shell-transcript-dir` is the second
+switch, for recording, and is absent by default -- no directory is
+created and no byte is written until a path is given.
+
 It is deliberately not a listener and not in `c2.listeners`: a listener
 never holds the encryption key, which is what makes one safe on a host
 you do not mind losing. See `configs/raccoon.yaml` and docs/LISTENERS.md.
@@ -22,9 +33,11 @@ environment, because anything on a command line is readable by every user
 on the host through `ps` -- a finding this project has already paid for
 once. `--key-store` is the *path* to the PSK registry, not key material;
 the file is read by this process and by the generator, and it never
-appears on a command line in any other form. The per-identity SOCKS
-credential is minted here, in memory, and reported over the control
-socket.
+appears on a command line in any other form. `--shell-transcript-dir` is
+a path in the same way, and nothing secret is written there. The
+per-identity SOCKS credential and the per-identity shell password are
+both minted here, in memory, as two separate secrets, and reported over
+the control socket.
 
 Unlike `listeners/__main__.py` this process accepts no socket from
 `$LISTEN_FDS`. That mechanism exists so a listener can serve port 53 or
@@ -58,6 +71,7 @@ import time
 
 from .keys import KeyStore
 from .server import TunnelServer, crypto_path
+from .shell import ShellFront, Transcripts
 from .socks import SocksFront
 
 logger = logging.getLogger("raccoon.tunnel.main")
@@ -77,6 +91,13 @@ _CONTROL_TOKEN_VAR = "RACCOON_CONTROL_TOKEN"
 # host is not something a typo should be able to produce.
 _SOCKS_HOST = "127.0.0.1"
 
+# Where every shell port binds, and the claim is stronger still: this one
+# carries a root PTY on the implant host, and `ShellFront` refuses a
+# non-loopback address for itself as well. Its own constant rather than a
+# reuse of the SOCKS one for the same reason that one is not the control
+# socket's: three claims, three places to be wrong on purpose.
+_SHELL_HOST = "127.0.0.1"
+
 # One request, one line, and a cap so a client cannot make this process
 # buffer. A status request is about eighty bytes.
 _MAX_REQUEST = 4096
@@ -87,18 +108,31 @@ _MAX_REQUEST = 4096
 # being open; half a second is below noticing and costs nothing.
 _RECONCILE_INTERVAL = 0.5
 
-# Bytes of randomness in a SOCKS password. Per identity, generated here,
+# Bytes of randomness in a port password. Per identity, generated here,
 # and never written to disk: it protects a loopback port against the
 # other local users of the team server, and a port that outlives this
 # process has lost its sessions anyway.
+#
+# **One identity gets two of these, and they are two separate secrets.**
+# An operator handed the SOCKS credential so that a colleague can pivot
+# must not thereby have handed them a root terminal on the host, and both
+# are read off the same panel row -- so the separation is in the mint
+# rather than in how carefully a row is copied.
 _PASSWORD_BYTES = 16
 
 
 def main(argv=None):
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, stream=sys.stderr,
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
+
+    # One local, read twice: the server assigns the ports and `_Fronts`
+    # opens them, and two separate readings of the same two arguments is
+    # how one of the two ends up disagreeing about whether the feature is
+    # on. `None` is the off state and the default.
+    shell_range = _shell_range(args, parser)
 
     try:
         keystore = KeyStore(args.key_store)
@@ -116,12 +150,23 @@ def main(argv=None):
         server = TunnelServer(
             keystore, args.bind_host, args.bind_port,
             (args.socks_port_first, args.socks_port_last), args.state_path,
+            shell_port_range=shell_range,
             keepalive_interval=args.keepalive_seconds)
     except (OSError, ValueError) as exc:
         print("could not build the tunnel server: %s" % exc, file=sys.stderr)
         return 1
 
-    fronts = _Fronts(server)
+    # `None` through to `Transcripts`, rather than a path defaulted
+    # anywhere: absent means no recording, and that has to mean no
+    # directory is created and no byte is written.
+    transcripts = Transcripts(args.shell_transcript_dir)
+    if transcripts.enabled and shell_range is None:
+        logger.warning(
+            "tunnel: --shell-transcript-dir %s is configured but no "
+            "--shell-port-first/--shell-port-last, so there are no shell "
+            "sessions to record", transcripts.directory)
+    fronts = _Fronts(server, shell_enabled=shell_range is not None,
+                     transcripts=transcripts)
     try:
         server.start()
     except OSError as exc:
@@ -130,6 +175,9 @@ def main(argv=None):
         return 1
     logger.info("tunnel: %d build%s registered, crypto path %s",
                 len(builds), "" if len(builds) == 1 else "s", crypto_path())
+    if shell_range is None:
+        logger.info("tunnel: no shell port range, so no shell port is "
+                    "opened for any endpoint")
 
     control = _start_control(server, fronts, args)
     stopping = threading.Event()
@@ -168,6 +216,19 @@ def _parser():
                         help="first loopback SOCKS port, one per endpoint")
     parser.add_argument("--socks-port-last", type=int, required=True,
                         help="last loopback SOCKS port, inclusive")
+    parser.add_argument("--shell-port-first", type=int,
+                        help="first loopback shell port, one per endpoint; "
+                             "leave both out and no shell port is opened "
+                             "for anybody")
+    parser.add_argument("--shell-port-last", type=int,
+                        help="last loopback shell port, inclusive; must be "
+                             "given with --shell-port-first and must not "
+                             "overlap the SOCKS range")
+    parser.add_argument("--shell-transcript-dir",
+                        help="record each shell session's output here, one "
+                             "file per session; a path, never a secret. "
+                             "Leave it out and nothing is recorded and no "
+                             "directory is created")
     parser.add_argument("--key-store", required=True,
                         help="the PSK and identity registry the generator "
                              "writes; a path, never key material")
@@ -182,12 +243,45 @@ def _parser():
     return parser
 
 
-class _Fronts(object):
-    """The loopback SOCKS ports this process has opened, one per identity.
+def _shell_range(args, parser):
+    """`(first, last)` for the shell ports, or None when there are none.
 
-    One per endpoint identity, on the port the tunnel server's port table
-    assigned it, because an operator's `proxychains.conf` names that port
-    and this design's own anti-goal is a port that moves under them.
+    Both arguments absent is the off state and the default: no shell port
+    is opened for any endpoint, and `status` says so. One without the
+    other is refused by the name of the one that is missing -- it is the
+    mistake a half-copied command line produces, and reading it as a
+    range of one would hand the first build a shell port and every build
+    after it nothing, with no reason anybody could read.
+
+    The reversed pair and an overlap with the SOCKS range are refused by
+    `TunnelServer.__init__`, which names both fields; `tunnel_server_
+    config` refuses both earlier still for a deployment started from a
+    config file.
+    """
+    first, last = args.shell_port_first, args.shell_port_last
+    if first is None and last is None:
+        return None
+    if first is None:
+        parser.error("--shell-port-first is needed as well: a shell port "
+                     "range takes both ends, and leaving both out is how "
+                     "no shell port is opened")
+    if last is None:
+        parser.error("--shell-port-last is needed as well: a shell port "
+                     "range takes both ends, and leaving both out is how "
+                     "no shell port is opened")
+    return (first, last)
+
+
+class _Fronts(object):
+    """The loopback ports this process has opened, one pair per identity.
+
+    One SOCKS port per endpoint identity, on the port the tunnel server's
+    port table assigned it, because an operator's `proxychains.conf` names
+    that port and this design's own anti-goal is a port that moves under
+    them. One **shell** port beside it on the same terms, out of the
+    server's second port table, and only when a shell port range was
+    configured: `shell_enabled` False is the feature switched off and
+    nothing is attempted at all.
 
     A port is opened when its identity first connects and then **kept**,
     disconnected or not. Closing it on a disconnect would make a tunnel
@@ -198,8 +292,17 @@ class _Fronts(object):
     session with the tunnel's own reply code, which is a refusal the
     operator can read.
 
-    `factory` is `SocksFront` in production and is a parameter so the
-    reconciliation can be tested without binding anything.
+    **The two ports are opened independently and fail independently.** A
+    shell port that cannot be bound costs that identity its shell and
+    nothing else -- not its SOCKS port, which is the pivot, and not its
+    registration, which happened in the tunnel server long before this
+    loop ran. The reverse holds too.
+
+    `factory` is `SocksFront` and `shell_factory` is `ShellFront` in
+    production; both are parameters so the reconciliation can be tested
+    without binding anything. `transcripts` is the one `Transcripts` every
+    shell front shares, which records nothing unless a directory was
+    configured.
 
     `reconcile` is the only writer and is called from one thread -- the
     main loop -- so it reads the tables without the lock and takes it to
@@ -207,77 +310,156 @@ class _Fronts(object):
     control-socket thread.
     """
 
-    def __init__(self, tunnel_server, factory=None):
+    def __init__(self, tunnel_server, factory=None, shell_factory=None,
+                 shell_enabled=False, transcripts=None):
         self._tunnel = tunnel_server
         self._factory = factory or SocksFront
+        self._shell_factory = shell_factory or ShellFront
+        self._shell_enabled = bool(shell_enabled)
+        self._transcripts = transcripts
         self._lock = threading.Lock()
-        self._fronts = {}          # type: dict
-        self._credentials = {}     # type: dict
-        self._failures = {}        # type: dict
+        self._fronts = {}           # type: dict
+        self._credentials = {}      # type: dict
+        self._failures = {}         # type: dict
+        self._shell_fronts = {}     # type: dict
+        self._shell_passwords = {}  # type: dict
+        self._shell_failures = {}   # type: dict
+
+    @property
+    def transcript_directory(self):
+        """Where sessions are recorded, or None when none are."""
+        if self._transcripts is None or not self._transcripts.enabled:
+            return None
+        return self._transcripts.directory
+
+    @property
+    def recording(self):
+        """Whether a session on one of these ports would be recorded.
+
+        Both halves, because either one alone would be a panel badge that
+        means nothing: a transcript directory with no shell port range
+        records nothing because there is nothing to record.
+        """
+        return self._shell_enabled and self.transcript_directory is not None
 
     def reconcile(self, rows):
-        """Open a SOCKS port for every connected identity that has none."""
+        """Open the ports every connected identity should have and has not.
+
+        Two independent steps per row, so that neither port can cost the
+        other one: a number another process is holding is the likeliest
+        failure here, and it is a per-port failure.
+        """
         for row in rows:
             identity = row.get("identity")
-            port = row.get("port")
-            if (not identity or row.get("state") != "connected"
-                    or identity in self._fronts or not port):
+            if not identity or row.get("state") != "connected":
                 continue
-            # The username is the identity, which is not a secret and
-            # makes a proxychains entry say which endpoint it reaches.
-            # Only the password is random.
-            credential = (str(identity), secrets.token_urlsafe(_PASSWORD_BYTES))
-            try:
-                # Every argument past `password` by keyword: `max_pending`
-                # sits between `max_sessions` and `bind_host`, so a
-                # positional call here would silently cap the handshakes
-                # in flight with a hostname.
-                front = self._factory(self._tunnel, identity, int(port),
-                                      credential[0], credential[1],
-                                      bind_host=_SOCKS_HOST)
-                front.start()
-            except (OSError, ValueError) as exc:
-                # The likeliest cause by far is another process holding
-                # the number, and the operator can only act on it if they
-                # are told. Recorded against the row rather than raised:
-                # one unusable port must not cost the other endpoints
-                # theirs.
-                reason = ("the SOCKS port %s for %r could not be opened: %s"
-                          % (port, identity, exc))
-                if self._failures.get(identity) != reason:
-                    logger.warning("tunnel: %s", reason)
-                with self._lock:
-                    self._failures[identity] = reason
-                continue
-            with self._lock:
-                self._fronts[identity] = front
-                self._credentials[identity] = credential
-                self._failures.pop(identity, None)
-            logger.info("tunnel: %r is served on %s:%s",
-                        identity, _SOCKS_HOST, port)
+            self._open_socks(identity, row.get("port"))
+            if self._shell_enabled:
+                self._open_shell(identity, row.get("shell_port"))
+
+    def _open_socks(self, identity, port):
+        if identity in self._fronts or not port:
+            return
+        # The username is the identity, which is not a secret and
+        # makes a proxychains entry say which endpoint it reaches.
+        # Only the password is random.
+        credential = (str(identity), secrets.token_urlsafe(_PASSWORD_BYTES))
+        try:
+            # Every argument past `password` by keyword: `max_pending`
+            # sits between `max_sessions` and `bind_host`, so a
+            # positional call here would silently cap the handshakes
+            # in flight with a hostname.
+            front = self._factory(self._tunnel, identity, int(port),
+                                  credential[0], credential[1],
+                                  bind_host=_SOCKS_HOST)
+            front.start()
+        except (OSError, ValueError) as exc:
+            self._record_failure(self._failures, "SOCKS", identity, port, exc)
+            return
+        with self._lock:
+            self._fronts[identity] = front
+            self._credentials[identity] = credential
+            self._failures.pop(identity, None)
+        logger.info("tunnel: %r is served on %s:%s",
+                    identity, _SOCKS_HOST, port)
+
+    def _open_shell(self, identity, port):
+        """Open this identity's shell port, if it has one and none is open.
+
+        `port` is None when no shell port could be assigned -- no range,
+        or a range with nothing left in it -- and the row already carries
+        the server's own reason for that, which `decorate` leaves alone.
+        """
+        if identity in self._shell_fronts or not port:
+            return
+        # Its own secret, minted here, and not the SOCKS password: see
+        # `_PASSWORD_BYTES`. No username, because there is one operator
+        # per port and nothing for a name to distinguish.
+        password = secrets.token_urlsafe(_PASSWORD_BYTES)
+        try:
+            front = self._shell_factory(self._tunnel, identity, int(port),
+                                        password, bind_host=_SHELL_HOST,
+                                        transcripts=self._transcripts)
+            front.start()
+        except (OSError, ValueError) as exc:
+            self._record_failure(self._shell_failures, "shell", identity,
+                                 port, exc)
+            return
+        with self._lock:
+            self._shell_fronts[identity] = front
+            self._shell_passwords[identity] = password
+            self._shell_failures.pop(identity, None)
+        logger.info("tunnel: %r has a shell on %s:%s",
+                    identity, _SHELL_HOST, port)
+
+    def _record_failure(self, table, what, identity, port, exc):
+        """Keep one port's failure against its row, and log it once.
+
+        The likeliest cause by far is another process holding the number,
+        and the operator can only act on it if they are told. Recorded
+        against the row rather than raised: one unusable port must not
+        cost the other endpoints theirs, or this endpoint its other port.
+        """
+        reason = ("the %s port %s for %r could not be opened: %s"
+                  % (what, port, identity, exc))
+        if table.get(identity) != reason:
+            logger.warning("tunnel: %s", reason)
+        with self._lock:
+            table[identity] = reason
 
     def decorate(self, row):
-        """One `endpoints()` row plus what its SOCKS port has done.
+        """One `endpoints()` row plus what its two loopback ports have done.
 
-        This row carries the port's `username` and `password`, which is a
-        deliberate exception to the rule `TunnelServer.status()` keeps --
-        no field a screenshot must not carry. That rule is about the relay
-        session token, which is the credential that would let somebody
-        else take an operator's relay, and about what gets written to
-        disk. This one is the operator's own credential for the operator's
-        own loopback port: the port authenticates per RFC 1929 precisely
-        so that another local user of the team server cannot pivot
-        through it, and an operator who cannot read it cannot write their
-        `proxychains.conf`. The team server already shows the operator
-        token in its settings panel for the same reason. It is minted per
-        identity, never written to disk, and travels only over the
-        token-authenticated loopback control socket.
+        This row carries the port's `username` and `password`, and the
+        shell port's `shell_password`, which is a deliberate exception to
+        the rule `TunnelServer.status()` keeps -- no field a screenshot
+        must not carry. That rule is about the relay session token, which
+        is the credential that would let somebody else take an operator's
+        relay, and about what gets written to disk. These are the
+        operator's own credentials for the operator's own loopback ports:
+        each port authenticates -- the SOCKS one per RFC 1929 -- precisely
+        so that another local user of the team server cannot pivot or
+        attach through it, and an operator who cannot read them cannot
+        write their `proxychains.conf` or attach a terminal. The team
+        server already shows the operator token in its settings panel for
+        the same reason. They are minted per identity, never written to
+        disk, and travel only over the token-authenticated loopback
+        control socket.
+
+        **`shell_detail` belongs to the tunnel server's row**, which is
+        why it is filled here only when it arrives empty: "no
+        shell_port_range is configured" and "the range is exhausted" are
+        the server's own answers, and a front that failed to bind must be
+        able to explain itself without overwriting either.
         """
         identity = row.get("identity")
         with self._lock:
             front = self._fronts.get(identity)
             credential = self._credentials.get(identity)
             failure = self._failures.get(identity, "")
+            shell = self._shell_fronts.get(identity)
+            shell_password = self._shell_passwords.get(identity)
+            shell_failure = self._shell_failures.get(identity, "")
         out = dict(row)
         out["socks"] = front.stats() if front is not None else None
         out["username"] = credential[0] if credential else None
@@ -285,18 +467,51 @@ class _Fronts(object):
         out["socks_detail"] = failure or ("" if front is not None else (
             "no SOCKS port is open yet: one opens on this identity's "
             "assigned port when the endpoint connects"))
+        out["shell"] = shell.stats() if shell is not None else None
+        out["shell_password"] = shell_password
+        out["shell_detail"] = (str(row.get("shell_detail") or "")
+                               or shell_failure
+                               or self._shell_pending(shell))
+        out["shell_recording"] = self.recording
         return out
+
+    def _shell_pending(self, front):
+        """Why this identity has no shell port, when its row did not say.
+
+        The middle case is the one worth spelling out: a port table
+        written while a shell range was configured keeps its `shell_ports`
+        entries after the range is taken out of the configuration, so the
+        row arrives with a shell port, no reason, and no port that will
+        ever open. "One opens when the endpoint connects" would be false
+        about a connected endpoint, which is the reading this field exists
+        to prevent.
+        """
+        if front is not None:
+            return ""
+        if not self._shell_enabled:
+            return ("no shell port range is configured, so no shell port "
+                    "is opened for any endpoint")
+        return ("no shell port is open yet: one opens on this identity's "
+                "assigned shell port when the endpoint connects")
 
     def stop_all(self):
         with self._lock:
             fronts = list(self._fronts.values())
+            shells = list(self._shell_fronts.values())
             self._fronts = {}
             self._credentials = {}
+            self._shell_fronts = {}
+            self._shell_passwords = {}
         for front in fronts:
             try:
                 front.stop()
             except Exception as exc:          # pragma: no cover - teardown
                 logger.warning("tunnel: a SOCKS port did not stop: %s", exc)
+        for shell in shells:
+            try:
+                shell.stop()
+            except Exception as exc:          # pragma: no cover - teardown
+                logger.warning("tunnel: a shell port did not stop: %s", exc)
 
 
 def _start_control(server, fronts, args):
@@ -407,6 +622,18 @@ class _ControlHandler(socketserver.BaseRequestHandler):
             # there.
             "crypto": crypto_path(),
             "socks_port_range": [tunnel.first_port, tunnel.last_port],
+            # Null when no shell port range was configured, which is this
+            # feature's off state and the only thing that switches it on.
+            # Reported so that an operator who cannot find a shell port on
+            # a row can tell "nobody configured one here" from "this
+            # endpoint has not been given one", which are two different
+            # things to do about it.
+            "shell_port_first": tunnel.shell_first_port,
+            "shell_port_last": tunnel.shell_last_port,
+            # The directory sessions are recorded to, or null for a
+            # deployment that records nothing -- which is the default, and
+            # means no directory has been created either.
+            "shell_transcripts": fronts.transcript_directory,
             "endpoints": [fronts.decorate(row) for row in tunnel.endpoints()],
             "sessions": tunnel.status(),
         }

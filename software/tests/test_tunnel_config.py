@@ -607,6 +607,118 @@ class TestTheYamlPath(unittest.TestCase):
         self.assertIn("Generate the build with the tunnel enabled", answer)
 
 
+class TestTheShellRangeInTheServerBlock(unittest.TestCase):
+    """`c2.tunnel_server`'s shell keys: read, or refused by field name.
+
+    The SOCKS pair's own cases live in `test_tunnel_gui.py`, beside the
+    supervisor that spawns the child; these are here because the shipped
+    file is read in this module and the two belong together -- the single
+    switch for this feature is "are these keys set", and a test that only
+    asked the validator would not notice the shipped file turning it on.
+
+    `shell_transcript_dir` is a path, and a path on a command line is
+    allowed: the child is handed it with `--shell-transcript-dir` and
+    nothing secret goes there.
+    """
+
+    def block(self, **over):
+        """A runnable `c2.tunnel_server`, plus whatever is being tested."""
+        asked = {"enabled": True, "bind_host": "0.0.0.0", "bind_port": 8446,
+                 "socks_port_first": 19050, "socks_port_last": 19099,
+                 "keepalive_seconds": 30}
+        asked.update(over)
+        return {"c2": {"tunnel_server": asked}}
+
+    def config(self, **over):
+        from software.c2.tunnel.supervisor import tunnel_server_config
+
+        return tunnel_server_config(self.block(**over))
+
+    def refusal(self, **over):
+        from software.c2.tunnel.supervisor import tunnel_server_config
+
+        with self.assertRaises(ValueError) as caught:
+            tunnel_server_config(self.block(**over))
+        return str(caught.exception)
+
+    def test_the_shell_range_is_read_and_passed_on(self):
+        out = self.config(shell_port_first=19100, shell_port_last=19149,
+                          shell_transcript_dir="/srv/raccoon/transcripts")
+        self.assertEqual(out["shell_port_first"], 19100)
+        self.assertEqual(out["shell_port_last"], 19149)
+        self.assertEqual(out["shell_transcript_dir"],
+                         "/srv/raccoon/transcripts")
+        # The SOCKS pair beside it is untouched: a second range is a
+        # second range, not a reinterpretation of the first.
+        self.assertEqual(out["socks_port_first"], 19050)
+        self.assertEqual(out["socks_port_last"], 19099)
+        # Passed on to the child as arguments, which only a real child
+        # can confirm: `test_tunnel_gui.py`'s
+        # `test_a_configured_shell_range_and_transcript_dir_reach_the_
+        # child` starts one and reads these three back out of it.
+
+    def test_no_shell_keys_means_no_shell_range_and_no_transcripts(self):
+        # The deciding case. Both keys absent is the shipped state and it
+        # has to reach the child as "open nothing": a default range here
+        # would open a root shell port on every deployment that upgraded.
+        out = self.config()
+        self.assertIsNone(out["shell_port_first"])
+        self.assertIsNone(out["shell_port_last"])
+        self.assertIsNone(out["shell_transcript_dir"])
+
+    def test_a_reversed_shell_range_is_refused_by_field_name(self):
+        message = self.refusal(shell_port_first=19149,
+                               shell_port_last=19100)
+        self.assertIn("c2.tunnel_server.shell_port_first", message)
+        self.assertIn("shell_port_last", message)
+
+    def test_a_shell_range_overlapping_the_socks_range_is_refused_by_field_name(self):
+        # The invariant `TunnelServer.__init__` refuses for itself, caught
+        # here instead so it is a refusal before the process starts. Both
+        # pairs are named, because either one of the four numbers could be
+        # the one that is wrong.
+        for over in ({"shell_port_first": 19099, "shell_port_last": 19148},
+                     {"shell_port_first": 19000, "shell_port_last": 19050},
+                     {"shell_port_first": 19000, "shell_port_last": 20000},
+                     {"shell_port_first": 19060, "shell_port_last": 19070}):
+            with self.subTest(over=over):
+                message = self.refusal(**over)
+                self.assertIn("shell_port_first", message)
+                self.assertIn("socks_port_first", message)
+
+        # Adjacent but disjoint is fine, and is what the shipped comment
+        # suggests: 19050-19099 beside 19100-19149.
+        self.assertEqual(
+            self.config(shell_port_first=19100,
+                        shell_port_last=19149)["shell_port_first"], 19100)
+
+    def test_a_shell_key_that_is_not_a_port_or_a_path_is_refused_by_name(self):
+        for field, over in (
+                ("shell_port_first", {"shell_port_first": "19100",
+                                      "shell_port_last": 19149}),
+                ("shell_port_first", {"shell_port_first": True,
+                                      "shell_port_last": 19149}),
+                ("shell_port_first", {"shell_port_first": 0,
+                                      "shell_port_last": 19149}),
+                ("shell_port_last", {"shell_port_first": 19100,
+                                     "shell_port_last": 70000}),
+                # One end without the other is the mistake a copied block
+                # produces, and it must not be read as a range of one.
+                ("shell_port_last", {"shell_port_first": 19100}),
+                ("shell_port_first", {"shell_port_last": 19149}),
+                ("shell_transcript_dir", {"shell_transcript_dir": 5})):
+            with self.subTest(over=over):
+                self.assertIn("c2.tunnel_server.%s" % field,
+                              self.refusal(**over))
+
+        # A key present and blank is recording switched off rather than a
+        # refusal, which is what `Transcripts` documents an empty string
+        # to mean -- so a commented-out key that gets uncommented and left
+        # empty records nothing instead of stopping the server.
+        self.assertIsNone(self.config(
+            shell_transcript_dir="  ")["shell_transcript_dir"])
+
+
 class TestTheShippedConfig(unittest.TestCase):
     """What a fresh checkout's `configs/raccoon.yaml` says."""
 
@@ -635,6 +747,46 @@ class TestTheShippedConfig(unittest.TestCase):
         self.assertNotIn("psk", self.shipped["c2"]["tunnel"])
         self.assertIn(beacon_mod._TUNNEL_PSK_ENV, self.text,
                       "the file does not say where the PSK comes from")
+
+    def test_the_shipped_config_ships_both_keys_commented_out(self):
+        """The shell port range is off in a fresh checkout, and says why.
+
+        Off by being **absent**, not by a `false` beside it: the switch is
+        the presence of the range, so a key with a number in it opens the
+        port. Present as a comment all the same, because an operator who
+        cannot find the key invents one.
+        """
+        from software.c2.tunnel.supervisor import tunnel_server_config
+
+        block = self.shipped["c2"]["tunnel_server"]
+        for key in ("shell_port_first", "shell_port_last",
+                    "shell_transcript_dir"):
+            self.assertNotIn(
+                key, block,
+                "c2.tunnel_server ships %s set; a fresh checkout would "
+                "open a root shell port nobody asked for" % key)
+
+        # Commented out inside that block and not somewhere else in the
+        # file, so uncommenting them lands them where they are read.
+        start = self.text.index("  tunnel_server:")
+        end = self.text.index("\n  proxy:", start)
+        body = self.text[start:end]
+        for key in ("shell_port_first", "shell_port_last",
+                    "shell_transcript_dir"):
+            self.assertIn("# %s:" % key, body,
+                          "c2.tunnel_server does not mention %s at all, so "
+                          "an operator has to invent the key name" % key)
+        self.assertIn("root shell on the implant host", body,
+                      "the block does not say what the port is, on whose "
+                      "host")
+
+        # And the loader agrees with the file: the block as shipped, with
+        # only `enabled` flipped, configures no shell port at all.
+        enabled = dict(block, enabled=True)
+        out = tunnel_server_config({"c2": {"tunnel_server": enabled}})
+        self.assertIsNone(out["shell_port_first"])
+        self.assertIsNone(out["shell_port_last"])
+        self.assertIsNone(out["shell_transcript_dir"])
 
     def test_the_two_yaml_blocks_say_which_side_they_are_in_a_comment(self):
         # `c2.tunnel` and `c2.tunnel_server` look alike and mean opposite

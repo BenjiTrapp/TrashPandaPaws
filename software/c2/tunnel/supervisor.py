@@ -87,6 +87,17 @@ _DEFAULTS = {
     "socks_port_first": 19050,
     "socks_port_last": 19099,
     "keepalive_seconds": 30.0,
+    # The shell port range and the transcript directory default to
+    # nothing, and that is the feature switch rather than an `enabled`
+    # flag beside them: a shell port is a root PTY on the implant host, so
+    # it is opened because somebody wrote a range here and for no other
+    # reason. A default range would open one on every deployment that
+    # upgraded, which is the opposite of what the listeners' ship-disabled
+    # posture is for. See `configs/raccoon.yaml`, where both ship
+    # commented out.
+    "shell_port_first": None,
+    "shell_port_last": None,
+    "shell_transcript_dir": None,
 }
 
 
@@ -127,6 +138,8 @@ def tunnel_server_config(config: dict) -> Optional[dict]:
             "c2.tunnel_server.socks_port_first %d is above socks_port_last "
             "%d, so no endpoint could be given a port"
             % (out["socks_port_first"], out["socks_port_last"]))
+    _shell_range(block, out)
+    _shell_transcripts(block, out)
     keepalive = block.get("keepalive_seconds", out["keepalive_seconds"])
     try:
         keepalive = float(keepalive)
@@ -138,6 +151,76 @@ def tunnel_server_config(config: dict) -> Optional[dict]:
                          "positive, got %r" % (keepalive,))
     out["keepalive_seconds"] = keepalive
     return out
+
+
+def _shell_range(block: dict, out: dict) -> None:
+    """Read the optional shell port range, or refuse it by field name.
+
+    Both keys absent is the shipped state and means **no shell port is
+    opened at all** -- not a default range, not a disabled one. Validated
+    exactly as strictly as the SOCKS pair even so, because a range that
+    cannot be used is a root shell port the operator believes they have.
+    """
+    for field in ("shell_port_first", "shell_port_last"):
+        value = block.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) \
+                or not 1 <= value <= 65535:
+            raise ValueError("c2.tunnel_server.%s must be a port between 1 "
+                             "and 65535, or left out for no shell port at "
+                             "all, got %r" % (field, value))
+        out[field] = value
+    first, last = out["shell_port_first"], out["shell_port_last"]
+    if (first is None) != (last is None):
+        # One end alone is the mistake a half-copied block produces.
+        # Refused rather than read as a range of one: an operator who
+        # wrote `shell_port_first: 19100` and stopped expects fifty ports,
+        # and a silent range of one is a port that stops being issued the
+        # moment a second build appears.
+        missing = "shell_port_last" if last is None else "shell_port_first"
+        raise ValueError(
+            "c2.tunnel_server.%s must be set too: the shell port range "
+            "needs both ends, and leaving both out is how a deployment "
+            "opens no shell port" % missing)
+    if first is None:
+        return
+    if first > last:
+        raise ValueError(
+            "c2.tunnel_server.shell_port_first %d is above shell_port_last "
+            "%d, so no endpoint could be given a shell port"
+            % (first, last))
+    # The same refusal `TunnelServer.__init__` makes for itself, made here
+    # so that it happens before the process starts. Refused rather than
+    # narrowed: a shell port taken out of the SOCKS pool would eventually
+    # leave a new build with no SOCKS port and so no registration, which
+    # is the one cost a shell port must never impose.
+    if first <= out["socks_port_last"] and out["socks_port_first"] <= last:
+        raise ValueError(
+            "c2.tunnel_server.shell_port_first/shell_port_last %d-%d "
+            "overlaps socks_port_first/socks_port_last %d-%d; the two "
+            "ranges must be disjoint"
+            % (first, last, out["socks_port_first"], out["socks_port_last"]))
+
+
+def _shell_transcripts(block: dict, out: dict) -> None:
+    """Read the optional transcript directory, or refuse it by field name.
+
+    Absent is no recording: no directory is created and nothing is
+    written. A key present and blank means the same thing rather than
+    being a refusal -- `tunnel/shell.py`'s `Transcripts` documents an
+    empty string as recording switched off, so a key that was uncommented
+    and left empty records nothing instead of stopping the server.
+    """
+    directory = block.get("shell_transcript_dir")
+    if directory is None:
+        return
+    if not isinstance(directory, str):
+        raise ValueError(
+            "c2.tunnel_server.shell_transcript_dir must be a directory to "
+            "write session transcripts to, or left out for no recording, "
+            "got %r" % (directory,))
+    out["shell_transcript_dir"] = directory.strip() or None
 
 
 class TunnelSupervisor:
@@ -307,6 +390,33 @@ class _Child(SupervisedChild):
                    "--key-store", str(supervisor.key_store_path()),
                    "--state-path", str(supervisor.state_path()),
                    "--control-port", "0"]
+        # Both optional, and absent is the switch: a command line with no
+        # shell range opens no shell port, and one with no transcript
+        # directory records nothing and creates nothing. Paths on a
+        # command line are allowed -- `--key-store` is one -- and neither
+        # of these carries a secret; the shell password is minted in the
+        # child and reported over its control socket.
+        first = config.get("shell_port_first")
+        last = config.get("shell_port_last")
+        if (first is None) != (last is None):
+            # `tunnel_server_config` refuses this by field name long
+            # before here, so this is a block somebody built by hand.
+            # Refused all the same rather than silently dropped: "the
+            # shell port I configured never appeared" is the hardest
+            # thing in this feature to attribute afterwards.
+            raise SupervisorError(
+                "the tunnel server block has %s without %s, so its shell "
+                "port range has only one end"
+                % ("shell_port_first" if last is None
+                   else "shell_port_last",
+                   "shell_port_last" if last is None
+                   else "shell_port_first"))
+        if first is not None:
+            command += ["--shell-port-first", str(first),
+                        "--shell-port-last", str(last)]
+        if config.get("shell_transcript_dir"):
+            command += ["--shell-transcript-dir",
+                        str(config["shell_transcript_dir"])]
 
         environment = dict(os.environ)
         # Secrets by environment, never argv: a command line is readable

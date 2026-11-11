@@ -162,6 +162,64 @@ def _endpoint(identity="a1b2c3d4e5f6", **over):
     return row
 
 
+def _recording(cls, made):
+    """`cls`, with every front it builds appended to `made`.
+
+    A factory rather than a replacement, so the class under the test is
+    the real one: `ShellFront`'s arguments past `password` are
+    keyword-only and a wiring that passed one positionally would raise
+    here rather than pass against a stub that took `**kw`.
+    """
+
+    def build(*args, **kwargs):
+        front = cls(*args, **kwargs)
+        made.append(front)
+        return front
+
+    return build
+
+
+class _FakeFront:
+    """A front that binds nothing and remembers how it was called.
+
+    Used where what is under test is the reconciliation -- which identity
+    gets a front, what credential it was given -- rather than a bound
+    port. Two subclasses because the two real classes differ in their
+    positional tail: a SOCKS front takes a username before its password
+    and a shell front takes only the password, so a stub that accepted
+    both shapes would hide exactly the mistake worth catching.
+    """
+
+    def __init__(self, identity, bind_port, password, kwargs):
+        self.identity = identity
+        self.port = bind_port
+        self.password = password
+        self.kwargs = kwargs
+        self.started = 0
+        self.stopped = 0
+
+    def start(self):
+        self.started += 1
+
+    def stop(self):
+        self.stopped += 1
+
+    def stats(self):
+        return {"identity": self.identity, "port": self.port,
+                "serving": True, "sessions": 0, "refused": 0}
+
+
+class _FakeSocksFront(_FakeFront):
+    def __init__(self, tunnel, identity, bind_port, username, password, **kw):
+        _FakeFront.__init__(self, identity, bind_port, password, kw)
+        self.username = username
+
+
+class _FakeShellFront(_FakeFront):
+    def __init__(self, tunnel, identity, bind_port, password, **kw):
+        _FakeFront.__init__(self, identity, bind_port, password, kw)
+
+
 class _RouteCase(unittest.TestCase):
     """A test client, the fleet cleared around every test."""
 
@@ -209,14 +267,18 @@ class TestTheTunnelProcess(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
 
-    def spawn(self, control_token=_CONTROL_TOKEN):
+    def spawn(self, control_token=_CONTROL_TOKEN, socks=None, shell=None,
+              transcript_dir=None):
         # The SOCKS range is one probed port, not a literal: this process
         # binds a port out of that range the moment an endpoint connects.
         # No endpoint connects in these tests, so nothing is bound -- and
         # the range still comes from a probe, because the note in
         # test_tunnel_config.py asked this task to re-apply that rule
         # rather than inherit the assumption that the range is inert.
-        socks = _free_port()
+        # A caller that also wants a shell range probes both itself, so
+        # that the two cannot come back the same number: the process
+        # refuses to start on overlapping ranges, and rightly.
+        socks = _free_port() if socks is None else socks
         command = [sys.executable, "-m", "software.c2.tunnel",
                    "--bind-host", "127.0.0.1", "--bind-port", "0",
                    "--socks-port-first", str(socks),
@@ -224,6 +286,14 @@ class TestTheTunnelProcess(unittest.TestCase):
                    "--key-store", str(self.root / "keys.json"),
                    "--state-path", str(self.root / "ports.json"),
                    "--control-port", "0"]
+        # Absent by default, which is this feature's off state: a shell
+        # port is opened because the range was given and for no other
+        # reason.
+        if shell is not None:
+            command += ["--shell-port-first", str(shell[0]),
+                        "--shell-port-last", str(shell[1])]
+        if transcript_dir is not None:
+            command += ["--shell-transcript-dir", str(transcript_dir)]
         env = dict(os.environ, PYTHONPATH=str(_REPO), PYTHONUNBUFFERED="1")
         env.pop("RACCOON_CONTROL_TOKEN", None)
         if control_token is not None:
@@ -363,6 +433,274 @@ class TestTheTunnelProcess(unittest.TestCase):
         quiet = fronts.decorate(rows[1])
         self.assertIsNone(quiet["socks"])
         self.assertTrue(quiet["socks_detail"])
+
+    def _rows(self, count=1, state="connected", shell_detail="", **over):
+        """`count` endpoint rows as the tunnel server reports them.
+
+        `shell_port` is what Task 3's port table assigned, and
+        `shell_detail` is that table's own reason for there being none.
+        Probed ports, because some of these rows are handed to the real
+        fronts below and a literal would be a fixed number bound on a
+        shared machine.
+        """
+        rows = []
+        for number in range(count):
+            row = {"identity": "id-%d" % number, "port": _free_port(),
+                   "shell_port": _free_port(), "state": state,
+                   "shell_detail": shell_detail}
+            row.update(over)
+            rows.append(row)
+        return rows
+
+    def test_a_configured_range_opens_a_shell_front_per_connected_identity(self):
+        """The reconciliation again, with both real fronts bound.
+
+        Not stubs: `ShellFront` takes its password positionally and
+        everything after it by keyword, and its `stats()` has to come out
+        in the SOCKS row's shape because the panel reads the two with one
+        renderer. A stub taking `**kw` would pass against a call that got
+        either of those wrong.
+        """
+        from software.c2.tunnel import __main__ as tunnel_main
+        from software.c2.tunnel.shell import ShellFront
+        from software.c2.tunnel.socks import SocksFront
+
+        socks_made, shell_made = [], []
+        fronts = tunnel_main._Fronts(
+            object(), factory=_recording(SocksFront, socks_made),
+            shell_factory=_recording(ShellFront, shell_made),
+            shell_enabled=True)
+        self.addCleanup(fronts.stop_all)
+        rows = self._rows(2)
+        rows[1]["state"] = "disconnected"
+        fronts.reconcile(rows)
+        fronts.reconcile(rows)
+
+        # One shell front, for the connected identity, on the port the
+        # shell port table assigned it -- and opened once.
+        self.assertEqual([(f.identity, f.port) for f in shell_made],
+                         [("id-0", rows[0]["shell_port"])])
+        self.assertTrue(shell_made[0].is_serving())
+        self.assertEqual(len(socks_made), 1)
+
+        row = fronts.decorate(rows[0])
+        self.assertEqual(row["shell"]["port"], rows[0]["shell_port"])
+        self.assertTrue(row["shell"]["serving"])
+        # The SOCKS row's shape, which is what the panel reads.
+        self.assertEqual(row["shell"]["sessions"], 0)
+        self.assertEqual(row["shell"]["refused"], 0)
+        self.assertTrue(row["shell_password"])
+        self.assertEqual(row["shell_detail"], "",
+                         "an open shell port carries a reason it has not "
+                         "got")
+        # And the two ports are two ports: a shell front that bound the
+        # SOCKS number would have taken the pivot with it.
+        self.assertNotEqual(row["shell"]["port"], row["socks"]["port"])
+
+        # The disconnected identity has neither, and says so.
+        quiet = fronts.decorate(rows[1])
+        self.assertIsNone(quiet["shell"])
+        self.assertIsNone(quiet["shell_password"])
+        self.assertTrue(quiet["shell_detail"])
+
+    def test_a_shell_port_that_cannot_be_bound_costs_only_the_shell(self):
+        """One unusable number must not take the pivot with it.
+
+        The likeliest failure this wiring has: another process holding
+        the number. It is recorded against the row and logged, and the
+        SOCKS port -- which is the pivot, and the thing an engagement is
+        actually running through -- opens regardless.
+        """
+        from software.c2.tunnel import __main__ as tunnel_main
+        from software.c2.tunnel.shell import ShellFront
+
+        # Held open for the duration, so this is not the probe-then-bind
+        # race: the port is in use because this test is using it.
+        taken = socket.socket()
+        self.addCleanup(taken.close)
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        held = taken.getsockname()[1]
+
+        fronts = tunnel_main._Fronts(
+            object(), factory=_FakeSocksFront, shell_factory=ShellFront,
+            shell_enabled=True)
+        self.addCleanup(fronts.stop_all)
+        rows = self._rows(1, shell_port=held)
+        with self.assertLogs(tunnel_main.logger, level="WARNING") as logged:
+            fronts.reconcile(rows)
+
+        row = fronts.decorate(rows[0])
+        self.assertIsNone(row["shell"])
+        self.assertIn(str(held), row["shell_detail"])
+        self.assertIn("could not be opened", row["shell_detail"])
+        self.assertIn(str(held), "\n".join(logged.output),
+                      "the operator was not told which port it was")
+        # The pivot opened, with its own credential, and the row is whole.
+        self.assertEqual(row["socks"]["port"], rows[0]["port"])
+        self.assertTrue(row["password"])
+        self.assertEqual(row["socks_detail"], "")
+
+    def test_no_range_opens_no_shell_front_and_the_status_says_so(self):
+        """The single switch, on both sides of it.
+
+        No range configured is not "a front that failed to bind": nothing
+        is attempted at all, and the reason an operator reads is the port
+        table's own. A shell port is a root shell on the implant host, so
+        it opens because somebody configured a range on the server and
+        for no other reason -- the listeners' compose profile, again.
+        """
+        from software.c2.tunnel import __main__ as tunnel_main
+
+        def never(*args, **kwargs):
+            raise AssertionError("a shell front was opened with no range "
+                                 "configured")
+
+        fronts = tunnel_main._Fronts(
+            object(), factory=_FakeSocksFront, shell_factory=never)
+        self.addCleanup(fronts.stop_all)
+        # What Task 3's row carries when no range is configured: no port,
+        # and the reason in `shell_detail`.
+        rows = self._rows(1, shell_port=None,
+                          shell_detail="no shell_port_range is configured")
+        fronts.reconcile(rows)
+        row = fronts.decorate(rows[0])
+        self.assertIsNone(row["shell"])
+        self.assertIsNone(row["shell_password"])
+        self.assertFalse(row["shell_recording"])
+        self.assertEqual(row["shell_detail"],
+                         "no shell_port_range is configured",
+                         "the row's own reason was overwritten")
+        # The pivot is untouched by any of that.
+        self.assertEqual(row["socks"]["port"], rows[0]["port"])
+
+        # And the awkward case: a port table written while a range *was*
+        # configured keeps its entries, so a row can arrive with a shell
+        # port, no reason of its own, and no port that will ever open.
+        # Saying "one opens when the endpoint connects" about an endpoint
+        # that is connected would be false.
+        stale = self._rows(1)
+        fronts.reconcile(stale)
+        detail = fronts.decorate(stale[0])["shell_detail"]
+        self.assertIn("no shell port range is configured", detail)
+        self.assertNotIn("when the endpoint connects", detail)
+
+        # And the process says which it is, over its control socket, with
+        # no shell argument on its command line.
+        child = self.spawn()
+        port = int(child.stdout.readline().strip().split(" ", 1)[1])
+        answer = self._ask(port, _CONTROL_TOKEN)
+        self.assertIsNone(answer["shell_port_first"], answer)
+        self.assertIsNone(answer["shell_port_last"], answer)
+        self.assertIsNone(answer["shell_transcripts"], answer)
+        # Nothing was created for a feature nobody switched on: the
+        # process opened no port and wrote no transcript directory.
+        self.assertEqual([p.name for p in self.root.iterdir() if p.is_dir()],
+                         [], "a directory was created for a feature that "
+                             "is off")
+
+        # Configured, and the same question answers with the range. Three
+        # distinct probed ports, so the SOCKS range and the shell range
+        # cannot come back as the same number -- an overlap is refused by
+        # the process and would be a flake rather than a finding.
+        ports = set()
+        while len(ports) < 3:
+            ports.add(_free_port())
+        socks, first, last = sorted(ports)
+        recordings = self.root / "recordings"
+        served = self.spawn(socks=socks, shell=(first, last),
+                            transcript_dir=recordings)
+        port = int(served.stdout.readline().strip().split(" ", 1)[1])
+        answer = self._ask(port, _CONTROL_TOKEN)
+        self.assertEqual([answer["shell_port_first"],
+                          answer["shell_port_last"]], [first, last], answer)
+        self.assertEqual(answer["shell_transcripts"], str(recordings))
+
+    def test_the_shell_password_is_not_the_socks_password(self):
+        """Two ports, two secrets, minted separately.
+
+        Somebody handed the SOCKS credential for a pivot must not thereby
+        hold a root terminal on the host, and both are read off the same
+        panel row -- so the separation has to be in the mint and not in
+        how carefully a row is copied. Twelve identities rather than one,
+        because a single pair differing proves nothing about where the
+        second one came from.
+        """
+        from software.c2.tunnel import __main__ as tunnel_main
+
+        fronts = tunnel_main._Fronts(
+            object(), factory=_FakeSocksFront,
+            shell_factory=_FakeShellFront, shell_enabled=True)
+        self.addCleanup(fronts.stop_all)
+        rows = self._rows(12)
+        fronts.reconcile(rows)
+        decorated = [fronts.decorate(row) for row in rows]
+
+        socks = {row["password"] for row in decorated}
+        shell = {row["shell_password"] for row in decorated}
+        self.assertEqual(len(socks), 12, "a SOCKS password was reused")
+        self.assertEqual(len(shell), 12, "a shell password was reused")
+        self.assertFalse(socks & shell,
+                         "a shell port is held by a SOCKS credential")
+        # Each front was given its own row's password and nothing else:
+        # the username, which is the identity and not a secret, is the
+        # SOCKS front's alone.
+        for row in decorated:
+            self.assertEqual(row["username"], row["identity"])
+            self.assertNotEqual(row["shell_password"], row["identity"])
+            self.assertGreaterEqual(len(row["shell_password"]), 16)
+
+    def test_the_decorated_row_reports_recording_when_a_directory_is_configured(self):
+        """Recording is one switch with a path behind it, and off is off.
+
+        `shell_recording` is what the panel badges, so it has to be the
+        answer to "would this session be recorded" rather than "is a key
+        set somewhere". Absent means no recording: no directory is
+        created and nothing is written, which is asserted on the
+        filesystem rather than on the flag.
+        """
+        from software.c2.tunnel import __main__ as tunnel_main
+        from software.c2.tunnel.shell import Transcripts
+
+        directory = self.root / "transcripts"
+        recording = Transcripts(str(directory))
+        made = []
+        fronts = tunnel_main._Fronts(
+            object(), factory=_FakeSocksFront,
+            shell_factory=_recording(_FakeShellFront, made),
+            shell_enabled=True, transcripts=recording)
+        self.addCleanup(fronts.stop_all)
+        rows = self._rows(1)
+        fronts.reconcile(rows)
+
+        self.assertTrue(fronts.decorate(rows[0])["shell_recording"])
+        # The front holds the recorder itself, which is the only way a
+        # session ever reaches a file; a flag on the row that nothing was
+        # wired to would badge a panel and record nothing.
+        self.assertIs(made[0].kwargs.get("transcripts"), recording)
+        # And not before a session: the directory is created when a
+        # transcript is opened, so a configured deployment with nobody
+        # attached leaves no trace of which builds exist.
+        self.assertFalse(directory.exists())
+
+        # Off, which is the default. The front is still handed a
+        # `Transcripts`, and it is one that records nothing: `None` is
+        # passed through rather than a path being defaulted anywhere.
+        quiet_made = []
+        quiet = tunnel_main._Fronts(
+            object(), factory=_FakeSocksFront,
+            shell_factory=_recording(_FakeShellFront, quiet_made),
+            shell_enabled=True, transcripts=Transcripts(None))
+        self.addCleanup(quiet.stop_all)
+        rows = self._rows(1)
+        quiet.reconcile(rows)
+        self.assertFalse(quiet.decorate(rows[0])["shell_recording"])
+        handed = quiet_made[0].kwargs.get("transcripts")
+        self.assertFalse(handed.enabled)
+        self.assertIsNone(handed.directory)
+        self.assertIsNone(handed.open("id-0", 1, "127.0.0.1:1"))
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), [],
+                         "recording that is off created something anyway")
 
 
 class TestTheRowFixtureMatchesTheRealThing(unittest.TestCase):
@@ -512,6 +850,68 @@ class TestTheSupervisor(unittest.TestCase):
                 with self.assertRaises(SupervisorError) as caught:
                     getattr(supervisor, action)()
                 self.assertIn("does not manage", str(caught.exception))
+
+    def test_a_configured_shell_range_and_transcript_dir_reach_the_child(self):
+        """The block the team server read, on the child's command line.
+
+        The one step `tunnel_server_config`'s own tests cannot hold: the
+        validated block has to become arguments, and the child has to
+        have been built from them. Read back out of the child's own
+        `status`, which is the only thing that knows -- `_child` is
+        reached for because no public method reports the child's view of
+        its own shell range, and the alternative is asserting on a
+        command line nobody ran.
+        """
+        ports = set()
+        while len(ports) < 3:
+            ports.add(_free_port())
+        socks, first, last = sorted(ports)
+        directory = self.data_dir / "transcripts"
+        supervisor = self.supervisor(
+            socks_port_first=socks, socks_port_last=socks,
+            shell_port_first=first, shell_port_last=last,
+            shell_transcript_dir=str(directory))
+        self.assertEqual(supervisor.start()["state"], "running")
+
+        reported = supervisor._child.ask_status(supervisor.control_token)
+        self.assertIsNotNone(reported, "the child did not answer")
+        self.assertEqual([reported["shell_port_first"],
+                          reported["shell_port_last"]], [first, last])
+        self.assertEqual(reported["shell_transcripts"], str(directory))
+        # Configured is not created: a deployment with recording on and
+        # nobody attached writes nothing, so the directory appears with
+        # the first session and not with the process.
+        self.assertFalse(directory.exists())
+
+    def test_a_block_with_no_shell_keys_starts_a_child_with_no_shell_port(self):
+        # The shipped state, through the real supervisor: the two keys are
+        # absent from the block, so the command line carries neither and
+        # the child opens no shell port for anybody.
+        supervisor = self.supervisor()
+        self.assertEqual(supervisor.start()["state"], "running")
+        reported = supervisor._child.ask_status(supervisor.control_token)
+        self.assertIsNotNone(reported, "the child did not answer")
+        self.assertIsNone(reported["shell_port_first"])
+        self.assertIsNone(reported["shell_port_last"])
+        self.assertIsNone(reported["shell_transcripts"])
+
+    def test_a_shell_range_with_one_end_is_refused_rather_than_dropped(self):
+        from software.c2.tunnel.supervisor import SupervisorError
+
+        # `tunnel_server_config` refuses this by field name long before a
+        # child is spawned, so this is a block built by hand. Spawning
+        # anyway and quietly opening no shell port would make "the shell
+        # port I configured never appeared" unattributable.
+        for field, over in (("shell_port_last",
+                             {"shell_port_first": _free_port()}),
+                            ("shell_port_first",
+                             {"shell_port_last": _free_port()})):
+            with self.subTest(over=over):
+                supervisor = self.supervisor(**over)
+                with self.assertRaises(SupervisorError) as caught:
+                    supervisor.start()
+                self.assertIn(field, str(caught.exception))
+                self.assertEqual(supervisor.status()["state"], "stopped")
 
     def test_a_block_that_cannot_be_run_is_refused_by_field_name(self):
         from software.c2.tunnel.supervisor import tunnel_server_config

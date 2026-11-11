@@ -245,6 +245,25 @@ c2:
     # range and stable across restarts.
     socks_port_first: 19050
     socks_port_last: 19099
+    # Loopback *shell* ports, one per connected endpoint, from a second
+    # range that must not overlap the one above.
+    #
+    # WARNING: this port is a root shell on the implant host.
+    #
+    # Commented out, and that absence is the whole switch: set both and
+    # every connected endpoint gets one, so it is opened because somebody
+    # wrote these two lines and for no other reason. The port binds
+    # 127.0.0.1 and needs the password the 🔌 panel shows beside it;
+    # forwarding it to a workstation extends that reach to whatever can
+    # reach the workstation's loopback.
+    # shell_port_first: 19100
+    # shell_port_last: 19149
+    # Record each shell session's output here, one file per session, 0600
+    # in directories 0700. Commented out, and that absence means nothing
+    # is recorded and no directory is created. A transcript is a root
+    # shell on someone's host written down: keep it where the rest of the
+    # engagement's evidence is kept.
+    # shell_transcript_dir: "/var/lib/raccoon-c2/transcripts"
     keepalive_seconds: 30
 
   # ── Egress proxy (Python fallback beacon) ──
