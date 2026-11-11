@@ -67,7 +67,9 @@ import errno
 import logging
 import os
 import re
+import shutil
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -125,6 +127,66 @@ _NO_PTY = "this host has no pty support, so it cannot carry a shell session"
 # construction -- and the rest run on whatever shell the host has.
 _HAS_BASH = os.access("/bin/bash", os.X_OK)
 _NO_BASH = "this host has no /bin/bash, so there is no rcfile path to test"
+
+# A session only has a *controlling* terminal where `setsid(1)` is there
+# to acquire one, which is the endpoint's preferred path; without it the
+# session runs the documented fallback, which has no controlling terminal
+# and therefore no signal from `^C`. Probed independently of the
+# endpoint's own resolver -- `shutil.which`, the way `test_tunnel_yara`
+# finds `yara` -- so that a resolver which stopped finding `setsid`
+# produces a failing test rather than a skipped one.
+_HAS_SETSID = shutil.which("setsid") is not None
+_NO_SETSID = ("no setsid(1) on this host, as on macOS, so the session "
+              "takes the documented fallback path -- on which Darwin "
+              "hands a session leader its controlling terminal anyway, "
+              "so this would pass here without proving anything. The "
+              "deployment target is Linux, where setsid is present and "
+              "where the fallback really has no ^C")
+
+# A stand-in for `setsid -c`, for the host that has no `setsid(1)` at all.
+#
+# What `setsid -c` does is `setsid()`, `TIOCSCTTY` on its stdin, and
+# `exec`. It is a separate *program* for one reason only: no interpreter
+# may run between the fork and the exec of a process holding as many
+# threads and locks as this one. A shim is already past that point -- it
+# is its own exec'd program with one thread -- so it can make the two
+# calls in Python and then exec the shell, which is what makes the
+# endpoint's preferred path assertable on a host with no `setsid` to
+# probe for.
+#
+# It records the argv it was given, and refuses an invocation without
+# `-c`, so both halves of what the endpoint has to get right are read
+# back from the program that was actually run.
+_SETSID_STAND_IN = '''#!%s
+import fcntl
+import os
+import sys
+import termios
+
+args = sys.argv[1:]
+with open(sys.argv[0] + ".ran", "w") as handle:
+    handle.write("\\n".join(sys.argv))
+if args[:1] != ["-c"]:
+    raise SystemExit("asked for no controlling terminal: %%r" %% (args,))
+args = args[1:]
+os.setsid()
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+os.execv(args[0], args)
+'''
+
+
+def _alive(pid):
+    """True while `pid` is still in the process table.
+
+    Signal 0 and not a flag of anybody's: it is the kernel's answer. A
+    zombie answers yes, which is deliberate -- a process that has been
+    signalled but not reaped is still a row in `ps`.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def _free_port():
@@ -1338,6 +1400,15 @@ class TestAShellSession(TunnelEndpointTestCase):
         stream.send(command)
         return self.expect(stream, marker)
 
+    def a_setsid_stand_in(self):
+        """Point the endpoint's wrapper probe at `_SETSID_STAND_IN`."""
+        path = os.path.join(self.root, "setsid-stand-in")
+        with open(path, "w") as handle:
+            handle.write(_SETSID_STAND_IN % sys.executable)
+        os.chmod(path, 0o700)
+        self.patched("_setsid_program", lambda: path)
+        return path
+
     def a_home_directory(self, bashrc=None):
         """An empty HOME this process's children inherit, with a `.bashrc`.
 
@@ -1546,6 +1617,73 @@ class TestAShellSession(TunnelEndpointTestCase):
         # And on `/bin/sh` there is no `--rcfile`, so history is held off
         # by the weaker documented path instead.
         self.assertIn(b"H=[%s]" % os.devnull.encode("ascii"), data)
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_SETSID, _NO_SETSID)
+    def test_control_c_interrupts_a_running_command(self):
+        """`^C` reaches the running command, through the host's setsid(1)."""
+        self.assert_control_c_reaches_the_command()
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    def test_the_shell_is_spawned_through_setsid_asking_for_a_ctty(self):
+        """The preferred path's own half, on a host with no `setsid(1)`.
+
+        The behaviour above is the claim, and it is a claim this machine
+        cannot carry. What it *can* carry is everything the endpoint is
+        responsible for: that the shell is spawned as `<setsid> -c
+        <shell> …` and not directly, and that `Popen` is not *also* asked
+        for a new session. The wrapper is stood in for -- see
+        `_SETSID_STAND_IN` -- and reports the argv it was handed.
+        """
+        wrapper = self.a_setsid_stand_in()
+        stream = self.ask_for_a_shell()
+
+        # That the session works at all is the second half, and it is not
+        # readable off an argv: the stand-in's `setsid()` succeeded, so
+        # the child was not already a session leader -- had `Popen` been
+        # asked for a new session as well, that call would have failed
+        # with EPERM and no shell would ever have run.
+        self.run_in_the_shell(stream, b'echo "W""RAPPED"\n', b"WRAPPED")
+
+        with open(wrapper + ".ran") as handle:
+            argv = handle.read().splitlines()
+        self.assertEqual(argv[:2], [wrapper, "-c"],
+                         "the shell was not spawned through the wrapper "
+                         "asking for a controlling terminal: %r" % (argv,))
+        self.assertIn(argv[2], ("/bin/bash", "/bin/sh"))
+        self.assertIn("-i", argv[3:])
+
+    def assert_control_c_reaches_the_command(self):
+        """`0x03` on the stream kills the foreground command. Needs a ctty.
+
+        The point of an interactive session over a task channel is partly
+        this: a capture can be started and then stopped. The byte only
+        becomes a SIGINT if the slave is some session's *controlling*
+        terminal, because the line discipline signals that terminal's
+        foreground process group -- and with no such group it has nobody
+        to signal and discards the byte. So this fails on a session whose
+        child merely has a session of its own, which is all
+        `start_new_session=True` gives.
+
+        A grandchild reports its own pid and then sleeps in the
+        foreground. Both halves are asserted, because either alone is
+        passable by accident: the pid leaves the process table, and the
+        shell takes a command again afterwards -- which it could not if
+        the sleep were still holding the terminal.
+        """
+        stream = self.ask_for_a_shell()
+        data = self.run_in_the_shell(
+            stream, b"/bin/sh -c 'echo \"K\"\"ID=$$\"; sleep 300'\n", b"KID=")
+        found = re.search(rb"KID=(\d+)", data)
+        self.assertIsNotNone(found, "the foreground command reported no pid")
+        pid = int(found.group(1))
+        os.kill(pid, 0)
+
+        stream.send(b"\x03")
+
+        self.wait_for(lambda: not _alive(pid), timeout=10.0,
+                      what="^C interrupting the foreground command %d" % pid)
+        self.run_in_the_shell(stream, b'echo "B""ACK"\n', b"BACK")
 
     # ── refusals, in text, because a terminal is what is reading them ──
 

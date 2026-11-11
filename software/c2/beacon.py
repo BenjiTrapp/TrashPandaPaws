@@ -3021,6 +3021,33 @@ _SHELL_BASH = "/bin/bash"
 _SHELL_SH = "/bin/sh"
 _DEV_FD = "/dev/fd"
 
+# Where `setsid(1)` is, and why the shell is started through it.
+#
+# A terminal is only half a terminal until it is some session's
+# *controlling* terminal. Without that, the line discipline has no
+# foreground process group to signal, so `^C` and `^Z` are swallowed and
+# the shell runs with job control off -- which would mean an operator
+# could start a capture through this session and then have no way to stop
+# it, and stopping one is a good part of why the session exists.
+#
+# Acquiring it has to happen in the child, between `fork` and `exec`:
+# `setsid()` and then `TIOCSCTTY` on the slave. Doing that in Python --
+# a `preexec_fn`, or `pty.fork`'s `login_tty` -- means running an
+# interpreter in the child of a fork in a process holding this many
+# threads and locks, which is the documented way to deadlock a child
+# before it ever reaches `exec`. `setsid -c` does exactly those two
+# calls in a few lines of C instead, and it does not fork when it is not
+# already a process-group leader -- which this child never is -- so it
+# `exec`s the shell in place. The pid `Popen` returns is therefore the
+# session leader and the group id, which is what `killpg` needs, and
+# `ps` shows the shell rather than the wrapper.
+#
+# `-c` is util-linux 2.21 and later, which is everything current. Where
+# there is no `setsid` at all -- macOS has none -- the session falls back
+# to `Popen(start_new_session=True)`, which gives the child its own
+# session and no controlling terminal, and says so in the log.
+_SETSID_PATHS = ("/usr/bin/setsid", "/bin/setsid")
+
 # The rcfile a bash session is started on, held in a pipe and never
 # written anywhere.
 #
@@ -3083,6 +3110,19 @@ def _shell_program() -> str:
     completion still beats one command per check-in.
     """
     return _SHELL_BASH if _shell_executable(_SHELL_BASH) else _SHELL_SH
+
+
+def _setsid_program() -> str:
+    """`setsid(1)`'s path, or `""` where the host has none.
+
+    Probed rather than assumed, the way the shell is, because it is the
+    same question about a host and the answer picks between two
+    documented paths -- see `_SETSID_PATHS` for which and why.
+    """
+    for path in _SETSID_PATHS:
+        if _shell_executable(path):
+            return path
+    return ""
 
 
 def _shell_rcfile_fd() -> int:
@@ -4001,14 +4041,19 @@ class TunnelEndpoint(object):
         The two refusals that remain are written as plain text for the
         same reason -- a terminal is what is reading them.
 
-        The child is started in a session of its own so that it leads a
-        process group, which is what the teardown signals: what an
+        The child is started so that it leads a session of its own and
+        owns the terminal: through `setsid -c` where the host has it, and
+        otherwise with `start_new_session=True` and no controlling
+        terminal, which `_SETSID_PATHS` sets out at length. Either way the
+        pid is the group id, which is what the teardown signals: what an
         operator leaves behind is as likely to be a `tcpdump` they started
-        as the shell itself. The slave is closed here the moment the child
-        holds its own copy, because the master reports the child's exit --
-        `EIO`, or an empty read -- only once nothing else has the slave
-        open; a parent that kept it would park the output pump for ever on
-        a shell that had already gone.
+        as the shell itself.
+
+        The slave is closed here the moment the child holds its own copy,
+        because the master reports the child's exit -- `EIO`, or an empty
+        read -- only once nothing else has the slave open; a parent that
+        kept it would park the output pump for ever on a shell that had
+        already gone.
 
         Everything is undone in the `finally`, including on a thread that
         could not be started: no child process and no descriptor may
@@ -4037,9 +4082,19 @@ class TunnelEndpoint(object):
         try:
             master, slave = pty_mod.openpty()
             argv, env, child_fds = _shell_invocation(cols, rows)
+            program = argv[0]
+            leader = _setsid_program()
+            if leader:
+                argv = [leader, "-c"] + argv
+            else:
+                logger.info(
+                    "tunnel: no setsid on this host, so a shell session's "
+                    "terminal is not its controlling terminal: job control "
+                    "is off and ^C reaches readline rather than the "
+                    "running command")
             child = subprocess.Popen(argv, stdin=slave, stdout=slave,
                                      stderr=slave, cwd=_SHELL_CWD, env=env,
-                                     start_new_session=True,
+                                     start_new_session=not leader,
                                      pass_fds=child_fds)
             _close_fd(slave)
             slave = None
@@ -4056,7 +4111,7 @@ class TunnelEndpoint(object):
                                "session (%s)." % exc)
         else:
             logger.info("tunnel: a shell session opened: %s, %dx%d, pid %d",
-                        argv[0], cols, rows, child.pid)
+                        program, cols, rows, child.pid)
             self._count_session(1)
             try:
                 self._shell_bridge(sock, noise, master)
@@ -4211,11 +4266,13 @@ class TunnelEndpoint(object):
     def _end_shell(self, child: "subprocess.Popen", signal_mod) -> None:
         """Hang the session up, kill what is left of it, and reap it.
 
-        The process group and not the process: the child was started in a
-        session of its own, so it leads a group, and an operator's
-        `tcpdump` is in that group too. `SIGHUP` first, because losing a
-        terminal is what a hangup is and an interactive shell exits on it
-        after hanging up its own jobs; `SIGKILL` after
+        The process group and not the process: the child leads a session
+        of its own on both of `_serve_shell`'s paths -- `setsid(1)`
+        `exec`s in place rather than forking, so the pid `Popen` returned
+        is the session leader and the group id either way -- and an
+        operator's `tcpdump` is in that group too. `SIGHUP` first, because
+        losing a terminal is what a hangup is and an interactive shell
+        exits on it after hanging up its own jobs; `SIGKILL` after
         `_SHELL_TERM_GRACE`, because a session whose stream has gone has
         nothing left to negotiate with.
 
