@@ -30,7 +30,10 @@ is entered only when stdin is a terminal and restored in a `finally`
 that covers every way out -- the stream ending, a refusal, an interrupt,
 an unexpected exception -- because a client that exits leaving an
 operator's terminal in raw mode has taken their shell away along with
-the session.
+the session. A `finally` does not cover being killed, so `SIGTERM` and
+`SIGHUP` are held while the terminal is raw: each restores it and then
+dies of the same signal, which is ordinary for a client run under a
+wrapper or in a terminal emulator somebody closed.
 
 **The size is sent once and cannot be renegotiated.** There is no resize
 message on this wire; the far end sizes its pty at the `ioctl` that
@@ -45,8 +48,12 @@ repository states about tokens and keys.
 
 There is no escape character. The way out of a session is to end the
 shell at the far end -- `exit`, or the Ctrl-D the far end's terminal
-reads -- after which this client's exit code is 0. A refusal is one line
-of plain text from the port, which is printed and answered with 1.
+reads -- and that clean end is the only thing answered with 0.
+Everything else is a line on stderr and an exit code: 1 for a refusal
+from the port, a port that cannot be reached, and a session whose stream
+failed mid-way; 130 for an interrupt. A session that was carrying a
+shell and lost it must not look like a shell that exited, because the
+two have nothing in common to do about them.
 
 Stdlib only, and nothing from `software/`: this is a file an operator
 copies to a workstation that has nothing else of this repository on it.
@@ -145,21 +152,73 @@ class _Refusal(Exception):
         return "".join(c if " " <= c <= "~" else "?" for c in flat.strip())
 
 
-def geometry() -> Tuple[int, int]:
+def geometry(fd: Optional[int] = None) -> Tuple[int, int]:
     """This terminal's `(cols, rows)`, as a size the port can parse.
 
-    `shutil.get_terminal_size` honours `COLUMNS` and `LINES`, falls back
-    to the ioctl on stdout, and falls back again to what it is given --
-    here the port's own default, so a client with no terminal at all asks
-    for what it would have got by saying nothing.
+    `COLUMNS` and `LINES` first, which is `shutil.get_terminal_size`'s
+    own precedence and an operator's deliberate override; then the ioctl,
+    on `fd` when one is given and on `sys.__stdout__` otherwise; then the
+    port's own default, so a client with no terminal at all asks for what
+    it would have got by saying nothing.
+
+    `fd` is the descriptor this client actually writes the session to.
+    `shutil` would ask `sys.__stdout__` instead, which is the wrong
+    terminal whenever stdout has been reopened -- and no terminal at all
+    when it is a pipe.
+
+    **The environment is right for this and wrong for a resize.**
+    `COLUMNS` and `LINES` are what an operator exported once; they do not
+    change when the window does, so `_resized` asks the descriptor and
+    does not come through here.
 
     Clamped into one to five digits so that the line stays parseable: see
     `_GEOMETRY_MAX`. A terminal reporting 0 or six digits is a terminal
     in an odd state, and the cost of passing that on verbatim is not a
     badly sized session but a refused one.
     """
-    size = shutil.get_terminal_size(_DEFAULT_SIZE)
+    # `shutil.get_terminal_size`'s own algorithm, with `fd` substituted
+    # for the descriptor it would have chosen: an exported variable wins,
+    # either one of them alone is filled in from the ioctl, and the
+    # fallback is used only when there is no terminal to ask.
+    columns, lines = _exported("COLUMNS"), _exported("LINES")
+    if columns <= 0 or lines <= 0:
+        size = _winsize(fd) or shutil.get_terminal_size(_DEFAULT_SIZE)
+        columns = columns if columns > 0 else size.columns
+        lines = lines if lines > 0 else size.lines
+    return _digits(columns), _digits(lines)
+
+
+def _resized(fd: int) -> Tuple[int, int]:
+    """The size now, from the descriptor and not from the environment.
+
+    What a resize note is for is telling the operator the size their
+    window has *become*, and `COLUMNS` and `LINES` do not change when it
+    does: a note built from them would hand over an `stty` line for the
+    size before the resize, which makes the far end's terminal more wrong
+    rather than less. So this asks the descriptor, and falls back to
+    `geometry` only when there is nothing there to ask.
+    """
+    size = _winsize(fd)
+    if size is None:
+        return geometry(fd)
     return _digits(size.columns), _digits(size.lines)
+
+
+def _winsize(fd: Optional[int]):
+    """What the descriptor says it is, or None if it is not a terminal."""
+    if fd is None:
+        return None
+    try:
+        return os.get_terminal_size(fd)
+    except OSError:
+        return None
+
+
+def _exported(name: str) -> int:
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return 0
 
 
 def _digits(value: int) -> int:
@@ -210,6 +269,23 @@ def raw_terminal(stream):
     block -- an orderly end, a refusal, `KeyboardInterrupt`, an
     unexpected exception -- and it runs even when putting the terminal
     into raw mode is what failed.
+
+    **A `finally` does not cover being killed**, and the two signals that
+    happen to a client like this are ordinary: a wrapper or a `timeout`
+    sends `SIGTERM`, and a terminal emulator being closed sends `SIGHUP`.
+    Their default action ends the process without unwinding, which would
+    leave the operator holding a raw terminal. So while this block is
+    held, both restore first and then die as though no handler had been
+    installed -- `SIG_DFL` and the same signal again at this process, so
+    the exit status is still the truth about how it ended. The previous
+    handlers go back in the same `finally` as the modes.
+
+    `TCSANOW` entering and `TCSADRAIN` leaving, both deliberately.
+    `tty.setraw`'s own default is `TCSAFLUSH`, which discards whatever is
+    already in the input queue -- and this is entered after the
+    handshake, which can take as long as the port's wait for the implant
+    to dial back, so anything the operator typed in that window would be
+    thrown away rather than sent.
     """
     fd = -1
     saved = None
@@ -222,20 +298,51 @@ def raw_terminal(stream):
         # not a file, or is a terminal this platform will not describe.
         # None of it is worth refusing a session over.
         saved = None
+    previous = {}
+
+    def die(signum, frame):
+        # `TCSANOW`, not `TCSADRAIN`: this runs in a handler, and on a
+        # `SIGHUP` the thing that would have to drain is the terminal
+        # that has just gone.
+        _restore(fd, saved, termios.TCSANOW)
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
     try:
         if saved is not None:
-            tty.setraw(fd)
+            tty.setraw(fd, termios.TCSANOW)
+            for name in ("SIGTERM", "SIGHUP"):
+                number = getattr(signal, name, None)
+                if number is None:
+                    continue
+                try:
+                    previous[number] = signal.signal(number, die)
+                except (OSError, ValueError):
+                    # No such signal here, or not the main thread. The
+                    # modes are still restored by every other way out.
+                    pass
         yield saved is not None
     finally:
-        if saved is not None:
+        for number, handler in previous.items():
             try:
-                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-            except (OSError, termios.error) as exc:
-                # The one failure this client cannot paper over, so it
-                # says what will: an operator reading a staircased
-                # terminal needs the command, not the diagnosis.
-                _note("this terminal could not be put back: %s. `stty sane` "
-                      "will do it." % exc)
+                signal.signal(number, handler)
+            except (OSError, ValueError, TypeError):
+                pass
+        _restore(fd, saved, termios.TCSADRAIN)
+
+
+def _restore(fd: int, saved, when: int) -> None:
+    """Put a terminal's modes back, or say what will. Safe twice."""
+    if saved is None:
+        return
+    try:
+        termios.tcsetattr(fd, when, saved)
+    except (OSError, termios.error) as exc:
+        # The one failure this client cannot paper over, so it says what
+        # will: an operator reading a staircased terminal needs the
+        # command, not the diagnosis.
+        _note("this terminal could not be put back: %s. `stty sane` will "
+              "do it." % exc)
 
 
 @contextlib.contextmanager
@@ -262,11 +369,21 @@ def resize_notice(out_fd: int, enabled: bool):
         return
 
     def note(signum, frame):
-        cols, rows = geometry()
-        _write(out_fd, ("raccoon-shell: this terminal is now %dx%d, and a "
-                        "session's size is set once, at attach. Paste this "
-                        "into the session: stty rows %d cols %d\r\n"
-                        % (cols, rows, rows, cols)).encode("utf-8"))
+        # Measured from the descriptor: see `_resized`. An environment
+        # that exported `COLUMNS` would otherwise have this print the
+        # size the window had *before* the resize, and hand the operator
+        # an `stty` line that makes the far end more wrong, not less.
+        cols, rows = _resized(out_fd)
+        try:
+            _write(out_fd, ("raccoon-shell: this terminal is now %dx%d, and "
+                            "a session's size is set once, at attach. Paste "
+                            "this into the session: stty rows %d cols %d\r\n"
+                            % (cols, rows, rows, cols)).encode("utf-8"))
+        except OSError:
+            # A terminal that has gone between the resize and the note.
+            # Raising here would surface at whatever the relay loop was
+            # doing, which is a worse answer than no note.
+            pass
 
     try:
         previous = signal.signal(signal.SIGWINCH, note)
@@ -338,14 +455,21 @@ def attach(host: str, port: int, password: str,
 
 def _carry(sock: socket.socket) -> int:
     """Raw mode, a resize note, and bytes both ways until one side ends."""
-    try:
-        keys, shown = sys.stdin.fileno(), sys.stdout.fileno()
-    except (AttributeError, OSError, ValueError):
+    keys, shown = _fd(sys.stdin), _fd(sys.stdout)
+    if keys is None or shown is None:
         _note("this client needs a real stdin and stdout to carry a "
               "terminal, and has not got them.")
         return 1
     with raw_terminal(sys.stdin) as raw, resize_notice(shown, raw):
         return _relay(sock, keys, shown)
+
+
+def _fd(stream) -> Optional[int]:
+    """A stream's descriptor, or None when it has not got one."""
+    try:
+        return stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return None
 
 
 def _relay(sock: socket.socket, keys: int, shown: int) -> int:
@@ -358,6 +482,13 @@ def _relay(sock: socket.socket, keys: int, shown: int) -> int:
     exists, so judging the first bytes alone is enough -- and holding
     them rather than reading ahead for a whole line is what keeps a
     terminal that says nothing until it is typed at from looking hung.
+
+    **0 is only ever a clean end of stream.** The far end finishing is a
+    shell that exited, and it is the one thing here that is not a
+    failure; every other way out of this loop says what happened and
+    answers 1. An operator who cannot tell "the shell exited" from "the
+    tunnel went while I was typing" is back to debugging the network,
+    which is the thing this client exists to be better than `socat` at.
     """
     watched = [sock, keys]
     held = b""
@@ -365,20 +496,23 @@ def _relay(sock: socket.socket, keys: int, shown: int) -> int:
     while True:
         try:
             ready = select.select(watched, [], [])[0]
-        except OSError:
-            # A descriptor went out from under the select: the session is
-            # over either way.
-            return 0
+        except OSError as exc:
+            _note("this session's descriptors could not be waited on: %s. "
+                  "Something took one of them away." % exc)
+            return 1
         if sock in ready:
             try:
                 data = sock.recv(_CHUNK)
-            except OSError:
-                data = b""
+            except OSError as exc:
+                _note("the session's stream failed: %s. The shell did not "
+                      "exit; this end stopped being able to read it." % exc)
+                return 1
             if not data:
                 if held:
                     # Short of a refusal and now finished, so it was the
                     # far end's own output after all.
-                    _write(shown, held)
+                    if _show(shown, held) != 0:
+                        return 1
                 return 0
             if not judged:
                 held += data
@@ -387,7 +521,8 @@ def _relay(sock: socket.socket, keys: int, shown: int) -> int:
                 if len(held) < len(REFUSAL) and REFUSAL.startswith(held):
                     continue
                 data, held, judged = held, b"", True
-            _write(shown, data)
+            if _show(shown, data) != 0:
+                return 1
         if keys in ready:
             try:
                 data = os.read(keys, _CHUNK)
@@ -406,8 +541,27 @@ def _relay(sock: socket.socket, keys: int, shown: int) -> int:
                 continue
             try:
                 sock.sendall(data)
-            except OSError:
-                return 0
+            except OSError as exc:
+                _note("what you typed could not be sent: %s. Nothing after "
+                      "it reached the shell." % exc)
+                return 1
+
+
+def _show(fd: int, data: bytes) -> int:
+    """Write what the far end printed to the terminal: 0, or 1 and a line.
+
+    Its own answer rather than the connection's: stdout going away -- a
+    pager closed, a terminal emulator gone, a pipe whose reader left --
+    is not the tunnel ending, and reporting it as one would send an
+    operator looking at the wrong half of the system.
+    """
+    try:
+        _write(fd, data)
+    except OSError as exc:
+        _note("this terminal could not be written to: %s. What the shell "
+              "printed after that is lost." % exc)
+        return 1
+    return 0
 
 
 def _refusal(sock: socket.socket, first: bytes) -> _Refusal:
@@ -442,12 +596,20 @@ def _recv_upto(sock: socket.socket, count: int) -> bytes:
 
 
 def _write(fd: int, data: bytes) -> None:
-    """All of it, however many writes that takes."""
+    """All of it, however many writes that takes.
+
+    `BlockingIOError` is waited out rather than treated as a failure: a
+    stdout somebody left non-blocking, with a full buffer, is a terminal
+    that is behind and not one that has gone, and dropping the bytes
+    would silently lose what the shell printed.
+    """
     while data:
         try:
             data = data[os.write(fd, data):]
         except InterruptedError:
             continue
+        except BlockingIOError:
+            select.select([], [fd], [], 0.1)
 
 
 def _note(message: str) -> None:
@@ -469,7 +631,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="the port the panel shows for this build")
     args = parser.parse_args(argv)
     try:
-        return attach(args.host, args.port, read_password(), geometry())
+        # Measured on the descriptor this client will write the session
+        # to, which is not necessarily the one `shutil` would have asked:
+        # see `geometry`.
+        return attach(args.host, args.port, read_password(),
+                      geometry(_fd(sys.stdout)))
     except KeyboardInterrupt:
         # Only reachable where Ctrl-C is still a signal: at the password
         # prompt, or with stdin redirected. Inside a session it is a byte

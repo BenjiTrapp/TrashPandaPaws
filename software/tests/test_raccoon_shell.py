@@ -41,10 +41,15 @@ usage error -- there is nowhere for a password to go on this client's
 command line, which is the point.
 """
 
+import fcntl
 import io
 import os
+import pathlib
 import select
+import signal
 import socket
+import struct
+import subprocess
 import sys
 import termios
 import threading
@@ -115,6 +120,36 @@ def _typed(conn, pipelined):
 def _refuses(conn, port):
     """One line of plain text, and then the close that follows it."""
     conn.sendall(_WRONG_PASSWORD)
+
+
+def _paired_then_resets(conn, port):
+    """A stream that fails rather than ends, which is a different thing.
+
+    `SO_LINGER` at zero, so the close in `_FakePort._serve` is an RST and
+    not a FIN: the shell did not exit, the connection carrying it broke.
+    """
+    conn.sendall(_SHELL_PROMPT)
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                    struct.pack("ii", 1, 0))
+
+
+class _Environment(object):
+    """Environment variables set for one test and put back after it."""
+
+    def _env(self, name, value):
+        self._remember(name)
+        os.environ[name] = value
+
+    def _unset(self, name):
+        self._remember(name)
+        os.environ.pop(name, None)
+
+    def _remember(self, name):
+        saved = os.environ.get(name)
+        if saved is None:
+            self.addCleanup(os.environ.pop, name, None)
+        else:
+            self.addCleanup(os.environ.__setitem__, name, saved)
 
 
 class _FakePort(object):
@@ -190,7 +225,7 @@ class _FakePort(object):
             self.failure = traceback.format_exc()
 
 
-class ShellClientTests(unittest.TestCase):
+class ShellClientTests(_Environment, unittest.TestCase):
     """One attach each, against a fake port and through two pipes."""
 
     def setUp(self):
@@ -210,21 +245,6 @@ class ShellClientTests(unittest.TestCase):
         saved = getattr(obj, name)
         self.addCleanup(setattr, obj, name, saved)
         setattr(obj, name, value)
-
-    def _env(self, name, value):
-        self._remember(name)
-        os.environ[name] = value
-
-    def _unset(self, name):
-        self._remember(name)
-        os.environ.pop(name, None)
-
-    def _remember(self, name):
-        saved = os.environ.get(name)
-        if saved is None:
-            self.addCleanup(os.environ.pop, name, None)
-        else:
-            self.addCleanup(os.environ.__setitem__, name, saved)
 
     def _port(self, session, **kwargs):
         port = _FakePort(session, **kwargs)
@@ -364,7 +384,11 @@ class ShellClientTests(unittest.TestCase):
         self.assertEqual(port.received, b"whoami\n")
         self.assertEqual(self._shown(), _SHELL_PROMPT + b"WHOAMI\n")
 
-    def test_it_restores_the_terminal_when_the_stream_ends(self):
+    def test_it_ends_cleanly_when_the_stream_ends(self):
+        """A shell that exited is exit 0, in silence, and a pipe is left
+        alone. That it *restores a terminal* is `RawTerminalTests`: there
+        is none here to restore.
+        """
         port = self._port(_paired_then_closed)
         self._terminal()
         self._env("RACCOON_SHELL_PASSWORD", "attach")
@@ -374,14 +398,33 @@ class ShellClientTests(unittest.TestCase):
         self.assertEqual(self._attach(port), 0)
         port.stop()
         self.assertEqual(self._shown(), _SHELL_PROMPT)
+        # Nothing said: a far end that finished is the one ending here
+        # that is not a failure, and the only one that is silent.
         self.assertEqual(self.errors.getvalue(), "")
 
         # stdin here is a pipe, so there was no terminal to put into raw
         # mode and none to put back, and `raw_terminal` says so rather
         # than reaching for `termios` on a descriptor that has no modes.
-        # The restoring itself is `RawTerminalTests`.
         with raccoon_shell.raw_terminal(sys.stdin) as raw:
             self.assertFalse(raw)
+
+    def test_a_stream_that_fails_is_not_a_shell_that_exited(self):
+        """An error mid-session is said, and the exit code is not zero."""
+        port = self._port(_paired_then_resets)
+        self._terminal()
+        self._env("RACCOON_SHELL_PASSWORD", "attach")
+        self._env("COLUMNS", "80")
+        self._env("LINES", "24")
+
+        self.assertEqual(self._attach(port), 1)
+        port.stop()
+
+        # Which half of the system broke, in the words an operator needs:
+        # a client that answered 0 in silence here would have them
+        # debugging the shell they were typing at instead of the tunnel.
+        said = self.errors.getvalue()
+        self.assertIn("the session's stream failed", said)
+        self.assertIn("The shell did not exit", said)
 
     def test_a_refusal_line_is_shown_and_the_exit_code_is_nonzero(self):
         port = self._port(_refuses)
@@ -471,6 +514,128 @@ class RawTerminalTests(unittest.TestCase):
             with raccoon_shell.raw_terminal(self.terminal):
                 raise RuntimeError("the stream died mid-session")
         self.assertEqual(_modes(self.fd), self.cooked)
+
+    def test_the_previous_signal_handlers_are_put_back(self):
+        before = (signal.getsignal(signal.SIGTERM),
+                  signal.getsignal(signal.SIGHUP))
+        with raccoon_shell.raw_terminal(self.terminal):
+            # Taken over while the terminal is raw, because their default
+            # action would end this process without unwinding: see
+            # `test_a_terminating_signal_restores_the_terminal_first`.
+            self.assertNotIn(signal.getsignal(signal.SIGTERM),
+                             (signal.SIG_DFL, before[0]))
+            self.assertNotIn(signal.getsignal(signal.SIGHUP),
+                             (signal.SIG_DFL, before[1]))
+        self.assertEqual((signal.getsignal(signal.SIGTERM),
+                          signal.getsignal(signal.SIGHUP)), before)
+
+    def test_a_terminating_signal_restores_the_terminal_first(self):
+        """`SIGTERM` is the one way out a `finally` cannot cover.
+
+        In a child process, because the handler's last act is to die of
+        the signal it was given -- which is the other half of what is
+        asserted here, since an exit status that lied about how the
+        process ended would break whatever supervises it. The pty is
+        shared with the child, so its modes are read back here.
+        """
+        child = subprocess.Popen(
+            [sys.executable, "-c", _RAW_UNTIL_KILLED, str(self.fd)],
+            pass_fds=(self.fd,), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(child.kill)
+        self.addCleanup(child.stdout.close)
+        self.addCleanup(child.stderr.close)
+        ready = child.stdout.readline()
+        if ready != b"raw\n":
+            # Killed before its stderr is read, and read only on this
+            # path: `child.stderr.read()` waits for the child to close
+            # that stream, so passing it as an assertion message -- which
+            # unittest evaluates whether or not the assertion fails --
+            # would wait out the sleep below and let the child's own
+            # `finally` restore the terminal before it was looked at.
+            child.kill()
+            self.fail("the child did not reach raw mode: %r"
+                      % child.stderr.read())
+        self.assertEqual(_modes(self.fd)[3] & self._COOKED, 0)
+
+        child.send_signal(signal.SIGTERM)
+        self.assertEqual(child.wait(timeout=20), -signal.SIGTERM)
+        self.assertEqual(_modes(self.fd), self.cooked)
+
+
+# The child of `test_a_terminating_signal_restores_the_terminal_first`:
+# hold a pty in raw mode, say so, and wait to be killed.
+_RAW_UNTIL_KILLED = """
+import os, sys, time
+sys.path.insert(0, %r)
+from tools import raccoon_shell
+terminal = os.fdopen(int(sys.argv[1]), "rb", 0)
+with raccoon_shell.raw_terminal(terminal) as raw:
+    assert raw, "the descriptor handed over was not a terminal"
+    sys.stdout.write("raw\\n")
+    sys.stdout.flush()
+    time.sleep(60)
+""" % str(pathlib.Path(__file__).resolve().parents[2])
+
+
+class ResizeNoticeTests(_Environment, unittest.TestCase):
+    """The resize note: the one thing a `SIGWINCH` does on this wire.
+
+    A pty whose window size this test sets, and a real `SIGWINCH` sent to
+    this process, so the whole handler runs. No subprocess needed, and no
+    attach: what is being checked is the numbers in the note.
+    """
+
+    def setUp(self):
+        self.master, slave = os.openpty()
+        self.addCleanup(os.close, self.master)
+        self.terminal = slave
+        self.addCleanup(os.close, slave)
+        self._resize(80, 24)
+
+    def _resize(self, cols, rows):
+        fcntl.ioctl(self.terminal, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, cols, 0, 0))
+
+    def _said(self, timeout=5.0):
+        chunks = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not select.select([self.master], [], [], 0.05)[0]:
+                if chunks:
+                    break
+                continue
+            chunks.append(os.read(self.master, 65536))
+        return b"".join(chunks)
+
+    def test_the_note_is_measured_from_the_terminal_not_the_environment(self):
+        # Exported and then stale, which is what makes this worth a test:
+        # `COLUMNS` and `LINES` do not change when the window does, so a
+        # note built from them would hand the operator an `stty` line for
+        # the size the session already has -- or for the size it had
+        # before the resize, which makes the far end more wrong, not less.
+        self._env("COLUMNS", "80")
+        self._env("LINES", "24")
+        before = signal.getsignal(signal.SIGWINCH)
+
+        with raccoon_shell.resize_notice(self.terminal, True):
+            self._resize(100, 30)
+            os.kill(os.getpid(), signal.SIGWINCH)
+            said = self._said()
+
+        self.assertIn(b"this terminal is now 100x30", said)
+        self.assertIn(b"stty rows 30 cols 100", said)
+        self.assertNotIn(b"80x24", said)
+        self.assertNotIn(b"stty rows 24 cols 80", said)
+        # And the handler this test displaced is back.
+        self.assertEqual(signal.getsignal(signal.SIGWINCH), before)
+
+    def test_nothing_is_installed_without_a_terminal_to_hear(self):
+        before = signal.getsignal(signal.SIGWINCH)
+        with raccoon_shell.resize_notice(self.terminal, False):
+            self.assertEqual(signal.getsignal(signal.SIGWINCH), before)
+            os.kill(os.getpid(), signal.SIGWINCH)
+        self.assertEqual(self._said(timeout=0.5), b"")
 
 
 if __name__ == "__main__":
