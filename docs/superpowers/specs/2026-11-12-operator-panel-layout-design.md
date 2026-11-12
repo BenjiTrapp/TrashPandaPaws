@@ -271,7 +271,7 @@ is the approver's call below rather than an assumption in this document.
 
 ## Known issue this does not fix
 
-`var(--dim)` and `var(--bg3)` are undefined in `:root` and used throughout
+`var(--dim)`, `var(--bg3)` and `var(--bg2)` are undefined in `:root` and used throughout
 the operator page. Every declaration that names them is invalid, so
 secondary text and hover states across the eight panels are not rendering as
 intended. The tunnel card stops using them; the rest of the page still does.
