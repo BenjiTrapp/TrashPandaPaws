@@ -661,28 +661,31 @@ class TestTheLoopIsWired(unittest.TestCase):
         self.assertEqual(ran, [{"cmd": "shell id"}])
 
     def test_a_stale_dns_answer_does_not_send_a_rescue_next_cycle(self):
-        # Review Focus 5, and the second attempt at it. The first version
-        # could not fail, because the latch masked the stale flag. This one
-        # isolates it: cycle 1 DELIVERS tasking, which re-arms the latch
-        # and sets FLAG_DNS_ANSWERED; cycle 2 gets SERVFAIL and delivers
-        # nothing. The only thing that could permit a rescue in cycle 2 is
-        # cycle 1's flag surviving, so a no-op `_start_cycle` sends one and
-        # a correct one sends none.
-        beacon = _rescue_beacon()
+        # Review Focus 5, third attempt. The first could not fail, the
+        # second was invalidated when "stuck" stopped meaning "nothing came
+        # back". It isolates the accumulator like this: cycle 1 has an
+        # UPSTREAM leg delivering, so no rescue is due and the DNS probe
+        # never runs; cycle 2 loses that leg and the resolver starts
+        # failing. The only thing that could permit a rescue in cycle 2 is
+        # a flag left over from an earlier cycle, so a no-op `_start_cycle`
+        # sends one into a dead resolver and a correct one sends none.
+        beacon = _a_beacon(
+            https={"enabled": True},
+            dns={"enabled": True, "domain": "rescue.example",
+                 "resolver": "127.0.0.1"})
         cycle = {"n": 0}
         sent = []
-        task = beacon._encrypt({"cmd": "shell id"})
+
+        def https():
+            # Delivers in cycle 1, gone from cycle 2 on.
+            return {"cmd": "noop"} if cycle["n"] == 0 else None
 
         def query(name, qtype, server, timeout=10, status=None):
             if "." + dns_rescue.MARKER + "." in name:
                 sent.append(name)
                 return []
-            if cycle["n"] == 0:
-                if status is not None:
-                    status["rcode"] = 0
-                return [task]
             if status is not None:
-                status["rcode"] = 2            # SERVFAIL from now on
+                status["rcode"] = 2            # SERVFAIL whenever asked
             return []
 
         def stop_after(*a, **kw):
@@ -690,8 +693,13 @@ class TestTheLoopIsWired(unittest.TestCase):
             if cycle["n"] >= 2:
                 beacon._running = False
 
+        # Pre-set the flag the way a cycle with a live resolver would, so
+        # the only question this test asks is whether it survives.
+        beacon._rescue_flags = dns_rescue.FLAG_DNS_ANSWERED
+        beacon._registered = True
         beacon._running = True
-        with unittest.mock.patch.object(beacon, "_jittered_sleep",
+        with unittest.mock.patch.object(beacon, "_beacon_https", https), \
+             unittest.mock.patch.object(beacon, "_jittered_sleep",
                                         stop_after), \
              unittest.mock.patch.object(beacon, "_backoff_sleep",
                                         stop_after), \
@@ -703,7 +711,7 @@ class TestTheLoopIsWired(unittest.TestCase):
 
         self.assertEqual(sent, [],
                          "a rescue went into a resolver that said SERVFAIL, "
-                         "which can only happen if the previous cycle's "
+                         "which can only happen if a previous cycle's "
                          "FLAG_DNS_ANSWERED survived")
 
 
@@ -1611,6 +1619,76 @@ class TestOnlyAnUpstreamLegReArmsTheLatch(unittest.TestCase):
         self.assertEqual(len(rescues), 2,
                          "a recovered and re-broken upstream leg must earn a "
                          "second rescue; got %r" % (rescues,))
+
+
+class TestBeingStuckIsNotTheSameAsGettingNothing(unittest.TestCase):
+    """The finding an end-to-end run produced and every stub had hidden.
+
+    `api_dns_tasking` answers with an encrypted body **always** -- its own
+    docstring says so, deliberately, "so it is not an existence oracle
+    even for a token holder". An empty queue therefore decrypts to `{}`,
+    `_beacon_dns` returns it, and `tasking` is not None.
+
+    The trigger used to live inside `if tasking is None:`. So a beacon
+    whose HTTPS, SMB and QUIC legs were all dead but whose DNS listener
+    was reachable looked fine to itself for ever, and the rescue never
+    fired -- in exactly the configuration it exists for. Being stuck is
+    "no upstream leg delivered", not "nothing came back".
+    """
+
+    def _run(self, beacon, cycles, dns_payload):
+        sent = []
+        count = {"n": 0}
+
+        def query(name, qtype, server, timeout=10, status=None):
+            if status is not None:
+                status["rcode"] = 0
+            if "." + dns_rescue.MARKER + "." in name:
+                sent.append(name)
+                return []
+            return [dns_payload]
+
+        def stop(*a, **kw):
+            count["n"] += 1
+            if count["n"] >= cycles:
+                beacon._running = False
+
+        beacon._registered = True
+        beacon._running = True
+        with unittest.mock.patch.object(beacon, "_jittered_sleep", stop), \
+             unittest.mock.patch.object(beacon, "_backoff_sleep", stop), \
+             unittest.mock.patch.object(beacon, "_process_tasking_batch",
+                                        lambda *_: None), \
+             unittest.mock.patch.object(
+                 sys.modules["software.c2.beacon"], "_dns_query", query):
+            beacon._beacon_loop()
+        return sent
+
+    def test_an_empty_tasking_body_over_dns_still_counts_as_stuck(self):
+        beacon = _rescue_beacon()
+        empty = beacon._encrypt({})
+        sent = self._run(beacon, 4, empty)
+        self.assertEqual(len(sent), 1,
+                         "a beacon with no upstream and a reachable DNS "
+                         "listener never reported being stuck")
+
+    def test_a_real_task_over_dns_still_counts_as_stuck(self):
+        # Receiving work does not mean the way out is open: results of
+        # that work cannot be reported either.
+        beacon = _rescue_beacon()
+        task = beacon._encrypt({"cmd": "shell id"})
+        sent = self._run(beacon, 4, task)
+        self.assertEqual(len(sent), 1)
+
+    def test_an_upstream_leg_delivering_still_means_not_stuck(self):
+        beacon = _a_beacon(
+            https={"enabled": True},
+            dns={"enabled": True, "domain": "rescue.example",
+                 "resolver": "127.0.0.1"})
+        with unittest.mock.patch.object(beacon, "_beacon_https",
+                                        lambda: {"cmd": "noop"}):
+            sent = self._run(beacon, 4, beacon._encrypt({}))
+        self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":

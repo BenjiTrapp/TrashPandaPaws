@@ -7639,15 +7639,24 @@ class Beacon:
                 if tasking and tasking.get("success"):
                     self._registered = True
 
-            if tasking is None:
-                # Nothing got through. If the resolver has shown it
-                # answers, say why -- once, and in the same exchange that
-                # collects whatever the operator queued in reply. It is
-                # resolved here, before the dispatch below, so that an
-                # answer to the rescue runs like any other tasking: an
-                # assignment inside the failure arm would be collected and
-                # then dropped, because the arm that dispatches is an elif.
-                tasking = self._maybe_rescue()
+            # Stuck means no *upstream* leg delivered -- not that nothing
+            # came back. The team server's DNS tasking route answers with
+            # an encrypted body even when the queue is empty, on purpose,
+            # so that it is not an existence oracle; that body decrypts to
+            # {} and `tasking` is therefore rarely None. Keying the trigger
+            # on `tasking is None` meant a beacon with three dead upstream
+            # legs and a reachable DNS listener looked fine to itself for
+            # ever, and the rescue never fired in the one configuration it
+            # exists for. Receiving work over DNS is not getting out: the
+            # results of that work cannot be reported either.
+            if delivered_by not in _RESCUE_UPSTREAM:
+                # Resolved before the dispatch below, so an answer to the
+                # rescue runs like any other tasking: assigning it inside
+                # the failure arm would collect the operator's reply and
+                # then drop it, because the arm that dispatches is an elif.
+                rescued = self._maybe_rescue()
+                if rescued and not tasking:
+                    tasking = rescued
 
             if tasking is None:
                 self._consecutive_failures += 1
