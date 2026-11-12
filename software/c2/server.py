@@ -3481,6 +3481,50 @@ header .info{font-size:11px;color:var(--text2)}
 .loot-meta{font-size:10px;color:var(--text2)}
 .loot-dl{color:var(--green);text-decoration:none;font-size:16px;padding:4px}
 .loot-dl:hover{color:var(--text)}
+.loot-panel.panel-wide{max-width:900px}
+.pcard{
+  border:1px solid var(--border);background:var(--surface);border-radius:6px;
+  padding:11px;margin-bottom:8px;
+}
+.pcard-head{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding-bottom:8px;margin-bottom:9px;border-bottom:1px solid var(--border);
+  font-size:12px;color:var(--text2);
+}
+.pcard-head b{font-family:var(--mono);color:var(--text)}
+.pcard-head button{margin-left:auto}
+.pcard-pill{
+  display:inline-block;padding:1px 8px;border-radius:9px;font-size:10px;
+  border:1px solid var(--border);background:var(--surface2);color:var(--text2);
+}
+.pcard-pill-ok{border-color:var(--green-dim);color:var(--green)}
+.pcard-two{display:grid;grid-template-columns:1fr 1.15fr;gap:14px}
+.pcard-two>div{min-width:0}
+@media (max-width:760px){.pcard-two{grid-template-columns:1fr}}
+.pcard-col-h{
+  margin:0 0 6px;font-size:10px;letter-spacing:1px;text-transform:uppercase;
+  color:var(--text2);
+}
+.pcard-kv{
+  display:grid;grid-template-columns:52px 1fr;gap:2px 10px;font-size:11px;
+  font-family:var(--mono);
+}
+.pcard-kv>:nth-child(odd){color:var(--text2);text-align:right}
+.pcard-kv>:nth-child(even){color:var(--text);word-break:break-all}
+.pcard-port{font-family:var(--mono);font-size:22px;color:var(--green)}
+.pcard-port small{display:block;font-size:11px;color:var(--text2)}
+.pcard-warn{
+  margin:8px 0;padding:6px 9px;font-size:11px;color:var(--yellow);
+  border-left:3px solid var(--yellow);background:rgba(255,204,0,0.07);
+}
+.pcard-hint{margin:8px 0 3px;font-size:11px;color:var(--text2)}
+.pcard-cmd{
+  display:block;margin:0;padding:6px 8px;border-radius:4px;
+  background:rgba(0,0,0,0.4);border:1px solid var(--border);
+  font-family:var(--mono);font-size:11px;color:var(--text);
+  overflow-x:auto;white-space:pre;
+}
+.pcard-cmd-alt{color:var(--text2)}
 .fb-upload-zone{
   border:2px dashed var(--border);border-radius:6px;padding:12px;margin:6px 8px;
   text-align:center;color:var(--text2);font-size:11px;cursor:pointer;

@@ -1694,6 +1694,88 @@ def _js_function(page, name):
     return page[start.start():end.start() if end else len(page)]
 
 
+class TestTheCardVocabulary(unittest.TestCase):
+    """The `.pcard-*` classes and the wide panel, read out of the served CSS.
+
+    **What this cannot hold:** there is no JavaScript runner and no browser
+    in this repository, so these assertions read CSS text. They prove a
+    rule exists, names the right properties and names no variable that does
+    not resolve. They cannot prove the card renders without overflow at
+    1440 px, that the one-column fallback triggers at the width the
+    media query says, or that a long command scrolls inside its box;
+    only looking at the panel can.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.page = _served_page()
+        cls.style = cls.page[cls.page.index("<style>"):
+                             cls.page.index("</style>")]
+
+    def _rule(self, selector):
+        """The body of the first rule whose selector list is exactly this."""
+        match = re.search(
+            r"(?:^|\})\s*%s\s*\{([^}]*)\}" % re.escape(selector),
+            self.style)
+        self.assertIsNotNone(match, "no rule for %s" % selector)
+        return match.group(1)
+
+    def test_the_wide_panel_is_a_modifier_and_the_narrow_dialogs_keep_their_width(self):
+        self.assertIn("max-width:600px", re.sub(r"\s+", "", self._rule(".loot-panel")))
+        wide = re.sub(r"\s+", "", self._rule(".loot-panel.panel-wide"))
+        self.assertIn("max-width:900px", wide)
+        self.assertNotIn("max-width:600px", wide)
+
+    def test_the_wide_panel_keeps_the_panel_s_own_scrolling(self):
+        wide = self._rule(".loot-panel.panel-wide")
+        self.assertNotIn("max-height", wide)
+        self.assertNotIn("overflow", wide)
+        base = self._rule(".loot-panel")
+        self.assertIn("max-height:70vh", base)
+        self.assertIn("overflow-y:auto", base)
+
+    def test_the_card_vocabulary_is_defined(self):
+        for selector in (".pcard", ".pcard-head", ".pcard-pill",
+                         ".pcard-pill-ok", ".pcard-two", ".pcard-col-h",
+                         ".pcard-kv", ".pcard-port", ".pcard-warn",
+                         ".pcard-cmd", ".pcard-cmd-alt", ".pcard-hint"):
+            with self.subTest(selector=selector):
+                self._rule(selector)
+
+    def test_the_card_uses_no_undefined_variable(self):
+        """Neither `--dim` nor `--bg3` (nor `--bg2`) is defined in `:root`.
+
+        A declaration naming one is invalid and silently dropped, which is
+        why the old panel's "dim" text renders at full brightness. The
+        window runs from the first `.pcard` rule to the end of the last.
+        """
+        first = self.style.index(".pcard")
+        last = self.style.rindex(".pcard")
+        window = self.style[first:self.style.index("}", last) + 1]
+        for name in ("--dim", "--bg3", "--bg2"):
+            with self.subTest(variable=name):
+                self.assertNotIn(name, window)
+        root = self._rule(":root")
+        for used in set(re.findall(r"var\((--[\w-]+)", window)):
+            with self.subTest(resolves=used):
+                self.assertIn(used + ":", root)
+
+    def test_the_two_column_body_collapses_rather_than_clipping(self):
+        two = re.sub(r"\s+", "", self._rule(".pcard-two"))
+        self.assertIn("grid-template-columns:1fr1.15fr", two)
+        media = re.search(
+            r"@media[^{]*\{[^{}]*\.pcard-two\s*\{([^}]*)\}", self.style)
+        self.assertIsNotNone(media, "no media query collapses .pcard-two")
+        self.assertIn("grid-template-columns:1fr",
+                      re.sub(r"\s+", "", media.group(1)))
+        self.assertNotIn("1.15fr", media.group(1))
+
+    def test_the_warning_band_uses_the_panel_s_yellow(self):
+        warn = self._rule(".pcard-warn")
+        self.assertIn("--yellow", warn)
+        self.assertNotIn("--orange", warn)
+
+
 class TestTheBeaconGenTunnelForm(unittest.TestCase):
     """The Beacon Gen form asking for a tunnel, on both delivery paths.
 
