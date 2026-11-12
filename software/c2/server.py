@@ -7394,10 +7394,14 @@ async function drawTunnel(panel){
     return '<div class="pcard-port">team 127.0.0.1:' + port
       + '<small>' + esc(String(shell.sessions)) + ' live session(s)'
       + (shell.max_sessions ? ' / ' + esc(String(shell.max_sessions)) : '')
+      + '</small>'
+      // The credential on the line below the port, which is what
+      // `.pcard-port` was built for. It is the shell port's own and not
+      // the SOCKS one; the label says so, because a reader who pasted the
+      // wrong one would be refused with nothing to say why.
+      + '<small>password (this port only &mdash; not the SOCKS5 password; '
+      + 'enter it at the password prompt): ' + esc(row.shell_password)
       + '</small></div>'
-      + cmd('Shell password (this port only &mdash; not the SOCKS5 password; '
-            + 'enter it at the password prompt):',
-            esc(row.shell_password))
       + '<div class="pcard-warn">'
       + 'This is a root shell on the implant host. Forwarding the port to '
       + 'your workstation extends its reach to whatever can reach that '
@@ -7542,7 +7546,8 @@ async function drawTunnel(panel){
       + kv('out', esc(bytes(row.bytes_out)))
       + kv('fleet', row.linked ? 'agent ' + esc(row.agent) : 'unlinked')
       + '</div>'
-      + '<div class="pcard-col-h">socks</div>'
+      + '<div class="pcard-col-h" style="opacity:0.65;font-size:9px;'
+      + 'margin:10px 0 4px 2px">socks</div>'
       + '<div class="pcard-port">127.0.0.1:' + esc(String(row.port))
       + '<small>' + esc(String(row.sessions)) + ' live session(s)'
       + (socks ? ' / ' + esc(String(socks.max_sessions)) : '') + '</small></div>'

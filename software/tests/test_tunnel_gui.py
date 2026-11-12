@@ -1756,9 +1756,10 @@ class TestTheTunnelPanel(unittest.TestCase):
                          "a command box is built outside the helper "
                          "(the class and its -alt variant)")
         calls = [m.start() for m in re.finditer(r"\bcmd\(", half)]
-        self.assertEqual(len(calls), 3 + 1,  # the definition and three uses
+        self.assertEqual(len(calls), 3,  # three call sites; the arrow
+                         # definition `cmd = (` does not match \bcmd\(
                          "not three commands")
-        forward, attach, fallback = calls[1:]
+        forward, attach, fallback = calls
         spans = [(forward, attach), (attach, fallback),
                  (fallback, half.index("};", fallback))]
         for (start, end), hint, command in zip(
