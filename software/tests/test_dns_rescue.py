@@ -1331,9 +1331,14 @@ class _StuckC2:
     async def get_agent(self, agent_id):
         return self._agents.get(agent_id)
 
-    async def queue_task(self, agent_id, command, lane="agent"):
-        self.queued.append((agent_id, command, lane))
-        return {"id": "t1"}
+    async def queue_task(self, agent_id, cmd, args="", data="",
+                         timeout=300, lane="agent"):
+        # The real signature. The first version of the egress tool passed
+        # the whole attempt as `cmd`, which matches no verb the implant
+        # dispatches, and a stub taking `command` hid that completely.
+        self.queued.append({"agent": agent_id, "cmd": cmd, "args": args,
+                            "data": data, "lane": lane})
+        return "t1"
 
 
 def _stuck_agent(**over):
@@ -1391,24 +1396,77 @@ class TestTheAgentReadsTheDiagnosis(unittest.TestCase):
         # One candidate per call. A sweep of twelve is the loud thing the
         # design refused when it ruled out approach C.
         c2 = _StuckC2({"b1": _stuck_agent()})
-        out = self._tool(c2, "try_egress")(beacon_id="b1",
-                                           attempt="proxy http://10.0.0.9:3128")
+        out = self._tool(c2, "try_egress")(beacon_id="b1", attempt="sleep",
+                                           value="600")
         self.assertEqual(len(c2.queued), 1)
-        self.assertEqual(c2.queued[0][0], "b1")
-        self.assertIn("10.0.0.9", c2.queued[0][1])
+        self.assertEqual(c2.queued[0]["agent"], "b1")
         self.assertNotIn("error", out)
+
+    def test_every_attempt_names_a_verb_the_implant_dispatches(self):
+        # The first version of this tool emitted "proxy ..." and
+        # "transport ...", neither of which the implant has. It queued
+        # work that could never run, and nothing failed.
+        import re
+
+        from software.agent.tools import egress
+
+        src = pathlib_Path("software/c2/beacon.py").read_text()
+        dispatched = set(re.findall(r'elif cmd == "([a-z_0-9]+)"', src))
+        dispatched.update(re.findall(r'if cmd == "([a-z_0-9]+)"', src))
+        for verb in egress.ATTEMPT_VERBS.values():
+            with self.subTest(verb=verb):
+                self.assertIn(verb, dispatched,
+                              "try_egress can emit cmd %r, which the beacon "
+                              "does not dispatch" % verb)
+
+    def test_sleep_goes_out_as_the_implants_own_verb(self):
+        c2 = _StuckC2({"b1": _stuck_agent()})
+        self._tool(c2, "try_egress")(beacon_id="b1", attempt="sleep",
+                                     value="600")
+        self.assertEqual(c2.queued[0]["cmd"], "sleep")
+        self.assertEqual(c2.queued[0]["args"], "600")
+
+    def test_a_profile_swap_goes_out_as_reconfig(self):
+        c2 = _StuckC2({"b1": _stuck_agent()})
+        self._tool(c2, "try_egress")(beacon_id="b1", attempt="profile",
+                                     value='{"c2_profile": {"useragent": "x"}}')
+        self.assertEqual(c2.queued[0]["cmd"], "reconfig")
+        self.assertIn("useragent", c2.queued[0]["data"])
+
+    def test_an_unknown_attempt_is_refused_with_the_list(self):
+        c2 = _StuckC2({"b1": _stuck_agent()})
+        out = self._tool(c2, "try_egress")(beacon_id="b1", attempt="proxy",
+                                           value="http://x")
+        self.assertIn("error", out)
+        self.assertEqual(c2.queued, [])
+
+    def test_a_profile_value_that_is_not_json_is_refused(self):
+        c2 = _StuckC2({"b1": _stuck_agent()})
+        out = self._tool(c2, "try_egress")(beacon_id="b1", attempt="profile",
+                                           value="not json")
+        self.assertIn("error", out)
+        self.assertEqual(c2.queued, [])
+
+    def test_a_sleep_value_that_is_not_a_number_is_refused(self):
+        c2 = _StuckC2({"b1": _stuck_agent()})
+        out = self._tool(c2, "try_egress")(beacon_id="b1", attempt="sleep",
+                                           value="600; rm -rf /")
+        self.assertIn("error", out)
+        self.assertEqual(c2.queued, [])
 
     def test_it_refuses_a_beacon_that_is_not_stuck(self):
         # Changing the transport of a beacon that is fine is a way to lose
         # a working channel.
         c2 = _StuckC2({"b1": _stuck_agent(stuck=None)})
-        out = self._tool(c2, "try_egress")(beacon_id="b1", attempt="proxy x")
+        out = self._tool(c2, "try_egress")(beacon_id="b1", attempt="sleep",
+                                           value="600")
         self.assertIn("error", out)
         self.assertEqual(c2.queued, [])
 
     def test_it_refuses_an_unknown_beacon(self):
         c2 = _StuckC2({"b1": _stuck_agent()})
-        out = self._tool(c2, "try_egress")(beacon_id="nope", attempt="proxy x")
+        out = self._tool(c2, "try_egress")(beacon_id="nope", attempt="sleep",
+                                           value="600")
         self.assertIn("error", out)
         self.assertEqual(c2.queued, [])
 
@@ -1446,6 +1504,113 @@ class TestTheOrchestratorOffersThem(unittest.TestCase):
         self.assertIn("c2=", call,
                       "orchestrator_tools is called without a c2, so the "
                       "egress tools are filtered out and never offered")
+
+
+class TestOnlyAnUpstreamLegReArmsTheLatch(unittest.TestCase):
+    """The final review's finding, and the sharpest one on this branch.
+
+    Excluding the rescue's own reply was not enough. The agent answers a
+    rescue by queueing one attempt; that attempt is DELIVERED OVER DNS,
+    which is a leg returning tasking, which re-armed the latch -- so the
+    next dead cycle sent another rescue. Measured before the fix: six
+    queries in twelve cycles, one every other cycle. That is a periodic
+    pattern, which is precisely what the anti-goal forbids, because
+    detection keys on rate and volume.
+
+    Receiving over DNS proves nothing about egress: that channel is
+    receive-only. Only HTTPS, SMB or QUIC delivering proves the way out is
+    open again.
+    """
+
+    def _run(self, beacon, cycles, answer_each_rescue=True):
+        cycle = {"n": 0}
+        rescues = []
+        pending = {"task": False}
+        task = beacon._encrypt({"cmd": "proxy http://10.0.0.9:3128"})
+
+        def query(name, qtype, server, timeout=10, status=None):
+            if status is not None:
+                status["rcode"] = 0
+            if "." + dns_rescue.MARKER + "." in name:
+                rescues.append(cycle["n"])
+                if answer_each_rescue:
+                    pending["task"] = True
+                return []
+            if pending["task"]:
+                pending["task"] = False
+                return [task]
+            return []
+
+        def stop_after(*a, **kw):
+            cycle["n"] += 1
+            if cycle["n"] >= cycles:
+                beacon._running = False
+
+        beacon._running = True
+        with unittest.mock.patch.object(beacon, "_jittered_sleep",
+                                        stop_after), \
+             unittest.mock.patch.object(beacon, "_backoff_sleep",
+                                        stop_after), \
+             unittest.mock.patch.object(beacon, "_process_tasking_batch",
+                                        lambda *_: None), \
+             unittest.mock.patch.object(
+                 sys.modules["software.c2.beacon"], "_dns_query", query):
+            beacon._beacon_loop()
+        return rescues
+
+    def test_an_attempt_delivered_over_dns_does_not_re_arm_the_latch(self):
+        beacon = _rescue_beacon()
+        rescues = self._run(beacon, 12)
+        self.assertEqual(len(rescues), 1,
+                         "the rescue became periodic: %r" % (rescues,))
+
+    def test_an_upstream_leg_delivering_does_re_arm_it(self):
+        # The latch must not become permanent. A beacon whose HTTPS comes
+        # back and then dies again has a new story to tell.
+        beacon = _a_beacon(
+            https={"enabled": True},
+            dns={"enabled": True, "domain": "rescue.example",
+                 "resolver": "127.0.0.1"})
+        state = {"https_up": False}
+
+        def https():
+            return {"cmd": "noop"} if state["https_up"] else None
+
+        cycle = {"n": 0}
+        rescues = []
+
+        def query(name, qtype, server, timeout=10, status=None):
+            if status is not None:
+                status["rcode"] = 0
+            if "." + dns_rescue.MARKER + "." in name:
+                rescues.append(cycle["n"])
+            return []
+
+        def stop_after(*a, **kw):
+            cycle["n"] += 1
+            # Dead, dead, HTTPS back, dead, dead.
+            state["https_up"] = cycle["n"] == 2
+            if cycle["n"] >= 5:
+                beacon._running = False
+
+        # _beacon_loop registers first when https is enabled, and that
+        # loop sleeps through _backoff_sleep -- which this test patches as
+        # its cycle counter. Start registered so the counter means cycles.
+        beacon._registered = True
+        beacon._running = True
+        with unittest.mock.patch.object(beacon, "_beacon_https", https), \
+             unittest.mock.patch.object(beacon, "_jittered_sleep",
+                                        stop_after), \
+             unittest.mock.patch.object(beacon, "_backoff_sleep",
+                                        stop_after), \
+             unittest.mock.patch.object(beacon, "_process_tasking_batch",
+                                        lambda *_: None), \
+             unittest.mock.patch.object(
+                 sys.modules["software.c2.beacon"], "_dns_query", query):
+            beacon._beacon_loop()
+        self.assertEqual(len(rescues), 2,
+                         "a recovered and re-broken upstream leg must earn a "
+                         "second rescue; got %r" % (rescues,))
 
 
 if __name__ == "__main__":
