@@ -3499,6 +3499,7 @@ header .info{font-size:11px;color:var(--text2)}
 }
 .pcard-pill-ok{border-color:var(--green-dim);color:var(--green)}
 .pcard-two{display:grid;grid-template-columns:1fr 1.15fr;gap:14px}
+/* The columns must be `div` elements -- this is what gives each its width. */
 .pcard-two>div{min-width:0}
 @media (max-width:760px){.pcard-two{grid-template-columns:1fr}}
 .pcard-col-h{
@@ -3509,6 +3510,9 @@ header .info{font-size:11px;color:var(--text2)}
   display:grid;grid-template-columns:52px 1fr;gap:2px 10px;font-size:11px;
   font-family:var(--mono);
 }
+/* Children must alternate label then value: these two rules style the odd
+   children as labels and the even as values, so `drawTunnel` must emit them
+   in that order. */
 .pcard-kv>:nth-child(odd){color:var(--text2);text-align:right}
 .pcard-kv>:nth-child(even){color:var(--text);word-break:break-all}
 .pcard-port{font-family:var(--mono);font-size:22px;color:var(--green)}

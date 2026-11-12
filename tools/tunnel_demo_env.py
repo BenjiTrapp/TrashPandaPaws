@@ -22,8 +22,8 @@ authenticates with.
 
 The default token is a well-known constant, `demo-operator-token`, the
 same `demo_env.py` ships. That is acceptable precisely because the
-operator socket is loopback-only: `create_app`'s socket policy binds the
-GUI to 127.0.0.1 and a token readable in this file guards nothing an
+operator socket is loopback-only: `make_server` below binds the GUI to
+127.0.0.1 and a token readable in this file guards nothing an
 attacker on the host could not already reach. A deployment that is not a
 local capture rig passes its own `--token`.
 

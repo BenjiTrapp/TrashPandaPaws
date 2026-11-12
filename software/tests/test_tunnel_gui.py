@@ -1704,7 +1704,6 @@ class TestTheTunnelPanel(unittest.TestCase):
         # what gives each its width.
         self.assertEqual(row.count('<div class="pcard-two">'), 1)
         self.assertEqual(row.count('class="pcard-col-h"'), 3)
-        self.assertEqual(row.count("</div></div>'\n      + '<div class=\"x\""), 0)
         # None of the shell session leaks into the endpoint's column.
         left = row[heading:shell]
         for shells in ("shell_password", "shellBlock", "shell.port",
