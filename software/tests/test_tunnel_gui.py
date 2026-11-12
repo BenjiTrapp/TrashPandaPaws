@@ -1472,6 +1472,18 @@ class TestTheTunnelPanel(unittest.TestCase):
         cls.page = _served_page()
         start = cls.page.index("function showTunnel()")
         cls.body = cls.page[start:cls.page.index("</script>", start)]
+        # The card is built in two places: the helpers above the server
+        # block (the label/value pair, the command box, the shell column)
+        # and the per-row loop. Both windows are checked for being the
+        # card and not an empty slice, because an anchor that stops
+        # matching would otherwise turn every "not in the card" assertion
+        # into one about nothing.
+        helpers = cls.body.index("const kv =")
+        cls.shell_half = cls.body[helpers:cls.body.index("let html = head")]
+        loop = cls.body.index("rows.forEach(row")
+        cls.per_row = cls.body[loop:cls.body.index("panel.innerHTML = html;",
+                                                   loop)]
+        assert "pcard" in cls.shell_half and "pcard" in cls.per_row
 
     def test_the_header_has_a_tunnel_button_after_the_listener_one(self):
         listeners = self.page.index("showListeners()")
@@ -1570,8 +1582,8 @@ class TestTheTunnelPanel(unittest.TestCase):
         And the label saying the credential is not the SOCKS one: the two
         sit a few lines apart on one row, and copying the wrong one would
         be refused with nothing to say why. The refusal detail goes
-        through the reader the SOCKS half uses; a second one is a second
-        place to get the nine kinds wrong.
+        through the reader the SOCKS half uses; that there is only one
+        reader is `test_one_generic_refusal_reader_serves_both_halves`.
         """
         self.assertIn("esc(String(shell.port))", self.body)
         self.assertIn("esc(row.shell_password)", self.body)
@@ -1581,8 +1593,6 @@ class TestTheTunnelPanel(unittest.TestCase):
         self.assertLess(flat.index("esc(row.shell_password)") - label, 300,
                         "the label is not beside the credential")
         self.assertIn("refusals(shell)", self.body)
-        self.assertEqual(self.body.count('indexOf("refused_")'), 1,
-                         "the shell half grew its own refusal reader")
 
     def test_the_panel_shows_the_ssh_forward_before_the_attach_command(self):
         # The port is on the team server and the panel is reached over a
@@ -1618,18 +1628,248 @@ class TestTheTunnelPanel(unittest.TestCase):
         self.assertIn("Forwarding the port", window)
         self.assertIn("loopback", window)
 
-    def test_a_row_without_a_shell_port_shows_the_reason(self):
-        """`shell_detail` stands in for the port when there is none.
+    def test_a_row_without_a_shell_port_shows_the_reason_in_the_shell_column(self):
+        """`shell_detail` stands in for the port, under the same heading.
 
         Guarded on the absence of the `shell` object, so an open port is
-        never shown beside a reason it does not have, and escaped: it
-        carries an OS error string from a bind that failed.
+        never shown beside a reason it does not have, escaped -- it carries
+        an OS error string from a bind that failed -- and **under the
+        `shell session` heading**, so the column is never empty. A row
+        whose reason is empty still says something, because a column that
+        is blank is the silence this panel exists to end.
         """
+        heading = self.per_row.index("shell session")
         self.assertRegex(
-            self.body,
-            r"(?s)row\.shell\s*\?\s*shellBlock\(row\)\s*:\s*"
-            r"\(row\.shell_detail\s*\?.{0,200}?esc\(row\.shell_detail\)",
-            "the reason is not the else branch of the port")
+            self.per_row[heading:],
+            r"(?s)^shell session</div>'\s*\+\s*\(row\.shell\s*\?\s*"
+            r"shellBlock\(row\)\s*:\s*(?P<reason>.{0,300}?esc\(row\."
+            r"shell_detail\).{0,200}?)\)\s*\+",
+            "the reason is not the else branch of the port, under the heading")
+        reason = re.search(
+            r"shellBlock\(row\)\s*:\s*(.{0,300}?esc\(row\.shell_detail\)"
+            r".{0,200}?)\)\s*\+", self.per_row[heading:], re.S).group(1)
+        self.assertNotIn("shell.port", reason,
+                         "a port is printed beside a reason there is none for")
+        self.assertRegex(reason, r"row\.shell_detail\s*\?",
+                         "an empty reason renders an empty column")
+        # The reason is not drawn anywhere else, in particular not in the
+        # left column where a port that does not exist would be read.
+        self.assertEqual(self.body.count("esc(row.shell_detail)"), 1)
+        self.assertLess(self.per_row.index("the endpoint"), heading)
+
+    def test_the_endpoint_rows_are_cards_and_no_longer_loot_items(self):
+        self.assertEqual(self.per_row.count('<div class="pcard">'), 1,
+                         "a row is not exactly one card")
+        for name, text in (("a row", self.per_row),
+                           ("the shell column", self.shell_half)):
+            self.assertNotIn("loot-item", text, "%s is still a loot row" % name)
+            # The old row's secondary text named variables that do not
+            # resolve; the card uses the classes and `--text2`.
+            for undefined in ("--dim", "--bg3", "--bg2"):
+                self.assertNotIn(undefined, text,
+                                 "%s names %s, which is undefined"
+                                 % (name, undefined))
+        # Not removed from the page: Listeners, Loot and the server block
+        # above still use it.
+        style = self.page[self.page.index("<style>"):self.page.index("</style>")]
+        self.assertIn(".loot-item{", style)
+        self.assertIn('class="loot-item"', self.body,
+                      "the server block lost its row")
+        self.assertIn('id="tunnel-endpoint-rows"', self.body)
+        # And the panel that holds them is the wide one -- only this one.
+        self.assertIn('"loot-panel panel-wide"',
+                      _js_function(self.page, "showTunnel"))
+        for narrow in ("showAvEnumDialog", "showRdpDialog",
+                       "showRelayKingDialog", "showResponderDialog",
+                       "showBeaconGen", "showListeners", "showLootViewer"):
+            with self.subTest(panel=narrow):
+                self.assertNotIn("panel-wide", _js_function(self.page, narrow))
+
+    def test_the_card_puts_the_endpoint_s_facts_and_socks_on_the_left(self):
+        row = self.per_row
+        heading = row.index("the endpoint")
+        shell = row.index("shell session")
+        socks = row.index(">socks<")
+        order = [heading, row.index("esc(row.peer)"),
+                 row.index("esc(String(row.endpoint_crypto"),
+                 row.index("esc(bytes(row.bytes_in))"),
+                 row.index("row.linked ?"), socks,
+                 row.index("esc(String(row.port))"),
+                 row.index("esc(row.username)"), row.index("esc(row.password)"),
+                 shell]
+        self.assertEqual(order, sorted(order),
+                         "the left column is not peer, crypto, traffic, "
+                         "fleet, then socks with its port and credential")
+        # Two columns, and both of them are divs: `.pcard-two > div` is
+        # what gives each its width.
+        self.assertEqual(row.count('<div class="pcard-two">'), 1)
+        self.assertEqual(row.count('class="pcard-col-h"'), 3)
+        self.assertEqual(row.count("</div></div>'\n      + '<div class=\"x\""), 0)
+        # None of the shell session leaks into the endpoint's column.
+        left = row[heading:shell]
+        for shells in ("shell_password", "shellBlock", "shell.port",
+                       "raccoon_shell"):
+            self.assertNotIn(shells, left)
+
+    def test_the_shell_session_has_the_right_column_to_itself(self):
+        row = self.per_row
+        shell = row.index("shell session")
+        socks_credential = row.index("esc(row.password)")
+        self.assertLess(socks_credential, shell)
+        self.assertEqual(row.count("shellBlock(row)"), 1)
+        self.assertLess(shell, row.index("shellBlock(row)"))
+        # Nothing about the endpoint is drawn after the shell heading.
+        right = row[shell:]
+        for fact in ("esc(row.peer)", "endpoint_crypto", "bytes(",
+                     "row.linked", "esc(row.username)", "esc(row.password)"):
+            self.assertNotIn(fact, right, "%s is in the shell column" % fact)
+        # And inside it: the port, then the password, then the band, then
+        # the commands -- what the operator reads first is the port.
+        half = self.shell_half
+        order = [half.index("esc(String(shell.port))"),
+                 half.index("esc(row.shell_password)"),
+                 half.index('class="pcard-warn"'),
+                 half.index("ssh -L "),
+                 half.index("raccoon_shell.py 127.0.0.1 "),
+                 half.index("socat -,raw")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn('class="pcard-port"', half)
+        self.assertLess(half.index('class="pcard-port"'),
+                        half.index("esc(row.shell_password)"))
+
+    def test_each_command_sits_alone_in_a_box_behind_its_own_hint(self):
+        """One helper builds the pair, so no command can lose its hint.
+
+        The hint and the box are written adjoining, in one place, and each
+        of the three calls passes the hint prose first and the bare command
+        second -- the command argument is a literal command and a port, with
+        no sentence in it, so the box a click selects is the command and
+        only the command.
+        """
+        half = self.shell_half
+        self.assertRegex(
+            half,
+            r"""const cmd = \(hint, text, alt\) => '<div class="pcard-hint">'"""
+            r"""\s*\+\s*hint\s*\+\s*'</div>'\s*\+\s*'<code class="pcard-cmd'"""
+            r"""[^;]*?'</code>';""")
+        self.assertEqual(half.count("pcard-cmd"), 2,
+                         "a command box is built outside the helper "
+                         "(the class and its -alt variant)")
+        calls = [m.start() for m in re.finditer(r"\bcmd\(", half)]
+        self.assertEqual(len(calls), 3 + 1,  # the definition and three uses
+                         "not three commands")
+        forward, attach, fallback = calls[1:]
+        spans = [(forward, attach), (attach, fallback),
+                 (fallback, half.index("};", fallback))]
+        for (start, end), hint, command in zip(
+                spans,
+                ("not on your workstation", "sends your terminal size",
+                 "Fallback"),
+                ("ssh -L ' + port + ':127.0.0.1:' + port",
+                 "raccoon_shell.py 127.0.0.1 ' + port",
+                 "socat -,raw,echo=0,escape=0x1d TCP:127.0.0.1:' + port")):
+            with self.subTest(command=command):
+                call = half[start:end]
+                self.assertIn(hint, call, "the hint is not in its own call")
+                self.assertIn(command, call)
+                self.assertLess(call.index(hint), call.index(command),
+                                "the hint does not come first")
+                # The command is the last argument and ends the call.
+                tail = call[call.index(command) + len(command):]
+                self.assertRegex(tail.strip(), r"^(?:\+ '[^']*')?,?\s*(?:true)?\)")
+        # The fallback is the only one in the quieter box.
+        self.assertRegex(half[fallback:half.index("};", fallback)],
+                         r",\s*true\)")
+        for call_start in (forward, attach):
+            self.assertNotRegex(half[call_start:call_start + 700], r",\s*true\)\s*;?\s*\n?\s*\+\s*cmd")
+
+    def test_a_disconnected_row_does_not_claim_to_be_connected(self):
+        """The pill says what the row's state is; only a connected row is green.
+
+        A disconnected endpoint still has its ports -- the SOCKS number and
+        any shell number are assigned to the identity and survive a
+        restart -- so they are shown, and nothing about them depends on
+        the state.
+        """
+        row = self.per_row
+        self.assertEqual(row.count("pcard-pill-ok"), 1)
+        self.assertRegex(
+            row,
+            r"""class="pcard-pill'\s*\+\s*\(connected\s*\?\s*' pcard-pill-ok'"""
+            r"""\s*:\s*''\)\s*\+\s*'">'\s*\+\s*esc\(row\.state\)""")
+        self.assertNotRegex(row, r">\s*connected\s*<",
+                            "the pill says 'connected' as a literal")
+        # The port numbers are not behind the state.
+        ok = row.index("pcard-pill-ok")
+        port = row.index("esc(String(row.port))")
+        self.assertNotIn("connected", row[ok + len("pcard-pill-ok"):port])
+        self.assertNotRegex(row[:port], r"connected\s*&&")
+        self.assertIn("(connected ? 'Stop' : 'Start')", row)
+
+    def test_a_long_identity_cannot_widen_the_card(self):
+        """The cause of the old panel, closed in the places it could recur.
+
+        **What this does not hold:** it reads CSS and source. That a
+        64-character identity wraps rather than pushing the card past 900 px
+        is something only a browser shows.
+        """
+        style = self.page[self.page.index("<style>"):self.page.index("</style>")]
+        card = re.search(r"(?:^|\})\s*\.pcard\s*\{([^}]*)\}", style).group(1)
+        self.assertIn("overflow-wrap:anywhere", card.replace(" ", ""),
+                      "a long unbroken identity or hostname can push the "
+                      "card wider than the panel")
+        two = re.search(r"\.pcard-two>div\s*\{([^}]*)\}", style).group(1)
+        self.assertIn("min-width:0", two.replace(" ", ""))
+        head = self.per_row.index('class="pcard-head"')
+        identity = self.per_row.index("esc(row.identity)")
+        self.assertLess(head, identity, "the identity is outside the head")
+        self.assertNotIn("nowrap", self.per_row + self.shell_half)
+        self.assertNotIn("white-space", self.per_row + self.shell_half)
+
+    def test_five_rows_render_five_cards(self):
+        """Each row appends a card; none replaces another or is cut off.
+
+        **What this does not hold:** the arithmetic of five cards in a
+        panel that scrolls is a browser's, not this test's. What it holds is
+        that the loop appends (`+=`) one `.pcard` per row, nothing indexes
+        into the rows or stops early, and the container the cards go into
+        is a plain block that stacks them.
+        """
+        self.assertRegex(self.per_row, r"^rows\.forEach\(row => \{")
+        self.assertEqual(len(re.findall(r"html \+= '<div class=\"pcard\">'",
+                                        self.per_row)), 1)
+        self.assertNotRegex(self.per_row, r"(?<![\w.])html = ")
+        for cap in ("rows[0]", "slice(", "break", "return", "rows.length >"):
+            self.assertNotIn(cap, self.per_row)
+        self.assertNotIn("rows.slice", self.body)
+        self.assertRegex(self.body,
+                         r"""html \+= '<div id="tunnel-endpoint-rows">';""")
+        style = self.page[self.page.index("<style>"):self.page.index("</style>")]
+        card = re.search(r"(?:^|\})\s*\.pcard\s*\{([^}]*)\}", style).group(1)
+        self.assertIn("margin-bottom", card)
+        self.assertNotIn("display:flex", card.replace(" ", ""))
+
+    def test_one_generic_refusal_reader_serves_both_halves(self):
+        """The nine refusal kinds are read off the keys, in one place.
+
+        Was: `indexOf("refused_")` appears exactly once. That counted a
+        spelling; the promise is that the SOCKS port and the shell port go
+        through the same reader, so that a tenth kind added to the tunnel
+        server shows up in both without anyone remembering to edit two
+        lists. Asserted as: one definition, one key scan, called with each
+        object, and neither half spelling a kind of its own.
+        """
+        self.assertEqual(len(re.findall(r"const refusals = ", self.body)), 1)
+        self.assertEqual(self.body.count('indexOf("refused_")'), 1)
+        self.assertEqual(self.body.count('"refused_'), 1,
+                         "a refusal key is spelled somewhere else")
+        self.assertIn("refusals(socks)", self.per_row)
+        self.assertIn("refusals(shell)", self.shell_half)
+        self.assertEqual(len(re.findall(r"\brefusals\(", self.body)), 3,
+                         "one definition and one call per half")
+        for kind in ("auth", "capacity", "command", "address", "tunnel",
+                     "protocol", "timeout", "pending", "threads"):
+            self.assertNotIn("refused_" + kind, self.body)
 
     def test_the_panel_shows_a_recording_badge_only_when_recording_is_on(self):
         """A badge about the deployment, read off the server block.

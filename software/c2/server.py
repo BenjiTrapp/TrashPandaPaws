@@ -3484,7 +3484,7 @@ header .info{font-size:11px;color:var(--text2)}
 .loot-panel.panel-wide{max-width:900px}
 .pcard{
   border:1px solid var(--border);background:var(--surface);border-radius:6px;
-  padding:11px;margin-bottom:8px;
+  padding:11px;margin-bottom:8px;overflow-wrap:anywhere;
 }
 .pcard-head{
   display:flex;align-items:center;gap:10px;flex-wrap:wrap;
@@ -7324,7 +7324,7 @@ async function showTunnel(){
   overlay.className = "loot-overlay";
   overlay.onclick = e => { if(e.target===overlay) overlay.remove(); };
   const panel = document.createElement("div");
-  panel.className = "loot-panel";
+  panel.className = "loot-panel panel-wide";
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
   await drawTunnel(panel);
@@ -7359,57 +7359,62 @@ async function drawTunnel(panel){
   // naming three of them turned "5 refused (auth 0, capacity 0, tunnel
   // 0)" into something a reader takes for a broken panel instead of a
   // refusal for one of the six that were not shown.
-  const refusals = s => Object.keys(s)
+  const refusals = function refusals(s){ return Object.keys(s)
     .filter(k => k.indexOf("refused_") === 0 && s[k])
     .map(k => esc(k.slice(8).replace(/_/g," ")) + " " + esc(String(s[k])))
-    .join(", ");
+    .join(", "); };
 
-  // The shell half of a row. It sits beside the SOCKS half and reads like
-  // it: a port, a count of live sessions, its refusals through the same
-  // reader, and a credential. The credential is the shell port's own and
-  // is not the SOCKS one; the label says so, because the two are printed
-  // a few lines apart and a reader who pasted the wrong one would be
-  // refused with nothing to say why.
-  //
-  // The port is on the team server's loopback and the panel is routinely
-  // reached over an SSH forward, so the forward is written first and the
-  // attach command second. Each is its own line so that it can be copied
-  // whole.
+  // A label/value pair for a `.pcard-kv` grid. The grid styles its
+  // children by odd/even position, so a pair is always a label div then a
+  // value div and nothing between them. Labels are short -- the label
+  // column is 52px -- so a long value wraps under its own label rather
+  // than shoving it aside.
+  const kv = (label, value) => '<div>' + label + '</div><div>' + value + '</div>';
+
+  // One hint-and-command pair. The hint prose is written first and the
+  // bare command second, so the box a click selects is the command and
+  // only the command; `alt` puts the quieter fallback in the dimmer box.
+  const cmd = (hint, text, alt) => '<div class="pcard-hint">' + hint + '</div>'
+    + '<code class="pcard-cmd' + (alt ? ' pcard-cmd-alt' : '') + '">'
+    + text + '</code>';
+
+  // The shell session column. The port large and green with its live
+  // session count, then the credential -- the shell port's own, which is
+  // not the SOCKS one, so the label says as much because the two sit a
+  // few lines apart and a reader who pasted the wrong one would be refused
+  // with nothing to say why. Then the root-shell warning band, then the
+  // three commands: the port is on the team server's loopback and the
+  // panel is routinely reached over an SSH forward, so the forward is
+  // written first and the attach command second, the socat line last as a
+  // fallback. Its refusals go through the same reader the SOCKS half uses.
   const shellBlock = row => {
     const shell = row.shell;
     const port = esc(String(shell.port));
     const refusedShell = refusals(shell);
-    const line = text => '<div style="margin-left:12px"><code>' + text
-      + '</code></div>';
-    return '<div style="font-size:12px;margin-top:6px">'
-      + '<strong>Shell</strong> <span style="color:var(--dim)">'
-      + 'team server 127.0.0.1:' + port
-      + ' &middot; ' + esc(String(shell.sessions)) + ' session(s)'
-      + (shell.max_sessions ? '/' + esc(String(shell.max_sessions)) : '')
-      + '</span></div>'
-      + '<div style="font-size:11px;color:var(--yellow,#d7ba7d)">'
+    return '<div class="pcard-port">team 127.0.0.1:' + port
+      + '<small>' + esc(String(shell.sessions)) + ' live session(s)'
+      + (shell.max_sessions ? ' / ' + esc(String(shell.max_sessions)) : '')
+      + '</small></div>'
+      + cmd('Shell password (this port only &mdash; not the SOCKS5 password; '
+            + 'enter it at the password prompt):',
+            esc(row.shell_password))
+      + '<div class="pcard-warn">'
       + 'This is a root shell on the implant host. Forwarding the port to '
       + 'your workstation extends its reach to whatever can reach that '
       + 'workstation\'s loopback.</div>'
-      + '<div style="font-size:11px;color:var(--dim)">'
-      + 'The port is on the team server, not on your workstation. From '
-      + 'your workstation, forward it:</div>'
-      + line('ssh -L ' + port + ':127.0.0.1:' + port
-             + ' &lt;user&gt;@&lt;team-server&gt;')
-      + '<div style="font-size:11px;color:var(--dim)">then attach (this '
-      + 'client sends your terminal size, and has no escape key: end the '
-      + 'far shell to leave):</div>'
-      + line('python3 tools/raccoon_shell.py 127.0.0.1 ' + port)
-      + '<div style="font-size:11px;color:var(--dim)">Fallback if the '
-      + 'client is not to hand &mdash; socat cannot send a terminal size, '
-      + 'and Ctrl-] leaves the session:</div>'
-      + line('socat -,raw,echo=0,escape=0x1d TCP:127.0.0.1:' + port)
-      + '<div style="font-size:11px;color:var(--dim)">'
-      + 'Shell password (this port only &mdash; not the SOCKS5 password; '
-      + 'enter it at the password prompt): '
-      + esc(row.shell_password) + '</div>'
+      + cmd('The port is on the team server, not on your workstation. From '
+            + 'your workstation, forward it:',
+            'ssh -L ' + port + ':127.0.0.1:' + port
+            + ' &lt;user&gt;@&lt;team-server&gt;')
+      + cmd('then attach (this client sends your terminal size, and has '
+            + 'no escape key: end the far shell to leave):',
+            'python3 tools/raccoon_shell.py 127.0.0.1 ' + port)
+      + cmd('Fallback if the client is not to hand &mdash; '
+            + 'socat cannot send a terminal size, and Ctrl-] leaves the '
+            + 'session:',
+            'socat -,raw,echo=0,escape=0x1d TCP:127.0.0.1:' + port, true)
       + (shell.refused
-         ? '<div style="font-size:11px;color:var(--dim)">'
+         ? '<div class="pcard-hint">'
            + esc(String(shell.refused)) + ' refused on the shell port'
            + (refusedShell ? ' &mdash; ' + refusedShell : '')
            + '</div>'
@@ -7480,87 +7485,105 @@ async function drawTunnel(panel){
       + esc(data.detail || "No endpoint has connected to this tunnel server yet.")
       + '</p>';
   }
-  html += '<div class="loot-list" id="tunnel-endpoint-rows">';
+  html += '<div id="tunnel-endpoint-rows">';
   rows.forEach(row => {
     const connected = row.state === "connected";
     const socks = row.socks;
     const refused = socks ? refusals(socks) : "";
-    html += '<div class="loot-item">'
-      + '<div><strong>' + esc(row.identity) + '</strong>'
-      + ' <span style="color:var(--dim)">SOCKS 127.0.0.1:' + esc(String(row.port))
-      + ' &middot; ' + (row.linked ? 'agent ' + esc(row.agent) : 'unlinked')
-      + '</span></div>'
-      + '<div style="font-size:12px">state <strong>' + esc(row.state) + '</strong>'
-      + (row.hostname ? ' &middot; ' + esc(row.hostname) : '')
-      + (row.os ? ' &middot; ' + esc(row.os) : '')
-      + (row.peer ? ' &middot; from ' + esc(row.peer) : '')
-      + ' &middot; ' + esc(String(row.sessions)) + ' session(s)'
-      + (socks ? '/' + esc(String(socks.max_sessions)) : '')
-      + ' &middot; in ' + esc(bytes(row.bytes_in))
-      + ' out ' + esc(bytes(row.bytes_out))
-      + '</div>'
-      // The crypto path of both halves, per row. A tunnel on the
-      // pure-Python cipher moves roughly 50-200 KB/s, and an operator
-      // who cannot see that spends the afternoon looking for a network
-      // fault that is not there. Two values because they are two
-      // processes on two hosts and either one bounds the throughput:
-      // `endpoint_crypto` comes from the endpoint's own HELLO and is the
-      // one an `allow_slow_crypto` build is about, `server_crypto` is
-      // this team server, which encrypts every relayed byte as well.
-      + '<div style="font-size:11px;color:'
-      + ((row.endpoint_crypto === "pure-python"
-          || row.server_crypto === "pure-python")
-         ? 'var(--yellow,#d7ba7d)' : 'var(--dim)') + '">'
-      + 'crypto endpoint ' + esc(String(row.endpoint_crypto || "unreported"))
-      + ' &middot; server ' + esc(String(row.server_crypto || "unknown"))
-      + (row.endpoint_crypto === "pure-python"
-         ? ' &mdash; the endpoint is on pure-python AES-GCM, roughly '
-           + '50-200 KB/s: a scan through this tunnel is slow because of '
-           + 'the cipher, not the network'
-         : '')
-      + (row.server_crypto === "pure-python"
-         ? ' &mdash; this team server is on pure-python AES-GCM, roughly '
-           + '50-200 KB/s: it encrypts every relayed byte, so the tunnel '
-           + 'is slow because of the cipher, not the network'
-         : '')
-      + '</div>'
-      + (socks && socks.refused
-         ? '<div style="font-size:11px;color:var(--dim)">'
-           + esc(String(socks.refused)) + ' refused on the SOCKS port'
-           + (refused ? ' &mdash; ' + refused : '')
-           + '</div>'
-         : '')
-      + (row.socks_detail
-         ? '<div style="font-size:11px;color:var(--dim)">' + esc(row.socks_detail) + '</div>'
-         : '')
-      + (row.username
-         ? '<div style="font-size:11px;color:var(--dim)">'
-           + 'SOCKS5 user/pass per RFC 1929: ' + esc(row.username)
-           + ' / ' + esc(row.password) + '</div>'
-         : '')
-      + (row.shell
-         ? shellBlock(row)
-         : (row.shell_detail
-            ? '<div style="font-size:11px;color:var(--dim)">shell port: '
-              + esc(row.shell_detail) + '</div>'
-            : ''))
-      // Why a tunnel refused to start. The endpoint child's stderr is
-      // closed, so this sentence reaches an operator here or nowhere.
-      + (row.refusal
-         ? '<div style="font-size:11px;color:var(--red,#ff1a1a)">' + esc(row.refusal) + '</div>'
-         : '')
-      + '<div style="margin-top:6px">'
+    // Computed once, up here, so the head can read them without writing
+    // the word "connected" or "row.linked" between the state pill and the
+    // ports below -- the ports belong to the identity and survive its
+    // state, and nothing about them is behind it.
+    const endAction = connected ? 'stop' : 'start';
+    const endLabel = (connected ? 'Stop' : 'Start');
+    const linked = row.linked;
+    html += '<div class="pcard">'
+      // ── Head: who the endpoint is, its state, and the one button ──
+      + '<div class="pcard-head"><b>' + esc(row.identity) + '</b>'
+      + '<span class="pcard-pill' + (connected ? ' pcard-pill-ok' : '') + '">'
+      + esc(row.state) + '</span>'
+      + (row.hostname ? '<span>' + esc(row.hostname) + '</span>' : '')
+      + (row.os ? '<span>' + esc(row.os) + '</span>' : '')
       + (row.pending
          ? '<button disabled>pending until ~' + esc(row.expected) + '</button>'
          : '<button data-tunnel-endpoint="' + esc(row.identity) + '"'
-           + ' data-endpoint-action="' + (connected ? 'stop' : 'start') + '"'
-           + (row.linked ? '' : ' disabled title="' + esc(row.detail) + '"')
-           + '>' + (connected ? 'Stop' : 'Start') + '</button>')
-      + (row.detail
-         ? '<span style="font-size:11px;color:var(--dim);margin-left:8px">'
-           + esc(row.detail) + '</span>'
+           + ' data-endpoint-action="' + endAction + '"'
+           + (linked ? '' : ' disabled title="' + esc(row.detail) + '"')
+           + '>' + endLabel + '</button>')
+      + '</div>'
+      // ── The two columns ──
+      + '<div class="pcard-two">'
+      // Left: facts about the endpoint, then the SOCKS pivot.
+      + '<div>'
+      + '<div class="pcard-col-h">the endpoint</div>'
+      + '<div class="pcard-kv">'
+      + kv('peer', row.peer ? esc(row.peer) : '&mdash;')
+      // The crypto path of both halves. A tunnel on the pure-Python cipher
+      // moves roughly 50-200 KB/s, and an operator who cannot see that
+      // spends the afternoon looking for a network fault that is not
+      // there. Two values because they are two processes on two hosts and
+      // either one bounds the throughput: `endpoint_crypto` comes from the
+      // endpoint's own HELLO and is the one an `allow_slow_crypto` build is
+      // about, `server_crypto` is this team server, which encrypts every
+      // relayed byte as well.
+      + kv('crypto', esc(String(row.endpoint_crypto || "unreported"))
+           + (row.endpoint_crypto === "pure-python"
+              ? ' &mdash; the endpoint is on pure-python AES-GCM, roughly '
+                + '50-200 KB/s: a scan through this tunnel is slow because '
+                + 'of the cipher, not the network'
+              : ''))
+      + kv('server', esc(String(row.server_crypto || "unknown"))
+           + (row.server_crypto === "pure-python"
+              ? ' &mdash; this team server is on pure-python AES-GCM, '
+                + 'roughly 50-200 KB/s: it encrypts every relayed byte, so '
+                + 'the tunnel is slow because of the cipher, not the network'
+              : ''))
+      + kv('in', esc(bytes(row.bytes_in)))
+      + kv('out', esc(bytes(row.bytes_out)))
+      + kv('fleet', row.linked ? 'agent ' + esc(row.agent) : 'unlinked')
+      + '</div>'
+      + '<div class="pcard-col-h">socks</div>'
+      + '<div class="pcard-port">127.0.0.1:' + esc(String(row.port))
+      + '<small>' + esc(String(row.sessions)) + ' live session(s)'
+      + (socks ? ' / ' + esc(String(socks.max_sessions)) : '') + '</small></div>'
+      + (row.username
+         ? '<div class="pcard-kv" style="margin-top:6px">'
+           + kv('user', esc(row.username))
+           + kv('pass', esc(row.password))
+           + '</div>'
          : '')
-      + '</div></div>';
+      + (socks && socks.refused
+         ? '<div class="pcard-hint">'
+           + esc(String(socks.refused)) + ' refused on the SOCKS port'
+           + (refused ? ' &mdash; ' + refused : '') + '</div>'
+         : '')
+      + (row.socks_detail
+         ? '<div class="pcard-hint">' + esc(row.socks_detail) + '</div>'
+         : '')
+      + '</div>'
+      // Right: the live session, or, with no port, the reason why --
+      // under the same heading, so the column is never empty or silent.
+      + '<div>'
+      + '<div class="pcard-col-h">shell session</div>'
+      + (row.shell
+         ? shellBlock(row)
+         : (row.shell_detail
+            ? '<div class="pcard-hint">' + esc(row.shell_detail) + '</div>'
+            : '<div class="pcard-hint">no shell port is open for this '
+              + 'endpoint</div>'))
+      + '</div>'
+      + '</div>'
+      // Why a tunnel refused to start. The endpoint child's stderr is
+      // closed, so this sentence reaches an operator here or nowhere.
+      + (row.refusal
+         ? '<div class="pcard-warn" style="color:var(--red);'
+           + 'border-left-color:var(--red);background:rgba(255,26,26,0.07)">'
+           + esc(row.refusal) + '</div>'
+         : '')
+      + (row.detail && !row.pending
+         ? '<div class="pcard-hint">' + esc(row.detail) + '</div>'
+         : '')
+      + '</div>';
   });
   html += '</div>';
   panel.innerHTML = html;
