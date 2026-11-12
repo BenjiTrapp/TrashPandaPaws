@@ -23,6 +23,7 @@ import sys
 import unittest
 import unittest.mock
 from pathlib import Path
+from pathlib import Path as pathlib_Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -55,14 +56,14 @@ def _a_record() -> bytes:
 
 def _a_ciphertext() -> str:
     raw = _a_record()
-    return _encrypt_like_the_beacon({"d": base64.b64encode(raw).decode()})
+    return _encrypt_like_the_beacon({dns_rescue.WRAPPER_KEY: base64.b64encode(raw).decode()})
 
 
 class TestTheRecord(unittest.TestCase):
-    def test_the_record_is_fourteen_bytes(self):
+    def test_the_record_is_sixteen_bytes(self):
         # Two bytes for the code, because 407 does not fit in one.
-        self.assertEqual(len(_a_record()), 14)
-        self.assertEqual(dns_rescue.RECORD_BYTES, 14)
+        self.assertEqual(len(_a_record()), 16)
+        self.assertEqual(dns_rescue.RECORD_BYTES, 16)
 
     def test_pack_and_unpack_round_trip(self):
         got = dns_rescue.unpack(_a_record())
@@ -83,7 +84,7 @@ class TestTheRecord(unittest.TestCase):
         self.assertEqual(dns_rescue.CLASSES["not_attempted"], 0)
 
     def test_a_wrong_length_or_version_is_refused(self):
-        for bad in (b"", b"\x00" * 13, b"\x00" * 15, b"\xff" + b"\x00" * 13):
+        for bad in (b"", b"\x00" * 15, b"\x00" * 17, b"\xff" + b"\x00" * 15):
             with self.subTest(raw=bad):
                 with self.assertRaises(ValueError):
                     dns_rescue.unpack(bad)
@@ -133,7 +134,7 @@ class TestTheLabelArithmetic(unittest.TestCase):
     def test_the_payload_is_exactly_two_labels_of_at_most_63(self):
         one, two = dns_rescue.to_labels(_a_ciphertext())
         self.assertEqual(len(one) + len(two), dns_rescue.PAYLOAD_CHARS)
-        self.assertEqual(dns_rescue.PAYLOAD_CHARS, 90)
+        self.assertEqual(dns_rescue.PAYLOAD_CHARS, 96)
         for label in (one, two):
             with self.subTest(label=label):
                 self.assertLessEqual(len(label), 63)
@@ -157,7 +158,7 @@ class TestTheLabelArithmetic(unittest.TestCase):
         # the key name or the separators change. Halving survives that.
         for extra in range(0, 15, 7):
             cipher = _encrypt_like_the_beacon(
-                {"d": base64.b64encode(_a_record() + b"\x00" * extra).decode()})
+                {dns_rescue.WRAPPER_KEY: base64.b64encode(_a_record() + b"\x00" * extra).decode()})
             one, two = dns_rescue.to_labels(cipher)
             with self.subTest(extra=extra):
                 self.assertEqual(one + two,
@@ -363,7 +364,7 @@ class TestTheBeaconsCopyOfTheFormat(unittest.TestCase):
         found = None
         for extra in range(0, 12):
             candidate = _encrypt_like_the_beacon(
-                {"d": base64.b64encode(_a_record() + b"\x00" * extra).decode()})
+                {dns_rescue.WRAPPER_KEY: base64.b64encode(_a_record() + b"\x00" * extra).decode()})
             length = len(base64.b32encode(base64.b64decode(candidate))
                          .decode().rstrip("="))
             if length % 2:
@@ -433,7 +434,8 @@ class TestTheTrigger(unittest.TestCase):
             beacon._maybe_rescue()
         one, two = sent.names[0].split(".")[:2]
         wrapper = beacon._decrypt(dns_rescue.from_labels(one, two))
-        got = dns_rescue.unpack(base64.b64decode(wrapper["d"]))
+        got = dns_rescue.unpack(
+            base64.b64decode(wrapper[dns_rescue.WRAPPER_KEY]))
         self.assertEqual(got["https"],
                          (dns_rescue.CLASSES["auth_required"], 407))
         self.assertEqual(got["dns"], (dns_rescue.CLASSES["answered"], 0))
@@ -544,7 +546,7 @@ class TestTheTrigger(unittest.TestCase):
             beacon._maybe_rescue()
         one, two = sent.names[0].split(".")[:2]
         raw = base64.b64decode(
-            beacon._decrypt(dns_rescue.from_labels(one, two))["d"])
+            beacon._decrypt(dns_rescue.from_labels(one, two))[dns_rescue.WRAPPER_KEY])
         self.assertEqual(len(raw), dns_rescue.RECORD_BYTES)
         for secret in (b"rescue.example", b"127.0.0.1", _KEY,
                        beacon._implant_id.encode()):
@@ -1129,6 +1131,188 @@ class TestTheListenerRelaysARescue(unittest.TestCase):
         for forbidden in ("_decrypt", "ServerCrypto", "aes", "encryption_key"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, source)
+
+
+class TestTheFingerprint(unittest.TestCase):
+    """Two bytes that say which beacon is stuck, because the id will not fit."""
+
+    def test_it_is_two_bytes_and_stable(self):
+        got = dns_rescue.fingerprint("clumsy-raccoon")
+        self.assertEqual(got, dns_rescue.fingerprint("clumsy-raccoon"))
+        self.assertTrue(0 <= got <= 0xFFFF)
+
+    def test_different_agents_usually_differ(self):
+        seen = {dns_rescue.fingerprint("agent-%d" % n) for n in range(200)}
+        # Birthday collisions are expected and documented; what matters is
+        # that it is not a constant.
+        self.assertGreater(len(seen), 180)
+
+    def test_it_survives_the_record(self):
+        raw = dns_rescue.pack({}, 0, dns_rescue.fingerprint("sly-fox"))
+        self.assertEqual(dns_rescue.unpack(raw)["fingerprint"],
+                         dns_rescue.fingerprint("sly-fox"))
+
+    def test_both_sides_compute_the_same_one(self):
+        from software.c2 import beacon as beacon_mod
+
+        for agent in ("clumsy-raccoon", "a", "", "ümlaut-agent"):
+            with self.subTest(agent=agent):
+                self.assertEqual(beacon_mod._rescue_fingerprint(agent),
+                                 dns_rescue.fingerprint(agent))
+
+    def test_the_beacon_puts_its_own_fingerprint_in_the_record(self):
+        beacon = _rescue_beacon()
+        beacon._start_cycle()
+        beacon._rescue_flags |= dns_rescue.FLAG_DNS_ANSWERED
+        beacon._record_leg("https", dns_rescue.CLASSES["auth_required"], 407)
+        sent = _Sent()
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query", sent):
+            beacon._maybe_rescue()
+        one, two = sent.names[0].split(".")[:2]
+        raw = base64.b64decode(beacon._decrypt(
+            dns_rescue.from_labels(one, two))[dns_rescue.WRAPPER_KEY])
+        self.assertEqual(
+            dns_rescue.unpack(raw)["fingerprint"],
+            dns_rescue.fingerprint(beacon._agent_id or beacon._implant_id))
+
+
+# ── The server shows it (Task 5) ──
+
+
+class TestTheServerDecodesARescue(unittest.TestCase):
+    """Through the real unwrap path, with no server-side decryption change."""
+
+    def setUp(self):
+        import tempfile
+
+        from software.c2 import server as server_mod
+
+        self.server_mod = server_mod
+        self.crypto = server_mod.ServerCrypto(_KEY)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        # A real app, because the handlers answer with `jsonify` and the
+        # cover response is part of what is being tested.
+        self.app = server_mod.create_app(self.crypto, "operator-token",
+                                         pathlib_Path(tmp.name))
+        server_mod.agents.clear()
+        self.addCleanup(server_mod.agents.clear)
+        self.agent = "clumsy-raccoon"
+        server_mod.agents[self.agent] = {
+            "id": "implant-1", "hostname": "h", "last_seen": "now",
+            "caps": [],
+        }
+
+    def _record(self, agent_for_fingerprint=None, **legs):
+        return dns_rescue.pack(
+            legs or {"https": (dns_rescue.CLASSES["auth_required"], 407),
+                     "dns": (dns_rescue.CLASSES["answered"], 0)},
+            dns_rescue.FLAG_PROXY_FOUND | dns_rescue.FLAG_DNS_ANSWERED,
+            dns_rescue.fingerprint(agent_for_fingerprint
+                                   if agent_for_fingerprint is not None
+                                   else self.agent))
+
+    def _deliver(self, raw):
+        """Hand a wrapped rescue to the handler the way the relay does."""
+        wrapped = self.crypto.wrap(
+            {dns_rescue.WRAPPER_KEY: base64.b64encode(raw).decode()})
+        with self.app.test_request_context("/api/v1/beacon", json=wrapped):
+            return self.server_mod._handle_rescue(
+                self.crypto.unwrap(wrapped) or {}, self.crypto)
+
+    def _deliver_through_the_socket(self, raw):
+        """The whole path: a POST shaped the way `relay` shapes one."""
+        wrapped = self.crypto.wrap(
+            {dns_rescue.WRAPPER_KEY: base64.b64encode(raw).decode()})
+        with self.app.test_client() as client:
+            return client.post("/api/v1/beacon", json=wrapped)
+
+    def test_a_rescue_reaches_the_matching_agent_record(self):
+        self._deliver(self._record())
+        stuck = self.server_mod.agents[self.agent].get("stuck")
+        self.assertIsNotNone(stuck)
+        self.assertEqual(stuck["https"], ["auth_required", 407])
+        self.assertTrue(stuck["dns_answered"])
+
+    def test_it_reads_as_a_sentence_an_operator_can_act_on(self):
+        self._deliver(self._record())
+        summary = self.server_mod.agents[self.agent]["stuck"]["summary"]
+        self.assertIn("407", summary)
+        self.assertIn("HTTPS", summary.upper())
+        self.assertNotIn("0x", summary)
+
+    def test_an_unattributable_rescue_is_kept_not_dropped(self):
+        # A drop-box that never managed to register is the case with the
+        # least other evidence, so it must still be visible.
+        self._deliver(self._record(agent_for_fingerprint="nobody-here"))
+        self.assertIsNone(self.server_mod.agents[self.agent].get("stuck"))
+        self.assertTrue(self.server_mod.unattributed_rescues)
+        self.assertIn("407",
+                      self.server_mod.unattributed_rescues[-1]["summary"])
+
+    def test_an_unknown_version_is_refused_but_still_looks_ordinary(self):
+        # Refused, and indistinguishable from any other request: a record
+        # this server cannot read is as likely to be an attacker probing
+        # as a beacon from a future build, and neither should learn which.
+        bad = bytearray(self._record())
+        bad[0] = 0xFF
+        before = len(self.server_mod.unattributed_rescues)
+        answer = self._deliver(bytes(bad))
+        self.assertIsNotNone(answer)
+        self.assertIsNone(self.server_mod.agents[self.agent].get("stuck"))
+        self.assertEqual(len(self.server_mod.unattributed_rescues), before)
+
+    def test_the_whole_path_works_through_the_beacon_socket(self):
+        # Shaped the way `relay` shapes a POST, through the real route and
+        # the real unwrap, with no server-side decryption change.
+        response = self._deliver_through_the_socket(self._record())
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(self.server_mod.agents[self.agent].get("stuck"))
+
+    def test_the_handler_answers_like_any_other_check_in(self):
+        # The reply must not tell a prober that a rescue was understood.
+        answer = self._deliver(self._record())
+        self.assertIsNotNone(answer)
+
+    def test_a_rescue_routes_through_the_action_dispatch_by_its_key(self):
+        # The contract is the dedicated wrapper key, checked before the
+        # action dispatch -- not a guess about a payload with no action.
+        import inspect
+
+        src = inspect.getsource(self.server_mod.create_app)
+        self.assertIn("WRAPPER_KEY", src)
+
+
+class TestWhatTheOperatorSees(unittest.TestCase):
+    """Source-level, because the repo has no JS harness. Stated, not implied."""
+
+    def setUp(self):
+        self.src = pathlib_Path("software/c2/server.py").read_text()
+
+    def test_the_via_dns_tag_no_longer_claims_nothing_is_reported(self):
+        self.assertNotIn(
+            "That channel carries tasking only: a task is delivered once "
+            "and its result is never reported.", self.src)
+        self.assertIn("why it is stuck", self.src)
+
+    def test_the_diagnosis_is_rendered_as_an_advisory_not_an_error(self):
+        # `ai-warns` is the yellow advisory class the OpSec notes use. A
+        # working configuration that happens to be stuck must not render
+        # as a failure.
+        i = self.src.index("info.stuck ?")
+        block = self.src[i:i + 400]
+        self.assertIn("ai-warns", block)
+        self.assertNotIn("Unavailable", block)
+
+    def test_the_summary_is_escaped(self):
+        # It is derived from a record a target sent.
+        i = self.src.index("info.stuck ?")
+        self.assertIn("escHtml(info.stuck.summary)", self.src[i:i + 400])
+
+    def test_a_dead_resolver_is_called_out(self):
+        i = self.src.index("info.stuck ?")
+        self.assertIn("nothing can leave", self.src[i:i + 400])
 
 
 if __name__ == "__main__":

