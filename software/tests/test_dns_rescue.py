@@ -1315,5 +1315,138 @@ class TestWhatTheOperatorSees(unittest.TestCase):
         self.assertIn("nothing can leave", self.src[i:i + 400])
 
 
+# ── The agent reads it (Task 6) ──
+
+
+class _StuckC2:
+    """Just enough C2 for the tool: a fleet and a task queue."""
+
+    def __init__(self, agents):
+        self._agents = agents
+        self.queued = []
+
+    async def list_agents(self):
+        return list(self._agents.values())
+
+    async def get_agent(self, agent_id):
+        return self._agents.get(agent_id)
+
+    async def queue_task(self, agent_id, command, lane="agent"):
+        self.queued.append((agent_id, command, lane))
+        return {"id": "t1"}
+
+
+def _stuck_agent(**over):
+    agent = {
+        "id": "b1", "hostname": "host-1", "last_channel": "dns",
+        "stuck": {
+            "summary": "HTTPS: wanted authentication (407); DNS: answered; "
+                       "SMB: unreachable; QUIC: timed out. a proxy was found.",
+            "dns_answered": True, "fingerprint": 4242, "at": "now",
+            "https": ["auth_required", 407], "dns": ["answered", 0],
+            "smb": ["unreachable", 0], "quic": ["timed_out", 0],
+        },
+    }
+    agent.update(over)
+    return agent
+
+
+class TestTheAgentReadsTheDiagnosis(unittest.TestCase):
+    def _tool(self, c2, name):
+        import asyncio as _asyncio
+
+        from software.agent.tools import registry
+
+        tools = registry.orchestrator_tools(
+            None, 1, dispatch_single=None, dispatch_parallel=None,
+            tier="full", scope_key="k", c2=c2)
+        for tool in tools:
+            if tool.spec.name == name:
+                return lambda **kw: _asyncio.run(tool.fn(**kw))
+        raise AssertionError("no tool %r; got %s"
+                            % (name, [t.spec.name for t in tools]))
+
+    def test_it_reports_the_diagnosis_for_a_stuck_beacon(self):
+        c2 = _StuckC2({"b1": _stuck_agent()})
+        got = self._tool(c2, "get_stuck_beacons")()
+        self.assertEqual(len(got["stuck"]), 1)
+        self.assertIn("407", got["stuck"][0]["summary"])
+        self.assertEqual(got["stuck"][0]["beacon_id"], "b1")
+
+    def test_a_fleet_with_nothing_stuck_is_not_an_error(self):
+        # Most beacons are fine and have nothing to report.
+        c2 = _StuckC2({"b1": _stuck_agent(stuck=None)})
+        got = self._tool(c2, "get_stuck_beacons")()
+        self.assertEqual(got["stuck"], [])
+        self.assertNotIn("error", got)
+
+    def test_it_says_when_nothing_can_leave(self):
+        agent = _stuck_agent()
+        agent["stuck"]["dns_answered"] = False
+        c2 = _StuckC2({"b1": agent})
+        got = self._tool(c2, "get_stuck_beacons")()
+        self.assertFalse(got["stuck"][0]["dns_answered"])
+
+    def test_it_queues_exactly_one_next_attempt(self):
+        # One candidate per call. A sweep of twelve is the loud thing the
+        # design refused when it ruled out approach C.
+        c2 = _StuckC2({"b1": _stuck_agent()})
+        out = self._tool(c2, "try_egress")(beacon_id="b1",
+                                           attempt="proxy http://10.0.0.9:3128")
+        self.assertEqual(len(c2.queued), 1)
+        self.assertEqual(c2.queued[0][0], "b1")
+        self.assertIn("10.0.0.9", c2.queued[0][1])
+        self.assertNotIn("error", out)
+
+    def test_it_refuses_a_beacon_that_is_not_stuck(self):
+        # Changing the transport of a beacon that is fine is a way to lose
+        # a working channel.
+        c2 = _StuckC2({"b1": _stuck_agent(stuck=None)})
+        out = self._tool(c2, "try_egress")(beacon_id="b1", attempt="proxy x")
+        self.assertIn("error", out)
+        self.assertEqual(c2.queued, [])
+
+    def test_it_refuses_an_unknown_beacon(self):
+        c2 = _StuckC2({"b1": _stuck_agent()})
+        out = self._tool(c2, "try_egress")(beacon_id="nope", attempt="proxy x")
+        self.assertIn("error", out)
+        self.assertEqual(c2.queued, [])
+
+    def test_the_tools_are_offered_to_the_orchestrator_only(self):
+        from software.agent.tools import registry
+
+        names = {s.name for s in registry.specs("executor", (), "full")}
+        self.assertNotIn("get_stuck_beacons", names)
+        self.assertNotIn("try_egress", names)
+
+    def test_they_are_absent_without_a_c2(self):
+        # Every other orchestrator tool must keep working when no C2 is
+        # passed, which is what every existing caller does today.
+        from software.agent.tools import registry
+
+        tools = registry.orchestrator_tools(
+            None, 1, dispatch_single=None, dispatch_parallel=None,
+            tier="full", scope_key="k")
+        names = {t.spec.name for t in tools}
+        self.assertNotIn("get_stuck_beacons", names)
+        self.assertIn("log_score", names)
+
+
+class TestTheOrchestratorOffersThem(unittest.TestCase):
+    """A tool built and never offered is a tool that does not exist."""
+
+    def test_the_orchestrator_passes_its_c2_to_the_tool_registry(self):
+        import inspect
+
+        from software.agent import orchestrator
+
+        src = inspect.getsource(orchestrator)
+        i = src.index("registry.orchestrator_tools(")
+        call = src[i:i + 400]
+        self.assertIn("c2=", call,
+                      "orchestrator_tools is called without a c2, so the "
+                      "egress tools are filtered out and never offered")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -31,6 +31,10 @@ class Context(NamedTuple):
     router: Optional[Any] = None
     dispatch_single: Optional[Callable[..., Awaitable[Any]]] = None
     dispatch_parallel: Optional[Callable[..., Awaitable[Any]]] = None
+    # The fleet, for the tools that read it. None on a run built without
+    # one, and those tools are then not offered rather than offered and
+    # refused -- the same rule `requires_caps` follows.
+    c2: Optional[Any] = None
 
 
 class Entry(NamedTuple):
@@ -50,6 +54,10 @@ class Entry(NamedTuple):
     # it be called and refused: a tool the model never sees costs no turn,
     # and the preamble describes what is offered, so it stays consistent.
     requires_online: bool = False
+    # True for a tool that reads or tasks the fleet, which needs a C2
+    # client in the Context. Declared rather than inferred, so a tool is
+    # never offered and then found to have nothing to talk to.
+    requires_c2: bool = False
 
 
 # Shared by the modules that declare entries.
