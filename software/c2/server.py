@@ -7391,7 +7391,7 @@ async function drawTunnel(panel){
     const shell = row.shell;
     const port = esc(String(shell.port));
     const refusedShell = refusals(shell);
-    return '<div class="pcard-port">team 127.0.0.1:' + port
+    return '<div class="pcard-port">127.0.0.1:' + port
       + '<small>' + esc(String(shell.sessions)) + ' live session(s)'
       + (shell.max_sessions ? ' / ' + esc(String(shell.max_sessions)) : '')
       + '</small>'

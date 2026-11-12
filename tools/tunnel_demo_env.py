@@ -20,20 +20,33 @@ flags mean what `demo_env.py`'s do: `--operator-port` is the GUI and API,
 which is what a capture opens, and `--token` is the operator token it
 authenticates with.
 
+The default token is a well-known constant, `demo-operator-token`, the
+same `demo_env.py` ships. That is acceptable precisely because the
+operator socket is loopback-only: `create_app`'s socket policy binds the
+GUI to 127.0.0.1 and a token readable in this file guards nothing an
+attacker on the host could not already reach. A deployment that is not a
+local capture rig passes its own `--token`.
+
 `--endpoints` runs more than one build, so the panel can be seen with a
 stack of cards, and `--identity` fixes the build name, so a long one can
 be used to see whether it wraps rather than widening the panel. Both have
 defaults that reproduce the single-endpoint capture the plan asks for.
 
 Stays in the foreground until interrupted, printing the operator URL, each
-identity, its assigned shell port and the transcript directory, then stops
-the endpoints and the supervisor on the way out.
+identity, its assigned shell port and the transcript directory. It stops
+the endpoints and the supervisor, and removes its temporary directory, on
+the way out -- for an interrupt (Ctrl-C) and for a `kill`: a tool whose
+whole job is to be started and stopped by hand installs a SIGTERM handler
+so the default terminate-without-unwinding does not leave a tunnel server
+behind holding the implant-facing port.
 """
 
 import argparse
 import base64
 import os
 import pathlib
+import shutil
+import signal
 import socket
 import sys
 import tempfile
@@ -102,7 +115,21 @@ def demo_config(bind_port, socks_first, socks_last, shell_first, shell_last,
     }}}
 
 
-def _register_endpoint(supervisor, config, bind_port, identity):
+def default_demo_config(bind_port, transcript_dir):
+    """`demo_config` with the ranges this script actually ships.
+
+    The seam a test validates: `demo_config` alone is parametric, so a test
+    that passed it literals would leave `_SOCKS_FIRST/_LAST` and
+    `_SHELL_FIRST/_LAST` unread and would stay green if someone edited the
+    shipped constants to overlap. This reads them, so the test is checking
+    what `main` runs and the overlap refusal is exercised against the real
+    defaults. `main` calls this too, so there is one spelling of the ports.
+    """
+    return demo_config(bind_port, _SOCKS_FIRST, _SOCKS_LAST,
+                       _SHELL_FIRST, _SHELL_LAST, transcript_dir)
+
+
+def _register_endpoint(supervisor, bind_port, identity):
     """Mint a build's PSK, register it by hand, and dial a real endpoint.
 
     Returns the `TunnelEndpoint`, already running on its own thread. The
@@ -133,13 +160,26 @@ def _register_endpoint(supervisor, config, bind_port, identity):
 
 
 def _wait_connected(supervisor, count):
-    """Give the endpoints a moment to complete their handshakes."""
+    """Wait for `count` endpoints to connect; say so on stderr if they don't.
+
+    Returns the number connected. A silent return after the timeout would
+    leave the script printing `shell None` and carrying on as though the
+    demo were what it claims, so a shortfall is named on stderr rather than
+    left for the operator to notice in the panel.
+    """
     for _ in range(80):
         rows = supervisor.status().get("endpoints") or []
         connected = [r for r in rows if r.get("state") == "connected"]
         if len(connected) >= count:
-            return
+            return len(connected)
         time.sleep(0.25)
+    rows = supervisor.status().get("endpoints") or []
+    connected = [r for r in rows if r.get("state") == "connected"]
+    if len(connected) < count:
+        print("warning: only %d of %d endpoints connected within 20s; the "
+              "panel will show the rest as not connected"
+              % (len(connected), count), file=sys.stderr)
+    return len(connected)
 
 
 def build_parser():
@@ -156,8 +196,17 @@ def build_parser():
     return parser
 
 
+def _raise_keyboard_interrupt(signum, frame):
+    # SIGTERM's default handler terminates the process without unwinding,
+    # so `finally` never runs and the tunnel child is orphaned holding the
+    # implant-facing port. Turning it into the same exception Ctrl-C raises
+    # routes a `kill` through the one cleanup path below.
+    raise KeyboardInterrupt
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
 
     work = pathlib.Path(tempfile.mkdtemp(prefix="tunnel-demo-"))
     data = work / "data"
@@ -165,52 +214,61 @@ def main(argv=None) -> int:
     transcripts = work / "transcripts"
 
     bind_port = _free_port()
-    config = demo_config(bind_port, _SOCKS_FIRST, _SOCKS_LAST,
-                         _SHELL_FIRST, _SHELL_LAST, str(transcripts))
+    config = default_demo_config(bind_port, str(transcripts))
     block = tunnel_server_config(config)
 
     supervisor = TunnelSupervisor(block, data, cwd=REPO)
-    supervisor.start()
-
     endpoints = []
-    identities = []
-    for index in range(max(1, args.endpoints)):
-        if index == 0 and args.identity:
-            identity = args.identity
-        else:
-            identity = "tun-" + os.urandom(6).hex()
-        identities.append(identity)
-        endpoints.append(_register_endpoint(supervisor, config, bind_port,
-                                             identity))
-
-    _wait_connected(supervisor, len(endpoints))
-
-    app = create_app(ServerCrypto(b"k" * 32), args.token, data,
-                     server_config=config, operator_port=args.operator_port,
-                     tunnel_supervisor=supervisor)
-    server = make_server("127.0.0.1", args.operator_port, app, threaded=True)
-
-    print("operator http://127.0.0.1:%d/  token %s"
-          % (args.operator_port, args.token))
-    rows = {r.get("identity"): r for r in (supervisor.status().get("endpoints")
-                                           or [])}
-    for identity in identities:
-        row = rows.get(identity) or {}
-        print("endpoint %s  shell %s" % (identity, row.get("shell_port")))
-    print("transcripts %s" % transcripts)
-    sys.stdout.flush()
-
+    # The child exists from here on, so cleanup has to cover everything
+    # after it: an exception in `_register_endpoint`, the up-to-20s wait,
+    # `create_app` or `make_server` (a busy --operator-port raises OSError
+    # here) must not leave the tunnel server behind. The `try` opens
+    # immediately after `start`, not after `serve_forever`.
+    supervisor.start()
     try:
+        identities = []
+        for index in range(max(1, args.endpoints)):
+            if index == 0 and args.identity:
+                identity = args.identity
+            else:
+                identity = "tun-" + os.urandom(6).hex()
+            identities.append(identity)
+            endpoints.append(_register_endpoint(supervisor, bind_port,
+                                                 identity))
+
+        _wait_connected(supervisor, len(endpoints))
+
+        app = create_app(ServerCrypto(b"k" * 32), args.token, data,
+                         server_config=config,
+                         operator_port=args.operator_port,
+                         tunnel_supervisor=supervisor)
+        server = make_server("127.0.0.1", args.operator_port, app,
+                             threaded=True)
+
+        print("operator http://127.0.0.1:%d/  token %s"
+              % (args.operator_port, args.token))
+        rows = {r.get("identity"): r
+                for r in (supervisor.status().get("endpoints") or [])}
+        for identity in identities:
+            row = rows.get(identity) or {}
+            print("endpoint %s  shell %s" % (identity, row.get("shell_port")))
+        print("transcripts %s" % transcripts)
+        sys.stdout.flush()
+
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         for endpoint in endpoints:
             endpoint.stop()
-        try:
-            supervisor.stop()
-        except Exception:
-            pass
+        # `stop_all` is the documented shutdown path and never raises: it
+        # tears the child down whether it is running, already dead, or was
+        # never started. `stop()` would raise SupervisorError on a child
+        # that has already died, which an `except: pass` would then have to
+        # swallow -- and swallowing is how a real failure to stop would go
+        # unseen.
+        supervisor.stop_all()
+        shutil.rmtree(work, ignore_errors=True)
     return 0
 
 
