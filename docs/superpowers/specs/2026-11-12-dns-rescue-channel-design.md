@@ -274,8 +274,8 @@ name longer than the ordinary one, which is a signature cost paid once per
 exhaustion and recorded here as deliberate.
 
 **When the name will not fit.** 90 payload characters plus two dots, plus the
-agent label (52 characters for a 32-hex-character id), plus `.r.`, is 146
-characters — leaving **107 for the zone** before the 253-character ceiling. A
+agent label (52 characters for a 32-hex-character id), plus `.r.`, is 147
+characters — leaving **106 for the zone** before the 253-character ceiling. A
 longer zone than that means the rescue **is not sent** and the fact is written
 to the debug log. It is not truncated: a truncated record decrypts to nothing
 and would be indistinguishable, at the server, from an attacker's noise.
