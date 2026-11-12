@@ -21,6 +21,7 @@ import math
 import os
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -183,6 +184,163 @@ class TestTheLabelArithmetic(unittest.TestCase):
         self.assertEqual(dns_rescue.MARKER, "r")
         self.assertNotEqual(dns_rescue.MARKER, "b")
 
+
+
+# ── What the beacon keeps (Task 2) ──
+
+
+def _a_beacon(**protocols):
+    """A beacon with every transport off unless a test turns one on."""
+    from software.c2.beacon import Beacon
+
+    config = {"c2": {
+        "beacon_interval_seconds": 300,
+        "jitter_percent": 0,
+        "encryption_key": base64.b64encode(_KEY).decode(),
+        "proxy": {"mode": "none"},
+        "https": {"enabled": False},
+        "dns": {"enabled": False, "domain": "rescue.example",
+                "resolver": "127.0.0.1"},
+        "smb": {"enabled": False},
+        "quic": {"enabled": False},
+    }}
+    config["c2"].update(protocols)
+    return Beacon(config)
+
+
+class TestTheBeaconKeepsWhatItKnows(unittest.TestCase):
+    def test_a_fresh_beacon_has_an_empty_leg_record(self):
+        beacon = _a_beacon()
+        self.assertEqual(beacon._leg_status, {})
+        self.assertEqual(beacon._rescue_flags, 0)
+
+    def test_an_https_status_is_recorded_with_its_code(self):
+        beacon = _a_beacon(https={"enabled": True})
+
+        class _Resp:
+            status_code = 503
+
+            def json(self):
+                return {}
+
+        class _Session:
+            trust_env = True
+            proxies = {}
+
+            def post(self, *a, **kw):
+                return _Resp()
+
+        beacon._proxy_session = _Session()
+        self.assertIsNone(beacon._beacon_https())
+        self.assertEqual(beacon._leg_status["https"],
+                         (dns_rescue.CLASSES["http_status"], 503))
+
+    def test_a_407_is_recorded_as_authentication_required(self):
+        # The one status this channel exists to carry. _https_post already
+        # logs it specially; now it survives the call.
+        beacon = _a_beacon(https={"enabled": True})
+
+        class _Resp:
+            status_code = 407
+
+            def json(self):
+                return {}
+
+        class _Session:
+            trust_env = True
+            proxies = {}
+
+            def post(self, *a, **kw):
+                return _Resp()
+
+        beacon._proxy_session = _Session()
+        # The existing warning is behaviour worth keeping, so assert it
+        # rather than letting it print into the suite's output.
+        with self.assertLogs("raccoon.c2", level="WARNING") as caught:
+            beacon._beacon_https()
+        self.assertIn("407", "".join(caught.output))
+        self.assertEqual(beacon._leg_status["https"],
+                         (dns_rescue.CLASSES["auth_required"], 407))
+
+    def test_a_dns_query_that_answers_with_no_tasking_records_answered(self):
+        # The distinction the whole rescue rests on: `None` from
+        # _beacon_dns means "the resolver never answered" or "there was
+        # nothing to deliver", and only the recorded class tells them apart.
+        beacon = _a_beacon(dns={"enabled": True, "domain": "rescue.example",
+                                "resolver": "127.0.0.1"})
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query",
+                return_value=[]):
+            self.assertIsNone(beacon._beacon_dns())
+        self.assertEqual(beacon._leg_status["dns"],
+                         (dns_rescue.CLASSES["answered"], 0))
+        self.assertTrue(beacon._rescue_flags & dns_rescue.FLAG_DNS_ANSWERED)
+
+    def test_a_dns_query_that_never_resolves_records_resolve_failed(self):
+        beacon = _a_beacon(dns={"enabled": True, "domain": "rescue.example",
+                                "resolver": "127.0.0.1"})
+        with unittest.mock.patch.object(
+                sys.modules["software.c2.beacon"], "_dns_query",
+                side_effect=OSError("no route")):
+            self.assertIsNone(beacon._beacon_dns())
+        self.assertEqual(beacon._leg_status["dns"],
+                         (dns_rescue.CLASSES["resolve_failed"], 0))
+        self.assertFalse(beacon._rescue_flags & dns_rescue.FLAG_DNS_ANSWERED)
+
+    def test_the_accumulator_is_cleared_at_the_top_of_each_cycle(self):
+        # Without this, a failure from an earlier cycle rides along in a
+        # later rescue and an operator reads a stale reason as current.
+        beacon = _a_beacon()
+        beacon._leg_status["https"] = (dns_rescue.CLASSES["refused"], 0)
+        beacon._rescue_flags = dns_rescue.FLAG_PROXY_FOUND
+        beacon._start_cycle()
+        self.assertEqual(beacon._leg_status, {})
+        self.assertEqual(beacon._rescue_flags, 0)
+
+    def test_what_is_recorded_packs_without_complaint(self):
+        # The record is the only consumer of these pairs, so the classes and
+        # codes the beacon writes must be ones `pack` accepts.
+        beacon = _a_beacon()
+        beacon._leg_status = {
+            "https": (dns_rescue.CLASSES["auth_required"], 407),
+            "dns": (dns_rescue.CLASSES["answered"], 0),
+        }
+        raw = dns_rescue.pack(beacon._leg_status, beacon._rescue_flags)
+        self.assertEqual(dns_rescue.unpack(raw)["https"],
+                         (dns_rescue.CLASSES["auth_required"], 407))
+
+
+class TestTheBeaconsCopyOfTheFormat(unittest.TestCase):
+    """`beacon.py` is served as source text and cannot import the module.
+
+    So it carries a copy, and a copy that drifts is the failure mode this
+    arrangement buys. This is the test that makes the drift loud.
+    """
+
+    def test_the_classes_match(self):
+        from software.c2 import beacon as beacon_mod
+
+        self.assertEqual(beacon_mod._RESCUE_CLASSES, dns_rescue.CLASSES)
+
+    def test_the_flags_match(self):
+        from software.c2 import beacon as beacon_mod
+
+        self.assertEqual(
+            (beacon_mod._RESCUE_FLAG_PROXY_FOUND,
+             beacon_mod._RESCUE_FLAG_DOT1X_SEEN,
+             beacon_mod._RESCUE_FLAG_PORTAL_ANSWERED,
+             beacon_mod._RESCUE_FLAG_DNS_ANSWERED),
+            (dns_rescue.FLAG_PROXY_FOUND, dns_rescue.FLAG_DOT1X_SEEN,
+             dns_rescue.FLAG_PORTAL_ANSWERED, dns_rescue.FLAG_DNS_ANSWERED))
+
+    def test_the_struct_and_marker_match(self):
+        from software.c2 import beacon as beacon_mod
+
+        self.assertEqual(beacon_mod._RESCUE_STRUCT.format,
+                         dns_rescue._STRUCT.format)
+        self.assertEqual(beacon_mod._RESCUE_MARKER, dns_rescue.MARKER)
+        self.assertEqual(beacon_mod._RESCUE_VERSION, dns_rescue.VERSION)
+        self.assertEqual(beacon_mod._RESCUE_TRANSPORTS, dns_rescue.TRANSPORTS)
 
 if __name__ == "__main__":
     unittest.main()
