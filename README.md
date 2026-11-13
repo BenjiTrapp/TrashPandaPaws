@@ -9,7 +9,7 @@
   <a href="https://benjitrapp.github.io/trashpandapaws-network-implant/"><img src="https://img.shields.io/badge/write--up-the%20why%20behind%20it-ff8c00?logo=jekyll&logoColor=white" alt="Write-up"></a>
   <img src="https://img.shields.io/badge/platform-Raspberry%20Pi%204%20%7C%20CM4-c51a4a?logo=raspberrypi&logoColor=white" alt="Platform">
   <img src="https://img.shields.io/badge/OS-ParrotOS%20ARM64-00e5ff?logo=linux&logoColor=white" alt="OS">
-  <a href="docs/C2_DEMO.md"><img src="https://img.shields.io/badge/C2%20Demo-31%20stills%20%2B%202%20GIFs-blueviolet" alt="C2 Demo"></a>
+  <a href="docs/C2_DEMO.md"><img src="https://img.shields.io/badge/C2%20Demo-32%20stills%20%2B%202%20GIFs-blueviolet" alt="C2 Demo"></a>
   <img src="https://img.shields.io/badge/transport-HTTPS%20%7C%20DNS%20%7C%20SMB%20%7C%20QUIC-blue" alt="Transports">
   <img src="https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen" alt="No Dependencies">
   <img src="https://img.shields.io/badge/license-use%20responsibly-red" alt="License">

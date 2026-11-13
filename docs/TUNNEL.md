@@ -286,6 +286,11 @@ mentioned one. Both switches are on the **tunnel server**, in the
 
 ### Attaching to it
 
+Everything needed to attach is on the endpoint's card, which is where the
+port, the password and the two commands below come from:
+
+![The tunnel panel, with one connected endpoint](screenshots/36_tunnel_panel.png)
+
 The port is on the **team server's loopback**, and the panel is usually
 reached over a forward, so the forward comes first:
 
