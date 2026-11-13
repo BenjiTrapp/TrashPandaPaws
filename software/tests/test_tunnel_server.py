@@ -163,10 +163,15 @@ class _CommandPeer(_Peer):
         self._thread = None
 
     def hello(self, identity, implant_id=None, hostname="raccoon-host",
-              os_name="Linux-6.1", features=None):
+              os_name="Linux-6.1", features=None, user=None):
         body = {"identity": identity, "hostname": hostname, "os": os_name}
         if implant_id is not None:
             body["implant_id"] = implant_id
+        # Left out entirely when None, like `features` below: an endpoint
+        # built before the panel needed this sends no `user` key, and a
+        # row that invented one would be the claim this field removes.
+        if user is not None:
+            body["user"] = user
         # Left out entirely when None: an endpoint built before the shell
         # sends no `features` key at all, and that is the case to cover.
         if features is not None:
@@ -366,6 +371,26 @@ class TestRegistration(TunnelServerTestCase):
             document = json.load(handle)
         self.assertEqual(document["ports"]["build-alpha"], row["port"])
         peer.close()
+
+    def test_the_row_carries_the_user_from_the_hello(self):
+        server = self.start_server()
+        self.command_peer(server, "build-alpha", user="root")
+
+        self.assertEqual(self.row(server, "build-alpha")["user"], "root")
+
+    def test_an_endpoint_that_reports_no_user_gets_no_user_invented(self):
+        """An older build says nothing about its user, and must not be read.
+
+        The panel warns an operator about the rights a shell session would
+        have. A default here -- "root", or the empty string rendered as
+        one -- would put that warning on a row nothing had measured, which
+        is the overclaim this field exists to remove. So the absence
+        travels as `None`, and the panel says the build does not report it.
+        """
+        server = self.start_server()
+        self.command_peer(server, "build-alpha")
+
+        self.assertIsNone(self.row(server, "build-alpha")["user"])
 
     def test_the_same_identity_gets_the_same_port_after_a_server_restart(self):
         first = self.start_server()

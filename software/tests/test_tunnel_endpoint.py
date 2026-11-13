@@ -75,6 +75,7 @@ import tempfile
 import threading
 import time
 import traceback
+import pwd
 import unittest
 
 from software.c2 import beacon as beacon_mod
@@ -908,6 +909,30 @@ class TestRegistration(TunnelEndpointTestCase):
         self.assertTrue(status["connected"])
         self.assertEqual(status["egress"], "direct")
         self.assertEqual(status["sessions"], 0)
+
+    def test_the_row_names_the_user_the_endpoint_runs_as(self):
+        """The panel warns about a shell's rights, so it has to know them.
+
+        A shell session has exactly the privileges of the endpoint process
+        that spawned it: root when the endpoint came up from the service
+        unit, and some unprivileged account when a generated build was
+        started by hand. The panel used to state "root shell" for both,
+        which is a claim nothing on the team server could check -- the
+        HELLO carried hostname, OS, crypto and features, and no user.
+
+        So the endpoint reports it, the way it already reports its own
+        hostname rather than being told: from the effective uid, which is
+        what the shell will actually have.
+        """
+        server = self.start_server()
+        self.start_endpoint(self.config_for(server.port))
+
+        row = self.wait_connected(server)
+
+        expected = pwd.getpwuid(os.geteuid()).pw_name
+        self.assertEqual(row["user"], expected,
+                         "the row does not name the user whose rights the "
+                         "shell session would have")
 
     def test_endpoint_sends_the_implant_id_when_the_config_carries_one(self):
         server = self.start_server()

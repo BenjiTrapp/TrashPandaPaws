@@ -1621,10 +1621,44 @@ class TestTheTunnelPanel(unittest.TestCase):
         self.assertIn("Ctrl-]", self.body)
         self.assertIn("socat cannot send a terminal size", self.body)
 
-    def test_the_panel_says_the_session_is_a_root_shell_on_the_implant_host(self):
-        self.assertIn("root shell on the implant host", self.body)
-        warning = self.body.index("root shell on the implant host")
-        window = self.body[warning:warning + 300]
+    def test_the_shell_warning_names_the_rights_it_was_told_about(self):
+        """Three cases, because the panel is only allowed to say what it knows.
+
+        A shell session has the endpoint process's own rights. The panel
+        said "root shell" for every row, which is true of an endpoint
+        started from the service unit and false of a generated build
+        someone ran as themselves -- and nothing on the team server could
+        tell the two apart, because the HELLO carried no user. It does
+        now, so the sentence is chosen rather than asserted:
+
+        * `root` -- the original sentence, and now a measured one.
+        * any other account -- named, and said not to be root.
+        * nothing reported, as from an older build -- said to be
+          unreported, which is the one case where a guess would be the
+          overclaim this field removes.
+        """
+        self.assertIn("row.user === 'root'", self.body,
+                      "the warning does not branch on the reported user, so "
+                      "it is still claiming root for every row")
+        self.assertIn("root shell on the implant host", self.body,
+                      "the root case lost the sentence that is true of it")
+        self.assertIn("esc(row.user)", self.body,
+                      "a user from the far end of the tunnel reaches the "
+                      "page unescaped, or is not named at all")
+        self.assertIn("does not report", self.body,
+                      "a build that reports no user is not said to be "
+                      "unreported")
+
+    def test_every_shell_warning_still_warns_about_the_forward(self):
+        # Whichever sentence the branch above picked, the operator has to
+        # be told what forwarding the port costs: that is the half of the
+        # warning which does not depend on who the shell runs as.
+        warn = self.body.index('"pcard-warn"')
+        window = self.body[warn:warn + 1200]
+        for case in ("root shell on the implant host", "does not report"):
+            self.assertIn(case, window,
+                          "%r is not in the same warning block as the "
+                          "forwarding sentence" % case)
         self.assertIn("Forwarding the port", window)
         self.assertIn("loopback", window)
 

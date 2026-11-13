@@ -265,6 +265,14 @@ root shell on the implant host to whoever holds its password. It is a
 separate secret from the SOCKS credential, minted per identity: a SOCKS
 password handed out for a pivot does not also open this.
 
+**Which user that is, the endpoint reports.** The `HELLO` carries the
+account from the endpoint's effective uid, beside the hostname and OS it
+already reported, and the card names it: `root` gets the sentence above,
+any other account is named and said not to be root, and a build too old
+to report it is called **unreported** rather than assumed. The warning in
+`configs/raccoon.yaml` still names the worst case, because a config file
+is read before any endpoint has said anything.
+
 ### The two switches, both server-side
 
 Nothing opens a root shell port because a config file on the implant

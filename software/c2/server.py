@@ -7407,7 +7407,18 @@ async function drawTunnel(panel){
       + 'enter it at the password prompt): ' + esc(row.shell_password)
       + '</small></div>'
       + '<div class="pcard-warn">'
-      + 'This is a root shell on the implant host. Forwarding the port to '
+      // A session has the endpoint process's rights, and this panel used
+      // to state root for every row. It is a HELLO field now, so the
+      // sentence is chosen: the unreported case is an older build, and
+      // guessing there is the overclaim the field removes.
+      + (row.user === 'root'
+           ? 'This is a root shell on the implant host.'
+           : row.user
+               ? 'This shell runs as ' + esc(row.user) + ' on the implant '
+                 + 'host, with that account\'s rights and not root\'s.'
+               : 'This shell has the endpoint\'s own rights on the implant '
+                 + 'host; this build does not report which user that is.')
+      + ' Forwarding the port to '
       + 'your workstation extends its reach to whatever can reach that '
       + 'workstation\'s loopback.</div>'
       + cmd('The port is on the team server, not on your workstation. From '

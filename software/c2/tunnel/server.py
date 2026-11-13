@@ -355,6 +355,10 @@ class _CommandChannel(object):
         self.implant_id = None      # type: Optional[str]
         self.hostname = None        # type: Optional[str]
         self.os_name = None         # type: Optional[str]
+        # The account the endpoint process runs as, which is what a shell
+        # session there would have. `None` from a build that does not
+        # report it: the panel says so rather than assuming root.
+        self.user = None            # type: Optional[str]
         # Which AES backend the *endpoint* has, as its HELLO reported it.
         # Not this process's: `crypto_path()` answers for the server, and
         # the two halves are different hosts with different libcrypto.
@@ -622,6 +626,7 @@ class TunnelServer(object):
                 "linked": agent is not None,
                 "hostname": channel.hostname if channel is not None else None,
                 "os": channel.os_name if channel is not None else None,
+                "user": channel.user if channel is not None else None,
                 "peer": channel.peer if channel is not None else None,
                 "sessions": len(mine),
                 "bytes_in": before[0] + sum(s.sock.bytes_in for s in counted),
@@ -880,6 +885,7 @@ class TunnelServer(object):
         channel = _CommandChannel(identity, conn, noise, peer)
         channel.hostname = _text(body.get("hostname"))
         channel.os_name = _text(body.get("os"))
+        channel.user = _text(body.get("user"))
         channel.implant_id = _text(body.get("implant_id"))
         channel.crypto = _text(body.get("crypto"))
         channel.features = _features(body.get("features"))
