@@ -3058,17 +3058,40 @@ _SETSID_PATHS = ("/usr/bin/setsid", "/bin/setsid")
 # The rcfile a bash session is started on, held in a pipe and never
 # written anywhere.
 #
-# `bash -i` has to read `/etc/bash.bashrc` and `~/.bashrc`: that is where
-# `bash-completion` is sourced, and completion for the tools on the
-# target is the whole reason for using the target's own shell. Those are
-# also the files most likely to set `HISTFILE` on Debian and ParrotOS, so
-# `HISTFILE` in the environment would be undone by the very files that
-# have to run. Hence the order here: source them, then unset it, then
-# turn history off for the session. What this construction holds is
-# exactly that -- no history file on the target unless something
-# re-enables one *after* rc processing -- and the documentation claims no
-# more than that.
+# `bash -i` has to read `/etc/bash.bashrc` and `~/.bashrc`, because
+# completion for the tools on the target is the whole reason for using
+# the target's own shell. Those are also the files most likely to set
+# `HISTFILE` on Debian and ParrotOS, so `HISTFILE` in the environment
+# would be undone by the very files that have to run. Hence the order
+# here: source them, then unset it, then turn history off for the
+# session. What this construction holds is exactly that -- no history
+# file on the target unless something re-enables one *after* rc
+# processing -- and the documentation claims no more than that.
+#
+# The loader in the middle is there because those two files are *not*
+# where `bash-completion` comes from, however reasonable that sounds.
+# Measured on Debian 13 with bash-completion 2.16: the direct source in
+# `/etc/bash.bashrc` is commented out, the package installs itself
+# through `/etc/profile.d/bash_completion.sh`, and only a **login** shell
+# reads `/etc/profile`. A real interactive ssh session therefore has flag
+# completion and a session here did not -- which left this feature
+# offering what a line-mode REPL would have, the thing the design
+# rejected it for. Only the loader is read, not the rest of `profile.d`:
+# a banner or a locale change from some other script would land in the
+# operator's first screen and in the transcript.
+#
+# Three candidate paths because distributions disagree, each tested for
+# readability before it is read -- an unguarded source would be an error
+# message in every session on a host without the package -- and the whole
+# thing skipped when `/etc/bash.bashrc` already did it.
 _SHELL_RCFILE = ('[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n'
+                 'declare -F _completion_loader >/dev/null 2>&1 ||'
+                 ' for _rc_bc in /etc/profile.d/bash_completion.sh'
+                 ' /usr/share/bash-completion/bash_completion'
+                 ' /etc/bash_completion; do\n'
+                 '  [ -r "$_rc_bc" ] && { . "$_rc_bc"; break; }\n'
+                 'done\n'
+                 'unset _rc_bc\n'
                  '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"\n'
                  'unset HISTFILE\n'
                  'set +o history\n')

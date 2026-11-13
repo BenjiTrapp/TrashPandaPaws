@@ -373,7 +373,7 @@ to know when reading a directory of them:
   made, a symlink in its place, a write that fails — each is logged once
   and the shell runs on.
 
-### Two platform facts
+### Three platform facts
 
 The shell is spawned through **`setsid -c`** where that binary exists,
 which gives the session its terminal as a *controlling* terminal — and
@@ -384,6 +384,20 @@ no `setsid` at all — macOS has none — the session **still runs but has no
 controlling terminal**: job control is off, and Ctrl-C reaches only the
 shell's own line editing rather than the running command. The endpoint
 logs which path it took.
+
+**Completion is the target's own, and flag completion needs one extra
+step that the rcfile takes.** Command and path completion are `readline`'s
+and always there. Flag completion — `ls --col` becoming `ls --color` — is
+`bash-completion`, which is a package, and on Debian and ParrotOS it
+installs itself through `/etc/profile.d/bash_completion.sh`: the direct
+source in `/etc/bash.bashrc` is commented out, and only a **login** shell
+reads `/etc/profile`. A session here is `bash -i`, so the generated rcfile
+sources that loader itself, from the first of three candidate paths it can
+read, and skips the whole thing when the loader is already defined.
+Measured on Debian 13 with bash-completion 2.16: without this, a real
+interactive `ssh` session had flag completion and a session here did not.
+A host without the package keeps command and path completion and loses
+nothing else.
 
 ### What it leaves on the host
 

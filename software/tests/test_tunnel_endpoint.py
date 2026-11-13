@@ -141,6 +141,19 @@ _LINE_START = rb"(?m)^(?:\x1b\[[0-9?;]*[a-zA-Z]|\r)*"
 _HAS_BASH = os.access("/bin/bash", os.X_OK)
 _NO_BASH = "this host has no /bin/bash, so there is no rcfile path to test"
 
+# Flag completion comes from bash-completion, which is a package and not
+# part of bash. A host without it can still run the session, so the two
+# tests that measure the loader skip rather than fail. These are the three
+# places a distribution puts it; Debian 13 ships the first, and its
+# `/etc/bash.bashrc` has the direct source commented out.
+_COMPLETION_LOADERS = ("/etc/profile.d/bash_completion.sh",
+                       "/usr/share/bash-completion/bash_completion",
+                       "/etc/bash_completion")
+_HAS_BASH_COMPLETION = any(os.access(path, os.R_OK)
+                           for path in _COMPLETION_LOADERS)
+_NO_BASH_COMPLETION = ("this host has no bash-completion installed, so "
+                       "there is no loader for a session to pick up")
+
 # A session only has a *controlling* terminal where `setsid(1)` is there
 # to acquire one, which is the endpoint's preferred path; without it the
 # session runs the documented fallback, which has no controlling terminal
@@ -1750,6 +1763,75 @@ class TestAShellSession(TunnelEndpointTestCase):
         self.wait_for(lambda: ".bash_history" not in os.listdir(home),
                       timeout=10.0,
                       what="the session leaving no history file behind")
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    @unittest.skipUnless(_HAS_BASH_COMPLETION, _NO_BASH_COMPLETION)
+    def test_flag_completion_is_loaded_the_way_a_login_shell_loads_it(self):
+        """`nmap --sc<TAB>` has to offer `--script`, as it would over ssh.
+
+        Measured on Debian 13 with bash-completion 2.16: a real
+        interactive ssh session has the loader and this session did not.
+        The reason is that the package installs itself through
+        `/etc/profile.d/bash_completion.sh`, which only a **login** shell
+        reads -- `/etc/bash.bashrc` has the direct source commented out --
+        and a session here is `bash -i` with an rcfile, so neither
+        `/etc/profile` nor anything in `profile.d` is read.
+
+        Flag completion is the property that ruled out a line-mode REPL in
+        the design, so a session without it is the rejected approach
+        wearing a pty.
+
+        The probe prints `$?` rather than a word, because a pty echoes the
+        command line back and a word would be found in the echo before
+        anything had run.
+        """
+        stream = self.ask_for_a_shell()
+
+        data = self.run_in_the_shell(
+            stream,
+            b'declare -F _completion_loader >/dev/null 2>&1;'
+            b' echo "BC""=[$?]"\n',
+            b"BC=[")
+
+        self.assertIn(b"BC=[0]", data,
+                      "bash-completion's loader is not in the session, so "
+                      "an operator gets no flag completion -- the one thing "
+                      "a pty session was supposed to buy over a REPL")
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    @unittest.skipUnless(_HAS_BASH_COMPLETION, _NO_BASH_COMPLETION)
+    def test_loading_completion_does_not_bring_history_back(self):
+        # The rcfile's whole purpose is that history ends up off. Sourcing
+        # a few thousand lines of someone else's shell code before that
+        # happens is a new way for it to come back on, so the two
+        # properties are measured together rather than assumed to compose.
+        stream = self.ask_for_a_shell()
+
+        data = self.run_in_the_shell(
+            stream, b'echo "HIST""=[$(set -o | grep -c \'^history.*on$\')]"\n',
+            b"HIST=[")
+
+        self.assertIn(b"HIST=[0]", data,
+                      "history is on in a session that loaded completion")
+
+    def test_the_rcfile_sources_nothing_it_has_not_checked_for(self):
+        """Every path in the rcfile is read only after a test for it.
+
+        A bare `. /etc/profile.d/bash_completion.sh` on a host without the
+        package is an error message in the first thing an operator sees,
+        on every session, forever. The file is a few lines of generated
+        shell that cannot be tested by running it on a host that lacks
+        exactly the file in question, so the guard is checked as text.
+        """
+        for line in beacon_mod._SHELL_RCFILE.splitlines():
+            if not line.strip().startswith("."):
+                continue
+            self.fail("the rcfile sources %r on its own line, so a host "
+                      "without that file gets an error on every session; "
+                      "guard it with a readability test like the lines "
+                      "above it" % (line.strip(),))
 
     @unittest.skipUnless(_HAS_PTY, _NO_PTY)
     @unittest.skipUnless(_HAS_BASH, _NO_BASH)
