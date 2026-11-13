@@ -1487,15 +1487,25 @@ class TestTheDnsListener(unittest.TestCase):
 
     def test_no_result_path_is_offered(self):
         # The documented limit must not drift into a half-built upstream:
-        # nothing here may accept a result.
+        # nothing here may accept a task's result.
+        #
+        # `relay` used to be banned outright, and that was the right rule
+        # while the channel was download-only. The rescue changed it on
+        # purpose: a beacon with no upstream left sends one encrypted
+        # 14-byte record saying why it is stuck, and it goes through the
+        # same `relay` the SMB and QUIC listeners use. So the rule is now
+        # narrower rather than gone -- a *result* still has no path here,
+        # and `relay` may be reached from exactly one place.
         imported, used = _imports_and_names("software", "c2", "listeners",
                                             "dns.py")
-        for banned in ("_handle_result", "relay"):
-            self.assertNotIn(banned, used,
-                             "dns.py reaches for %s; this channel carries "
-                             "tasking only" % banned)
+        self.assertNotIn("_handle_result", used,
+                         "dns.py reaches for _handle_result; a task's "
+                         "result still has no path over DNS")
         src = _read_source("software", "c2", "listeners", "dns.py")
         self.assertNotIn("action\": \"result", src)
+        self.assertEqual(src.count("relay("), 1,
+                         "dns.py calls relay more than once; the rescue is "
+                         "the single exception to the download-only rule")
 
     def test_the_listener_holds_no_key(self):
         imported, used = _imports_and_names("software", "c2", "listeners",

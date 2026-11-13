@@ -393,7 +393,7 @@ class Campaign:
                     dispatch_single=self._dispatch_single,
                     dispatch_parallel=self._dispatch_parallel,
                     tier=self._agent_cfg.capability_tier,
-                    scope_key=self._scope_key)),
+                    scope_key=self._scope_key, c2=self._c2)),
                 max_turns=self._limits["orchestrator_turns"],
                 conn=self._conn, run_id=self.run_id,
                 caller_context="orchestrator",

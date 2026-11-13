@@ -31,12 +31,13 @@ from typing import List
 
 from software.agent.llm.loop import Tool
 from software.agent.llm.provider import TIER_LIMITS, ToolSpec
-from software.agent.tools import (Context, Entry, memory, recon, scoring,
-                                  scripts, vuln)
+from software.agent.tools import (Context, Entry, egress, memory, recon,
+                                  scoring, scripts, vuln)
 
 # Order is the order the model sees them in.
 _CATALOGUE = (recon.entries() + scripts.entries() + vuln.entries()
-              + memory.entries() + scoring.entries())  # type: List[Entry]
+              + memory.entries() + scoring.entries()
+              + egress.entries())  # type: List[Entry]
 
 
 def _level(tier):
@@ -74,11 +75,17 @@ def executor_tools(router, conn, run_id, *, caps, tier, scope_key,
 
 
 def orchestrator_tools(conn, run_id, *, dispatch_single, dispatch_parallel,
-                       tier, scope_key) -> List[Tool]:
+                       tier, scope_key, c2=None) -> List[Tool]:
     # No caps argument: the orchestrator's tools plan and record, and none of
     # them touches a beacon's hardware.
+    #
+    # `c2` is optional because every caller before the egress tools passed
+    # none, and a tool that needs the fleet is left out rather than offered
+    # and refused -- the same rule `requires_caps` follows for hardware.
     ctx = Context(conn=conn, run_id=run_id, scope_key=scope_key,
                   dispatch_single=dispatch_single,
-                  dispatch_parallel=dispatch_parallel)
-    return [Tool(e.spec, e.build(ctx))
-            for e in _select("orchestrator", (), tier)]
+                  dispatch_parallel=dispatch_parallel, c2=c2)
+    selected = _select("orchestrator", (), tier)
+    if c2 is None:
+        selected = [e for e in selected if not e.requires_c2]
+    return [Tool(e.spec, e.build(ctx)) for e in selected]

@@ -1227,9 +1227,14 @@ class TestKeyMustBeSupplied(unittest.TestCase):
         # the Noise handshake hash, which is a transcript of public
         # material -- protocol name, prologue, ephemeral public keys,
         # ciphertexts -- and derives no key: every Noise key comes out of
-        # `_hkdf`. Neither one has ever seen the callback URL.
+        # `_hkdf`. `_rescue_fingerprint` digests the **agent id** down to
+        # two bytes, because the full id does not fit in a DNS label beside
+        # the rescue record; it leaks strictly less than the ordinary DNS
+        # query, which already carries that id base32-encoded in full, in
+        # the clear, every cycle. None of the three has ever seen the
+        # callback URL.
         self.assertEqual(self._sha256_callers(beacon_mod.__file__),
-                         {"_generate_id", "mix_hash"})
+                         {"_generate_id", "mix_hash", "_rescue_fingerprint"})
 
     # ── Beacon ──
 
