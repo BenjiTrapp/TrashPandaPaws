@@ -4427,7 +4427,7 @@ async function renderAgentView(id){
       <span class="detail">${esc(info.user||'?')}@${esc(info.hostname||'?')} · PID ${esc(info.pid||'?')} · up ${formatUptime(info.uptime||0)}</span>
       ${info.proxy_active ? '<span class="tag" style="background:#1a6e1a">PROXY: '+esc(info.proxy_active)+'</span>' : ''}
       ${info.last_channel === 'dns' ? '<span class="tag" style="background:#6e5a1a" title="The last contact from this agent came over DNS. A task is delivered once and its result is never reported, so queue one here and it will run with no outcome shown. The one thing this agent can still tell you is why it is stuck -- see Stuck below, if it has said.">VIA DNS</span>' : ''}
-      ${info.stuck ? `<div class="ai-warns" style="margin-top:6px"><b>Stuck:</b> ${escHtml(info.stuck.summary)}${info.stuck.dns_answered ? '' : ' <i>(the resolver did not answer, so nothing can leave)</i>'}</div>` : ''}
+      ${info.stuck ? `<div class="ai-warns" style="margin-top:6px"><b>Stuck:</b> ${esc(info.stuck.summary)}${info.stuck.dns_answered ? '' : ' <i>(the resolver did not answer, so nothing can leave)</i>'}</div>` : ''}
       ${info.c2_profile && info.c2_profile.active ? '<span class="tag" style="background:#4a1a6e;cursor:pointer" onclick="showBeaconConfig()" title="Click for details">&#128737; C2 Profile</span>' : '<span class="tag" style="background:#333;opacity:0.5">No C2 Profile</span>'}
     </div>
     <div class="terminal-wrap">

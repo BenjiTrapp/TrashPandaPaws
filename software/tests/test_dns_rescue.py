@@ -19,6 +19,8 @@ import base64
 import json
 import math
 import os
+import socket
+import struct
 import sys
 import unittest
 import unittest.mock
@@ -961,15 +963,157 @@ class TestClassifyingAFailure(unittest.TestCase):
         self.assertIn(self._class_of(hostile), set(dns_rescue.CLASSES.values()))
 
 
-class TestTheOtherLegsRecordToo(unittest.TestCase):
-    """An unrecorded leg packs as `not_attempted`, which is a lie."""
+class _SilentUdp:
+    """A UDP socket that takes a datagram and never answers.
 
-    def test_a_quic_failure_is_recorded(self):
-        beacon = _a_beacon(quic={"enabled": True, "host": "127.0.0.1",
-                                 "port": 1})
-        beacon._beacon_quic()
-        self.assertIn("quic", beacon._leg_status)
-        self.assertNotEqual(beacon._leg_status["quic"][0],
+    This is what a dead QUIC endpoint looks like on Linux: the datagram
+    goes out, the ICMP port-unreachable comes back, and the kernel does
+    not deliver it on an *unconnected* socket -- so there is no
+    exception, only a timeout. macOS does surface it as
+    ConnectionRefusedError, which is why the first version of this test
+    passed there and failed in the VM.
+    """
+
+    def __init__(self):
+        self.sent = []
+
+    def settimeout(self, _):
+        pass
+
+    def sendto(self, data, _addr):
+        self.sent.append(data)
+
+    def recvfrom(self, _n):
+        raise socket.timeout()
+
+    def close(self):
+        pass
+
+
+class _AnsweringUdp(_SilentUdp):
+    """Answers with one well-formed fragment carrying the given bytes."""
+
+    def __init__(self, body: bytes):
+        super().__init__()
+        frame = struct.pack(">I", len(body)) + body
+        self._dgram = struct.pack(">IHH", 1, 0, 1) + frame
+        self._given = False
+
+    def recvfrom(self, _n):
+        if self._given:
+            raise socket.timeout()
+        self._given = True
+        return self._dgram, ("127.0.0.1", 4433)
+
+
+def _with_udp(beacon, sock):
+    """Hand `_quic_send` a socket without touching the real socket module."""
+    stub = unittest.mock.Mock()
+    stub.AF_INET = socket.AF_INET
+    stub.SOCK_DGRAM = socket.SOCK_DGRAM
+    stub.timeout = socket.timeout
+    stub.socket.return_value = sock
+    return unittest.mock.patch.object(
+        sys.modules["software.c2.beacon"], "socket", stub)
+
+
+class TestTheOtherLegsRecordToo(unittest.TestCase):
+    """An unrecorded leg packs as `not_attempted`, which is a lie.
+
+    Found in the ParrotOS VM, not here: these legs recorded their
+    failures only from an `except` branch, and both of them have quiet
+    return paths that reach no exception at all. On Linux those quiet
+    paths are the *normal* ones, so a QUIC endpoint that was tried and
+    timed out was reported to the operator as "not tried".
+    """
+
+    def test_a_quic_timeout_is_recorded_not_left_as_not_attempted(self):
+        # Deterministic on purpose. The earlier version pointed a real
+        # socket at 127.0.0.1:1 and relied on the OS to raise, which is
+        # macOS behaviour and not Linux's.
+        beacon = _a_beacon(quic={"enabled": True, "host": "127.0.0.1:4433"})
+        sock = _SilentUdp()
+        with _with_udp(beacon, sock):
+            self.assertIsNone(beacon._beacon_quic())
+        self.assertTrue(sock.sent, "nothing was even sent")
+        self.assertEqual(beacon._leg_status.get("quic", (None,))[0],
+                         dns_rescue.CLASSES["timed_out"],
+                         "a QUIC leg that was tried and timed out would be "
+                         "reported to the operator as 'not tried'")
+
+    def test_a_quic_answer_that_does_not_decrypt_is_bad_payload(self):
+        beacon = _a_beacon(quic={"enabled": True, "host": "127.0.0.1:4433"})
+        with _with_udp(beacon, _AnsweringUdp(b"not encrypted at all")):
+            self.assertIsNone(beacon._beacon_quic())
+        self.assertEqual(beacon._leg_status.get("quic", (None,))[0],
+                         dns_rescue.CLASSES["bad_payload"])
+
+    def test_a_quic_failure_that_does_raise_is_still_recorded(self):
+        # The path that already worked, kept so a fix to the quiet paths
+        # cannot silently break it.
+        beacon = _a_beacon(quic={"enabled": True, "host": "127.0.0.1:4433"})
+
+        class _Refused(_SilentUdp):
+            def recvfrom(self, _n):
+                raise ConnectionRefusedError(61)
+
+        with _with_udp(beacon, _Refused()):
+            beacon._beacon_quic()
+        self.assertEqual(beacon._leg_status.get("quic", (None,))[0],
+                         dns_rescue.CLASSES["refused"])
+
+    def test_an_smb_pipe_that_answers_nothing_is_recorded(self):
+        beacon = _a_beacon(smb={"enabled": True, "host": "127.0.0.1"})
+
+        class _Sock:
+            def close(self):
+                pass
+
+        with unittest.mock.patch.object(beacon, "_smb_connect",
+                                        lambda: _Sock()), \
+             unittest.mock.patch.object(beacon, "_smb_write_pipe",
+                                        lambda *a, **kw: True), \
+             unittest.mock.patch.object(beacon, "_smb_read_pipe",
+                                        lambda *a, **kw: None):
+            self.assertIsNone(beacon._beacon_smb())
+        self.assertEqual(beacon._leg_status.get("smb", (None,))[0],
+                         dns_rescue.CLASSES["timed_out"])
+
+    def test_an_smb_answer_that_does_not_decrypt_is_bad_payload(self):
+        beacon = _a_beacon(smb={"enabled": True, "host": "127.0.0.1"})
+
+        class _Sock:
+            def close(self):
+                pass
+
+        with unittest.mock.patch.object(beacon, "_smb_connect",
+                                        lambda: _Sock()), \
+             unittest.mock.patch.object(beacon, "_smb_write_pipe",
+                                        lambda *a, **kw: True), \
+             unittest.mock.patch.object(beacon, "_smb_read_pipe",
+                                        lambda *a, **kw: b"not encrypted"):
+            self.assertIsNone(beacon._beacon_smb())
+        self.assertEqual(beacon._leg_status.get("smb", (None,))[0],
+                         dns_rescue.CLASSES["bad_payload"])
+
+    def test_an_smb_exception_is_recorded_like_https_and_quic(self):
+        beacon = _a_beacon(smb={"enabled": True, "host": "127.0.0.1"})
+
+        class _Sock:
+            def close(self):
+                pass
+
+        def boom(*a, **kw):
+            raise ConnectionResetError(54)
+
+        with unittest.mock.patch.object(beacon, "_smb_connect",
+                                        lambda: _Sock()), \
+             unittest.mock.patch.object(beacon, "_smb_write_pipe", boom):
+            self.assertIsNone(beacon._beacon_smb())
+        self.assertIn("smb", beacon._leg_status,
+                      "SMB was the only leg whose except branch recorded "
+                      "nothing at all")
+        self.assertNotEqual(beacon._leg_status["smb"][0],
                             dns_rescue.CLASSES["not_attempted"])
 
     def test_an_smb_write_failure_is_recorded_not_just_the_connect(self):
@@ -1292,9 +1436,122 @@ class TestTheServerDecodesARescue(unittest.TestCase):
         self.assertIn("WRAPPER_KEY", src)
 
 
+def _operator_script(cache={}):
+    """The inline JS of the operator GUI, with literal text removed.
+
+    Removed, because the page is one 200 kB string full of prose: a
+    tooltip that happens to read "Analyze (fast)" looks exactly like a
+    call to a function named `Analyze` to any regex. What is left is
+    code, including the `${...}` expressions inside template literals,
+    which is where the GUI does most of its work.
+    """
+    if "js" in cache:
+        return cache["js"]
+    import re
+
+    from software.c2 import server as server_mod
+
+    blocks = re.findall(r"<script[^>]*>(.*?)</script>",
+                        server_mod._OPERATOR_HTML, re.S)
+    cache["js"] = _strip_js_literals("\n".join(blocks))
+    return cache["js"]
+
+
+def _strip_js_literals(js):
+    """Drop comments and string *contents*, keeping ${...} expressions."""
+    out = []
+    i, n = 0, len(js)
+    while i < n:
+        c = js[i]
+        if c == "/" and js[i + 1:i + 2] == "/":
+            while i < n and js[i] != "\n":
+                i += 1
+        elif c == "/" and js[i + 1:i + 2] == "*":
+            i += 2
+            while i + 1 < n and not (js[i] == "*" and js[i + 1] == "/"):
+                i += 1
+            i += 2
+        elif c in "\"'":
+            quote = c
+            i += 1
+            while i < n and js[i] != quote:
+                i += 2 if js[i] == "\\" else 1
+            i += 1
+            out.append(' "" ')
+        elif c == "`":
+            i += 1
+            while i < n:
+                if js[i] == "\\":
+                    i += 2
+                    continue
+                if js[i] == "`":
+                    i += 1
+                    break
+                if js[i] == "$" and js[i + 1:i + 2] == "{":
+                    i += 2
+                    start, brace = i, 1
+                    while i < n and brace:
+                        brace += {"{": 1, "}": -1}.get(js[i], 0)
+                        i += 1
+                    out.append(" " + js[start:i - 1] + " ")
+                    continue
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+class TestTheTwoGuisDoNotShareHelpers(unittest.TestCase):
+    """The operator page may not call a helper only the agent page has.
+
+    This repository serves two separate front ends: the operator console
+    is one big string inside server.py, and the agent console is
+    static/agent.js. They have escapers that do the same job under
+    different names -- `esc` and `escHtml` -- and nothing stops a line
+    moving between them. When one does, the symptom is not a visible
+    error: the whole render throws, and a panel silently does not
+    appear. That is how `escHtml(info.stuck.summary)` shipped.
+
+    Today this finds exactly one name and nothing else, so it costs no
+    maintenance to keep honest.
+    """
+
+    def _names(self, code):
+        import re
+
+        found = set(re.findall(r"function\s+([A-Za-z_$][\w$]*)", code))
+        found |= set(re.findall(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)",
+                                code))
+        return found
+
+    def test_no_agent_only_helper_is_called_from_the_operator_console(self):
+        import re
+
+        operator = _operator_script()
+        agent = _strip_js_literals(
+            pathlib_Path("software/c2/static/agent.js").read_text())
+
+        called = set(re.findall(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(",
+                                operator))
+        leaked = sorted((called & self._names(agent))
+                        - self._names(operator) - _JS_KEYWORDS)
+        self.assertEqual(leaked, [],
+                         "the operator console calls %s, which only the "
+                         "agent console defines -- the render will throw "
+                         "and the panel will not appear" % leaked)
+
+
+_JS_KEYWORDS = frozenset({
+    "if", "for", "while", "switch", "catch", "return", "function", "var",
+    "let", "const", "new", "typeof", "in", "of", "do", "else", "async",
+    "await", "delete", "void", "instanceof", "throw", "yield", "class",
+    "super", "this", "case", "break", "continue", "try", "finally",
+})
+
+
 class TestWhatTheOperatorSees(unittest.TestCase):
     """Source-level, because the repo has no JS harness. Stated, not implied."""
-
     def setUp(self):
         self.src = pathlib_Path("software/c2/server.py").read_text()
 
@@ -1313,10 +1570,33 @@ class TestWhatTheOperatorSees(unittest.TestCase):
         self.assertIn("ai-warns", block)
         self.assertNotIn("Unavailable", block)
 
-    def test_the_summary_is_escaped(self):
-        # It is derived from a record a target sent.
+    def test_the_summary_is_escaped_with_a_helper_that_exists(self):
+        # The first version of this test asserted `escHtml(...)` -- the
+        # spelling I had invented. It passed, and the panel threw
+        # "escHtml is not defined" in the browser, so an agent with a
+        # stuck record rendered no detail panel at all. escHtml is real,
+        # but it belongs to the *agent* GUI in static/agent.js; the
+        # operator HTML calls its escaper `esc`. Checking a string
+        # against itself is not a check: this asserts the escaper is
+        # applied AND that the name is defined where it is called.
+        import re
+
         i = self.src.index("info.stuck ?")
-        self.assertIn("escHtml(info.stuck.summary)", self.src[i:i + 400])
+        block = self.src[i:i + 400]
+        called = re.search(r"\b([A-Za-z_$][\w$]*)\(info\.stuck\.summary\)",
+                           block)
+        self.assertIsNotNone(called, "the summary is interpolated raw")
+        name = called.group(1)
+        # assertTrue, not assertRegex: the latter echoes the haystack, and
+        # the haystack here is 200 kB of operator console.
+        defined = re.search(
+            r"function\s+%s\s*\(|(?:const|let|var)\s+%s\s*="
+            % (re.escape(name), re.escape(name)), _operator_script())
+        self.assertTrue(
+            defined,
+            "the operator GUI calls %s() on a record a target sent, and "
+            "does not define it -- the panel will throw and not render"
+            % name)
 
     def test_a_dead_resolver_is_called_out(self):
         i = self.src.index("info.stuck ?")
