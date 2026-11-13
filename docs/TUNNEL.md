@@ -447,7 +447,11 @@ row shows the endpoint's as `unreported`, because it arrives with the
 `HELLO` and leaves with the channel.
 
 On a brought-interpreter host the gate is satisfied for free — the
-Windows embeddable distribution ships a real `libcrypto`.
+Windows embeddable distribution ships a real `libcrypto`. On a Linux
+host the loader asks `ctypes.util.find_library` for the library, so a
+refusal on a host that plainly has OpenSSL installed is a question about
+the dynamic linker's search path — `ldconfig -p | grep libcrypto` is the
+check — and not about the package being present.
 
 ---
 

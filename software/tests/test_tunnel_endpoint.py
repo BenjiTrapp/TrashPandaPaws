@@ -124,6 +124,17 @@ _UNRESOLVABLE = "no-endpoint-here.invalid"
 _HAS_PTY = hasattr(os, "openpty")
 _NO_PTY = "this host has no pty support, so it cannot carry a shell session"
 
+# The start of a line as it arrives from a pty, which is not always the
+# character the line begins with. Bash 5 enables bracketed paste and
+# writes the disable sequence immediately before the line it is about to
+# print, so a pattern anchored with `^` against raw pty bytes sees
+# `\x1b[?2004l\r40 120` and misses the value that is plainly there.
+# Measured on Debian 13 with bash 5.2.37; macOS's bash 3.2 does not do
+# it, which is why this surfaced only on the platform this project
+# deploys to. The sequences are allowed rather than stripped, so one
+# pattern can both drive `read_until_match` and be asserted on.
+_LINE_START = rb"(?m)^(?:\x1b\[[0-9?;]*[a-zA-Z]|\r)*"
+
 # Two tests are about bash specifically -- the generated rcfile is a bash
 # construction -- and the rest run on whatever shell the host has.
 _HAS_BASH = os.access("/bin/bash", os.X_OK)
@@ -1536,7 +1547,7 @@ class TestAShellSession(TunnelEndpointTestCase):
 
         # A line that is exactly `/`, not a prompt that happens to carry a
         # slash: the install directory in a prompt is a free finding.
-        self.assertRegex(data, rb"(?m)^/\r?$")
+        self.assertRegex(data, re.compile(_LINE_START + rb"/\r?$"))
 
     @unittest.skipUnless(_HAS_PTY, _NO_PTY)
     def test_the_shell_is_reaped_when_the_stream_dies(self):
@@ -1745,7 +1756,7 @@ class TestAShellSession(TunnelEndpointTestCase):
     # `stty size` reports the terminal's own size, read out of the ioctl
     # the endpoint applied, so it is the size the session really has and
     # not the numbers that were asked for.
-    _SIZE = re.compile(rb"(?m)^(\d+) (\d+)\s*$")
+    _SIZE = re.compile(_LINE_START + rb"(\d+) (\d+)\s*$")
 
     def the_terminal_size(self, stream):
         """The `(rows, cols)` the session's terminal actually has."""
