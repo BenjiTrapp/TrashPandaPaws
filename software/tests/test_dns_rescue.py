@@ -1436,9 +1436,122 @@ class TestTheServerDecodesARescue(unittest.TestCase):
         self.assertIn("WRAPPER_KEY", src)
 
 
+def _operator_script(cache={}):
+    """The inline JS of the operator GUI, with literal text removed.
+
+    Removed, because the page is one 200 kB string full of prose: a
+    tooltip that happens to read "Analyze (fast)" looks exactly like a
+    call to a function named `Analyze` to any regex. What is left is
+    code, including the `${...}` expressions inside template literals,
+    which is where the GUI does most of its work.
+    """
+    if "js" in cache:
+        return cache["js"]
+    import re
+
+    from software.c2 import server as server_mod
+
+    blocks = re.findall(r"<script[^>]*>(.*?)</script>",
+                        server_mod._OPERATOR_HTML, re.S)
+    cache["js"] = _strip_js_literals("\n".join(blocks))
+    return cache["js"]
+
+
+def _strip_js_literals(js):
+    """Drop comments and string *contents*, keeping ${...} expressions."""
+    out = []
+    i, n = 0, len(js)
+    while i < n:
+        c = js[i]
+        if c == "/" and js[i + 1:i + 2] == "/":
+            while i < n and js[i] != "\n":
+                i += 1
+        elif c == "/" and js[i + 1:i + 2] == "*":
+            i += 2
+            while i + 1 < n and not (js[i] == "*" and js[i + 1] == "/"):
+                i += 1
+            i += 2
+        elif c in "\"'":
+            quote = c
+            i += 1
+            while i < n and js[i] != quote:
+                i += 2 if js[i] == "\\" else 1
+            i += 1
+            out.append(' "" ')
+        elif c == "`":
+            i += 1
+            while i < n:
+                if js[i] == "\\":
+                    i += 2
+                    continue
+                if js[i] == "`":
+                    i += 1
+                    break
+                if js[i] == "$" and js[i + 1:i + 2] == "{":
+                    i += 2
+                    start, brace = i, 1
+                    while i < n and brace:
+                        brace += {"{": 1, "}": -1}.get(js[i], 0)
+                        i += 1
+                    out.append(" " + js[start:i - 1] + " ")
+                    continue
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+class TestTheTwoGuisDoNotShareHelpers(unittest.TestCase):
+    """The operator page may not call a helper only the agent page has.
+
+    This repository serves two separate front ends: the operator console
+    is one big string inside server.py, and the agent console is
+    static/agent.js. They have escapers that do the same job under
+    different names -- `esc` and `escHtml` -- and nothing stops a line
+    moving between them. When one does, the symptom is not a visible
+    error: the whole render throws, and a panel silently does not
+    appear. That is how `escHtml(info.stuck.summary)` shipped.
+
+    Today this finds exactly one name and nothing else, so it costs no
+    maintenance to keep honest.
+    """
+
+    def _names(self, code):
+        import re
+
+        found = set(re.findall(r"function\s+([A-Za-z_$][\w$]*)", code))
+        found |= set(re.findall(r"(?:const|let|var)\s+([A-Za-z_$][\w$]*)",
+                                code))
+        return found
+
+    def test_no_agent_only_helper_is_called_from_the_operator_console(self):
+        import re
+
+        operator = _operator_script()
+        agent = _strip_js_literals(
+            pathlib_Path("software/c2/static/agent.js").read_text())
+
+        called = set(re.findall(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(",
+                                operator))
+        leaked = sorted((called & self._names(agent))
+                        - self._names(operator) - _JS_KEYWORDS)
+        self.assertEqual(leaked, [],
+                         "the operator console calls %s, which only the "
+                         "agent console defines -- the render will throw "
+                         "and the panel will not appear" % leaked)
+
+
+_JS_KEYWORDS = frozenset({
+    "if", "for", "while", "switch", "catch", "return", "function", "var",
+    "let", "const", "new", "typeof", "in", "of", "do", "else", "async",
+    "await", "delete", "void", "instanceof", "throw", "yield", "class",
+    "super", "this", "case", "break", "continue", "try", "finally",
+})
+
+
 class TestWhatTheOperatorSees(unittest.TestCase):
     """Source-level, because the repo has no JS harness. Stated, not implied."""
-
     def setUp(self):
         self.src = pathlib_Path("software/c2/server.py").read_text()
 
@@ -1457,10 +1570,33 @@ class TestWhatTheOperatorSees(unittest.TestCase):
         self.assertIn("ai-warns", block)
         self.assertNotIn("Unavailable", block)
 
-    def test_the_summary_is_escaped(self):
-        # It is derived from a record a target sent.
+    def test_the_summary_is_escaped_with_a_helper_that_exists(self):
+        # The first version of this test asserted `escHtml(...)` -- the
+        # spelling I had invented. It passed, and the panel threw
+        # "escHtml is not defined" in the browser, so an agent with a
+        # stuck record rendered no detail panel at all. escHtml is real,
+        # but it belongs to the *agent* GUI in static/agent.js; the
+        # operator HTML calls its escaper `esc`. Checking a string
+        # against itself is not a check: this asserts the escaper is
+        # applied AND that the name is defined where it is called.
+        import re
+
         i = self.src.index("info.stuck ?")
-        self.assertIn("escHtml(info.stuck.summary)", self.src[i:i + 400])
+        block = self.src[i:i + 400]
+        called = re.search(r"\b([A-Za-z_$][\w$]*)\(info\.stuck\.summary\)",
+                           block)
+        self.assertIsNotNone(called, "the summary is interpolated raw")
+        name = called.group(1)
+        # assertTrue, not assertRegex: the latter echoes the haystack, and
+        # the haystack here is 200 kB of operator console.
+        defined = re.search(
+            r"function\s+%s\s*\(|(?:const|let|var)\s+%s\s*="
+            % (re.escape(name), re.escape(name)), _operator_script())
+        self.assertTrue(
+            defined,
+            "the operator GUI calls %s() on a record a target sent, and "
+            "does not define it -- the panel will throw and not render"
+            % name)
 
     def test_a_dead_resolver_is_called_out(self):
         i = self.src.index("info.stuck ?")
