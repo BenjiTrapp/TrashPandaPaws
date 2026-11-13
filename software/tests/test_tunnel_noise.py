@@ -26,6 +26,7 @@ instead.
 """
 
 import unittest
+from unittest import mock
 from contextlib import contextmanager
 
 from software.c2 import beacon as beacon_mod
@@ -680,6 +681,45 @@ class TestNoiseSession(unittest.TestCase):
         with self.assertRaises(ValueError):
             beacon_mod.NoiseSession.responder(b"\x01" * 33,
                                               lambda: [b"\x02" * 32])
+
+
+class TestFindingLibcryptoOnPosix(unittest.TestCase):
+    """`_load_libcrypto` has to resolve the library a POSIX host actually has.
+
+    `ctypes.util.find_library` adds the `lib` prefix itself: the name of
+    libcrypto on Linux is `crypto`, and `find_library("libcrypto")` looks
+    for `liblibcrypto.so`. A candidate list of Windows file stems
+    therefore cannot resolve anything on the platform this project
+    deploys to -- measured on Debian 13 with the system interpreter,
+    `libcrypto.so.3` sat in `/usr/lib/<triplet>/` while
+    `_load_libcrypto()` returned None, so the tunnel refused to start on
+    its own target.
+
+    The resolver is faked rather than probed, so the test says the same
+    thing on every host: the loader is handed a resolver that knows only
+    the POSIX stem, and has to come back with a library.
+    """
+
+    def test_the_loader_resolves_the_bare_posix_stem(self):
+        handle = object()
+        asked = []
+
+        def only_the_posix_stem(name):
+            asked.append(name)
+            return "/usr/lib/libcrypto.so.3" if name == "crypto" else None
+
+        with mock.patch.object(beacon_mod.platform, "system",
+                               return_value="Linux"), \
+                mock.patch("ctypes.util.find_library",
+                           side_effect=only_the_posix_stem), \
+                mock.patch("ctypes.CDLL", return_value=handle), \
+                mock.patch("os.listdir", return_value=[]):
+            loaded = beacon_mod._load_libcrypto()
+
+        self.assertIs(loaded, handle,
+                      "the loader asked for %s and gave up; a POSIX host "
+                      "names this library 'crypto'" % (asked,))
+        self.assertIn("crypto", asked)
 
 
 if __name__ == "__main__":

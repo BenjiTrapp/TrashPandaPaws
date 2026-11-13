@@ -116,7 +116,14 @@ def _load_libcrypto():
                     return ctypes.CDLL(p)
                 except OSError:
                     continue
-    for name in ("libcrypto-3", "libcrypto-3-x64", "libcrypto-1_1",
+    # `crypto` first, and it is not a typo: `find_library` adds the `lib`
+    # prefix itself, so the POSIX name of this library is the bare stem and
+    # `find_library("libcrypto")` looks for `liblibcrypto.so`. Without it
+    # every candidate below is a Windows file stem, which is how a Debian
+    # host with `libcrypto.so.3` in /usr/lib/<triplet>/ ended up on the
+    # pure-Python cipher -- and therefore with a tunnel that refused to
+    # start on this project's own target platform.
+    for name in ("crypto", "libcrypto-3", "libcrypto-3-x64", "libcrypto-1_1",
                  "libcrypto-1_1-x64", "libcrypto"):
         path = ctypes.util.find_library(name)
         if path:
