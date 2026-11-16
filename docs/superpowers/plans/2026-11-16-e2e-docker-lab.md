@@ -94,9 +94,13 @@ def test_the_payload_travels_on_stdin_through_a_shell_builtin(self):
     self.assertTrue(one.startswith("printf %s \""), one[:40])
 
 def test_the_quoting_invariant_still_holds(self):
-    stage = self.generate(1)["oneliner_unix"]
+    # The one-liner gains a pipe and keeps its double quotes; what must
+    # stay absent is what would make the double-quoted form unsafe.
+    # `printf %s` puts the format in its own argument, so a `%` inside
+    # the stage is data and not a directive.
+    one = self.generate(1)["oneliner_unix"]
     for forbidden in ("$", "`", "\\"):
-        self.assertNotIn(forbidden, stage)
+        self.assertNotIn(forbidden, one)
 ```
 
 Keep the existing `test_a_real_shell_hands_the_stage_over_as_one_argument`, renaming it to `test_a_real_shell_delivers_the_stage_to_python` and changing its `subprocess.run` to execute the one-liner as a **script** (`["sh", scriptpath]` with the one-liner as the file's only line), not as `sh -c <command>` — passing it to `-c` makes the whole line one argv entry and reintroduces the limit the artifact no longer has.
@@ -149,16 +153,32 @@ def test_stop_shuts_the_listener_down_before_closing_it(self):
     # bound and ACCEPTING until it returns. So on Linux the operator
     # stops the relay and the target keeps an open port. shutdown()
     # wakes a blocked accept on both platforms; close() alone does not.
+    #
+    # A recording proxy on `relay._server`, not a monkeypatch on the
+    # socket: socket objects use __slots__ and reject attribute
+    # assignment (measured), and this way the test pins the ORDER, which
+    # is the whole property -- shutdown after close would fix nothing.
+    class _Recorder:
+        def __init__(self, inner):
+            self._inner, self.calls = inner, []
+
+        def shutdown(self, how):
+            self.calls.append("shutdown")
+            return self._inner.shutdown(how)
+
+        def close(self):
+            self.calls.append("close")
+            return self._inner.close()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
     relay = self._setup()
-    calls = []
-    real_shutdown = relay._server.shutdown
-    real_close = relay._server.close
-    relay._server.shutdown = lambda how: (calls.append("shutdown"),
-                                          real_shutdown(how))[1]
-    relay._server.close = lambda: (calls.append("close"), real_close())[1]
+    recorder = _Recorder(relay._server)
+    relay._server = recorder
     relay.stop()
     self.relay = None
-    self.assertEqual(calls, ["shutdown", "close"])
+    self.assertEqual(recorder.calls, ["shutdown", "close"])
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
@@ -401,7 +421,9 @@ def test_dnsmasq_keeps_its_cache(self):
     # defect worth catching, so turning the cache off would hide it.
 ```
 
-Parse the compose file with `yaml` if the suite already has it, otherwise with a small reader in the test; check `software/tests/requirements.txt` first and do not add a dependency for this.
+Parse the compose file with `yaml` — PyYAML 6.0.3 is installed and
+`software/requirements.txt` already requires `pyyaml>=6.0`, so this adds no
+dependency. Do not hand-roll a reader.
 
 - [ ] **Step 2: Run them to verify they fail**
 
