@@ -712,15 +712,37 @@ class CiTests(unittest.TestCase):
         # should be able to tell which broke.
         self.assertEqual(set(self.doc["jobs"]), {"tests", "lab"})
 
+    def _steps(self, job):
+        """Every step of a job, as structure rather than as text.
+
+        Asserting against the file's raw text is how three of these tests
+        shipped broken: the words `node`, `ffmpeg` and `3.9` all appear in
+        the comments that explain why they matter, so removing the step
+        they describe left every one of them green. Measured -- deleting
+        the `setup-node` step passed all ten CI tests. The parsed steps
+        cannot lie that way.
+        """
+        return self.doc["jobs"][job]["steps"]
+
+    def _uses(self, job):
+        return [step.get("uses", "") for step in self._steps(job)]
+
+    def _run_scripts(self, job):
+        return "\n".join(step.get("run", "") for step in self._steps(job))
+
     def test_ci_installs_the_three_packages_the_suite_needs(self):
         # Measured: without git, ffmpeg and procps the suite reports 19
         # errors and 6 failures that say nothing about the code -- the
         # requirements-floor and leak-walk tests shell out to git, the
         # figure tools encode with ffmpeg, and the supervisor and tunnel
         # spawn tests read a child's command line with ps.
+        installs = self._run_scripts("tests")
         for package in ("git", "ffmpeg", "procps"):
             with self.subTest(package=package):
-                self.assertIn(package, self.text)
+                self.assertRegex(
+                    installs, r"apt-get install[^\n]*(\\\s*\n[^\n]*)*\b%s\b"
+                              % re.escape(package),
+                    "%s is named in prose but never installed" % package)
 
     def test_ci_provides_node(self):
         # The hard input from the notification task: its dedupe and
@@ -728,13 +750,31 @@ class CiTests(unittest.TestCase):
         # node they SKIP SILENTLY and the logic this branch added goes
         # unverified while the job still reports green. That is the exact
         # failure mode the lab exists to prevent.
-        self.assertIn("node", self.text.lower())
+        #
+        # Asserted against the step, not the file's text, because the word
+        # `node` is also in the comment above that step -- and the first
+        # version of this test passed with the step deleted.
+        self.assertTrue(
+            any(use.startswith("actions/setup-node") for use in
+                self._uses("tests")),
+            "no setup-node step: several tests would skip silently and the "
+            "job would report green over logic it never ran")
+        self.assertRegex(self._run_scripts("tests"), r"\bnode\b",
+                         "nothing proves node is actually on PATH, so a "
+                         "failed setup would surface as a silent skip")
 
     def test_ci_pins_the_python_the_suite_is_documented_for(self):
         # software/tests/requirements.txt says the suite runs in a 3.9 venv
         # and has only ever run against it. Testing a version nobody
         # develops against would report failures nobody asked for.
-        self.assertIn("3.9", self.text)
+        for job in ("tests", "lab"):
+            with self.subTest(job=job):
+                versions = [str(step.get("with", {}).get("python-version"))
+                            for step in self._steps(job)
+                            if step.get("uses", "").startswith(
+                                "actions/setup-python")]
+                self.assertEqual(versions, ["3.9"],
+                                 "%s does not pin python 3.9" % job)
 
     def test_the_tests_job_runs_the_whole_suite_the_documented_way(self):
         body = yaml.dump(self.doc["jobs"]["tests"])

@@ -70,12 +70,21 @@ jobs:
       # ── node is not optional ──
       #
       # Several tests are @skipUnless(shutil.which("node")), including the
-      # operator console's notification dedupe and batching, which run the
-      # page's real JavaScript. Without node they SKIP SILENTLY and the job
-      # still reports green over logic it never executed -- which is the
-      # exact failure mode this whole workflow exists to prevent. So node
-      # is installed deliberately and its absence is a setup failure rather
-      # than a quiet gap.
+      # operator console's notification dedupe, batching and escaping,
+      # which run the page's real JavaScript. Without node they SKIP
+      # SILENTLY and the job still reports green over logic it never
+      # executed -- which is the exact failure mode this whole workflow
+      # exists to prevent.
+      #
+      # Measured rather than asserted, with node hidden from PATH and
+      # ffmpeg, git and ps left in place: test_c2_hardening,
+      # test_dns_rescue and test_brand_assets run 294 tests and report
+      # `OK` either way -- 0 skips with node, **17 skips without**, seven
+      # of them the notification tests above. Green both times.
+      #
+      # So node is installed deliberately, and the step below proves it is
+      # on PATH, which turns a failed setup into a loud error instead of a
+      # quiet gap.
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
