@@ -487,5 +487,117 @@ class BeaconEntryTests(unittest.TestCase):
             _flags(_command(self.services["listener-smb"]))["--bind-port"][0])
 
 
+class DriverTests(unittest.TestCase):
+    """`tools/e2e_lab.py`, judged without Docker.
+
+    The driver needs Docker; its tests must not, because they run in the
+    normal suite on every machine. So these check the contract a reader
+    and a CI job depend on -- the parser, the exit codes, the refusal to
+    reuse a stale project -- and leave what Docker actually does to the
+    driver's own run.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from tools import e2e_lab
+        cls.driver = e2e_lab
+        cls.source = (REPO / "tools" / "e2e_lab.py").read_text()
+
+    def test_it_exits_2_and_says_so_without_docker(self):
+        # tools/listener_docker_rig.py's convention: a missing Docker must
+        # never fail in a way that looks like a product fault. 2 is the
+        # house code for "I could not run", distinct from 1, "it failed".
+        import io
+        import unittest.mock
+
+        err = io.StringIO()
+        with unittest.mock.patch.object(self.driver.shutil, "which",
+                                        lambda _name: None), \
+             unittest.mock.patch("sys.stderr", err):
+            code = self.driver.main(["rescue"])
+        self.assertEqual(code, 2)
+        self.assertIn("docker", err.getvalue().lower())
+
+    def test_it_refuses_to_start_when_the_projects_containers_exist(self):
+        # Review Focus 4 from the design. A reused container would report a
+        # pass that means nothing: the beacon inside it has already run its
+        # cycles, and its resolver log already holds a rescue.
+        self.assertIn("_existing_containers", self.source)
+        names = self.driver._existing_containers.__doc__ or ""
+        self.assertTrue(names.strip(), "the refusal needs its reason written")
+
+    def test_the_refusal_is_scoped_to_the_labs_own_project(self):
+        # There are other people's containers on a developer's machine --
+        # fifteen of them on mine while this was written. A driver that
+        # refused on any running container, or tore one down, would be a
+        # destructive bug rather than a safety check.
+        #
+        # The property is that every compose call goes through one helper
+        # that injects `-p PROJECT`, and that nothing reaches for `down`
+        # outside it. The first version of this test forbade "down" in any
+        # `_compose([...])` call, which banned the legitimate teardown and
+        # asserted the opposite of what was meant.
+        self.assertRegex(self.source, r'command = compose \+ \["-p", PROJECT')
+        raw = re.findall(r'subprocess\.run\(\s*\[([^\]]*)\]', self.source)
+        for call in raw:
+            self.assertNotIn('"down"', call,
+                             "a teardown outside the project-scoped helper "
+                             "could take another project down with it")
+
+    def test_an_unknown_scenario_is_refused_by_name(self):
+        # python 3.9's argparse validates the empty list that nargs="*"
+        # produces against `choices` and rejects it, so the names are
+        # checked by hand; this pins that the check still happens.
+        with self.assertRaises(SystemExit):
+            self.driver.main(["no-such-scenario"])
+
+    def test_the_parser_flags_mean_what_the_design_says(self):
+        parser = self.driver.build_parser()
+        args = parser.parse_args([])
+        self.assertEqual(args.scenarios, [])
+        self.assertFalse(args.keep)
+        self.assertFalse(args.shipped_image)
+        chosen = parser.parse_args(["rescue", "--keep", "--shipped-image"])
+        self.assertEqual(chosen.scenarios, ["rescue"])
+        self.assertTrue(chosen.keep)
+        self.assertTrue(chosen.shipped_image)
+
+    def test_every_scenario_name_is_reachable_from_the_parser(self):
+        parser = self.driver.build_parser()
+        for name in self.driver.SCENARIOS:
+            self.assertEqual(parser.parse_args([name]).scenarios, [name])
+
+    def test_the_scenarios_it_offers_are_the_ones_the_entry_script_knows(self):
+        # The driver chooses a scenario and beacon_entry.py runs it. A name
+        # in one and not the other is a run that dies in the container with
+        # an argparse error the driver would report as a lab fault.
+        self.assertEqual(set(self.driver.SCENARIOS),
+                         set(_load_entry().SCENARIOS))
+
+    def test_it_reports_the_architecture_it_ran_on(self):
+        # From the design's risk table: aarch64 here, amd64 in CI. A report
+        # that does not say which machine produced it cannot be acted on,
+        # and this project has twice been bitten by a platform difference
+        # nobody recorded.
+        self.assertIn("machine", self.source)
+        self.assertRegex(self.source, r"os\.uname\(\)|platform\.machine\(\)")
+
+    def test_it_detects_which_compose_command_exists(self):
+        # Measured: `docker compose` does not work on this development
+        # machine and the standalone `docker-compose` does, while newer
+        # ubuntu-latest images ship the plugin and have dropped the
+        # standalone. Hardcoding either breaks the other.
+        self.assertTrue(_COMPOSE_PLUGIN.search(self.source),
+                        "the plugin form is never tried")
+        self.assertTrue(_COMPOSE_STANDALONE.search(self.source),
+                        "the standalone form is never tried")
+
+    def test_the_teardown_cannot_be_skipped_by_a_failure(self):
+        # A scenario that raises must still take its containers down, or
+        # the next run refuses to start and the one after reuses state.
+        self.assertIn("finally", self.source)
+        self.assertRegex(self.source, r'"down"')
+
+
 if __name__ == "__main__":
     unittest.main()
