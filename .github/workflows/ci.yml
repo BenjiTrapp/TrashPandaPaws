@@ -1,0 +1,150 @@
+# This repository had no CI at all until this file, and the reason it has
+# one now is a measurement: four defects shipped in the DNS rescue channel
+# and a 3528-test suite found none of them. Two of the four could not
+# surface on macOS at all -- a dead QUIC endpoint raises on Darwin and
+# merely times out on Linux, and Linux refuses an argv entry over 131072
+# bytes where Darwin has no such limit. The suite had never run on Linux.
+#
+# Two jobs, not one. They fail for different reasons, and a reader looking
+# at a red run should be able to tell which broke without opening it: the
+# suite is the primary guard, and the lab covers what unit tests
+# structurally cannot.
+#
+# Neither job takes a secret. The lab generates its AES key per run with
+# os.urandom, and a workflow that referenced `secrets.` would be a standing
+# invitation to add one.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── The suite ──
+  #
+  # Python 3.9 because software/tests/requirements.txt says the suite runs
+  # in a 3.9 venv and has only ever run against it. Testing a version
+  # nobody develops against would report failures nobody asked for.
+  tests:
+    name: suite (python 3.9, linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The requirements-floor and leak-walk tests shell out to git and
+          # read what is TRACKED, so a shallow clone with no history is
+          # fine but a detached blobless one is not.
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      # ── Three packages, each with a measured consequence ──
+      #
+      # Without them the suite reports 19 errors and 6 failures that say
+      # nothing whatever about the code. Measured in a python:3.9-slim
+      # container before this file existed:
+      #
+      #   git      the requirements-floor and leak-walk tests shell out to
+      #            it; 4 errors without it
+      #   ffmpeg   the figure and GIF tools encode with it; 9 errors and
+      #            2 failures
+      #   procps   `ps`, which the supervisor and tunnel-spawn tests read a
+      #            child's command line with; 5 errors and 1 failure
+      #
+      # Delete one and the run goes red for a reason that looks like a
+      # product fault. That is why each is named here.
+      - name: System packages the suite shells out to
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            git ffmpeg procps bash-completion util-linux
+
+      # ── node is not optional ──
+      #
+      # Several tests are @skipUnless(shutil.which("node")), including the
+      # operator console's notification dedupe and batching, which run the
+      # page's real JavaScript. Without node they SKIP SILENTLY and the job
+      # still reports green over logic it never executed -- which is the
+      # exact failure mode this whole workflow exists to prevent. So node
+      # is installed deliberately and its absence is a setup failure rather
+      # than a quiet gap.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Prove the environment provides what the suite needs
+        run: |
+          set -eu
+          for tool in git ffmpeg ps node setsid; do
+            command -v "$tool" >/dev/null || { echo "missing: $tool" >&2; exit 1; }
+          done
+          python3 -c "import sys; assert sys.version_info[:2] == (3, 9), sys.version"
+          echo "arch: $(uname -m), $(uname -s)"
+
+      - name: Install the suite's dependencies
+        run: python3 -m pip install -r software/tests/requirements.txt
+
+      # The documented invocation, unchanged: pytest is not installed and
+      # the suite is not written for it.
+      - name: The suite
+        run: python3 -m unittest discover -s software/tests -t .
+
+      # On Linux the suite runs MORE than it does on a developer's Mac: the
+      # shell-session tests that skip on Darwin for want of setsid(1) take
+      # the real path here, and their own skip message says the fallback
+      # "really has no ^C" on the deployment target. A count that silently
+      # dropped would hide a module that stopped importing, which has
+      # happened here before -- 26 reported errors once hid 968 tests that
+      # never ran.
+      - name: Report what actually ran
+        if: always()
+        run: |
+          python3 -m unittest discover -s software/tests -t . 2>&1 \
+            | tail -3 || true
+
+  # ── The lab ──
+  #
+  # The integration proof: a beacon whose transports fail because they do
+  # not route, through a real recursive resolver, on Linux. Separate from
+  # the suite because it needs Docker and because a red lab means something
+  # different from a red suite.
+  lab:
+    name: end-to-end lab (docker, linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      # The driver detects which compose spelling exists rather than
+      # hardcoding one: `docker compose` is the plugin form these runners
+      # ship, while the project's development machine has only the
+      # standalone `docker-compose`. Both were measured.
+      - name: What docker and compose are here
+        run: |
+          docker --version
+          docker compose version || docker-compose version
+          echo "arch: $(uname -m)"
+
+      - name: Build the lab's images
+        run: |
+          docker compose -p raccoon-lab \
+            -f software/tests/lab/docker-compose.yml --profile smb build
+
+      # Exit 2 means "I could not run" and is distinct from 1, "it failed".
+      # If Docker were missing the driver would say so and exit 2 rather
+      # than failing in a way that looks like a product fault -- but on
+      # this runner it is present, so a 2 here is itself a finding.
+      - name: Every scenario
+        run: python3 tools/e2e_lab.py

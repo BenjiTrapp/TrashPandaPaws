@@ -680,5 +680,95 @@ class ScenarioTests(unittest.TestCase):
                     "%s asserts nothing about the outcome" % name)
 
 
+WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
+
+
+class CiTests(unittest.TestCase):
+    """The workflow, which is the only thing that runs any of this on Linux.
+
+    This repository had no CI at all until now, and the whole argument for
+    the lab is that two of the four defects it chases could not surface on
+    macOS. A workflow that silently skipped the Linux-only paths would
+    report green over exactly what it exists to cover, so what it provides
+    is asserted here rather than assumed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # Deliberately not a skip. A missing workflow is the failure this
+        # class exists to catch: skipping would mean that deleting CI makes
+        # its guard disappear with it, which is the same silent-green
+        # failure the node check below is about.
+        cls.text = WORKFLOW.read_text() if WORKFLOW.exists() else ""
+        cls.doc = yaml.safe_load(cls.text) if cls.text else {"jobs": {}}
+
+    def test_the_workflow_exists(self):
+        self.assertTrue(WORKFLOW.exists(),
+                        "this repository's only Linux coverage is the "
+                        "workflow at %s" % WORKFLOW.relative_to(REPO))
+
+    def test_the_workflow_parses_and_has_both_jobs(self):
+        # Two jobs, not one: they fail for different reasons and a reader
+        # should be able to tell which broke.
+        self.assertEqual(set(self.doc["jobs"]), {"tests", "lab"})
+
+    def test_ci_installs_the_three_packages_the_suite_needs(self):
+        # Measured: without git, ffmpeg and procps the suite reports 19
+        # errors and 6 failures that say nothing about the code -- the
+        # requirements-floor and leak-walk tests shell out to git, the
+        # figure tools encode with ffmpeg, and the supervisor and tunnel
+        # spawn tests read a child's command line with ps.
+        for package in ("git", "ffmpeg", "procps"):
+            with self.subTest(package=package):
+                self.assertIn(package, self.text)
+
+    def test_ci_provides_node(self):
+        # The hard input from the notification task: its dedupe and
+        # batching tests are @skipUnless(shutil.which("node")), so without
+        # node they SKIP SILENTLY and the logic this branch added goes
+        # unverified while the job still reports green. That is the exact
+        # failure mode the lab exists to prevent.
+        self.assertIn("node", self.text.lower())
+
+    def test_ci_pins_the_python_the_suite_is_documented_for(self):
+        # software/tests/requirements.txt says the suite runs in a 3.9 venv
+        # and has only ever run against it. Testing a version nobody
+        # develops against would report failures nobody asked for.
+        self.assertIn("3.9", self.text)
+
+    def test_the_tests_job_runs_the_whole_suite_the_documented_way(self):
+        body = yaml.dump(self.doc["jobs"]["tests"])
+        self.assertIn("unittest discover -s software/tests -t .", body)
+
+    def test_the_lab_job_runs_the_driver(self):
+        body = yaml.dump(self.doc["jobs"]["lab"])
+        self.assertIn("tools/e2e_lab.py", body)
+
+    def test_ci_passes_no_secret_to_either_job(self):
+        # The lab generates its key per run with os.urandom, and nothing
+        # here needs a credential. What must be absent is a REFERENCE --
+        # `${{ secrets.X }}` is the only way a workflow reads one -- and
+        # not the word: the first version of this test forbade the string
+        # "secrets." and was failed by the comment in the workflow
+        # explaining why there are none. assertNotIn also echoed the whole
+        # file into the failure, which is why this reports a count.
+        references = re.findall(r"\$\{\{\s*secrets\.", self.text)
+        self.assertEqual(references, [],
+                         "the workflow reads %d secret(s); the lab needs "
+                         "none and a reference is a standing invitation to "
+                         "add more" % len(references))
+
+    def test_both_jobs_run_on_linux(self):
+        for job in ("tests", "lab"):
+            with self.subTest(job=job):
+                self.assertIn("ubuntu", self.doc["jobs"][job]["runs-on"])
+
+    def test_the_workflow_says_why_the_packages_are_there(self):
+        # Three apt packages with no reason beside them are three packages
+        # the next person deletes. Each measured consequence is named.
+        self.assertRegex(self.text, r"#.*ffmpeg|ffmpeg.*#")
+        self.assertIn("skip", self.text.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
