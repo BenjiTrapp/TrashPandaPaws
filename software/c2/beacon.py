@@ -2097,6 +2097,18 @@ class _NtlmProxyRelay:
     def stop(self):
         self._running = False
         if self._server:
+            # close() alone does not wake an accept() blocked in another
+            # thread: closing a descriptor someone is blocked on is undefined
+            # in POSIX. macOS wakes it anyway (and there shutdown() raises
+            # ENOTCONN on a listener, so close() does the waking); Linux
+            # leaves the socket bound and still accepting until accept()
+            # returns, so a stopped relay would keep an open port on the
+            # target. shutdown() is what wakes it there. It can raise --
+            # teardown must not, and close() below still runs.
+            try:
+                self._server.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
             try:
                 self._server.close()
             except Exception:
