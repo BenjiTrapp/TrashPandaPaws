@@ -480,11 +480,12 @@ class TestGeneratedArtifactKeepsItsSource(unittest.TestCase):
 
     @staticmethod
     def artifact(body):
-        """The Python inside `python3 -c "..."`, without the quoting."""
-        prefix = 'python3 -c "'
+        """The Python inside `printf %s "..." | python3 -`, unquoted."""
+        prefix = 'printf %s "'
+        suffix = '" | python3 -'
         one = body["oneliner_unix"]
-        assert one.startswith(prefix) and one.endswith('"'), one[:80]
-        return one[len(prefix):-1]
+        assert one.startswith(prefix) and one.endswith(suffix), one[:80]
+        return one[len(prefix):-len(suffix)]
 
     @staticmethod
     def run_artifact(code):
@@ -527,8 +528,8 @@ class TestGeneratedArtifactKeepsItsSource(unittest.TestCase):
 
     # ── tests ──
 
-    def test_the_one_liners_reach_a_minus_c_through_three_parsers(self):
-        """One text that `sh -c`, `cmd.exe` and `Invoke-Expression` agree on.
+    def test_the_one_liners_reach_their_interpreter_through_three_parsers(self):
+        """One text that `sh`, `cmd.exe` and `Invoke-Expression` agree on.
 
         The defect this holds: the stage used to carry
         `globals()["_src"]` and `b64decode("...")` while the Windows
@@ -539,17 +540,22 @@ class TestGeneratedArtifactKeepsItsSource(unittest.TestCase):
         `NameError`. The Windows stager is the first Windows consumer for
         which length is not the blocker, so this is what its
         probe-found-a-Python path runs.
+
+        The Unix form is `printf %s "<stage>" | python3 -`, so the stage
+        is `printf`'s argument and python reads it from stdin; the
+        Windows form is still `python -c "<stage>"`.
         """
         body = self.generate(1)
-        for key, program in (("oneliner_unix", "python3"),
-                             ("oneliner_win", "python")):
+        forms = (("oneliner_unix", 'printf %s "', '" | python3 -'),
+                 ("oneliner_win", 'python -c "', '"'))
+        for key, prefix, suffix in forms:
             with self.subTest(key=key):
                 one = body[key]
-                prefix = program + ' -c "'
-                self.assertTrue(one.startswith(prefix) and one.endswith('"'),
-                                "%s is not a double-quoted -c: %s"
-                                % (key, one[:80]))
-                stage = one[len(prefix):-1]
+                self.assertTrue(
+                    one.startswith(prefix) and one.endswith(suffix),
+                    "%s is not the expected double-quoted form: %s"
+                    % (key, one[:80]))
+                stage = one[len(prefix):-len(suffix)]
                 # What makes the double-quoted form safe in all three
                 # languages. base64's alphabet has none of these and
                 # neither does the alias, so this is a property the
@@ -560,40 +566,86 @@ class TestGeneratedArtifactKeepsItsSource(unittest.TestCase):
                 self.assertEqual(hostile, [],
                                  "%s carries %r, which one of the three "
                                  "parsers would act on" % (key, hostile))
-                for what, argv in (("a POSIX shell", shlex.split(one)),
-                                   ("CommandLineToArgvW", _argv_w(one))):
+                if key == "oneliner_unix":
+                    expected = [("a POSIX shell", shlex.split(one),
+                                 ["printf", "%s", stage, "|", "python3",
+                                  "-"])]
+                else:
+                    expected = [("a POSIX shell", shlex.split(one),
+                                 ["python", "-c", stage]),
+                                ("CommandLineToArgvW", _argv_w(one),
+                                 ["python", "-c", stage])]
+                for what, argv, want in expected:
                     # `assertTrue`, not `assertEqual`: the stage is 115 KB
                     # and a diff of it is not a readable failure.
                     self.assertTrue(
-                        argv == [program, "-c", stage],
-                        "%s does not hand %s over as one -c argument: %d "
-                        "arguments, the last of them %d characters against "
-                        "the stage's %d"
-                        % (what, key, len(argv), len(argv[-1]), len(stage)))
+                        argv == want,
+                        "%s does not hand %s over with the stage as one "
+                        "argument: %d arguments, the longest of them %d "
+                        "characters against the stage's %d"
+                        % (what, key, len(argv), max(map(len, argv)),
+                           len(stage)))
 
-    def test_a_real_shell_hands_the_stage_over_as_one_argument(self):
-        # The simulation above, done for real on this platform: the
-        # one-liner with its program replaced by a script that writes its
-        # arguments out, run through `sh -c` exactly as a C2 task would
-        # deliver it.
+    def test_no_generated_artifact_puts_the_payload_in_an_argv_entry(self):
+        # Review Focus 1. Linux refuses any single argv entry over
+        # 131072 bytes, so a payload passed as `python3 -c "<stage>"`
+        # cannot be executed there at all -- not by any quoting, and not
+        # through the POSIX stager, which `eval`s the same text and then
+        # has to exec python with it. macOS has no such limit, which is
+        # why this was invisible here.
+        MAX_ARG_STRLEN = 131072
         body = self.generate(1)
         one = body["oneliner_unix"]
-        stage = one[len('python3 -c "'):-1]
+        self.assertGreater(len(one), MAX_ARG_STRLEN,
+                           "the stage shrank; this test no longer proves "
+                           "anything")
+        self.assertNotIn("python3 -c", one)
+        self.assertIn("| python3 -", one)
+
+    def test_the_payload_travels_on_stdin_through_a_shell_builtin(self):
+        # Review Focus 5. `printf` is internal to dash, bash and busybox
+        # ash, so nothing execs the payload. An external printf would put
+        # it back in an argv entry and restore the limit.
+        one = self.generate(1)["oneliner_unix"]
+        self.assertTrue(one.startswith("printf %s \""), one[:40])
+
+    def test_the_quoting_invariant_still_holds(self):
+        # The one-liner gains a pipe and keeps its double quotes; what
+        # must stay absent is what would make the double-quoted form
+        # unsafe. `printf %s` puts the format in its own argument, so a
+        # `%` inside the stage is data and not a directive.
+        one = self.generate(1)["oneliner_unix"]
+        for forbidden in ("$", "`", "\\"):
+            self.assertNotIn(forbidden, one)
+
+    def test_a_real_shell_delivers_the_stage_to_python(self):
+        # The simulation above, done for real on this platform: the
+        # one-liner with its `python3 -` replaced by a script that writes
+        # its stdin out, run as a script file. Not `sh -c <command>`: that
+        # would make the whole line one argv entry again, which is the
+        # limit this artifact no longer has.
+        body = self.generate(1)
+        one = body["oneliner_unix"]
+        suffix = " | python3 -"
+        self.assertTrue(one.endswith(suffix), one[-40:])
+        stage = one[len('printf %s "'):-len('" | python3 -')]
         with tempfile.TemporaryDirectory() as root:
-            echo = Path(root) / "argv"
+            sink = Path(root) / "stdin-sink"
             out = Path(root) / "out"
-            echo.write_text('#!/bin/sh\nprintf "%%s" "$2" > "%s"\n' % (out,),
+            sink.write_text('#!/bin/sh\ncat > "%s"\n' % (out,),
                             encoding="utf-8")
-            echo.chmod(0o700)
-            command = str(echo) + one[len("python3"):]
-            result = subprocess.run(["sh", "-c", command],
+            sink.chmod(0o700)
+            script = Path(root) / "deliver.sh"
+            script.write_text(one[:-len("python3 -")] + str(sink) + "\n",
+                              encoding="utf-8")
+            result = subprocess.run(["sh", str(script)],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr[:400])
             passed = out.read_text(encoding="utf-8")
             self.assertTrue(passed == stage,
-                            "`sh -c` did not pass the stage to -c intact: %d "
-                            "characters arrived against the stage's %d"
-                            % (len(passed), len(stage)))
+                            "`sh` did not deliver the stage to python "
+                            "intact: %d characters arrived against the "
+                            "stage's %d" % (len(passed), len(stage)))
 
     def test_generated_artifact_exposes_its_own_source_as__src(self):
         body = self.generate(3)

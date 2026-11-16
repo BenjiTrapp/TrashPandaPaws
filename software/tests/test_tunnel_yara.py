@@ -251,7 +251,7 @@ class _ArtifactCase(_GeneratorCase):
     def artifact(self, route="gen"):
         """`(delivered, expanded)` for one build with a tunnel baked in.
 
-        `delivered` is the text inside `python3 -c "..."`, which is what
+        `delivered` is the text inside `printf %s "..." | python3 -`, which is what
         actually lands on a host; `expanded` is the source it decodes to,
         which is what runs and what an analyst recovers. The first is
         base64 of a deflate stream, so no marker could appear in it
@@ -262,11 +262,12 @@ class _ArtifactCase(_GeneratorCase):
         self.assertEqual(response.status_code, 200, response.data[:400])
         body = response.get_json()
         if route == "gen":
-            prefix = 'python3 -c "'
+            prefix = 'printf %s "'
+            suffix = '" | python3 -'
             one = body["oneliner_unix"]
-            self.assertTrue(one.startswith(prefix) and one.endswith('"'),
+            self.assertTrue(one.startswith(prefix) and one.endswith(suffix),
                             one[:80])
-            delivered = one[len(prefix):-1]
+            delivered = one[len(prefix):-len(suffix)]
         else:
             self.assertIsNotNone(self._uploaded,
                                  "the gist route uploaded nothing")

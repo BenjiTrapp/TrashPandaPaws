@@ -1887,13 +1887,21 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             })
 
         # Double quotes on both, with single quotes inside the stage
-        # itself: one text that `sh -c`, `cmd.exe` and PowerShell's
-        # `Invoke-Expression` all hand to `-c` as a single argument. The
-        # stage carries no `$`, backtick, backslash or `"`, which is what
-        # makes the double-quoted form safe in all three. See
+        # itself. The stage carries no `$`, backtick, backslash or `"`,
+        # which is what makes the double-quoted form safe in `sh`,
+        # `cmd.exe` and PowerShell's `Invoke-Expression` alike. See
         # `_obfuscate_layer`, and `docs/TUNNEL.md` for why the inline
         # Windows one-liner is undeliverable at this size regardless.
-        oneliner_unix = f'python3 -c "{stage}"'
+        #
+        # The two differ in where the payload goes. Linux refuses any
+        # single argv entry over 131072 bytes (MAX_ARG_STRLEN) and the
+        # stage is larger, so `python3 -c "<stage>"` cannot be exec'd
+        # there. Unix therefore pipes it into python's stdin, through
+        # `printf`, which dash, bash and busybox ash all run as a builtin
+        # so nothing execs the payload; `%s` keeps it out of the format
+        # string. Windows keeps `-c`: its one-liner is only ever run
+        # through `Invoke-Expression`, which has no such limit.
+        oneliner_unix = f'printf %s "{stage}" | python3 -'
         oneliner_win = f'python -c "{stage}"'
         stagers = _stagers_for_build(gen_cfg, drops, oneliner_unix,
                                      oneliner_win)
