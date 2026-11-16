@@ -1800,12 +1800,16 @@ class TestWhatTheOperatorSees(unittest.TestCase):
 class _StuckC2:
     """Just enough C2 for the tool: a fleet and a task queue."""
 
-    def __init__(self, agents):
+    def __init__(self, agents, unattributed=()):
         self._agents = agents
+        self._unattributed = list(unattributed)
         self.queued = []
 
     async def list_agents(self):
         return list(self._agents.values())
+
+    async def unattributed_rescues(self):
+        return list(self._unattributed)
 
     async def get_agent(self, agent_id):
         return self._agents.get(agent_id)
@@ -1835,20 +1839,24 @@ def _stuck_agent(**over):
     return agent
 
 
+def _orchestrator_tool(c2, name):
+    import asyncio as _asyncio
+
+    from software.agent.tools import registry
+
+    tools = registry.orchestrator_tools(
+        None, 1, dispatch_single=None, dispatch_parallel=None,
+        tier="full", scope_key="k", c2=c2)
+    for tool in tools:
+        if tool.spec.name == name:
+            return lambda **kw: _asyncio.run(tool.fn(**kw))
+    raise AssertionError("no tool %r; got %s"
+                         % (name, [t.spec.name for t in tools]))
+
+
 class TestTheAgentReadsTheDiagnosis(unittest.TestCase):
     def _tool(self, c2, name):
-        import asyncio as _asyncio
-
-        from software.agent.tools import registry
-
-        tools = registry.orchestrator_tools(
-            None, 1, dispatch_single=None, dispatch_parallel=None,
-            tier="full", scope_key="k", c2=c2)
-        for tool in tools:
-            if tool.spec.name == name:
-                return lambda **kw: _asyncio.run(tool.fn(**kw))
-        raise AssertionError("no tool %r; got %s"
-                            % (name, [t.spec.name for t in tools]))
+        return _orchestrator_tool(c2, name)
 
     def test_it_reports_the_diagnosis_for_a_stuck_beacon(self):
         c2 = _StuckC2({"b1": _stuck_agent()})
@@ -1967,6 +1975,168 @@ class TestTheAgentReadsTheDiagnosis(unittest.TestCase):
         names = {t.spec.name for t in tools}
         self.assertNotIn("get_stuck_beacons", names)
         self.assertIn("log_score", names)
+
+
+def _unattributed_record(**over):
+    record = {
+        "summary": "HTTPS: unreachable; DNS: answered; SMB: unreachable; "
+                   "QUIC: timed out.",
+        "dns_answered": True, "fingerprint": 4242, "at": "now",
+        "https": ["unreachable", 0], "dns": ["answered", 0],
+        "smb": ["unreachable", 0], "quic": ["timed_out", 0],
+    }
+    record.update(over)
+    return record
+
+
+class TestTheAgentReadsRescuesNobodyCanClaim(unittest.TestCase):
+    """Rescues from a beacon that never registered, so there is no id."""
+
+    def _tool(self, c2, name):
+        return _orchestrator_tool(c2, name)
+
+    def test_the_tool_reports_unattributed_rescues_under_their_own_key(self):
+        # Separate from "stuck" on purpose: there is no beacon id to task, so
+        # a model must not be able to mistake one for something it can act on.
+        c2 = _StuckC2({"b1": _stuck_agent()},
+                      unattributed=[_unattributed_record()])
+        got = self._tool(c2, "get_stuck_beacons")()
+        self.assertEqual(len(got["stuck"]), 1)
+        self.assertEqual(len(got["unattributed"]), 1)
+        self.assertEqual(got["stuck"][0]["beacon_id"], "b1")
+        self.assertIn("unreachable", got["unattributed"][0]["summary"])
+        self.assertTrue(got["unattributed"][0]["dns_answered"])
+        self.assertEqual(got["unattributed"][0]["legs"]["quic"],
+                         ["timed_out", 0])
+
+    def test_unattributed_entries_are_never_mixed_into_stuck(self):
+        c2 = _StuckC2({}, unattributed=[_unattributed_record()])
+        got = self._tool(c2, "get_stuck_beacons")()
+        self.assertEqual(got["stuck"], [])
+        self.assertEqual(len(got["unattributed"]), 1)
+
+    def test_an_unattributed_entry_carries_no_beacon_id_field(self):
+        # A field named like an id invites queueing work against it.
+        c2 = _StuckC2({}, unattributed=[_unattributed_record()])
+        entry = self._tool(c2, "get_stuck_beacons")()["unattributed"][0]
+        for key in entry:
+            with self.subTest(key=key):
+                self.assertNotIn("id", key.lower().split("_"))
+        self.assertNotIn("hostname", entry)
+
+    def test_no_unattributed_rescues_is_an_empty_list(self):
+        got = self._tool(_StuckC2({}), "get_stuck_beacons")()
+        self.assertEqual(got["unattributed"], [])
+
+    def _tool_over_the_real_client(self, status):
+        # The real client against a server that answers `status` for the
+        # route, so the failure is the one the client itself raises.
+        import types
+
+        from software.agent import c2client
+
+        class Session:
+            def request(self, method, url, **kw):
+                if url.endswith("/api/agents"):
+                    body = [_stuck_agent()]
+                    return types.SimpleNamespace(
+                        status_code=200, json=lambda: body)
+                return types.SimpleNamespace(
+                    status_code=status, json=lambda: {})
+
+        client = c2client.C2Client("http://127.0.0.1:8099", "tok",
+                                   session=Session())
+        return self._tool(client, "get_stuck_beacons")
+
+    def test_the_tool_still_works_against_a_server_without_the_route_405(self):
+        # An older team server answers 405, not 404: its catch-all
+        # /<path:path> accepts only POST, so a GET to an unrouted path is a
+        # method error. The client treats only 404 as "missing", so this
+        # arrives as a C2Unavailable and the tool has to absorb it.
+        got = self._tool_over_the_real_client(405)()
+        self.assertEqual(len(got["stuck"]), 1)
+        self.assertEqual(got["unattributed"], [])
+        self.assertNotIn("error", got)
+
+    def test_the_tool_still_works_against_a_server_without_the_route_404(self):
+        got = self._tool_over_the_real_client(404)()
+        self.assertEqual(len(got["stuck"]), 1)
+        self.assertEqual(got["unattributed"], [])
+
+    def test_the_tool_still_works_when_the_route_fails_outright(self):
+        got = self._tool_over_the_real_client(500)()
+        self.assertEqual(len(got["stuck"]), 1)
+        self.assertEqual(got["unattributed"], [])
+
+    def test_the_stuck_list_is_not_swallowed_with_it(self):
+        # Only the unattributed fetch degrades. A failing fleet listing is
+        # still a failure of the whole call.
+        from software.agent import c2client
+
+        class Broken(_StuckC2):
+            async def list_agents(self):
+                raise c2client.C2Unavailable("down")
+
+        with self.assertRaises(c2client.C2Unavailable):
+            self._tool(Broken({}), "get_stuck_beacons")()
+
+    def test_the_tool_description_says_they_cannot_be_tasked(self):
+        from software.agent.tools import egress
+
+        spec = next(e.spec for e in egress.entries()
+                    if e.spec.name == "get_stuck_beacons")
+        text = spec.description.lower()
+        self.assertIn("unattributed", text)
+        self.assertIn("no id", text)
+        self.assertIn("cannot be tasked", text)
+
+
+class TestTheClientAsksForUnattributedRescues(unittest.IsolatedAsyncioTestCase):
+    def _client(self, status=200, payload=None):
+        import types
+
+        from software.agent import c2client
+
+        calls = []
+
+        class Session:
+            def request(self, method, url, **kw):
+                calls.append((method, url))
+                return types.SimpleNamespace(
+                    status_code=status, json=lambda: payload)
+
+        return (c2client.C2Client("http://127.0.0.1:8099", "tok",
+                                  session=Session()), calls)
+
+    async def test_it_returns_the_records_from_the_route(self):
+        client, calls = self._client(
+            payload={"unattributed": [_unattributed_record()]})
+        got = await client.unattributed_rescues()
+        self.assertEqual(got, [_unattributed_record()])
+        self.assertEqual(calls, [
+            ("GET", "http://127.0.0.1:8099/api/rescues/unattributed")])
+
+    async def test_a_404_is_an_empty_list(self):
+        client, _ = self._client(status=404)
+        self.assertEqual(await client.unattributed_rescues(), [])
+
+    async def test_a_405_is_still_an_error_here(self):
+        # allow_missing must stay 404-only: widening it would make every
+        # call in the client read a method error as an absent resource.
+        from software.agent import c2client
+
+        client, _ = self._client(status=405)
+        with self.assertRaises(c2client.C2Unavailable):
+            await client.unattributed_rescues()
+
+    async def test_an_answer_without_the_list_is_rejected(self):
+        from software.agent import c2client
+
+        for payload in ([], {"oops": 1}, {"unattributed": "no"}):
+            with self.subTest(payload=payload):
+                client, _ = self._client(payload=payload)
+                with self.assertRaises(c2client.C2Unavailable):
+                    await client.unattributed_rescues()
 
 
 class TestTheOrchestratorOffersThem(unittest.TestCase):

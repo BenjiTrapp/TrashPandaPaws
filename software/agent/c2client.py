@@ -21,6 +21,7 @@ Endpoints (the two marked * are the shape the C2 gets in Task 9; this client
 is written to that shape and does not support the old one):
 
     GET  /api/agents                       list_agents
+    GET  /api/rescues/unattributed         unattributed_rescues
     GET  /api/agents/<id>                  get_agent
     POST /api/agents/<id>/task             queue_task      (takes a `lane`*)
     GET  /api/tasks/<task_id>              get_task_result
@@ -272,6 +273,24 @@ class C2Client:
         if not isinstance(payload, list):
             raise self._bad_shape("a list of beacons")
         return payload
+
+    async def unattributed_rescues(self) -> List[dict]:
+        """Rescues the C2 received but could not match to any beacon.
+
+        Newest first. A 404 reads as "none": a team server older than the
+        route has nothing of this kind to report. It answers 405 rather
+        than 404 (its catch-all takes only POST), and that is deliberately
+        not tolerated here -- the caller that wants to degrade on it does so.
+        """
+        payload = await self._request(
+            "GET", "/api/rescues/unattributed", allow_missing=True)
+        if payload is None:
+            return []
+        records = self._expect_dict(
+            payload, "the unattributed rescues").get("unattributed")
+        if not isinstance(records, list):
+            raise self._bad_shape("a list of unattributed rescues")
+        return records
 
     async def get_agent(self, agent_id: str) -> Optional[dict]:
         """One beacon, or None when the C2 does not know the id.
