@@ -606,9 +606,12 @@ def _obfuscate_layer(code: str, var_mod: str) -> str:
     The emitted line binds the decompressed text to the module global
     `_src` before executing it, instead of handing it straight to `exec`.
     That is what lets a running artifact start a second mode of itself:
-    under `python3 -c` there is no file to re-run and `sys.argv[0]` is the
-    literal string "-c", so the only copy of the source is the one the
-    process is holding. `Beacon._exec_tunnel` writes it to a
+    under `printf %s "<stage>" | python3 -` there is no file to re-run and
+    `sys.argv[0]` is the literal string "-" (the Windows one-liner's
+    `python -c` gives "-c"), so the only copy of the source is the one
+    the process is holding. The payload travels on stdin rather than as
+    a `-c` argument because Linux refuses an argv entry over 131072
+    bytes. `Beacon._exec_tunnel` writes it to a
     `python3 -` child on stdin, which keeps the payload off the child's
     command line and off the disk.
 

@@ -514,9 +514,10 @@ Then, as an operator step rather than something the stager does:
 only when it finds nothing.
 
 **On Windows the stager is the route, and the inline one-liner is not.**
-At roughly 115 KB the generated `python -c "…"` exceeds both the 8191
-character `cmd.exe` command line and the 32767 character `CreateProcess`
-limit, so it cannot be delivered on that platform at any quoting. It is
+At roughly 135 KB (135,453 characters with one layer, about 138 KB at
+the default of three, up to 143 KB at six) the generated `python -c "…"`
+exceeds both the 8191 character `cmd.exe` command line and the 32767
+character `CreateProcess` limit, so it cannot be delivered on that platform at any quoting. It is
 still emitted, because it is the text the Windows stager runs through
 `Invoke-Expression` when its probe finds a Python — where there is no
 length limit — and because an operator may paste it into something that

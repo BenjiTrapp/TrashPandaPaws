@@ -5,9 +5,11 @@ mode of itself without its own source reaching a command line.
 
 What this task has to get right, and how these tests hold it.
 
-**`python3 -c` leaves nothing to re-execute.** `sys.argv[0]` is the literal
-string `-c`, so `_get_beacon_path` returns `-c` resolved against the
-working directory in exactly the mode this project ships. The artifact
+**Running from stdin leaves nothing to re-execute.** The Unix one-liner is
+`printf %s "<stage>" | python3 -`, so `sys.argv[0]` is the literal string
+`-` (`-c` for the Windows `python -c` one-liner), and `_get_beacon_path`
+returns it resolved against the working directory in exactly the mode
+this project ships. The artifact
 therefore has to keep its own source, which is what `_obfuscate_layer`'s
 `_src` binding is for, and the child is started as `python3 -` with that
 source on stdin. The three alternatives are all worse: re-running
@@ -561,7 +563,7 @@ class TestGeneratedArtifactKeepsItsSource(unittest.TestCase):
                 # neither does the alias, so this is a property the
                 # emitter can keep rather than escape around. Asserted
                 # on the set rather than with `assertNotIn`, which would
-                # print the whole 115 KB stage on failure.
+                # print the whole 135 KB stage on failure.
                 hostile = sorted(set(stage) & set('"$`\\\n'))
                 self.assertEqual(hostile, [],
                                  "%s carries %r, which one of the three "
@@ -576,7 +578,7 @@ class TestGeneratedArtifactKeepsItsSource(unittest.TestCase):
                                 ("CommandLineToArgvW", _argv_w(one),
                                  ["python", "-c", stage])]
                 for what, argv, want in expected:
-                    # `assertTrue`, not `assertEqual`: the stage is 115 KB
+                    # `assertTrue`, not `assertEqual`: the stage is 135 KB
                     # and a diff of it is not a readable failure.
                     self.assertTrue(
                         argv == want,
@@ -609,7 +611,13 @@ class TestGeneratedArtifactKeepsItsSource(unittest.TestCase):
         one = self.generate(1)["oneliner_unix"]
         self.assertTrue(one.startswith("printf %s \""), one[:40])
 
-    def test_the_quoting_invariant_still_holds(self):
+    def test_the_quoting_invariant_survives_the_new_form(self):
+        # A regression guard, not evidence for the argv fix: this passed
+        # before that change too, because the old `python3 -c "<stage>"`
+        # form had the same stage with the same absences. It earns its
+        # place by pinning an invariant the new form could plausibly have
+        # broken, and it would catch a future form that interpolates the
+        # stage somewhere a `$`, a backtick or a backslash becomes live.
         # The one-liner gains a pipe and keeps its double quotes; what
         # must stay absent is what would make the double-quoted form
         # unsafe. `printf %s` puts the format in its own argument, so a

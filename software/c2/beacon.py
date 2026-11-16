@@ -7017,11 +7017,13 @@ class Beacon:
         A generated artifact carries its own source in the module global
         `_src`, bound by each obfuscation layer as it decompresses the
         next (`_obfuscate_layer` in server.py). That global is the only
-        copy there is: what this project ships is
-        `python3 -c '<blob>'`, where there is no file to re-run and
-        `sys.argv[0]` is the literal string "-c" -- which is also why
-        `_get_beacon_path` answers with something useless in exactly the
-        mode this runs in.
+        copy there is: what this project ships on Unix is
+        `printf %s '<blob>' | python3 -`, where the payload is on stdin
+        (Linux refuses an argv entry over 131072 bytes, so it cannot be
+        a `-c` argument), there is no file to re-run, and
+        `sys.argv[0]` is the literal string "-" ("-c" for the Windows
+        `python -c` one-liner) -- which is also why `_get_beacon_path`
+        answers with something useless in exactly the mode this runs in.
 
         No `_src` means this file was run straight from a checkout rather
         than built into an artifact, and then `__file__` is the source. A
@@ -7313,10 +7315,12 @@ class Beacon:
         the command line carries nothing to find.
 
         Otherwise the bundled payload if there is one, and `sys.argv[0]`
-        if there is not -- which is the one thing this project ships as
-        `python3 -c '<blob>'`, where `sys.argv[0]` is the literal "-c"
-        and the answer is useless. A build that brought an interpreter is
-        exactly the build that can do better, so it does.
+        if there is not -- which is the one thing this project ships:
+        the Unix one-liner is `printf %s '<blob>' | python3 -`, where
+        `sys.argv[0]` is the literal "-" (the Windows `python -c`
+        one-liner gives "-c"), and the answer is useless. A build that
+        brought an interpreter is exactly the build that can do better,
+        so it does.
         """
         bundled = self._bundled_payload()
         if bundled:
