@@ -1,0 +1,239 @@
+# The end-to-end lab: containers and networks for a Linux run of the rescue
+# channel. Not a deployment -- software/c2/docker-compose.yml is that, and
+# this file does not touch it. See docs/superpowers/specs/
+# 2026-11-15-e2e-docker-lab-design.md for the reasoning; the driver that
+# brings this up and runs a scenario is tools/e2e_lab.py.
+#
+#    beacon-net                      c2-net
+#  ┌──────────────┐              ┌──────────────┐
+#  │    beacon    │─ ─ ─ ─ ┐     │  teamserver  │    beacon is attached to
+#  └──────────────┘        │     └──────┬───────┘    c2-net at the start and
+#                    ┌─────▼─────┐      │            detached by the driver
+#                    │  resolver │      │ relay-net
+#                    └─────┬─────┘      └─────────┐
+#                    ┌─────▼──────────┐           │
+#                    │  listener-dns  │───────────┘
+#                    └────────────────┘
+#
+# The point of the arrangement is that a beacon's transports fail because
+# they do not route: once the beacon is off c2-net, the team server's name
+# does not resolve and its address is not reachable, which is measured
+# rather than assumed. Nothing here is simulated -- no stub returns None
+# and no test points a leg at a closed port.
+#
+# No UDP port is published, anywhere. Published UDP does not arrive on
+# macOS (tools/listener_docker_rig.py measured it), and that is why the
+# beacon is a container: its datagram to the resolver never crosses the
+# host boundary. The operator socket is TCP and is published on loopback,
+# which is how the driver and a browser reach it.
+#
+# Run it through the driver. By hand, from the repository root -- with
+# whichever of the two spellings your Docker has, because neither can be
+# assumed:
+#
+#   docker compose -f software/tests/lab/docker-compose.yml build   # plugin, v2
+#   docker-compose -f software/tests/lab/docker-compose.yml build   # standalone
+#
+# Newer `ubuntu-latest` images ship the plugin form and have dropped the v1
+# standalone binary; this development machine is the other way round --
+# `docker compose` answers `docker: unknown command` here and only the
+# standalone `docker-compose` exists. So neither form works everywhere, and
+# tools/e2e_lab.py detects which one does rather than hard-coding either.
+# Then, with the same spelling:
+#
+#   RACCOON_KEY=$(python3 -c "import os,base64; print(base64.b64encode(os.urandom(32)).decode())") \
+#   RACCOON_TOKEN=lab docker-compose -f software/tests/lab/docker-compose.yml up
+#
+# `--profile smb` adds the SMB listener, which only the smb-up scenario
+# wants: every other scenario needs SMB to be unreachable.
+name: raccoon-lab
+
+services:
+  teamserver:
+    build:
+      context: .
+      dockerfile: teamserver.Dockerfile
+    image: raccoon-lab-teamserver
+    # The working tree, read-only, so the lab tests what is checked out
+    # and a container cannot write into it. COPY would test a snapshot
+    # taken at build time and need a rebuild per edit.
+    volumes:
+      - ../../..:/src:ro
+    working_dir: /src
+    environment:
+      - PYTHONPATH=/src
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+      # Both required by the server, and generated per run by the driver:
+      # the lab holds no secret and CI needs none. Empty makes the server
+      # exit at start with its own reason, as the shipped compose does.
+      - RACCOON_KEY=${RACCOON_KEY:-}
+      - RACCOON_TOKEN=${RACCOON_TOKEN:-}
+      # What the server accepts on its DNS tasking route. A listener
+      # holding a different value is the stale-token scenario.
+      - RACCOON_LISTENER_TOKEN=${LAB_SERVER_LISTENER_TOKEN:-lab-listener-token}
+    # The GUI socket is bound on every interface *inside* the container
+    # because the published port arrives on the container's address. It is
+    # still loopback-only where it matters: the host binding below.
+    command: >
+      python -m software.c2.server
+      --host 0.0.0.0 --port 8443
+      --operator-host 0.0.0.0 --operator-port 8444
+      --data-dir /data
+    # State is not kept: no run may see another's.
+    tmpfs:
+      - /data
+    ports:
+      # Ephemeral on the host (compose's `port` subcommand says which), so a
+      # developer's own 8444 is never in the way.
+      - "127.0.0.1::8444"
+    healthcheck:
+      # A connect, not a request: it needs no token and no route.
+      test: ["CMD", "python", "-c", "import socket; [socket.create_connection(('127.0.0.1', p), 2).close() for p in (8443, 8444)]"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    networks:
+      - c2-net
+      - relay-net
+
+  # dnsmasq, a real recursive resolver, between the beacon and the
+  # listener. The beacon's resolver is this container and
+  # `beacon._DNS_PORT` is untouched, so the hop the rescue channel rests
+  # on is exercised and not bypassed. It forwards one zone to the listener
+  # and answers nothing else.
+  resolver:
+    build:
+      context: .
+      dockerfile: resolver.Dockerfile
+    image: raccoon-lab-resolver
+    volumes:
+      - ./resolver.conf:/etc/lab/dnsmasq.conf:ro
+    healthcheck:
+      # dnsmasq listens on TCP 53 as well as UDP.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/53"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    networks:
+      beacon-net:
+        # dnsmasq's server=/zone/addr#port takes an IP, and it parses its
+        # config before it could resolve anything, so Docker's embedded
+        # DNS cannot help. Both addresses are fixed for that reason.
+        ipv4_address: 192.0.2.53
+
+  # ── Listeners ──
+  #
+  # The artefact the project ships, built from the shipped Dockerfile and
+  # given the shipped posture and flags (test_e2e_lab compares them). What
+  # differs is where the relay is: a service name on relay-net, because
+  # this is a compose network and there is no host-gateway to go through.
+  # Each is on beacon-net *and* relay-net. That is the whole point of a
+  # listener: it is the one thing that bridges.
+  listener-dns:
+    build:
+      context: ../../..
+      dockerfile: software/c2/listeners/Dockerfile
+    image: raccoon-lab-listener
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      # Distinct from the server's variable so a scenario can make them
+      # differ: that is how the listener comes to hold a token the server
+      # no longer accepts.
+      - RACCOON_LISTENER_TOKEN=${LAB_DNS_LISTENER_TOKEN:-lab-listener-token}
+    command: >
+      --transport dns --name dns-53
+      --bind-host 0.0.0.0 --bind-port 8053
+      --setting zone=c2.lab
+      --relay-url http://teamserver:8443
+    networks:
+      beacon-net:
+        ipv4_address: 192.0.2.10
+      relay-net:
+
+  # Behind a profile because only the smb-up scenario wants it. In the
+  # others SMB has to be unreachable, and a listener that merely nobody
+  # points at would be a lab one edit away from reaching it.
+  listener-smb:
+    profiles: ["smb"]
+    build:
+      context: ../../..
+      dockerfile: software/c2/listeners/Dockerfile
+    image: raccoon-lab-listener
+    user: "65534:65534"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    command: >
+      --transport smb --name smb-445
+      --bind-host 0.0.0.0 --bind-port 8445
+      --relay-url http://teamserver:8443/api/v1/beacon
+    networks:
+      - beacon-net
+      - relay-net
+
+  # The implant, as a container, so that the network it sees is the
+  # container's and severing it is real. Started on c2-net as well: a beacon
+  # that has never registered fingerprints its implant id, which matches
+  # nothing, so the life-cycle is register for real, *then* be cut off.
+  # The driver does the cutting: `docker network disconnect c2-net`.
+  beacon:
+    build:
+      context: .
+      dockerfile: beacon.Dockerfile
+    image: raccoon-lab-beacon
+    # No restart: a beacon that finishes its stuck cycles has done its job,
+    # and one that came back would run a second scenario into the first.
+    restart: "no"
+    volumes:
+      - ../../..:/src:ro
+    working_dir: /src
+    depends_on:
+      teamserver:
+        condition: service_healthy
+      resolver:
+        condition: service_healthy
+      listener-dns:
+        condition: service_started
+    environment:
+      - PYTHONPATH=/src
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+      - RACCOON_KEY=${RACCOON_KEY:-}
+      # What beacon_entry.py reaches. The hosts are service names fixed in
+      # the script; the ports are here so there is one place to read them.
+      - LAB_BEACON_PORT=8443
+      - LAB_SMB_PORT=8445
+      - LAB_QUIC_PORT=8445
+    command: >
+      python software/tests/lab/beacon_entry.py
+      --scenario ${LAB_SCENARIO:-rescue}
+      --zone c2.lab
+      --cycles ${LAB_CYCLES:-4}
+    networks:
+      - beacon-net
+      - c2-net
+
+networks:
+  # Carries the beacon, the resolver and the listeners' public side, and
+  # nothing that holds a team server's address. Internal: nothing in the
+  # lab has a reason to reach the internet, and a network that cannot is
+  # one less way for a run to depend on where it ran.
+  beacon-net:
+    internal: true
+    ipam:
+      config:
+        # TEST-NET-1 (RFC 5737): reserved for documentation, so it can
+        # never collide with a real network a developer or a CI runner is
+        # on, and no Docker default pool will hand it out.
+        - subnet: 192.0.2.0/24
+  # Joins each listener to the team server's beacon socket. A listener
+  # needs it; the beacon must never be on it.
+  relay-net:
+    internal: true
+  # The operator socket, and where the beacon registers before it is cut
+  # off. Not internal: a published port needs a network that is not.
+  c2-net:
