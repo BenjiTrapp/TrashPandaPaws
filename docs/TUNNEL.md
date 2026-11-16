@@ -485,8 +485,8 @@ check — and not about the package being present.
 ## Staging onto a host with no Python
 
 The ordinary artifact is `printf %s "…" | python3 -`, and a one-liner
-cannot install Python. The second artifact shape from the same generator is a **stager**
-— a POSIX shell script and a PowerShell script — which:
+cannot install Python. The second artifact shape from the same generator
+is a **stager** — a POSIX shell script and a PowerShell script — which:
 
 1. **probes** for a usable interpreter and, finding one, runs the
    ordinary one-liner and stops there;
@@ -517,14 +517,14 @@ only when it finds nothing.
 At roughly 135 KB (135,453 characters with one layer, about 138 KB at
 the default of three, up to 143 KB at six) the generated `python -c "…"`
 exceeds both the 8191 character `cmd.exe` command line and the 32767
-character `CreateProcess` limit, so it cannot be delivered on that platform at any quoting. It is
-still emitted, because it is the text the Windows stager runs through
-`Invoke-Expression` when its probe finds a Python — where there is no
-length limit — and because an operator may paste it into something that
-does not go through `cmd.exe`. Both one-liners are therefore
-double-quoted with single quotes inside, and the stage carries no `$`,
-backtick, backslash or `"`, so the same stage survives `sh`, `cmd.exe` and
-`Invoke-Expression` alike.
+character `CreateProcess` limit, so it cannot be delivered on that
+platform at any quoting. It is still emitted, because it is the text the
+Windows stager runs through `Invoke-Expression` when its probe finds a
+Python — where there is no length limit — and because an operator may
+paste it into something that does not go through `cmd.exe`. Both
+one-liners are therefore double-quoted with single quotes inside, and the
+stage carries no `$`, backtick, backslash or `"`, so the same stage
+survives `sh`, `cmd.exe` and `Invoke-Expression` alike.
 
 **On Linux the payload cannot be an argument at all.** The kernel refuses
 any single `argv` entry over 131072 bytes (`MAX_ARG_STRLEN`), and the

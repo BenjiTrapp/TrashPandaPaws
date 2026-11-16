@@ -595,6 +595,13 @@ class TestGeneratedArtifactKeepsItsSource(unittest.TestCase):
         # through the POSIX stager, which `eval`s the same text and then
         # has to exec python with it. macOS has no such limit, which is
         # why this was invisible here.
+        #
+        # "Every artifact" is the two Linux delivery routes, the
+        # one-liner and the POSIX stager that embeds it. `oneliner_win`
+        # is excluded on purpose: it is still `python -c "<stage>"`
+        # because it only ever travels through `Invoke-Expression`, where
+        # no length limit applies, and the Windows stager is the route
+        # for a Windows host in any case.
         MAX_ARG_STRLEN = 131072
         body = self.generate(1)
         one = body["oneliner_unix"]
@@ -604,10 +611,35 @@ class TestGeneratedArtifactKeepsItsSource(unittest.TestCase):
         self.assertNotIn("python3 -c", one)
         self.assertIn("| python3 -", one)
 
+        stager = body["stager_nix"]
+        self.assertNotIn("python3 -c", stager)
+        self.assertIn("| python3 -", stager)
+        # The payload may sit in one place in the stager, and that place
+        # is the argument of `eval`, a shell builtin, which nothing
+        # execs. Any other line that large would be somewhere an exec'd
+        # program could be handed it.
+        oversized = [line.strip()[:20] for line in stager.splitlines()
+                     if len(line) > MAX_ARG_STRLEN]
+        self.assertEqual(len(oversized), 1, oversized)
+        self.assertTrue(oversized[0].startswith("eval '"), oversized[0])
+
+        self.assertTrue(body["oneliner_win"].startswith('python -c "'),
+                        "the Windows one-liner was meant to stay a -c "
+                        "form; if that changed on purpose, so must the "
+                        "comment above")
+
     def test_the_payload_travels_on_stdin_through_a_shell_builtin(self):
         # Review Focus 5. `printf` is internal to dash, bash and busybox
         # ash, so nothing execs the payload. An external printf would put
         # it back in an argv entry and restore the limit.
+        #
+        # What this pins is the form of the generated string: it starts
+        # with `printf %s "`. What it cannot pin is whether the shell
+        # that eventually runs the string resolves `printf` internally;
+        # that is a property of the target's shell, not of anything
+        # generated here. dash, bash and busybox ash all do, and a shell
+        # that used an external printf would put the payload back in an
+        # argv entry and bring the limit back with it.
         one = self.generate(1)["oneliner_unix"]
         self.assertTrue(one.startswith("printf %s \""), one[:40])
 

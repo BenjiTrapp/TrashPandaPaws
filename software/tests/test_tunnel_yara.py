@@ -251,12 +251,13 @@ class _ArtifactCase(_GeneratorCase):
     def artifact(self, route="gen"):
         """`(delivered, expanded)` for one build with a tunnel baked in.
 
-        `delivered` is the text inside `printf %s "..." | python3 -`, which is what
-        actually lands on a host; `expanded` is the source it decodes to,
-        which is what runs and what an analyst recovers. The first is
-        base64 of a deflate stream, so no marker could appear in it
-        literally -- it is checked anyway, because a marker in the
-        *wrapper* would be a real leak and costs nothing to rule out.
+        `delivered` is the text inside `printf %s "..." | python3 -`,
+        which is what actually lands on a host; `expanded` is the source
+        it decodes to, which is what runs and what an analyst recovers.
+        The first is base64 of a deflate stream, so no marker could
+        appear in it literally -- it is checked anyway, because a marker
+        in the *wrapper* would be a real leak and costs nothing to rule
+        out.
         """
         response = getattr(self, "post_" + route)(self.asked_for())
         self.assertEqual(response.status_code, 200, response.data[:400])
