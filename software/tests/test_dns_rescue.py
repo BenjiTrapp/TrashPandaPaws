@@ -1953,13 +1953,12 @@ async function api(path){ seen_paths.push(path); return polls[tick++]; }
     def test_a_record_already_seen_raises_no_second_notification(self):
         # The list is capped at 50 and never cleared, so a poll that
         # announces everything it is given re-fires every record on every
-        # tick. Same list three times, then one new record at the front.
+        # tick. One record three times, then one new record at the front.
         old = self._rec(fingerprint=1, at="2026-01-01T00:00:01Z")
-        older = self._rec(fingerprint=2, at="2026-01-01T00:00:00Z")
         new = self._rec(fingerprint=3, at="2026-01-01T00:00:02Z")
-        same = self._unattributed(old, older)
-        got = self._run([same, same, same, self._unattributed(new, old, older)])
-        self.assertEqual(got["counts"], [2, 2, 2, 3])
+        same = self._unattributed(old)
+        got = self._run([same, same, same, self._unattributed(new, old)])
+        self.assertEqual(got["counts"], [1, 1, 1, 2])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_two_records_are_told_apart_by_beacon_and_by_time(self):
@@ -1972,6 +1971,41 @@ async function api(path){ seen_paths.push(path); return polls[tick++]; }
                          self._unattributed(later, a),
                          self._unattributed(other, later, a)])
         self.assertEqual(got["counts"], [1, 2, 3])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_several_unseen_records_in_one_poll_raise_one_notification(self):
+        # One rule, not a special case for the first load: a console opened
+        # on a server that has been up for a week meets up to 50 records at
+        # once, and so does a burst. toast() shows the element and files it
+        # in the panel in one call, so there is no per-record route into the
+        # panel without new plumbing; one notification says how many.
+        records = [self._rec(fingerprint=n, at="2026-01-01T00:00:%02dZ" % n,
+                             summary="leg %d is stuck" % n)
+                   for n in (9, 8, 7, 6, 5)]
+        got = self._run([self._unattributed(*records)])
+        self.assertEqual(len(got["toasts"]), 1, got["toasts"])
+        note = got["toasts"][0]
+        self.assertEqual(note["type"], "warning")
+        text = note["title"] + " " + note["msg"]
+        self.assertIn(str(len(records)), text)
+        self.assertRegex(text, r"(?i)match no agent|nobody can claim|unclaim")
+        # It counts them; it does not pretend to name them.
+        for n in range(5, 10):
+            self.assertNotIn("leg %d" % n, text)
+            self.assertNotIn("%04x" % n, text)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_batch_is_not_announced_again_one_by_one(self):
+        # Records folded into a batch are still *seen*: the next tick must
+        # not re-raise them singly, and a later arrival is announced alone.
+        batch = [self._rec(fingerprint=n, at="2026-01-01T00:00:%02dZ" % n)
+                 for n in (3, 2, 1)]
+        later = self._rec(fingerprint=4, at="2026-01-01T00:00:04Z")
+        got = self._run([self._unattributed(*batch),
+                         self._unattributed(*batch),
+                         self._unattributed(later, *batch)])
+        self.assertEqual(got["counts"], [1, 1, 2])
+        self.assertIn("%04x" % 4, got["toasts"][1]["msg"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_what_a_target_sent_is_escaped_in_the_notification(self):

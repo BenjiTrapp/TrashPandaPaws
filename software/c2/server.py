@@ -9392,20 +9392,29 @@ function copyToClipboard(text, label){
 
 // A rescue no beacon can claim is told once, not every tick: the server
 // keeps the last 50 and never clears them, so each is keyed on who sent it
-// and when.
+// and when. Several found in one poll -- a console opened on a server that
+// has been up for a week, or a burst -- are one notification that counts
+// them; the Server Log has each.
 let seenRescues = {};
 async function refreshRescues(){
   if(!storedToken()) return;
   const r = await api("/api/rescues/unattributed");
   // Served newest first; announced oldest first, so the newest ends on top.
-  (r.unattributed || []).slice().reverse().forEach(rec => {
+  const fresh = (r.unattributed || []).slice().reverse().filter(rec => {
     const key = rec.fingerprint+"@"+rec.at;
-    if(seenRescues[key]) return;
+    if(seenRescues[key]) return false;
     seenRescues[key] = true;
+    return true;
+  });
+  if(fresh.length > 1){
+    toast("warning", fresh.length+" Unknown Beacons Are Stuck",
+      fresh.length+" stuck beacons match no agent<br>Each is in the Server Log", 10000);
+  } else if(fresh.length === 1){
+    const rec = fresh[0];
     const fp = ("0000"+(rec.fingerprint|0).toString(16)).slice(-4);
     toast("warning", "Unknown Beacon Is Stuck",
       "fingerprint "+esc(fp)+" matches no agent<br>"+esc(rec.summary), 10000);
-  });
+  }
 }
 
 if(storedToken()){
