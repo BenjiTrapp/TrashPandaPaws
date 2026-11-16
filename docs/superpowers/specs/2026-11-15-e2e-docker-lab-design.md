@@ -182,7 +182,7 @@ entirely lab-side — no product change — which is why it was chosen over
 the alternatives the check listed (adding an operator route for
 unattributed rescues, or widening the server's matching).
 
-### A product gap this exposes, and does not fix
+### A product gap this exposes, and the operator decided to close
 
 `unattributed_rescues` is appended to and trimmed and **never served over
 HTTP**. A beacon that never managed to register at all is therefore
@@ -191,9 +191,8 @@ by any operator. That is a real gap in the feature — and the affected
 beacon is precisely the one most likely to be stuck, since never
 registering means the way out was never open.
 
-Out of scope here. A lab is not the place to change the product, and this
-deserves its own change with its own tests. Recorded so it is not
-rediscovered.
+It was out of scope in the first draft. The operator brought it in; see
+"The gap in scope: a rescue nobody can see" below for the four surfaces.
 
 ### Severance is asserted, not assumed
 
@@ -414,6 +413,56 @@ That is a real conflict risk and the reason I proposed a separate branch;
 the operator chose to carry them here, so the plan sequences them **first**,
 each with its own commit, so they can be split out if a conflict makes
 that necessary.
+
+## The gap in scope: a rescue nobody can see
+
+In scope by the operator's decision, having been flagged above as
+deliberately excluded.
+
+`unattributed_rescues` is a module-level list. `_handle_rescue` appends to
+it when no agent's fingerprint matches, trims it to 50, and **nothing
+reads it** — there is no route, no GUI surface, no log line. A beacon that
+never managed to register is therefore invisible: its diagnosis is
+received, decrypted, decoded and discarded into memory. That beacon is the
+one most likely to be stuck, because never registering means the way out
+was never open.
+
+Three surfaces, in increasing cost, and all three are needed because each
+reaches a different reader:
+
+1. **A log event on arrival.** `_log_event("RESCUE", …)` the moment a
+   record cannot be attributed. The Server Log drawer already renders
+   entries and already escapes them, so this costs no GUI code and makes
+   the event non-silent immediately. Safe to log in full: the record holds
+   a 2-byte fingerprint and leg codes, and no string from the target can
+   reach it by construction.
+2. **An authenticated operator route.** `GET /api/rescues/unattributed`,
+   returning the structured records. Operator socket only, like every
+   other `/api/` route.
+3. **The agent tool.** `get_stuck_beacons` gains an `unattributed` key
+   beside `stuck`. Deliberately a separate key: there is no beacon id to
+   task, so a model must not be able to mistake one of these for something
+   it can act on. The tool's description has to say that.
+
+And one that touches the operator HTML, which is where this feature's
+worst defect came from yesterday:
+
+4. **A bell notification.** "Visible in a drawer nobody opens" is not
+   addressed, so the GUI polls the new route and raises a `toast`. This is
+   the only part that edits `_OPERATOR_HTML`, so the plan gives it its own
+   task whose acceptance is **a browser, not a regex**: the panel must be
+   opened and the notification seen. A source-level assertion that a
+   string is present is what let `escHtml(info.stuck.summary)` ship and
+   destroy the whole agent panel. The cross-GUI helper guard added in that
+   fix now catches that specific class automatically, which lowers the risk
+   but does not remove the rule.
+
+My call on what this does **not** do: it does not try to attribute these
+records after the fact. Matching a late registration back to an earlier
+unattributed rescue would need the implant id in the record, the record is
+16 bytes by design, and widening it to carry one would change the wire
+format for a convenience. An operator who sees "something out there is
+stuck and here is why" has what this feature promised.
 
 ## Risks, and what each would look like
 
