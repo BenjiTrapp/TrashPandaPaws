@@ -319,12 +319,24 @@ to tell which broke:
 
 | Job | Runs | Why |
 |---|---|---|
-| `tests` | the full unittest suite | the primary guard, ~7 minutes locally |
+| `tests` | the full unittest suite | the primary guard, ~7 minutes locally, ~10 in a container |
 | `lab` | `python3 tools/e2e_lab.py` | the integration proof |
 
 On `ubuntu-latest`, where Docker is present and published UDP is iptables
 rather than a userspace proxy — so the lab is, if anything, less
 constrained there than here.
+
+The `tests` job needs three system packages the suite reaches for and
+`python:3.9-slim` does not carry: **`git`** (the requirements-floor and
+leak-walk tests shell out to it), **`ffmpeg`** (the figure and GIF tools
+encode with it) and **`procps`** (`ps`, which the supervisor and tunnel
+spawn tests read a child's command line with). Measured: without them,
+19 errors and 6 failures that say nothing about the code.
+
+Python is pinned to **3.9**, because `software/tests/requirements.txt`
+states that is the interpreter the suite runs in and has only ever run
+against. Testing a version nobody develops against would report failures
+nobody asked for.
 
 Running both rather than only the lab is my call. A repository with no CI
 gains more from the suite than from the lab, and the lab's value is
@@ -334,6 +346,74 @@ other would misrepresent either.
 Two things CI must not do, and the workflow will say so: no secrets (the
 lab generates its key per run with `os.urandom`), and no network egress
 beyond the base images.
+
+## Three Linux defects this work also fixes
+
+Not part of the lab, and in scope by the operator's decision: the Linux
+suite was run in a container before the CI job was written, and what it
+found is the best argument for that job existing.
+
+Without `git`, `ffmpeg` and `procps` in the image: 19 errors, 6 failures.
+With them: **three remain**, and all three are real defects on the
+platform the implant targets. 3438 tests ran on Linux against 3258 on
+macOS — 180 that had never executed anywhere.
+
+### 1. The Unix one-liner cannot be executed on Linux at all
+
+`oneliner_unix` is `python3 -c "<stage>"` and the stage is **135,492
+bytes**. Linux refuses any single `argv` entry over **131,072** —
+measured exactly: 131,072 passes, 131,073 raises `OSError 7, Argument
+list too long`. This is not a shell limit and no quoting avoids it; it is
+`MAX_ARG_STRLEN` in `execve`. macOS has no equivalent, which is why this
+has never been seen here.
+
+Both Linux delivery routes are therefore dead. The pasted one-liner
+cannot run, and the POSIX stager's probe-and-delegate path cannot either:
+it does `eval '<oneliner>'`, and although `eval` is a shell builtin the
+shell must still `execve` python with the oversized argument. Measured:
+`eval: python3: Argument list too long`.
+
+`docs/TUNNEL.md` documents the Windows one-liner as undeliverable at this
+size and says of the POSIX stager that "on a host that has a Python it
+runs the ordinary one-liner, which is the common case on Linux and
+macOS". That sentence is false, and it names the project's primary target.
+
+**The fix: the stage moves from python's argv to python's stdin.**
+`printf %s "<stage>" | python3 -`. Measured to deliver 135,491 bytes and
+execute. `printf` is a shell builtin in dash, bash and busybox ash, so
+nothing `execve`s the payload; the only exec is python itself, with a
+tiny argument list. The existing quoting invariant survives untouched —
+the stage still carries no `$`, backtick, backslash or `"`, so the
+double-quoted form is still safe, and `eval` in the stager handles a pipe
+as readily as a command.
+
+This is my call on the shape of a shipped artifact, so it is worth saying
+what it does **not** change: the Windows one-liner stays as it is, since
+it is already documented as undeliverable and is used through
+`Invoke-Expression`, where no length limit applies. `docs/TUNNEL.md` gains
+the Linux limit it was missing.
+
+### 2. and 3. `stop()` leaves the NTLM relay's port accepting on Linux
+
+`_NtlmProxyRelay.stop()` sets `_running = False`, closes the listening
+socket, and joins the thread. The thread is blocked in `accept()`.
+Closing a descriptor another thread is blocked on is undefined in POSIX:
+macOS wakes the `accept()`, Linux does not, and the socket stays bound
+and **accepting** until it returns. Two tests prove it —
+`test_stop_closes_listener` and `test_stop_tears_down_relay` — by
+connecting after `stop()` and getting a connection instead of a refusal.
+
+The operator believes the relay is down and the target still has an open,
+accepting port. The portable fix is `shutdown(SHUT_RDWR)` before `close()`,
+which does wake a blocked `accept()` on both platforms, with the existing
+`OSError` arm of the loop catching the result.
+
+Both of these live in tunnel and implant code that two other worktrees
+are currently working in (`reverse-socks-tunnel`, `implant-shell-session`).
+That is a real conflict risk and the reason I proposed a separate branch;
+the operator chose to carry them here, so the plan sequences them **first**,
+each with its own commit, so they can be split out if a conflict makes
+that necessary.
 
 ## Risks, and what each would look like
 
