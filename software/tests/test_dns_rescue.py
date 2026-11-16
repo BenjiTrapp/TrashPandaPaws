@@ -2055,18 +2055,72 @@ class TestTheAgentReadsRescuesNobodyCanClaim(unittest.TestCase):
         # arrives as a C2Unavailable and the tool has to absorb it.
         got = self._tool_over_the_real_client(405)()
         self.assertEqual(len(got["stuck"]), 1)
-        self.assertEqual(got["unattributed"], [])
+        self.assertNotIn("unattributed", got)
         self.assertNotIn("error", got)
 
     def test_the_tool_still_works_against_a_server_without_the_route_404(self):
         got = self._tool_over_the_real_client(404)()
         self.assertEqual(len(got["stuck"]), 1)
-        self.assertEqual(got["unattributed"], [])
+        self.assertNotIn("unattributed", got)
 
     def test_the_tool_still_works_when_the_route_fails_outright(self):
         got = self._tool_over_the_real_client(500)()
         self.assertEqual(len(got["stuck"]), 1)
-        self.assertEqual(got["unattributed"], [])
+        self.assertNotIn("unattributed", got)
+
+    def test_a_failed_fetch_omits_the_key_rather_than_emptying_it(self):
+        # Present and empty means "I asked, there are none"; absent means
+        # "I could not ask". Emptying it would make the two the same.
+        asked = self._tool(_StuckC2({}), "get_stuck_beacons")()
+        self.assertEqual(asked["unattributed"], [])
+        could_not = self._tool_over_the_real_client(405)()
+        self.assertNotIn("unattributed", could_not)
+
+    def test_a_rejected_token_on_that_route_also_omits_the_key(self):
+        from software.agent import c2client
+
+        class Rejected(_StuckC2):
+            async def unattributed_rescues(self):
+                raise c2client.C2Unauthorized("no")
+
+        got = self._tool(Rejected({"b1": _stuck_agent()}),
+                         "get_stuck_beacons")()
+        self.assertEqual(len(got["stuck"]), 1)
+        self.assertNotIn("unattributed", got)
+
+    def test_a_programming_error_in_that_call_is_not_swallowed(self):
+        # Only the client's own failures degrade. Anything else is a bug
+        # and must surface, not read as "no unattributed rescues".
+        class Buggy(_StuckC2):
+            async def unattributed_rescues(self):
+                raise KeyError("a bug")
+
+        with self.assertRaises(KeyError):
+            self._tool(Buggy({}), "get_stuck_beacons")()
+
+    def test_an_entry_carries_the_fingerprint_as_the_server_logs_it(self):
+        c2 = _StuckC2({}, unattributed=[_unattributed_record(fingerprint=0xBEE)])
+        entry = self._tool(c2, "get_stuck_beacons")()["unattributed"][0]
+        self.assertEqual(entry["fingerprint"], "0bee")
+
+    def test_repeats_from_one_beacon_share_a_fingerprint(self):
+        c2 = _StuckC2({}, unattributed=[
+            _unattributed_record(fingerprint=7, at="t1"),
+            _unattributed_record(fingerprint=7, at="t2"),
+            _unattributed_record(fingerprint=9, at="t3")])
+        got = self._tool(c2, "get_stuck_beacons")()["unattributed"]
+        self.assertEqual([e["fingerprint"] for e in got],
+                         ["0007", "0007", "0009"])
+
+    def test_a_fingerprint_that_is_not_two_bytes_is_not_passed_through(self):
+        # Whatever the server sent, only a two-byte number is rendered.
+        for bad in ("<script>", -1, 0x10000, None, True, 1.5):
+            with self.subTest(bad=bad):
+                c2 = _StuckC2({}, unattributed=[
+                    _unattributed_record(fingerprint=bad)])
+                entry = self._tool(c2, "get_stuck_beacons")()[
+                    "unattributed"][0]
+                self.assertEqual(entry["fingerprint"], "")
 
     def test_the_stuck_list_is_not_swallowed_with_it(self):
         # Only the unattributed fetch degrades. A failing fleet listing is
@@ -2089,6 +2143,19 @@ class TestTheAgentReadsRescuesNobodyCanClaim(unittest.TestCase):
         self.assertIn("unattributed", text)
         self.assertIn("no id", text)
         self.assertIn("cannot be tasked", text)
+
+    def test_the_description_explains_an_absent_key(self):
+        # The model cannot infer that convention; the description is the
+        # only place it reads.
+        from software.agent.tools import egress
+
+        spec = next(e.spec for e in egress.entries()
+                    if e.spec.name == "get_stuck_beacons")
+        text = " ".join(spec.description.lower().split())
+        self.assertIn("key is absent the server could not be asked", text)
+        self.assertIn("present and empty means it was asked and there are "
+                      "none", text)
+        self.assertIn("same `fingerprint`", text)
 
 
 class TestTheClientAsksForUnattributedRescues(unittest.IsolatedAsyncioTestCase):
@@ -2116,18 +2183,17 @@ class TestTheClientAsksForUnattributedRescues(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [
             ("GET", "http://127.0.0.1:8099/api/rescues/unattributed")])
 
-    async def test_a_404_is_an_empty_list(self):
-        client, _ = self._client(status=404)
-        self.assertEqual(await client.unattributed_rescues(), [])
-
-    async def test_a_405_is_still_an_error_here(self):
-        # allow_missing must stay 404-only: widening it would make every
-        # call in the client read a method error as an absent resource.
+    async def test_a_missing_route_is_an_error_not_an_empty_list(self):
+        # "Could not ask" must not read as "asked, none": 404 and the 405
+        # an older team server gives both raise. (405 also stays an error
+        # in `_request` generally; allow_missing is not widened.)
         from software.agent import c2client
 
-        client, _ = self._client(status=405)
-        with self.assertRaises(c2client.C2Unavailable):
-            await client.unattributed_rescues()
+        for status in (404, 405):
+            with self.subTest(status=status):
+                client, _ = self._client(status=status)
+                with self.assertRaises(c2client.C2Unavailable):
+                    await client.unattributed_rescues()
 
     async def test_an_answer_without_the_list_is_rejected(self):
         from software.agent import c2client

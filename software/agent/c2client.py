@@ -277,15 +277,12 @@ class C2Client:
     async def unattributed_rescues(self) -> List[dict]:
         """Rescues the C2 received but could not match to any beacon.
 
-        Newest first. A 404 reads as "none": a team server older than the
-        route has nothing of this kind to report. It answers 405 rather
-        than 404 (its catch-all takes only POST), and that is deliberately
-        not tolerated here -- the caller that wants to degrade on it does so.
+        Newest first. A missing route is NOT read as "none": a 404 (or the
+        405 an older team server gives, its catch-all taking only POST)
+        raises, because "I could not ask" and "I asked and there are none"
+        are different answers and the caller reports them differently.
         """
-        payload = await self._request(
-            "GET", "/api/rescues/unattributed", allow_missing=True)
-        if payload is None:
-            return []
+        payload = await self._request("GET", "/api/rescues/unattributed")
         records = self._expect_dict(
             payload, "the unattributed rescues").get("unattributed")
         if not isinstance(records, list):
