@@ -938,6 +938,11 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                                "caps": info.get("caps") or []})
         return jsonify(agent_list)
 
+    @app.route("/api/rescues/unattributed", methods=["GET"])
+    @require_auth
+    def api_rescues_unattributed():
+        return jsonify({"unattributed": list(reversed(unattributed_rescues))})
+
     @app.route("/api/agents/<agent_id>", methods=["GET"])
     @require_auth
     def api_agent_detail(agent_id):
@@ -2959,6 +2964,10 @@ def _handle_rescue(payload: dict, crypto: ServerCrypto):
             info["last_channel"] = "dns"
             return _handle_beacon({"agent_id": agent_id}, crypto)
 
+    # No agent id here: the record carries a fingerprint and leg codes,
+    # never a string from the target, so the summary is safe to log whole.
+    _log_event("RESCUE", "A stuck beacon nobody can claim (fingerprint "
+               "%04x) says: %s" % (record["fingerprint"], stuck["summary"]))
     unattributed_rescues.append(stuck)
     del unattributed_rescues[:-_RESCUE_UNATTRIBUTED_MAX]
     return _fake_response()

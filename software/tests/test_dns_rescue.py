@@ -1436,6 +1436,197 @@ class TestTheServerDecodesARescue(unittest.TestCase):
         self.assertIn("WRAPPER_KEY", src)
 
 
+class TestARescueNobodyCanClaim(unittest.TestCase):
+    """The diagnosis of the beacon that never registered, made visible.
+
+    It used to be appended to a list nothing read: received, decrypted and
+    decoded, then discarded into memory. Every record here is built by the
+    real path -- the beacon's own `_encrypt`, POSTed to `/` -- rather than
+    appended to the list.
+    """
+
+    TOKEN = "operator-token"
+
+    def setUp(self):
+        import tempfile
+
+        from software.c2 import server as server_mod
+
+        self.server_mod = server_mod
+        self.crypto = server_mod.ServerCrypto(_KEY)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.app = server_mod.create_app(self.crypto, self.TOKEN,
+                                         pathlib_Path(tmp.name))
+        self.beacon = _a_beacon()
+        server_mod.agents.clear()
+        self.addCleanup(server_mod.agents.clear)
+        del server_mod.unattributed_rescues[:]
+        self.addCleanup(server_mod.unattributed_rescues.clear)
+        before = len(server_mod.event_log)
+        self.addCleanup(lambda: server_mod.event_log.__delitem__(
+            slice(before, None)))
+        self._first_new_log = before
+
+    def _auth(self):
+        return {"Authorization": "Bearer %s" % self.TOKEN}
+
+    def _send(self, agent="a-box-that-never-registered", status=407,
+              fingerprint=None):
+        raw = dns_rescue.pack(
+            {"https": (dns_rescue.CLASSES["http_status"], status),
+             "dns": (dns_rescue.CLASSES["answered"], 0)},
+            dns_rescue.FLAG_DNS_ANSWERED,
+            dns_rescue.fingerprint(agent) if fingerprint is None
+            else fingerprint)
+        blob = self.beacon._encrypt(
+            {dns_rescue.WRAPPER_KEY: base64.b64encode(raw).decode()})
+        with self.app.test_client() as client:
+            response = client.post("/", json={"cipher_text": blob})
+        self.assertEqual(response.status_code, 200)
+
+    def _served(self, client=None, **kw):
+        client = client or self.app.test_client()
+        return client.get("/api/rescues/unattributed",
+                          headers=self._auth(), **kw)
+
+    def _rescue_log(self):
+        return [e for e in self.server_mod.event_log[self._first_new_log:]
+                if e["cat"] == "RESCUE"]
+
+    def test_an_unattributed_rescue_is_logged_so_it_is_not_silent(self):
+        # It used to be appended to a list nothing read: decoded, stored and
+        # discarded. The beacon that cannot be attributed is the one most
+        # likely to be stuck, because never registering means the way out
+        # was never open.
+        self._send(status=407)
+        entries = self._rescue_log()
+        self.assertEqual(len(entries), 1)
+        self.assertIn("407", entries[0]["msg"])
+        self.assertIn("HTTPS", entries[0]["msg"])
+        self.assertIn("%04x" % dns_rescue.fingerprint(
+            "a-box-that-never-registered"), entries[0]["msg"])
+
+    def test_an_attributed_rescue_is_not_logged_as_unclaimed(self):
+        self.server_mod.agents["clumsy-raccoon"] = {
+            "id": "implant-1", "hostname": "h", "last_seen": "now",
+            "caps": []}
+        self._send(agent="clumsy-raccoon")
+        self.assertEqual(self._rescue_log(), [])
+        self.assertEqual(self._served().get_json(), {"unattributed": []})
+
+    def test_the_route_returns_it_newest_first(self):
+        self._send(agent="first", status=401)
+        self._send(agent="second", status=402)
+        self._send(agent="third", status=403)
+        response = self._served()
+        self.assertEqual(response.status_code, 200)
+        records = response.get_json()["unattributed"]
+        self.assertEqual([r["fingerprint"] for r in records],
+                         [dns_rescue.fingerprint(a)
+                          for a in ("third", "second", "first")])
+        self.assertIn("403", records[0]["summary"])
+        for record in records:
+            for key in ("summary", "dns_answered", "fingerprint", "at",
+                        "https", "dns", "smb", "quic"):
+                self.assertIn(key, record)
+        self.assertEqual(records[0]["https"], ["http_status", 403])
+
+    def test_the_route_is_empty_when_nothing_has_been_received(self):
+        self.assertEqual(self._served().get_json(), {"unattributed": []})
+
+    def test_the_route_needs_the_operator_token(self):
+        self._send()
+        client = self.app.test_client()
+        self.assertEqual(
+            client.get("/api/rescues/unattributed").status_code, 401)
+        wrong = client.get("/api/rescues/unattributed",
+                           headers={"Authorization": "Bearer nope"})
+        self.assertEqual(wrong.status_code, 401)
+        self.assertNotIn(b"summary", wrong.data)
+
+    def test_the_route_is_not_on_the_agent_socket(self):
+        # Same policy as every other /api/ route: a request judged by the
+        # socket it arrived on, refused with the catch-all's own answer.
+        import tempfile
+
+        self._send()
+        with tempfile.TemporaryDirectory() as tmp:
+            split = self.server_mod.create_app(
+                self.crypto, self.TOKEN, pathlib_Path(tmp),
+                operator_port=8444)
+        client = split.test_client()
+        cover = client.post("/", json={"not": "a beacon"},
+                            environ_overrides={"SERVER_PORT": "9444"})
+        refused = client.get("/api/rescues/unattributed",
+                             headers=self._auth(),
+                             environ_overrides={"SERVER_PORT": "9444"})
+        self.assertEqual((refused.status_code, refused.data),
+                         (cover.status_code, cover.data))
+        self.assertNotIn(b"unattributed", refused.data)
+        served = client.get("/api/rescues/unattributed",
+                            headers=self._auth(),
+                            environ_overrides={"SERVER_PORT": "8444"})
+        self.assertEqual(served.status_code, 200)
+        self.assertEqual(len(served.get_json()["unattributed"]), 1)
+
+    def test_a_rescue_for_a_deleted_agent_is_reported_not_dropped(self):
+        # Review Focus 3. Attribution matches the live fleet, so a record
+        # for an agent the operator has removed lands here.
+        agent = "clumsy-raccoon"
+        self.server_mod.agents[agent] = {
+            "id": "implant-1", "hostname": "h", "last_seen": "now",
+            "caps": []}
+        self._send(agent=agent)
+        self.assertIn("stuck", self.server_mod.agents[agent])
+        self.assertEqual(self._served().get_json(), {"unattributed": []})
+
+        del self.server_mod.agents[agent]
+        self._send(agent=agent, status=503)
+        records = self._served().get_json()["unattributed"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["fingerprint"],
+                         dns_rescue.fingerprint(agent))
+        self.assertIn("503", records[0]["summary"])
+        self.assertEqual(len(self._rescue_log()), 1)
+
+    def test_nothing_in_the_record_is_treated_as_an_agent_id(self):
+        # Review Focus 3. The record carries a 2-byte fingerprint and leg
+        # codes. No string from the target can reach it, and the route must
+        # not invent an id from the fingerprint.
+        fp = dns_rescue.fingerprint("a-box-that-never-registered")
+        lookalikes = ("%04x" % fp, "%d" % fp, "0x%04x" % fp)
+        for name in lookalikes:
+            self.server_mod.agents[name] = {
+                "id": "impl-" + name, "hostname": "h", "last_seen": "now",
+                "caps": []}
+        self._send()
+        record = self._served().get_json()["unattributed"][0]
+        for key in ("agent_id", "agent", "id", "name"):
+            self.assertNotIn(key, record)
+        self.assertEqual(sorted(k for k, v in record.items()
+                                if isinstance(v, str)), ["at", "summary"])
+        self.assertEqual(self._rescue_log()[0]["agent"], "")
+        for name in lookalikes:
+            self.assertNotIn("stuck", self.server_mod.agents[name])
+        self.assertEqual(set(self.server_mod.agents), set(lookalikes))
+        with self.app.test_client() as client:
+            for name in lookalikes:
+                logs = client.get("/api/logs/agent/" + name,
+                                  headers=self._auth()).get_json()
+                self.assertEqual(logs, [])
+
+    def test_the_list_stays_capped(self):
+        # Review Focus 2's other half: 51 records leave 50.
+        cap = self.server_mod._RESCUE_UNATTRIBUTED_MAX
+        for n in range(cap + 1):
+            self._send(fingerprint=n)
+        records = self._served().get_json()["unattributed"]
+        self.assertEqual(len(records), cap)
+        self.assertEqual(records[0]["fingerprint"], cap)
+        self.assertEqual(records[-1]["fingerprint"], 1)
+
+
 def _operator_script(cache={}):
     """The inline JS of the operator GUI, with literal text removed.
 
