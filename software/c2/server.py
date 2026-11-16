@@ -9390,10 +9390,30 @@ function copyToClipboard(text, label){
   });
 }
 
+// A rescue no beacon can claim is told once, not every tick: the server
+// keeps the last 50 and never clears them, so each is keyed on who sent it
+// and when.
+let seenRescues = {};
+async function refreshRescues(){
+  if(!storedToken()) return;
+  const r = await api("/api/rescues/unattributed");
+  // Served newest first; announced oldest first, so the newest ends on top.
+  (r.unattributed || []).slice().reverse().forEach(rec => {
+    const key = rec.fingerprint+"@"+rec.at;
+    if(seenRescues[key]) return;
+    seenRescues[key] = true;
+    const fp = ("0000"+(rec.fingerprint|0).toString(16)).slice(-4);
+    toast("warning", "Unknown Beacon Is Stuck",
+      "fingerprint "+esc(fp)+" matches no agent<br>"+esc(rec.summary), 10000);
+  });
+}
+
 if(storedToken()){
   setInterval(refreshAgents, 3000);
+  setInterval(refreshRescues, 3000);
   setInterval(checkTaskResults, 2500);
   refreshAgents();
+  refreshRescues();
   toast("info","Server Online","Listening for beacon connections<br>Beacon traffic accepted on any POST path",6000);
 } else {
   askForToken(false);

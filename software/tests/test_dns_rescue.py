@@ -19,8 +19,10 @@ import base64
 import json
 import math
 import os
+import shutil
 import socket
 import struct
+import subprocess
 import sys
 import unittest
 import unittest.mock
@@ -1810,6 +1812,179 @@ class TestWhatTheOperatorSees(unittest.TestCase):
     def test_a_dead_resolver_is_called_out(self):
         i = self.src.index("info.stuck ?")
         self.assertIn("nothing can leave", self.src[i:i + 400])
+
+
+_RESCUE_ROUTE = "/api/rescues/unattributed"
+
+
+def _the_function_that_polls_rescues():
+    """(name, source) of the operator-console function that asks the route.
+
+    Found by what it does -- it is the one function that requests the
+    route -- not by a name chosen here, so a rename cannot make the
+    tests below vacuous and they never assert their own spelling.
+    """
+    import re
+
+    from software.c2 import server as server_mod
+
+    html = server_mod._OPERATOR_HTML
+    if _RESCUE_ROUTE not in html:
+        raise AssertionError("the operator console never asks for %s, so "
+                             "nothing tells the operator" % _RESCUE_ROUTE)
+    at = html.index(_RESCUE_ROUTE)
+    starts = list(re.finditer(r"(?:async\s+)?function\s+([A-Za-z_$][\w$]*)"
+                              r"\s*\([^)]*\)\s*\{", html[:at]))
+    start = starts[-1]
+    depth, i = 1, start.end()
+    while depth:
+        depth += {"{": 1, "}": -1}.get(html[i], 0)
+        i += 1
+    return start.group(1), html[start.start():i]
+
+
+class TestTheOperatorIsToldAboutRescuesNobodyCanClaim(unittest.TestCase):
+    """The drawer is a place you have to open; the console should speak up.
+
+    Source-level for what can be read off the page (that the name called
+    is defined where it is called -- the defect this feature already
+    shipped once), and run under node for what cannot (that a record is
+    announced once, not on every tick).
+    """
+
+    def test_the_poll_is_started_beside_the_agent_poll(self):
+        import re
+
+        from software.c2 import server as server_mod
+
+        name, _ = _the_function_that_polls_rescues()
+        html = server_mod._OPERATOR_HTML
+        self.assertRegex(html, r"setInterval\(%s\s*,\s*\d+\)" % re.escape(name))
+        self.assertRegex(html, r"setInterval\(refreshAgents\s*,\s*\d+\)")
+
+    def test_the_notification_escapes_with_a_helper_that_exists(self):
+        # The rule this feature's worst defect earned: escHtml(...) was an
+        # invented spelling, the operator console calls its escaper `esc`,
+        # and the whole agent panel threw and rendered nothing. So: every
+        # function the poll calls must be one this page defines.
+        import re
+
+        _, source = _the_function_that_polls_rescues()
+        code = _strip_js_literals(source)
+        called = set(re.findall(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(", code))
+        called -= _JS_KEYWORDS
+        called.discard(_the_function_that_polls_rescues()[0])
+        defined = TestTheTwoGuisDoNotShareHelpers()._names(_operator_script())
+        undefined = sorted(called - defined)
+        self.assertEqual(
+            undefined, [],
+            "the rescue poll calls %s, which the operator console does not "
+            "define -- the poll will throw" % undefined)
+        # And it must actually escape the one field a target influences.
+        self.assertTrue(
+            re.search(r"\b(?:%s)\(\s*\w+\.summary\s*\)"
+                      % "|".join(map(re.escape, sorted(called))), code),
+            "the summary is not passed through any function")
+
+    def _run(self, polls):
+        """Run the real poll under node against scripted responses.
+
+        `polls` is a list of what the route answers on successive ticks.
+        The page's own `esc` is lifted out of the page, so a name the poll
+        calls that the page lacks throws here as it would in the browser.
+        """
+        import re
+
+        from software.c2 import server as server_mod
+
+        name, source = _the_function_that_polls_rescues()
+        esc = re.search(r"function esc\(s\)\{.*?\n\}\n",
+                        server_mod._OPERATOR_HTML, re.S).group(0)
+        # The page-level `let` the poll keeps its memory in: whichever
+        # declaration in the page the poll's own source mentions.
+        state = "".join(
+            d.group(0) + "\n" for d in re.finditer(
+                r"^let\s+([A-Za-z_$][\w$]*)\s*=\s*[{\[][}\]];",
+                server_mod._OPERATOR_HTML, re.M)
+            if re.search(r"\b%s\b" % re.escape(d.group(1)), source))
+        self.assertTrue(state, "the poll keeps no memory of what it has told")
+        script = """
+const toasts = [];
+const seen_paths = [];
+const polls = %s;
+let tick = 0;
+function storedToken(){ return "t"; }
+function toast(type, title, msg, duration){ toasts.push({type, title, msg}); }
+async function api(path){ seen_paths.push(path); return polls[tick++]; }
+%s
+%s
+%s
+(async () => {
+  const counts = [];
+  for(let i = 0; i < polls.length; i++){ await %s(); counts.push(toasts.length); }
+  console.log(JSON.stringify({counts, toasts, seen_paths}));
+})().catch(e => { console.error(e.stack); process.exit(1); });
+""" % (json.dumps(polls), state, esc, source, name)
+        done = subprocess.run(["node", "-e", script], capture_output=True,
+                              text=True, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout)
+
+    @staticmethod
+    def _rec(fingerprint=1234, at="2026-01-01T00:00:00Z",
+             summary="HTTPS: wanted authentication (407)"):
+        return {"summary": summary, "dns_answered": True,
+                "fingerprint": fingerprint, "at": at,
+                "https": ["auth_required", 407]}
+
+    def _unattributed(self, *records):
+        return {"unattributed": list(records)}
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_record_is_announced_once_with_a_warning(self):
+        got = self._run([self._unattributed(self._rec())])
+        self.assertEqual(got["seen_paths"], [_RESCUE_ROUTE])
+        self.assertEqual(len(got["toasts"]), 1)
+        self.assertEqual(got["toasts"][0]["type"], "warning")
+        self.assertIn("407", got["toasts"][0]["msg"])
+        self.assertIn("%04x" % 1234, got["toasts"][0]["msg"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_record_already_seen_raises_no_second_notification(self):
+        # The list is capped at 50 and never cleared, so a poll that
+        # announces everything it is given re-fires every record on every
+        # tick. Same list three times, then one new record at the front.
+        old = self._rec(fingerprint=1, at="2026-01-01T00:00:01Z")
+        older = self._rec(fingerprint=2, at="2026-01-01T00:00:00Z")
+        new = self._rec(fingerprint=3, at="2026-01-01T00:00:02Z")
+        same = self._unattributed(old, older)
+        got = self._run([same, same, same, self._unattributed(new, old, older)])
+        self.assertEqual(got["counts"], [2, 2, 2, 3])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_two_records_are_told_apart_by_beacon_and_by_time(self):
+        # The key is per record: the same beacon stuck again later is news,
+        # and two beacons stuck in the same second are two beacons.
+        a = self._rec(fingerprint=7, at="2026-01-01T00:00:00Z")
+        later = self._rec(fingerprint=7, at="2026-01-01T00:00:09Z")
+        other = self._rec(fingerprint=8, at="2026-01-01T00:00:09Z")
+        got = self._run([self._unattributed(a),
+                         self._unattributed(later, a),
+                         self._unattributed(other, later, a)])
+        self.assertEqual(got["counts"], [1, 2, 3])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_what_a_target_sent_is_escaped_in_the_notification(self):
+        got = self._run([self._unattributed(
+            self._rec(summary="<img src=x onerror=alert(1)>"))])
+        msg = got["toasts"][0]["msg"]
+        self.assertNotIn("<img", msg)
+        self.assertIn("&lt;img", msg)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_no_records_raises_nothing(self):
+        got = self._run([{"unattributed": []}])
+        self.assertEqual(got["toasts"], [])
 
 
 # ── The agent reads it (Task 6) ──
