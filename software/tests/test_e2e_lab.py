@@ -599,5 +599,86 @@ class DriverTests(unittest.TestCase):
         self.assertRegex(self.source, r'"down"')
 
 
+class ScenarioTests(unittest.TestCase):
+    """The three scenarios, and what each one is for.
+
+    Each exists to make one claim falsifiable, and the claims differ: a
+    scenario whose expectations were copied from its neighbour would pass
+    for the wrong reason. These check the declarations rather than the
+    runs, because a run needs Docker and these do not.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from tools import e2e_lab
+        cls.driver = e2e_lab
+        cls.source = (REPO / "tools" / "e2e_lab.py").read_text()
+
+    def test_stale_token_gives_the_listener_a_token_the_server_rejects(self):
+        # Tasking over DNS needs that token; the rescue does not, because
+        # it goes through the beacon handler. So the ladder runs all the
+        # way down and SMB and QUIC are really attempted -- which is the
+        # only way this lab can prove the leg-recording fix on Linux.
+        env = self.driver.SCENARIOS["stale-token"].get("env", {})
+        self.assertIn("LAB_DNS_LISTENER_TOKEN", env)
+        compose = _load(LAB_COMPOSE)["services"]
+        server = compose["teamserver"]["environment"]
+        listener = compose["listener-dns"]["environment"]
+        self.assertTrue(
+            any("LAB_SERVER_LISTENER_TOKEN" in entry for entry in server),
+            "the server's token must be settable separately or the two "
+            "cannot be made to differ")
+        self.assertTrue(
+            any("LAB_DNS_LISTENER_TOKEN" in entry for entry in listener))
+        self.assertNotEqual(env["LAB_DNS_LISTENER_TOKEN"],
+                            self.driver.DEFAULT_LISTENER_TOKEN)
+
+    def test_stale_token_expects_the_lower_legs_to_be_attempted(self):
+        # The point of the scenario. On Linux a dead QUIC endpoint raises
+        # nothing and merely times out, so an unrecorded leg packs as
+        # `not_attempted` and the operator is told "not tried" about a leg
+        # that was tried. Anything but that word is the fix working.
+        expect = self.driver.SCENARIOS["stale-token"]
+        self.assertTrue(expect.get("legs_attempted"),
+                        "stale-token must require smb and quic to be "
+                        "reported as attempted")
+        self.assertEqual(set(expect["legs_attempted"]), {"smb", "quic"})
+
+    def test_smb_up_expects_no_rescue_because_an_upstream_leg_delivered(self):
+        expect = self.driver.SCENARIOS["smb-up"]
+        self.assertEqual(expect.get("rescues"), 0)
+        self.assertEqual(expect.get("delivered_by"), "smb")
+
+    def test_smb_up_keeps_the_dns_leg_armed(self):
+        # Disabling DNS would make "no rescue was sent" vacuous:
+        # _maybe_rescue returns immediately when DNS is off, so the latch
+        # would never be armed and the absence would prove nothing. The
+        # scenario therefore keeps the stale token: the resolver answers,
+        # the latch is armed, and tasking over DNS still returns nothing.
+        env = self.driver.SCENARIOS["smb-up"].get("env", {})
+        self.assertIn("LAB_DNS_LISTENER_TOKEN", env)
+        self.assertNotEqual(env["LAB_DNS_LISTENER_TOKEN"],
+                            self.driver.DEFAULT_LISTENER_TOKEN)
+
+    def test_only_smb_up_runs_the_smb_listener(self):
+        # Every other scenario needs SMB unreachable, so the listener is
+        # behind a profile and only this scenario asks for it.
+        self.assertTrue(self.driver.SCENARIOS["smb-up"].get("profile"))
+        for name in ("rescue", "stale-token"):
+            self.assertFalse(self.driver.SCENARIOS[name].get("profile"),
+                             "%s must not start the SMB listener" % name)
+
+    def test_the_rescue_scenario_expects_exactly_one(self):
+        self.assertEqual(self.driver.SCENARIOS["rescue"].get("rescues"), 1)
+
+    def test_every_scenario_says_what_it_expects(self):
+        # A scenario with no expectation would pass by running.
+        for name, spec in self.driver.SCENARIOS.items():
+            with self.subTest(scenario=name):
+                self.assertTrue(
+                    "rescues" in spec or "legs_attempted" in spec,
+                    "%s asserts nothing about the outcome" % name)
+
+
 if __name__ == "__main__":
     unittest.main()

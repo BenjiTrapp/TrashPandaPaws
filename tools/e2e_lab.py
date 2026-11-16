@@ -50,13 +50,52 @@ COMPOSE_FILE = REPO / "software" / "tests" / "lab" / "docker-compose.yml"
 # while this was written) and nothing here may see, let alone remove, one.
 PROJECT = "raccoon-lab"
 
-# What a scenario needs from the beacon container, beyond the compose file.
+# What the compose file defaults both listener tokens to. A scenario makes
+# the DNS listener's differ from the server's to produce the stale-token
+# case, so the value has to be known here.
+DEFAULT_LISTENER_TOKEN = "lab-listener-token"
+_STALE_TOKEN = "a-token-the-server-stopped-accepting"
+
+# What each scenario sets up and what it claims. The claims differ on
+# purpose: a scenario whose expectations were copied from its neighbour
+# would pass for the wrong reason.
+#
 # `cycles` counts *stuck* cycles -- see beacon_entry.py, which cannot count
 # from the start because the beacon is healthy until the driver severs it.
 SCENARIOS = {
-    "rescue": {"cycles": 4},
-    "stale-token": {"cycles": 4},
-    "smb-up": {"cycles": 4},
+    # The named gap: every upstream leg unroutable, the resolver answering,
+    # the listener relaying. One rescue, and a diagnosis the operator can
+    # read.
+    "rescue": {
+        "cycles": 4,
+        "rescues": 1,
+        "env": {},
+    },
+    # The scenario the hand-kept VM died before reaching, and the only one
+    # that proves the leg-recording fix on Linux. The listener holds a
+    # token the server no longer accepts, so tasking over DNS returns
+    # nothing while the rescue still arrives -- it goes through the beacon
+    # handler, which needs no listener token. The ladder therefore runs all
+    # the way down and SMB and QUIC are really attempted.
+    "stale-token": {
+        "cycles": 4,
+        "rescues": 1,
+        "legs_attempted": ("smb", "quic"),
+        "env": {"LAB_DNS_LISTENER_TOKEN": _STALE_TOKEN},
+    },
+    # The first of the later transports, and the proof the shape extends.
+    # It keeps the stale token on purpose: disabling DNS would make "no
+    # rescue was sent" vacuous, because _maybe_rescue returns immediately
+    # when DNS is off and the latch would never be armed. Here the resolver
+    # answers, the latch IS armed and could fire, and it does not -- because
+    # an upstream leg delivered.
+    "smb-up": {
+        "cycles": 4,
+        "rescues": 0,
+        "delivered_by": "smb",
+        "profile": ("--profile", "smb"),
+        "env": {"LAB_DNS_LISTENER_TOKEN": _STALE_TOKEN},
+    },
 }
 
 _SEVER_NETWORK = "raccoon-lab_c2-net"
@@ -239,6 +278,16 @@ def _assert_severed(compose, env=None):
 _QUERY_LINE = re.compile(r"query\[(?P<type>\w+)\] (?P<name>\S+) from")
 _FORWARD_LINE = re.compile(r"forwarded (?P<name>\S+) to ")
 
+# beacon_entry.py prints one of these per cycle, prefixed `lab-beacon:`.
+# `legs` lists only the legs that FAILED, which is what makes the absence
+# of one evidence that it delivered.
+_CYCLE_LINE = re.compile(r"cycle \d+ \w+ agent=\S+ legs=(?P<legs>\S*)")
+
+# The order the beacon tries its transports in. A leg below the one that
+# delivered is never reached, so finding one in the failures disproves the
+# delivery.
+_LADDER = ("https", "dns", "smb", "quic")
+
 
 def _resolver_log(compose, env=None):
     """dnsmasq's query log, read from the file it writes.
@@ -297,8 +346,9 @@ def run_scenario(name, *, compose, env, keep):
     settings = dict(env)
     settings["LAB_SCENARIO"] = name
     settings["LAB_CYCLES"] = str(spec["cycles"])
+    settings.update(spec.get("env", {}))
 
-    profile = ["--profile", "smb"] if name == "smb-up" else []
+    profile = list(spec.get("profile", ()))
     _say("  bringing the lab up%s" % (" with the SMB listener" if profile
                                       else ""))
     _compose(profile + ["up", "-d"], compose=compose, env=settings,
@@ -332,6 +382,7 @@ def run_scenario(name, *, compose, env, keep):
     _say("  waiting for %d stuck cycles" % spec["cycles"])
     _wait_for("the beacon to finish its stuck cycles",
               lambda: "finished after" in _beacon_output(compose, settings))
+    beacon_said = _beacon_output(compose, settings)
 
     log = _resolver_log(compose, settings)
     queries = _queries(log)
@@ -350,16 +401,25 @@ def run_scenario(name, *, compose, env, keep):
     _say("    %d tasking queries, %d rescue" % (len(tasking), len(rescues)))
 
     problems = []
-    if len(rescues) == 0:
-        problems.append(
-            "no rescue crossed the resolver across %d stuck cycles: the "
-            "beacon never reported why it was stuck, which is the whole "
-            "feature" % spec["cycles"])
-    elif len(rescues) != 1:
-        problems.append(
-            "%d rescues crossed the resolver across %d stuck cycles, not "
-            "one -- the latch is the OpSec promise and a second query "
-            "breaks it" % (len(rescues), spec["cycles"]))
+    wanted = spec["rescues"]
+    if len(rescues) != wanted:
+        if wanted == 0:
+            problems.append(
+                "%d rescue(s) crossed the resolver, and this scenario "
+                "expects none: an upstream leg delivered while the latch "
+                "was armed, so sending one means the latch fires on "
+                "something other than being stuck"
+                % len(rescues))
+        elif not rescues:
+            problems.append(
+                "no rescue crossed the resolver across %d stuck cycles: the "
+                "beacon never reported why it was stuck, which is the whole "
+                "feature" % spec["cycles"])
+        else:
+            problems.append(
+                "%d rescues crossed the resolver across %d stuck cycles, not "
+                "%d -- the latch is the OpSec promise and a second query "
+                "breaks it" % (len(rescues), spec["cycles"], wanted))
     for qname in rescues:
         if not _name_is_legal(qname):
             problems.append("the rescue name is not legal DNS: %d chars, "
@@ -372,15 +432,60 @@ def run_scenario(name, *, compose, env, keep):
     stuck = record.get("stuck")
     _say("")
     _say("  WHAT THE OPERATOR SEES:")
+    if spec.get("delivered_by"):
+        # NOT `last_channel`. A listener relays to the beacon handler over
+        # HTTP, so an SMB delivery lands as `last_channel: http` and that
+        # field cannot distinguish SMB from HTTPS at all -- the first
+        # version of this check compared it to "smb", printed
+        # "expected smb" when it saw "http", and passed anyway, which is a
+        # central claim proved by nothing.
+        #
+        # The beacon's own per-cycle line does distinguish them. A leg is
+        # recorded in `_leg_status` only when it FAILS, and the ladder is
+        # ordered https, dns, smb, quic. So if SMB delivered, `smb` is
+        # absent from every cycle's legs and `quic` was never reached; if
+        # SMB had failed, both would be there -- which is exactly what the
+        # stale-token scenario shows.
+        delivered = spec["delivered_by"]
+        legs_seen = set()
+        for line in _CYCLE_LINE.finditer(beacon_said):
+            for entry in line.group("legs").split(","):
+                name = entry.split(":")[0].strip()
+                if name and name != "-":
+                    legs_seen.add(name)
+        _say("    legs the beacon recorded as failed: %s"
+             % (", ".join(sorted(legs_seen)) or "none"))
+        if delivered in legs_seen:
+            problems.append(
+                "the beacon recorded %s as failed, so tasking did not "
+                "arrive over it and this scenario proved nothing about "
+                "that transport" % delivered)
+        else:
+            later = _LADDER[_LADDER.index(delivered) + 1:]
+            reached = sorted(set(later) & legs_seen)
+            if reached:
+                problems.append(
+                    "the beacon went on to try %s after %s, which it would "
+                    "only do if %s had not delivered"
+                    % (", ".join(reached), delivered, delivered))
+            else:
+                _say("    tasking arrived over %s: it is absent from the "
+                     "failures and nothing below it was tried" % delivered)
     if not stuck:
-        problems.append("the team server decoded no diagnosis: the agent "
-                        "record carries no `stuck` summary")
-        _say("    (nothing)")
+        if spec["rescues"]:
+            problems.append("the team server decoded no diagnosis: the agent "
+                            "record carries no `stuck` summary")
+        _say("    no `stuck` summary, which is what this scenario expects"
+             if not spec["rescues"] else "    (nothing)")
     else:
         _say("    Stuck: %s" % stuck.get("summary", ""))
         _say("    dns_answered: %s" % stuck.get("dns_answered"))
         legs = {leg: stuck.get(leg) for leg in ("https", "dns", "smb", "quic")}
         _say("    legs: %s" % legs)
+        if not spec["rescues"]:
+            problems.append(
+                "a diagnosis reached the operator in a scenario that "
+                "expects none: %s" % stuck.get("summary"))
         if stuck.get("https") and stuck["https"][0] == "not_attempted":
             problems.append("HTTPS is reported as not attempted, but the "
                             "beacon tried it on every severed cycle")
@@ -388,6 +493,19 @@ def run_scenario(name, *, compose, env, keep):
             problems.append("dns_answered is false, yet the rescue arrived "
                             "through the resolver -- the record contradicts "
                             "the wire")
+        # The claim this lab exists to make falsifiable on Linux: an
+        # unrecorded leg packs as `not_attempted`, so the operator is told
+        # "not tried" about a leg that was tried and timed out.
+        for leg in spec.get("legs_attempted", ()):
+            reported = stuck.get(leg)
+            if not reported or reported[0] == "not_attempted":
+                problems.append(
+                    "%s is reported as %r, but this scenario drove the "
+                    "ladder all the way down and really attempted it -- on "
+                    "Linux a dead endpoint raises nothing and merely times "
+                    "out, which is exactly the case that used to go "
+                    "unrecorded"
+                    % (leg, reported[0] if reported else None))
     return problems
 
 
