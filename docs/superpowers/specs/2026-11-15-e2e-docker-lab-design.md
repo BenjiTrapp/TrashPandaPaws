@@ -218,7 +218,7 @@ container's — which is what makes severance real.
 | Image | Base | Contents |
 |---|---|---|
 | `lab-teamserver` | `python:3.12-slim` | `flask`, `cryptography`. Source bind-mounted. |
-| `lab-beacon` | `python:3.12-slim` | `requests` only. Source bind-mounted. |
+| `lab-beacon` | `python:3.12-slim` | Nothing installed. Source bind-mounted. |
 | `lab-resolver` | `debian:stable-slim` | `dnsmasq`. No project source. |
 | listeners | existing `software/c2/listeners/Dockerfile` | unchanged, stdlib only, `USER 65534`, `cap_drop: [ALL]` |
 
@@ -235,6 +235,17 @@ container cannot write into the checkout.
 My call, as is the choice of two thin images over one shared one: the
 beacon must not have `flask` available, because a beacon that can import
 the server is a beacon that might.
+
+**Two corrections this document needed, made during Task 6.** The table
+first said the beacon image installs `requests`; it installs nothing,
+because `beacon.py` is standard-library only — its HTTP session is
+`_HttpSession` over `urllib` and says so — and an unused dependency would
+contradict the stdlib-only constraint this same document states. And the
+`smb-up` scenario below first spoke of giving the SMB listener "a valid
+token"; only the DNS listener has that concept (`listeners/dns.py:79` is
+the one constructor taking `listener_token`, and the shipped compose gives
+the variable to the DNS service alone). Both were caught by an implementer
+reading the design against the code, which is what the review loop is for.
 
 ## The driver
 
@@ -281,9 +292,9 @@ things a human runs, and a compose file is not that.
    because `_maybe_rescue` returns immediately when DNS is off. So the
    scenario keeps the stale-token listener — the resolver answers, the
    latch is genuinely armed, tasking over DNS returns nothing — and adds
-   the SMB listener to `beacon-net` with a valid token. Asserts: tasking
-   arrives over **SMB**, and **no** rescue is sent, because an upstream leg
-   delivered while the latch was armed and could have fired.
+   the SMB listener to `beacon-net`. Asserts: tasking arrives over **SMB**,
+   and **no** rescue is sent, because an upstream leg delivered while the
+   latch was armed and could have fired.
 
 Scenario 2 is the one that must fail against the parent of the
 leg-recording fix (`3dad39e`). Scenario 1's subject is the trigger
