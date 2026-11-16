@@ -1535,6 +1535,24 @@ class TestARescueNobodyCanClaim(unittest.TestCase):
     def test_the_route_is_empty_when_nothing_has_been_received(self):
         self.assertEqual(self._served().get_json(), {"unattributed": []})
 
+    def test_premise_a_get_to_an_unrouted_path_is_405(self):
+        # A premise, not a feature. The agent tool's degradation against an
+        # older team server rests on what such a server answers to GET
+        # /api/rescues/unattributed: 405, because its catch-all
+        # /<path:path> accepts only POST, so a GET to an unrouted path is
+        # a method error. `C2Client._request` tolerates only 404 as
+        # "missing", which is why the tool has to absorb the 405 itself,
+        # and why the client's docstring says what it says. If someone adds
+        # a GET catch-all, the handling still works (every non-2xx raises)
+        # but that rationale quietly stops being true; this test must break
+        # first. The path is one no route will ever claim.
+        client = self.app.test_client()
+        for headers in ({}, self._auth()):
+            with self.subTest(authenticated=bool(headers)):
+                response = client.get(
+                    "/never-a-route-405-premise/x", headers=headers)
+                self.assertEqual(response.status_code, 405)
+
     def test_the_route_needs_the_operator_token(self):
         self._send()
         client = self.app.test_client()
