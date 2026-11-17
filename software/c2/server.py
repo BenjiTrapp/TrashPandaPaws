@@ -1761,7 +1761,19 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return jsonify({"error": "target required"}), 400
 
         if mode == "xfreerdp":
-            cmd_parts = ["xfreerdp"]
+            # Looked up, not assumed. freerdp2 ships `xfreerdp` and
+            # freerdp3 ships `xfreerdp3`; this used to hardcode the former,
+            # so moving the image's Debian base -- which happened once
+            # already, unnoticed -- would leave the RDP button failing at
+            # runtime for an operator to discover. The VNC branch below
+            # has always probed its viewer names; this now matches it.
+            client = next(
+                (name for name in ("xfreerdp", "xfreerdp3")
+                 if shutil.which(name)), None)
+            if client is None:
+                return jsonify({"error": "No RDP client found (install "
+                                         "freerdp2-x11 or freerdp3-x11)"}), 400
+            cmd_parts = [client]
             cmd_parts.append(f"/v:{target}")
             if port:
                 cmd_parts.append(f"/port:{port}")

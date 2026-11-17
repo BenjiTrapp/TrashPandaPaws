@@ -1,6 +1,14 @@
 services:
   raccoon-c2:
-    build: .
+    build:
+      # The repository root, because the image needs the `software/`
+      # package: server.py imports `software.c2.listeners` and
+      # `software.c2.stagers`, and a context of this directory cannot
+      # COPY them. With the old context the image built and then died at
+      # start-up with "No module named 'software'". The listener service
+      # below has always used this context for the same reason.
+      context: ../..
+      dockerfile: software/c2/Dockerfile
     container_name: raccoon-c2
     restart: unless-stopped
     network_mode: host
