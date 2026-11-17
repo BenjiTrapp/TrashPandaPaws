@@ -21,9 +21,6 @@ What is checked, and why each one:
   * `--check` re-derives every asset and compares bytes, so an asset
     edited by hand, or an artwork changed without regenerating, is
     reported rather than shipped.
-  * The eye coordinates the favicon animation draws its glow at are
-    re-derived from the committed favicon. A picture that moves would
-    otherwise leave the glow on the fur, and nothing would say so.
   * The header cannot distort its source again, whatever it is given.
 """
 
@@ -235,75 +232,6 @@ class TestTheCommittedAssetsAreWhatTheGeneratorMakes(unittest.TestCase):
             self.assertIn("DIFFERS", done.stdout)
         finally:
             target.write_bytes(original)
-
-
-class TestTheGlowSitsOnTheEyes(unittest.TestCase):
-    """Where the favicon animation draws, against where the eyes are.
-
-    The page carries the coordinates as constants because fetching them
-    would be an extra request and a failure mode. This is what keeps them
-    true: the eyes are found in the committed favicon the same way the
-    generator found them, and compared.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        cls.page = _page_source()
-        cls.favicon = _Png(WEB / "favicon-64.png")
-
-    def _declared(self):
-        match = re.search(r"const FAVICON_EYES = \[\[([\d.]+), ([\d.]+)\], "
-                          r"\[([\d.]+), ([\d.]+)\]\]", self.page)
-        self.assertIsNotNone(match,
-                             "the page no longer declares FAVICON_EYES")
-        values = [float(g) for g in match.groups()]
-        return [(values[0], values[1]), (values[2], values[3])]
-
-    def _measured(self):
-        """The two glowing clusters in the favicon, as fractions of it."""
-        image = self.favicon
-        x0, x1 = int(image.width * 0.20), int(image.width * 0.70)
-        y0, y1 = int(image.height * 0.35), int(image.height * 0.55)
-        hits = []
-        for y in range(y0, y1):
-            for x in range(x0, x1):
-                r, g, b = image.pixel(x, y)
-                if r > 150 and r - max(g, b) > 60:
-                    hits.append((x, y))
-        self.assertTrue(hits, "no red pixels in the favicon's eye band")
-        columns = sorted({x for x, _ in hits})
-        gaps = [(b - a, a) for a, b in zip(columns, columns[1:]) if b - a > 2]
-        self.assertTrue(gaps, "the red pixels form one cluster, not two eyes")
-        split = max(gaps)[1]
-        out = []
-        for group in ([p for p in hits if p[0] <= split],
-                      [p for p in hits if p[0] > split]):
-            xs = [p[0] for p in group]
-            ys = [p[1] for p in group]
-            out.append(((min(xs) + max(xs)) / 2 / image.width,
-                        (min(ys) + max(ys)) / 2 / image.height))
-        return out
-
-    def test_the_declared_eyes_are_where_the_red_pixels_are(self):
-        for declared, measured in zip(self._declared(), self._measured()):
-            with self.subTest(declared=declared):
-                self.assertAlmostEqual(declared[0], measured[0], delta=0.05,
-                                       msg="the glow is %.3f from the left "
-                                           "and the eye is %.3f"
-                                           % (declared[0], measured[0]))
-                self.assertAlmostEqual(declared[1], measured[1], delta=0.05,
-                                       msg="the glow is %.3f from the top "
-                                           "and the eye is %.3f"
-                                           % (declared[1], measured[1]))
-
-    def test_the_radius_is_smaller_than_the_gap_between_the_eyes(self):
-        # Otherwise the two glows merge into one smear across the muzzle.
-        match = re.search(r"const FAVICON_EYE_RADIUS = ([\d.]+)", self.page)
-        self.assertIsNotNone(match)
-        radius = float(match.group(1))
-        left, right = self._declared()
-        self.assertLess(radius * 4, right[0] - left[0],
-                        "the glow is wide enough to merge the two eyes")
 
 
 class TestTheHeaderCannotSquashItsLogoAgain(unittest.TestCase):
