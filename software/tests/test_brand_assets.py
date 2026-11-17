@@ -24,9 +24,11 @@ What is checked, and why each one:
     and transparent at the corners, and their outlines have not taken on
     the GIF's pink matte colour -- the symptom of a resample that did
     not premultiply, which only the outline pixels can show.
-  * `--check` re-derives every asset and compares bytes, so an asset
-    edited by hand, or an artwork changed without regenerating, is
-    reported rather than shipped.
+  * `--check` re-derives every asset and compares what each PNG says --
+    its header and its decompressed scanlines, never the compressed bytes
+    -- so an asset edited by hand, or an artwork changed without
+    regenerating, is reported rather than shipped, and a machine whose
+    zlib deflates differently is not blamed for it.
   * The header shows the whole animated artwork, contained rather than
     cropped or squashed, and the server serves that file to it. The
     wide banner is still served at `/logo.png`, but not to the header.
@@ -153,8 +155,13 @@ class _Png:
         copy.pixels = bytes(pixels)
         return copy
 
-    def to_bytes(self):
-        """Re-encode, so a test can write back a file it has altered."""
+    def to_bytes(self, level=9):
+        """Re-encode, so a test can write back a file it has altered.
+
+        `level` is zlib's compression level and changes the file's bytes
+        and nothing it means, which is what a test of `--check` needs to
+        stand in for another machine's zlib.
+        """
         stride = self.width * self.channels
         raw = bytearray()
         for y in range(self.height):
@@ -170,8 +177,23 @@ class _Png:
                 + chunk(b"IHDR", struct.pack(">IIBBBBB", self.width,
                                              self.height, 8, self.colour,
                                              0, 0, 0))
-                + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+                + chunk(b"IDAT", zlib.compress(bytes(raw), level))
                 + chunk(b"IEND", b""))
+
+
+def _split_idat(png):
+    """The same PNG with its one IDAT chunk cut into two."""
+    start = png.index(b"IDAT") - 4
+    length = struct.unpack(">I", png[start:start + 4])[0]
+    payload = png[start + 8:start + 8 + length]
+    half = len(payload) // 2
+
+    def chunk(piece):
+        return (struct.pack(">I", len(piece)) + b"IDAT" + piece
+                + struct.pack(">I", zlib.crc32(b"IDAT" + piece) & 0xFFFFFFFF))
+
+    return (png[:start] + chunk(payload[:half]) + chunk(payload[half:])
+            + png[start + 12 + length:])
 
 
 def _page_source():
@@ -272,6 +294,34 @@ class TestTheCommittedAssetsAreWhatTheGeneratorMakes(unittest.TestCase):
             self.assertNotEqual(done.returncode, 0,
                                 "--check passed on an edited asset")
             self.assertIn("DIFFERS", done.stdout)
+            # From the pixels alone an edit and a resampling Pillow look
+            # the same, so the message has to name both.
+            self.assertIn("edited", done.stdout)
+            self.assertIn("Pillow", done.stdout)
+        finally:
+            target.write_bytes(original)
+
+    def test_check_ignores_how_an_asset_was_compressed(self):
+        # The same pixels deflated at another level, and split across two
+        # IDAT chunks, are different bytes on disk -- which is all another
+        # machine's zlib would change. `--check` must still call it a match.
+        target = WEB / "favicon-16.png"
+        original = target.read_bytes()
+        try:
+            for level in (1, 0):
+                with self.subTest(level=level):
+                    recompressed = _Png(target).to_bytes(level)
+                    self.assertNotEqual(recompressed, original,
+                                        "the recompression changed nothing, "
+                                        "so this test proves nothing")
+                    target.write_bytes(recompressed)
+                    done = self._check()
+                    self.assertEqual(done.returncode, 0,
+                                     done.stdout + done.stderr)
+                    self.assertNotIn("DIFFERS", done.stdout)
+            target.write_bytes(_split_idat(original))
+            done = self._check()
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         finally:
             target.write_bytes(original)
 
