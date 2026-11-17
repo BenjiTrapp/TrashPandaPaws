@@ -16,8 +16,10 @@ generator is run as a subprocess for the one test that needs it.
 
 What is checked, and why each one:
 
-  * The artwork is committed, and the assets derived from it are square,
-    transparent at the corners and free of the GIF's pink matte colour.
+  * The artwork is committed, and the assets derived from it are square
+    and transparent at the corners, and their outlines have not taken on
+    the GIF's pink matte colour -- the symptom of a resample that did
+    not premultiply, which only the outline pixels can show.
   * `--check` re-derives every asset and compares bytes, so an asset
     edited by hand, or an artwork changed without regenerating, is
     reported rather than shipped.
@@ -189,14 +191,35 @@ class TestTheAssetsComeFromTheCommittedArtwork(unittest.TestCase):
                 self.assertEqual((image.width, image.height), (size, size))
                 self.assertEqual(image.channels, 4)
 
-    def test_no_pink_bled_into_the_transparent_corners(self):
+    def test_the_matte_colour_has_not_bled_into_the_outline(self):
         # The GIF's transparent pixels carry RGB (224, 106, 108). A
-        # reduction that did not premultiply would smear that pink around
-        # the whole outline; a fully transparent corner says it did.
-        for size in WEB_SIZES:
-            with self.subTest(size=size):
-                self.assertEqual(
-                    _Png(WEB / ("favicon-%d.png" % size)).pixel(0, 0)[3], 0)
+        # resample that did not premultiply would average that pink into
+        # every outline pixel, weighted by how much of the pixel is
+        # background: the mostly-transparent edge would come out almost
+        # entirely pink. Measured on this artwork, 80% or more of the
+        # pixels with alpha below 128 are within 40 of the matte colour
+        # when the resample is wrong, and 4% or fewer when it is right.
+        #
+        # It is a proportion and not "none of them", because the raccoon's
+        # own fur rim is red: a legitimate edge pixel sits as close as 12
+        # to the matte colour, so no per-pixel threshold separates the
+        # two. What does is that bleed takes over the whole population.
+        matte = (224, 106, 108)
+        paths = [BRAND / MASTER] + [WEB / ("favicon-%d.png" % size)
+                                    for size in WEB_SIZES]
+        for path in paths:
+            with self.subTest(asset=path.name):
+                image = _Png(path)
+                edge = [pixel for pixel in (
+                    image.pixel(x, y) for y in range(image.height)
+                    for x in range(image.width)) if 0 < pixel[3] < 128]
+                self.assertTrue(edge, "no mostly-transparent edge pixels")
+                pink = [pixel for pixel in edge
+                        if max(abs(c - m) for c, m in zip(pixel, matte)) <= 40]
+                self.assertLess(
+                    len(pink) / len(edge), 0.10,
+                    "%d of %d outline pixels are the GIF's matte colour"
+                    % (len(pink), len(edge)))
 
     def test_the_upscale_is_marked_as_one(self):
         # 512 is a Lanczos upscale and carries no detail the 256 does not.
