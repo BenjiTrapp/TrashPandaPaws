@@ -897,6 +897,40 @@ class TestNtlmRelayTunnel(unittest.TestCase):
         with self.assertRaises((ConnectionRefusedError, OSError)):
             socket.create_connection(("127.0.0.1", port), timeout=2).close()
 
+    def test_stop_shuts_the_listener_down_before_closing_it(self):
+        # Closing a descriptor another thread is blocked in accept() on is
+        # undefined in POSIX: macOS wakes the accept, Linux leaves the socket
+        # bound and ACCEPTING until it returns. So on Linux the operator
+        # stops the relay and the target keeps an open port. shutdown()
+        # wakes a blocked accept on Linux (on macOS it raises ENOTCONN on a
+        # listener and close() does the waking); close() alone does not.
+        #
+        # A recording proxy on `relay._server`, not a monkeypatch on the
+        # socket: socket objects use __slots__ and reject attribute
+        # assignment (measured), and this way the test pins the ORDER, which
+        # is the whole property -- shutdown after close would fix nothing.
+        class _Recorder:
+            def __init__(self, inner):
+                self._inner, self.calls = inner, []
+
+            def shutdown(self, how):
+                self.calls.append("shutdown")
+                return self._inner.shutdown(how)
+
+            def close(self):
+                self.calls.append("close")
+                return self._inner.close()
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        relay = self._setup()
+        recorder = _Recorder(relay._server)
+        relay._server = recorder
+        relay.stop()
+        self.relay = None
+        self.assertEqual(recorder.calls, ["shutdown", "close"])
+
 
 class TestBeaconNtlmWiring(unittest.TestCase):
     def _ntlm_config(self, **ntlm):

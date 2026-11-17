@@ -21,6 +21,7 @@ behaves.
 
 import json
 
+from software.agent.c2client import C2Unauthorized, C2Unavailable
 from software.agent.llm.provider import ToolSpec
 from software.agent.tools import CORE, Entry
 
@@ -53,6 +54,29 @@ def _stuck_of(agent):
     return stuck if isinstance(stuck, dict) else None
 
 
+def _leg_report(record):
+    return {
+        "summary": record.get("summary", ""),
+        # False means nothing can leave: the resolver did not answer, so a
+        # queued attempt will never reach it either.
+        "dns_answered": bool(record.get("dns_answered")),
+        "reported_at": record.get("at", ""),
+        "legs": {leg: record.get(leg) for leg in
+                 ("https", "dns", "smb", "quic")},
+    }
+
+
+def _unattributed_entry(record):
+    entry = _leg_report(record)
+    # The two-byte tag the beacon sent, shown as the server's own log shows
+    # it. It is a hash, not an id: it names nothing that can be tasked, but
+    # two entries with the same value are very likely the same beacon.
+    fp = record.get("fingerprint")
+    ok = isinstance(fp, int) and not isinstance(fp, bool) and 0 <= fp <= 0xFFFF
+    entry["fingerprint"] = "%04x" % fp if ok else ""
+    return entry
+
+
 def _get_stuck_beacons(ctx):
     async def get_stuck_beacons():
         agents = await ctx.c2.list_agents()
@@ -61,18 +85,30 @@ def _get_stuck_beacons(ctx):
             stuck = _stuck_of(agent)
             if stuck is None:
                 continue
-            out.append({
-                "beacon_id": agent.get("id") or agent.get("agent_id"),
-                "hostname": agent.get("hostname", ""),
-                "summary": stuck.get("summary", ""),
-                # False means nothing can leave: the resolver did not
-                # answer, so a queued attempt will never reach it either.
-                "dns_answered": bool(stuck.get("dns_answered")),
-                "reported_at": stuck.get("at", ""),
-                "legs": {leg: stuck.get(leg) for leg in
-                         ("https", "dns", "smb", "quic")},
-            })
-        return {"stuck": out}
+            entry = _leg_report(stuck)
+            entry["beacon_id"] = agent.get("id") or agent.get("agent_id")
+            entry["hostname"] = agent.get("hostname", "")
+            out.append(entry)
+
+        # Rescues the server could not attribute to any beacon. They are
+        # reported under their own key because there is no id to task: mixed
+        # into `stuck`, a model would try to queue work against one.
+        #
+        # If the fetch fails the key is OMITTED, not emptied: present means
+        # "I asked", so an empty list means there are none, and an absent
+        # key means the question could not be put. A team server older than
+        # the route answers 405 (its catch-all takes only POST). The
+        # exceptions are listed on purpose and must not be "simplified" to
+        # `except Exception`: a programming error on this path should crash
+        # loudly, not turn into a quiet "no unattributed rescues".
+        result = {"stuck": out}
+        try:
+            records = await ctx.c2.unattributed_rescues()
+        except (C2Unavailable, C2Unauthorized):
+            return result
+        result["unattributed"] = [_unattributed_entry(r) for r in records or ()
+                                  if isinstance(r, dict)]
+        return result
 
     return get_stuck_beacons
 
@@ -139,7 +175,14 @@ def entries():
                 "List beacons that reported being unable to reach the team "
                 "server, with the reason each leg failed. `dns_answered` "
                 "false means nothing can leave that host, so a queued "
-                "attempt will not arrive either.",
+                "attempt will not arrive either. `unattributed` lists "
+                "rescues the server could not match to any beacon: those "
+                "entries have no id and cannot be tasked, so do not try to "
+                "queue anything for them -- they are evidence that a beacon "
+                "is stuck somewhere, nothing more. Entries with the same "
+                "`fingerprint` are very likely the same beacon. If the "
+                "`unattributed` key is absent the server could not be asked; "
+                "present and empty means it was asked and there are none.",
                 {"type": "object", "properties": {}}),
             ("orchestrator",), CORE, _get_stuck_beacons,
             requires_c2=True),

