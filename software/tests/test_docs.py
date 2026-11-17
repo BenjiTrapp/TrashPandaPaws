@@ -546,11 +546,21 @@ def _nothing_is_pinned():
             _read("software", "tests", "requirements.txt")]
     image = _read("software", "c2", "Dockerfile")
     pip_block = image.split("RUN pip install", 1)[1].split("\n\n", 1)[0]
+    # The third clause used to be `re.search(r"NetExec\s*$", image, re.M)`:
+    # the NetExec line happening to end the line was read as "its git ref
+    # carries no tag". Adding a `\` continuation to that line defeated the
+    # probe without changing a thing about pinning, and the suite reported
+    # this finding as fixed. So ask the question the finding actually
+    # asks -- are the three source builds pulling a moving ref? -- which a
+    # reformat cannot answer differently.
+    sources = re.findall(r"(?:git\+https://|https://)github\.com/\S+", image)
+    moving = [url for url in sources
+              if "@" not in url.split("github.com/", 1)[1]]
     return (not any("==" in line for text in reqs
                     for line in text.splitlines()
                     if not line.lstrip().startswith("#"))
             and not re.search(r"[<>=]", pip_block)
-            and re.search(r"NetExec\s*$", image, re.M) is not None)
+            and len(moving) >= 3)
 
 
 def _the_old_dependencies_are_still_declared():
