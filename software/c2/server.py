@@ -907,6 +907,13 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return send_from_directory(str(logo.parent), logo.name)
         return "", 404
 
+    @app.route("/logo.gif")
+    def serve_logo_gif():
+        logo = Path(__file__).parent.parent.parent / "static" / "logo.gif"
+        if logo.exists():
+            return send_from_directory(str(logo.parent), logo.name)
+        return "", 404
+
     # ── Operator GUI ──
 
     @app.route("/")
@@ -3303,14 +3310,16 @@ header{
   background:var(--surface);border-bottom:1px solid var(--border);
   box-shadow:0 2px 20px rgba(255,26,26,0.08);
 }
-/* object-fit is the part that matters. This used to be handed
-   /logo.png -- a 677x369 banner of a round badge on a white field --
-   and 38x38 squashed a 1.83:1 image into a square, after which the
-   border-radius cropped a circle out of the white margin. The source is
-   square now, and `cover` means that even a wrong one would be cropped
-   rather than distorted. */
-header img{width:38px;height:38px;border-radius:50%;object-fit:cover;
-  border:2px solid var(--red-dim);box-shadow:0 0 10px var(--red-glow)}
+/* object-fit is the part that matters, and it must be `contain`. The
+   artwork is a raccoon in a beret holding a glowing USB stick, and the
+   beret is at the very top of the frame while the hands and the stick
+   are at the very bottom. `cover`, or a round border-radius mask, crops
+   the top and bottom away -- exactly the parts it was chosen for. 45x40
+   keeps the artwork's own 443:394, so nothing is squashed either, and a
+   drop-shadow follows the raccoon's outline where a ring would have
+   framed the box. */
+header img{width:45px;height:40px;object-fit:contain;
+  filter:drop-shadow(0 0 7px rgba(255,26,26,0.55))}
 header h1{font-size:18px;font-weight:700;color:var(--red);text-shadow:0 0 15px var(--red-glow);letter-spacing:0.04em}
 header .subtitle{font-size:11px;color:var(--text2);margin-left:4px}
 header .spacer{flex:1}
@@ -4210,7 +4219,7 @@ header .info{font-size:11px;color:var(--text2)}
 <body>
 <div id="app">
   <header>
-    <img src="/static/favicon-128.png" alt="Trash Panda Paws"
+    <img src="/logo.gif" alt="Trash Panda Paws"
          onerror="this.style.display='none'">
     <h1>RACCOON C2</h1>
     <span class="subtitle">Team Server</span>

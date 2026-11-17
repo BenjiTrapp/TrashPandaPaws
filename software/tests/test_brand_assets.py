@@ -309,33 +309,53 @@ class TestTheFrameStripCarriesTheArtworksOwnAnimation(unittest.TestCase):
                          self.strip.cell(4, 64))
 
 
-class TestTheHeaderCannotSquashItsLogoAgain(unittest.TestCase):
+class TestTheHeaderShowsTheWholeArtwork(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.page = _page_source()
+        cls.header = cls.page.split("<header>", 1)[1].split("</header>", 1)[0]
 
-    def test_the_header_image_is_cropped_not_stretched(self):
-        rule = re.search(r"header img\{[^}]*\}", self.page, re.S)
-        self.assertIsNotNone(rule, "the header image rule is gone")
-        self.assertIn("object-fit:cover", rule.group(0),
-                      "a non-square source would be squashed into the box "
-                      "again, which is the defect this replaced")
+    def test_the_header_shows_the_animated_gif(self):
+        self.assertIn('src="/logo.gif"', self.header)
 
-    def test_the_header_is_given_a_square_source(self):
-        match = re.search(r'<img src="(/static/[^"]+)"', self.page)
-        self.assertIsNotNone(match, "the header has no image")
-        name = match.group(1).rsplit("/", 1)[1]
-        image = _Png(WEB / name)
-        self.assertEqual(image.width, image.height,
-                         "%s is %dx%d, and the header draws it square"
-                         % (name, image.width, image.height))
+    def test_it_is_contained_rather_than_cropped_or_stretched(self):
+        rule = re.search(r"header img\{[^}]*\}", self.page, re.S).group(0)
+        self.assertIn("object-fit:contain", rule,
+                      "the whole motif is the point; cover would cut the "
+                      "beret and the hands off again")
+        self.assertNotIn("border-radius", rule,
+                         "a round mask crops the motif this replaced it to show")
+
+    def test_a_missing_logo_leaves_no_broken_image(self):
+        self.assertIn("onerror", self.header)
 
     def test_the_header_no_longer_serves_the_wide_banner(self):
         # `/logo.png` still exists for anything that linked it; the header
         # is what must not use it.
-        header = self.page.split("<header>", 1)[1].split("</header>", 1)[0]
-        self.assertNotIn("/logo.png", header,
-                         "the header is back on the 677x369 banner")
+        self.assertNotIn("/logo.png", self.header)
+
+
+class TestTheServerServesTheArtwork(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(REPO))
+        from software.c2.server import ServerCrypto, create_app
+        from tools.demo_env import random_key
+        cls.data_dir = Path(tempfile.mkdtemp())
+        app = create_app(ServerCrypto(random_key()), "token", cls.data_dir)
+        app.config["TESTING"] = True
+        cls.client = app.test_client()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.data_dir, ignore_errors=True)
+
+    def test_the_route_serves_the_committed_gif(self):
+        response = self.client.get("/logo.gif")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "image/gif")
+        self.assertEqual(response.data, (BRAND / "logo.gif").read_bytes())
+        response.close()
 
 
 class TestTheAnimationBehaves(unittest.TestCase):
