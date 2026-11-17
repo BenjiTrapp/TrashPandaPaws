@@ -396,18 +396,28 @@ class TestTheAnimationBehaves(unittest.TestCase):
         self.assertIn("catch", self.body,
                       "a canvas error would be raised ten times a second")
 
+    def test_it_draws_the_strip_and_not_a_painted_glow(self):
+        self.assertIn("FAVICON_STRIP", self.body)
+        self.assertNotIn("createRadialGradient", self.body,
+                         "the synthetic glow is back on top of artwork "
+                         "that glows already")
+
+    def test_the_eye_constants_are_gone(self):
+        page = _page_source()
+        for name in ("FAVICON_EYES", "FAVICON_EYE_RADIUS"):
+            self.assertNotIn(name, page)
+
 
 _HARNESS = r"""
-// A canvas that draws nothing and records where it would have drawn, so
-// the glow's geometry can be checked rather than assumed.
+// A canvas that draws nothing and records which cell of the strip it would
+// have drawn, so the walk through the frames can be checked rather than
+// assumed.
 const drawn = [];
 const hrefs = [];
 const link = { set href(v) { hrefs.push(v); } };
 const ctx = {
-  globalCompositeOperation: "source-over", fillStyle: null,
-  clearRect(){}, drawImage(){}, beginPath(){}, fill(){},
-  arc(x, y, r){ drawn.push({x, y, r}); },
-  createRadialGradient(){ return { addColorStop(){} }; },
+  clearRect(){},
+  drawImage(img, sx, sy, sw, sh){ drawn.push({sx, sw}); },
 };
 const canvas = { width:0, height:0, getContext(){ return ctx; },
                  toDataURL(){ return "data:image/png;base64,FAKE"; } };
@@ -418,29 +428,19 @@ global.window = { HTMLCanvasElement: function(){} };
 let image = null;
 global.Image = function(){ image = this; };
 
-// The clock, controlled. The pulse has a period of about 2.9 seconds and
-// the harness watches for well under one, so with the real clock the
-// radius spread depended on which part of the sine the run happened to
-// start in -- the spread assertion passed most of the time and failed in
-// a full-suite run. Each frame now advances the clock 700 ms, so seven
-// frames cover more than a full period whatever the wall clock says.
-let fakeNow = 0;
-Date.now = function(){ fakeNow += 700; return fakeNow; };
-
 eval(require("fs").readFileSync(process.argv[2], "utf8"));
 animateFavicon();
 if(!image){ console.log("RESULT " + JSON.stringify({error:"no image requested"})); process.exit(0); }
 const src = image.src;
 image.onload();
+// 1800 ms is ten frames at 180 ms: all eight cells and the wrap to the first.
 setTimeout(() => {
   const before = drawn.length;
   document.hidden = true;
   setTimeout(() => {
     console.log("RESULT " + JSON.stringify({
       src: src, updates: hrefs.length, href: hrefs[0] || "",
-      circles: drawn.slice(0, 2),
-      radii: [Math.min.apply(null, drawn.map(c => c.r)),
-              Math.max.apply(null, drawn.map(c => c.r))],
+      cells: drawn.map(d => d.sx / 64),
       whileHidden: drawn.length - before,
     }));
     // The animation keeps a timer alive even while hidden -- that is the
@@ -448,7 +448,7 @@ setTimeout(() => {
     // never return, which it did not, for two minutes.
     process.exit(0);
   }, 700);
-}, 650);
+}, 1800);
 """
 
 
@@ -461,8 +461,8 @@ class TestTheAnimationActuallyRuns(unittest.TestCase):
     Everything above this checks the page's text and the committed
     pixels, which is the floor and runs everywhere. This runs the
     function in node against a canvas that records what it would have
-    drawn, and is the only thing here that can tell "the glow is centred
-    on the eyes" from "the constants happen to be written down".
+    drawn, and is the only thing here that can tell "the loop walks the
+    frames in order" from "the constants happen to be written down".
 
     It skips without node, and a skipped test holds nothing -- which is
     why the structural checks are separate and not folded into this one.
@@ -471,7 +471,7 @@ class TestTheAnimationActuallyRuns(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         page = _page_source()
-        start = page.index("const FAVICON_EYES")
+        start = page.index("const FAVICON_STRIP")
         end = page.index("\nfunction esc(s){")
         cls.result = cls._run(page[start:end])
 
@@ -491,45 +491,24 @@ class TestTheAnimationActuallyRuns(unittest.TestCase):
                              "stderr: %s"
                              % (done.stdout[-600:], done.stderr[-600:]))
 
-    def test_it_loads_the_favicon_it_was_given(self):
+    def test_it_loads_the_strip(self):
         self.assertNotIn("error", self.result, self.result)
-        self.assertEqual(self.result["src"], "/static/favicon-64.png")
+        self.assertEqual(self.result["src"], "/static/favicon-frames-64.png")
 
     def test_it_keeps_replacing_the_icon(self):
         self.assertGreaterEqual(self.result["updates"], 4,
-                                "only %d frames in 650 ms"
+                                "only %d frames in 1800 ms"
                                 % self.result["updates"])
         self.assertTrue(self.result["href"].startswith("data:image/png"),
                         "the icon was set to %r"
                         % self.result["href"][:40])
 
-    def test_the_glow_is_centred_on_the_eyes(self):
-        # 64 is the canvas size the page uses, so a circle at x 21.4 is at
-        # 0.334 of the width -- which is where the left eye is.
-        page = _page_source()
-        match = re.search(r"const FAVICON_EYES = \[\[([\d.]+), ([\d.]+)\], "
-                          r"\[([\d.]+), ([\d.]+)\]\]", page)
-        declared = [(float(match.group(1)), float(match.group(2))),
-                    (float(match.group(3)), float(match.group(4)))]
-        circles = self.result["circles"]
-        self.assertEqual(len(circles), 2,
-                         "a frame drew %d glows, not two" % len(circles))
-        for (ex, ey), circle in zip(declared, circles):
-            with self.subTest(eye=(ex, ey)):
-                self.assertAlmostEqual(circle["x"] / 64, ex, delta=0.01)
-                self.assertAlmostEqual(circle["y"] / 64, ey, delta=0.01)
-
-    def test_the_glow_pulses(self):
-        # The harness advances a fake clock 700 ms per frame, so the
-        # frames it watched span more than one full period of the pulse
-        # and the spread is the whole amplitude rather than whatever slice
-        # of the sine the wall clock happened to land on. With the real
-        # clock this assertion was a coin toss, and it came up tails in a
-        # full-suite run.
-        low, high = self.result["radii"]
-        self.assertGreater(high - low, 2.0,
-                           "the radius went from %.2f to %.2f, which is not "
-                           "the full pulse" % (low, high))
+    def test_it_walks_the_cells_in_order_and_wraps(self):
+        cells = self.result["cells"]
+        self.assertGreaterEqual(len(cells), 9,
+                                "only %d frames in 1800 ms" % len(cells))
+        self.assertEqual(cells[:8], list(range(8)))
+        self.assertEqual(cells[8], 0, "the loop did not wrap to the first cell")
 
     def test_it_draws_nothing_while_the_tab_is_hidden(self):
         self.assertEqual(self.result["whileHidden"], 0,

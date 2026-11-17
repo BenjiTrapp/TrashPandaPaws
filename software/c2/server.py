@@ -4618,19 +4618,13 @@ async function pollHistory(id){
   refreshAgents();
 }
 
-// ── The favicon, with the eyes alight ──
+// ── The favicon, animated from the artwork's own frames ──
 //
-// Measured, not eyeballed: these are where the glowing eyes are in
-// `/static/favicon-64.png`, as fractions of its size, printed by
-// `tools/make_brand_assets.py` when it cut the face out of the
-// wallpaper. A test in `software/tests/test_brand_assets.py` re-derives
-// them from the committed file and fails if they drift, because a crop
-// that moves would otherwise leave the glow sitting on the fur.
-const FAVICON_EYES = [[0.3340, 0.4414], [0.5664, 0.4453]];
-const FAVICON_EYE_RADIUS = 0.0293;
-
-// The artwork's own animation: eight frames side by side, stepped on the
-// GIF's own timing. A test fails if FAVICON_FRAMES disagrees with the strip.
+// `static/logo.gif` pulses its eyes, USB stick, beret badge and fur rim from
+// dim to bright and back. `/static/favicon-frames-64.png` holds those eight
+// frames side by side at 64 px, and this plays them at the GIF's own timing,
+// so nothing here needs to know where the eyes are or paint a glow of its
+// own. A test fails if FAVICON_FRAMES disagrees with the strip.
 const FAVICON_STRIP = "/static/favicon-frames-64.png";
 const FAVICON_FRAMES = 8;
 const FAVICON_FRAME_MS = 180;   // the GIF's own timing
@@ -4644,42 +4638,31 @@ function animateFavicon(){
   const ctx = canvas.getContext("2d");
   if(!ctx) return;
 
-  const base = new Image();
-  base.onerror = () => {};   // the static href above stays; nothing breaks
-  base.onload = () => {
+  const strip = new Image();
+  strip.onerror = () => {};   // the static href above stays; nothing breaks
+  strip.onload = () => {
+    // The cursor is an index this loop increments, not a function of the
+    // clock: a frame that runs late is shown late rather than skipped.
+    let frame = 0;
     const draw = () => {
       // Nothing is drawn while the tab is hidden. A favicon nobody can
-      // see is not worth ten frames a second, and this runs for as long
+      // see is not worth five frames a second, and this runs for as long
       // as the console is open -- which for an operator is all day.
       if(document.hidden){ setTimeout(draw, 1000); return; }
 
-      const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 1000 * 2.2);
       ctx.clearRect(0, 0, size, size);
-      ctx.drawImage(base, 0, 0, size, size);
-      ctx.globalCompositeOperation = "lighter";
-      FAVICON_EYES.forEach(eye => {
-        const cx = eye[0] * size, cy = eye[1] * size;
-        const r = FAVICON_EYE_RADIUS * size * (2.0 + 1.6 * pulse);
-        const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
-        grad.addColorStop(0, "rgba(255,120,90," + (0.30 + 0.60 * pulse).toFixed(3) + ")");
-        grad.addColorStop(0.40, "rgba(255,26,26," + (0.20 + 0.45 * pulse).toFixed(3) + ")");
-        grad.addColorStop(1, "rgba(255,26,26,0)");
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(cx, cy, r, 0, Math.PI * 2);
-        ctx.fill();
-      });
-      ctx.globalCompositeOperation = "source-over";
+      ctx.drawImage(strip, frame * size, 0, size, size, 0, 0, size, size);
       try {
         link.href = canvas.toDataURL("image/png");
       } catch(e) {
         return;   // a tainted canvas would throw once and for ever
       }
-      setTimeout(draw, 100);
+      frame = (frame + 1) % FAVICON_FRAMES;
+      setTimeout(draw, FAVICON_FRAME_MS);
     };
     draw();
   };
-  base.src = "/static/favicon-64.png";
+  strip.src = FAVICON_STRIP;
 }
 
 animateFavicon();
