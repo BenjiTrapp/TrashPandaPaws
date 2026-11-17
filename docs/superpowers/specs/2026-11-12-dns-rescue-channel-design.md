@@ -287,6 +287,16 @@ sent and still shown — as an unattributed rescue, which is a real and useful
 thing to see — because a drop-box that never managed to register is precisely
 the case with the least other evidence.
 
+> **Corrected by `2026-11-17-dns-rescue-attribution-amendment.md`.** A process
+> that never registered is not the only one without an `_agent_id`: it is set
+> only in the HTTPS registration reply, and nothing else registers, so a
+> beacon whose HTTPS leg is dead never learns its name. An implant id is one
+> per host and stable across restarts, so the agent row from an earlier
+> process is still in the fleet holding that id. The server now matches the
+> fingerprint against fleet names first and implant ids second, which is what
+> `_handle_beacon` and `_handle_register` already do. An implant with no agent
+> row anywhere is still unattributable, still kept, still shown.
+
 ### 6. The listener
 
 On a name whose marker label is `r`: take the two payload labels,
@@ -332,7 +342,7 @@ implant.
 | The accumulator is cleared each cycle: a failure from an earlier cycle never appears in a later rescue | same |
 | A DNS leg that answered with no tasking still counts as "the resolver answered", so the rescue fires; a DNS leg that failed to resolve does not | same |
 | DNS delivering tasking suppresses the rescue entirely, and leaves SMB and QUIC untried, as the loop already does | same |
-| A rescue from an implant with no agent id is sent and shown unattributed | same |
+| A rescue from an implant with no agent id **anywhere in the fleet** is sent and shown unattributed; one whose implant id is on an agent row reaches that row — see `2026-11-17-dns-rescue-attribution-amendment.md` | same |
 | A rescue query whose payload does not decrypt is answered exactly like any other, so the listener is no oracle | `test_listeners.py` |
 | The listener holds no key on the rescue path | the two existing relay tests, unchanged |
 | One rescue per exhaustion event, and none after an upstream leg recovers | the new file |
