@@ -2942,11 +2942,50 @@ def _handle_rescue(payload: dict, crypto: ServerCrypto):
         klass, code = record[leg]
         stuck[leg] = [names.get(klass, "unknown"), code]
 
+    def _claim(agent_id, info):
+        info["stuck"] = stuck
+        answer = _handle_beacon({"agent_id": agent_id}, crypto)
+        # After the check-in bookkeeping, not before. `_handle_beacon` sets
+        # `last_channel = "http"` on every call, by design: it means "the
+        # last contact came in over the agent socket", which it cannot tell
+        # apart from the SMB and QUIC relays. A rescue is relayed over that
+        # same socket, so it would be marked "http" -- and this handler's
+        # own `last_channel = "dns"`, written one line earlier, was wiped
+        # out before anyone could read it. The interface then showed "http"
+        # for a beacon whose only working leg was DNS, which is the exact
+        # situation this channel exists for.
+        info["last_channel"] = "dns"
+        return answer
+
+    # Two passes, and the order is the whole design. A fleet name is the
+    # stronger signal -- a beacon can only stamp one if this server told it
+    # that name in a registration reply -- so it is tried across the whole
+    # fleet before any implant id is considered. Two bytes of fingerprint
+    # collide once in 65536, and offering a second candidate per agent
+    # doubles that; when both kinds match, the name wins.
     for agent_id, info in agents.items():
         if dns_rescue.fingerprint(agent_id) == record["fingerprint"]:
-            info["stuck"] = stuck
-            info["last_channel"] = "dns"
-            return _handle_beacon({"agent_id": agent_id}, crypto)
+            return _claim(agent_id, info)
+
+    # The implant id, because a beacon often cannot know its fleet name.
+    # `_agent_id` is set in exactly one place -- the HTTPS registration
+    # reply -- and no other transport sends `action=register`, so a process
+    # whose HTTPS leg was down throughout its life stamps its implant id
+    # instead. That id is stable per host, so the agent record from an
+    # earlier process is still here holding it in `info["id"]`, and the
+    # operator was being told nobody could claim a host the server could
+    # name. `_handle_beacon` and `_handle_register` both already resolve an
+    # implant id this way; this path was the one that did not.
+    #
+    # An empty id identifies nobody: `fingerprint("")` is a fixed value, so
+    # a record carrying no id would otherwise claim every rescue sent by a
+    # beacon that had not yet learned who it was.
+    for agent_id, info in agents.items():
+        implant_id = info.get("id") or ""
+        if (implant_id
+                and dns_rescue.fingerprint(implant_id)
+                == record["fingerprint"]):
+            return _claim(agent_id, info)
 
     unattributed_rescues.append(stuck)
     del unattributed_rescues[:-_RESCUE_UNATTRIBUTED_MAX]

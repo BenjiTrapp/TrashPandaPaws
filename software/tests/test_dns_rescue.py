@@ -1387,6 +1387,17 @@ class TestTheServerDecodesARescue(unittest.TestCase):
         self.assertEqual(stuck["https"], ["auth_required", 407])
         self.assertTrue(stuck["dns_answered"])
 
+    def test_the_agent_is_marked_as_last_heard_over_dns(self):
+        # `_handle_rescue` sets `last_channel = "dns"` and then calls
+        # `_handle_beacon`, which sets it to "http" on every check-in --
+        # so the mark the rescue path deliberately made was destroyed one
+        # line later, and the interface showed "http" for a beacon whose
+        # only working leg was DNS. Exactly backwards, and exactly in the
+        # situation this channel exists for.
+        self._deliver(self._record())
+        self.assertEqual(
+            self.server_mod.agents[self.agent].get("last_channel"), "dns")
+
     def test_it_reads_as_a_sentence_an_operator_can_act_on(self):
         self._deliver(self._record())
         summary = self.server_mod.agents[self.agent]["stuck"]["summary"]
@@ -1500,6 +1511,120 @@ def _strip_js_literals(js):
             out.append(c)
             i += 1
     return "".join(out)
+
+
+class TestARescueFromABeaconThatNeverLearnedItsName(unittest.TestCase):
+    """The fingerprint may be of the implant id, and the server knows it.
+
+    An implant stamps `fingerprint(self._agent_id or self._implant_id)`, and
+    `_agent_id` is set in exactly one place: the HTTPS registration reply.
+    No other transport sends `action=register`, so a beacon whose HTTPS leg
+    is down for the whole life of its process never learns its fleet name
+    and stamps its implant id instead.
+
+    That is not a rare shape. An implant id is one per host and stable
+    across restarts (a known limit in its own right), so the agent record
+    from an earlier process is still in the fleet, holding that very id in
+    `info["id"]`. The server compared the record only against fleet names,
+    dropped the diagnosis into the unattributable list, and showed the
+    operator "a stuck beacon nobody can claim" about a host it could name.
+
+    Matching an implant id to a fleet name is not new here: `_handle_beacon`
+    does it for a check-in that arrives without one, and `_handle_register`
+    does it to recognise a returning host. The rescue path was the one that
+    did not.
+    """
+
+    def setUp(self):
+        import tempfile
+
+        from software.c2 import server as server_mod
+
+        self.server_mod = server_mod
+        self.crypto = server_mod.ServerCrypto(_KEY)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.app = server_mod.create_app(self.crypto, "operator-token",
+                                         pathlib_Path(tmp.name))
+        server_mod.agents.clear()
+        del server_mod.unattributed_rescues[:]
+        self.addCleanup(server_mod.agents.clear)
+        self.addCleanup(lambda: server_mod.unattributed_rescues.clear())
+        self.agent = "clumsy-raccoon"
+        self.implant = "3948e54c95459fd4"
+        server_mod.agents[self.agent] = {
+            "id": self.implant, "hostname": "h", "last_seen": "now",
+            "caps": [],
+        }
+
+    def _deliver(self, stamped_with):
+        raw = dns_rescue.pack(
+            {"https": (dns_rescue.CLASSES["timed_out"], 0),
+             "dns": (dns_rescue.CLASSES["answered"], 0)},
+            dns_rescue.FLAG_DNS_ANSWERED,
+            dns_rescue.fingerprint(stamped_with))
+        wrapped = self.crypto.wrap(
+            {dns_rescue.WRAPPER_KEY: base64.b64encode(raw).decode()})
+        with self.app.test_request_context("/api/v1/beacon", json=wrapped):
+            return self.server_mod._handle_rescue(
+                self.crypto.unwrap(wrapped) or {}, self.crypto)
+
+    def test_a_rescue_stamped_with_the_implant_id_reaches_its_agent(self):
+        self._deliver(self.implant)
+        stuck = self.server_mod.agents[self.agent].get("stuck")
+        self.assertIsNotNone(
+            stuck, "the server holds this implant id in info['id'] and "
+                   "still could not place the diagnosis")
+        self.assertEqual(stuck["https"], ["timed_out", 0])
+
+    def test_it_is_not_also_filed_as_unattributable(self):
+        # Both would be worse than neither: the operator would see a claim
+        # that nobody owns this record next to the record on its own row.
+        self._deliver(self.implant)
+        self.assertEqual(self.server_mod.unattributed_rescues, [])
+
+    def test_the_agents_last_channel_says_dns(self):
+        # The same bookkeeping a fleet-name match does. A rescue only ever
+        # arrives over the DNS relay.
+        self._deliver(self.implant)
+        self.assertEqual(
+            self.server_mod.agents[self.agent].get("last_channel"), "dns")
+
+    def test_a_fleet_name_still_matches(self):
+        self._deliver(self.agent)
+        self.assertIsNotNone(self.server_mod.agents[self.agent].get("stuck"))
+
+    def test_an_id_matching_neither_is_still_unattributable(self):
+        self._deliver("a-host-that-never-registered")
+        self.assertIsNone(self.server_mod.agents[self.agent].get("stuck"))
+        self.assertEqual(len(self.server_mod.unattributed_rescues), 1)
+
+    def test_a_record_with_no_implant_id_does_not_swallow_the_fingerprint(self):
+        # `fingerprint("")` is a fixed value, so an agent record carrying no
+        # id would match every rescue a beacon sent before it knew who it
+        # was -- and the first such record in the dict would claim all of
+        # them. An empty id identifies nobody.
+        self.server_mod.agents["nameless-raccoon"] = {
+            "id": "", "hostname": "", "last_seen": "now", "caps": [],
+        }
+        self._deliver("")
+        self.assertIsNone(
+            self.server_mod.agents["nameless-raccoon"].get("stuck"))
+        self.assertEqual(len(self.server_mod.unattributed_rescues), 1)
+
+    def test_the_fleet_name_wins_when_two_records_could_claim_it(self):
+        # Two bytes of fingerprint collide once in 65536, and adding a
+        # second candidate per agent doubles the chance. When both kinds
+        # match, the fleet name is the stronger signal: the beacon only
+        # stamps one if the server told it that name.
+        other = "tidy-raccoon"
+        self.server_mod.agents[other] = {
+            "id": self.agent, "hostname": "h2", "last_seen": "now",
+            "caps": [],
+        }
+        self._deliver(self.agent)
+        self.assertIsNotNone(self.server_mod.agents[self.agent].get("stuck"))
+        self.assertIsNone(self.server_mod.agents[other].get("stuck"))
 
 
 class TestTheTwoGuisDoNotShareHelpers(unittest.TestCase):
