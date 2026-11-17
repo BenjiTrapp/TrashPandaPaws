@@ -80,9 +80,10 @@ WEB_DIR = REPO / "software" / "c2" / "static"
 MASTER = "logo_256.png"
 UPSCALE = "logo_512.png"
 MASTER_SIZE = 256
-# 128 is what the header shows at 38 logical pixels, which covers a
-# 3x display; 64 is the favicon's working size, and 32 and 16 are the
-# sizes a browser actually picks for a tab and a bookmark.
+# 128 is the page's `apple-touch-icon`, the only thing that links it now
+# that the header shows `/logo.gif` instead; 64 is the favicon's working
+# size, and 32 and 16 are the sizes a browser actually picks for a tab and
+# a bookmark.
 WEB_SIZES = (128, 64, 32, 16)
 # The tab's animation: all eight frames at the favicon's working size,
 # side by side, in frame order. The page steps through it on the GIF's own
@@ -166,7 +167,7 @@ def _frames():
 
             # Measured on the frame as decoded, transparent pink included:
             # it is the brightness of the artwork as it is committed.
-            sums.append(sum(frame.getchannel("R").getdata()))
+            sums.append(sum(frame.getchannel("R").tobytes()))
 
             levels = {level for _, level
                       in frame.getchannel("A").getcolors()}

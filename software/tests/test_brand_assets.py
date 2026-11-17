@@ -16,7 +16,7 @@ committed artwork, `static/logo.gif`, and that script needs Pillow to
 decode it. Nothing here does: this file carries its own PNG reader,
 about fifty lines of `zlib` and `struct`, so the suite can check the
 committed pixels without trusting the library that wrote them. The
-generator is run as a subprocess for the one test that needs it.
+generator is run as a subprocess by three tests, all of them of `--check`.
 
 What is checked, and why each one:
 
@@ -441,10 +441,10 @@ class TestTheAnimationBehaves(unittest.TestCase):
 
     def test_it_gives_up_rather_than_looping_on_a_canvas_error(self):
         # `toDataURL` throws on a tainted canvas, and it would throw every
-        # frame. One return is cheaper than ten exceptions a second.
+        # frame. One return is cheaper than five exceptions a second.
         self.assertIn("toDataURL", self.body)
         self.assertIn("catch", self.body,
-                      "a canvas error would be raised ten times a second")
+                      "a canvas error would be raised five times a second")
 
     def test_it_draws_the_strip_and_not_a_painted_glow(self):
         self.assertIn("FAVICON_STRIP", self.body)
