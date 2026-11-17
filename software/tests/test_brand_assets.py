@@ -124,6 +124,19 @@ class _Png:
         i = (y * self.width + x) * self.channels
         return tuple(self.pixels[i:i + self.channels])
 
+    def cell(self, index, size):
+        """The bytes of one `size`-wide cell of a strip `size` tall.
+
+        Row by row, so it compares equal to the `pixels` of a standalone
+        `size` x `size` image of the same picture.
+        """
+        stride = self.width * self.channels
+        step = size * self.channels
+        return b"".join(
+            self.pixels[y * stride + index * step:
+                        y * stride + (index + 1) * step]
+            for y in range(size))
+
     def with_pixel_cleared(self):
         """A copy with pixel (8, 8) set to opaque white: a hand edit."""
         copy = object.__new__(_Png)
@@ -255,6 +268,45 @@ class TestTheCommittedAssetsAreWhatTheGeneratorMakes(unittest.TestCase):
             self.assertIn("DIFFERS", done.stdout)
         finally:
             target.write_bytes(original)
+
+
+class TestTheFrameStripCarriesTheArtworksOwnAnimation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.strip = _Png(WEB / "favicon-frames-64.png")
+        cls.page = _page_source()
+
+    def test_it_is_eight_square_cells(self):
+        self.assertEqual(self.strip.height, 64)
+        self.assertEqual(self.strip.width, 8 * 64)
+        self.assertEqual(self.strip.channels, 4)
+
+    def test_the_page_expects_exactly_that_many_frames(self):
+        # A re-exported artwork with a different frame count must fail
+        # here rather than freeze the icon on a half-drawn cell.
+        declared = int(re.search(r"const FAVICON_FRAMES = (\d+)",
+                                 self.page).group(1))
+        self.assertEqual(declared, self.strip.width // self.strip.height)
+
+    def test_consecutive_cells_differ(self):
+        for i in range(7):
+            with self.subTest(cell=i):
+                self.assertNotEqual(self.strip.cell(i, 64),
+                                    self.strip.cell(i + 1, 64))
+
+    def test_the_glow_rises_then_falls(self):
+        reds = [sum(self.strip.cell(i, 64)[0::4]) for i in range(8)]
+        self.assertEqual(reds.index(max(reds)), 4,
+                         "the brightest cell is %d, not the still frame"
+                         % reds.index(max(reds)))
+        self.assertLess(reds[0], reds[4])
+        self.assertLess(reds[7], reds[4])
+
+    def test_the_still_favicon_is_the_strips_bright_cell(self):
+        # Written as a copy, so the tab's static icon and the animation's
+        # brightest frame cannot drift apart.
+        self.assertEqual(_Png(WEB / "favicon-64.png").pixels,
+                         self.strip.cell(4, 64))
 
 
 class TestTheHeaderCannotSquashItsLogoAgain(unittest.TestCase):

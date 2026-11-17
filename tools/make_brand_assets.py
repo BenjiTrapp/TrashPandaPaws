@@ -75,6 +75,11 @@ MASTER_SIZE = 256
 # 3x display; 64 is the favicon's working size, and 32 and 16 are the
 # sizes a browser actually picks for a tab and a bookmark.
 WEB_SIZES = (128, 64, 32, 16)
+# The tab's animation: all eight frames at the favicon's working size,
+# side by side, in frame order. The page steps through it on the GIF's own
+# 180 ms, drawing one cell at a time.
+STRIP = "favicon-frames-64.png"
+STRIP_CELL = 64
 
 
 def main(argv=None):
@@ -109,9 +114,14 @@ def main(argv=None):
     # checking cannot disagree about what the assets are.
     assets = {BRAND_DIR / MASTER: _reduce(still, MASTER_SIZE).to_png(),
               BRAND_DIR / UPSCALE: _reduce(still, 2 * MASTER_SIZE).to_png()}
+    strip = _strip(frames)
+    assets[WEB_DIR / STRIP] = strip.to_png()
     for size in WEB_SIZES:
-        assets[WEB_DIR / ("favicon-%d.png" % size)] = \
-            _reduce(still, size).to_png()
+        # The 64 is the strip's own still cell, copied out, and not a
+        # second reduction that merely happens to agree with it.
+        raster = _cell(strip, STILL_FRAME) if size == STRIP_CELL \
+            else _reduce(still, size)
+        assets[WEB_DIR / ("favicon-%d.png" % size)] = raster.to_png()
 
     lines = []
     if args.check:
@@ -201,6 +211,42 @@ def _reduce(image, size):
                     255, (data[i + channel] * 255 + a // 2) // a)
             out[i + 3] = a
     return _Raster(size, size, bytes(out))
+
+
+def _strip(frames):
+    """The animation as one image: cell *i* is frame *i*, `STRIP_CELL` square.
+
+    Each cell is `_reduce(frames[i], STRIP_CELL)` -- one Lanczos pass over
+    that frame's own pixels, unpremultiplied at the end -- so no cell is
+    ever a resample of another, and the cells are exactly what a lone
+    favicon of that frame would be. A strip is a single file because the
+    browser fetches one URL, and the page can cut it up on a canvas with no
+    eight-way race between loads.
+    """
+    cells = [_reduce(frame, STRIP_CELL) for frame in frames]
+    stride = STRIP_CELL * 4
+    data = bytearray()
+    for y in range(STRIP_CELL):
+        for cell in cells:
+            data += cell.data[y * stride:(y + 1) * stride]
+    return _Raster(STRIP_CELL * len(cells), STRIP_CELL, bytes(data))
+
+
+def _cell(strip, index):
+    """One cell of a strip, copied out as a `STRIP_CELL` square raster.
+
+    This is how the still favicon is made. It is a copy and not its own
+    `_reduce` of the still frame: the two would come out the same today,
+    but only a copy keeps the tab's resting icon and the animation's
+    brightest frame identical by construction, however either is later
+    changed.
+    """
+    stride = strip.width * 4
+    step = STRIP_CELL * 4
+    data = b"".join(
+        strip.data[y * stride + index * step:y * stride + (index + 1) * step]
+        for y in range(STRIP_CELL))
+    return _Raster(STRIP_CELL, STRIP_CELL, data)
 
 
 def _write(path, data, lines):

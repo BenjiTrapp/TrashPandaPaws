@@ -4620,6 +4620,12 @@ async function pollHistory(id){
 const FAVICON_EYES = [[0.3340, 0.4414], [0.5664, 0.4453]];
 const FAVICON_EYE_RADIUS = 0.0293;
 
+// The artwork's own animation: eight frames side by side, stepped on the
+// GIF's own timing. A test fails if FAVICON_FRAMES disagrees with the strip.
+const FAVICON_STRIP = "/static/favicon-frames-64.png";
+const FAVICON_FRAMES = 8;
+const FAVICON_FRAME_MS = 180;   // the GIF's own timing
+
 function animateFavicon(){
   const link = document.getElementById("favicon");
   if(!link || !window.HTMLCanvasElement) return;
