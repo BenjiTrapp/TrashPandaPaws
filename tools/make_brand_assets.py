@@ -65,6 +65,11 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = REPO / "static" / "logo.gif"
 
 FRAME_COUNT = 8
+# Every frame's delay, in milliseconds. The operator page carries the same
+# number as `FAVICON_FRAME_MS` in software/c2/server.py, so the tab icon
+# pulses at the rate the header's GIF does: a change here is a change
+# there.
+FRAME_MS = 180
 # The brightest frame, measured below and not merely believed.
 STILL_FRAME = 4
 
@@ -159,10 +164,12 @@ def _frames():
 
     frames = []
     sums = []
+    delays = []
     with Image.open(SOURCE) as gif:
         count = getattr(gif, "n_frames", 1)
         for index in range(count):
             gif.seek(index)
+            delays.append(gif.info.get("duration"))
             frame = gif.convert("RGBA")
 
             # Measured on the frame as decoded, transparent pink included:
@@ -190,6 +197,10 @@ def _frames():
     if len(frames) != FRAME_COUNT:
         raise ValueError("the artwork has %d frames, not %d"
                          % (len(frames), FRAME_COUNT))
+    if delays != [FRAME_MS] * FRAME_COUNT:
+        raise ValueError("the frame delays are %s ms, not %d each; the "
+                         "page's FAVICON_FRAME_MS must change with them"
+                         % (delays, FRAME_MS))
     if sums.index(max(sums)) != STILL_FRAME:
         raise ValueError("frame %d is not the brightest; the red-channel "
                          "sums are %s, and the brightest is frame %d"
