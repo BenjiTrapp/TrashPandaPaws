@@ -8,6 +8,7 @@ that: every way the bookkeeping could forget a stop it owes.
 
 import ast
 import base64
+import hashlib
 import json
 import os
 import selectors
@@ -2098,6 +2099,78 @@ class TestTheSweepIsWiredToTheCheckIn(_RouteCase):
         state = client.get(self.url("/api/opshell/state?session=" + session),
                            headers=self.auth).get_json()
         self.assertEqual(state["sessions"], 1)
+
+
+STATIC = Path(__file__).resolve().parents[1] / "c2" / "static"
+VENDOR_MD = STATIC / "VENDOR.md"
+
+
+class TestTheVendoredTerminal(unittest.TestCase):
+    """The one third-party file in this project, and its pin.
+
+    "Nothing is pinned" is an open finding in `AGENT.md`: four
+    requirements files use lower bounds, the image installs six packages
+    with no constraint, and three tools are built from moving git
+    branches. A vendored file with no recorded hash would be a new
+    instance of that finding, so the hash is the point of this task and
+    not bookkeeping around it.
+    """
+
+    def _parse_vendor_md(self):
+        """Every row of VENDOR.md's table, by filename.
+
+        A table rather than a sentence, because a test has to read it: a
+        record only a human can parse is a record that drifts.
+        """
+        out = {}
+        for line in VENDOR_MD.read_text().splitlines():
+            if not line.startswith("|"):
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) < 3 or cells[0] in ("file", "") or set(cells[0]) <= set("-: "):
+                continue
+            out[cells[0].strip("`")] = {"version": cells[1],
+                                        "sha256": cells[2]}
+        return out
+
+    def test_vendor_md_records_a_version_and_a_sha256_for_every_file(self):
+        recorded = self._parse_vendor_md()
+        self.assertEqual(set(recorded), {"xterm.js", "xterm.css"})
+        for name, entry in recorded.items():
+            self.assertRegex(entry["version"], r"^\d+\.\d+\.\d+$", name)
+            self.assertRegex(entry["sha256"], r"^[0-9a-f]{64}$", name)
+
+    def test_each_file_matches_its_recorded_hash(self):
+        for name, entry in self._parse_vendor_md().items():
+            digest = hashlib.sha256((STATIC / name).read_bytes()).hexdigest()
+            self.assertEqual(digest, entry["sha256"], name)
+
+    def test_the_record_says_where_each_file_came_from_and_when(self):
+        # A hash proves the file has not changed. It does not say what the
+        # file is, who may use it, or which release to compare against --
+        # so the row carries the upstream URL, the licence and the date.
+        text = VENDOR_MD.read_text()
+        self.assertIn("https://", text)
+        self.assertRegex(text, r"MIT")
+        self.assertRegex(text, r"20\d\d-\d\d-\d\d")
+
+    def test_the_version_agrees_with_the_url_it_was_fetched_from(self):
+        # Without this the version column is decoration: changing 6.0.0 to
+        # 6.0.1 in the table left every other test green, because nothing
+        # cross-checked it against anything. The upstream URL carries the
+        # version, so the two have to agree.
+        for line in VENDOR_MD.read_text().splitlines():
+            if not line.startswith("| `"):
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            name, version, url = cells[0].strip("`"), cells[1], cells[3]
+            self.assertIn(version, url,
+                          "%s: the row says %s and was fetched from %s"
+                          % (name, version, url))
+
+    def test_the_files_are_served_and_not_empty(self):
+        for name in ("xterm.js", "xterm.css"):
+            self.assertGreater((STATIC / name).stat().st_size, 1000, name)
 
 
 if __name__ == "__main__":
