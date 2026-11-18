@@ -15,9 +15,9 @@ feature needs in order to know when a `tunnel stop` is owed:
 The first lives in memory and is meant to die with the process: a claim is
 a promise by a browser that is gone once the process is. The second is a
 small JSON file, `{agent_id: {"since": iso8601}}`, written 0600 on every
-change. Ownership outlives the last session on purpose: it is released by
-`forget`, which the caller invokes once the stop has been acknowledged, not
-by closing the view, since closing the view only *queues* the stop.
+change. Ownership outlives the last session on purpose: closing the view
+only *queues* the stop, so ownership is released by `release` once the stop
+has been acknowledged, or by `forget` when the agent no longer exists.
 
 Stdlib only.
 """
@@ -31,6 +31,18 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List
+
+
+class OwnershipRecordError(ValueError):
+    """The ownership record cannot be trusted: damaged, or unreadable.
+
+    Raised rather than reading the file as "owns nothing", which would
+    silently drop every stop that was owed. `path` names the file.
+    """
+
+    def __init__(self, path: Path, why: str):
+        super().__init__("ownership record %s: %s" % (path, why))
+        self.path = path
 
 
 class Claims:
@@ -67,7 +79,7 @@ class Claims:
 
         An unknown session answers False: it was already released (a lapse
         removed it) and the stop that release owed has been reported then.
-        Ownership is not released here; see the module docstring.
+        Ownership is not released here; see `release`.
         """
         with self._lock:
             held = self._sessions.get(agent_id)
@@ -96,7 +108,7 @@ class Claims:
         count would make the live session's later close answer "not the
         last", and the stop would never be queued. An agent is reported
         once, at the call that removed its last session; its ownership
-        stays until `forget`, so `reconcile` still sees it.
+        stays until `release`, so `reconcile` still sees it.
         """
         with self._lock:
             out = []
@@ -118,30 +130,52 @@ class Claims:
         with self._lock:
             return sorted(self._owned)
 
-    def forget(self, agent_id: str) -> None:
-        """Release ownership and drop any claims on the agent.
+    def release(self, agent_id: str) -> bool:
+        """Drop ownership once the stop has been acknowledged; True if dropped.
 
-        For when the stop was acknowledged, or the agent no longer exists.
-        A caller that forgets while a session has just reopened drops that
-        session too; the caller owns that race, since only it knows whether
-        its `tunnel start` was queued after the stop.
+        Only when no session holds a claim. A view that opened after the
+        stop was queued has queued a start behind it, and that channel is
+        this view's to close; dropping ownership then would leave it open
+        with no owner and no pending stop. The check and the drop happen
+        under one lock, which is why this is not left to the caller.
+        """
+        with self._lock:
+            if self._sessions.get(agent_id) or agent_id not in self._owned:
+                return False
+            self._drop(agent_id)
+            return True
+
+    def forget(self, agent_id: str) -> None:
+        """Drop ownership and every claim: the agent no longer exists.
+
+        Unconditional, unlike `release`. There is no queue to put a stop
+        on, so a live claim has nothing left to protect. A channel that is
+        merely acknowledged closed is `release`'s case, not this one.
         """
         with self._lock:
             self._sessions.pop(agent_id, None)
             if agent_id in self._owned:
-                updated = dict(self._owned)
-                del updated[agent_id]
-                self._save(updated)
-                self._owned = updated
+                self._drop(agent_id)
+
+    def _drop(self, agent_id: str) -> None:
+        updated = dict(self._owned)
+        del updated[agent_id]
+        self._save(updated)
+        self._owned = updated
 
     def _load(self) -> Dict[str, dict]:
         try:
             raw = self.path.read_text()
         except FileNotFoundError:
             return {}
-        data = json.loads(raw)
+        except OSError as exc:
+            raise OwnershipRecordError(self.path, "unreadable (%s)" % exc)
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            raise OwnershipRecordError(self.path, "not valid JSON (%s)" % exc)
         if not isinstance(data, dict):
-            raise ValueError("ownership record %s is not an object" % self.path)
+            raise OwnershipRecordError(self.path, "not a JSON object")
         return data
 
     def _save(self, record: Dict[str, dict]) -> None:

@@ -11,7 +11,6 @@ import os
 import stat
 import sys
 import tempfile
-import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -40,7 +39,8 @@ class TestTheClaimCounts(_ClaimsCase):
         # only thing standing between `exit` in one tab and a dead session
         # in the other.
         c = opshell.Claims(self.path)
-        first, second = c.open("raccoon-bandit"), c.open("raccoon-bandit")
+        first = c.open("raccoon-bandit")
+        c.open("raccoon-bandit")
         c.close("raccoon-bandit", first)
         self.assertEqual(c.sessions("raccoon-bandit"), 1)
 
@@ -50,7 +50,8 @@ class TestTheClaimCounts(_ClaimsCase):
         # leave both sessions equally stale.
         c = opshell.Claims(self.path, grace=10.0)
         with unittest.mock.patch.object(opshell.time, "time", return_value=1000.0):
-            quiet, alive = c.open("quiet-one"), c.open("alive-one")
+            c.open("quiet-one")
+            alive = c.open("alive-one")
         with unittest.mock.patch.object(opshell.time, "time", return_value=1008.0):
             c.beat("alive-one", alive)
         self.assertEqual(c.lapsed(now=1011.0), ["quiet-one"])
@@ -123,8 +124,44 @@ class TestOwnershipIsPersisted(_ClaimsCase):
         fresh = opshell.Claims(self.path)
         self.assertEqual(opshell.reconcile(fresh, ["raccoon-bandit"]),
                          ["raccoon-bandit"])
-        fresh.forget("raccoon-bandit")
+        self.assertTrue(fresh.release("raccoon-bandit"))
         self.assertEqual(opshell.Claims(self.path).owned(), [])
+
+    def test_release_after_the_stop_is_seen_drops_ownership(self):
+        c = opshell.Claims(self.path)
+        sid = c.open("raccoon-bandit")
+        c.close("raccoon-bandit", sid)
+        self.assertTrue(c.release("raccoon-bandit"))
+        self.assertEqual(c.owned(), [])
+        self.assertEqual(opshell.Claims(self.path).owned(), [])
+
+    def test_a_view_opened_after_the_stop_keeps_its_claim_through_the_release(self):
+        # The start-after-stop race. The last view closes (stop queued),
+        # another opens (start queued after it), then the stop is
+        # acknowledged. Releasing ownership there would leave a channel
+        # open with no owner and no pending stop: the live view's `exit`
+        # would answer "not the last" and a restart would reconcile to
+        # nothing.
+        c = opshell.Claims(self.path)
+        old = c.open("raccoon-bandit")
+        self.assertTrue(c.close("raccoon-bandit", old))
+        new = c.open("raccoon-bandit")
+        self.assertFalse(c.release("raccoon-bandit"))
+        self.assertEqual(c.sessions("raccoon-bandit"), 1)
+        self.assertEqual(c.owned(), ["raccoon-bandit"])
+        self.assertEqual(opshell.Claims(self.path).owned(), ["raccoon-bandit"])
+        self.assertTrue(c.close("raccoon-bandit", new))
+
+    def test_releasing_a_channel_that_is_not_owned_is_not_a_release(self):
+        c = opshell.Claims(self.path)
+        self.assertFalse(c.release("never-opened"))
+
+    def test_forget_is_for_an_agent_that_is_gone_and_takes_its_claims_with_it(self):
+        c = opshell.Claims(self.path)
+        c.open("gone-raccoon")
+        c.forget("gone-raccoon")
+        self.assertEqual(c.sessions("gone-raccoon"), 0)
+        self.assertEqual(c.owned(), [])
 
     def test_a_live_claim_is_not_owed_a_stop(self):
         c = opshell.Claims(self.path)
@@ -174,12 +211,32 @@ class TestOwnershipIsPersisted(_ClaimsCase):
         self.assertEqual(c.owned(), [])
         self.assertEqual([p.name for p in self.path.parent.iterdir()], [])
 
-    def test_an_unreadable_record_is_an_error_not_an_empty_fleet(self):
+    def test_a_damaged_record_is_an_error_not_an_empty_fleet(self):
         # Treating a damaged file as "owns nothing" would drop every stop
         # that was owed without anyone being told.
         self.path.write_text("{not json")
-        with self.assertRaises(ValueError):
+        with self.assertRaises(opshell.OwnershipRecordError) as raised:
             opshell.Claims(self.path)
+        self.assertIn(str(self.path), str(raised.exception))
+        self.assertEqual(raised.exception.path, self.path)
+
+    def test_a_record_that_is_not_an_object_is_the_same_error(self):
+        self.path.write_text("[]")
+        with self.assertRaises(opshell.OwnershipRecordError) as raised:
+            opshell.Claims(self.path)
+        self.assertIn(str(self.path), str(raised.exception))
+
+    def test_a_record_that_cannot_be_read_is_the_same_error(self):
+        # One `except` for the caller: damaged and unreadable both mean
+        # "do not guess what was owned".
+        self.path.write_text("{}")
+        with unittest.mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")):
+            with self.assertRaises(opshell.OwnershipRecordError) as raised:
+                opshell.Claims(self.path)
+        self.assertIn(str(self.path), str(raised.exception))
+
+    def test_the_record_error_is_a_value_error(self):
+        self.assertTrue(issubclass(opshell.OwnershipRecordError, ValueError))
 
 
 if __name__ == "__main__":
