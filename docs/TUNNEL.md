@@ -420,6 +420,72 @@ three artifacts above, though, are real and are the cost of the session.
 
 ---
 
+## Opening one from the interface, without reading a port out of a panel
+
+Everything above is reachable with `tools/raccoon_shell.py` and a port the
+tunnel panel shows. The **Operator Shell** glyph (`▮_`) in the header is
+the same session without that detour, and it exists because the detour was
+the reason nobody found the feature: you had to know a tunnel existed, type
+`tunnel start` into a command line that never advertised it, wait without
+being told how long, read a port and a password out of a card, and forward
+a port before you could attach.
+
+It is **one** terminal onto the operator's own hardware implant, and
+deliberately not a per-agent feature — lateral movement keeps the
+task-based `shell` command. Three rules shape it, and all three were
+operator decisions rather than implementation convenience:
+
+- **Nothing is dialled until you ask.** No channel is raised on opening the
+  view, on hovering, or on page load. The button that raises it says so.
+- **The channel is dropped again when the session ends**, to keep the
+  footprint on the device as small as possible. Both the raising and the
+  dropping are `tunnel start` / `tunnel stop` *tasks*, so both take effect
+  at the implant's next check-in — up to a whole interval away. The view
+  shows that wait as a **number**, not a spinner, and **never shortens the
+  beacon's interval to make it feel faster**: a beacon that knocks every
+  ten seconds is a beacon that gets noticed.
+- **The shutdown is queued only for a channel this view raised, and only
+  when the endpoint reports no live SOCKS session.** One child process on
+  the implant serves both the SOCKS port and the shell port, so an
+  unconditional stop would drop a pivot somebody raised from the tunnel
+  panel for something else. When it cannot stop, it says so and the
+  shutdown stays owed.
+
+The view may start the tunnel **server** itself, because that process runs
+on the team server and costs the implant nothing. It will not edit
+`configs/raccoon.yaml`: a missing shell port range is reported as the
+reason, not fixed behind your back.
+
+**The build has to carry a tunnel.** That is the generator's "Carry a
+tunnel" checkbox; a build without one has no `c2.tunnel` block, and
+`tunnel start` refuses by name. The view cannot add what is missing from
+the artifact, so it shows the beacon's own refusal when the answer comes
+back.
+
+**The terminal's size is fixed when the session opens.** The wire sends the
+geometry once, on the password line, and cannot renegotiate it — the same
+limitation `tools/raccoon_shell.py` already documents. So the strip states
+the geometry that was actually sent, and resizing the browser window does
+not resize the pty. A terminal that redrew itself to a new size while the
+far end kept the old one would be a quiet lie about what the shell thinks
+it has.
+
+**The password never reaches the browser.** The team server holds the TCP
+connection to the shell port itself and puts the password on it; the
+browser authenticates with the operator token it already has. The tunnel
+panel still shows the password, deliberately, because `raccoon_shell.py`
+needs an operator to read it.
+
+**A view that is closed without ending the session does not leave the
+channel up for ever.** The claim it holds lapses when the browser stops
+polling, and the next request — another operator's page, or the implant's
+own check-in — queues the shutdown. The one case this does not cover is a
+browser that disappears while no other page is open and the implant is not
+checking in; then the channel stands until somebody opens the interface
+again.
+
+---
+
 ## The crypto path, and the tunnel that refuses to start
 
 A tunnel endpoint **refuses to start when the host has no libcrypto**,

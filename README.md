@@ -605,6 +605,7 @@ asked for again.
 | Netstat View | Parsed network connections table with automatic security assessment |
 | Pivot View | Discover and enumerate hosts on adjacent subnets, drawn as a **pivot map** — a visualisation of scan results. It carries no traffic; the thing that does is the reverse SOCKS tunnel, below |
 | Tunnel | Start and stop the tunnel server and each endpoint, with the per-identity SOCKS port and its credential ([`docs/TUNNEL.md`](docs/TUNNEL.md)) |
+| Operator Shell | One terminal onto the operator's own hardware implant, opened from the header. Not per-agent: lateral movement keeps the task-based `shell`. The channel is raised on an explicit action and dropped when the session ends, and both cost one check-in — the view shows that wait as a number and never shortens the beacon's interval ([`docs/TUNNEL.md`](docs/TUNNEL.md)) |
 | Server Logs | Global server log viewer with filtering (accessible without active agent) |
 
 #### Transport Protocols

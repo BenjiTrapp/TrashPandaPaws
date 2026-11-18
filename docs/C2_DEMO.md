@@ -80,15 +80,15 @@ The main view after login. All connected agents are listed in the left sidebar w
 
 ### Header Bar
 
-The top bar shows the Raccoon C2 logo with a green server status dot, plus quick-access buttons for Beacon Generator, Listeners, Tunnel, Loot Vault, Server Log, Notifications, and Server Settings. Everything is one click away.
+The top bar shows the Raccoon C2 logo with a green server status dot, plus quick-access buttons for Beacon Generator, Listeners, Tunnel, Operator Shell, Loot Vault, Server Log, Notifications, and Server Settings. Everything is one click away.
 
 The **Listeners** panel (📡) lists the processes that terminate the beacon's non-HTTPS transports — SMB, QUIC and DNS — with their state, pid and traffic counters, and starts or stops one. Where it cannot act it says why instead of offering a button that does nothing. See [`docs/LISTENERS.md`](LISTENERS.md).
 
 The **Tunnel** panel (🔌) holds two objects and keeps them visually apart, because their buttons do not mean the same thing. The tunnel **server** is a supervised process: it takes the endpoints' connections and opens one loopback SOCKS port for each, and stopping it is immediate and drops every endpoint at once — the panel says so, with the count, before it acts. An **endpoint** is one agent's own tunnel, so starting or stopping one queues a task that takes effect at that agent's next check-in; until the agent confirms, the row's button reads `pending until ~HH:MM`. Each row carries the fixed SOCKS port and its RFC 1929 credential, the sessions and bytes each way, whether the tunnel is linked to a fleet agent or unlinked, the crypto path — a tunnel on the pure-Python cipher moves roughly 50–200 KB/s, which is otherwise diagnosed as a network fault — and the reason the endpoint refused to start, if it did.
 
-### Agent Sidebar (left)
+The **Operator Shell** panel (▮_) is one terminal onto the operator's own hardware implant, and it is deliberately not a per-agent feature: lateral movement keeps the task-based `shell` command, and this exists for the device that carries the arsenal. It opens nothing on its own. Pressing **Open a shell** raises the channel with a `tunnel start` task, so the view then shows the expected check-in **as a number** — a spinner would invite someone to help it along, and the beacon's interval is never changed to make the wait shorter. When the channel comes up the terminal attaches by itself, and the strip above it carries the host, the user the shell runs as, a `root` marker only when that is what the endpoint reported, the geometry that was actually sent, whether the session is being recorded, and the channel's state. Leaving the session queues the shutdown, so the strip reads **closing** — not closed — until the agent confirms it at its next check-in. The build must carry a tunnel (the generator's "Carry a tunnel" checkbox); without one the view names that as the reason instead of waiting. The terminal's geometry is fixed when the session opens, because the wire sends it once and cannot renegotiate it. See [`docs/TUNNEL.md`](TUNNEL.md).
 
-Each agent appears as a card color-coded by status: **green** (online), **yellow** (stale), **red** (offline). Cards display the agent name, `user@hostname`, architecture, and last-seen timestamp. The sidebar auto-refreshes every 3 seconds, so new check-ins appear in real time.
+### Agent Sidebar (left)Each agent appears as a card color-coded by status: **green** (online), **yellow** (stale), **red** (offline). Cards display the agent name, `user@hostname`, architecture, and last-seen timestamp. The sidebar auto-refreshes every 3 seconds, so new check-ins appear in real time.
 
 ### Agent Header (when selected)
 

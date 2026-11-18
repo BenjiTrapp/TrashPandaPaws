@@ -2173,5 +2173,115 @@ class TestTheVendoredTerminal(unittest.TestCase):
             self.assertGreater((STATIC / name).stat().st_size, 1000, name)
 
 
+SERVER_SRC = (Path(__file__).resolve().parents[1] / "c2" / "server.py").read_text()
+
+
+class _GuiCase(unittest.TestCase):
+    """The interface is inline in `server.py`, so the tests read it.
+
+    The pattern this repository already uses (`test_tunnel_gui.py`, and
+    `TestTheTwoGuisDoNotShareHelpers` in `test_dns_rescue.py`). Two small
+    readers are all it needs.
+    """
+
+    def header_block(self):
+        start = SERVER_SRC.index("topbar-ico-btn\" onclick=")
+        return SERVER_SRC[start - 200:start + 1200]
+
+    def js_function(self, name):
+        for opener in ("async function %s(" % name, "function %s(" % name):
+            at = SERVER_SRC.find(opener)
+            if at >= 0:
+                break
+        self.assertGreaterEqual(at, 0, "no function %s in server.py" % name)
+        depth, i, started = 0, SERVER_SRC.index("{", at), False
+        for j in range(i, len(SERVER_SRC)):
+            if SERVER_SRC[j] == "{":
+                depth, started = depth + 1, True
+            elif SERVER_SRC[j] == "}":
+                depth -= 1
+                if started and depth == 0:
+                    return SERVER_SRC[at:j + 1]
+        self.fail("unbalanced braces reading %s" % name)
+
+
+class TestTheGlyphAndTheView(_GuiCase):
+    def test_the_header_carries_a_terminal_glyph_that_opens_the_view(self):
+        self.assertIn("showOperatorShell()", self.header_block())
+
+    def test_the_view_dials_nothing_until_the_operator_asks(self):
+        # The goal: nothing happens on open, on hover, or on page load. The
+        # channel is raised only when the operator presses the button in
+        # the view that says it will.
+        opened = self.js_function("showOperatorShell")
+        self.assertNotIn("/api/opshell/open", opened)
+
+    def test_the_page_loads_the_vendored_terminal(self):
+        self.assertIn('/static/xterm.js', SERVER_SRC)
+        self.assertIn('/static/xterm.css', SERVER_SRC)
+
+    def test_the_stream_is_read_with_fetch_and_not_eventsource(self):
+        # EventSource cannot send the Authorization header this socket
+        # requires, and a token in a URL is forbidden by test_docs.
+        attach = self.js_function("opshellAttach")
+        self.assertIn("getReader", attach)
+        # Not used, rather than not mentioned. The first version of this
+        # forbade the word and caught the comment that explains why the
+        # thing is unusable here -- the same mistake as a Dockerfile test
+        # earlier in this branch, which forbade a string and hit the
+        # comment quoting the defect it described.
+        self.assertNotRegex(SERVER_SRC, r"new\s+EventSource\s*\(")
+
+    def test_keystrokes_are_posted_not_put_in_the_url(self):
+        attach = self.js_function("opshellAttach")
+        self.assertIn("/api/opshell/keys", attach)
+
+
+class TestTheViewDoesNotOverclaim(_GuiCase):
+    def test_the_word_closed_is_never_rendered_from_the_closing_state(self):
+        # "Closing" and "closed" are different facts: a stop is queued and
+        # takes effect at the next check-in. The first mockup of this said
+        # "stop acknowledged" at the moment of exit, which was a lie.
+        render = self.js_function("opshellRender")
+        self.assertIn('"closing"', render)
+        for line in render.splitlines():
+            if '"closing"' in line:
+                self.assertNotIn("Channel closed", line)
+
+    def test_the_strip_states_the_user_and_does_not_assume_root(self):
+        # The tunnel panel carries this scar already: it "used to state
+        # root for every row", and the user is a reported field now.
+        render = self.js_function("opshellRender")
+        self.assertIn("state.user", render)
+        self.assertIn("state.root", render)
+
+    def test_the_first_terminal_line_claims_only_what_the_code_does(self):
+        # `unset HISTFILE` and `set +o history` run after the rc files
+        # (beacon.py:3228). That is exactly what this says, and no more.
+        self.assertIn("history is off in this session", SERVER_SRC)
+
+    def test_there_is_no_cancel_button_for_a_queued_task(self):
+        # This server has no task withdrawal, so a button that said it
+        # could take one back would be worse than its absence.
+        render = self.js_function("opshellRender")
+        self.assertNotRegex(render, r"(?i)>\s*cancel")
+
+    def test_the_view_states_the_geometry_it_actually_sent(self):
+        # The pty cannot be renegotiated, so the pair on screen is the one
+        # that was sent or nothing.
+        render = self.js_function("opshellRender")
+        self.assertIn("state.geometry", render)
+
+    def test_the_wait_shows_the_expected_check_in_not_a_spinner(self):
+        # A spinner invites the operator to help it along; the number says
+        # that waiting is the price of staying quiet.
+        render = self.js_function("opshellRender")
+        self.assertIn("expected_checkin", render)
+
+    def test_the_reason_is_shown_whenever_the_server_sends_one(self):
+        render = self.js_function("opshellRender")
+        self.assertIn("state.reason", render)
+
+
 if __name__ == "__main__":
     unittest.main()
