@@ -434,13 +434,14 @@ class _FakeShellPort:
 
     def __init__(self, prompt=PROMPT, then=b"", die_after_auth=False,
                  drip=False, hold=None, drain=True, quiet=0.0, late=b"",
-                 reset=False):
+                 reset=False, connections=1):
         # `reset`: hang up with SO_LINGER 0 after the auth line, so the peer
         # sees ECONNRESET rather than a clean end. A tunnel server that is
         # killed looks like this, and every other fake port in this file
         # closes politely -- which is why the pump's missing `OSError` arm
         # survived the whole branch.
         self._reset = reset
+        self._connections = connections
         # `quiet` and `late`: stay silent for that many seconds after the
         # auth line, then write `late` and hang up. The only way to prove
         # that the route's pump treats a read timeout as "still open"
@@ -463,15 +464,29 @@ class _FakeShellPort:
         self._thread.start()
 
     def _serve(self):
-        conn = None
+        """Accept up to `connections` callers, each on its own thread.
+
+        One connection was enough until a test needed two live sessions
+        with different geometries -- and with one, the second stream got a
+        502 and the test silently measured the first session again. The
+        real port serves four at once.
+        """
+        served = 0
+        while served < self._connections and not self._stop.is_set():
+            try:
+                conn, _ = self._listener.accept()
+            except socket.timeout:
+                continue
+            served += 1
+            if served == self._connections:
+                self._handle(conn)
+            else:
+                t = threading.Thread(target=self._handle, args=(conn,),
+                                     daemon=True)
+                t.start()
+
+    def _handle(self, conn):
         try:
-            while conn is None:
-                if self._stop.is_set():
-                    return
-                try:
-                    conn, _ = self._listener.accept()
-                except socket.timeout:
-                    pass
             self.connected.set()
             if self._hold is not None:
                 self._hold.wait(10.0)
@@ -950,7 +965,7 @@ class _RouteCase(unittest.TestCase):
         return self._supervisor({
             "state": "running", "can_control": True, "pid": 4242,
             "shell_port_first": 19630, "shell_port_last": 19640,
-            "shell_transcript_dir": "/tmp/transcripts",
+            "shell_transcripts": "/tmp/transcripts",
             "endpoints": [{
                 "identity": "parrot-box", "implant_id": self.IMPLANT,
                 "state": "connected", "user": user,
@@ -1431,7 +1446,8 @@ class TestTheStreamAndTheKeystrokes(_RouteCase):
         # sent back the same numbers it had been handed -- so the strip's
         # "120x40" was a restatement of the view's own guess, not a fact
         # about the pty.
-        port, client = self._with_port(then=b"hello", drain=False)
+        port, client = self._with_port(then=b"hello", drain=False,
+                                       connections=2)
         session = self._open(client)
         # Held open, not just requested: the bridge is gone by the time a
         # buffered response has been read to its end, so a test that asked
@@ -1445,6 +1461,20 @@ class TestTheStreamAndTheKeystrokes(_RouteCase):
         state = client.get(self.url("/api/opshell/state?session=" + session),
                            headers=self.auth).get_json()
         self.assertEqual(state["geometry"], [81, 25])
+        # A second session with a different pty, so the answer cannot be
+        # "the first bridge in the dict" and still look right. Taking
+        # `live[0]` returned another tab's geometry to a caller that had
+        # named its own.
+        other = self._open(client)
+        second = client.get(
+            self.url("/api/opshell/stream?session=%s&cols=100&rows=30"
+                     % other), headers=self.auth, buffered=False)
+        self.addCleanup(second.close)
+        next(iter(second.response))
+        for sid, expected in ((session, [81, 25]), (other, [100, 30])):
+            answer = client.get(self.url("/api/opshell/state?session=" + sid),
+                                headers=self.auth).get_json()
+            self.assertEqual(answer["geometry"], expected, sid)
 
     def test_with_no_session_live_there_is_no_geometry_to_report(self):
         # Nothing has a geometry when nothing is open. The constant that
@@ -1934,6 +1964,84 @@ class TestTheBeatComesBeforeTheSweep(_RouteCase):
         self.assertTrue(order, "the sweep did not run at all")
 
 
+class TestTheFixturesDoNotInventFieldNames(_RouteCase):
+    """The third field-name error of this branch, and its last.
+
+    Twice before, a fixture invented a key and the test then compared a
+    typo against a typo. The third time it was `shell_transcript_dir`,
+    which is the *config* key; `TunnelSupervisor.status()` reports the
+    directory as `shell_transcripts`. So the Closed state's transcript
+    path was permanently `null` in production while 194 tests passed.
+
+    Reading the field names out of a real supervisor is the only version
+    of this that cannot drift.
+    """
+
+    def real_status_keys(self):
+        from software.c2.tunnel import supervisor as sup
+        real = sup.TunnelSupervisor({"shell_transcript_dir": "/tmp/x"},
+                                    self.data_dir)
+        return set(real.status())
+
+    def test_every_key_this_fixture_reports_is_one_the_real_one_reports(self):
+        real = self.real_status_keys()
+        for name in ("connected", "configured_but_stopped"):
+            fixture = getattr(self, name)().status()
+            unknown = set(fixture) - real
+            self.assertEqual(unknown, set(),
+                             "%s() invents %s" % (name, sorted(unknown)))
+
+    def test_the_server_reads_the_key_the_supervisor_writes(self):
+        real = self.real_status_keys()
+        self.assertIn("shell_transcripts", real)
+        src = (Path(__file__).resolve().parents[1] / "c2" / "server.py").read_text()
+        at = src.index('out["transcript_dir"]')
+        self.assertIn("shell_transcripts", src[at:at + 200])
+
+    def test_the_transcript_directory_reaches_the_view(self):
+        # The property itself, through the route: the strip badges
+        # "recording" from a field that is real, so an operator was told a
+        # transcript existed and given nowhere to look for it.
+        client = self.client()
+        state = client.get(self.url("/api/opshell/state"),
+                           headers=self.auth).get_json()
+        self.assertEqual(state["transcript_dir"], "/tmp/transcripts")
+
+
+class TestADeviceThatStoppedCallingHomeIsNotReportedLive(_RouteCase):
+    def test_an_agent_hours_overdue_is_not_reported_open(self):
+        """Review Focus 1's second form: "never checks in again".
+
+        Measured by the reviewer: an agent still in the fleet, last seen
+        two hours ago, reporting a running child, came back as
+        `state: live, channel: open, expected_checkin: -6900` -- a positive
+        claim about a device nothing had heard from, with the overdue
+        number computed and rendered only in the waiting state. The
+        operator's close then queues a stop that can never be delivered.
+        """
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        self.sm.agents[self.AGENT]["_last_seen_ts"] = time.time() - 7200
+        self.sm.agents[self.AGENT]["tunnel"] = {"pid": 9, "running": True}
+        client = self.client()
+        state = client.get(self.url("/api/opshell/state"),
+                           headers=self.auth).get_json()
+        self.assertEqual(state["channel"], "unknown")
+        self.assertRegex(state["reason"] or "", r"(?i)overdue|has not checked")
+
+    def test_an_agent_that_is_merely_late_is_still_reported_as_it_is(self):
+        # One missed interval is normal: jitter, a slow link, a host that
+        # was busy. Calling that "unknown" would make the word useless.
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        self.sm.agents[self.AGENT]["_last_seen_ts"] = time.time() - 310
+        self.sm.agents[self.AGENT]["tunnel"] = {"pid": 9, "running": True}
+        client = self.client()
+        state = client.get(self.url("/api/opshell/state"),
+                           headers=self.auth).get_json()
+        self.assertEqual(state["channel"], "open")
+
+
 class TestTheCheapGuardsOnTheRoutes(_RouteCase):
     def test_a_huge_paste_is_refused_rather_than_holding_a_worker(self):
         # `/keys` had no ceiling, so one paste could hold a worker thread
@@ -1942,6 +2050,17 @@ class TestTheCheapGuardsOnTheRoutes(_RouteCase):
                            {"session": "x",
                             "data": base64.b64encode(b"A" * 400000).decode()})
         self.assertEqual(answer.status_code, 413)
+
+    def test_data_that_is_not_a_string_is_a_bad_request_not_a_crash(self):
+        # The ceiling I added introduced its own defect: `len()` on a
+        # number raises TypeError, so `{"data": 5}` became HTTP 500 where
+        # the old `except Exception` had answered 400. An earlier round of
+        # this work had two fixes that each introduced a fault; this is the
+        # third.
+        for junk in (5, True, {"a": 1}, [1, 2], None):
+            answer = self.post(self.url("/api/opshell/keys"),
+                               {"session": "x", "data": junk})
+            self.assertLess(answer.status_code, 500, repr(junk))
 
     def test_a_paste_a_person_could_make_is_not_refused(self):
         # The ceiling has to be above anything an operator would actually
@@ -2200,54 +2319,95 @@ class TestTheSweepRunsOnCheckInsAndNotOnEverything(_RouteCase):
                          "a result post swept as well")
 
 
-class TestTheLapseGraceIsPerDriver(_ClaimsCase):
-    """A driver with no heartbeat judges with a wider margin, not never.
+class TestOneGraceForEveryDriver(_RouteCase):
+    def test_a_second_tab_cannot_retire_a_hidden_tabs_session(self):
+        """The same defect as C1, from the other side.
 
-    These two used to pin `lapsed=False` / `lapsed=True`, which was the
-    defect: the boolean's only False caller was the check-in, and the
-    check-in is the one driver that arrives when no browser exists at all.
+        `/state` swept with the claim record's own 60 s grace -- which the
+        check-in's new comment itself identifies as a hidden browser tab's
+        exact poll period. So a second panel polling every two seconds
+        retired the hidden tab's session, and the operator came back to a
+        channel somebody else's page had stopped. Fixed by having one
+        number instead of two: nothing is gained by being tighter than the
+        slowest live poll, because the stop waits for a check-in anyway.
+        """
+        app = self.app(supervisor=self.connected())
+        hidden = self.operator_client(app)
+        with unittest.mock.patch.object(opshell.time, "time",
+                                        return_value=time.time() - 90):
+            session = hidden.post(self.url("/api/opshell/open"),
+                                  json={"agent": self.AGENT},
+                                  headers=self.auth).get_json()["session"]
+        self.sm.task_queues.pop(self.AGENT, None)
+        self.sm.history.pop(self.AGENT, None)
+        # A second panel on the same server, polling now.
+        self.operator_client(app).get(self.url("/api/opshell/state"),
+                                      headers=self.auth)
+        tunnel = [e.get("args") for e in self.sm.history.get(self.AGENT, [])
+                  if e.get("cmd") == "tunnel"]
+        self.assertEqual(tunnel, [],
+                         "another tab's poll stopped a hidden tab's channel")
+        state = hidden.get(self.url("/api/opshell/state?session=" + session),
+                           headers=self.auth).get_json()
+        self.assertEqual(state["sessions"], 1)
+
+    def test_there_is_only_one_grace_to_get_wrong(self):
+        # Two numbers meant two places to reason about, and the second one
+        # was missed. The claim record's default *is* the lapse margin.
+        self.assertEqual(
+            opshell.Claims(self.data_dir / "g.json").grace,
+            opshell.LAPSE_GRACE)
+        import inspect
+        self.assertNotIn("lapse_grace",
+                         inspect.signature(opshell.sweep).parameters)
+
+
+class TestTheLapseIsTheSameForEverySweep(_ClaimsCase):
+    """One margin, and no caller can choose another.
+
+    These tests have been rewritten twice, which is the point of the
+    docstring. First they pinned `lapsed=False` / `lapsed=True` -- and that
+    boolean's only False caller, the check-in, was the one that had to
+    lapse. Then they pinned a per-driver grace, and the driver that kept
+    the narrow one retired hidden tabs. Now there is one number.
     """
 
-    def test_a_wide_grace_leaves_a_slow_tab_alone(self):
-        claims = opshell.Claims(self.path, grace=10.0)
-        claims.open("raccoon-bandit")
-        queues = {}
-        opshell.sweep(claims, ["raccoon-bandit"],
-                      {"raccoon-bandit": {"socks": {"sessions": 0}}},
-                      {"raccoon-bandit": False}, queues, {}, "now",
-                      time.time() + 11, {}, {}, lapse_grace=40.0)
-        self.assertEqual(queues, {})
-        self.assertEqual(claims.sessions("raccoon-bandit"), 1)
-
-    def test_the_same_silence_past_the_wide_grace_does_retire_it(self):
-        claims = opshell.Claims(self.path, grace=10.0)
-        claims.open("raccoon-bandit")
-        queues = {}
-        opshell.sweep(claims, ["raccoon-bandit"],
-                      {"raccoon-bandit": {"socks": {"sessions": 0}}},
-                      {"raccoon-bandit": False}, queues, {}, "now",
-                      time.time() + 41, {}, {}, lapse_grace=40.0)
-        self.assertEqual([t["args"] for t in queues["raccoon-bandit"]],
-                         ["stop"])
-
-    def test_the_claims_own_grace_is_the_default(self):
-        claims = opshell.Claims(self.path, grace=10.0)
+    def test_silence_inside_the_margin_keeps_the_claim(self):
+        claims = opshell.Claims(self.path, grace=40.0)
         claims.open("raccoon-bandit")
         queues = {}
         opshell.sweep(claims, ["raccoon-bandit"],
                       {"raccoon-bandit": {"socks": {"sessions": 0}}},
                       {"raccoon-bandit": False}, queues, {}, "now",
                       time.time() + 11, {}, {})
+        self.assertEqual(queues, {})
+        self.assertEqual(claims.sessions("raccoon-bandit"), 1)
+
+    def test_silence_past_the_margin_queues_the_stop(self):
+        claims = opshell.Claims(self.path, grace=40.0)
+        claims.open("raccoon-bandit")
+        queues = {}
+        opshell.sweep(claims, ["raccoon-bandit"],
+                      {"raccoon-bandit": {"socks": {"sessions": 0}}},
+                      {"raccoon-bandit": False}, queues, {}, "now",
+                      time.time() + 41, {}, {})
         self.assertEqual([t["args"] for t in queues["raccoon-bandit"]],
                          ["stop"])
 
-    def test_there_is_no_way_to_ask_the_sweep_not_to_lapse_at_all(self):
-        # The boolean is gone on purpose. A caller that could abstain was
-        # a caller that would, and the one that did was the one that
-        # mattered most.
+    def test_no_caller_can_ask_for_a_different_judgement(self):
+        # Neither an abstention nor a margin of its own. Both existed, and
+        # both became a defect in the same place.
         import inspect
-        self.assertNotIn("lapsed",
-                         inspect.signature(opshell.sweep).parameters)
+        taken = inspect.signature(opshell.sweep).parameters
+        self.assertNotIn("lapsed", taken)
+        self.assertNotIn("lapse_grace", taken)
+
+    def test_the_margin_clears_the_slowest_poll_a_live_browser_makes(self):
+        # A hidden tab is throttled to about one poll a minute. The margin
+        # has to clear that by enough that jitter cannot reach it, and
+        # halving it should fail here rather than in the field, where the
+        # symptom is a channel retired under a live tab.
+        self.assertGreaterEqual(opshell.LAPSE_GRACE, 4 * 60.0)
 
 
 class TestAStaleReportDoesNotOutliveItsBeacon(_RouteCase):
@@ -2366,8 +2526,12 @@ class TestTheSweepIsWiredToTheCheckIn(_RouteCase):
         """
         app = self.app(supervisor=self.connected())
         client = self.operator_client(app)
+        # 120 s, not 60: the margin against a 60 s grace used to be the
+        # milliseconds between `/open` and the beacon POST, so the test
+        # passed on a float tick. A hidden tab polls about once a minute,
+        # so two missed polls is the case worth asserting.
         with unittest.mock.patch.object(opshell.time, "time",
-                                        return_value=time.time() - 60):
+                                        return_value=time.time() - 120):
             session = client.post(self.url("/api/opshell/open"),
                                   json={"agent": self.AGENT},
                                   headers=self.auth).get_json()["session"]
@@ -2383,15 +2547,6 @@ class TestTheSweepIsWiredToTheCheckIn(_RouteCase):
         state = client.get(self.url("/api/opshell/state?session=" + session),
                            headers=self.auth).get_json()
         self.assertEqual(state["sessions"], 1)
-
-    def test_the_two_graces_cannot_drift_into_each_other(self):
-        # The check-in's margin only works while it is comfortably wider
-        # than the slowest poll the view's own grace tolerates. Written
-        # down so that halving one of them fails here rather than in the
-        # field, where the symptom is a channel retired under a live tab.
-        self.assertGreaterEqual(opshell.CHECKIN_LAPSE_GRACE,
-                                4 * opshell.Claims(self.data_dir /
-                                                   "g.json").grace)
 
 
 
@@ -2503,20 +2658,15 @@ class TestTheGlyphAndTheView(_GuiCase):
     def test_the_header_carries_a_terminal_glyph_that_opens_the_view(self):
         self.assertIn("showOperatorShell()", self.header_block())
 
-    def test_the_open_button_cannot_be_pressed_twice(self):
-        # Two claims from a double-click: the first is orphaned, so the
-        # operator's next close answers "not the last" and no stop is
-        # queued until the orphan lapses.
-        opened = self.js_function("opshellOpen")
-        self.assertIn("disabled", opened)
-
     def test_the_stylesheet_comment_does_not_claim_a_defer_it_has_not(self):
-        # Only the script carried `defer`; the comment said both were
-        # deferred. The cost is nil -- it is 7 KB served locally -- which
-        # is exactly why a wrong comment here would survive for ever.
+        # Only the script carries `defer`; the comment said both were
+        # deferred. Case-insensitive and over the whole comment block: the
+        # first version read 400 bytes and matched a capital D, so writing
+        # "both are deferred" would have passed.
         at = SERVER_SRC.index('href="/static/xterm.css"')
-        head = SERVER_SRC[at - 400:at]
-        self.assertNotIn("Deferred", head)
+        start = SERVER_SRC.rindex("<!--", 0, at)
+        comment = SERVER_SRC[start:SERVER_SRC.index("-->", start)].lower()
+        self.assertIn("stylesheet is not", comment)
 
     def test_a_closed_tab_ends_the_session_too(self):
         # A tab that is closed sends no click, and it is one of the two
@@ -2666,8 +2816,9 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " set innerHTML(v){}, get innerHTML(){ return ''; }}),"
             " body:{appendChild(){}}};\n"
             "const window = {addEventListener(){}};\n"
+            "let scheduled = [];\n"
             "function clearTimeout(){}\n"
-            "function setTimeout(){ return 1; }\n"
+            "function setTimeout(fn, ms){ scheduled.push(ms); return 1; }\n"
             "const navigator = {};\n"
             "class TextEncoder { encode(s){ return Buffer.from(s,'utf8'); } }\n"
         )
@@ -2681,7 +2832,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         src = "\n".join(decls + [self.js_function(n) for n in (
             "esc", "opshellEndSession", "opshellTeardown", "opshellPicker",
             "opshellRender", "opshellOpen", "opshellB64",
-            "opshellFlushKeys")]) + "\n"
+            "opshellSay", "opshellFlushKeys", "opshellEndAfterAttach",
+            "opshellPoll")]) + "\n"
         out = subprocess.run(
             ["node", "--input-type=module", "-e", env + src + script],
             capture_output=True, text=True, timeout=30)
@@ -2762,8 +2914,14 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         html = got["html"]
         self.assertIn("opshellOpen(", html,
                       "no way to attach to a channel the view can see")
-        self.assertIn("opshellEndSession()", html,
+        # Not `opshellEndSession` -- that is the inert one in this state,
+        # and asserting its *name* here is what let the Critical through.
+        # What it actually does is
+        # `test_the_end_button_actually_ends_something`.
+        self.assertIn("opshellEndAfterAttach(", html,
                       "no way to drop a channel the view can see")
+        self.assertNotIn("opshellEndSession()", html,
+                         "the inert handler is back on the button")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_live_channel_this_page_holds_draws_the_terminal_instead(self):
@@ -2773,6 +2931,133 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " host:'parrot', geometry:[120,40]});\n"
             "console.log(JSON.stringify({html}));")
         self.assertIn('id="opshell-term"', got["html"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_end_button_actually_ends_something(self):
+        """The re-review's Critical, and it was in my own fix.
+
+        The branch is drawn only when `!opshellSession`, and
+        `opshellEndSession` returns false before it aborts or posts
+        anything when there is no session -- so the button promised "ending
+        it queues the channel's shutdown" and provably did nothing. The
+        same class as the two Criticals this wave was written to fix, and
+        the test that was supposed to cover it asserted that the markup
+        *mentions* the call.
+
+        So this calls the handler the markup names, rather than looking for
+        its name.
+        """
+        got = self._node(
+            "opshellSession = null;\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "const html = opshellRender({state:'live', channel:'open',"
+            " host:'parrot', candidates:['clumsy-raccoon'],"
+            " target:'clumsy-raccoon', geometry:[120,40]});\n"
+            "const m = html.match(/onclick=\"([a-zA-Z]+)\\(([^\"]*)\\)\"/g);\n"
+            "const ender = (m||[]).find(x => !x.includes('opshellOpen'));\n"
+            "nextReply = {ok:true, status:200, body:{session:'adopted'}};\n"
+            "await opshellEndAfterAttach();\n"
+            "console.log(JSON.stringify({ender,"
+            " urls: posted.map(p => p.url)}));")
+        self.assertIsNotNone(got["ender"], "no control to end the session")
+        self.assertIn("opshellEndAfterAttach", got["ender"])
+        # It takes the claim, then releases it: the stop then goes through
+        # the one path that decides stops, and a channel this view did not
+        # raise comes back with the server's own refusal rather than a
+        # silent nothing.
+        self.assertEqual(got["urls"],
+                         ["/api/opshell/open", "/api/opshell/close"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_double_click_on_open_takes_only_one_claim(self):
+        # The first version grepped `opshellOpen` for the word "disabled",
+        # which survives in `if(button.disabled) return;` -- so deleting
+        # the line that arms the guard left it green and the double-click
+        # took two claims again. The orphaned one then made the operator's
+        # close answer "not the last", and no stop was queued until it
+        # lapsed.
+        got = self._node(
+            "const button = {disabled:false};\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "nextReply = {ok:true, status:200, body:{session:'s1'}};\n"
+            "const ev = {currentTarget: button};\n"
+            "await Promise.all([opshellOpen(ev), opshellOpen(ev)]);\n"
+            "console.log(JSON.stringify({opens: posted.filter("
+            "p => p.url.endsWith('open')).length}));")
+        self.assertEqual(got["opens"], 1)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_refused_keystroke_batch_is_kept_and_reported(self):
+        """Coalescing made the unit of loss a whole batch.
+
+        The chunk left the buffer before the POST, the reply was never
+        looked at, and a failure `break`ed with the chunk gone. So fifteen
+        typed characters vanished with no message -- and a lost batch
+        followed by a batch containing Enter runs a truncated command in a
+        root shell.
+        """
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = {lines: [],"
+            " writeln(s){ this.lines.push(s); }};\n"
+            "nextReply = {ok:false, status:413, body:{error:'too much'}};\n"
+            "opshellKeys = 'rm -rf /tmp/x';\n"
+            "await opshellFlushKeys();\n"
+            "console.log(JSON.stringify({leftover: opshellKeys,"
+            " posts: posted.length, said: opshellTerm.lines.join(' ')}));")
+        self.assertEqual(got["leftover"], "rm -rf /tmp/x",
+                         "a refused batch was thrown away")
+        self.assertRegex(got["said"], r"(?i)not (sent|delivered)|refused")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_keystrokes_do_not_cross_from_one_session_into_the_next(self):
+        # Measured by the reviewer: "more" typed into a session that died,
+        # then "ls" in the next one, posted as "morels". Injected input
+        # into a root shell on the operator's own device.
+        got = self._node(
+            "opshellSession = 'first'; opshellKeys = 'more';\n"
+            "await opshellEndSession();\n"
+            "opshellSession = 'second'; opshellKeys += 'ls';\n"
+            "posted.length = 0;\n"
+            "await opshellFlushKeys();\n"
+            "const sent = posted.filter(p => p.url.endsWith('keys'))"
+            ".map(p => Buffer.from(JSON.parse(p.body).data,'base64')"
+            ".toString());\n"
+            "console.log(JSON.stringify({sent}));")
+        self.assertEqual(got["sent"], ["ls"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_one_failed_poll_does_not_end_the_heartbeat(self):
+        """The grace argument rests on the poll being reliable.
+
+        The catch returned without rescheduling, so one network blip -- or
+        a proxy's HTML 502, which makes `api()` reject on the JSON parse --
+        stopped the heartbeat for good. The claim then lapsed and a session
+        the operator was sitting in was stopped on the device.
+        """
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "globalThis.api = async () => { throw new Error('network'); };\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({scheduled,"
+            " shown: els['opshell-body'].innerHTML}));")
+        self.assertEqual(got["scheduled"], [2000],
+                         "the poll did not reschedule itself after a failure")
+        self.assertIn("network", got["shown"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_failed_poll_does_not_destroy_a_live_terminal(self):
+        # The same line replaced `innerHTML` while the terminal was
+        # attached, so a blip during a session took the terminal's DOM node
+        # with it -- and the stream then wrote into a detached element.
+        got = self._node(
+            "opshellAttached = true;\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['opshell-body'].innerHTML = '<div id=\"opshell-term\"></div>';\n"
+            "globalThis.setTimeout = () => 7;\n"
+            "globalThis.api = async () => { throw new Error('blip'); };\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({still: els['opshell-body'].innerHTML}));")
+        self.assertIn("opshell-term", got["still"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_closed_state_says_where_the_transcript_is(self):

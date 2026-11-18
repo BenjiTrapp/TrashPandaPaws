@@ -484,17 +484,23 @@ tab's case with `keepalive`, so the request survives the page going away.
 **And a browser that is killed outright still does not leave the channel
 up.** It posts nothing, so the claim it held goes silent instead; four
 minutes of silence is enough for the implant's own next check-in to retire
-it and carry the shutdown. Four minutes rather than the one the view's own
-poll uses, because a hidden browser tab is throttled to about one poll a
-minute and a margin that tight would retire a tab that is merely in the
-background. So the cost of a killed browser is bounded by that margin plus
-one check-in interval, and no operator action is needed.
+it and carry the shutdown. Four minutes, and the same four everywhere —
+every driver that can notice a silent claim uses one margin. An earlier
+version gave this one a wider margin than the view's own poll, and the
+narrower one then retired a backgrounded tab when a second panel was open.
+Four minutes is four times the slowest poll a live browser makes: a hidden
+tab is throttled to about one a minute. Nothing is lost by the width,
+because a shutdown can only ride a check-in anyway, and those are ten to
+three hundred seconds apart. So the cost of a killed browser is bounded by
+that margin plus one interval, and no operator action is needed.
 
 The one case left is narrow: **the implant stops checking in as well.**
 Then the channel stands — but so would any shutdown, because a task can
 only be delivered to an agent that calls home. Nothing can be queued for a
-device that is not listening, and the view says `unknown` rather than
-claiming the channel is closed.
+device that is not listening, and the view says so rather than guessing:
+once a device is two of its own intervals overdue, the channel reads
+`unknown` with the seconds since its last word, because every claim about
+it comes from a report that old.
 
 ---
 

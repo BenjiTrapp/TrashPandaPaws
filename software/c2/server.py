@@ -861,12 +861,11 @@ _AGENT_SOCKET_ENDPOINTS = frozenset({"beacon_handler", "api_dns_tasking"})
 # The pump's read slice, as a constant so a test can shorten it:
 # proving that a timeout does not end the stream otherwise costs a
 # real wait in a suite of three and a half thousand tests.
-#: The most base64 one `/keys` request may carry. 256 KB of encoded
-#: text is about 192 KB of keystrokes -- far more than any paste a
-#: person makes, and far less than enough to hold a worker thread
-#: for the write timeout.
-_OPSHELL_MAX_KEYS = 256 * 1024
 _OPSHELL_READ_TIMEOUT = 5.0
+#: The most base64 one `/keys` request may carry. 256 KB of encoded text is
+#: about 192 KB of keystrokes -- far more than any paste a person makes, and
+#: far less than enough to hold a worker thread for the write timeout.
+_OPSHELL_MAX_KEYS = 256 * 1024
 _OPSHELL_OWNED = "opshell-owned.json"
 _OPSHELL_TARGET = "opshell-target.json"
 
@@ -1731,7 +1730,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                    % (action, task["id"]), agent_id=agent_name)
         return task
 
-    def opshell_state():
+    def opshell_state(session_id=None):
         """What the view renders. Four states, and no fifth that lies."""
         claims = opshell_claims()
         target = opshell_target()
@@ -1789,15 +1788,32 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 "the tunnel server has no shell port range configured, so "
                 "it opens no shell port: set shell_port_first and "
                 "shell_port_last in the tunnel server's block")
-        out["transcript_dir"] = state.get("shell_transcript_dir") or None
+        # `shell_transcripts`, which is what `TunnelSupervisor.status()`
+        # reports. `shell_transcript_dir` is the *config* key it reads to
+        # build it, and asking the status for that name returned None every
+        # time -- so the Closed state named a transcript directory that was
+        # always absent, while the strip badged "recording" from a field
+        # that is real. Invisible because the fixture had invented the same
+        # wrong name: a typo checked against a typo, for the third time on
+        # this branch.
+        out["transcript_dir"] = (state.get("shell_transcripts")
+                                 or state.get("shell_transcript_dir")
+                                 or None)
         # The pair a live session actually sent, when there is one. The
         # default below is what the *next* session would get, and reporting
         # that as "the geometry" was honest only by coincidence: the view
         # happened to send back the same numbers it had been given.
-        live = [b.geometry for b in list(opshell_bridges.values())
-                if b is not None]
-        if live:
-            out["geometry"] = list(live[0])
+        mine = opshell_bridges.get(session_id) if session_id else None
+        if mine is None:
+            # No session named, or one that is not streaming: any live
+            # bridge is still a better answer than the default, but the
+            # caller's own comes first. Taking the first of the dict
+            # returned another tab's pty for a caller that named its own.
+            others = [b for b in list(opshell_bridges.values())
+                      if b is not None]
+            mine = others[0] if others else None
+        if mine is not None:
+            out["geometry"] = list(mine.geometry)
         if target is None:
             return out
         if target not in agents:
@@ -1812,11 +1828,33 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
 
         out["expected_checkin"] = opshell.expected_checkin(
             agents.get(target) or {}, time.time())
+        # A device that has gone two of its own intervals past due cannot
+        # speak for its channel any more, and every conclusion below is
+        # drawn from its last report. Measured before this: an agent two
+        # hours overdue, still in the fleet, came back `state: live,
+        # channel: open` -- a positive claim about a device nothing had
+        # heard from, with the overdue number computed and rendered only in
+        # the waiting state. The operator's close then queued a stop that
+        # could never be delivered.
+        overdue = opshell.report_is_overdue(agents.get(target) or {},
+                                           time.time())
         if claims is not None:
             out["sessions"] = claims.sessions(target)
             owned = target in claims.owned()
         else:
             owned = False
+
+        if overdue:
+            late = out["expected_checkin"]
+            out["channel"] = "unknown"
+            out["reason"] = reason or (
+                "%s has not checked in for %d seconds, so nothing here can "
+                "speak for its channel. A shutdown cannot be delivered to a "
+                "device that is not calling home."
+                % (target, -(late or 0)))
+            if claims is not None:
+                out["sessions"] = claims.sessions(target)
+            return out
 
         pending = _tunnel_pending(target)
         last = _opshell_last_tunnel(target)
@@ -1872,7 +1910,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 target, _opshell_started_pid(last)) else "waiting"
         return out
 
-    def opshell_sweep(lapse_grace=None):
+    def opshell_sweep():
         """Queue the stop for claims nobody is watching any more.
 
         Driven by whatever request arrives, because a view that is gone
@@ -1902,7 +1940,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         for agent_name in opshell.sweep(claims, list(agents), rows, reports,
                                         task_queues, history, _now(),
                                         time.time(), pending, settled,
-                                        lapse_grace=lapse_grace):
+                                        ):
             # The task id, so the line can be tied to the task. The
             # queue is read before the dispatcher can empty it.
             last_task = (task_queues.get(agent_name) or [{}])[-1]
@@ -1928,7 +1966,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         # is watching, and a hidden browser tab is throttled to about one
         # poll a minute, which is exactly that edge.
         opshell_sweep()
-        return jsonify(opshell_state())
+        return jsonify(opshell_state(session_id))
 
     @app.route("/api/opshell/open", methods=["POST"])
     @require_auth
@@ -2148,6 +2186,11 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         # The ceiling before the lookup: it is the cheaper check, and it is
         # the one that stops a request holding a worker thread.
         raw = body.get("data") or ""
+        if not isinstance(raw, str):
+            # The ceiling below introduced this: `len()` on a number raises
+            # TypeError, which Flask turns into 500, where the base64
+            # decode's `except Exception` had answered 400.
+            return jsonify({"error": "data must be base64"}), 400
         if len(raw) > _OPSHELL_MAX_KEYS:
             # A ceiling above any paste a person makes, below anything that
             # could hold a worker thread for the whole write timeout. No
@@ -3583,15 +3626,18 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 # all -- which made closing a browser the one way to leave
                 # a channel up for ever, because this is the only driver
                 # that arrives when no browser exists and the only moment a
-                # stop can be delivered. `CHECKIN_LAPSE_GRACE` carries the
-                # reasoning for the number.
+                # stop can be delivered. `opshell.LAPSE_GRACE` carries the
+                # reasoning for the number, and there is only one of them:
+                # a second, tighter margin on this view's own poll was the
+                # defect that followed, because a panel polling every two
+                # seconds then retired a hidden tab's session.
                 # Only a check-in. `register` and `result` arrive on the
                 # same route, and a busy agent posts many results per
                 # interval -- each one paying a relay round trip per owned
                 # agent for a claim that cannot have changed since the last
                 # one.
                 if action == "beacon":
-                    opshell_sweep(lapse_grace=opshell.CHECKIN_LAPSE_GRACE)
+                    opshell_sweep()
             except Exception as exc:
                 # Warning, not debug: this driver runs precisely when no
                 # browser is open, so a failure here is the one nobody
@@ -8277,6 +8323,11 @@ async function opshellEndSession(){
   const session = opshellSession;
   opshellSession = null;
   opshellAttached = false;
+  // Whatever was typed and not yet delivered dies with the session.
+  // Measured: "more" left over from a session that dropped, prepended to
+  // the next session's "ls", went out as "morels" -- injected input into a
+  // root shell on the operator's own device.
+  opshellKeys = "";
   if(opshellAbort){
     // The stream outlived the view otherwise: the bridge, the pty, one of
     // the shell port's slots, the transcript and a worker thread all
@@ -8304,6 +8355,9 @@ function opshellTeardown(overlay){
   // of the two ways the design says a session ends.
   if(opshellTimer){ clearTimeout(opshellTimer); opshellTimer = null; }
   if(opshellTerm){ opshellTerm.dispose(); opshellTerm = null; }
+  // Otherwise reopening the panel an hour later still says "the session
+  // lasted 92s" above the picker.
+  opshellLast = null;
   if(overlay) overlay.remove();
   return opshellEndSession();
 }
@@ -8316,7 +8370,22 @@ async function opshellPoll(){
     state = await api("/api/opshell/state"
       + (opshellSession ? "?session=" + encodeURIComponent(opshellSession) : ""));
   } catch(e) {
-    body.innerHTML = '<p class="loot-empty">' + esc(String(e.message||e)) + '</p>';
+    // Rescheduled, not abandoned. The first version returned here, so one
+    // network blip -- or a proxy answering with an HTML error page, which
+    // makes `api()` reject on the JSON parse -- stopped the heartbeat for
+    // good: the claim then lapsed and a session the operator was sitting
+    // in was stopped on the device. The whole grace argument assumes this
+    // poll keeps running.
+    const why = esc(String((e && e.message) || e));
+    if(opshellAttached){
+      // Never over an attached terminal: replacing the body took the
+      // terminal's own node with it, and the stream then wrote into a
+      // detached element.
+      opshellSay("the view lost contact with the team server (" + why + ")");
+    } else {
+      body.innerHTML = '<p class="loot-empty">' + why + '</p>';
+    }
+    opshellTimer = setTimeout(opshellPoll, 2000);
     return;
   }
   if(opshellLast && state.state === "idle"){
@@ -8375,10 +8444,12 @@ function opshellRender(state){
       return strip
         + '<p>This channel is up, and this page is not holding it.</p>'
         + '<button class="fd-btn" onclick="opshellOpen(event)">Attach</button> '
-        + '<button class="fd-btn" onclick="opshellEndSession()">'
+        + '<button class="fd-btn" onclick="opshellEndAfterAttach(event)">'
         + 'End the session</button>'
-        + '<p class="loot-empty">Ending it queues the channel\'s shutdown '
-        + 'for the next check-in.</p>';
+        + '<p class="loot-empty">Ending it takes the channel over and then '
+        + 'drops it, so the shutdown goes through the one place that decides '
+        + 'them -- and a channel this view did not raise comes back with the '
+        + 'reason it cannot be dropped.</p>';
     }
     return strip + '<div id="opshell-term"></div>'
       + '<p class="loot-empty">exit, or Ctrl-D, ends the session. Closing it '
@@ -8446,16 +8517,41 @@ async function opshellOpen(ev){
     r = await fetch("/api/opshell/open", {method:"POST", headers:H(),
       body: JSON.stringify(agent ? {agent} : {})});
     answer = await r.json();
-  } catch(e) { return fail(String((e && e.message) || e)); }
-  if(r.status === 401){ tokenRejected(); return; }
+  } catch(e) { fail(String((e && e.message) || e)); return false; }
+  if(r.status === 401){ tokenRejected(); return false; }
   if(!r.ok || !answer || answer.error){
-    return fail((answer && answer.error) || ("the server refused this: HTTP "
-                                             + r.status));
+    fail((answer && answer.error) || ("the server refused this: HTTP "
+                                      + r.status));
+    return false;
   }
   if(answer.session){
     opshellSession = answer.session;
     opshellLast = null;
+    // Nothing typed before this session existed belongs inside it.
+    opshellKeys = "";
   }
+  return true;
+}
+
+async function opshellEndAfterAttach(ev){
+  // The button used to call `opshellEndSession` directly, and that branch
+  // is drawn precisely when there is no session -- so it returned false
+  // before aborting or posting anything, and the button promised a
+  // shutdown it never queued. The claim has to exist before it can be
+  // given back: `/open` adopts the live channel without queueing a second
+  // start, and the close that follows runs through `decide_stop` like
+  // every other one. A channel this view did not raise comes back from
+  // there with the server's own refusal, which is the sentence the
+  // operator needs rather than a silent nothing.
+  if(await opshellOpen(ev) === false) return;
+  await opshellEndSession();
+}
+
+function opshellSay(text){
+  // Out of band, in the terminal, where the operator is looking. The dim
+  // sequence is what this view already uses for its own notes, so it
+  // cannot be mistaken for something the shell printed.
+  if(opshellTerm) opshellTerm.writeln("\r\n\x1b[2m-- " + text + " --\x1b[0m");
 }
 
 function opshellB64(text){
@@ -8480,11 +8576,28 @@ async function opshellFlushKeys(){
     while(opshellKeys && opshellSession){
       const chunk = opshellKeys;
       opshellKeys = "";
+      let r;
       try {
-        await fetch("/api/opshell/keys", {method:"POST", headers:H(),
+        r = await fetch("/api/opshell/keys", {method:"POST", headers:H(),
           body: JSON.stringify({session: opshellSession,
                                 data: opshellB64(chunk)})});
-      } catch(e) { break; }
+      } catch(e) {
+        // Put it back and say so. The chunk used to leave the buffer
+        // before the POST and the reply was never looked at, so a refusal
+        // or a blip dropped a whole batch in silence -- and the coalescing
+        // this wave added made that batch large. A lost batch followed by
+        // one carrying Enter runs a truncated command in a root shell.
+        opshellKeys = chunk + opshellKeys;
+        opshellSay("keystrokes were not sent (" + ((e && e.message) || e)
+                   + ") and are still waiting");
+        break;
+      }
+      if(!r.ok){
+        opshellKeys = chunk + opshellKeys;
+        opshellSay("keystrokes were not delivered (HTTP " + r.status
+                   + ") and are still waiting");
+        break;
+      }
     }
   } finally { opshellFlushing = false; }
 }

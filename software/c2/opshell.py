@@ -81,10 +81,34 @@ class OwnershipRecordError(ValueError):
         self.path = path
 
 
+#: How long a session may be silent before any driver calls it gone.
+#:
+#: The lapse used to be skipped entirely at the check-in, on the argument
+#: that a request with no heartbeat must not judge a browser's liveness.
+#: The argument is sound and the conclusion was wrong: the check-in is the
+#: only driver that arrives when no browser exists at all, and the only
+#: moment a stop can be delivered, so switching it off made "the operator
+#: closed the browser" the one way to leave a channel up for ever -- this
+#: feature's stated anti-goal, reached by closing a tab.
+#:
+#: The repair gave that driver a wider margin and left this view's own
+#: poll on a 60 second one. Two numbers to reason about, and the second was
+#: then missed: a hidden browser tab is throttled to about one poll a
+#: minute, 60 seconds exactly, so a *second* panel polling every two
+#: seconds retired the hidden tab's session and stopped a channel nobody
+#: had finished with.
+#:
+#: So: one margin, wide enough for the slowest poll a live browser makes.
+#: Nothing is lost by it -- being tighter buys no earlier shutdown at all,
+#: because a stop can only ride a check-in, and those are 10 to 300 seconds
+#: apart. 240 seconds is four times a throttled tab's period.
+LAPSE_GRACE = 240.0
+
+
 class Claims:
     """Sessions per agent, plus the persisted record of whose channel it is."""
 
-    def __init__(self, path: Path, grace: float = 60.0):
+    def __init__(self, path: Path, grace: float = LAPSE_GRACE):
         self.path = Path(path)
         self.grace = grace
         self._lock = threading.RLock()
@@ -147,13 +171,14 @@ class Claims:
             if held and session_id in held:
                 held[session_id] = time.time()
 
-    def lapsed(self, now: float, grace: float = None) -> List[str]:
+    def lapsed(self, now: float,
+               grace: Optional[float] = None) -> List[str]:
         """Agents whose every session missed the grace, as of `now`.
 
         A session is stale when `now` is more than `grace` past its last
         beat (opening counts as a beat). `grace` overrides this claim
-        record's own, for the caller that arrives on its own schedule
-        rather than a browser's -- see `CHECKIN_LAPSE_GRACE`. Stale sessions are removed here,
+        record's own, which only the tests do: production has one margin,
+        and `LAPSE_GRACE` carries why. Stale sessions are removed here,
         for agents that still have a live one as well: a ghost left in the
         count would make the live session's later close answer "not the
         last", and the stop would never be queued. An agent is reported
@@ -360,6 +385,37 @@ def expected_checkin(agent: dict, now: float) -> Optional[float]:
     return last + interval - now
 
 
+#: How many missed intervals make a device's report stale rather than late.
+#:
+#: One missed interval is ordinary -- jitter, a slow link, a host that was
+#: busy -- and calling that "unknown" would make the word useless. Two is
+#: already a statement: the device has gone past its own schedule twice,
+#: and every claim made from its last report is that old. Reporting
+#: `channel: open` about such a device is a positive claim nothing has
+#: checked, and the operator's close then queues a stop that cannot be
+#: delivered to anybody.
+STALE_AFTER_INTERVALS = 2
+
+
+def report_is_overdue(agent: dict, now: float) -> bool:
+    """Whether this agent's last report is too old to speak for the device.
+
+    Counted in the agent's own interval rather than in seconds, because a
+    beacon on a 10-second interval and one on 300 are both "two intervals
+    late" at wildly different clock times. An agent that has never been
+    seen is not overdue -- it is unknown for a different reason, and
+    `expected_checkin` already answers None for it.
+    """
+    due = expected_checkin(agent, now)
+    if due is None:
+        return False
+    interval = agent.get("interval")
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) \
+            or interval <= 0:
+        interval = _DEFAULT_INTERVAL
+    return due < -(interval * (STALE_AFTER_INTERVALS - 1))
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -422,29 +478,10 @@ def end_session(claims, agent_id, session_id, endpoint_row,
     return queued, True, why
 
 
-#: How long a session may be silent before a driver that carries no
-#: browser's heartbeat calls it gone.
-#:
-#: The lapse used to be skipped entirely at the check-in, on the argument
-#: that a request with no heartbeat must not judge a browser's liveness.
-#: The argument is sound and the conclusion was wrong: the check-in is the
-#: only driver that arrives when no browser exists at all, and the only
-#: moment a stop can be delivered, so switching it off made "the operator
-#: closed the browser" the one way to leave a channel up for ever -- this
-#: feature's stated anti-goal, reached by closing a tab.
-#:
-#: So it judges with a wider margin instead. A hidden browser tab is
-#: throttled to about one poll a minute, which is exactly the view's own
-#: 60 s grace; four times that cannot retire a tab that is polling at all,
-#: while a tab that is gone loses its channel at a check-in a few intervals
-#: later. A check-in arrives every 10 to 300 s, so this costs at most one
-#: extra interval of channel over the ideal.
-CHECKIN_LAPSE_GRACE = 240.0
 
 
 def sweep(claims, agents_now, endpoint_rows, reports_running, task_queues,
-          history, now, clock, pending=None, settled=None,
-          lapse_grace=None):
+          history, now, clock, pending=None, settled=None):
     """Queue the stop for every claim nobody is watching any more.
 
     `agents_now` is the fleet's agent ids, `endpoint_rows` maps an agent to
@@ -460,8 +497,7 @@ def sweep(claims, agents_now, endpoint_rows, reports_running, task_queues,
 
     Two clocks, because this module already has two: `now` is the ISO stamp
     a task carries, `clock` is the float `lapsed` measures a grace against.
-    `lapse_grace` overrides that grace for a driver that carries no
-    browser's heartbeat; `None` means the claim record's own.
+    There is no per-driver grace; `LAPSE_GRACE` carries why.
     Passing one where the other belonged is how the first version of this
     raised a TypeError on its first call.
     """
@@ -478,11 +514,12 @@ def sweep(claims, agents_now, endpoint_rows, reports_running, task_queues,
                        already_pending=bool(pending.get(agent_id)))[0]:
             queued.append(agent_id)
 
-    # Always. The boolean that used to switch this half off is gone: it
-    # had exactly one caller passing False, the check-in, and that caller
-    # was the one that needed it most. `lapse_grace` is how a driver with
-    # no heartbeat of its own says so -- a wider margin, not an abstention.
-    for agent_id in list(claims.lapsed(clock, lapse_grace)):
+    # Always, and with the claim record's own margin. Both knobs that sat
+    # here are gone: a boolean that let a driver abstain -- its only False
+    # caller was the one that needed the lapse most -- and then a
+    # per-driver grace, whose second number was missed, so a second panel
+    # retired a hidden tab. `LAPSE_GRACE` carries the reasoning.
+    for agent_id in list(claims.lapsed(clock)):
         if agent_id not in agents_now:
             claims.forget(agent_id)
             continue
