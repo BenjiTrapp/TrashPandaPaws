@@ -909,6 +909,22 @@ def _opshell_agent_reports_tunnel(agent_name: str) -> bool:
     return tunnel.get("running") is True
 
 
+def _opshell_tunnel_reported_gone(agent_name: str) -> bool:
+    """Whether the agent's last check-in said its tunnel child has exited.
+
+    The other half of `_opshell_agent_reports_tunnel`, and not its
+    negation: "no report at all" means the beacon has never started a
+    child and says nothing about one this view asked for, while
+    `running: False` is the beacon confirming it is gone. The state uses
+    this to stop saying `waiting` or `closing` for ever.
+    """
+    info = agents.get(agent_name) or {}
+    tunnel = info.get("tunnel")
+    if not isinstance(tunnel, dict):
+        return False
+    return tunnel.get("running") is False
+
+
 def _opshell_last_tunnel(agent_name: str):
     """That agent's most recent `tunnel` history entry, or None.
 
@@ -1609,16 +1625,28 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             "expected_checkin": None,
             "reason": reason,
         }
-        if tunnel_supervisor is None:
-            out["reason"] = reason or _TUNNEL_UNCONFIGURED
+        def _blind(why):
+            """An early answer that still reports a channel it can see.
+
+            The first version returned `idle` here, before it had looked at
+            the agent's own report -- so a supervisor removed under a live
+            channel, or a port range taken out of the configuration, made
+            the view say nothing was running while a child was.
+            """
+            out["reason"] = reason or why
+            if target and _opshell_agent_reports_tunnel(target):
+                out["channel"] = "open"
+                out["state"] = "live"
             return out
+
+        if tunnel_supervisor is None:
+            return _blind(_TUNNEL_UNCONFIGURED)
         row, state = _opshell_endpoint_row(tunnel_supervisor, target)
         if state.get("shell_port_first") is None:
-            out["reason"] = reason or (
+            return _blind(
                 "the tunnel server has no shell port range configured, so "
                 "it opens no shell port: set shell_port_first and "
                 "shell_port_last in the tunnel server's block")
-            return out
         out["transcript_dir"] = state.get("shell_transcript_dir") or None
         if target is None:
             return out
@@ -1666,15 +1694,22 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         elif out["channel"] == "open":
             out["state"] = "live"
         elif action == "stop":
-            # A stop that has been answered and no channel left to show.
-            out["state"] = "closing"
+            # A stop that has been answered. The agent's own report is what
+            # ends this: once it says the child is gone, the channel is
+            # closed and saying "closing" for ever would be the same kind of
+            # overclaim in the other direction.
+            out["state"] = "idle" if _opshell_tunnel_reported_gone(target) \
+                else "closing"
         elif refusal:
             # The beacon refused the start. Not on its way anywhere, and
             # the reason is already in `reason`.
             out["state"] = "idle"
         elif action == "start":
-            # Started, answered, and the relay has not shown a row yet.
-            out["state"] = "waiting"
+            # Started, answered, and the relay has not shown a row yet --
+            # unless the agent has since reported the child gone, which is
+            # a start that died rather than one still arriving.
+            out["state"] = "idle" if _opshell_tunnel_reported_gone(target) \
+                else "waiting"
         return out
 
     @app.route("/api/opshell/state", methods=["GET"])
@@ -1699,10 +1734,16 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         if not agent_name or agent_name not in agents:
             return jsonify({"error": "no such agent",
                             "refused": str(agent_name)[:64]}), 404
+        claims = opshell_claims()
         if _opshell["record_error"]:
-            # Refused rather than started: a channel raised now could not
-            # be recorded, and an unrecorded channel is one nothing will
-            # ever queue a stop for.
+            # `opshell_claims()` first, on purpose: the error is filled in
+            # lazily there, so checking the flag before calling it meant the
+            # very first request after a restart sailed past this guard and
+            # queued a start with nothing owning it.
+            #
+            # Refused rather than started: a channel raised now could not be
+            # recorded, and an unrecorded channel is one nothing will ever
+            # queue a stop for.
             return jsonify({"error": _opshell["record_error"]}), 409
         if tunnel_supervisor is None:
             return jsonify({"error": _TUNNEL_UNCONFIGURED}), 409
@@ -1727,7 +1768,6 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                                      "shell port"}), 409
 
         opshell_remember(agent_name)
-        claims = opshell_claims()
         # The claim before the task, in that order. `Claims.open` saves the
         # ownership record before it hands back a session, "so a channel is
         # never started on the strength of a record that was not saved" --
@@ -1811,26 +1851,44 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return jsonify({"error": "could not attach: %s"
                                      % type(exc).__name__}), 502
 
-        # The session the operator already holds, when they pass it. A
-        # second claim per stream was how `/open`'s session became an
-        # orphan nobody could close: the refcount then answered "not the
-        # last" for a whole grace period and no stop was ever queued.
-        session_id = request.args.get("session")
-        if not session_id or claims is None or \
-                claims.sessions(target) == 0:
-            session_id = claims.open(target) if claims is not None \
-                else secrets.token_hex(8)
+        # The session the operator already holds, when they pass one *and*
+        # it is really theirs. `claims.holds` and not `sessions(...) == 0`:
+        # the second asks whether anybody is live, so a stale or invented
+        # id was adopted whenever another tab was, and that stream then ran
+        # uncounted under the other tab's close.
+        asked = request.args.get("session")
+        own_claim = False
+        if asked and claims is not None and claims.holds(target, asked):
+            session_id = asked
+        elif claims is not None:
+            session_id = claims.open(target)
+            own_claim = True
+        else:
+            session_id = secrets.token_hex(8)
         opshell_bridges[session_id] = bridge
 
         def cleanup():
             if opshell_bridges.get(session_id) is bridge:
                 del opshell_bridges[session_id]
             bridge.close()
-            # The claim too: a stream that ended, was refused, or was
-            # abandoned must not leave a session counted. Without this the
-            # last close would answer "not the last" for a grace period.
-            if claims is not None:
-                claims.close(target, session_id)
+            # Only a claim this stream opened itself. Releasing the
+            # browser's claim here is how the first version of this lost an
+            # owed stop: the stream ended, `close` answered "that was the
+            # last", nothing queued a stop, and the browser's later
+            # `/close` got False for a session that no longer existed. The
+            # browser's claim lapses on its own when the browser stops
+            # beating, and the sweep turns that into a stop.
+            if own_claim and claims is not None and \
+                    claims.close(target, session_id):
+                # This stream held the last claim, so the stop is owed now.
+                row_now, _ = _opshell_endpoint_row(tunnel_supervisor, target)
+                owned_now = target in claims.owned()
+                allowed, _why = opshell.may_stop(row_now, owned_now)
+                if not allowed and owned_now and row_now is None \
+                        and _opshell_agent_reports_tunnel(target):
+                    allowed = True
+                if allowed:
+                    opshell_queue(target, "stop")
 
         def pump():
             try:

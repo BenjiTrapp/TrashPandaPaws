@@ -110,6 +110,18 @@ class Claims:
             self._sessions.setdefault(agent_id, {})[session_id] = time.time()
             return session_id
 
+    def holds(self, agent_id: str, session_id: str) -> bool:
+        """Whether that exact session is one of this agent's live claims.
+
+        `sessions(agent_id)` answers "is anyone holding one", which is not
+        the same question and must not stand in for it: a stream that
+        adopted a stale or invented session id whenever *somebody else* was
+        live ran uncounted, and the other tab's close then queued a stop
+        underneath it.
+        """
+        with self._lock:
+            return session_id in (self._sessions.get(agent_id) or {})
+
     def close(self, agent_id: str, session_id: str) -> bool:
         """Release one claim; True when that was the last one.
 
