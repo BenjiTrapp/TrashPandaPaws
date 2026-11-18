@@ -476,13 +476,25 @@ browser authenticates with the operator token it already has. The tunnel
 panel still shows the password, deliberately, because `raccoon_shell.py`
 needs an operator to read it.
 
-**A view that is closed without ending the session does not leave the
-channel up for ever.** The claim it holds lapses when the browser stops
-polling, and the next request — another operator's page, or the implant's
-own check-in — queues the shutdown. The one case this does not cover is a
-browser that disappears while no other page is open and the implant is not
-checking in; then the channel stands until somebody opens the interface
-again.
+**Leaving the view ends the session, by every route out of it.** Closing
+the panel, clicking outside it, typing `exit`, and closing the browser tab
+all post the same close, which is what queues the channel's shutdown — the
+tab's case with `keepalive`, so the request survives the page going away.
+
+**And a browser that is killed outright still does not leave the channel
+up.** It posts nothing, so the claim it held goes silent instead; four
+minutes of silence is enough for the implant's own next check-in to retire
+it and carry the shutdown. Four minutes rather than the one the view's own
+poll uses, because a hidden browser tab is throttled to about one poll a
+minute and a margin that tight would retire a tab that is merely in the
+background. So the cost of a killed browser is bounded by that margin plus
+one check-in interval, and no operator action is needed.
+
+The one case left is narrow: **the implant stops checking in as well.**
+Then the channel stands — but so would any shutdown, because a task can
+only be delivered to an agent that calls home. Nothing can be queued for a
+device that is not listening, and the view says `unknown` rather than
+claiming the channel is closed.
 
 ---
 

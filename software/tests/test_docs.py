@@ -1076,6 +1076,44 @@ class TestTheGuiTourKeepsUpWithTheHeader(unittest.TestCase):
                             "the tour's Header Bar section never mentions "
                             "the %r button" % title)
 
+    def test_no_heading_has_its_paragraph_glued_to_it(self):
+        """A heading and its text need the blank line between them.
+
+        Found by a reviewer, not by a test: an edit on this branch removed
+        the newline after `### Agent Sidebar (left)` and the whole
+        paragraph became part of the H3 -- 302 characters of prose
+        rendered as a heading. Nothing noticed, because every docs test
+        here searches for substrings and the substrings were all still
+        there; only the rendering was wrong.
+
+        Two signals, because one alone misfires. Length catches it on its
+        own (the next longest heading in these three files is 89
+        characters, and that one is a shell comment), and the sentence
+        rule catches a short run-on that length would let through.
+        `#` lines inside a fenced block are shell comments, not headings,
+        so the fences are tracked rather than assumed away -- without that
+        the rule flagged four code comments and no real defect.
+        """
+        for doc in (DEMO_DOC, REPO / "docs" / "TUNNEL.md", REPO / "README.md"):
+            fenced = False
+            for n, line in enumerate(doc.read_text().splitlines(), 1):
+                if line.lstrip().startswith("```"):
+                    fenced = not fenced
+                    continue
+                if fenced or not line.startswith("#"):
+                    continue
+                where = "%s:%d: %r" % (doc.name, n, line[:80])
+                self.assertLessEqual(
+                    len(line), 120,
+                    "a heading this long is a paragraph with a lost "
+                    "newline -- " + where)
+                # A title does not end in a full stop and carry on. The
+                # lookbehind spares "## 1. Operator Dashboard", which is a
+                # numbered heading and not a sentence.
+                self.assertNotRegex(
+                    line.lstrip("#"), r"(?<![0-9])[.!?]\s+\S",
+                    "a heading does not contain a sentence break -- " + where)
+
     def test_the_tour_links_the_listener_guide(self):
         self.assertIn("LISTENERS.md", self.tour,
                       "the tour describes a Listeners panel and does not "

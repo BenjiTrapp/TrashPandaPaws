@@ -9,10 +9,14 @@ that: every way the bookkeeping could forget a stop it owes.
 import ast
 import base64
 import hashlib
+import re
+import shutil
+import subprocess
 import json
 import os
 import selectors
 import socket
+import struct
 import stat
 import sys
 import tempfile
@@ -227,6 +231,22 @@ class TestOwnershipIsPersisted(_ClaimsCase):
         self.assertIn(str(self.path), str(raised.exception))
         self.assertEqual(raised.exception.path, self.path)
 
+    def test_every_shape_of_damage_is_the_same_error(self):
+        """Promoted from a deferred minor by the final review.
+
+        `read_text()` raises `UnicodeDecodeError`, which is not an
+        `OSError`, so it escaped `_load`, escaped `opshell_claims()`'s
+        `except OwnershipRecordError`, and reached Flask: measured, every
+        route of this feature answered 500 for a record with one stray
+        byte in it. The deferred note said "does not catch
+        UnicodeDecodeError" and I had read that as tidiness.
+        """
+        for damage in (b"{not json", b"[]", b"\xff\xfe nonsense",
+                       b"\x00", b'{"a": 1}\xff'):
+            self.path.write_bytes(damage)
+            with self.assertRaises(opshell.OwnershipRecordError, msg=damage):
+                opshell.Claims(self.path)
+
     def test_a_record_that_is_not_an_object_is_the_same_error(self):
         self.path.write_text("[]")
         with self.assertRaises(opshell.OwnershipRecordError) as raised:
@@ -413,7 +433,14 @@ class _FakeShellPort:
     PROMPT = b"password: "
 
     def __init__(self, prompt=PROMPT, then=b"", die_after_auth=False,
-                 drip=False, hold=None, drain=True, quiet=0.0, late=b""):
+                 drip=False, hold=None, drain=True, quiet=0.0, late=b"",
+                 reset=False):
+        # `reset`: hang up with SO_LINGER 0 after the auth line, so the peer
+        # sees ECONNRESET rather than a clean end. A tunnel server that is
+        # killed looks like this, and every other fake port in this file
+        # closes politely -- which is why the pump's missing `OSError` arm
+        # survived the whole branch.
+        self._reset = reset
         # `quiet` and `late`: stay silent for that many seconds after the
         # auth line, then write `late` and hang up. The only way to prove
         # that the route's pump treats a read timeout as "still open"
@@ -468,6 +495,11 @@ class _FakeShellPort:
             self._got_line.set()
             if self._then:
                 conn.sendall(self._then)
+            if self._reset:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                struct.pack("ii", 1, 0))
+                conn.close()
+                return
             if self._quiet:
                 if self._stop.wait(self._quiet):
                     return
@@ -1393,6 +1425,67 @@ class TestTheStreamAndTheKeystrokes(_RouteCase):
                             headers=self.auth)
         self.assertEqual(answer.status_code, 400)
 
+    def test_the_geometry_reported_is_a_live_sessions_own(self):
+        # The field used to be the constant default, every time, reported
+        # even when no session existed. It read as honest because the view
+        # sent back the same numbers it had been handed -- so the strip's
+        # "120x40" was a restatement of the view's own guess, not a fact
+        # about the pty.
+        port, client = self._with_port(then=b"hello", drain=False)
+        session = self._open(client)
+        # Held open, not just requested: the bridge is gone by the time a
+        # buffered response has been read to its end, so a test that asked
+        # afterwards measured the idle answer and would have passed against
+        # the constant.
+        stream = client.get(
+            self.url("/api/opshell/stream?session=%s&cols=81&rows=25"
+                     % session), headers=self.auth, buffered=False)
+        self.addCleanup(stream.close)
+        self.assertEqual(next(iter(stream.response))[:5], b"hello")
+        state = client.get(self.url("/api/opshell/state?session=" + session),
+                           headers=self.auth).get_json()
+        self.assertEqual(state["geometry"], [81, 25])
+
+    def test_with_no_session_live_there_is_no_geometry_to_report(self):
+        # Nothing has a geometry when nothing is open. The constant that
+        # used to be reported here is what the *next* session would be
+        # given, which is not a fact about this device.
+        port, client = self._with_port(then=b"x", die_after_auth=True)
+        state = client.get(self.url("/api/opshell/state"),
+                           headers=self.auth).get_json()
+        self.assertIsNone(state["geometry"])
+
+    def test_a_tunnel_that_is_reset_ends_the_stream_with_a_reason(self):
+        """I4 of the final review, and it escaped the response.
+
+        `Bridge.read`'s docstring makes the distinction deliberately ("a
+        shell that exited and a tunnel that was lost are not the same
+        news") and the pump then caught only `socket.timeout`, so a reset
+        raised `ConnectionResetError` out of the generator and aborted the
+        chunked response mid-flight with a traceback. It survived the whole
+        branch because every other fake port here closes politely.
+        """
+        port, client = self._with_port(then=b"root@parrot:~# ", reset=True)
+        session = self._open(client)
+        answer = client.get(self.url("/api/opshell/stream?session=" + session),
+                            headers=self.auth)
+        self.assertEqual(answer.status_code, 200)
+        body = answer.get_data()
+        self.assertIn(b"root@parrot", body)
+        # A named reason, and one the operator can tell apart from `exit`:
+        # a clean end prints "session ended" in the browser, and this must
+        # not look like that.
+        self.assertRegex(body, rb"(?i)tunnel.*(lost|reset)")
+
+    def test_a_port_that_hangs_up_cleanly_says_so_differently(self):
+        # The other half of the same distinction: without this, naming the
+        # reset could be done by naming everything the same way.
+        port, client = self._with_port(then=b"bye", die_after_auth=True)
+        session = self._open(client)
+        body = client.get(self.url("/api/opshell/stream?session=" + session),
+                          headers=self.auth).get_data()
+        self.assertNotRegex(body, rb"(?i)tunnel.*(lost|reset)")
+
     def test_the_geometry_header_is_the_pair_that_was_sent(self):
         port, client = self._with_port(then=b"x", die_after_auth=True)
         session = self._open(client)
@@ -1841,6 +1934,38 @@ class TestTheBeatComesBeforeTheSweep(_RouteCase):
         self.assertTrue(order, "the sweep did not run at all")
 
 
+class TestTheCheapGuardsOnTheRoutes(_RouteCase):
+    def test_a_huge_paste_is_refused_rather_than_holding_a_worker(self):
+        # `/keys` had no ceiling, so one paste could hold a worker thread
+        # for the whole 15 s write timeout.
+        answer = self.post(self.url("/api/opshell/keys"),
+                           {"session": "x",
+                            "data": base64.b64encode(b"A" * 400000).decode()})
+        self.assertEqual(answer.status_code, 413)
+
+    def test_a_paste_a_person_could_make_is_not_refused(self):
+        # The ceiling has to be above anything an operator would actually
+        # paste, or it is a new defect rather than a guard. A 64 KB script
+        # pasted into a shell is a real thing to do.
+        answer = self.post(self.url("/api/opshell/keys"),
+                           {"session": "x",
+                            "data": base64.b64encode(b"A" * 65536).decode()})
+        self.assertNotEqual(answer.status_code, 413)
+
+    def test_the_designation_is_no_more_readable_than_the_ownership_record(self):
+        # Its sibling is written 0600 deliberately. A hostname is not a
+        # secret, but "which host is the operator working on" is exactly
+        # the sort of thing that should not be world-readable in a data
+        # directory, and the inconsistency invites someone to relax the
+        # other one to match.
+        client = self.client()
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        target = self.data_dir / "opshell-target.json"
+        self.assertTrue(target.exists())
+        self.assertEqual(oct(target.stat().st_mode & 0o777), "0o600")
+
+
 class TestADamagedRecordIsNotAFreeForAll(_RouteCase):
     def test_the_stream_is_refused_rather_than_inventing_a_session(self):
         (self.data_dir / "opshell-owned.json").write_text("{not json")
@@ -1857,6 +1982,52 @@ class TestADamagedRecordIsNotAFreeForAll(_RouteCase):
         with self.assertLogs("raccoon.c2.server", level="ERROR"):
             self.post(self.url("/api/opshell/close"), {"session": "anything"})
         self.assertEqual(self.sm.task_queues, {})
+
+
+    def test_no_route_answers_500_for_any_shape_of_damage(self):
+        """The property the class name claims, over every shape.
+
+        This class tested `"{not json"` only, and the final review found
+        that one stray byte took a different path: `read_text()` raises
+        `UnicodeDecodeError`, which is not an `OSError`, so it escaped the
+        guard and every route answered 500.
+
+        A fresh app per shape, which is a restart per shape. The first
+        version of this reused the cached client and so answered all three
+        times out of the app built for the *first* damage -- measured:
+        shapes two and three logged nothing at all, because nothing had
+        read them. Three assertions about one file.
+        """
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        for damage in (b"{not json", b"\xff\xfe not utf-8", b"[]",
+                       b'{"a": 1}\xff'):
+            (self.data_dir / "opshell-owned.json").write_bytes(damage)
+            client = self.operator_client(self.app(supervisor=self.connected()))
+            with self.assertLogs("raccoon.c2.server", level="ERROR"):
+                answers = [
+                    client.get(self.url("/api/opshell/state"),
+                               headers=self.auth),
+                    client.get(self.url("/api/opshell/stream"),
+                               headers=self.auth),
+                    client.post(self.url("/api/opshell/open"), json={},
+                                headers=self.auth),
+                    client.post(self.url("/api/opshell/close"),
+                                json={"session": "x"}, headers=self.auth),
+                    client.post(self.url("/api/opshell/keys"),
+                                json={"session": "x", "data": ""},
+                                headers=self.auth),
+                ]
+            for answer in answers:
+                self.assertLess(answer.status_code, 500,
+                                "%r: HTTP %d" % (damage, answer.status_code))
+            # And it names the record rather than going quiet. Not
+            # `channel: unknown`: a damaged record does not stop the server
+            # seeing a channel that is up, and calling that one "unknown"
+            # would be the lie this view exists to avoid.
+            body = answers[0].get_json() or {}
+            self.assertIn("ownership record", body.get("reason") or "",
+                          repr(damage))
 
 
 class TestTheStreamDoesNotDialBeforeItChecks(_RouteCase):
@@ -1982,31 +2153,101 @@ class TestWhatReleasesOwnership(_RouteCase):
         self.assertFalse(self.sm._opshell_stop_settled(self.AGENT, None))
 
 
-class TestACheckInDoesNotRetireAWatchingTab(_ClaimsCase):
-    def test_lapsed_false_leaves_a_slow_tab_alone(self):
-        # A check-in carries no browser heartbeat, so it must not judge
-        # whether a browser is still watching. A tab polling slower than
-        # the grace would otherwise be retired by somebody else's agent.
+class TestTheViewNeverReportsAStateItHasNotGot(_RouteCase):
+    def test_an_agent_that_left_the_fleet_leaves_the_channel_unknown(self):
+        """Review Focus condition 1, which asked for exactly this word.
+
+        The claim's half was right and tested; the view's half reported
+        `channel: "closed"` from the default, so the strip said "channel
+        closed" about a device nothing had heard from. Nothing in the
+        feature had seen that channel go down.
+        """
+        app = self.app(supervisor=self.connected())
+        client = self.operator_client(app)
+        session = client.post(self.url("/api/opshell/open"),
+                              json={"agent": self.AGENT},
+                              headers=self.auth).get_json()["session"]
+        self.sm.agents.pop(self.AGENT, None)
+        state = client.get(self.url("/api/opshell/state?session=" + session),
+                           headers=self.auth).get_json()
+        self.assertEqual(state["channel"], "unknown")
+        self.assertIn("no longer in the fleet", state["reason"])
+
+
+class TestTheSweepRunsOnCheckInsAndNotOnEverything(_RouteCase):
+    def test_a_result_post_does_not_pay_for_a_relay_round_trip(self):
+        # The sweep ran on every beacon request, including `register` and
+        # `result`, each costing one `tunnel_supervisor.status()` per owned
+        # agent. A busy agent posts many results per check-in.
+        (self.data_dir / "opshell-owned.json").write_text(
+            json.dumps({self.AGENT: {"since": "2026-11-18T00:00:00Z"}}))
+        supervisor = self.connected()
+        calls = []
+        real = supervisor.status
+        supervisor.status = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+        app = self.app(supervisor=supervisor)
+        client = app.test_client()
+        client.post("http://localhost:1/api/v1/beacon",
+                    json=self.crypto.wrap({"action": "beacon",
+                                           "agent_id": self.AGENT}))
+        after_checkin = len(calls)
+        self.assertGreater(after_checkin, 0, "the check-in did not sweep")
+        client.post("http://localhost:1/api/v1/beacon",
+                    json=self.crypto.wrap({"action": "result",
+                                           "agent_id": self.AGENT,
+                                           "task_id": "t", "output": "x"}))
+        self.assertEqual(len(calls), after_checkin,
+                         "a result post swept as well")
+
+
+class TestTheLapseGraceIsPerDriver(_ClaimsCase):
+    """A driver with no heartbeat judges with a wider margin, not never.
+
+    These two used to pin `lapsed=False` / `lapsed=True`, which was the
+    defect: the boolean's only False caller was the check-in, and the
+    check-in is the one driver that arrives when no browser exists at all.
+    """
+
+    def test_a_wide_grace_leaves_a_slow_tab_alone(self):
         claims = opshell.Claims(self.path, grace=10.0)
         claims.open("raccoon-bandit")
         queues = {}
         opshell.sweep(claims, ["raccoon-bandit"],
                       {"raccoon-bandit": {"socks": {"sessions": 0}}},
                       {"raccoon-bandit": False}, queues, {}, "now",
-                      time.time() + 11, {}, {}, lapsed=False)
+                      time.time() + 11, {}, {}, lapse_grace=40.0)
         self.assertEqual(queues, {})
         self.assertEqual(claims.sessions("raccoon-bandit"), 1)
 
-    def test_lapsed_true_does_retire_it(self):
+    def test_the_same_silence_past_the_wide_grace_does_retire_it(self):
         claims = opshell.Claims(self.path, grace=10.0)
         claims.open("raccoon-bandit")
         queues = {}
         opshell.sweep(claims, ["raccoon-bandit"],
                       {"raccoon-bandit": {"socks": {"sessions": 0}}},
                       {"raccoon-bandit": False}, queues, {}, "now",
-                      time.time() + 11, {}, {}, lapsed=True)
+                      time.time() + 41, {}, {}, lapse_grace=40.0)
         self.assertEqual([t["args"] for t in queues["raccoon-bandit"]],
                          ["stop"])
+
+    def test_the_claims_own_grace_is_the_default(self):
+        claims = opshell.Claims(self.path, grace=10.0)
+        claims.open("raccoon-bandit")
+        queues = {}
+        opshell.sweep(claims, ["raccoon-bandit"],
+                      {"raccoon-bandit": {"socks": {"sessions": 0}}},
+                      {"raccoon-bandit": False}, queues, {}, "now",
+                      time.time() + 11, {}, {})
+        self.assertEqual([t["args"] for t in queues["raccoon-bandit"]],
+                         ["stop"])
+
+    def test_there_is_no_way_to_ask_the_sweep_not_to_lapse_at_all(self):
+        # The boolean is gone on purpose. A caller that could abstain was
+        # a caller that would, and the one that did was the one that
+        # mattered most.
+        import inspect
+        self.assertNotIn("lapsed",
+                         inspect.signature(opshell.sweep).parameters)
 
 
 class TestAStaleReportDoesNotOutliveItsBeacon(_RouteCase):
@@ -2078,27 +2319,80 @@ class TestTheSweepIsWiredToTheCheckIn(_RouteCase):
                   if e.get("cmd") == "tunnel"]
         self.assertEqual([e.get("args") for e in tunnel], ["stop"])
 
-    def test_a_check_in_does_not_retire_a_session_that_is_watching(self):
-        # `lapsed=False` at the call site: a check-in carries no heartbeat,
-        # so it must not judge a browser's liveness. Reverting the keyword
-        # turns this red.
-        app = self.app(supervisor=self.configured_but_stopped())
+    def test_a_check_in_retires_a_claim_no_browser_is_behind(self):
+        """The anti-goal, reached by closing a browser.
+
+        Found by the final review, and it was my own parked ruling: the
+        lapse ran only from `/state`, so the one driver that arrives when
+        no browser exists -- and the only moment a stop can be delivered --
+        passed `lapsed=False` and never retired the stale session.
+        `reconcile` then saw a session count of 1 and owed nothing. Measured
+        over ten check-ins and 100000 simulated seconds: no stop. Worse,
+        Task 8 then documented the opposite in `docs/TUNNEL.md`.
+
+        The session's last beat is put in the past rather than the clock
+        moved forward, so the check-in runs in real time like every other
+        request.
+        """
+        app = self.app(supervisor=self.connected())
         client = self.operator_client(app)
-        session = client.post(self.url("/api/opshell/open"),
-                              json={"agent": self.AGENT},
-                              headers=self.auth).get_json()["session"]
+        with unittest.mock.patch.object(opshell.time, "time",
+                                        return_value=time.time() - 1000):
+            client.post(self.url("/api/opshell/open"),
+                        json={"agent": self.AGENT}, headers=self.auth)
         self.sm.task_queues.pop(self.AGENT, None)
-        with unittest.mock.patch.object(opshell.Claims, "lapsed",
-                                        autospec=True,
-                                        return_value=[self.AGENT]) as lapsed:
-            app.test_client().post(
-                "http://localhost:1/api/v1/beacon",
-                json=self.crypto.wrap({"action": "beacon",
-                                       "agent_id": self.AGENT}))
-        self.assertEqual(lapsed.call_args_list, [])
+        self.sm.history.pop(self.AGENT, None)
+        app.test_client().post(
+            "http://localhost:1/api/v1/beacon",
+            json=self.crypto.wrap({"action": "beacon",
+                                   "agent_id": self.AGENT}))
+        tunnel = [e.get("args") for e in self.sm.history.get(self.AGENT, [])
+                  if e.get("cmd") == "tunnel"]
+        self.assertEqual(tunnel, ["stop"],
+                         "a check-in with no browser behind the claim left "
+                         "the channel up")
+
+    def test_a_check_in_does_not_retire_a_tab_that_is_merely_throttled(self):
+        """The reason the lapse was switched off here, and it is real.
+
+        A hidden browser tab is throttled to about one poll a minute, and
+        the view's own grace is 60 s -- exactly that edge. So this driver
+        gets a wider margin instead of no judgement at all: 60 s of silence
+        is a throttled tab, 1000 s is a tab that is gone.
+
+        Measured by outcome. The version this replaces asserted that
+        `Claims.lapsed` was never *called*, which pinned the implementation
+        detail that turned out to be the defect.
+        """
+        app = self.app(supervisor=self.connected())
+        client = self.operator_client(app)
+        with unittest.mock.patch.object(opshell.time, "time",
+                                        return_value=time.time() - 60):
+            session = client.post(self.url("/api/opshell/open"),
+                                  json={"agent": self.AGENT},
+                                  headers=self.auth).get_json()["session"]
+        self.sm.task_queues.pop(self.AGENT, None)
+        self.sm.history.pop(self.AGENT, None)
+        app.test_client().post(
+            "http://localhost:1/api/v1/beacon",
+            json=self.crypto.wrap({"action": "beacon",
+                                   "agent_id": self.AGENT}))
+        tunnel = [e.get("args") for e in self.sm.history.get(self.AGENT, [])
+                  if e.get("cmd") == "tunnel"]
+        self.assertEqual(tunnel, [], "a throttled tab lost its channel")
         state = client.get(self.url("/api/opshell/state?session=" + session),
                            headers=self.auth).get_json()
         self.assertEqual(state["sessions"], 1)
+
+    def test_the_two_graces_cannot_drift_into_each_other(self):
+        # The check-in's margin only works while it is comfortably wider
+        # than the slowest poll the view's own grace tolerates. Written
+        # down so that halving one of them fails here rather than in the
+        # field, where the symptom is a channel retired under a live tab.
+        self.assertGreaterEqual(opshell.CHECKIN_LAPSE_GRACE,
+                                4 * opshell.Claims(self.data_dir /
+                                                   "g.json").grace)
+
 
 
 STATIC = Path(__file__).resolve().parents[1] / "c2" / "static"
@@ -2209,6 +2503,34 @@ class TestTheGlyphAndTheView(_GuiCase):
     def test_the_header_carries_a_terminal_glyph_that_opens_the_view(self):
         self.assertIn("showOperatorShell()", self.header_block())
 
+    def test_the_open_button_cannot_be_pressed_twice(self):
+        # Two claims from a double-click: the first is orphaned, so the
+        # operator's next close answers "not the last" and no stop is
+        # queued until the orphan lapses.
+        opened = self.js_function("opshellOpen")
+        self.assertIn("disabled", opened)
+
+    def test_the_stylesheet_comment_does_not_claim_a_defer_it_has_not(self):
+        # Only the script carried `defer`; the comment said both were
+        # deferred. The cost is nil -- it is 7 KB served locally -- which
+        # is exactly why a wrong comment here would survive for ever.
+        at = SERVER_SRC.index('href="/static/xterm.css"')
+        head = SERVER_SRC[at - 400:at]
+        self.assertNotIn("Deferred", head)
+
+    def test_a_closed_tab_ends_the_session_too(self):
+        # A tab that is closed sends no click, and it is one of the two
+        # ordinary ways of leaving. `pagehide` rather than `beforeunload`:
+        # the latter is not fired reliably for a discarded tab, and this is
+        # the one path where "usually" is not good enough -- the channel
+        # stays up on the device otherwise.
+        self.assertRegex(SERVER_SRC,
+                         r'addEventListener\("pagehide"[^)]*\)')
+        at = SERVER_SRC.index('addEventListener("pagehide"')
+        self.assertIn("opshellEndSession", SERVER_SRC[at:at + 200])
+        # And the request has to survive the page going away.
+        self.assertIn("keepalive:true", self.js_function("opshellEndSession"))
+
     def test_the_view_dials_nothing_until_the_operator_asks(self):
         # The goal: nothing happens on open, on hover, or on page load. The
         # channel is raised only when the operator presses the button in
@@ -2233,8 +2555,15 @@ class TestTheGlyphAndTheView(_GuiCase):
         self.assertNotRegex(SERVER_SRC, r"new\s+EventSource\s*\(")
 
     def test_keystrokes_are_posted_not_put_in_the_url(self):
-        attach = self.js_function("opshellAttach")
-        self.assertIn("/api/opshell/keys", attach)
+        # The POST moved out of `opshellAttach` when the keystrokes were
+        # coalesced, and its own behaviour is covered by
+        # `test_only_one_keystroke_post_is_ever_in_flight`. What is left
+        # here is the naming contract: a keystroke never rides in a URL,
+        # anywhere.
+        flush = self.js_function("opshellFlushKeys")
+        self.assertIn("/api/opshell/keys", flush)
+        self.assertIn('method:"POST"', flush)
+        self.assertNotRegex(SERVER_SRC, r"/api/opshell/keys\?")
 
 
 class TestTheViewDoesNotOverclaim(_GuiCase):
@@ -2281,6 +2610,231 @@ class TestTheViewDoesNotOverclaim(_GuiCase):
     def test_the_reason_is_shown_whenever_the_server_sends_one(self):
         render = self.js_function("opshellRender")
         self.assertIn("state.reason", render)
+
+
+class TestTheViewRunsAndIsNotJustRead(_GuiCase):
+    """The view, executed, not grepped.
+
+    Every other interface test on this branch reads `server.py` as text,
+    and the final review found four defects they were all green through:
+    closing the panel queued nothing, a server refusal was swallowed
+    whole, a reloaded page offered no control at all, and the Closed state
+    was never rendered. A grep for an identifier cannot see any of those.
+
+    `test_c2_hardening.py` already runs this interface in node under
+    `skipUnless`, so this is the house pattern rather than a new
+    dependency.
+    """
+
+    def _node(self, script):
+        env = (
+            "let posted = [], aborted = [], removed = [];\n"
+            "const sessionStorage = {d:{}, getItem(k){ return this.d[k] ?? null; },"
+            " setItem(k,v){ this.d[k]=String(v); }, removeItem(k){ delete this.d[k]; }};\n"
+            "sessionStorage.setItem('raccoon_operator_token','t');\n"
+            "function storedToken(){ return 't'; }\n"
+            "function tokenRejected(){}\n"
+            "function askForToken(){}\n"
+            "function H(){ return {'Authorization':'Bearer t',"
+            "'Content-Type':'application/json'}; }\n"
+            "let nextReply = {ok:true, status:200, body:{}};\n"
+            "let inFlight = 0, maxInFlight = 0, holdFetch = 0;\n"
+            "async function fetch(url, opts){\n"
+            "  posted.push({url, method:(opts||{}).method||'GET',"
+            " body:(opts||{}).body, keepalive:!!(opts||{}).keepalive});\n"
+            "  if((opts||{}).signal) (opts||{}).signal.onabort ="
+            " () => aborted.push(url);\n"
+            "  inFlight += 1;\n"
+            "  maxInFlight = Math.max(maxInFlight, inFlight);\n"
+            "  // Resolves late, and the later the earlier it was made: a\n"
+            "  // stub that resolves at once preserves order whatever the\n"
+            "  // code does, which is how the first version of the\n"
+            "  // coalescing test passed with the serialisation removed.\n"
+            "  for(let i = 0; i < holdFetch; i++) await Promise.resolve();\n"
+            "  inFlight -= 1;\n"
+            "  const r = nextReply;\n"
+            "  return {ok:r.ok, status:r.status, body:r.stream||null,"
+            " json: async () => r.body};\n"
+            "}\n"
+            "class AbortController { constructor(){ this.signal={onabort:null};"
+            " } abort(){ if(this.signal.onabort) this.signal.onabort(); } }\n"
+            "const els = {};\n"
+            "function el(id){ return els[id] || (els[id] = {id, innerHTML:'',"
+            " value:'', remove(){ removed.push(id); }}); }\n"
+            "const document = {getElementById: id => els[id] || null,"
+            " createElement: () => ({classList:{}, appendChild(){},"
+            " set innerHTML(v){}, get innerHTML(){ return ''; }}),"
+            " body:{appendChild(){}}};\n"
+            "const window = {addEventListener(){}};\n"
+            "function clearTimeout(){}\n"
+            "function setTimeout(){ return 1; }\n"
+            "const navigator = {};\n"
+            "class TextEncoder { encode(s){ return Buffer.from(s,'utf8'); } }\n"
+        )
+        # The module's own `let` declarations, lifted from the source
+        # rather than restated here: a harness that declares its own
+        # `opshellSession` is a harness that tests its own invention, which
+        # is the exact failure this whole class exists to stop.
+        decls = re.findall(r"^let opshell\w+ = .*$", SERVER_SRC, re.M)
+        self.assertGreaterEqual(len(decls), 6, "the view's state is not "
+                                "declared with `let opshell...` any more")
+        src = "\n".join(decls + [self.js_function(n) for n in (
+            "esc", "opshellEndSession", "opshellTeardown", "opshellPicker",
+            "opshellRender", "opshellOpen", "opshellB64",
+            "opshellFlushKeys")]) + "\n"
+        out = subprocess.run(
+            ["node", "--input-type=module", "-e", env + src + script],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0,
+                         "node failed:\n" + out.stderr[-1500:])
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_closing_the_view_closes_the_session(self):
+        # C2 of the final review. Teardown cleared a timer and returned, so
+        # the channel stayed up on the device -- while the panel's own text
+        # promised "closing it queues the channel's shutdown" and
+        # teardown's own comment claimed the lapse would handle it.
+        got = self._node(
+            "opshellSession = 'sid-1'; opshellAbort = new AbortController();\n"
+            "els['x'] = el('x');\n"
+            "await opshellTeardown(els['x']);\n"
+            "console.log(JSON.stringify({posted: posted.map(p => p.url),"
+            " methods: posted.map(p => p.method), bodies: posted.map(p => p.body),"
+            " session: opshellSession, removed}));")
+        self.assertEqual(got["posted"], ["/api/opshell/close"])
+        self.assertEqual(got["methods"], ["POST"])
+        self.assertIn("sid-1", got["bodies"][0])
+        self.assertIsNone(got["session"])
+        self.assertEqual(got["removed"], ["x"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_ending_the_session_aborts_the_stream_it_left_running(self):
+        # The stream outlived the view: the bridge, the pty, one of the
+        # port's four slots, the transcript and a Flask worker all survived
+        # a closed panel, because the pump exits only on handover, lapse or
+        # EOF.
+        got = self._node(
+            "opshellSession = 'sid-2'; opshellAbort = new AbortController();\n"
+            "opshellAbort.signal.onabort = () => aborted.push('stream');\n"
+            "await opshellEndSession();\n"
+            "console.log(JSON.stringify({aborted, abort: opshellAbort}));")
+        self.assertEqual(got["aborted"], ["stream"])
+        self.assertIsNone(got["abort"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_closing_a_view_that_never_opened_a_session_posts_nothing(self):
+        got = self._node(
+            "opshellSession = null; els['y'] = el('y');\n"
+            "await opshellTeardown(els['y']);\n"
+            "console.log(JSON.stringify({posted, removed}));")
+        self.assertEqual(got["posted"], [])
+        self.assertEqual(got["removed"], ["y"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_refusal_from_open_is_shown_and_not_swallowed(self):
+        # I3. `api()` throws only on 401, so a 409 resolved normally, the
+        # body had no `session`, and the catch never ran: the button did
+        # nothing and the server's carefully worded reason was discarded.
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "nextReply = {ok:false, status:409, body:"
+            "{error:'the tunnel server would not start: port in use'}};\n"
+            "await opshellOpen();\n"
+            "console.log(JSON.stringify({shown: els['opshell-body'].innerHTML,"
+            " session: opshellSession}));")
+        self.assertIn("would not start", got["shown"])
+        self.assertIn("port in use", got["shown"])
+        self.assertIsNone(got["session"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_live_channel_with_no_local_session_offers_both_controls(self):
+        # I6. After F5, in a second tab, or when the channel was raised
+        # from the tunnel panel, the view drew the live strip with an empty
+        # terminal box and no control at all: the operator could neither
+        # join the session they could see nor drop it, and about a minute
+        # later it was stopped without anyone asking.
+        got = self._node(
+            "opshellSession = null;\n"
+            "const html = opshellRender({state:'live', channel:'open',"
+            " host:'parrot', geometry:[120,40]});\n"
+            "console.log(JSON.stringify({html}));")
+        html = got["html"]
+        self.assertIn("opshellOpen(", html,
+                      "no way to attach to a channel the view can see")
+        self.assertIn("opshellEndSession()", html,
+                      "no way to drop a channel the view can see")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_live_channel_this_page_holds_draws_the_terminal_instead(self):
+        got = self._node(
+            "opshellSession = 'mine';\n"
+            "const html = opshellRender({state:'live', channel:'open',"
+            " host:'parrot', geometry:[120,40]});\n"
+            "console.log(JSON.stringify({html}));")
+        self.assertIn('id="opshell-term"', got["html"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_closed_state_says_where_the_transcript_is(self):
+        # I2. The design: Closed "says what remains: the session's
+        # duration, and the transcript's path when recording was on".
+        # `transcript_dir` was computed, shipped in every state body, and
+        # read by nothing -- so after a recorded session the operator was
+        # given no way to find the one artifact it left.
+        got = self._node(
+            "const on = opshellRender({state:'closed', channel:'closed',"
+            " host:'parrot', recording:true, geometry:[120,40],"
+            " transcript_dir:'/opt/raccoon/transcripts', duration:92});\n"
+            "const off = opshellRender({state:'closed', channel:'closed',"
+            " host:'parrot', recording:false, geometry:[120,40],"
+            " transcript_dir:'/opt/raccoon/transcripts'});\n"
+            "console.log(JSON.stringify({on, off}));")
+        self.assertIn("/opt/raccoon/transcripts", got["on"])
+        self.assertIn("92", got["on"])
+        # Not when nothing was recorded: a path with no file at the end of
+        # it is worse than no path.
+        self.assertNotIn("/opt/raccoon/transcripts", got["off"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_only_one_keystroke_post_is_ever_in_flight(self):
+        """I5, and the property the first version of this test missed.
+
+        One POST per keystroke over up to six parallel connections can
+        complete out of order, and in a terminal that means transposed
+        characters -- which the operator blames on the link rather than on
+        this. So the guarantee is "never two at once", and it has to be
+        measured while requests are slow: with a stub that resolves
+        immediately, order holds whatever the code does, and removing the
+        serialisation left the first version of this test green. Measured
+        by mutation, not assumed.
+        """
+        got = self._node(
+            "holdFetch = 6; opshellSession = 'sid'; opshellKeys = '';\n"
+            "opshellKeys += 'a'; const a = opshellFlushKeys();\n"
+            "opshellKeys += 'b'; const b = opshellFlushKeys();\n"
+            "opshellKeys += 'c'; const c = opshellFlushKeys();\n"
+            "await Promise.all([a, b, c]);\n"
+            "await opshellFlushKeys();\n"
+            "const bodies = posted.map(p => JSON.parse(p.body).data);\n"
+            "console.log(JSON.stringify({urls: posted.map(p => p.url),"
+            " max: maxInFlight,"
+            " text: bodies.map(x => Buffer.from(x,'base64').toString())}));")
+        self.assertTrue(all(u == "/api/opshell/keys" for u in got["urls"]))
+        self.assertEqual(got["max"], 1,
+                         "%d keystroke posts were in flight at once; two can "
+                         "complete out of order" % got["max"])
+        # Every keystroke arrives, in order, and in fewer posts than
+        # keystrokes: the point of coalescing.
+        self.assertEqual("".join(got["text"]), "abc")
+        self.assertLess(len(got["text"]), 3)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_non_ascii_keystrokes_survive_the_encoding(self):
+        # The old encoder was `btoa(unescape(encodeURIComponent(d)))`,
+        # which works but leans on a deprecated function.
+        got = self._node(
+            "console.log(JSON.stringify({b64: opshellB64('\\u00e4\\u20ac')}));")
+        self.assertEqual(base64.b64decode(got["b64"]).decode("utf-8"), "\u00e4\u20ac")
 
 
 if __name__ == "__main__":
