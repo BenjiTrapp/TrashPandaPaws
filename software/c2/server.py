@@ -1796,9 +1796,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         # that is real. Invisible because the fixture had invented the same
         # wrong name: a typo checked against a typo, for the third time on
         # this branch.
-        out["transcript_dir"] = (state.get("shell_transcripts")
-                                 or state.get("shell_transcript_dir")
-                                 or None)
+        out["transcript_dir"] = state.get("shell_transcripts") or None
         # The pair a live session actually sent, when there is one. The
         # default below is what the *next* session would get, and reporting
         # that as "the geometry" was honest only by coincidence: the view
@@ -1845,16 +1843,34 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             owned = False
 
         if overdue:
-            late = out["expected_checkin"]
+            # The silence, not the lateness. The first version printed
+            # `-expected_checkin`, which is seconds *past due*, under the
+            # words "has not checked in for" -- so 7200 s of silence on a
+            # 300 s interval was reported as 6900, one whole interval out,
+            # and the documentation describes it as the silence.
+            seen = (agents.get(target) or {}).get("_last_seen_ts")
+            silent = time.time() - seen if isinstance(seen, (int, float)) \
+                and not isinstance(seen, bool) else None
             out["channel"] = "unknown"
             out["reason"] = reason or (
-                "%s has not checked in for %d seconds, so nothing here can "
-                "speak for its channel. A shutdown cannot be delivered to a "
+                "%s has not checked in for %s, so nothing here can speak "
+                "for its channel. A shutdown cannot be delivered to a "
                 "device that is not calling home."
-                % (target, -(late or 0)))
+                % (target, "%d seconds" % silent if silent is not None
+                   else "a while"))
             if claims is not None:
                 out["sessions"] = claims.sessions(target)
-            return out
+            # And it does not return: a queued start still has to read as
+            # `waiting`, or the operator sees nothing happen after the
+            # click and presses the button again, taking a fresh claim each
+            # time. Only the channel and the reason are the overdue
+            # device's to decide; what this view has *asked for* is still
+            # true, and `reason` is held so the branches below cannot
+            # overwrite it.
+            reason = out["reason"]
+            overdue_channel = True
+        else:
+            overdue_channel = False
 
         pending = _tunnel_pending(target)
         last = _opshell_last_tunnel(target)
@@ -1908,6 +1924,11 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             # child must not be read as this one having died.
             out["state"] = "idle" if _opshell_tunnel_reported_gone(
                 target, _opshell_started_pid(last)) else "waiting"
+        if overdue_channel:
+            # Whatever the state machine concluded about what was asked
+            # for, nothing here has heard from the device.
+            out["channel"] = "unknown"
+            out["reason"] = reason
         return out
 
     def opshell_sweep():
@@ -2015,11 +2036,17 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         # never started on the strength of a record that was not saved" --
         # queueing first would mean a failed save left a start queued and
         # nothing owning it.
-        session_id = claims.open(agent_name) if claims is not None else None
-
+        # Whether this claim raises the channel or adopts one that is
+        # already up, decided *before* the claim so the record says which.
+        # Only a channel this view raised may be stopped: one child process
+        # on the device serves both the SOCKS port and the shell port.
         row, _ = _opshell_endpoint_row(tunnel_supervisor, agent_name)
-        if row is None and not _opshell_agent_reports_tunnel(agent_name) \
-                and _tunnel_pending(agent_name) is None:
+        raising = (row is None
+                   and not _opshell_agent_reports_tunnel(agent_name)
+                   and _tunnel_pending(agent_name) is None)
+        session_id = claims.open(agent_name, raised=raising) \
+            if claims is not None else None
+        if raising:
             # Not idempotent by itself: a second open while a start is
             # outstanding must not queue another one.
             opshell_queue(agent_name, "start")
@@ -8294,6 +8321,8 @@ let opshellStarted = 0;
 let opshellLast = null;
 let opshellKeys = "";
 let opshellFlushing = false;
+let opshellTrouble = "";
+let opshellNoted = "";
 
 async function showOperatorShell(){
   // Dials nothing. The channel is raised only when the operator presses
@@ -8341,12 +8370,38 @@ async function opshellEndSession(){
     opshellLast = {duration: Math.round((Date.now() - opshellStarted)/1000)};
     opshellStarted = 0;
   }
+  // The answer is read, not merely awaited. The first version discarded
+  // it, so every one of the three ways a stop can be refused was silent:
+  // a rejected request, a `reason` from `may_stop` ("live socks sessions
+  // ride this channel"), and another view still holding the session --
+  // while the paragraph beside the button promised the reason would come
+  // back. A button that may refuse and says nothing either way is the
+  // defect this whole view exists to avoid.
+  let r, answer = null;
   try {
     // keepalive, so the same call survives the tab being closed. Not
     // `api()`: this must go out even while the page is being torn down.
-    await fetch("/api/opshell/close", {method:"POST", headers:H(),
+    r = await fetch("/api/opshell/close", {method:"POST", headers:H(),
       body: JSON.stringify({session}), keepalive:true});
-  } catch(e) {}
+    answer = await r.json();
+  } catch(e) {
+    opshellSay("the shutdown could not be requested ("
+               + ((e && e.message) || e) + "). The channel may still be up; "
+               + "it is dropped at a later check-in.");
+    return true;
+  }
+  const why = (answer && (answer.error || answer.reason)) || "";
+  if(why){
+    opshellSay(why);
+  } else if(r.ok){
+    opshellSay("the channel's shutdown is queued for the next check-in");
+  }
+  // Said in the panel too, for a view that has no terminal to write into:
+  // the picker, or a channel this page never attached to.
+  const body = document.getElementById("opshell-body");
+  if(body && !opshellTerm && why){
+    body.innerHTML = '<p class="loot-empty">' + esc(why) + '</p>';
+  }
   return true;
 }
 
@@ -8367,8 +8422,17 @@ async function opshellPoll(){
   if(!body){ if(opshellTimer) clearTimeout(opshellTimer); return; }
   let state;
   try {
-    state = await api("/api/opshell/state"
-      + (opshellSession ? "?session=" + encodeURIComponent(opshellSession) : ""));
+    // A deadline, because the whole lapse margin rests on this poll
+    // running. A proxy that accepts and never answers produces no
+    // rejection at all, so without this the heartbeat stopped silently and
+    // the claim lapsed under a live root shell.
+    state = await fetch("/api/opshell/state"
+      + (opshellSession ? "?session=" + encodeURIComponent(opshellSession) : ""),
+      {headers: H(), signal: AbortSignal.timeout(8000)})
+      .then(r => {
+        if(r.status === 401){ tokenRejected(); throw new Error("operator token rejected"); }
+        return r.json();
+      });
   } catch(e) {
     // Rescheduled, not abandoned. The first version returned here, so one
     // network blip -- or a proxy answering with an HTML error page, which
@@ -8380,13 +8444,25 @@ async function opshellPoll(){
     if(opshellAttached){
       // Never over an attached terminal: replacing the body took the
       // terminal's own node with it, and the stream then wrote into a
-      // detached element.
-      opshellSay("the view lost contact with the team server (" + why + ")");
+      // detached element. And once, not every two seconds: a sustained
+      // outage wrote thirty lines in a minute and scrolled the operator's
+      // own work off the screen exactly when they needed to read it.
+      if(opshellTrouble !== why){
+        opshellTrouble = why;
+        opshellSay("the view lost contact with the team server (" + why
+                   + "). The session is unaffected until it lapses.");
+      }
     } else {
       body.innerHTML = '<p class="loot-empty">' + why + '</p>';
     }
     opshellTimer = setTimeout(opshellPoll, 2000);
     return;
+  }
+  if(opshellTrouble){
+    // Recovery is worth one line, or the operator is left reading the
+    // last complaint with no sign it ended.
+    opshellTrouble = "";
+    opshellSay("the team server is answering again");
   }
   if(opshellLast && state.state === "idle"){
     // What a session this page ran left behind. The server has no Closed
@@ -8394,7 +8470,21 @@ async function opshellPoll(){
     // the remnant belongs to the page that ran the session anyway.
     state = Object.assign({}, state, opshellLast, {state: "closed"});
   }
-  if(!opshellAttached) body.innerHTML = opshellRender(state);
+  if(!opshellAttached){
+    body.innerHTML = opshellRender(state);
+  } else {
+    // The body is not redrawn under an attached terminal, so everything
+    // this view learns -- the channel going `unknown`, a queued shutdown,
+    // a device that stopped calling home -- used to be invisible to
+    // exactly the person who needed it. Said once per change, in the
+    // terminal, where they are looking.
+    const note = (state.channel === "unknown" || state.state === "closing")
+      ? (state.reason || ("the channel is now " + state.channel)) : "";
+    if(note !== opshellNoted){
+      opshellNoted = note;
+      if(note) opshellSay(note);
+    }
+  }
   if(state.state === "live" && opshellSession && !opshellAttached){
     opshellAttach(state);
   }
@@ -8525,6 +8615,15 @@ async function opshellOpen(ev){
     return false;
   }
   if(answer.session){
+    if(!document.getElementById("opshell-body")){
+      // The view went away while this was in flight. Adopting the session
+      // now would leave the claim held by a page that no longer exists,
+      // and the channel would come down only via the lapse four minutes
+      // later. Hand it straight back instead.
+      opshellSession = answer.session;
+      await opshellEndSession();
+      return false;
+    }
     opshellSession = answer.session;
     opshellLast = null;
     // Nothing typed before this session existed belongs inside it.
@@ -8564,42 +8663,71 @@ function opshellB64(text){
   return btoa(out);
 }
 
+//: The most text one POST may carry, the server's own ceiling. A paste
+//: larger than this is split rather than refused for ever: the same batch,
+//: retried, is the same refusal.
+const OPSHELL_KEYS_PER_POST = 128 * 1024;
+
 async function opshellFlushKeys(){
   // One POST in flight at a time, carrying everything that accumulated
-  // while the last one was flying. The first version posted once per
-  // keystroke, and independent POSTs over up to six parallel connections
-  // can complete out of order -- which in a terminal means transposed
-  // characters, and the operator would blame the link rather than this.
+  // while the last one was flying. Independent POSTs over up to six
+  // parallel connections can complete out of order -- which in a terminal
+  // means transposed characters, and the operator would blame the link
+  // rather than this.
+  //
+  // Three rules on failure, and the first version had none of them. It put
+  // the batch back unconditionally, so a refusal that cannot come good
+  // made an unbounded buffer that was reported as "still waiting" for
+  // ever -- and if the cause then cleared, the whole accumulated and
+  // never-echoed buffer would replay into a root shell as one batch. That
+  // was worse than the batch loss it replaced, because the operator had
+  // been told otherwise.
+  //
+  //   - a status that cannot succeed by waiting is dropped, and named as
+  //     dropped;
+  //   - a rejected request is retried once, then dropped and named;
+  //   - a batch over the ceiling is split, because retrying an oversized
+  //     batch is retrying the same refusal.
   if(opshellFlushing) return;
   opshellFlushing = true;
   try {
     while(opshellKeys && opshellSession){
-      const chunk = opshellKeys;
-      opshellKeys = "";
-      let r;
-      try {
-        r = await fetch("/api/opshell/keys", {method:"POST", headers:H(),
-          body: JSON.stringify({session: opshellSession,
-                                data: opshellB64(chunk)})});
-      } catch(e) {
-        // Put it back and say so. The chunk used to leave the buffer
-        // before the POST and the reply was never looked at, so a refusal
-        // or a blip dropped a whole batch in silence -- and the coalescing
-        // this wave added made that batch large. A lost batch followed by
-        // one carrying Enter runs a truncated command in a root shell.
-        opshellKeys = chunk + opshellKeys;
-        opshellSay("keystrokes were not sent (" + ((e && e.message) || e)
-                   + ") and are still waiting");
-        break;
-      }
-      if(!r.ok){
-        opshellKeys = chunk + opshellKeys;
-        opshellSay("keystrokes were not delivered (HTTP " + r.status
-                   + ") and are still waiting");
-        break;
+      const chunk = opshellKeys.slice(0, OPSHELL_KEYS_PER_POST);
+      opshellKeys = opshellKeys.slice(OPSHELL_KEYS_PER_POST);
+      if(!await opshellPostKeys(chunk)){
+        // Dropped, with the rest of it: delivering later keystrokes
+        // without the ones before them is how a truncated command reaches
+        // a root shell.
+        opshellKeys = "";
+        return;
       }
     }
   } finally { opshellFlushing = false; }
+}
+
+async function opshellPostKeys(chunk){
+  // True when the chunk reached the far end. False means it is gone and
+  // the operator has been told; it is never "put back and hope".
+  for(let attempt = 0; attempt < 2; attempt++){
+    let r;
+    try {
+      r = await fetch("/api/opshell/keys", {method:"POST", headers:H(),
+        body: JSON.stringify({session: opshellSession,
+                              data: opshellB64(chunk)})});
+    } catch(e) {
+      // A dropped connection can come good, so one retry -- and only one.
+      // Two is the unbounded buffer again with extra steps.
+      if(attempt === 0) continue;
+      opshellSay("keystrokes were not sent (" + ((e && e.message) || e)
+                 + ") and have been dropped. Type them again.");
+      return false;
+    }
+    if(r.ok) return true;
+    opshellSay("keystrokes were not delivered (HTTP " + r.status
+               + ") and have been dropped. Type them again.");
+    return false;
+  }
+  return false;
 }
 
 async function opshellAttach(state){
@@ -8628,11 +8756,24 @@ async function opshellAttach(state){
       + encodeURIComponent(opshellSession) + "&cols=" + cols + "&rows=" + rows,
       {headers: H(), signal: opshellAbort.signal});
   } catch(e) {
-    if(opshellTerm) opshellTerm.writeln("\r\n[stream failed: " + e + "]");
+    if(opshellTerm){
+      opshellTerm.writeln("\r\n\x1b[2m-- the stream failed ("
+        + ((e && e.message) || e) + ") --\x1b[0m");
+    }
+    await opshellEndSession();
     return;
   }
   if(!res.ok || !res.body){
-    if(opshellTerm) opshellTerm.writeln("\r\n[the shell port refused this session]");
+    // The end of the session, not a state to sit in. The first version
+    // wrote the line and returned with `opshellAttached` and
+    // `opshellSession` still set and no reader loop to clear them -- so
+    // every keystroke after that got 404, and the claim was held until the
+    // lapse four minutes later.
+    if(opshellTerm){
+      opshellTerm.writeln("\r\n\x1b[2m-- the shell port refused this "
+        + "session (HTTP " + res.status + ") --\x1b[0m");
+    }
+    await opshellEndSession();
     return;
   }
   const reader = res.body.getReader();

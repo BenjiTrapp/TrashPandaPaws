@@ -489,9 +489,11 @@ every driver that can notice a silent claim uses one margin. An earlier
 version gave this one a wider margin than the view's own poll, and the
 narrower one then retired a backgrounded tab when a second panel was open.
 Four minutes is four times the slowest poll a live browser makes: a hidden
-tab is throttled to about one a minute. Nothing is lost by the width,
-because a shutdown can only ride a check-in anyway, and those are ten to
-three hundred seconds apart. So the cost of a killed browser is bounded by
+tab is throttled to about one a minute. At the shipped three-hundred-second interval the
+width disappears inside the wait for the next check-in, because a shutdown
+can only ride one; on a fast beacon it does not, and costs about four extra
+minutes of channel. That is the price of not retiring a live session, and
+it is a price rather than a free lunch. So the cost of a killed browser is bounded by
 that margin plus one interval, and no operator action is needed.
 
 The one case left is narrow: **the implant stops checking in as well.**

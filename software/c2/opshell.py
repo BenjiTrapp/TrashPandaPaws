@@ -99,9 +99,15 @@ class OwnershipRecordError(ValueError):
 #: had finished with.
 #:
 #: So: one margin, wide enough for the slowest poll a live browser makes.
-#: Nothing is lost by it -- being tighter buys no earlier shutdown at all,
-#: because a stop can only ride a check-in, and those are 10 to 300 seconds
-#: apart. 240 seconds is four times a throttled tab's period.
+#: 240 seconds is four times a throttled tab's period.
+#:
+#: What it costs, stated honestly rather than as "nothing": at the shipped
+#: 300 second interval the margin disappears inside the wait for the next
+#: check-in, because a stop can only ride one. Below about 180 seconds it
+#: does not: a 10 second beacon would have carried the stop within ten
+#: seconds of the lapse, so the width costs roughly four extra minutes of
+#: channel on the device. That is the price of not retiring a live
+#: operator's session, and it is a price, not a free lunch.
 LAPSE_GRACE = 240.0
 
 
@@ -116,23 +122,56 @@ class Claims:
         self._sessions = {}  # type: Dict[str, Dict[str, float]]
         self._owned = self._load()  # type: Dict[str, dict]
 
-    def open(self, agent_id: str) -> str:
+    def open(self, agent_id: str, *, raised: bool) -> str:
         """Take a claim and return its session id.
 
         The ownership record is written before the claim is taken. If the
         write fails the exception propagates and nothing is claimed, so a
         channel is never started on the strength of a record that was not
         saved.
+
+        `raised` has no default, deliberately. Either value would be the
+        wrong one to forget: False leaves channels up, which is this
+        feature's stated anti-goal, and True lets a forgotten argument stop
+        a channel somebody else raised. A keyword with no default makes the
+        caller say which it is, and a caller that does not say fails at
+        once rather than quietly.
+
+        It says whether this claim is the one that *brought the channel
+        up*, as opposed to adopting one that was already there.
+        Only the first kind may be stopped: one child process on the device
+        serves both the SOCKS port and the shell port, so stopping a
+        channel somebody raised from the tunnel panel would drop their
+        pivot. The distinction is sticky -- once we raised it, the stop is
+        ours to owe, and a later adopting claim must not downgrade it.
         """
         with self._lock:
-            if agent_id not in self._owned:
+            known = self._owned.get(agent_id)
+            if known is None or (raised and not known.get("raised")):
                 updated = dict(self._owned)
-                updated[agent_id] = {"since": _now_iso()}
+                updated[agent_id] = {
+                    "since": (known or {}).get("since") or _now_iso(),
+                    "raised": bool(raised) or bool((known or {}).get("raised")),
+                }
                 self._save(updated)
                 self._owned = updated
             session_id = secrets.token_hex(8)
             self._sessions.setdefault(agent_id, {})[session_id] = time.time()
             return session_id
+
+    def raised(self, agent_id: str) -> bool:
+        """Whether this view brought that channel up, rather than adopting it.
+
+        A record written before this field existed describes a channel the
+        view did raise -- that was the only way to get one -- so a missing
+        field reads as True. Reading it as False would orphan those stops
+        for ever.
+        """
+        with self._lock:
+            known = self._owned.get(agent_id)
+            if known is None:
+                return False
+            return bool(known.get("raised", True))
 
     def holds(self, agent_id: str, session_id: str) -> bool:
         """Whether that exact session is one of this agent's live claims.
@@ -413,7 +452,17 @@ def report_is_overdue(agent: dict, now: float) -> bool:
     if isinstance(interval, bool) or not isinstance(interval, (int, float)) \
             or interval <= 0:
         interval = _DEFAULT_INTERVAL
-    return due < -(interval * (STALE_AFTER_INTERVALS - 1))
+    # Jitter widens the line, because it widens the beacon's own sleep.
+    # `beacon.py` draws from [interval*(1-j), interval*(1+j)] and the
+    # operator may set j as high as 100%, so a flat two-interval line calls
+    # a perfectly healthy agent overdue with no missed check-in at all --
+    # and the view would flap to `unknown` on a working device.
+    jitter = agent.get("jitter")
+    if isinstance(jitter, bool) or not isinstance(jitter, (int, float)) \
+            or jitter < 0:
+        jitter = 0
+    slack = interval * (1 + min(jitter, 100) / 100.0)
+    return due < -(interval * (STALE_AFTER_INTERVALS - 2) + slack)
 
 
 def _now_iso() -> str:
@@ -441,7 +490,13 @@ def decide_stop(claims, agent_id, endpoint_row, agent_reports_running,
     """
     if already_pending:
         return False, "a tunnel task is already queued for this agent"
-    owned = claims is None or agent_id in claims.owned()
+    # "Raised by this view", not merely "claimed by it". `/open` writes
+    # ownership whenever a session is taken, including onto a channel that
+    # was already up -- so `owned` answered True for a pivot somebody
+    # raised from the tunnel panel, and the view's Attach button made that
+    # one click away from a stop. The plan's constraint is the stronger
+    # word.
+    owned = claims is None or claims.raised(agent_id)
     allowed, why = may_stop(endpoint_row, owned)
     if not allowed and owned and endpoint_row is None \
             and agent_reports_running:
@@ -471,7 +526,12 @@ def end_session(claims, agent_id, session_id, endpoint_row,
     """
     last = claims.close(agent_id, session_id) if claims is not None else True
     if not last:
-        return False, False, ""
+        # A reason, not an empty string. This is correct behaviour -- the
+        # channel is still being watched -- but the route sent nothing, so
+        # the view had nothing to show and its button looked broken. Right
+        # behaviour with no explanation is indistinguishable from a bug.
+        return False, False, ("another view is holding this channel, so it "
+                              "stays up; this session is closed")
     queued, why = decide_stop(claims, agent_id, endpoint_row,
                               agent_reports_running, task_queues, history,
                               now)

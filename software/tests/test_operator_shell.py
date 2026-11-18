@@ -41,7 +41,7 @@ class _ClaimsCase(unittest.TestCase):
 class TestTheClaimCounts(_ClaimsCase):
     def test_the_last_session_out_is_the_one_that_closes(self):
         c = opshell.Claims(self.path)
-        a, b = c.open("raccoon-bandit"), c.open("raccoon-bandit")
+        a, b = c.open("raccoon-bandit", raised=True), c.open("raccoon-bandit", raised=True)
         self.assertFalse(c.close("raccoon-bandit", a))
         self.assertTrue(c.close("raccoon-bandit", b))
 
@@ -50,8 +50,8 @@ class TestTheClaimCounts(_ClaimsCase):
         # only thing standing between `exit` in one tab and a dead session
         # in the other.
         c = opshell.Claims(self.path)
-        first = c.open("raccoon-bandit")
-        c.open("raccoon-bandit")
+        first = c.open("raccoon-bandit", raised=True)
+        c.open("raccoon-bandit", raised=True)
         c.close("raccoon-bandit", first)
         self.assertEqual(c.sessions("raccoon-bandit"), 1)
 
@@ -61,8 +61,8 @@ class TestTheClaimCounts(_ClaimsCase):
         # leave both sessions equally stale.
         c = opshell.Claims(self.path, grace=10.0)
         with unittest.mock.patch.object(opshell.time, "time", return_value=1000.0):
-            c.open("quiet-one")
-            alive = c.open("alive-one")
+            c.open("quiet-one", raised=True)
+            alive = c.open("alive-one", raised=True)
         with unittest.mock.patch.object(opshell.time, "time", return_value=1008.0):
             c.beat("alive-one", alive)
         self.assertEqual(c.lapsed(now=1011.0), ["quiet-one"])
@@ -71,7 +71,7 @@ class TestTheClaimCounts(_ClaimsCase):
     def test_a_session_exactly_at_the_grace_has_not_lapsed(self):
         c = opshell.Claims(self.path, grace=10.0)
         with unittest.mock.patch.object(opshell.time, "time", return_value=1000.0):
-            c.open("raccoon-bandit")
+            c.open("raccoon-bandit", raised=True)
         self.assertEqual(c.lapsed(now=1010.0), [])
         self.assertEqual(c.lapsed(now=1010.5), ["raccoon-bandit"])
 
@@ -81,8 +81,8 @@ class TestTheClaimCounts(_ClaimsCase):
         # last", no stop would be queued, and the channel would stand.
         c = opshell.Claims(self.path, grace=10.0)
         with unittest.mock.patch.object(opshell.time, "time", return_value=1000.0):
-            c.open("raccoon-bandit")
-            live = c.open("raccoon-bandit")
+            c.open("raccoon-bandit", raised=True)
+            live = c.open("raccoon-bandit", raised=True)
         with unittest.mock.patch.object(opshell.time, "time", return_value=1008.0):
             c.beat("raccoon-bandit", live)
         self.assertEqual(c.lapsed(now=1012.0), [])
@@ -92,7 +92,7 @@ class TestTheClaimCounts(_ClaimsCase):
     def test_a_lapsed_claim_is_reported_once_and_not_revived_by_a_late_beat(self):
         c = opshell.Claims(self.path, grace=10.0)
         with unittest.mock.patch.object(opshell.time, "time", return_value=1000.0):
-            sid = c.open("raccoon-bandit")
+            sid = c.open("raccoon-bandit", raised=True)
         self.assertEqual(c.lapsed(now=1020.0), ["raccoon-bandit"])
         self.assertEqual(c.lapsed(now=1021.0), [])
         c.beat("raccoon-bandit", sid)
@@ -101,7 +101,7 @@ class TestTheClaimCounts(_ClaimsCase):
 
     def test_closing_a_session_that_is_not_held_is_not_a_last_close(self):
         c = opshell.Claims(self.path)
-        c.open("raccoon-bandit")
+        c.open("raccoon-bandit", raised=True)
         self.assertFalse(c.close("raccoon-bandit", "not-a-session"))
         self.assertFalse(c.close("never-opened", "x"))
         self.assertEqual(c.sessions("raccoon-bandit"), 1)
@@ -111,7 +111,7 @@ class TestOwnershipIsPersisted(_ClaimsCase):
     def test_ownership_survives_a_restart_and_reconciles(self):
         # The anti-goal: a restart between start and stop must not leave a
         # channel with nobody to close it.
-        opshell.Claims(self.path).open("raccoon-bandit")
+        opshell.Claims(self.path).open("raccoon-bandit", raised=True)
         fresh = opshell.Claims(self.path)          # a new process
         self.assertEqual(fresh.owned(), ["raccoon-bandit"])
         self.assertEqual(opshell.reconcile(fresh, ["raccoon-bandit"]),
@@ -120,7 +120,7 @@ class TestOwnershipIsPersisted(_ClaimsCase):
     def test_an_agent_that_vanished_is_forgotten_not_reported_closed(self):
         # Review Focus 1. No agent, no task, no honest claim of closure.
         c = opshell.Claims(self.path)
-        c.open("gone-raccoon")
+        c.open("gone-raccoon", raised=True)
         self.assertEqual(opshell.reconcile(c, []), [])
         self.assertEqual(c.owned(), [])
         self.assertEqual(opshell.Claims(self.path).owned(), [])
@@ -130,7 +130,7 @@ class TestOwnershipIsPersisted(_ClaimsCase):
         # session, a restart before the beacon's next check-in would find
         # nothing owed and the stop would never be re-queued.
         c = opshell.Claims(self.path)
-        sid = c.open("raccoon-bandit")
+        sid = c.open("raccoon-bandit", raised=True)
         self.assertTrue(c.close("raccoon-bandit", sid))
         fresh = opshell.Claims(self.path)
         self.assertEqual(opshell.reconcile(fresh, ["raccoon-bandit"]),
@@ -140,7 +140,7 @@ class TestOwnershipIsPersisted(_ClaimsCase):
 
     def test_release_after_the_stop_is_seen_drops_ownership(self):
         c = opshell.Claims(self.path)
-        sid = c.open("raccoon-bandit")
+        sid = c.open("raccoon-bandit", raised=True)
         c.close("raccoon-bandit", sid)
         self.assertTrue(c.release("raccoon-bandit"))
         self.assertEqual(c.owned(), [])
@@ -154,9 +154,9 @@ class TestOwnershipIsPersisted(_ClaimsCase):
         # would answer "not the last" and a restart would reconcile to
         # nothing.
         c = opshell.Claims(self.path)
-        old = c.open("raccoon-bandit")
+        old = c.open("raccoon-bandit", raised=True)
         self.assertTrue(c.close("raccoon-bandit", old))
-        new = c.open("raccoon-bandit")
+        new = c.open("raccoon-bandit", raised=True)
         self.assertFalse(c.release("raccoon-bandit"))
         self.assertEqual(c.sessions("raccoon-bandit"), 1)
         self.assertEqual(c.owned(), ["raccoon-bandit"])
@@ -169,46 +169,51 @@ class TestOwnershipIsPersisted(_ClaimsCase):
 
     def test_forget_is_for_an_agent_that_is_gone_and_takes_its_claims_with_it(self):
         c = opshell.Claims(self.path)
-        c.open("gone-raccoon")
+        c.open("gone-raccoon", raised=True)
         c.forget("gone-raccoon")
         self.assertEqual(c.sessions("gone-raccoon"), 0)
         self.assertEqual(c.owned(), [])
 
     def test_a_live_claim_is_not_owed_a_stop(self):
         c = opshell.Claims(self.path)
-        c.open("raccoon-bandit")
+        c.open("raccoon-bandit", raised=True)
         self.assertEqual(opshell.reconcile(c, ["raccoon-bandit"]), [])
         self.assertEqual(c.owned(), ["raccoon-bandit"])
 
     def test_a_channel_this_view_did_not_start_is_not_owned(self):
         c = opshell.Claims(self.path)
-        c.open("raccoon-bandit")
+        c.open("raccoon-bandit", raised=True)
         self.assertEqual(opshell.reconcile(c, ["raccoon-bandit", "other-one"]), [])
         self.assertEqual(c.owned(), ["raccoon-bandit"])
 
     def test_the_record_is_private_and_says_only_whose_channel_it_is(self):
-        opshell.Claims(self.path).open("raccoon-bandit")
+        opshell.Claims(self.path).open("raccoon-bandit", raised=True)
         self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
         record = json.loads(self.path.read_text())
         self.assertEqual(list(record), ["raccoon-bandit"])
-        self.assertEqual(list(record["raccoon-bandit"]), ["since"])
+        # `raised` as well as `since`: which of the two kinds of claim
+        # this is decides whether its stop may ever be queued, so it has
+        # to survive a restart. Still nothing about the host, the port or
+        # the password.
+        self.assertEqual(sorted(record["raccoon-bandit"]),
+                         ["raised", "since"])
 
     def test_the_record_stays_private_when_rewritten_under_a_loose_umask(self):
         c = opshell.Claims(self.path)
-        c.open("one")
+        c.open("one", raised=True)
         old = os.umask(0)
         try:
-            c.open("two")
+            c.open("two", raised=True)
         finally:
             os.umask(old)
         self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o600)
 
     def test_opening_again_does_not_move_the_ownership_date(self):
         c = opshell.Claims(self.path)
-        c.open("raccoon-bandit")
+        c.open("raccoon-bandit", raised=True)
         first = json.loads(self.path.read_text())["raccoon-bandit"]["since"]
         with unittest.mock.patch.object(opshell, "_now_iso", return_value="2999-01-01T00:00:00+00:00"):
-            c.open("raccoon-bandit")
+            c.open("raccoon-bandit", raised=True)
         self.assertEqual(json.loads(self.path.read_text())["raccoon-bandit"]["since"], first)
 
     def test_a_claim_is_not_taken_when_the_record_cannot_be_written(self):
@@ -217,7 +222,7 @@ class TestOwnershipIsPersisted(_ClaimsCase):
         c = opshell.Claims(self.path)
         with unittest.mock.patch.object(opshell.os, "replace", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
-                c.open("raccoon-bandit")
+                c.open("raccoon-bandit", raised=True)
         self.assertEqual(c.sessions("raccoon-bandit"), 0)
         self.assertEqual(c.owned(), [])
         self.assertEqual([p.name for p in self.path.parent.iterdir()], [])
@@ -968,6 +973,7 @@ class _RouteCase(unittest.TestCase):
             "shell_transcripts": "/tmp/transcripts",
             "endpoints": [{
                 "identity": "parrot-box", "implant_id": self.IMPLANT,
+                "hostname": "parrot",
                 "state": "connected", "user": user,
                 "shell_port": self.dead_port(),
                 "shell_password": self.SHELL_PASSWORD,
@@ -976,6 +982,40 @@ class _RouteCase(unittest.TestCase):
                 "socks": {"sessions": socks_sessions, "max_sessions": 256},
             }],
         })
+
+    def raised_and_up(self, socks_sessions=0):
+        """A view that raised the channel itself, on an endpoint now up.
+
+        The honest sequence, and several tests needed it once a stop became
+        allowed only for a channel *this view raised*: they had been
+        opening onto an endpoint that was already connected, which is
+        adoption, and then asserting a stop. `status()` returns the same
+        dict every call, so the endpoint can appear between the two
+        requests exactly as it does when the agent's start lands.
+
+        Returns `(client, session, status)`.
+        """
+        supervisor = self.configured_but_stopped()
+        status = supervisor.status()
+        client = self.operator_client(self.app(supervisor=supervisor))
+        session = client.post(self.url("/api/opshell/open"),
+                              json={"agent": self.AGENT},
+                              headers=self.auth).get_json()["session"]
+        status["state"] = "running"
+        status["shell_transcripts"] = "/tmp/transcripts"
+        status["endpoints"] = [{
+            "identity": "parrot-box", "implant_id": self.IMPLANT,
+                "hostname": "parrot",
+            "state": "connected", "user": "root",
+            "shell_port": self.dead_port(),
+            "shell_password": self.SHELL_PASSWORD,
+            "shell_recording": True,
+            "shell": {"sessions": 0, "max_sessions": 4},
+            "socks": {"sessions": socks_sessions, "max_sessions": 256},
+        }]
+        self.sm.task_queues.pop(self.AGENT, None)
+        self.sm.history.pop(self.AGENT, None)
+        return client, session, status
 
     def configured_but_stopped(self):
         return self._supervisor({
@@ -1132,22 +1172,21 @@ class TestOpeningTheChannel(_RouteCase):
 
 class TestClosingTheChannel(_RouteCase):
     def test_close_reports_closing_and_never_closed(self):
-        client = self.client()
-        opened = client.post(self.url("/api/opshell/open"),
-                             json={"agent": self.AGENT},
-                             headers=self.auth).get_json()
+        client, session, _ = self.raised_and_up()
         state = client.post(self.url("/api/opshell/close"),
-                            json={"session": opened["session"]},
+                            json={"session": session},
                             headers=self.auth).get_json()
         self.assertEqual(state["state"], "closing")
 
     def test_close_queues_the_stop_and_logs_it(self):
-        client = self.client()
-        opened = client.post(self.url("/api/opshell/open"),
-                             json={"agent": self.AGENT},
-                             headers=self.auth).get_json()
+        # `raised_and_up`, not `client()`: a stop is allowed only for a
+        # channel this view raised, and opening onto an endpoint that is
+        # already connected is adoption. This test used to assert a stop
+        # for an adopted channel, which is the behaviour the plan's
+        # constraint forbids.
+        client, session, _ = self.raised_and_up()
         client.post(self.url("/api/opshell/close"),
-                    json={"session": opened["session"]}, headers=self.auth)
+                    json={"session": session}, headers=self.auth)
         queued = [(t["cmd"], t["args"])
                   for t in self.sm.task_queues[self.AGENT]]
         self.assertIn(("tunnel", "stop"), queued)
@@ -1155,12 +1194,9 @@ class TestClosingTheChannel(_RouteCase):
     def test_a_live_socks_session_leaves_the_stop_owed_and_says_so(self):
         # The operator's rule: one child serves both ports, so closing the
         # terminal must not drop a pivot. The claim stays on file.
-        client = self.client(supervisor=self.connected(socks_sessions=2))
-        opened = client.post(self.url("/api/opshell/open"),
-                             json={"agent": self.AGENT},
-                             headers=self.auth).get_json()
+        client, session, _ = self.raised_and_up(socks_sessions=2)
         state = client.post(self.url("/api/opshell/close"),
-                            json={"session": opened["session"]},
+                            json={"session": session},
                             headers=self.auth).get_json()
         queued = [t["args"] for t in self.sm.task_queues.get(self.AGENT, [])]
         self.assertNotIn("stop", queued)
@@ -1275,12 +1311,9 @@ class TestTheSessionTheOperatorHolds(_RouteCase):
         self.assertTrue((answer.get_json() or {}).get("session"))
 
     def test_the_session_it_handed_back_closes_the_channel(self):
-        client = self.client(supervisor=self.connected())
-        opened = client.post(self.url("/api/opshell/open"),
-                             json={"agent": self.AGENT},
-                             headers=self.auth).get_json()
+        client, session, _ = self.raised_and_up()
         state = client.post(self.url("/api/opshell/close"),
-                            json={"session": opened["session"]},
+                            json={"session": session},
                             headers=self.auth).get_json()
         queued = [t["args"] for t in self.sm.task_queues.get(self.AGENT, [])]
         self.assertIn("stop", queued)
@@ -1303,10 +1336,10 @@ class TestTheSessionTheOperatorHolds(_RouteCase):
 
     def _two_closes(self, order):
             self.sm.task_queues.clear()
-            client = self.client(supervisor=self.connected())
-            first = client.post(self.url("/api/opshell/open"),
-                                json={"agent": self.AGENT},
-                                headers=self.auth).get_json()["session"]
+            # The first open raises the channel, the second adopts it --
+            # and the record must keep saying "raised", or the refcount
+            # would be right and the stop still refused.
+            client, first, _ = self.raised_and_up()
             second = client.post(self.url("/api/opshell/open"),
                                  json={"agent": self.AGENT},
                                  headers=self.auth).get_json()["session"]
@@ -1419,14 +1452,17 @@ class TestTheStreamAndTheKeystrokes(_RouteCase):
     def test_open_then_stream_then_close_queues_the_stop(self):
         # The path the review asked for by name, and the one the lost-stop
         # defect lived on.
-        port, client = self._with_port(then=b"bye", die_after_auth=True)
-        opened = client.post(self.url("/api/opshell/open"),
-                             json={"agent": self.AGENT},
-                             headers=self.auth).get_json()
-        client.get(self.url("/api/opshell/stream?session=" + opened["session"]),
+        # Raised by this view, then up: a stop is allowed only for a
+        # channel this view brought up, so a port that was already
+        # connected at open time is adoption and correctly refuses.
+        port = _FakeShellPort(then=b"bye", die_after_auth=True)
+        self.addCleanup(port.stop)
+        client, session, status = self.raised_and_up()
+        status["endpoints"][0]["shell_port"] = port.port
+        client.get(self.url("/api/opshell/stream?session=" + session),
                    headers=self.auth).get_data()
         client.post(self.url("/api/opshell/close"),
-                    json={"session": opened["session"]}, headers=self.auth)
+                    json={"session": session}, headers=self.auth)
         queued = [t["args"] for t in self.sm.task_queues.get(self.AGENT, [])]
         self.assertIn("stop", queued)
 
@@ -1715,8 +1751,8 @@ class TestTheOneDecisionPlace(_ClaimsCase):
 
     def test_not_the_last_session_decides_nothing(self):
         claims = opshell.Claims(self.path)
-        first = claims.open("raccoon-bandit")
-        second = claims.open("raccoon-bandit")
+        first = claims.open("raccoon-bandit", raised=True)
+        second = claims.open("raccoon-bandit", raised=True)
         queues = {}
         queued, last, _ = opshell.end_session(
             claims, "raccoon-bandit", first, {"socks": {"sessions": 0}},
@@ -1726,7 +1762,7 @@ class TestTheOneDecisionPlace(_ClaimsCase):
 
     def test_the_last_session_queues_the_stop(self):
         claims = opshell.Claims(self.path)
-        only = claims.open("raccoon-bandit")
+        only = claims.open("raccoon-bandit", raised=True)
         queues = {}
         queued, last, _ = opshell.end_session(
             claims, "raccoon-bandit", only, {"socks": {"sessions": 0}},
@@ -1737,7 +1773,7 @@ class TestTheOneDecisionPlace(_ClaimsCase):
 
     def test_a_live_pivot_leaves_it_owed_with_a_reason(self):
         claims = opshell.Claims(self.path)
-        only = claims.open("raccoon-bandit")
+        only = claims.open("raccoon-bandit", raised=True)
         queues = {}
         queued, last, why = opshell.end_session(
             claims, "raccoon-bandit", only, {"socks": {"sessions": 3}},
@@ -1749,7 +1785,7 @@ class TestTheOneDecisionPlace(_ClaimsCase):
 
     def test_a_channel_only_the_agent_reports_is_still_stoppable(self):
         claims = opshell.Claims(self.path)
-        only = claims.open("raccoon-bandit")
+        only = claims.open("raccoon-bandit", raised=True)
         queues = {}
         queued, _last, _why = opshell.end_session(
             claims, "raccoon-bandit", only, None, True, queues, {}, "now")
@@ -1759,7 +1795,7 @@ class TestTheOneDecisionPlace(_ClaimsCase):
 class TestTheSweepClosesWhatNobodyWatches(_ClaimsCase):
     def test_a_lapsed_claim_gets_its_stop_queued(self):
         claims = opshell.Claims(self.path, grace=10.0)
-        claims.open("raccoon-bandit")
+        claims.open("raccoon-bandit", raised=True)
         queues = {}
         done = opshell.sweep(claims, ["raccoon-bandit"],
                              {"raccoon-bandit": {"socks": {"sessions": 0}}},
@@ -1771,7 +1807,7 @@ class TestTheSweepClosesWhatNobodyWatches(_ClaimsCase):
 
     def test_a_live_claim_is_left_alone(self):
         claims = opshell.Claims(self.path, grace=10.0)
-        claims.open("raccoon-bandit")
+        claims.open("raccoon-bandit", raised=True)
         queues = {}
         done = opshell.sweep(claims, ["raccoon-bandit"],
                              {"raccoon-bandit": {"socks": {"sessions": 0}}},
@@ -1781,7 +1817,7 @@ class TestTheSweepClosesWhatNobodyWatches(_ClaimsCase):
 
     def test_a_lapsed_claim_over_a_live_pivot_is_not_dropped(self):
         claims = opshell.Claims(self.path, grace=10.0)
-        claims.open("raccoon-bandit")
+        claims.open("raccoon-bandit", raised=True)
         queues = {}
         done = opshell.sweep(claims, ["raccoon-bandit"],
                              {"raccoon-bandit": {"socks": {"sessions": 2}}},
@@ -1792,7 +1828,7 @@ class TestTheSweepClosesWhatNobodyWatches(_ClaimsCase):
 
     def test_an_agent_that_left_the_fleet_is_forgotten_not_tasked(self):
         claims = opshell.Claims(self.path, grace=10.0)
-        claims.open("gone-raccoon")
+        claims.open("gone-raccoon", raised=True)
         queues = {}
         done = opshell.sweep(claims, [], {}, {}, queues, {}, "now",
                              time.time() + 11)
@@ -1802,7 +1838,7 @@ class TestTheSweepClosesWhatNobodyWatches(_ClaimsCase):
     def test_ownership_left_by_a_dead_process_is_swept_at_once(self):
         # `reconcile`'s half: no live claim at all, which is what a restart
         # leaves behind.
-        opshell.Claims(self.path).open("raccoon-bandit")
+        opshell.Claims(self.path).open("raccoon-bandit", raised=True)
         fresh = opshell.Claims(self.path, grace=10.0)
         queues = {}
         done = opshell.sweep(fresh, ["raccoon-bandit"],
@@ -1891,7 +1927,7 @@ class TestTheSweepDoesNotRunAway(_ClaimsCase):
 
     def test_a_pending_stop_stops_the_sweep_queueing_another(self):
         claims = opshell.Claims(self.path, grace=10.0)
-        claims.open("raccoon-bandit")
+        claims.open("raccoon-bandit", raised=True)
         queues = {}
         clock = time.time() + 11
         for _ in range(4):
@@ -1903,7 +1939,7 @@ class TestTheSweepDoesNotRunAway(_ClaimsCase):
 
     def test_decide_stop_refuses_while_a_tunnel_task_is_outstanding(self):
         claims = opshell.Claims(self.path)
-        claims.open("raccoon-bandit")
+        claims.open("raccoon-bandit", raised=True)
         queues = {}
         queued, why = opshell.decide_stop(
             claims, "raccoon-bandit", {"socks": {"sessions": 0}}, False,
@@ -1914,7 +1950,7 @@ class TestTheSweepDoesNotRunAway(_ClaimsCase):
 
     def test_a_settled_stop_releases_the_ownership_that_owed_it(self):
         claims = opshell.Claims(self.path, grace=10.0)
-        claims.open("raccoon-bandit")
+        claims.open("raccoon-bandit", raised=True)
         claims.lapsed(time.time() + 11)
         queues = {}
         opshell.sweep(claims, ["raccoon-bandit"], self._rows(),
@@ -1927,7 +1963,7 @@ class TestTheSweepDoesNotRunAway(_ClaimsCase):
         # The second Critical in one test: stale ownership plus a sweep
         # stopped a pivot somebody else had raised from the tunnel panel.
         claims = opshell.Claims(self.path, grace=10.0)
-        claims.open("raccoon-bandit")
+        claims.open("raccoon-bandit", raised=True)
         claims.lapsed(time.time() + 11)
         queues = {}
         opshell.sweep(claims, ["raccoon-bandit"], self._rows(),
@@ -1964,6 +2000,101 @@ class TestTheBeatComesBeforeTheSweep(_RouteCase):
         self.assertTrue(order, "the sweep did not run at all")
 
 
+class TestAChannelThisViewNeverRaisedIsNotItsToStop(_RouteCase):
+    """The plan's Global Constraint, which I broke with a fix.
+
+    The rule: stop only a channel this view raised, and only with no live
+    SOCKS session. `/open` writes ownership unconditionally, so "owned"
+    meant "this view has a session here" -- and the Attach button I added
+    for the third review's I6, plus the End button, made that one click.
+    Measured before the fix: a connected endpoint the view had never
+    raised, 0 SOCKS sessions, one open and one close -> `stop` queued.
+
+    The second half of the rule always held: with a live SOCKS session the
+    stop is refused. So this is about an idle pivot somebody else brought
+    up and still wants.
+    """
+
+    def _adopt_and_close(self, socks=0):
+        app = self.app(supervisor=self.connected(socks_sessions=socks))
+        client = self.operator_client(app)
+        opened = client.post(self.url("/api/opshell/open"),
+                             json={"agent": self.AGENT},
+                             headers=self.auth).get_json()
+        answer = client.post(self.url("/api/opshell/close"),
+                             json={"session": opened["session"]},
+                             headers=self.auth).get_json()
+        queued = [q["args"] for q in self.sm.task_queues.get(self.AGENT, [])]
+        done = [e.get("args") for e in self.sm.history.get(self.AGENT, [])
+                if e.get("cmd") == "tunnel"]
+        return answer, queued + done
+
+    def test_an_adopted_channel_is_not_stopped(self):
+        answer, tasks = self._adopt_and_close()
+        self.assertNotIn("stop", tasks,
+                         "a channel this view never raised was stopped")
+        self.assertRegex(answer.get("reason") or "", r"(?i)did not raise|"
+                         r"was not (started|raised) (by|from) ")
+
+    def test_a_channel_this_view_did_raise_is_stopped(self):
+        # The other half, or the fix would be "never stop anything".
+        client, session, _ = self.raised_and_up()
+        client.post(self.url("/api/opshell/close"),
+                    json={"session": session}, headers=self.auth)
+        tasks = [q["args"] for q in self.sm.task_queues.get(self.AGENT, [])]
+        tasks += [e.get("args") for e in self.sm.history.get(self.AGENT, [])
+                  if e.get("cmd") == "tunnel"]
+        self.assertIn("stop", tasks)
+
+    def test_raising_it_later_makes_it_this_views_to_stop(self):
+        # Adopted first, then raised: ownership of the stop is sticky, so
+        # the record cannot be downgraded by a second adopting open.
+        claims = opshell.Claims(self.data_dir / "r.json")
+        claims.open("clumsy-raccoon", raised=False)
+        claims.open("clumsy-raccoon", raised=True)
+        self.assertTrue(claims.raised("clumsy-raccoon"))
+        claims.open("clumsy-raccoon", raised=False)
+        self.assertTrue(claims.raised("clumsy-raccoon"),
+                        "a later adopting open forgot that we raised it")
+
+    def test_the_record_survives_a_restart_with_the_distinction(self):
+        path = self.data_dir / "r2.json"
+        opshell.Claims(path).open("clumsy-raccoon", raised=True)
+        self.assertTrue(opshell.Claims(path).raised("clumsy-raccoon"))
+        other = self.data_dir / "r3.json"
+        opshell.Claims(other).open("clumsy-raccoon", raised=False)
+        self.assertFalse(opshell.Claims(other).raised("clumsy-raccoon"))
+
+    def test_an_older_record_without_the_field_is_treated_as_raised(self):
+        # Records written before this field existed describe channels the
+        # view did raise -- that was the only way to get one. Reading them
+        # as "adopted" would orphan their stops for ever.
+        path = self.data_dir / "r4.json"
+        path.write_text(json.dumps({"clumsy-raccoon":
+                                    {"since": "2026-11-18T00:00:00Z"}}))
+        self.assertTrue(opshell.Claims(path).raised("clumsy-raccoon"))
+
+
+class TestANotTheLastCloseSaysWhy(_RouteCase):
+    def test_a_second_tabs_close_comes_back_with_a_reason(self):
+        # `end_session` returned `(False, False, "")` for a close that was
+        # not the last, so the route sent no reason and the view had
+        # nothing to show. Correct behaviour with no explanation is still a
+        # button that looks broken.
+        app = self.app(supervisor=self.connected())
+        first = self.operator_client(app)
+        second = self.operator_client(app)
+        a = first.post(self.url("/api/opshell/open"),
+                       json={"agent": self.AGENT},
+                       headers=self.auth).get_json()["session"]
+        second.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        answer = first.post(self.url("/api/opshell/close"),
+                            json={"session": a}, headers=self.auth).get_json()
+        self.assertRegex(answer.get("reason") or "",
+                         r"(?i)another view|still (open|holding)")
+
+
 class TestTheFixturesDoNotInventFieldNames(_RouteCase):
     """The third field-name error of this branch, and its last.
 
@@ -1990,6 +2121,74 @@ class TestTheFixturesDoNotInventFieldNames(_RouteCase):
             unknown = set(fixture) - real
             self.assertEqual(unknown, set(),
                              "%s() invents %s" % (name, sorted(unknown)))
+
+    def test_every_fixture_in_this_file_is_checked_not_two_by_name(self):
+        # The first version named two fixtures by hand, so a third --
+        # `running_without_shell_ports` -- was checked against nothing. The
+        # list is discovered now.
+        import inspect
+        real = self.real_status_keys()
+        found = 0
+        for name, method in inspect.getmembers(self, inspect.ismethod):
+            if name.startswith(("test_", "_")) or name in (
+                    "real_status_keys", "setUp", "tearDown", "run",
+                    "debug", "countTestCases", "defaultTestResult",
+                    "shortDescription", "id", "subTest", "addCleanup",
+                    "doCleanups", "addTypeEqualityFunc", "skipTest",
+                    "client", "operator_client", "app", "get", "post",
+                    "url", "dead_port", "raised_and_up"):
+                continue
+            try:
+                value = method()
+            except Exception:
+                continue
+            status = getattr(value, "status", None)
+            if not callable(status):
+                continue
+            fixture = status()
+            if not isinstance(fixture, dict) or "endpoints" not in fixture:
+                continue
+            found += 1
+            unknown = set(fixture) - real
+            self.assertEqual(unknown, set(),
+                             "%s() invents %s" % (name, sorted(unknown)))
+        self.assertGreaterEqual(found, 3,
+                                "only %d supervisor fixtures were found" % found)
+
+    def test_an_endpoint_row_reports_the_fields_the_server_reads(self):
+        """Most of the fixture's surface is the endpoint row.
+
+        A row is built in two places and the C2 only ever sees the second:
+        `tunnel/server.py` makes it and `tunnel/__main__.py` augments it
+        with the SOCKS and shell halves. So the names are checked against
+        both sources rather than against a list in this file -- a list here
+        is the typo-against-a-typo shape again.
+        """
+        repo = Path(__file__).resolve().parents[1] / "c2" / "tunnel"
+        upstream = ((repo / "server.py").read_text()
+                    + (repo / "__main__.py").read_text())
+        row = self.connected().status()["endpoints"][0]
+        for field in ("implant_id", "state", "user", "hostname",
+                      "shell_port", "shell_password", "shell_recording",
+                      "shell", "socks"):
+            self.assertIn(field, row, "the fixture omits %r" % field)
+            self.assertIn('"%s"' % field, upstream,
+                          "nothing upstream writes %r" % field)
+        for inner in ("sessions", "max_sessions"):
+            self.assertIn(inner, row["shell"], inner)
+            self.assertIn(inner, row["socks"], inner)
+
+    def test_the_strip_gets_a_host_to_show(self):
+        # `connected()` omitted `hostname`, so `out["host"]` was "" in
+        # every route test and the strip's host was never exercised end to
+        # end. A target, because `/state` answers before the row without
+        # one -- which is how the first version of this test measured the
+        # early answer instead of the field it names.
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        state = self.client().get(self.url("/api/opshell/state"),
+                                  headers=self.auth).get_json()
+        self.assertEqual(state["host"], "parrot")
 
     def test_the_server_reads_the_key_the_supervisor_writes(self):
         real = self.real_status_keys()
@@ -2028,6 +2227,68 @@ class TestADeviceThatStoppedCallingHomeIsNotReportedLive(_RouteCase):
                            headers=self.auth).get_json()
         self.assertEqual(state["channel"], "unknown")
         self.assertRegex(state["reason"] or "", r"(?i)overdue|has not checked")
+
+    def test_the_overdue_reason_states_the_silence_not_the_lateness(self):
+        # I3. It printed `-expected_checkin`, which is seconds *past due*,
+        # under the words "has not checked in for" -- so 7200 s of silence
+        # on a 300 s interval was reported as 6900. One whole interval out,
+        # and `docs/TUNNEL.md` describes it as the silence.
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        self.sm.agents[self.AGENT]["_last_seen_ts"] = time.time() - 7200
+        state = self.client().get(self.url("/api/opshell/state"),
+                                  headers=self.auth).get_json()
+        self.assertRegex(state["reason"], r"7\d\d\d seconds")
+
+    def test_a_queued_start_on_an_overdue_device_still_shows_as_waiting(self):
+        # I4. The overdue branch returned before the state machine, so a
+        # queued start showed no `waiting` and no countdown: the operator
+        # saw nothing happen and clicked again, taking a fresh claim each
+        # time.
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        client = self.operator_client(self.app(
+            supervisor=self.configured_but_stopped()))
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        self.sm.agents[self.AGENT]["_last_seen_ts"] = time.time() - 7200
+        state = client.get(self.url("/api/opshell/state"),
+                           headers=self.auth).get_json()
+        self.assertEqual(state["state"], "waiting")
+        self.assertEqual(state["channel"], "unknown")
+        self.assertRegex(state["reason"], r"(?i)has not checked in")
+
+    def test_the_threshold_is_bounded_from_both_sides(self):
+        # The pair below bounds the constant only to 2..24: raising it to
+        # 24 left both green. These two sit either side of the boundary.
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        for age, expected in ((750, "unknown"), (450, "open")):
+            self.sm.agents[self.AGENT]["_last_seen_ts"] = time.time() - age
+            self.sm.agents[self.AGENT]["tunnel"] = {"pid": 9, "running": True}
+            client = self.operator_client(self.app(
+                supervisor=self.connected()))
+            state = client.get(self.url("/api/opshell/state"),
+                               headers=self.auth).get_json()
+            self.assertEqual(state["channel"], expected, age)
+
+    def test_a_jittered_beacon_is_not_called_overdue_for_being_jittered(self):
+        # The beacon draws its sleep from [interval*(1-j), interval*(1+j)],
+        # and jitter is operator-settable up to 100%. At that setting a
+        # perfectly healthy agent crosses a flat two-interval line with no
+        # missed check-in, and the view would flap to `unknown`.
+        # 650 s, not 550: at 100% jitter the beacon may sleep the full
+        # 600 s, so a flat two-interval line (600 s of silence) calls a
+        # healthy agent overdue. The first version of this test measured
+        # 550 s -- inside the flat line -- and passed without the
+        # threshold knowing anything about jitter.
+        agent = {"_last_seen_ts": 1000.0, "interval": 300, "jitter": 100}
+        self.assertFalse(opshell.report_is_overdue(agent, 1000.0 + 650))
+        # A beacon with no jitter keeps the tight line.
+        steady = {"_last_seen_ts": 1000.0, "interval": 300, "jitter": 0}
+        self.assertTrue(opshell.report_is_overdue(steady, 1000.0 + 650))
+        # And a genuinely silent one still is, jitter or no jitter.
+        self.assertTrue(opshell.report_is_overdue(agent, 1000.0 + 7200))
 
     def test_an_agent_that_is_merely_late_is_still_reported_as_it_is(self):
         # One missed interval is normal: jitter, a slow link, a host that
@@ -2374,7 +2635,7 @@ class TestTheLapseIsTheSameForEverySweep(_ClaimsCase):
 
     def test_silence_inside_the_margin_keeps_the_claim(self):
         claims = opshell.Claims(self.path, grace=40.0)
-        claims.open("raccoon-bandit")
+        claims.open("raccoon-bandit", raised=True)
         queues = {}
         opshell.sweep(claims, ["raccoon-bandit"],
                       {"raccoon-bandit": {"socks": {"sessions": 0}}},
@@ -2385,7 +2646,7 @@ class TestTheLapseIsTheSameForEverySweep(_ClaimsCase):
 
     def test_silence_past_the_margin_queues_the_stop(self):
         claims = opshell.Claims(self.path, grace=40.0)
-        claims.open("raccoon-bandit")
+        claims.open("raccoon-bandit", raised=True)
         queues = {}
         opshell.sweep(claims, ["raccoon-bandit"],
                       {"raccoon-bandit": {"socks": {"sessions": 0}}},
@@ -2494,12 +2755,28 @@ class TestTheSweepIsWiredToTheCheckIn(_RouteCase):
         moved forward, so the check-in runs in real time like every other
         request.
         """
-        app = self.app(supervisor=self.connected())
+        supervisor = self.configured_but_stopped()
+        status = supervisor.status()
+        app = self.app(supervisor=supervisor)
         client = self.operator_client(app)
         with unittest.mock.patch.object(opshell.time, "time",
                                         return_value=time.time() - 1000):
             client.post(self.url("/api/opshell/open"),
                         json={"agent": self.AGENT}, headers=self.auth)
+        # The endpoint appears between the two requests, as it does when
+        # the agent's start lands. Opening onto one that was already there
+        # is adoption, and an adopted channel is not this view's to stop.
+        status["state"] = "running"
+        status["endpoints"] = [{
+            "identity": "parrot-box", "implant_id": self.IMPLANT,
+                "hostname": "parrot",
+            "state": "connected", "user": "root",
+            "shell_port": self.dead_port(),
+            "shell_password": self.SHELL_PASSWORD,
+            "shell_recording": True,
+            "shell": {"sessions": 0, "max_sessions": 4},
+            "socks": {"sessions": 0, "max_sessions": 256},
+        }]
         self.sm.task_queues.pop(self.AGENT, None)
         self.sm.history.pop(self.AGENT, None)
         app.test_client().post(
@@ -2710,9 +2987,9 @@ class TestTheGlyphAndTheView(_GuiCase):
         # `test_only_one_keystroke_post_is_ever_in_flight`. What is left
         # here is the naming contract: a keystroke never rides in a URL,
         # anywhere.
-        flush = self.js_function("opshellFlushKeys")
-        self.assertIn("/api/opshell/keys", flush)
-        self.assertIn('method:"POST"', flush)
+        post = self.js_function("opshellPostKeys")
+        self.assertIn("/api/opshell/keys", post)
+        self.assertIn('method:"POST"', post)
         self.assertNotRegex(SERVER_SRC, r"/api/opshell/keys\?")
 
 
@@ -2762,6 +3039,123 @@ class TestTheViewDoesNotOverclaim(_GuiCase):
         self.assertIn("state.reason", render)
 
 
+#: The browser the view is executed against.
+#:
+#: Written as one JavaScript document rather than a pile of concatenated
+#: Python strings, because the first version's stubs were wrong in the same
+#: direction as the code and six mutations survived because of it: `fetch`
+#: could not reject, so every network-failure arm was unreachable;
+#: `AbortController.abort()` only recorded, so no test could show a stream
+#: ending; and `setTimeout` never fired, so nothing could see a poll loop
+#: that stopped or ran twice.
+_NODE_ENV = r"""
+let posted = [], aborted = [], removed = [], said = [];
+let inFlight = 0, maxInFlight = 0, holdFetch = 0;
+let scheduled = [], timers = [];
+
+const sessionStorage = {d: {}, getItem(k){ return this.d[k] ?? null; },
+  setItem(k, v){ this.d[k] = String(v); },
+  removeItem(k){ delete this.d[k]; }};
+sessionStorage.setItem('raccoon_operator_token', 't');
+function storedToken(){ return 't'; }
+function tokenRejected(){ said.push('token-rejected'); }
+function askForToken(){}
+function H(){ return {'Authorization': 'Bearer t',
+                      'Content-Type': 'application/json'}; }
+
+// One reply, or a queue of them, so a test can say "the first call
+// succeeds and the second is refused". `{throw: "..."}` rejects, which is
+// what a dropped connection does and what the first harness could not
+// express at all.
+let nextReply = {ok: true, status: 200, body: {}};
+let replies = null;
+function reply(){
+  if(replies && replies.length) return replies.shift();
+  return nextReply;
+}
+
+class AbortError extends Error {
+  constructor(){ super('The operation was aborted'); this.name = 'AbortError'; }
+}
+
+class AbortSignal2 {
+  constructor(){ this.aborted = false; this._on = []; }
+  addEventListener(_, fn){ this._on.push(fn); }
+  set onabort(fn){ this._on.push(fn); }
+  _fire(){ this.aborted = true; this._on.forEach(fn => fn()); }
+}
+
+class AbortController {
+  constructor(){ this.signal = new AbortSignal2(); }
+  abort(){ aborted.push('abort'); this.signal._fire(); }
+}
+// The real one: a timeout is a signal that fires itself.
+AbortSignal.timeout = ms => { const s = new AbortSignal2(); s._ms = ms; return s; };
+
+async function fetch(url, opts){
+  opts = opts || {};
+  posted.push({url, method: opts.method || 'GET', body: opts.body,
+               keepalive: !!opts.keepalive, timeout: opts.signal &&
+               opts.signal._ms});
+  if(opts.signal){
+    if(opts.signal.aborted) throw new AbortError();
+    opts.signal.addEventListener('abort', () => {});
+  }
+  inFlight += 1;
+  maxInFlight = Math.max(maxInFlight, inFlight);
+  for(let i = 0; i < holdFetch; i++) await Promise.resolve();
+  inFlight -= 1;
+  if(opts.signal && opts.signal.aborted) throw new AbortError();
+  const r = reply();
+  if(r.throw) throw new Error(r.throw);
+  return {ok: r.ok, status: r.status, body: r.stream || null,
+          json: async () => {
+            if(r.badJson) throw new Error('Unexpected token < in JSON');
+            return r.body;
+          }};
+}
+
+const els = {};
+function el(id){
+  return els[id] || (els[id] = {id, innerHTML: '', value: '',
+                               remove(){ removed.push(id); }});
+}
+const document = {
+  getElementById: id => els[id] || null,
+  createElement: () => ({classList: {}, appendChild(){},
+                         set innerHTML(v){}, get innerHTML(){ return ''; }}),
+  body: {appendChild(){}},
+};
+const window = {listeners: {}, addEventListener(name, fn){
+  (this.listeners[name] = this.listeners[name] || []).push(fn); }};
+const navigator = {};
+
+// Timers that can actually fire, one turn at a time, so a test can watch a
+// poll loop continue -- or stop.
+function setTimeout(fn, ms){ scheduled.push(ms); timers.push(fn); return timers.length; }
+function clearTimeout(id){ if(id) timers[id - 1] = null; }
+async function runTimers(rounds){
+  for(let i = 0; i < (rounds || 1); i++){
+    const due = timers.slice();
+    timers.length = 0;
+    for(const fn of due) if(fn) await fn();
+  }
+}
+
+class TextEncoder { encode(s){ return Buffer.from(s, 'utf8'); } }
+
+// A terminal that records, so `opshellSay` and the attach notes are
+// observable rather than merely survivable.
+function fakeTerm(){
+  return {lines: [], writeln(s){ this.lines.push(s); },
+          write(b){ this.lines.push(String(b)); },
+          dispose(){ this.disposed = true; },
+          open(){}, onData(fn){ this._data = fn; }};
+}
+"""
+
+
+
 class TestTheViewRunsAndIsNotJustRead(_GuiCase):
     """The view, executed, not grepped.
 
@@ -2777,51 +3171,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
     """
 
     def _node(self, script):
-        env = (
-            "let posted = [], aborted = [], removed = [];\n"
-            "const sessionStorage = {d:{}, getItem(k){ return this.d[k] ?? null; },"
-            " setItem(k,v){ this.d[k]=String(v); }, removeItem(k){ delete this.d[k]; }};\n"
-            "sessionStorage.setItem('raccoon_operator_token','t');\n"
-            "function storedToken(){ return 't'; }\n"
-            "function tokenRejected(){}\n"
-            "function askForToken(){}\n"
-            "function H(){ return {'Authorization':'Bearer t',"
-            "'Content-Type':'application/json'}; }\n"
-            "let nextReply = {ok:true, status:200, body:{}};\n"
-            "let inFlight = 0, maxInFlight = 0, holdFetch = 0;\n"
-            "async function fetch(url, opts){\n"
-            "  posted.push({url, method:(opts||{}).method||'GET',"
-            " body:(opts||{}).body, keepalive:!!(opts||{}).keepalive});\n"
-            "  if((opts||{}).signal) (opts||{}).signal.onabort ="
-            " () => aborted.push(url);\n"
-            "  inFlight += 1;\n"
-            "  maxInFlight = Math.max(maxInFlight, inFlight);\n"
-            "  // Resolves late, and the later the earlier it was made: a\n"
-            "  // stub that resolves at once preserves order whatever the\n"
-            "  // code does, which is how the first version of the\n"
-            "  // coalescing test passed with the serialisation removed.\n"
-            "  for(let i = 0; i < holdFetch; i++) await Promise.resolve();\n"
-            "  inFlight -= 1;\n"
-            "  const r = nextReply;\n"
-            "  return {ok:r.ok, status:r.status, body:r.stream||null,"
-            " json: async () => r.body};\n"
-            "}\n"
-            "class AbortController { constructor(){ this.signal={onabort:null};"
-            " } abort(){ if(this.signal.onabort) this.signal.onabort(); } }\n"
-            "const els = {};\n"
-            "function el(id){ return els[id] || (els[id] = {id, innerHTML:'',"
-            " value:'', remove(){ removed.push(id); }}); }\n"
-            "const document = {getElementById: id => els[id] || null,"
-            " createElement: () => ({classList:{}, appendChild(){},"
-            " set innerHTML(v){}, get innerHTML(){ return ''; }}),"
-            " body:{appendChild(){}}};\n"
-            "const window = {addEventListener(){}};\n"
-            "let scheduled = [];\n"
-            "function clearTimeout(){}\n"
-            "function setTimeout(fn, ms){ scheduled.push(ms); return 1; }\n"
-            "const navigator = {};\n"
-            "class TextEncoder { encode(s){ return Buffer.from(s,'utf8'); } }\n"
-        )
+        env = _NODE_ENV
         # The module's own `let` declarations, lifted from the source
         # rather than restated here: a harness that declares its own
         # `opshellSession` is a harness that tests its own invention, which
@@ -2833,7 +3183,12 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "esc", "opshellEndSession", "opshellTeardown", "opshellPicker",
             "opshellRender", "opshellOpen", "opshellB64",
             "opshellSay", "opshellFlushKeys", "opshellEndAfterAttach",
-            "opshellPoll")]) + "\n"
+            "opshellPoll", "opshellAttach", "opshellPostKeys")]) + "\n"
+        # The one module constant the keystroke path reads.
+        const = re.search(r"^const OPSHELL_KEYS_PER_POST = .*$",
+                          SERVER_SRC, re.M)
+        self.assertIsNotNone(const, "the per-post ceiling is gone")
+        src = const.group(0) + "\n" + src
         out = subprocess.run(
             ["node", "--input-type=module", "-e", env + src + script],
             capture_output=True, text=True, timeout=30)
@@ -2866,13 +3221,23 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # port's four slots, the transcript and a Flask worker all survived
         # a closed panel, because the pump exits only on handover, lapse or
         # EOF.
+        # The abort has to make an in-flight request reject, not merely
+        # be recorded. The first harness's `abort()` only pushed a string,
+        # so no test could show a stream ending -- and `opshellAttach`'s
+        # own reader loop was outside the harness entirely.
         got = self._node(
             "opshellSession = 'sid-2'; opshellAbort = new AbortController();\n"
-            "opshellAbort.signal.onabort = () => aborted.push('stream');\n"
+            "holdFetch = 4;\n"
+            "const inflight = fetch('/api/opshell/stream',"
+            " {signal: opshellAbort.signal}).then(() => 'resolved',"
+            " e => e.name);\n"
             "await opshellEndSession();\n"
-            "console.log(JSON.stringify({aborted, abort: opshellAbort}));")
-        self.assertEqual(got["aborted"], ["stream"])
+            "console.log(JSON.stringify({aborted, abort: opshellAbort,"
+            " outcome: await inflight}));")
+        self.assertEqual(got["aborted"], ["abort"])
         self.assertIsNone(got["abort"])
+        self.assertEqual(got["outcome"], "AbortError",
+                         "the stream request was not actually aborted")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_closing_a_view_that_never_opened_a_session_posts_nothing(self):
@@ -2987,26 +3352,184 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(got["opens"], 1)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
-    def test_a_refused_keystroke_batch_is_kept_and_reported(self):
-        """Coalescing made the unit of loss a whole batch.
+    def test_a_refusal_that_cannot_succeed_drops_the_batch_and_says_so(self):
+        """C1 of the third review: my own fix was worse than the defect.
 
-        The chunk left the buffer before the POST, the reply was never
-        looked at, and a failure `break`ed with the chunk gone. So fifteen
-        typed characters vanished with no message -- and a lost batch
-        followed by a batch containing Enter runs a truncated command in a
-        root shell.
+        Putting the batch back with no bound and no discard rule made an
+        unbounded, permanently undeliverable buffer -- and every keypress
+        re-drove the flush, so the operator was told "still waiting" for
+        ever while nothing was delivered. If the cause then cleared, the
+        whole accumulated and never-echoed buffer would replay into a root
+        shell as one batch.
+
+        413, 404, 409 and 400 cannot come good by waiting, so they are
+        dropped and named as dropped.
         """
+        for status in (413, 404, 409, 400):
+            got = self._node(
+                "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+                "nextReply = {ok:false, status:%d, body:{}};\n"
+                "opshellKeys = 'rm -rf /tmp/x';\n"
+                "await opshellFlushKeys();\n"
+                "opshellKeys += 'more';\n"
+                "await opshellFlushKeys();\n"
+                "console.log(JSON.stringify({leftover: opshellKeys,"
+                " posts: posted.filter(p => p.url.endsWith('keys')).length,"
+                " said: opshellTerm.lines.join(' ')}));" % status)
+            self.assertEqual(got["leftover"], "", status)
+            self.assertRegex(got["said"], r"(?i)dropped|not delivered",
+                             str(status))
+            self.assertEqual(got["posts"], 2, status)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_network_blip_is_retried_once(self):
+        # A dropped connection can come good, so one retry. Two would be
+        # the unbounded buffer again with extra steps.
         got = self._node(
-            "opshellSession = 'sid'; opshellTerm = {lines: [],"
-            " writeln(s){ this.lines.push(s); }};\n"
-            "nextReply = {ok:false, status:413, body:{error:'too much'}};\n"
-            "opshellKeys = 'rm -rf /tmp/x';\n"
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "replies = [{throw:'socket hang up'}, {ok:true, status:200,"
+            " body:{}}];\n"
+            "opshellKeys = 'ls';\n"
             "await opshellFlushKeys();\n"
             "console.log(JSON.stringify({leftover: opshellKeys,"
-            " posts: posted.length, said: opshellTerm.lines.join(' ')}));")
-        self.assertEqual(got["leftover"], "rm -rf /tmp/x",
-                         "a refused batch was thrown away")
-        self.assertRegex(got["said"], r"(?i)not (sent|delivered)|refused")
+            " posts: posted.filter(p => p.url.endsWith('keys')).length,"
+            " text: posted.filter(p => p.url.endsWith('keys')).map("
+            "p => Buffer.from(JSON.parse(p.body).data,'base64')"
+            ".toString())}));")
+        self.assertEqual(got["leftover"], "")
+        self.assertEqual(got["posts"], 2, "the blip was not retried")
+        self.assertEqual(got["text"], ["ls", "ls"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_blip_that_does_not_clear_gives_up_and_says_so(self):
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "nextReply = {throw:'socket hang up'};\n"
+            "opshellKeys = 'ls';\n"
+            "await opshellFlushKeys();\n"
+            "console.log(JSON.stringify({leftover: opshellKeys,"
+            " posts: posted.filter(p => p.url.endsWith('keys')).length,"
+            " said: opshellTerm.lines.join(' ')}));")
+        self.assertEqual(got["leftover"], "")
+        self.assertEqual(got["posts"], 2)
+        self.assertRegex(got["said"], r"(?i)dropped|not delivered")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_batch_too_large_to_send_is_split_rather_than_stuck(self):
+        # Without splitting, one paste over the ceiling could never be
+        # delivered by any number of retries: the same batch, refused for
+        # ever.
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "opshellKeys = 'A'.repeat(500000);\n"
+            "await opshellFlushKeys();\n"
+            "const sent = posted.filter(p => p.url.endsWith('keys'))"
+            ".map(p => JSON.parse(p.body).data.length);\n"
+            "console.log(JSON.stringify({leftover: opshellKeys.length,"
+            " sent, max: Math.max(...sent)}));")
+        self.assertEqual(got["leftover"], 0)
+        self.assertGreater(len(got["sent"]), 1, "the paste was not split")
+        self.assertLessEqual(got["max"], 256 * 1024)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_dropped_batch_takes_what_was_typed_after_it(self):
+        # Found by mutation: keeping the rest after dropping a batch left
+        # the later keystrokes to be delivered without the earlier ones,
+        # which is a truncated command arriving in a root shell. If a
+        # batch is lost the rest of the line is lost with it.
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "nextReply = {ok:false, status:413, body:{}};\n"
+            "opshellKeys = 'A'.repeat(200000) + 'rm -rf /\\r';\n"
+            "await opshellFlushKeys();\n"
+            "console.log(JSON.stringify({leftover: opshellKeys.length}));")
+        self.assertEqual(got["leftover"], 0,
+                         "keystrokes typed after a dropped batch survived it")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_stream_that_cannot_be_reached_ends_the_session(self):
+        # Found by mutation: the `catch` arm of the stream fetch had no
+        # test, so removing its `opshellEndSession` left everything green
+        # -- and that is the arm a dropped connection takes, which is
+        # commoner than a 409.
+        got = self._node(
+            "els['opshell-term'] = el('opshell-term');\n"
+            "globalThis.Terminal = function(){ return fakeTerm(); };\n"
+            "opshellSession = 'sid';\n"
+            "nextReply = {throw:'ECONNREFUSED'};\n"
+            "await opshellAttach({state:'live', geometry:[80,24],"
+            " host:'parrot'});\n"
+            "console.log(JSON.stringify({session: opshellSession,"
+            " attached: opshellAttached,"
+            " closed: posted.filter(p => p.url.endsWith('close')).length}));")
+        self.assertIsNone(got["session"])
+        self.assertFalse(got["attached"])
+        self.assertEqual(got["closed"], 1)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_stream_the_port_refuses_ends_the_session(self):
+        """The root of C1's "for ever".
+
+        `opshellAttach` wrote "[the shell port refused this session]" and
+        returned with `opshellAttached` and `opshellSession` still set and
+        no reader loop to clear them. Every keystroke after that got 404,
+        and the claim was held until the lapse four minutes later.
+        """
+        got = self._node(
+            "els['opshell-term'] = el('opshell-term');\n"
+            "globalThis.Terminal = function(){ return fakeTerm(); };\n"
+            "opshellSession = 'sid';\n"
+            "nextReply = {ok:false, status:409, body:{}};\n"
+            "await opshellAttach({state:'live', geometry:[80,24],"
+            " host:'parrot'});\n"
+            "console.log(JSON.stringify({session: opshellSession,"
+            " attached: opshellAttached,"
+            " closed: posted.filter(p => p.url.endsWith('close')).length}));")
+        self.assertIsNone(got["session"])
+        self.assertFalse(got["attached"])
+        self.assertEqual(got["closed"], 1,
+                         "a refused stream left the claim held")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_every_way_a_stop_can_be_refused_reaches_the_operator(self):
+        """C2 of the third review, and the same class a third time.
+
+        `opshellEndSession` awaited the close and never looked at the
+        answer, so all three refusals were silent: a rejected request, a
+        `reason` from `may_stop`, and another view holding the session --
+        while the paragraph beside the button promised the reason would
+        come back.
+        """
+        cases = (
+            ("{throw:'socket hang up'}", r"(?i)hang up"),
+            ("{ok:true, status:200, body:{reason:'3 live socks sessions "
+             "ride this channel'}}", r"(?i)socks session"),
+            ("{ok:true, status:200, body:{reason:'another view is holding "
+             "this channel'}}", r"(?i)another view"),
+            ("{ok:false, status:409, body:{error:'the ownership record "
+             "could not be read'}}", r"(?i)ownership record"),
+        )
+        for reply, expected in cases:
+            got = self._node(
+                "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+                "els['opshell-body'] = el('opshell-body');\n"
+                "nextReply = " + reply + ";\n"
+                "await opshellEndSession();\n"
+                "console.log(JSON.stringify({said: opshellTerm.lines.join(' '),"
+                " shown: els['opshell-body'].innerHTML}));")
+            self.assertRegex(got["said"] + " " + got["shown"], expected,
+                             reply)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_stop_that_was_queued_is_confirmed_rather_than_silent(self):
+        # Success has to be distinguishable from the silence that used to
+        # mean failure.
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "nextReply = {ok:true, status:200, body:{state:'closing'}};\n"
+            "await opshellEndSession();\n"
+            "console.log(JSON.stringify({said: opshellTerm.lines.join(' ')}));")
+        self.assertRegex(got["said"], r"(?i)queued|next check-in")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_keystrokes_do_not_cross_from_one_session_into_the_next(self):
@@ -3036,13 +3559,90 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         """
         got = self._node(
             "els['opshell-body'] = el('opshell-body');\n"
-            "globalThis.api = async () => { throw new Error('network'); };\n"
+            "nextReply = {throw:'network'};\n"
             "await opshellPoll();\n"
             "console.log(JSON.stringify({scheduled,"
             " shown: els['opshell-body'].innerHTML}));")
         self.assertEqual(got["scheduled"], [2000],
                          "the poll did not reschedule itself after a failure")
         self.assertIn("network", got["shown"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_poll_has_a_deadline_so_a_stall_becomes_a_failure(self):
+        # I1 of the third review. The 240 s margin rests on the poll
+        # running, and nothing bounded a single poll: a proxy that accepts
+        # and never answers produces no rejection at all, so the heartbeat
+        # stopped silently and the claim lapsed under a live root shell.
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({timeouts: posted.map("
+            "p => p.timeout)}));")
+        self.assertTrue(any(got["timeouts"]),
+                        "the state poll has no deadline")
+        for t in got["timeouts"]:
+            if t:
+                self.assertLessEqual(t, 30000)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_what_the_state_says_reaches_an_operator_in_the_terminal(self):
+        # I2. While attached the body is never re-rendered, so `unknown`,
+        # `closing` and the overdue reason were invisible to exactly the
+        # person who needed them.
+        got = self._node(
+            "opshellAttached = true; opshellSession = 'sid';\n"
+            "opshellTerm = fakeTerm();\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "nextReply = {ok:true, status:200, body:{state:'live',"
+            " channel:'unknown', host:'parrot', reason:'clumsy-raccoon has"
+            " not checked in for 7200 seconds'}};\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({said: opshellTerm.lines.join(' ')}));")
+        self.assertRegex(got["said"], r"(?i)has not checked in|unknown")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_same_trouble_is_not_announced_every_two_seconds(self):
+        # I5. A sustained outage wrote a line every poll: 30 polls, 30
+        # lines, scrolling the operator's own work off the screen exactly
+        # when they needed to read it.
+        got = self._node(
+            "opshellAttached = true; opshellSession = 'sid';\n"
+            "opshellTerm = fakeTerm();\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "nextReply = {throw:'network down'};\n"
+            "for(let i = 0; i < 6; i++) await opshellPoll();\n"
+            "const before = opshellTerm.lines.length;\n"
+            "nextReply = {ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot'}};\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({during: before,"
+            " after: opshellTerm.lines.length,"
+            " said: opshellTerm.lines.join(' ')}));")
+        self.assertEqual(got["during"], 1,
+                         "the outage was announced %d times" % got["during"])
+        # And recovery is worth one line, or the operator is left reading
+        # the last complaint.
+        self.assertEqual(got["after"], 2)
+        self.assertRegex(got["said"], r"(?i)again|restored|back")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_claim_that_lands_after_the_view_is_gone_is_given_back(self):
+        # I6. Teardown ran first, found no session, posted nothing -- and
+        # the reply then set `opshellSession` on a view that no longer
+        # existed, so the channel came down only via the lapse.
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "holdFetch = 4;\n"
+            "nextReply = {ok:true, status:200, body:{session:'late'}};\n"
+            "const opening = opshellOpen();\n"
+            "await opshellTeardown(els['opshell-body']);\n"
+            "delete els['opshell-body'];\n"
+            "await opening;\n"
+            "console.log(JSON.stringify({session: opshellSession,"
+            " urls: posted.map(p => p.url)}));")
+        self.assertIsNone(got["session"])
+        self.assertEqual(got["urls"],
+                         ["/api/opshell/open", "/api/opshell/close"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_failed_poll_does_not_destroy_a_live_terminal(self):
@@ -3054,7 +3654,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "els['opshell-body'] = el('opshell-body');\n"
             "els['opshell-body'].innerHTML = '<div id=\"opshell-term\"></div>';\n"
             "globalThis.setTimeout = () => 7;\n"
-            "globalThis.api = async () => { throw new Error('blip'); };\n"
+            "opshellTerm = fakeTerm();\n"
+            "nextReply = {throw:'blip'};\n"
             "await opshellPoll();\n"
             "console.log(JSON.stringify({still: els['opshell-body'].innerHTML}));")
         self.assertIn("opshell-term", got["still"])
