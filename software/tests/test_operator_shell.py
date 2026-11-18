@@ -2361,16 +2361,29 @@ class TestADeviceThatStoppedCallingHomeIsNotReportedLive(_RouteCase):
         server = (Path(__file__).resolve().parents[1] / "c2" / "server.py").read_text()
         reads = set(_re.findall(r'agent\.get\("(\w+)"\)', src))
         reads |= set(_re.findall(r'agent\[\"(\w+)\"\]', src))
+        # Nested reads too. The guard's first version saw only direct
+        # accesses, so `c2_profile["jitter"]` -- the field the fix beside
+        # it had just added -- was invisible to it.
+        nested = set(_re.findall(r'\(profile or \{\}\)\.get\(\"(\w+)\"\)',
+                                 src))
         self.assertTrue(reads, "no agent fields are read any more")
+        # Only the agent-record writers, not any dict key anywhere in a
+        # 426 KB file. The looser alternative matched `"host":` and
+        # `"state":` in the embedded JavaScript, so it would have passed
+        # names the server never puts on an agent record.
+        writers = "\n".join(
+            line for line in server.splitlines()
+            if _re.search(r'agents\[[^\]]+\]\[|payload\[|payload\.get',
+                          line))
         for field in sorted(reads):
-            if field.startswith("_"):
-                # `_last_seen_ts` and friends: the server writes them with
-                # the same spelling, checked below.
-                pass
             self.assertRegex(
-                server, r'agents\[[^\]]+\]\["%s"\]|"%s":' % (field, field),
-                "opshell.py reads agent[%r] and nothing in server.py "
-                "writes it" % field)
+                writers, r'\"%s\"' % field,
+                "opshell.py reads agent[%r] and no agent-record writer in "
+                "server.py mentions it" % field)
+        for field in sorted(nested):
+            self.assertRegex(
+                server, r'\"%s\"' % field,
+                "opshell.py reads a nested %r that nothing writes" % field)
 
     def test_an_agent_that_is_merely_late_is_still_reported_as_it_is(self):
         # One missed interval is normal: jitter, a slow link, a host that
@@ -3318,10 +3331,28 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # looked plausible. A floor makes a silent loss loud.
         names = [n for n in dir(TestTheViewRunsAndIsNotJustRead)
                  if n.startswith("test_")]
+        # A floor well under the real count permits a silent loss, and that
+        # is what happened twice: five tests deleted at once while the
+        # total still looked plausible, and later a single named safety
+        # test deleted while the total *rose* from 231 to 246. So the floor
+        # sits close to the real count --
         self.assertGreaterEqual(
-            len(names), 25,
-            "only %d behavioural view tests remain; five were once deleted "
-            "by accident and the suite stayed green" % len(names))
+            len(names), 35,
+            "only %d behavioural view tests remain; a named safety test was "
+            "once deleted while the total went up" % len(names))
+        # -- and the properties that each cost this branch a Critical are
+        # named one by one, because a count cannot defend a property.
+        for must in ("test_what_is_typed_during_a_failing_batch_dies_with_it",
+                     "test_the_same_holds_when_the_request_is_rejected_outright",
+                     "test_a_write_that_may_have_landed_is_not_called_nothing",
+                     "test_closing_the_view_closes_the_session",
+                     "test_the_poll_keeps_beating_on_the_path_that_usually_runs",
+                     "test_keystrokes_do_not_cross_from_one_session_into_the_next",
+                     "test_the_end_button_actually_ends_something"):
+            self.assertIn(must, names,
+                          "%s named a property that cost this branch a "
+                          "Critical. It may not be removed without another "
+                          "test that names the same property." % must)
 
 
 class TestTheViewRunsAndIsNotJustRead(_GuiCase):
@@ -3350,7 +3381,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         src = "\n".join(decls + [self.js_function(n) for n in (
             "esc", "opshellEndSession", "opshellTeardown", "opshellPicker",
             "opshellRender", "opshellOpen", "opshellB64",
-            "opshellSay", "opshellFlushKeys", "opshellEndAfterAttach",
+            "opshellSay", "opshellDropRest", "opshellFlushKeys",
+            "opshellEndAfterAttach",
             "opshellPoll", "opshellAttach")]) + "\n"
         # The one module constant the keystroke path reads.
         const = re.search(r"^const OPSHELL_KEYS_CEILING = .*$",
@@ -3502,6 +3534,48 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
                          ["/api/opshell/open", "/api/opshell/close"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_end_button_reports_a_close_that_was_refused(self):
+        # Two requests, two answers: one global reply could not express
+        # "the claim was taken and then the shutdown was refused", which is
+        # the case the button exists for -- a channel somebody else raised.
+        # It also puts the harness's reply queue to work, which nothing was
+        # using, so its "throw on an unexpected request" protection was
+        # dead weight.
+        got = self._node(
+            "opshellSession = null; opshellTerm = fakeTerm();\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "replies = [{ok:true, status:200, body:{session:'adopted'}},"
+            " {ok:true, status:200, body:{reason:'this channel was not "
+            "started by the operator shell'}}];\n"
+            "await opshellEndAfterAttach();\n"
+            "console.log(JSON.stringify({urls: posted.map(p => p.url),"
+            " said: opshellTerm.lines.join(' '),"
+            " shown: els['opshell-body'].innerHTML,"
+            " session: opshellSession}));")
+        self.assertEqual(got["urls"],
+                         ["/api/opshell/open", "/api/opshell/close"])
+        self.assertRegex(got["said"] + " " + got["shown"],
+                         r"(?i)not started by the operator shell")
+        self.assertIsNone(got["session"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_an_unexpected_extra_request_is_an_error_not_a_free_success(self):
+        # The harness's own guard, exercised. Without a test the queue's
+        # throw was dead: reverting it to a default 200 left every test
+        # green, so any mutation that added a request was absorbed.
+        out = subprocess.run(
+            ["node", "--input-type=module", "-e",
+             _NODE_ENV + "\nreplies = [{ok:true, status:200, body:{}}];\n"
+             "await fetch('/one');\n"
+             "let threw = false;\n"
+             "try { await fetch('/two'); } catch(e) { threw = true; }\n"
+             "console.log(JSON.stringify({threw}));"],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr[-800:])
+        self.assertTrue(json.loads(out.stdout.strip())["threw"],
+                        "a request beyond the queue was handed a free 200")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_double_click_on_open_takes_only_one_claim(self):
         # The first version grepped `opshellOpen` for the word "disabled",
         # which survives in `if(button.disabled) return;` -- so deleting
@@ -3551,6 +3625,103 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(got["leftover"], 0)
         self.assertRegex(got["said"], r"(?i)nothing .*(sent|delivered)|"
                                       r"not .*(sent|delivered)")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_what_is_typed_during_a_failing_batch_dies_with_it(self):
+        """The worst finding of this branch, and I caused it.
+
+        The previous shape cleared the buffer on a failed batch, under its
+        own comment: "delivering later keystrokes without the ones before
+        them is how a truncated command reaches a root shell". The atomic
+        rewrite deleted that line **and the test that named it** -- and the
+        test count went up, so the count check I had added could not see
+        it.
+
+        The window is not microseconds: a 502 comes from a `sendall` with a
+        fifteen-second timeout, so fifteen seconds of typing accumulates
+        and is then delivered without the batch that was dropped.
+        Reproduced by the reviewer as `rm -rf /` followed by an Enter typed
+        mid-flight.
+
+        `holdFetch` is what makes this measurable; the test it replaces had
+        it at zero, so nothing could arrive mid-flight at all.
+        """
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "holdFetch = 6;\n"
+            "opshellKeys = 'var/tmp/junk';\n"
+            "nextReply = {ok:false, status:502, body:{}};\n"
+            "const flushing = opshellFlushKeys();\n"
+            # Typed while the batch is in the air.
+            "opshellKeys += '\\r';\n"
+            "await flushing;\n"
+            "nextReply = {ok:true, status:200, body:{}};\n"
+            "await opshellFlushKeys();\n"
+            "const sent = posted.filter(p => p.url.endsWith('keys')).map("
+            "p => Buffer.from(JSON.parse(p.body).data,'base64').toString());\n"
+            "console.log(JSON.stringify({leftover: opshellKeys,"
+            " sent, said: opshellTerm.lines.join(' ')}));")
+        self.assertEqual(got["leftover"], "",
+                         "keystrokes typed during a failed batch survived it")
+        # Exactly one request: the failed one. The Enter must never go out
+        # on its own.
+        self.assertEqual(got["sent"], ["var/tmp/junk"])
+        self.assertRegex(got["said"], r"(?i)since|anything else|typed after")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_same_holds_when_the_request_is_rejected_outright(self):
+        # Two arms, and the first version of the fix covered one. A
+        # rejected request is the commoner of the two -- a dropped
+        # connection rather than a status -- and it had the same hole.
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "holdFetch = 6;\n"
+            "opshellKeys = 'var/tmp/junk';\n"
+            "nextReply = {throw:'socket hang up'};\n"
+            "const flushing = opshellFlushKeys();\n"
+            "opshellKeys += '\\r';\n"
+            "await flushing;\n"
+            "nextReply = {ok:true, status:200, body:{}};\n"
+            "await opshellFlushKeys();\n"
+            "const sent = posted.filter(p => p.url.endsWith('keys')).map("
+            "p => Buffer.from(JSON.parse(p.body).data,'base64').toString());\n"
+            "console.log(JSON.stringify({leftover: opshellKeys, sent,"
+            " said: opshellTerm.lines.join(' ')}));")
+        self.assertEqual(got["leftover"], "")
+        self.assertEqual(got["sent"], ["var/tmp/junk"])
+        self.assertRegex(got["said"], r"(?i)since|anything else|typed after")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_write_that_may_have_landed_is_not_called_nothing(self):
+        """B2: 502 is the one status that means a write was attempted.
+
+        The route answers 502 only when the bridge was accepted and
+        `sendall` raised -- and a `sendall` that times out mid-write has
+        already put bytes on the wire and cannot say how many. Saying
+        "nothing reached the shell" there is the same false assurance this
+        round was written to remove, one door along.
+        """
+        maybe = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "nextReply = {ok:false, status:502, body:{}};\n"
+            "opshellKeys = 'ls';\n"
+            "await opshellFlushKeys();\n"
+            "console.log(JSON.stringify({said: opshellTerm.lines.join(' ')}));")
+        # Uncertainty, however it is worded, and never the denial.
+        self.assertRegex(maybe["said"],
+                         r"(?i)may (or may not|already)? ?have")
+        self.assertNotRegex(maybe["said"], r"(?i)nothing reached")
+        # And the statuses that truly wrote nothing still say so, or the
+        # distinction is worthless.
+        for status in (413, 404, 409, 400):
+            got = self._node(
+                "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+                "nextReply = {ok:false, status:%d, body:{}};\n"
+                "opshellKeys = 'ls';\n"
+                "await opshellFlushKeys();\n"
+                "console.log(JSON.stringify({said: opshellTerm.lines"
+                ".join(' ')}));" % status)
+            self.assertRegex(got["said"], r"(?i)nothing reached", str(status))
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_paste_too_large_to_send_whole_is_refused_before_it_is_sent(self):

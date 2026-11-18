@@ -8654,6 +8654,25 @@ async function opshellEndAfterAttach(ev){
   await opshellEndSession();
 }
 
+function opshellDropRest(text){
+  // One place for "this batch failed", because the thing that matters is
+  // not the message -- it is the line below it.
+  //
+  // Everything typed while the failing batch was in flight goes with it.
+  // The shape before the atomic rewrite had this, under its own comment,
+  // and the rewrite deleted the line **and the test that named it**: a
+  // 502 comes from a `sendall` with a fifteen-second timeout, so fifteen
+  // seconds of typing -- Enters included -- accumulated and was then
+  // delivered without the batch it belonged to. Reproduced as `rm -rf /`
+  // and an Enter typed mid-flight: the Enter went out alone.
+  const pending = opshellKeys.length;
+  opshellKeys = "";
+  opshellSay(text + (pending
+    ? " Anything typed since has been dropped too, so no part of a command "
+      + "can arrive without the rest of it."
+    : ""));
+}
+
 function opshellSay(text){
   // Out of band, in the terminal, where the operator is looking. The dim
   // sequence is what this view already uses for its own notes, so it
@@ -8715,10 +8734,12 @@ async function opshellFlushKeys(){
         // units the route measures. Splitting is what produced the
         // partial-delivery defect; letting the server refuse it would
         // produce the same loss one round trip later.
-        opshellSay("that paste is too large to send in one piece ("
-                   + batch.length + " characters). Nothing was sent. Send "
-                   + "it in smaller pieces, or put the file on the host "
-                   + "another way.");
+        opshellSay("that paste is too large to send in one piece: "
+                   + batch.length + " characters, and about "
+                   + Math.floor(OPSHELL_KEYS_CEILING * 3 / 4 / 1024)
+                   + " KB of text is the most one request may carry. "
+                   + "Nothing was sent. Send it in smaller pieces, or put "
+                   + "the file on the host another way.");
         continue;
       }
       let r;
@@ -8728,24 +8749,37 @@ async function opshellFlushKeys(){
       } catch(e) {
         // Honest about the one thing nobody can know here: a rejected
         // request may have reached the shell before the connection broke.
-        opshellSay("those keystrokes may or may not have reached the shell "
-                   + "(" + ((e && e.message) || e) + "). Nothing was sent "
-                   + "again -- check the session before retyping.");
+        opshellDropRest("those keystrokes may or may not have reached the "
+                        + "shell (" + ((e && e.message) || e) + "). Nothing "
+                        + "was sent again -- check the session before "
+                        + "retyping.");
         return;
       }
       if(!r.ok){
-        // Both fields: the route answers 409 for a bridge that was never
-        // accepted with `error` and a `detail` saying where the reason is
-        // ("its reason is on the stream"), and printing only the status
-        // threw away the sentence that tells the operator where to look.
+        // Every field the route sends: a 409 for a bridge that was never
+        // accepted carries `refused` and a `detail` saying where the
+        // reason is ("its reason is on the stream"), and printing only the
+        // status threw away the sentence that tells the operator where to
+        // look.
         let said = "";
         try {
           const body = (await r.json()) || {};
-          said = [body.error, body.detail].filter(Boolean).join(" -- ");
+          said = [body.error, body.refused, body.detail]
+            .filter(Boolean).join(" -- ");
         } catch(e) {}
-        opshellSay("those keystrokes were not delivered (HTTP " + r.status
-                   + (said ? ": " + said : "") + "). Nothing reached "
-                   + "the shell.");
+        // 5xx is the one shape that means a write was *attempted*: the
+        // route answers 502 only when the bridge was accepted and
+        // `sendall` raised, and a `sendall` that times out mid-write has
+        // already put bytes on the wire and cannot say how many. Claiming
+        // nothing arrived there is the same false assurance this whole
+        // path was rewritten to remove.
+        const attempted = r.status >= 500;
+        opshellDropRest("those keystrokes were not delivered (HTTP "
+          + r.status + (said ? ": " + said : "") + "). "
+          + (attempted
+             ? "Some of them may already have reached the shell -- check "
+               + "the session before retyping."
+               : "Nothing reached the shell."));
         return;
       }
     }

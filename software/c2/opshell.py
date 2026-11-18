@@ -866,7 +866,16 @@ class Bridge:
             self._leave()
 
     def write(self, data: bytes) -> None:
-        """Send every byte of `data`, or raise `OSError`.
+        """Try to send every byte of `data`; raise `OSError` on failure.
+
+        **Not all-or-nothing, and the caller has to know it.** This is
+        `sendall` under a timeout, and a `sendall` that times out
+        mid-transfer has already put bytes on the wire with no way to
+        report how many. So a raise here means "some unknown prefix may
+        have arrived", not "nothing did" -- the route turns it into a 502
+        and the view says exactly that. The docstring used to promise
+        every byte or an exception, which is a guarantee `sendall` does
+        not give, and the view repeated the promise to the operator.
 
         `BrokenPipeError` when the bridge is closed or no password was
         sent -- a peer that refused has no shell to type into -- and an
