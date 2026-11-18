@@ -1931,7 +1931,7 @@ class TestTheBrakeCanLetGo(_RouteCase):
     def _entry(self, queued_iso, in_queue):
         self.sm.history[self.AGENT] = [{
             "task_id": "t1", "cmd": "tunnel", "args": "stop",
-            "status": "pending", "queued": queued_iso}]
+            "status": "pending", "timestamp": queued_iso}]
         if in_queue:
             self.sm.task_queues[self.AGENT] = [{"id": "t1", "cmd": "tunnel",
                                                 "args": "stop"}]
@@ -2006,6 +2006,98 @@ class TestACheckInDoesNotRetireAWatchingTab(_ClaimsCase):
                       time.time() + 11, {}, {}, lapsed=True)
         self.assertEqual([t["args"] for t in queues["raccoon-bandit"]],
                          ["stop"])
+
+
+class TestAStaleReportDoesNotOutliveItsBeacon(_RouteCase):
+    """An absent `tunnel` key is a statement, not a gap.
+
+    The beacon leaves it out when *this process* has never started a
+    child, so keeping the previous report meant a target reboot left a
+    dead `running: True` behind for ever: the view showed the channel
+    open, `/open` never queued another start for that agent, and the close
+    never settled -- which is how stale ownership could later stop a
+    teammate's pivot.
+    """
+
+    def _beacon(self, app, payload):
+        app.test_client().post("http://localhost:1/api/v1/beacon",
+                               json=self.crypto.wrap(payload))
+
+    def test_a_check_in_without_the_key_clears_the_last_report(self):
+        app = self.app(supervisor=self.configured_but_stopped())
+        self._beacon(app, {"action": "beacon", "agent_id": self.AGENT,
+                           "tunnel": {"pid": 9, "running": True}})
+        self._beacon(app, {"action": "beacon", "agent_id": self.AGENT})
+        self.assertNotIn("tunnel", self.sm.agents[self.AGENT])
+
+    def test_the_glyph_opens_again_after_the_target_rebooted(self):
+        app = self.app(supervisor=self.configured_but_stopped())
+        client = self.operator_client(app)
+        self._beacon(app, {"action": "beacon", "agent_id": self.AGENT,
+                           "tunnel": {"pid": 9, "running": True}})
+        self._beacon(app, {"action": "beacon", "agent_id": self.AGENT})
+        self.sm.task_queues.pop(self.AGENT, None)
+        client.post(self.url("/api/opshell/open"),
+                    json={"agent": self.AGENT}, headers=self.auth)
+        queued = [t["args"] for t in self.sm.task_queues.get(self.AGENT, [])]
+        self.assertEqual(queued, ["start"])
+
+    def test_a_re_registration_drops_the_old_processes_report(self):
+        app = self.app(supervisor=self.configured_but_stopped())
+        self._beacon(app, {"action": "beacon", "agent_id": self.AGENT,
+                           "tunnel": {"pid": 9, "running": True}})
+        self._beacon(app, {"action": "register", "id": self.IMPLANT,
+                           "hostname": "parrot", "interval": 300})
+        self.assertNotIn("tunnel", self.sm.agents[self.AGENT])
+
+
+class TestTheSweepIsWiredToTheCheckIn(_RouteCase):
+    def test_a_check_in_queues_the_stop_a_dead_process_owed(self):
+        # The wiring, not the helper: every other sweep test calls
+        # `opshell.sweep` directly, so four mutations of the call site
+        # survived -- including reverting `lapsed=False` and putting the
+        # whole-fleet walk back. This drives it through the beacon route.
+        (self.data_dir / "opshell-owned.json").write_text(
+            json.dumps({self.AGENT: {"since": "2026-11-18T00:00:00Z"}}))
+        # A connected endpoint with no SOCKS session: the one state in
+        # which the rules allow the stop. With no row and no agent report
+        # the stop stays correctly *owed* rather than queued, which is
+        # what the first version of this test asserted against.
+        app = self.app(supervisor=self.connected())
+        app.test_client().post(
+            "http://localhost:1/api/v1/beacon",
+            json=self.crypto.wrap({"action": "beacon",
+                                   "agent_id": self.AGENT}))
+        # The history, not the queue: the same check-in that noticed the
+        # stop was owed also dispatched it, so `task_queues` is empty
+        # again by the time the response is written. That is the property
+        # worth having -- the stop rides the check-in that found it -- and
+        # asserting on the queue was asserting on its absence.
+        tunnel = [e for e in self.sm.history.get(self.AGENT, [])
+                  if e.get("cmd") == "tunnel"]
+        self.assertEqual([e.get("args") for e in tunnel], ["stop"])
+
+    def test_a_check_in_does_not_retire_a_session_that_is_watching(self):
+        # `lapsed=False` at the call site: a check-in carries no heartbeat,
+        # so it must not judge a browser's liveness. Reverting the keyword
+        # turns this red.
+        app = self.app(supervisor=self.configured_but_stopped())
+        client = self.operator_client(app)
+        session = client.post(self.url("/api/opshell/open"),
+                              json={"agent": self.AGENT},
+                              headers=self.auth).get_json()["session"]
+        self.sm.task_queues.pop(self.AGENT, None)
+        with unittest.mock.patch.object(opshell.Claims, "lapsed",
+                                        autospec=True,
+                                        return_value=[self.AGENT]) as lapsed:
+            app.test_client().post(
+                "http://localhost:1/api/v1/beacon",
+                json=self.crypto.wrap({"action": "beacon",
+                                       "agent_id": self.AGENT}))
+        self.assertEqual(lapsed.call_args_list, [])
+        state = client.get(self.url("/api/opshell/state?session=" + session),
+                           headers=self.auth).get_json()
+        self.assertEqual(state["sessions"], 1)
 
 
 if __name__ == "__main__":

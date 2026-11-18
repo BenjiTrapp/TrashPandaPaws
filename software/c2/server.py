@@ -914,7 +914,12 @@ def _opshell_stop_in_flight(agent_name: str) -> bool:
     for queued in task_queues.get(agent_name) or []:
         if queued.get("id") == task_id:
             return True
-    stamped = task.get("queued") or ""
+    # "timestamp", not "queued": that is the key every history writer
+    # uses (`opshell.py:295`, `server.py:1188`, `:1620`, `:3357`). Reading
+    # the queue's name here made the parse raise and the age window never
+    # fire -- the same class of mistake as the `id`/`task_id` mix-up this
+    # replaced, and found the same way.
+    stamped = task.get("timestamp") or task.get("queued") or ""
     interval = _as_int((agents.get(agent_name) or {}).get("interval"), 300)
     try:
         when = datetime.fromisoformat(stamped.replace("Z", "+00:00"))
@@ -1865,8 +1870,12 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                                         task_queues, history, _now(),
                                         time.time(), pending, settled,
                                         lapsed=lapsed):
-            _log_event("TASK", "cmd=tunnel args=stop (operator shell: no "
-                               "view is watching this channel any more)",
+            # The task id, so the line can be tied to the task. The
+            # queue is read before the dispatcher can empty it.
+            last_task = (task_queues.get(agent_name) or [{}])[-1]
+            _log_event("TASK", "cmd=tunnel args=stop task_id=%s (operator "
+                               "shell: no view is watching this channel "
+                               "any more)" % last_task.get("id", "?"),
                        agent_id=agent_name)
 
     @app.route("/api/opshell/state", methods=["GET"])
@@ -3666,6 +3675,10 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
 
     for aid, info in agents.items():
         if info.get("id") == implant_id:
+            # A re-registration is a new beacon process, so whatever the
+            # old one last said about its tunnel child is about a child
+            # that no longer exists. `info.update` would have kept it.
+            info.pop("tunnel", None)
             info.update({
                 "hostname": payload.get("hostname", ""),
                 "os": payload.get("os", ""),
@@ -3824,6 +3837,15 @@ def _handle_beacon(payload: dict, crypto: ServerCrypto):
             agents[agent_id]["proxy_active"] = payload["proxy_active"]
         if payload.get("c2_profile") is not None:
             agents[agent_id]["c2_profile"] = payload["c2_profile"]
+        if payload.get("tunnel") is None and "tunnel" in agents[agent_id]:
+            # An absent key is authoritative: the beacon leaves it out
+            # when *this process* has never started a child
+            # (`beacon.py:5304`). Keeping the last report instead meant a
+            # target reboot left a dead `running: True` behind for ever --
+            # the view showed the channel open, `/open` never queued
+            # another start for that agent, and the close never settled, so
+            # stale ownership could later stop a teammate's pivot.
+            del agents[agent_id]["tunnel"]
         if isinstance(payload.get("tunnel"), dict):
             # The beacon has been sending this since the tunnel feature
             # shipped (`beacon.py:5309`) and nothing stored it. The
