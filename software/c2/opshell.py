@@ -22,12 +22,21 @@ change. Ownership outlives the last session on purpose: closing the view
 only *queues* the stop, so ownership is released by `release` once the stop
 has been acknowledged, or by `forget` when the agent no longer exists.
 
+The third is the bridge from the browser's side to the shell port. The
+tunnel server exposes the implant's pty as a raw TCP port on its own
+loopback, behind a one-line handshake; `Bridge` is the Flask process's end
+of that exchange, the same one `tools/raccoon_shell.py` speaks from a
+workstation. It receives the shell password and puts it on that socket.
+Nothing else here holds it, and nothing a browser can read does either.
+
 Stdlib only.
 """
 
 import json
 import os
 import secrets
+import selectors
+import socket
 import tempfile
 import threading
 import time
@@ -36,7 +45,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from .beacon import (
+    SHELL_DEFAULT_COLS,
+    SHELL_DEFAULT_ROWS,
+    SHELL_GEOMETRY_MAX,
+)
+from .tunnel.shell import PROMPT
+
 _DEFAULT_INTERVAL = 300
+
+# How long `connect` waits for the prompt. `ShellFront`'s own handshake
+# timeout is 15.0 s, so a port that has not prompted by then is not going
+# to.
+_CONNECT_TIMEOUT = 15.0
+
+# The longest a write may be blocked by a peer that has stopped reading.
+# Fixed on the socket for its life, because a per-call timeout set by one
+# thread would be inherited by whatever another thread did next.
+_WRITE_TIMEOUT = 15.0
+
+_CHUNK = 65536
+
+# The longest a waiting `read` goes without noticing that `close` was
+# called.
+_SLICE = 0.2
 
 
 class OwnershipRecordError(ValueError):
@@ -309,3 +341,211 @@ def expected_checkin(agent: dict, now: float) -> Optional[float]:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _dimension(value, default: int) -> int:
+    """One terminal dimension, inside `1..SHELL_GEOMETRY_MAX`.
+
+    The clamp the port and the implant apply: a number out of range is
+    pulled in rather than refused, and anything that is not an integer
+    takes the default.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    return max(1, min(SHELL_GEOMETRY_MAX, value))
+
+
+def auth_line(password: str, cols: int, rows: int) -> bytes:
+    """The wire's first line: `<password> <cols>x<rows>` and a newline.
+
+    The password is not quoted or escaped: the port takes the geometry
+    off the end only when the tail is entirely a geometry, so a password
+    with spaces in it arrives whole. The size is clamped here as well, so
+    what is on the wire is always what `Bridge.geometry` says it was. A
+    password with a line ending in it cannot be sent -- the newline is the
+    end of the line -- and is refused rather than truncated into a wrong
+    password.
+    """
+    if "\n" in password or "\r" in password:
+        raise ValueError("that password has a line ending in it, and the "
+                         "shell port's handshake is one line, so it cannot "
+                         "be sent")
+    cols = _dimension(cols, SHELL_DEFAULT_COLS)
+    rows = _dimension(rows, SHELL_DEFAULT_ROWS)
+    return ("%s %dx%d\n" % (password, cols, rows)).encode("utf-8")
+
+
+class Bridge:
+    """One connection to the shell port, from the team server's own side.
+
+    `connect` dials the loopback port, waits for the prompt and sends the
+    auth line; after that the socket is raw bytes both ways. The terminal
+    size is part of that line and cannot be renegotiated, so `geometry`
+    is fixed at construction and is the only size a view may state.
+
+    `read` is meant for one thread and `write` for another; `close` may
+    come from any and wakes a `read` that is waiting.
+
+    **A refusal is bytes, not an exception.** The port writes its refusal
+    onto the connection, in place of a shell, so that an operator reads
+    the reason instead of looking at what resembles a dead tunnel. That
+    includes the refusals the accept loop writes without ever prompting:
+    those are held for the first `read`, and the password is not sent to
+    a peer that did not ask for it.
+    """
+
+    def __init__(self, port: int, password: str, cols: int, rows: int,
+                 host: str = "127.0.0.1"):
+        self._host = host
+        self._port = port
+        self._password = password
+        self._geometry = (_dimension(cols, SHELL_DEFAULT_COLS),
+                          _dimension(rows, SHELL_DEFAULT_ROWS))
+        self._lock = threading.Lock()
+        self._sock = None  # type: Optional[socket.socket]
+        self._pending = b""
+        self._accepted = False
+        self._closed = False
+
+    def __repr__(self) -> str:
+        return "Bridge(%s:%s, %dx%d)" % (self._host, self._port,
+                                         self._geometry[0], self._geometry[1])
+
+    @property
+    def geometry(self) -> Tuple[int, int]:
+        """The `(cols, rows)` the port is sent, clamped. Fixed for good."""
+        return self._geometry
+
+    @property
+    def is_open(self) -> bool:
+        return self._sock is not None
+
+    def connect(self, timeout: float = _CONNECT_TIMEOUT) -> None:
+        """Dial, wait for the prompt, send the auth line.
+
+        `timeout` bounds the whole of it, the wait for the prompt
+        included, and a port that does not prompt in time raises
+        `socket.timeout`. The password is sent only after the prompt.
+        Anything else arriving first is a refusal in place of a prompt and
+        is kept for `read`; `connect` then returns without sending it.
+        """
+        with self._lock:
+            if self._sock is not None or self._closed:
+                raise RuntimeError("a bridge connects once; make another")
+            # Rejected before any connection exists to be left open.
+            line = auth_line(self._password, *self._geometry)
+            deadline = time.monotonic() + timeout
+            sock = socket.create_connection((self._host, self._port),
+                                            timeout=timeout)
+            try:
+                head = self._await_prompt(sock, deadline)
+                sock.settimeout(_WRITE_TIMEOUT)
+                if head.startswith(PROMPT):
+                    sock.sendall(line)
+                    head = head[len(PROMPT):]
+                    self._accepted = True
+            except BaseException:
+                _shutdown_and_close(sock)
+                raise
+            self._pending = head
+            self._sock = sock
+
+    def read(self, timeout: float) -> bytes:
+        """What the port has sent, up to a chunk; `b""` once it has ended.
+
+        Raises `socket.timeout` when it says nothing for `timeout`
+        seconds, which is not the end of anything: an idle shell is the
+        normal state of one, so the caller asks again. A stream that ends
+        in a reset is an `OSError` and not an end, because a shell that
+        exited and a tunnel that was lost are not the same news.
+        """
+        sock = self._sock
+        if sock is None:
+            if self._closed:
+                return b""
+            raise OSError("this bridge is not connected")
+        if self._pending:
+            data, self._pending = self._pending, b""
+            return data
+        # Waited on in short slices that look at `close` in between: a
+        # shutdown that races a `close` of the descriptor can be lost by
+        # the selector, and a read that never learns the bridge was closed
+        # is a view that claims to be live.
+        deadline = time.monotonic() + timeout
+        with selectors.DefaultSelector() as sel:
+            try:
+                sel.register(sock, selectors.EVENT_READ)
+            except (ValueError, OSError):
+                if self._sock is not sock:
+                    return b""
+                raise
+            while True:
+                if self._sock is not sock:
+                    return b""
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise socket.timeout("the shell port sent nothing for "
+                                         "%g s" % timeout)
+                try:
+                    if sel.select(min(left, _SLICE)):
+                        break
+                except (ValueError, OSError):
+                    if self._sock is not sock:
+                        return b""
+                    raise
+        try:
+            return sock.recv(_CHUNK)
+        except OSError:
+            if self._sock is None:
+                return b""
+            raise
+
+    def write(self, data: bytes) -> None:
+        """Send every byte of `data`, or raise `OSError`.
+
+        Raises `BrokenPipeError` when no password was sent, because a
+        peer that refused has no shell to type into, and `OSError` when
+        the bridge is closed or the peer stops reading for too long.
+        """
+        sock = self._sock
+        if sock is None or not self._accepted:
+            raise BrokenPipeError("the shell port did not accept this "
+                                  "session, so there is nothing to write to")
+        sock.sendall(data)
+
+    def close(self) -> None:
+        """End the connection; safe to repeat, and wakes a waiting `read`."""
+        sock, self._sock = self._sock, None
+        self._closed = True
+        if sock is not None:
+            _shutdown_and_close(sock)
+
+    @staticmethod
+    def _await_prompt(sock: socket.socket, deadline: float) -> bytes:
+        """Bytes read until they are the prompt or can never become it.
+
+        Returns what arrived. A prompt may come in pieces, so a prefix of
+        it is waited on; the deadline is absolute because `settimeout`
+        restarts on every byte.
+        """
+        head = b""
+        while not head.startswith(PROMPT):
+            if head and not PROMPT.startswith(head):
+                return head
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout("the shell port did not prompt in time")
+            sock.settimeout(left)
+            chunk = sock.recv(_CHUNK)
+            if not chunk:
+                return head
+            head += chunk
+        return head
+
+
+def _shutdown_and_close(sock: socket.socket) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    sock.close()

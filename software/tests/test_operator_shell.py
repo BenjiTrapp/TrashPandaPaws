@@ -9,16 +9,19 @@ that: every way the bookkeeping could forget a stop it owes.
 import ast
 import json
 import os
+import socket
 import stat
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from software.c2 import opshell
+from software.c2 import beacon, opshell
 
 
 class _ClaimsCase(unittest.TestCase):
@@ -388,6 +391,215 @@ class TestRaisingAndDroppingTheChannel(unittest.TestCase):
         bare = {"_last_seen_ts": 1000.0}
         opshell.expected_checkin(bare, now=1100.0)
         self.assertEqual(bare, {"_last_seen_ts": 1000.0})
+
+
+class _FakeShellPort:
+    """A loopback listener that plays the shell port, once.
+
+    It writes `prompt` (nothing at all when `prompt` is None), reads the
+    one auth line, then writes `then` and either hangs up (`die_after_auth`)
+    or holds the connection until `stop`. A prompt that is not the real one
+    is a refusal in its place, as the accept loop writes them, and is
+    followed by a half-close so the bridge sees the stream end. What the
+    peer sent is `received()`; `first_line()` waits for the line itself.
+    """
+
+    PROMPT = b"password: "
+
+    def __init__(self, prompt=PROMPT, then=b"", die_after_auth=False,
+                 drip=False):
+        self._prompt, self._then, self._die = prompt, then, die_after_auth
+        self._drip = drip
+        self._listener = socket.socket()
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(1)
+        self._listener.settimeout(0.05)
+        self.port = self._listener.getsockname()[1]
+        self._got_line = threading.Event()
+        self._stop = threading.Event()
+        self._received = b""
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        conn = None
+        try:
+            while conn is None:
+                if self._stop.is_set():
+                    return
+                try:
+                    conn, _ = self._listener.accept()
+                except socket.timeout:
+                    pass
+            if self._prompt is None:
+                self._stop.wait(10.0)
+                return
+            if self._drip:
+                for i in range(len(self._prompt)):
+                    conn.sendall(self._prompt[i:i + 1])
+                    time.sleep(0.02)
+            else:
+                conn.sendall(self._prompt)
+            if self._prompt != self.PROMPT:
+                conn.shutdown(socket.SHUT_WR)
+            conn.settimeout(5.0)
+            while b"\n" not in self._received:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                self._received += chunk
+            self._got_line.set()
+            if self._then:
+                conn.sendall(self._then)
+            conn.settimeout(0.05)
+            while not self._die and not self._stop.is_set():
+                try:
+                    chunk = conn.recv(65536)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+                self._received += chunk
+        except OSError:
+            pass
+        finally:
+            self._got_line.set()
+            if conn is not None:
+                conn.close()
+
+    def first_line(self):
+        self._got_line.wait(5.0)
+        return self._received.split(b"\n", 1)[0] + b"\n"
+
+    def received(self):
+        self._thread.join(5.0)
+        return self._received
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(5.0)
+        self._listener.close()
+
+
+class TestTheBridge(unittest.TestCase):
+    def _fake(self, **kwargs):
+        port = _FakeShellPort(**kwargs)
+        self.addCleanup(port.stop)
+        return port
+
+    def _bridge(self, port, password="secret", cols=80, rows=24):
+        b = opshell.Bridge(port.port, password, cols, rows)
+        self.addCleanup(b.close)
+        return b
+
+    def test_the_auth_line_carries_the_password_then_the_geometry(self):
+        self.assertEqual(opshell.auth_line("pw with space", 100, 30),
+                         b"pw with space 100x30\n")
+
+    def test_geometry_is_clamped_and_reported_as_sent(self):
+        # Review Focus 5. The pty cannot be renegotiated, so what was sent
+        # is the only truth the strip may state.
+        b = opshell.Bridge(port=1, password="x", cols=0, rows=9000)
+        self.assertEqual(b.geometry, (1, beacon.SHELL_GEOMETRY_MAX))
+
+    def test_it_waits_for_the_prompt_before_sending(self):
+        port = self._fake(prompt=b"password: ")
+        b = self._bridge(port)
+        b.connect()
+        self.assertEqual(port.first_line(), b"secret 80x24\n")
+
+    def test_a_refusal_arrives_as_bytes_on_the_stream(self):
+        # Review Focus 2. ShellFront writes its refusal onto the stream;
+        # the bridge must pass it through, not turn it into an exception.
+        port = self._fake(prompt=b"password: ", then=b"too many sessions\n")
+        b = self._bridge(port)
+        b.connect()
+        self.assertIn(b"too many sessions", b.read(timeout=2))
+
+    def test_a_port_that_dies_ends_the_read_within_the_timeout(self):
+        # Review Focus 4. A hang here is a view that lies about being live.
+        port = self._fake(prompt=b"password: ", die_after_auth=True)
+        b = self._bridge(port)
+        b.connect()
+        self.assertEqual(b.read(timeout=2), b"")
+
+    def test_a_port_that_never_prompts_raises_inside_the_timeout(self):
+        port = self._fake(prompt=None)
+        started = time.monotonic()
+        with self.assertRaises(OSError):
+            self._bridge(port).connect(timeout=1.0)
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_a_refusal_in_place_of_the_prompt_is_shown_and_no_password_is_sent(self):
+        # The accept loop refuses without ever prompting. That text is the
+        # reason the operator is owed, and the password has no business
+        # going to a peer that did not ask for it.
+        refusal = b"raccoon: too many attach attempts\r\n"
+        port = self._fake(prompt=refusal)
+        b = self._bridge(port)
+        b.connect()
+        seen, chunk = b"", b.read(timeout=2)
+        while chunk:
+            seen, chunk = seen + chunk, b.read(timeout=2)
+        self.assertEqual(seen, refusal)
+        b.close()
+        self.assertEqual(port.received(), b"")
+
+    def test_a_peer_that_says_nothing_is_a_timeout_not_the_end(self):
+        # `b""` means the stream ended. An idle shell is the normal state
+        # of one, so silence must be told apart from it.
+        port = self._fake(prompt=b"password: ")
+        b = self._bridge(port)
+        b.connect()
+        with self.assertRaises(socket.timeout):
+            b.read(timeout=0.2)
+        self.assertTrue(b.is_open)
+
+    def test_a_prompt_that_arrives_in_pieces_is_still_the_prompt(self):
+        port = self._fake(prompt=b"password: ", drip=True)
+        b = self._bridge(port)
+        b.connect()
+        self.assertEqual(port.first_line(), b"secret 80x24\n")
+
+    def test_bytes_written_reach_the_port_whole(self):
+        # Larger than a socket buffer's worth in one call: `sendall`, not
+        # `send`, or the tail would go missing.
+        port = self._fake(prompt=b"password: ")
+        b = self._bridge(port)
+        b.connect()
+        payload = b"x" * 4000000 + b"\n"
+        b.write(payload)
+        b.close()
+        got = port.received()
+        self.assertEqual(got, b"secret 80x24\n" + payload)
+
+    def test_closing_wakes_a_read_that_is_waiting(self):
+        port = self._fake(prompt=b"password: ")
+        b = self._bridge(port)
+        b.connect()
+        out = []
+        reader = threading.Thread(target=lambda: out.append(b.read(timeout=5)))
+        reader.start()
+        time.sleep(0.2)
+        b.close()
+        reader.join(3.0)
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(out, [b""])
+
+    def test_a_password_with_a_line_ending_is_refused_not_truncated(self):
+        for bad in ("a\nb", "a\rb"):
+            with self.assertRaises(ValueError):
+                opshell.auth_line(bad, 80, 24)
+
+    def test_a_dimension_that_is_not_a_number_takes_the_default(self):
+        for junk in (None, "wide", True, 80.5):
+            b = opshell.Bridge(1, "x", junk, junk)
+            self.assertEqual(b.geometry,
+                             (beacon.SHELL_DEFAULT_COLS, beacon.SHELL_DEFAULT_ROWS), junk)
+
+    def test_the_password_is_not_in_the_bridge_s_repr(self):
+        b = opshell.Bridge(1, "hunter2", 80, 24)
+        self.assertNotIn("hunter2", repr(b))
 
 
 if __name__ == "__main__":
