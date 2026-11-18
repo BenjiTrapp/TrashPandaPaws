@@ -500,7 +500,7 @@ The one case left is narrow: **the implant stops checking in as well.**
 Then the channel stands — but so would any shutdown, because a task can
 only be delivered to an agent that calls home. Nothing can be queued for a
 device that is not listening, and the view says so rather than guessing:
-once a device is two of its own intervals overdue, the channel reads
+once a device has been silent for two of its own intervals plus whatever jitter its beacon may add, the channel reads
 `unknown` with the seconds since its last word, because every claim about
 it comes from a report that old.
 

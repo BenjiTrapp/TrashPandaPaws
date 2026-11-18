@@ -1838,9 +1838,10 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                                            time.time())
         if claims is not None:
             out["sessions"] = claims.sessions(target)
-            owned = target in claims.owned()
-        else:
-            owned = False
+        # No `owned` local: it was computed here and never read, and a dead
+        # name beside a rule this delicate invites someone to use it for
+        # the wrong question. `decide_stop` asks `claims.raised`, which is
+        # the question that decides a stop.
 
         if overdue:
             # The silence, not the lateness. The first version printed
@@ -8357,6 +8358,13 @@ async function opshellEndSession(){
   // the next session's "ls", went out as "morels" -- injected input into a
   // root shell on the operator's own device.
   opshellKeys = "";
+  // And the two "say it once" memories, for the same reason, which is the
+  // reason the line above exists. Measured without this: session A warns
+  // once about an outage, session B hits the identical outage and is
+  // warned zero times while its claim lapses underneath -- and a fresh
+  // panel announces "answering again" for trouble it never saw.
+  opshellTrouble = "";
+  opshellNoted = "";
   if(opshellAbort){
     // The stream outlived the view otherwise: the bridge, the pty, one of
     // the shell port's slots, the transcript and a worker thread all
@@ -8663,71 +8671,85 @@ function opshellB64(text){
   return btoa(out);
 }
 
-//: The most text one POST may carry, the server's own ceiling. A paste
-//: larger than this is split rather than refused for ever: the same batch,
-//: retried, is the same refusal.
-const OPSHELL_KEYS_PER_POST = 128 * 1024;
+//: The most base64 one `/keys` request may carry -- the server's own
+//: ceiling, in the server's own units. The client used to slice 131072
+//: UTF-16 code units against a server counting base64 of UTF-8, so 200000
+//: accented characters made a 349528-character body: refused, and under
+//: the old splitting rule the rest of the paste was discarded with it.
+const OPSHELL_KEYS_CEILING = 256 * 1024;
 
 async function opshellFlushKeys(){
   // One POST in flight at a time, carrying everything that accumulated
-  // while the last one was flying. Independent POSTs over up to six
-  // parallel connections can complete out of order -- which in a terminal
-  // means transposed characters, and the operator would blame the link
-  // rather than this.
+  // while the last one was flying -- and **whole or not at all**.
   //
-  // Three rules on failure, and the first version had none of them. It put
-  // the batch back unconditionally, so a refusal that cannot come good
-  // made an unbounded buffer that was reported as "still waiting" for
-  // ever -- and if the cause then cleared, the whole accumulated and
-  // never-echoed buffer would replay into a root shell as one batch. That
-  // was worse than the batch loss it replaced, because the operator had
-  // been told otherwise.
+  // This is the fourth shape of this function, and the first three each
+  // added a failure mode rather than removing one:
   //
-  //   - a status that cannot succeed by waiting is dropped, and named as
-  //     dropped;
-  //   - a rejected request is retried once, then dropped and named;
-  //   - a batch over the ceiling is split, because retrying an oversized
-  //     batch is retrying the same refusal.
+  //   1. one POST per keystroke: independent requests over six parallel
+  //      connections can complete out of order, which in a terminal is
+  //      transposed characters;
+  //   2. coalesced: a refused batch vanished with no echo and no message;
+  //   3. coalesced with the batch put back: an unbounded buffer that was
+  //      reported as "still waiting" for ever, and would have replayed
+  //      into a root shell as one batch if the cause cleared;
+  //   4. coalesced, dropped on refusal, split when oversized: a split that
+  //      failed part way **delivered a prefix** -- measured, 262144 bytes
+  //      of a pasted script executed while the view said nothing had been
+  //      delivered and told the operator to type it again.
+  //
+  // The lesson of the fourth is that a terminal cannot express partial
+  // delivery, so this does not try. No splitting, so there is no prefix to
+  // half-deliver. No retry, so there is nothing to duplicate -- a rejected
+  // request may well have been delivered, and `/keys` has no idempotency
+  // of any kind, so re-sending `reboot\r` is not a recovery. What is left
+  // is one honest sentence in each case.
   if(opshellFlushing) return;
   opshellFlushing = true;
   try {
     while(opshellKeys && opshellSession){
-      const chunk = opshellKeys.slice(0, OPSHELL_KEYS_PER_POST);
-      opshellKeys = opshellKeys.slice(OPSHELL_KEYS_PER_POST);
-      if(!await opshellPostKeys(chunk)){
-        // Dropped, with the rest of it: delivering later keystrokes
-        // without the ones before them is how a truncated command reaches
-        // a root shell.
-        opshellKeys = "";
+      const batch = opshellKeys;
+      opshellKeys = "";
+      const encoded = opshellB64(batch);
+      if(encoded.length > OPSHELL_KEYS_CEILING){
+        // Refused here, before anything is sent, and measured in the
+        // units the route measures. Splitting is what produced the
+        // partial-delivery defect; letting the server refuse it would
+        // produce the same loss one round trip later.
+        opshellSay("that paste is too large to send in one piece ("
+                   + batch.length + " characters). Nothing was sent. Send "
+                   + "it in smaller pieces, or put the file on the host "
+                   + "another way.");
+        continue;
+      }
+      let r;
+      try {
+        r = await fetch("/api/opshell/keys", {method:"POST", headers:H(),
+          body: JSON.stringify({session: opshellSession, data: encoded})});
+      } catch(e) {
+        // Honest about the one thing nobody can know here: a rejected
+        // request may have reached the shell before the connection broke.
+        opshellSay("those keystrokes may or may not have reached the shell "
+                   + "(" + ((e && e.message) || e) + "). Nothing was sent "
+                   + "again -- check the session before retyping.");
+        return;
+      }
+      if(!r.ok){
+        // Both fields: the route answers 409 for a bridge that was never
+        // accepted with `error` and a `detail` saying where the reason is
+        // ("its reason is on the stream"), and printing only the status
+        // threw away the sentence that tells the operator where to look.
+        let said = "";
+        try {
+          const body = (await r.json()) || {};
+          said = [body.error, body.detail].filter(Boolean).join(" -- ");
+        } catch(e) {}
+        opshellSay("those keystrokes were not delivered (HTTP " + r.status
+                   + (said ? ": " + said : "") + "). Nothing reached "
+                   + "the shell.");
         return;
       }
     }
   } finally { opshellFlushing = false; }
-}
-
-async function opshellPostKeys(chunk){
-  // True when the chunk reached the far end. False means it is gone and
-  // the operator has been told; it is never "put back and hope".
-  for(let attempt = 0; attempt < 2; attempt++){
-    let r;
-    try {
-      r = await fetch("/api/opshell/keys", {method:"POST", headers:H(),
-        body: JSON.stringify({session: opshellSession,
-                              data: opshellB64(chunk)})});
-    } catch(e) {
-      // A dropped connection can come good, so one retry -- and only one.
-      // Two is the unbounded buffer again with extra steps.
-      if(attempt === 0) continue;
-      opshellSay("keystrokes were not sent (" + ((e && e.message) || e)
-                 + ") and have been dropped. Type them again.");
-      return false;
-    }
-    if(r.ok) return true;
-    opshellSay("keystrokes were not delivered (HTTP " + r.status
-               + ") and have been dropped. Type them again.");
-    return false;
-  }
-  return false;
 }
 
 async function opshellAttach(state){

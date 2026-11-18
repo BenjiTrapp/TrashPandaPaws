@@ -1359,14 +1359,15 @@ class TestTheSessionTheOperatorHolds(_RouteCase):
         # Requirement 2 exists to stop a refusal being read as "done". A
         # release in that branch would leave the old test green, so this
         # one asserts the ownership that makes the stop still owed.
-        client = self.client(supervisor=self.connected(socks_sessions=2))
-        opened = client.post(self.url("/api/opshell/open"),
-                             json={"agent": self.AGENT},
-                             headers=self.auth).get_json()
+        # `raised_and_up`, because an adopted channel now leaves nothing on
+        # file at all -- there is no owed stop to keep. The requirement is
+        # about a channel this view *raised* and could not stop yet.
+        client, session, _ = self.raised_and_up(socks_sessions=2)
         client.post(self.url("/api/opshell/close"),
-                    json={"session": opened["session"]}, headers=self.auth)
+                    json={"session": session}, headers=self.auth)
         claims = opshell.Claims(self.data_dir / "opshell-owned.json")
         self.assertIn(self.AGENT, claims.owned())
+        self.assertTrue(claims.raised(self.AGENT))
 
 
 class TestTheStreamAndTheKeystrokes(_RouteCase):
@@ -2075,6 +2076,55 @@ class TestAChannelThisViewNeverRaisedIsNotItsToStop(_RouteCase):
         self.assertTrue(opshell.Claims(path).raised("clumsy-raccoon"))
 
 
+class TestAnAdoptedClaimIsNotSweptForEver(_ClaimsCase):
+    def test_adopting_a_channel_leaves_nothing_behind_to_sweep(self):
+        """I5 of the fourth review.
+
+        An adopting `open` wrote an ownership record, `reconcile` reported
+        it owed on every sweep, `decide_stop` refused it every time, and
+        nothing could ever release it: `settled` cannot be true for a stop
+        that was never queued. Measured: five sweeps, no tasks, still
+        owned -- and each leaked record costs one relay round trip per
+        `/state` poll and per check-in, which is the cost the sweep was
+        narrowed to avoid.
+        """
+        claims = opshell.Claims(self.path)
+        session = claims.open("raccoon-bandit", raised=False)
+        self.assertEqual(claims.owned(), [],
+                         "an adopting claim left ownership on file")
+        # The session is still counted -- the refcount is what stops
+        # another tab's close queueing a stop under this one.
+        self.assertEqual(claims.sessions("raccoon-bandit"), 1)
+        queues = {}
+        # Inside the lapse margin, so the session is still watching: the
+        # point is that a sweep finds nothing to owe, not that a lapsed
+        # session cannot be closed.
+        for _ in range(5):
+            opshell.sweep(claims, ["raccoon-bandit"],
+                          {"raccoon-bandit": {"socks": {"sessions": 0}}},
+                          {"raccoon-bandit": False}, queues, {}, "now",
+                          time.time(), {}, {})
+        self.assertEqual(queues, {}, "an adopted channel was swept")
+        self.assertTrue(claims.close("raccoon-bandit", session))
+        # And after it lapses: still nothing owed, because nothing is owned.
+        claims2 = opshell.Claims(self.path)
+        claims2.open("raccoon-bandit", raised=False)
+        opshell.sweep(claims2, ["raccoon-bandit"],
+                      {"raccoon-bandit": {"socks": {"sessions": 0}}},
+                      {"raccoon-bandit": False}, queues, {}, "now",
+                      time.time() + 10000, {}, {})
+        self.assertEqual(queues, {})
+
+    def test_raising_one_later_still_records_it(self):
+        # The upgrade path has to work from nothing on file, since an
+        # adopting open now leaves nothing.
+        claims = opshell.Claims(self.path)
+        claims.open("raccoon-bandit", raised=False)
+        claims.open("raccoon-bandit", raised=True)
+        self.assertEqual(claims.owned(), ["raccoon-bandit"])
+        self.assertTrue(claims.raised("raccoon-bandit"))
+
+
 class TestANotTheLastCloseSaysWhy(_RouteCase):
     def test_a_second_tabs_close_comes_back_with_a_reason(self):
         # `end_session` returned `(False, False, "")` for a close that was
@@ -2277,18 +2327,50 @@ class TestADeviceThatStoppedCallingHomeIsNotReportedLive(_RouteCase):
         # and jitter is operator-settable up to 100%. At that setting a
         # perfectly healthy agent crosses a flat two-interval line with no
         # missed check-in, and the view would flap to `unknown`.
-        # 650 s, not 550: at 100% jitter the beacon may sleep the full
-        # 600 s, so a flat two-interval line (600 s of silence) calls a
-        # healthy agent overdue. The first version of this test measured
-        # 550 s -- inside the flat line -- and passed without the
-        # threshold knowing anything about jitter.
-        agent = {"_last_seen_ts": 1000.0, "interval": 300, "jitter": 100}
+        # The record shape production writes: `server.py` stores the
+        # beacon's reported profile at `agents[id]["c2_profile"]` and
+        # `beacon.py` puts `jitter` inside it. The first version of this
+        # test invented a top-level `jitter` key -- the fourth time on this
+        # branch that a fixture named a field production does not write,
+        # and the hazard stayed live behind a green test.
+        agent = {"_last_seen_ts": 1000.0, "interval": 300,
+                 "c2_profile": {"jitter": 100}}
         self.assertFalse(opshell.report_is_overdue(agent, 1000.0 + 650))
         # A beacon with no jitter keeps the tight line.
-        steady = {"_last_seen_ts": 1000.0, "interval": 300, "jitter": 0}
+        steady = {"_last_seen_ts": 1000.0, "interval": 300,
+                  "c2_profile": {"jitter": 0}}
         self.assertTrue(opshell.report_is_overdue(steady, 1000.0 + 650))
-        # And a genuinely silent one still is, jitter or no jitter.
-        self.assertTrue(opshell.report_is_overdue(agent, 1000.0 + 7200))
+        # And an agent that has reported no profile is given the
+        # generator's own default rather than zero, because its beacon
+        # still jitters.
+        silent = {"_last_seen_ts": 1000.0, "interval": 300}
+        self.assertFalse(opshell.report_is_overdue(silent, 1000.0 + 650))
+        self.assertTrue(opshell.report_is_overdue(silent, 1000.0 + 1200))
+
+    def test_every_agent_field_this_module_reads_is_one_the_server_writes(self):
+        """The class fix for four instances of the same mistake.
+
+        Twice a supervisor key, once a status key, once an agent-record
+        key: a fixture invented the name, the code read the same invented
+        name, and the test compared a typo against a typo. The guard added
+        for the supervisor's keys did not cover the agent record, so the
+        fourth one went through it.
+        """
+        import re as _re
+        src = (Path(__file__).resolve().parents[1] / "c2" / "opshell.py").read_text()
+        server = (Path(__file__).resolve().parents[1] / "c2" / "server.py").read_text()
+        reads = set(_re.findall(r'agent\.get\("(\w+)"\)', src))
+        reads |= set(_re.findall(r'agent\[\"(\w+)\"\]', src))
+        self.assertTrue(reads, "no agent fields are read any more")
+        for field in sorted(reads):
+            if field.startswith("_"):
+                # `_last_seen_ts` and friends: the server writes them with
+                # the same spelling, checked below.
+                pass
+            self.assertRegex(
+                server, r'agents\[[^\]]+\]\["%s"\]|"%s":' % (field, field),
+                "opshell.py reads agent[%r] and nothing in server.py "
+                "writes it" % field)
 
     def test_an_agent_that_is_merely_late_is_still_reported_as_it_is(self):
         # One missed interval is normal: jitter, a slow link, a host that
@@ -2987,9 +3069,9 @@ class TestTheGlyphAndTheView(_GuiCase):
         # `test_only_one_keystroke_post_is_ever_in_flight`. What is left
         # here is the naming contract: a keystroke never rides in a URL,
         # anywhere.
-        post = self.js_function("opshellPostKeys")
-        self.assertIn("/api/opshell/keys", post)
-        self.assertIn('method:"POST"', post)
+        flush = self.js_function("opshellFlushKeys")
+        self.assertIn("/api/opshell/keys", flush)
+        self.assertIn('method:"POST"', flush)
         self.assertNotRegex(SERVER_SRC, r"/api/opshell/keys\?")
 
 
@@ -3051,7 +3133,8 @@ class TestTheViewDoesNotOverclaim(_GuiCase):
 _NODE_ENV = r"""
 let posted = [], aborted = [], removed = [], said = [];
 let inFlight = 0, maxInFlight = 0, holdFetch = 0;
-let scheduled = [], timers = [];
+let scheduled = [];
+const timers = new Map();
 
 const sessionStorage = {d: {}, getItem(k){ return this.d[k] ?? null; },
   setItem(k, v){ this.d[k] = String(v); },
@@ -3069,8 +3152,15 @@ function H(){ return {'Authorization': 'Bearer t',
 // express at all.
 let nextReply = {ok: true, status: 200, body: {}};
 let replies = null;
+// A drained queue is an error, not a free 200. The first version fell
+// back to a default success, so any mutation that made the code issue an
+// *extra* request was absorbed silently -- which is a harness hiding the
+// thing it was built to find.
 function reply(){
-  if(replies && replies.length) return replies.shift();
+  if(replies){
+    if(!replies.length) throw new Error('unexpected extra request');
+    return replies.shift();
+  }
   return nextReply;
 }
 
@@ -3085,12 +3175,28 @@ class AbortSignal2 {
   _fire(){ this.aborted = true; this._on.forEach(fn => fn()); }
 }
 
+// Timeout signals that can be made to fire, rather than a comment saying
+// they fire. The previous version recorded the number and nothing else --
+// the same sin as an `abort()` that only pushed a string, which is what
+// made six mutations invisible.
+let pendingTimeouts = [];
+function fireTimeouts(){
+  const due = pendingTimeouts.slice();
+  pendingTimeouts.length = 0;
+  due.forEach(s => s._fire());
+}
+
 class AbortController {
   constructor(){ this.signal = new AbortSignal2(); }
   abort(){ aborted.push('abort'); this.signal._fire(); }
 }
 // The real one: a timeout is a signal that fires itself.
-AbortSignal.timeout = ms => { const s = new AbortSignal2(); s._ms = ms; return s; };
+AbortSignal.timeout = ms => {
+  const s = new AbortSignal2();
+  s._ms = ms;
+  pendingTimeouts.push(s);
+  return s;
+};
 
 async function fetch(url, opts){
   opts = opts || {};
@@ -3132,17 +3238,50 @@ const navigator = {};
 
 // Timers that can actually fire, one turn at a time, so a test can watch a
 // poll loop continue -- or stop.
-function setTimeout(fn, ms){ scheduled.push(ms); timers.push(fn); return timers.length; }
-function clearTimeout(id){ if(id) timers[id - 1] = null; }
+// A map, not an array whose length is the id: the first version reset
+// `timers.length = 0` on every round, so an id handed out before a round
+// pointed at an unrelated slot afterwards and `clearTimeout` would have
+// cancelled the wrong callback.
+let timerSeq = 0;
+function setTimeout(fn, ms){
+  scheduled.push(ms);
+  timerSeq += 1;
+  timers.set(timerSeq, fn);
+  return timerSeq;
+}
+function clearTimeout(id){ if(id) timers.delete(id); }
 async function runTimers(rounds){
   for(let i = 0; i < (rounds || 1); i++){
-    const due = timers.slice();
-    timers.length = 0;
-    for(const fn of due) if(fn) await fn();
+    const due = Array.from(timers.entries());
+    due.forEach(([id]) => timers.delete(id));
+    for(const [, fn] of due) if(fn) await fn();
   }
 }
 
 class TextEncoder { encode(s){ return Buffer.from(s, 'utf8'); } }
+
+// A readable stream, so the reader loop can actually run. Without one
+// every successful reply had `body: null` and took the `!res.body` branch,
+// which hid the whole loop: the terminal write path, the guard for a
+// disposed terminal, the `done` exit and the close that follows it. Two
+// Review Focus conditions were proven at the bridge and never through the
+// view.
+function fakeStream(chunks, failAfter){
+  let i = 0;
+  return {
+    getReader(){
+      return {
+        async read(){
+          if(failAfter !== undefined && i === failAfter){
+            throw new Error('stream broke');
+          }
+          if(i >= chunks.length) return {done: true, value: undefined};
+          return {done: false, value: chunks[i++]};
+        },
+      };
+    },
+  };
+}
 
 // A terminal that records, so `opshellSay` and the attach notes are
 // observable rather than merely survivable.
@@ -3154,6 +3293,35 @@ function fakeTerm(){
 }
 """
 
+
+
+class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
+    def test_node_is_present_or_this_fails_loudly(self):
+        """Twenty-eight tests hide behind `skipUnless(node)`.
+
+        They are the only defence the interface has -- the grep tests
+        cannot see a swallowed error, a missing control or a close that
+        never happens. A box without node loses all of them and reports
+        success, which is the same shape as the five tests this branch
+        once deleted while the suite went green.
+
+        One loud failure instead of twenty-eight quiet skips.
+        """
+        self.assertTrue(
+            shutil.which("node"),
+            "node is not installed, so every behavioural test of the "
+            "operator shell's interface was skipped. Install node, or "
+            "accept that this feature's view is untested on this machine.")
+
+    def test_the_count_of_behavioural_tests_has_not_quietly_dropped(self):
+        # The five deleted tests were invisible because the total still
+        # looked plausible. A floor makes a silent loss loud.
+        names = [n for n in dir(TestTheViewRunsAndIsNotJustRead)
+                 if n.startswith("test_")]
+        self.assertGreaterEqual(
+            len(names), 25,
+            "only %d behavioural view tests remain; five were once deleted "
+            "by accident and the suite stayed green" % len(names))
 
 
 class TestTheViewRunsAndIsNotJustRead(_GuiCase):
@@ -3183,11 +3351,11 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "esc", "opshellEndSession", "opshellTeardown", "opshellPicker",
             "opshellRender", "opshellOpen", "opshellB64",
             "opshellSay", "opshellFlushKeys", "opshellEndAfterAttach",
-            "opshellPoll", "opshellAttach", "opshellPostKeys")]) + "\n"
+            "opshellPoll", "opshellAttach")]) + "\n"
         # The one module constant the keystroke path reads.
-        const = re.search(r"^const OPSHELL_KEYS_PER_POST = .*$",
+        const = re.search(r"^const OPSHELL_KEYS_CEILING = .*$",
                           SERVER_SRC, re.M)
-        self.assertIsNotNone(const, "the per-post ceiling is gone")
+        self.assertIsNotNone(const, "the request ceiling is gone")
         src = const.group(0) + "\n" + src
         out = subprocess.run(
             ["node", "--input-type=module", "-e", env + src + script],
@@ -3352,6 +3520,130 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(got["opens"], 1)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_batch_is_sent_whole_or_not_at_all(self):
+        """Atomic, after three repairs that each added a failure mode.
+
+        Generation one posted per keystroke and could reorder. Generation
+        two coalesced and lost whole batches in silence. Generation three
+        put a failed batch back and made an unbounded buffer that lied.
+        Generation four split oversized batches -- and a split that fails
+        part way delivers a prefix into a root shell: measured, 262144
+        bytes of a pasted script executed while the view said nothing had
+        been delivered and told the operator to type it again.
+
+        A terminal cannot express partial delivery, so this does not try.
+        One batch, one request, no splitting, no retry: it arrives whole or
+        it is refused whole and named.
+        """
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            # Under the client's ceiling, so the server's refusal is the
+            # path under test rather than the up-front check.
+            "opshellKeys = 'rm -rf /important' + 'A'.repeat(100000) + '\\r';\n"
+            "nextReply = {ok:false, status:413, body:{}};\n"
+            "await opshellFlushKeys();\n"
+            "console.log(JSON.stringify({posts: posted.filter("
+            "p => p.url.endsWith('keys')).length,"
+            " leftover: opshellKeys.length,"
+            " said: opshellTerm.lines.join(' ')}));")
+        # Nothing was sent, so nothing can have partly landed.
+        self.assertEqual(got["posts"], 1)
+        self.assertEqual(got["leftover"], 0)
+        self.assertRegex(got["said"], r"(?i)nothing .*(sent|delivered)|"
+                                      r"not .*(sent|delivered)")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_paste_too_large_to_send_whole_is_refused_before_it_is_sent(self):
+        # Refused up front, with its size, rather than split: splitting is
+        # what created the partial-delivery defect. The ceiling is measured
+        # in the units the server measures, so a non-ASCII paste cannot
+        # slip past the client's check and be refused by the server.
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "opshellKeys = '\\u00e9'.repeat(200000);\n"
+            "await opshellFlushKeys();\n"
+            "console.log(JSON.stringify({posts: posted.filter("
+            "p => p.url.endsWith('keys')).length,"
+            " leftover: opshellKeys.length,"
+            " said: opshellTerm.lines.join(' ')}));")
+        self.assertEqual(got["posts"], 0,
+                         "an oversized paste was sent anyway")
+        self.assertEqual(got["leftover"], 0)
+        self.assertRegex(got["said"], r"(?i)too large|too much")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_paste_the_server_accepts_is_not_refused_by_the_client(self):
+        # The two ceilings have to agree, or the client refuses what the
+        # server would have taken -- or worse, the reverse. Measured in
+        # base64 of UTF-8, which is what the route counts.
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "opshellKeys = '\\u00e9'.repeat(60000);\n"
+            "await opshellFlushKeys();\n"
+            "const sent = posted.filter(p => p.url.endsWith('keys'));\n"
+            "console.log(JSON.stringify({posts: sent.length,"
+            " encoded: sent.length ? JSON.parse(sent[0].body).data.length : 0,"
+            " said: opshellTerm.lines.join(' ')}));")
+        self.assertEqual(got["posts"], 1)
+        self.assertLessEqual(got["encoded"], 256 * 1024)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_an_emoji_survives_the_encoding_whole(self):
+        # Atomic sending removed the slicing that could cut a surrogate
+        # pair, but the encoder still has to handle one: a pair arriving as
+        # two U+FFFD is a different character reaching a root shell.
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "opshellKeys = 'echo \\ud83d\\udc3e';\n"
+            "await opshellFlushKeys();\n"
+            "const body = posted.filter(p => p.url.endsWith('keys'))[0];\n"
+            "console.log(JSON.stringify({text: Buffer.from("
+            "JSON.parse(body.body).data, 'base64').toString('utf8')}));")
+        self.assertEqual(got["text"], "echo \U0001f43e")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_refusal_shows_the_detail_the_route_sent(self):
+        # The route answers 409 for a bridge that was never accepted with
+        # `detail: "its reason is on the stream"`. The client printed
+        # `HTTP 409` and discarded the sentence that tells the operator
+        # where to look.
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "nextReply = {ok:false, status:409, body:{error:'the shell port "
+            "refused this session', detail:'its reason is on the stream'}};\n"
+            "opshellKeys = 'ls';\n"
+            "await opshellFlushKeys();\n"
+            "console.log(JSON.stringify({said: opshellTerm.lines.join(' ')}));")
+        self.assertIn("refused this session", got["said"])
+        self.assertIn("on the stream", got["said"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_nothing_is_ever_sent_twice(self):
+        """The retry duplicated input, and its test pinned the duplicate.
+
+        A rejected `fetch` does not mean the request was not delivered: a
+        reset after the body was written, or a lost response, both reject.
+        The retry then re-sent the same bytes into a root shell, and
+        `/api/opshell/keys` has no idempotency of any kind. A named drop
+        beats a silent duplicate.
+        """
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "nextReply = {throw:'socket hang up'};\n"
+            "opshellKeys = 'reboot\\r';\n"
+            "await opshellFlushKeys();\n"
+            "console.log(JSON.stringify({posts: posted.filter("
+            "p => p.url.endsWith('keys')).length,"
+            " leftover: opshellKeys.length,"
+            " said: opshellTerm.lines.join(' ')}));")
+        self.assertEqual(got["posts"], 1, "the batch was sent twice")
+        self.assertEqual(got["leftover"], 0)
+        # The one thing nobody on this side can know: a rejected request
+        # may already have been delivered.
+        self.assertRegex(got["said"], r"(?i)may or may not|may have")
+        self.assertRegex(got["said"], r"(?i)not .*again|check the session")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_refusal_that_cannot_succeed_drops_the_batch_and_says_so(self):
         """C1 of the third review: my own fix was worse than the defect.
 
@@ -3382,69 +3674,89 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             self.assertEqual(got["posts"], 2, status)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
-    def test_a_network_blip_is_retried_once(self):
-        # A dropped connection can come good, so one retry. Two would be
-        # the unbounded buffer again with extra steps.
+    def test_what_the_port_writes_reaches_the_terminal(self):
+        """Review Focus 2's browser half, unproven until now.
+
+        The cap's refusal arrives as bytes on the stream rather than as an
+        HTTP error, which the bridge tests pin -- but no test ever gave the
+        harness a stream, so every successful reply took the `!res.body`
+        branch and the reader loop never ran once.
+        """
         got = self._node(
-            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
-            "replies = [{throw:'socket hang up'}, {ok:true, status:200,"
-            " body:{}}];\n"
-            "opshellKeys = 'ls';\n"
-            "await opshellFlushKeys();\n"
-            "console.log(JSON.stringify({leftover: opshellKeys,"
-            " posts: posted.filter(p => p.url.endsWith('keys')).length,"
-            " text: posted.filter(p => p.url.endsWith('keys')).map("
-            "p => Buffer.from(JSON.parse(p.body).data,'base64')"
-            ".toString())}));")
-        self.assertEqual(got["leftover"], "")
-        self.assertEqual(got["posts"], 2, "the blip was not retried")
-        self.assertEqual(got["text"], ["ls", "ls"])
+            "els['opshell-term'] = el('opshell-term');\n"
+            "globalThis.Terminal = function(){ return fakeTerm(); };\n"
+            "opshellSession = 'sid';\n"
+            "nextReply = {ok:true, status:200,"
+            " stream: fakeStream(['no free session slots', 'root@parrot:~# '])};\n"
+            "await opshellAttach({state:'live', geometry:[80,24],"
+            " host:'parrot'});\n"
+            "console.log(JSON.stringify({lines: opshellTerm"
+            " ? opshellTerm.lines : null, session: opshellSession,"
+            " closed: posted.filter(p => p.url.endsWith('close')).length}));")
+        self.assertIn("no free session slots", " ".join(got["lines"]))
+        self.assertIn("root@parrot", " ".join(got["lines"]))
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
-    def test_a_blip_that_does_not_clear_gives_up_and_says_so(self):
+    def test_a_far_end_that_hangs_up_ends_the_session(self):
+        # Review Focus 4's browser half: the loop's `done` exit, the
+        # closing note, and the close that queues the shutdown.
         got = self._node(
-            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
-            "nextReply = {throw:'socket hang up'};\n"
-            "opshellKeys = 'ls';\n"
-            "await opshellFlushKeys();\n"
-            "console.log(JSON.stringify({leftover: opshellKeys,"
-            " posts: posted.filter(p => p.url.endsWith('keys')).length,"
-            " said: opshellTerm.lines.join(' ')}));")
-        self.assertEqual(got["leftover"], "")
-        self.assertEqual(got["posts"], 2)
-        self.assertRegex(got["said"], r"(?i)dropped|not delivered")
+            "els['opshell-term'] = el('opshell-term');\n"
+            "globalThis.Terminal = function(){ return fakeTerm(); };\n"
+            "opshellSession = 'sid';\n"
+            "const term = fakeTerm();\n"
+            "globalThis.Terminal = function(){ return term; };\n"
+            "nextReply = {ok:true, status:200, stream: fakeStream(['bye'])};\n"
+            "await opshellAttach({state:'live', geometry:[80,24],"
+            " host:'parrot'});\n"
+            "console.log(JSON.stringify({said: term.lines.join(' '),"
+            " session: opshellSession,"
+            " closed: posted.filter(p => p.url.endsWith('close')).length}));")
+        self.assertRegex(got["said"], r"session ended")
+        self.assertIsNone(got["session"])
+        self.assertEqual(got["closed"], 1,
+                         "a finished stream did not end the session")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
-    def test_a_batch_too_large_to_send_is_split_rather_than_stuck(self):
-        # Without splitting, one paste over the ceiling could never be
-        # delivered by any number of retries: the same batch, refused for
-        # ever.
+    def test_a_stream_that_breaks_mid_session_ends_it_too(self):
         got = self._node(
-            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
-            "opshellKeys = 'A'.repeat(500000);\n"
-            "await opshellFlushKeys();\n"
-            "const sent = posted.filter(p => p.url.endsWith('keys'))"
-            ".map(p => JSON.parse(p.body).data.length);\n"
-            "console.log(JSON.stringify({leftover: opshellKeys.length,"
-            " sent, max: Math.max(...sent)}));")
-        self.assertEqual(got["leftover"], 0)
-        self.assertGreater(len(got["sent"]), 1, "the paste was not split")
-        self.assertLessEqual(got["max"], 256 * 1024)
+            "els['opshell-term'] = el('opshell-term');\n"
+            "const term = fakeTerm();\n"
+            "globalThis.Terminal = function(){ return term; };\n"
+            "opshellSession = 'sid';\n"
+            "nextReply = {ok:true, status:200,"
+            " stream: fakeStream(['hello'], 1)};\n"
+            "await opshellAttach({state:'live', geometry:[80,24],"
+            " host:'parrot'});\n"
+            "console.log(JSON.stringify({said: term.lines.join(' '),"
+            " session: opshellSession,"
+            " closed: posted.filter(p => p.url.endsWith('close')).length}));")
+        self.assertIn("hello", got["said"])
+        self.assertIsNone(got["session"])
+        self.assertEqual(got["closed"], 1)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
-    def test_a_dropped_batch_takes_what_was_typed_after_it(self):
-        # Found by mutation: keeping the rest after dropping a batch left
-        # the later keystrokes to be delivered without the earlier ones,
-        # which is a truncated command arriving in a root shell. If a
-        # batch is lost the rest of the line is lost with it.
+    def test_a_torn_down_view_does_not_write_into_a_disposed_terminal(self):
+        # The guard inside the loop. Without it the first chunk after a
+        # teardown threw a TypeError outside the try, the promise rejected
+        # unhandled, and the close never ran.
         got = self._node(
-            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
-            "nextReply = {ok:false, status:413, body:{}};\n"
-            "opshellKeys = 'A'.repeat(200000) + 'rm -rf /\\r';\n"
-            "await opshellFlushKeys();\n"
-            "console.log(JSON.stringify({leftover: opshellKeys.length}));")
-        self.assertEqual(got["leftover"], 0,
-                         "keystrokes typed after a dropped batch survived it")
+            "els['opshell-term'] = el('opshell-term');\n"
+            "const term = fakeTerm();\n"
+            "globalThis.Terminal = function(){ return term; };\n"
+            "opshellSession = 'sid';\n"
+            "let reads = 0;\n"
+            "nextReply = {ok:true, status:200, stream: {getReader(){"
+            " return {async read(){ reads += 1;"
+            " if(reads === 1){ opshellTerm = null;"
+            " return {done:false, value:'x'}; }"
+            " return {done:true}; }}; }}};\n"
+            "await opshellAttach({state:'live', geometry:[80,24],"
+            " host:'parrot'});\n"
+            "console.log(JSON.stringify({reads, wrote: term.lines.length}));")
+        # It stops at the first chunk after the terminal went, rather than
+        # throwing or writing into a detached element.
+        self.assertEqual(got["reads"], 1)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_stream_that_cannot_be_reached_ends_the_session(self):
@@ -3549,6 +3861,69 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(got["sent"], ["ls"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_poll_keeps_beating_on_the_path_that_usually_runs(self):
+        """Critical 2 of the fourth review: the line nothing defended.
+
+        `claims.beat` has one caller, reached only by this poll, and the
+        poll re-enters itself from two places: the failure arm, which had a
+        test, and the success arm, which had none. Deleting the success
+        arm's `setTimeout` left all 231 tests green -- and then the claim
+        goes silent, the 240 second margin retires it, and the sweep stops
+        a channel with an operator sitting in the shell. The whole lapse
+        argument rests on this one line.
+
+        `runTimers` existed and nothing called it, which is why the
+        multi-poll properties were all unproven.
+        """
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "opshellSession = 'sid';\n"
+            "nextReply = {ok:true, status:200, body:{state:'waiting',"
+            " channel:'closed', host:'parrot', expected_checkin:12}};\n"
+            "await opshellPoll();\n"
+            "const first = posted.length;\n"
+            "await runTimers(1);\n"
+            "await runTimers(1);\n"
+            "const urls = posted.filter(p => p.url.includes('/state'))"
+            ".map(p => p.url);\n"
+            "console.log(JSON.stringify({first, polls: urls.length,"
+            " carriesSession: urls.every(u => u.includes('session=')),"
+            " scheduledEach: scheduled}));")
+        self.assertEqual(got["first"], 1)
+        self.assertEqual(got["polls"], 3,
+                         "the poll did not keep beating: %d requests"
+                         % got["polls"])
+        self.assertTrue(got["carriesSession"],
+                        "a poll without the session id is not a heartbeat")
+        # One timer per poll, not two: a second schedule per turn doubles
+        # the loop every time round.
+        self.assertEqual(got["scheduledEach"], [2000, 2000, 2000])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_stalled_poll_becomes_a_failure_and_the_beat_goes_on(self):
+        """What the deadline actually does, not that it is present.
+
+        The previous test asserted the number was recorded and under 30
+        seconds -- `AbortSignal.timeout(29999)` would have passed it. The
+        harness now fires the signal, so the stall can be driven: a proxy
+        that accepts and never answers, which is the case this deadline
+        exists for and the one that produces no rejection on its own.
+        """
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "opshellSession = 'sid';\n"
+            "holdFetch = 8;\n"
+            "const polling = opshellPoll();\n"
+            "fireTimeouts();\n"
+            "await polling;\n"
+            "console.log(JSON.stringify({shown: els['opshell-body'].innerHTML,"
+            " scheduled, deadline: posted[0] && posted[0].timeout}));")
+        self.assertRegex(got["shown"], r"(?i)abort")
+        self.assertEqual(got["scheduled"], [2000],
+                         "a stalled poll did not reschedule itself")
+        self.assertEqual(got["deadline"], 8000)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_one_failed_poll_does_not_end_the_heartbeat(self):
         """The grace argument rests on the poll being reliable.
 
@@ -3643,6 +4018,62 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertIsNone(got["session"])
         self.assertEqual(got["urls"],
                          ["/api/opshell/open", "/api/opshell/close"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_second_session_is_warned_about_the_same_outage(self):
+        """I4 of the fourth review: two variables that outlive a session.
+
+        `opshellKeys` is cleared when a session ends, for exactly this
+        reason -- state leaking into the next one -- and the two variables
+        added for "say it once per transition" were left behind. Measured:
+        session A warns once, teardown, session B hits the identical
+        outage and is warned **zero** times, while the claim lapses under
+        an operator sitting in a root shell. And the mirror: a fresh panel
+        announcing "the team server is answering again" for trouble it
+        never saw.
+        """
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "opshellAttached = true; opshellSession = 'a';\n"
+            "opshellTerm = fakeTerm();\n"
+            "nextReply = {throw:'Failed to fetch'};\n"
+            "await opshellPoll();\n"
+            "const inA = opshellTerm.lines.length;\n"
+            "await opshellTeardown(els['opshell-body']);\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "opshellAttached = true; opshellSession = 'b';\n"
+            "opshellTerm = fakeTerm();\n"
+            "await opshellPoll();\n"
+            "const inB = opshellTerm.lines.length;\n"
+            "opshellTerm = fakeTerm();\n"
+            "nextReply = {ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot'}};\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({inA, inB,"
+            " recovered: opshellTerm.lines.join(' ')}));")
+        self.assertEqual(got["inA"], 1)
+        self.assertEqual(got["inB"], 1,
+                         "the second session was warned %d times"
+                         % got["inB"])
+        self.assertRegex(got["recovered"], r"(?i)answering again")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_fresh_panel_does_not_announce_a_recovery_it_never_missed(self):
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "opshellAttached = true; opshellSession = 'a';\n"
+            "opshellTerm = fakeTerm();\n"
+            "nextReply = {throw:'down'};\n"
+            "await opshellPoll();\n"
+            "await opshellTeardown(els['opshell-body']);\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "opshellAttached = true; opshellSession = 'b';\n"
+            "opshellTerm = fakeTerm();\n"
+            "nextReply = {ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot'}};\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({said: opshellTerm.lines.join(' ')}));")
+        self.assertNotRegex(got["said"], r"(?i)answering again")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_failed_poll_does_not_destroy_a_live_terminal(self):

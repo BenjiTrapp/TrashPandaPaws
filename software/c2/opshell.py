@@ -147,11 +147,20 @@ class Claims:
         """
         with self._lock:
             known = self._owned.get(agent_id)
-            if known is None or (raised and not known.get("raised")):
+            # Nothing on file for an adopting claim. The record exists to
+            # say "a stop is owed here"; an adopted channel is never this
+            # view's to stop, so a record for it could never be released --
+            # `settled` cannot be true for a stop that was never queued, so
+            # `reconcile` reported it owed on every sweep for ever, at one
+            # relay round trip each. The refcount still counts the session,
+            # which is what stops another tab's close acting under it, and
+            # `raised()` answers False for an agent with no record, which
+            # is already the right answer.
+            if raised and (known is None or not known.get("raised")):
                 updated = dict(self._owned)
                 updated[agent_id] = {
                     "since": (known or {}).get("since") or _now_iso(),
-                    "raised": bool(raised) or bool((known or {}).get("raised")),
+                    "raised": True,
                 }
                 self._save(updated)
                 self._owned = updated
@@ -435,6 +444,11 @@ def expected_checkin(agent: dict, now: float) -> Optional[float]:
 #: delivered to anybody.
 STALE_AFTER_INTERVALS = 2
 
+#: The generator's own default jitter, in percent, for an agent that has
+#: not reported a profile. `server.py` defaults the generator to 20, so a
+#: beacon built with the defaults sleeps in [0.8, 1.2] of its interval.
+_DEFAULT_JITTER = 20
+
 
 def report_is_overdue(agent: dict, now: float) -> bool:
     """Whether this agent's last report is too old to speak for the device.
@@ -457,10 +471,21 @@ def report_is_overdue(agent: dict, now: float) -> bool:
     # operator may set j as high as 100%, so a flat two-interval line calls
     # a perfectly healthy agent overdue with no missed check-in at all --
     # and the view would flap to `unknown` on a working device.
-    jitter = agent.get("jitter")
+    # `agents[id]["c2_profile"]["jitter"]`, which is where the server
+    # stores what the beacon reported (`server.py` on the check-in,
+    # `beacon.py` when it builds the profile). The first version read a
+    # top-level `jitter` that nothing writes, so the widening never
+    # happened and the test that proved it invented the key.
+    #
+    # An agent that has reported no profile is given the generator's own
+    # default of 20%, not zero: its beacon still jitters, and assuming no
+    # jitter is what calls a healthy device overdue.
+    profile = agent.get("c2_profile")
+    jitter = (profile or {}).get("jitter") if isinstance(profile, dict) \
+        else None
     if isinstance(jitter, bool) or not isinstance(jitter, (int, float)) \
             or jitter < 0:
-        jitter = 0
+        jitter = _DEFAULT_JITTER
     slack = interval * (1 + min(jitter, 100) / 100.0)
     return due < -(interval * (STALE_AFTER_INTERVALS - 2) + slack)
 
