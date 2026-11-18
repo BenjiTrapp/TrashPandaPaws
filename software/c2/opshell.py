@@ -59,16 +59,14 @@ _DEFAULT_INTERVAL = 300
 # to.
 _CONNECT_TIMEOUT = 15.0
 
-# The longest a write may be blocked by a peer that has stopped reading.
-# Fixed on the socket for its life, because a per-call timeout set by one
-# thread would be inherited by whatever another thread did next.
+# The longest one `write` may take in total: a socket's timeout bounds the
+# whole of a `sendall`, not each stalled send inside it, so a large write
+# to a peer that has stopped reading raises after this long, and so does
+# a large one to a slow peer. Set once on the socket for its life; `read`
+# waits on a selector and never touches it.
 _WRITE_TIMEOUT = 15.0
 
 _CHUNK = 65536
-
-# The longest a waiting `read` goes without noticing that `close` was
-# called.
-_SLICE = 0.2
 
 
 class OwnershipRecordError(ValueError):
@@ -384,28 +382,49 @@ class Bridge:
     is fixed at construction and is the only size a view may state.
 
     `read` is meant for one thread and `write` for another; `close` may
-    come from any and wakes a `read` that is waiting.
+    come from any, including while `connect` is still waiting for the
+    prompt, and ends whatever is waiting.
+
+    **Closing never closes a descriptor someone is using.** `close` shuts
+    the connection down and writes a byte to a private socketpair that
+    every wait also listens on, so a waiting `connect` or `read` wakes at
+    once; the descriptors themselves are closed by whichever thread is
+    the last one using them. Closing a descriptor under a thread that is
+    about to `recv` on it is the one way to hand its number to another
+    socket in this process.
 
     **A refusal is bytes, not an exception.** The port writes its refusal
     onto the connection, in place of a shell, so that an operator reads
     the reason instead of looking at what resembles a dead tunnel. That
     includes the refusals the accept loop writes without ever prompting:
     those are held for the first `read`, and the password is not sent to
-    a peer that did not ask for it.
+    a peer that did not ask for it. `accepted` says which of the two
+    happened.
     """
 
     def __init__(self, port: int, password: str, cols: int, rows: int,
                  host: str = "127.0.0.1"):
         self._host = host
         self._port = port
-        self._password = password
+        self._password = password  # type: Optional[str]
         self._geometry = (_dimension(cols, SHELL_DEFAULT_COLS),
                           _dimension(rows, SHELL_DEFAULT_ROWS))
+        # Serialises `connect`, which may hold it for the whole timeout,
+        # so nothing else may wait on it: `_mu` guards the state below.
         self._lock = threading.Lock()
+        self._mu = threading.Lock()
         self._sock = None  # type: Optional[socket.socket]
+        self._sel = None  # type: Optional[selectors.BaseSelector]
+        self._wake_r = None  # type: Optional[socket.socket]
+        self._wake_w = None  # type: Optional[socket.socket]
         self._pending = b""
+        self._connecting = False
+        self._established = False
         self._accepted = False
         self._closed = False
+        # Threads inside `read` or `write`: the descriptors stay open
+        # while this is above zero.
+        self._users = 0
 
     def __repr__(self) -> str:
         return "Bridge(%s:%s, %dx%d)" % (self._host, self._port,
@@ -418,115 +437,93 @@ class Bridge:
 
     @property
     def is_open(self) -> bool:
-        return self._sock is not None
+        return self._established and not self._closed
+
+    @property
+    def accepted(self) -> bool:
+        """True when the port prompted and was sent the auth line.
+
+        False means the port answered with a refusal in place of the
+        prompt: `read` has it, and `write` has nowhere to go. A caller
+        shows that text before it treats a failed `write` as the end.
+        """
+        return self._accepted
 
     def connect(self, timeout: float = _CONNECT_TIMEOUT) -> None:
         """Dial, wait for the prompt, send the auth line.
 
         `timeout` bounds the whole of it, the wait for the prompt
         included, and a port that does not prompt in time raises
-        `socket.timeout`. The password is sent only after the prompt.
-        Anything else arriving first is a refusal in place of a prompt and
-        is kept for `read`; `connect` then returns without sending it.
+        `socket.timeout`. The password is sent only after the prompt, and
+        not at all once `close` has been called: that raises
+        `ConnectionError`, as does a port that hangs up before sending a
+        byte. Anything else arriving before the prompt is a refusal in
+        its place, kept for `read`; `connect` then returns without
+        sending the password.
+
+        A bridge connects once. After any failure it is closed and its
+        password dropped.
         """
         with self._lock:
-            if self._sock is not None or self._closed:
-                raise RuntimeError("a bridge connects once; make another")
-            # Rejected before any connection exists to be left open.
-            line = auth_line(self._password, *self._geometry)
-            deadline = time.monotonic() + timeout
-            sock = socket.create_connection((self._host, self._port),
-                                            timeout=timeout)
+            with self._mu:
+                if (self._sock is not None or self._connecting
+                        or self._closed):
+                    raise RuntimeError("a bridge connects once; make "
+                                       "another")
+                # Before anything exists to be left open.
+                line = auth_line(self._password, *self._geometry)
+                self._wake_r, self._wake_w = socket.socketpair()
+                self._connecting = True
             try:
-                head = self._await_prompt(sock, deadline)
-                sock.settimeout(_WRITE_TIMEOUT)
-                if head.startswith(PROMPT):
-                    sock.sendall(line)
-                    head = head[len(PROMPT):]
-                    self._accepted = True
+                self._handshake(line, timeout)
             except BaseException:
-                _shutdown_and_close(sock)
+                with self._mu:
+                    self._closed = True
+                    self._password = None
+                    self._connecting = False
+                    self._release_if_idle()
                 raise
-            self._pending = head
-            self._sock = sock
 
-    def read(self, timeout: float) -> bytes:
-        """What the port has sent, up to a chunk; `b""` once it has ended.
-
-        Raises `socket.timeout` when it says nothing for `timeout`
-        seconds, which is not the end of anything: an idle shell is the
-        normal state of one, so the caller asks again. A stream that ends
-        in a reset is an `OSError` and not an end, because a shell that
-        exited and a tunnel that was lost are not the same news.
-        """
-        sock = self._sock
-        if sock is None:
-            if self._closed:
-                return b""
-            raise OSError("this bridge is not connected")
-        if self._pending:
-            data, self._pending = self._pending, b""
-            return data
-        # Waited on in short slices that look at `close` in between: a
-        # shutdown that races a `close` of the descriptor can be lost by
-        # the selector, and a read that never learns the bridge was closed
-        # is a view that claims to be live.
+    def _handshake(self, line: bytes, timeout: float) -> None:
         deadline = time.monotonic() + timeout
-        with selectors.DefaultSelector() as sel:
-            try:
-                sel.register(sock, selectors.EVENT_READ)
-            except (ValueError, OSError):
-                if self._sock is not sock:
-                    return b""
-                raise
-            while True:
-                if self._sock is not sock:
-                    return b""
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    raise socket.timeout("the shell port sent nothing for "
-                                         "%g s" % timeout)
-                try:
-                    if sel.select(min(left, _SLICE)):
-                        break
-                except (ValueError, OSError):
-                    if self._sock is not sock:
-                        return b""
-                    raise
-        try:
-            return sock.recv(_CHUNK)
-        except OSError:
-            if self._sock is None:
-                return b""
-            raise
+        sock = socket.create_connection((self._host, self._port),
+                                        timeout=timeout)
+        # Published at once so that `close` can reach it.
+        with self._mu:
+            self._sock = sock
+            if self._closed:
+                raise ConnectionError("closed before the shell port "
+                                      "answered")
+        sock.settimeout(_WRITE_TIMEOUT)
+        sel = selectors.DefaultSelector()
+        with self._mu:
+            self._sel = sel
+        sel.register(sock, selectors.EVENT_READ)
+        sel.register(self._wake_r, selectors.EVENT_READ)
+        head = self._await_prompt(sel, sock, deadline)
+        accepted = head.startswith(PROMPT)
+        with self._mu:
+            # The last look before the password leaves.
+            if self._closed:
+                raise ConnectionError("closed before the password was sent")
+        if accepted:
+            sock.sendall(line)
+            head = head[len(PROMPT):]
+        with self._mu:
+            if self._closed:
+                raise ConnectionError("closed while the password was sent")
+            self._pending = head
+            self._accepted = accepted
+            self._password = None
+            self._connecting = False
+            self._established = True
 
-    def write(self, data: bytes) -> None:
-        """Send every byte of `data`, or raise `OSError`.
-
-        Raises `BrokenPipeError` when no password was sent, because a
-        peer that refused has no shell to type into, and `OSError` when
-        the bridge is closed or the peer stops reading for too long.
-        """
-        sock = self._sock
-        if sock is None or not self._accepted:
-            raise BrokenPipeError("the shell port did not accept this "
-                                  "session, so there is nothing to write to")
-        sock.sendall(data)
-
-    def close(self) -> None:
-        """End the connection; safe to repeat, and wakes a waiting `read`."""
-        sock, self._sock = self._sock, None
-        self._closed = True
-        if sock is not None:
-            _shutdown_and_close(sock)
-
-    @staticmethod
-    def _await_prompt(sock: socket.socket, deadline: float) -> bytes:
+    def _await_prompt(self, sel: selectors.BaseSelector,
+                      sock: socket.socket, deadline: float) -> bytes:
         """Bytes read until they are the prompt or can never become it.
 
-        Returns what arrived. A prompt may come in pieces, so a prefix of
-        it is waited on; the deadline is absolute because `settimeout`
-        restarts on every byte.
+        A prompt may come in pieces, so a prefix of it is waited on. The
+        deadline is absolute: a per-recv timeout restarts on every byte.
         """
         head = b""
         while not head.startswith(PROMPT):
@@ -535,17 +532,120 @@ class Bridge:
             left = deadline - time.monotonic()
             if left <= 0:
                 raise socket.timeout("the shell port did not prompt in time")
-            sock.settimeout(left)
+            ready = {key.fileobj for key, _ in sel.select(left)}
+            if self._wake_r in ready:
+                raise ConnectionError("closed before the shell port "
+                                      "answered")
+            if sock not in ready:
+                continue
             chunk = sock.recv(_CHUNK)
             if not chunk:
-                return head
+                if head:
+                    return head
+                raise ConnectionError("the shell port hung up without "
+                                      "saying anything")
             head += chunk
         return head
 
+    def read(self, timeout: float) -> bytes:
+        """What the port has sent, up to a chunk; `b""` once it has ended.
 
-def _shutdown_and_close(sock: socket.socket) -> None:
-    try:
-        sock.shutdown(socket.SHUT_RDWR)
-    except OSError:
-        pass
-    sock.close()
+        `b""` is also what a closed bridge answers. Raises
+        `socket.timeout` when the port says nothing for `timeout`
+        seconds, which is not the end of anything: an idle shell is the
+        normal state of one, so the caller asks again. A stream that ends
+        in a reset is an `OSError` and not an end, because a shell that
+        exited and a tunnel that was lost are not the same news. One
+        thread reads at a time.
+        """
+        with self._mu:
+            if self._closed:
+                return b""
+            if not self._established:
+                raise OSError("this bridge is not connected")
+            if self._pending:
+                data, self._pending = self._pending, b""
+                return data
+            self._users += 1
+            sock, sel = self._sock, self._sel
+        try:
+            ready = {key.fileobj for key, _ in sel.select(timeout)}
+            if not ready:
+                raise socket.timeout("the shell port sent nothing for %g s"
+                                     % timeout)
+            if self._wake_r in ready or self._closed:
+                return b""
+            return sock.recv(_CHUNK)
+        except OSError:
+            if self._closed:
+                return b""
+            raise
+        finally:
+            self._leave()
+
+    def write(self, data: bytes) -> None:
+        """Send every byte of `data`, or raise `OSError`.
+
+        `BrokenPipeError` when the bridge is closed or no password was
+        sent -- a peer that refused has no shell to type into -- and an
+        `OSError` when the peer has stopped reading for `_WRITE_TIMEOUT`.
+        """
+        with self._mu:
+            if self._closed:
+                raise BrokenPipeError("this bridge is closed")
+            if not self._established or not self._accepted:
+                raise BrokenPipeError("the shell port did not accept this "
+                                      "session, so there is nothing to "
+                                      "write to")
+            self._users += 1
+            sock = self._sock
+        try:
+            sock.sendall(data)
+        finally:
+            self._leave()
+
+    def close(self) -> None:
+        """End the connection; safe to repeat, and from any thread.
+
+        Wakes a waiting `read` or `connect` and shuts the connection
+        down. The descriptors are closed here only when nothing is using
+        them; otherwise by the last thread that was.
+        """
+        with self._mu:
+            if self._closed:
+                return
+            self._closed = True
+            if self._wake_w is not None:
+                try:
+                    self._wake_w.send(b"x")
+                except OSError:
+                    pass
+            if self._sock is not None:
+                try:
+                    self._sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            self._release_if_idle()
+
+    def _leave(self) -> None:
+        with self._mu:
+            self._users -= 1
+            self._release_if_idle()
+
+    def _release_if_idle(self) -> None:
+        """Close every descriptor, once the bridge is closed and unused.
+
+        Called with `_mu` held. `connect` counts as a user until it
+        returns or fails, so it is the one that releases after a close
+        that came during the handshake.
+        """
+        if not self._closed or self._users or self._connecting:
+            return
+        for name in ("_sel", "_sock", "_wake_r", "_wake_w"):
+            held = getattr(self, name)
+            setattr(self, name, None)
+            if held is not None:
+                try:
+                    held.close()
+                except OSError:
+                    pass

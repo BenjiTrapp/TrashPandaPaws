@@ -9,6 +9,7 @@ that: every way the bookkeeping could forget a stop it owes.
 import ast
 import json
 import os
+import selectors
 import socket
 import stat
 import sys
@@ -402,14 +403,20 @@ class _FakeShellPort:
     is a refusal in its place, as the accept loop writes them, and is
     followed by a half-close so the bridge sees the stream end. What the
     peer sent is `received()`; `first_line()` waits for the line itself.
+    `hold`, an Event, keeps the prompt back until it is set, and
+    `connected` says the bridge has dialled in. `drain=False` never reads
+    past the line, so a large write to it ends up blocked.
     """
 
     PROMPT = b"password: "
 
     def __init__(self, prompt=PROMPT, then=b"", die_after_auth=False,
-                 drip=False):
+                 drip=False, hold=None, drain=True):
         self._prompt, self._then, self._die = prompt, then, die_after_auth
         self._drip = drip
+        self._hold = hold
+        self._drain = drain
+        self.connected = threading.Event()
         self._listener = socket.socket()
         self._listener.bind(("127.0.0.1", 0))
         self._listener.listen(1)
@@ -417,7 +424,7 @@ class _FakeShellPort:
         self.port = self._listener.getsockname()[1]
         self._got_line = threading.Event()
         self._stop = threading.Event()
-        self._received = b""
+        self._chunks = []
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
 
@@ -431,6 +438,9 @@ class _FakeShellPort:
                     conn, _ = self._listener.accept()
                 except socket.timeout:
                     pass
+            self.connected.set()
+            if self._hold is not None:
+                self._hold.wait(10.0)
             if self._prompt is None:
                 self._stop.wait(10.0)
                 return
@@ -443,23 +453,25 @@ class _FakeShellPort:
             if self._prompt != self.PROMPT:
                 conn.shutdown(socket.SHUT_WR)
             conn.settimeout(5.0)
-            while b"\n" not in self._received:
+            while b"\n" not in b"".join(self._chunks):
                 chunk = conn.recv(4096)
                 if not chunk:
                     break
-                self._received += chunk
+                self._chunks.append(chunk)
             self._got_line.set()
             if self._then:
                 conn.sendall(self._then)
             conn.settimeout(0.05)
-            while not self._die and not self._stop.is_set():
+            if not self._drain:
+                self._stop.wait(10.0)
+            while self._drain and not self._die and not self._stop.is_set():
                 try:
                     chunk = conn.recv(65536)
                 except socket.timeout:
                     continue
                 if not chunk:
                     break
-                self._received += chunk
+                self._chunks.append(chunk)
         except OSError:
             pass
         finally:
@@ -469,11 +481,11 @@ class _FakeShellPort:
 
     def first_line(self):
         self._got_line.wait(5.0)
-        return self._received.split(b"\n", 1)[0] + b"\n"
+        return b"".join(self._chunks).split(b"\n", 1)[0] + b"\n"
 
     def received(self):
         self._thread.join(5.0)
-        return self._received
+        return b"".join(self._chunks)
 
     def stop(self):
         self._stop.set()
@@ -600,6 +612,170 @@ class TestTheBridge(unittest.TestCase):
     def test_the_password_is_not_in_the_bridge_s_repr(self):
         b = opshell.Bridge(1, "hunter2", 80, 24)
         self.assertNotIn("hunter2", repr(b))
+
+    def test_a_close_during_connect_leaves_no_session_behind(self):
+        # The feature's anti-goal through a normal operator action: the
+        # view is closed while the prompt is still awaited. The password
+        # must not leave, and no live bridge may come back.
+        hold = threading.Event()
+        port = self._fake(prompt=b"password: ", hold=hold)
+        b = opshell.Bridge(port.port, "secret", 80, 24)
+        outcome = []
+
+        def dial():
+            try:
+                b.connect(timeout=10.0)
+                outcome.append("connected")
+            except OSError as exc:
+                outcome.append(exc)
+
+        t = threading.Thread(target=dial, daemon=True)
+        t.start()
+        self.assertTrue(port.connected.wait(5.0))
+        b.close()
+        t.join(3.0)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], ConnectionError)
+        self.assertFalse(b.is_open)
+        hold.set()
+        self.assertEqual(port.received(), b"")
+
+    def test_a_close_before_connect_returns_is_not_undone_by_it(self):
+        b = opshell.Bridge(1, "secret", 80, 24)
+        b.close()
+        with self.assertRaises(RuntimeError):
+            b.connect()
+        self.assertFalse(b.is_open)
+
+    def test_closing_wakes_a_read_without_the_shutdown_s_help(self):
+        # The socketpair is what makes the wake deterministic; with the
+        # shutdown made a no-op, nothing else is left to do it.
+        port = self._fake(prompt=b"password: ")
+        b = self._bridge(port)
+        b.connect()
+        out = []
+        reader = threading.Thread(target=lambda: out.append(b.read(timeout=5)),
+                                  daemon=True)
+        with unittest.mock.patch.object(socket.socket, "shutdown",
+                                        lambda self, how: None):
+            reader.start()
+            time.sleep(0.2)
+            started = time.monotonic()
+            b.close()
+            reader.join(3.0)
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(out, [b""])
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_no_descriptor_outlives_the_bridge_on_any_path(self):
+        # Every socket and selector the bridge makes is caught as it is
+        # made and must be closed once the bridge is. Counting the
+        # process's descriptors would be thrown off by whatever else a
+        # 3500-test process has running.
+        made = []
+
+        def keep(real):
+            def make(*args, **kwargs):
+                out = real(*args, **kwargs)
+                made.extend(out if isinstance(out, tuple) else [out])
+                return out
+            return make
+
+        def closed(obj):
+            if isinstance(obj, socket.socket):
+                return obj.fileno() == -1
+            return obj.get_map() is None
+
+        cases = {
+            "never connected": None,
+            "connected and closed": dict(prompt=b"password: "),
+            "refused in place of the prompt": dict(prompt=b"raccoon: no\r\n"),
+            "hung up before a byte": dict(prompt=b""),
+            "never prompted": dict(prompt=None),
+        }
+        for name, kwargs in cases.items():
+            del made[:]
+            port = self._fake(**kwargs) if kwargs is not None else None
+            with unittest.mock.patch.object(
+                    opshell.socket, "socketpair", keep(socket.socketpair)), \
+                    unittest.mock.patch.object(
+                        opshell.socket, "create_connection",
+                        keep(socket.create_connection)), \
+                    unittest.mock.patch.object(
+                        opshell.selectors, "DefaultSelector",
+                        keep(selectors.DefaultSelector)):
+                b = opshell.Bridge(port.port if port else 1, "secret", 80, 24)
+                if port is not None:
+                    try:
+                        b.connect(timeout=0.5)
+                    except OSError:
+                        pass
+                b.close()
+            # Two ends of the wake-up pair, the connection, the selector.
+            self.assertEqual(len(made), 0 if port is None else 4, name)
+            for obj in made:
+                self.assertTrue(closed(obj), (name, obj))
+
+    def test_closing_ends_a_write_that_is_blocked_on_a_peer_that_does_not_read(self):
+        # The wake byte cannot reach a thread inside `sendall`; the
+        # shutdown does.
+        port = self._fake(prompt=b"password: ", drain=False)
+        b = self._bridge(port)
+        b.connect()
+        out = []
+
+        def push():
+            try:
+                b.write(b"x" * 64000000)
+                out.append("sent")
+            except OSError as exc:
+                out.append(exc)
+
+        writer = threading.Thread(target=push, daemon=True)
+        writer.start()
+        time.sleep(0.3)
+        b.close()
+        writer.join(3.0)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(len(out), 1)
+        self.assertIsInstance(out[0], OSError)
+        with self.assertRaises(BrokenPipeError):
+            b.write(b"after")
+
+    def test_a_port_that_hangs_up_without_a_byte_is_not_a_live_session(self):
+        port = self._fake(prompt=b"")
+        b = opshell.Bridge(port.port, "secret", 80, 24)
+        self.addCleanup(b.close)
+        with self.assertRaises(ConnectionError):
+            b.connect(timeout=2.0)
+        self.assertFalse(b.is_open)
+        self.assertEqual(port.received(), b"")
+
+    def test_the_bridge_says_whether_the_port_accepted_the_session(self):
+        accepted = self._bridge(self._fake(prompt=b"password: "))
+        accepted.connect()
+        self.assertTrue(accepted.accepted)
+        refused = self._bridge(self._fake(prompt=b"raccoon: too many\r\n"))
+        refused.connect()
+        self.assertFalse(refused.accepted)
+        with self.assertRaises(OSError):
+            refused.write(b"ls\n")
+
+    def test_the_password_is_dropped_once_it_has_been_sent(self):
+        port = self._fake(prompt=b"password: ")
+        b = self._bridge(port, password="hunter2")
+        self.assertEqual(b._password, "hunter2")
+        b.connect()
+        self.assertIsNone(b._password)
+
+    def test_the_geometry_clamp_is_the_beacons(self):
+        # `_dimension` mirrors `beacon._shell_geometry`, which is private
+        # to that module; this is what notices the two drifting.
+        for value in (0, 1, 80, 999, 1000, 1001, 9000, -5, None, "x",
+                      True, 80.5):
+            self.assertEqual(opshell._dimension(value, 77),
+                             beacon._shell_geometry(value, 77), value)
 
 
 if __name__ == "__main__":
