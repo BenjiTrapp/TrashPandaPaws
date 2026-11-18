@@ -843,7 +843,21 @@ class _RouteCase(unittest.TestCase):
             tunnel_supervisor=supervisor)
 
     def client(self, **kw):
-        return self.operator_client(self.app(**kw))
+        """One app per test, cached.
+
+        A new `create_app` per request is a server restart per request:
+        the claim store is rebuilt empty while ownership sits on disk, so
+        the start-up reconcile correctly swept every channel between two
+        calls of the same test. That is right behaviour and a wrong
+        fixture. Tests that want a restart build a second app on purpose.
+        """
+        key = tuple(sorted((k, id(v)) for k, v in kw.items()))
+        cached = getattr(self, "_client_cache", None)
+        if cached is None:
+            cached = self._client_cache = {}
+        if key not in cached:
+            cached[key] = self.operator_client(self.app(**kw))
+        return cached[key]
 
     OPERATOR_URL = "http://localhost:18999"
 
@@ -1284,6 +1298,11 @@ class TestTheStreamAndTheKeystrokes(_RouteCase):
     end.
     """
 
+    def _open(self, client):
+        return client.post(self.url("/api/opshell/open"),
+                           json={"agent": self.AGENT},
+                           headers=self.auth).get_json()["session"]
+
     def _with_port(self, **kw):
         port = _FakeShellPort(**kw)
         self.addCleanup(port.stop)
@@ -1298,19 +1317,19 @@ class TestTheStreamAndTheKeystrokes(_RouteCase):
         # terminal is -- and the test client reads a body to its end.
         port, client = self._with_port(then=b"root@parrot:~# ",
                                        die_after_auth=True)
-        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
-                    headers=self.auth)
-        answer = client.get(self.url("/api/opshell/stream"),
-                            headers=self.auth)
+        session = self._open(client)
+        answer = client.get(
+            self.url("/api/opshell/stream?session=" + session),
+            headers=self.auth)
         self.assertEqual(answer.status_code, 200)
         self.assertIn(b"root@parrot", answer.get_data())
 
     def test_the_password_goes_on_the_wire_and_not_into_the_body(self):
         port, client = self._with_port(then=b"x", die_after_auth=True)
-        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
-                    headers=self.auth)
-        answer = client.get(self.url("/api/opshell/stream"),
-                            headers=self.auth)
+        session = self._open(client)
+        answer = client.get(
+            self.url("/api/opshell/stream?session=" + session),
+            headers=self.auth)
         self.assertNotIn(self.SHELL_PASSWORD.encode(), answer.get_data())
         self.assertIn(self.SHELL_PASSWORD.encode(), port.first_line())
 
@@ -1363,38 +1382,22 @@ class TestTheStreamAndTheKeystrokes(_RouteCase):
         queued = [t["args"] for t in self.sm.task_queues.get(self.AGENT, [])]
         self.assertIn("stop", queued)
 
-    def test_a_stream_that_owns_its_claim_queues_the_stop_when_it_ends(self):
-        # No session handed in, so the stream holds the only claim: when it
-        # ends, it is the last one out and the stop is its to queue.
-        port, client = self._with_port(then=b"bye", die_after_auth=True)
-        # The designation written straight to the file rather than through
-        # `/open`: that call would take a claim of its own, and then the
-        # stream would correctly not be the last one out -- which is a
-        # different case, covered by the test above.
-        (self.data_dir / "opshell-target.json").write_text(
-            json.dumps({"agent": self.AGENT}))
-        client.get(self.url("/api/opshell/stream"),
-                   headers=self.auth).get_data()
-        queued = [t["args"] for t in self.sm.task_queues.get(self.AGENT, [])]
-        self.assertIn("stop", queued)
-
     def test_a_made_up_session_is_not_adopted(self):
         # `sessions(target) == 0` asked whether anybody was live, so a
         # stale or invented id was adopted whenever another tab was -- and
         # that stream then ran uncounted under the other tab's close.
         port, client = self._with_port(then=b"x", die_after_auth=True)
-        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
-                    headers=self.auth)
+        self._open(client)
         answer = client.get(self.url("/api/opshell/stream?session=invented"),
                             headers=self.auth)
-        self.assertNotEqual(answer.headers["X-Opshell-Session"], "invented")
+        self.assertEqual(answer.status_code, 400)
 
     def test_the_geometry_header_is_the_pair_that_was_sent(self):
         port, client = self._with_port(then=b"x", die_after_auth=True)
-        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
-                    headers=self.auth)
-        answer = client.get(self.url("/api/opshell/stream?cols=0&rows=9000"),
-                            headers=self.auth)
+        session = self._open(client)
+        answer = client.get(
+            self.url("/api/opshell/stream?session=%s&cols=0&rows=9000"
+                     % session), headers=self.auth)
         self.assertEqual(answer.headers["X-Opshell-Geometry"],
                          "1x%d" % beacon.SHELL_GEOMETRY_MAX)
 
@@ -1434,10 +1437,10 @@ class TestTheStreamAndTheKeystrokes(_RouteCase):
         # broken pipe.
         port, client = self._with_port(prompt=b"raccoon: too many sessions\r\n",
                                        die_after_auth=True)
-        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
-                    headers=self.auth)
-        answer = client.get(self.url("/api/opshell/stream"),
-                            headers=self.auth)
+        session = self._open(client)
+        answer = client.get(
+            self.url("/api/opshell/stream?session=" + session),
+            headers=self.auth)
         self.assertIn(b"too many sessions", answer.get_data())
 
 
@@ -1540,10 +1543,12 @@ class TestThePumpWaitsOutAQuietShell(_RouteCase):
         supervisor = self.connected()
         supervisor.status()["endpoints"][0]["shell_port"] = port.port
         client = self.client(supervisor=supervisor)
-        (self.data_dir / "opshell-target.json").write_text(
-            json.dumps({"agent": self.AGENT}))
-        answer = client.get(self.url("/api/opshell/stream"),
-                            headers=self.auth)
+        session = client.post(self.url("/api/opshell/open"),
+                              json={"agent": self.AGENT},
+                              headers=self.auth).get_json()["session"]
+        answer = client.get(
+            self.url("/api/opshell/stream?session=" + session),
+            headers=self.auth)
         self.assertIn(b"late output", answer.get_data())
 
 
@@ -1569,6 +1574,181 @@ class TestARefusedBridgeTellsKeysWhy(_RouteCase):
             headers=self.auth)
         self.assertEqual(answer.status_code, 409)
         self.assertTrue(answer.get_json()["refused"])
+
+
+class TestTheOneDecisionPlace(_ClaimsCase):
+    """`end_session`: close one session and owe or queue the stop.
+
+    Four callers used to decide this with different knowledge, and two
+    rounds of fixes each closed one hole and opened another. These tests
+    are about the decision, not about a route.
+    """
+
+    def _args(self, claims, row, reports=False, queues=None, hist=None):
+        return (claims, "raccoon-bandit", "s1", row, reports,
+                queues if queues is not None else {},
+                hist if hist is not None else {}, "now")
+
+    def test_not_the_last_session_decides_nothing(self):
+        claims = opshell.Claims(self.path)
+        first = claims.open("raccoon-bandit")
+        second = claims.open("raccoon-bandit")
+        queues = {}
+        queued, last, _ = opshell.end_session(
+            claims, "raccoon-bandit", first, {"socks": {"sessions": 0}},
+            False, queues, {}, "now")
+        self.assertEqual((queued, last, queues), (False, False, {}))
+        self.assertTrue(claims.holds("raccoon-bandit", second))
+
+    def test_the_last_session_queues_the_stop(self):
+        claims = opshell.Claims(self.path)
+        only = claims.open("raccoon-bandit")
+        queues = {}
+        queued, last, _ = opshell.end_session(
+            claims, "raccoon-bandit", only, {"socks": {"sessions": 0}},
+            False, queues, {}, "now")
+        self.assertTrue(queued and last)
+        self.assertEqual([t["args"] for t in queues["raccoon-bandit"]],
+                         ["stop"])
+
+    def test_a_live_pivot_leaves_it_owed_with_a_reason(self):
+        claims = opshell.Claims(self.path)
+        only = claims.open("raccoon-bandit")
+        queues = {}
+        queued, last, why = opshell.end_session(
+            claims, "raccoon-bandit", only, {"socks": {"sessions": 3}},
+            False, queues, {}, "now")
+        self.assertEqual((queued, last), (False, True))
+        self.assertIn("socks", why.lower())
+        self.assertEqual(queues, {})
+        self.assertIn("raccoon-bandit", claims.owned())
+
+    def test_a_channel_only_the_agent_reports_is_still_stoppable(self):
+        claims = opshell.Claims(self.path)
+        only = claims.open("raccoon-bandit")
+        queues = {}
+        queued, _last, _why = opshell.end_session(
+            claims, "raccoon-bandit", only, None, True, queues, {}, "now")
+        self.assertTrue(queued)
+
+
+class TestTheSweepClosesWhatNobodyWatches(_ClaimsCase):
+    def test_a_lapsed_claim_gets_its_stop_queued(self):
+        claims = opshell.Claims(self.path, grace=10.0)
+        claims.open("raccoon-bandit")
+        queues = {}
+        done = opshell.sweep(claims, ["raccoon-bandit"],
+                             {"raccoon-bandit": {"socks": {"sessions": 0}}},
+                             {"raccoon-bandit": False}, queues, {}, "now",
+                             time.time() + 11)
+        self.assertEqual(done, ["raccoon-bandit"])
+        self.assertEqual([t["args"] for t in queues["raccoon-bandit"]],
+                         ["stop"])
+
+    def test_a_live_claim_is_left_alone(self):
+        claims = opshell.Claims(self.path, grace=10.0)
+        claims.open("raccoon-bandit")
+        queues = {}
+        done = opshell.sweep(claims, ["raccoon-bandit"],
+                             {"raccoon-bandit": {"socks": {"sessions": 0}}},
+                             {"raccoon-bandit": False}, queues, {}, "now",
+                             time.time())
+        self.assertEqual((done, queues), ([], {}))
+
+    def test_a_lapsed_claim_over_a_live_pivot_is_not_dropped(self):
+        claims = opshell.Claims(self.path, grace=10.0)
+        claims.open("raccoon-bandit")
+        queues = {}
+        done = opshell.sweep(claims, ["raccoon-bandit"],
+                             {"raccoon-bandit": {"socks": {"sessions": 2}}},
+                             {"raccoon-bandit": False}, queues, {}, "now",
+                             time.time() + 11)
+        self.assertEqual((done, queues), ([], {}))
+        self.assertIn("raccoon-bandit", claims.owned())
+
+    def test_an_agent_that_left_the_fleet_is_forgotten_not_tasked(self):
+        claims = opshell.Claims(self.path, grace=10.0)
+        claims.open("gone-raccoon")
+        queues = {}
+        done = opshell.sweep(claims, [], {}, {}, queues, {}, "now",
+                             time.time() + 11)
+        self.assertEqual((done, queues), ([], {}))
+        self.assertEqual(claims.owned(), [])
+
+    def test_ownership_left_by_a_dead_process_is_swept_at_once(self):
+        # `reconcile`'s half: no live claim at all, which is what a restart
+        # leaves behind.
+        opshell.Claims(self.path).open("raccoon-bandit")
+        fresh = opshell.Claims(self.path, grace=10.0)
+        queues = {}
+        done = opshell.sweep(fresh, ["raccoon-bandit"],
+                             {"raccoon-bandit": {"socks": {"sessions": 0}}},
+                             {"raccoon-bandit": False}, queues, {}, "now",
+                             time.time())
+        self.assertEqual(done, ["raccoon-bandit"])
+
+
+class TestTheHeartbeatIsPerSession(_RouteCase):
+    def test_state_beats_only_the_session_it_was_given(self):
+        # Beating every registered session let any open tab keep a dead
+        # tab's claim alive for ever, and the lapse is what turns an
+        # abandoned view into a queued stop.
+        client = self.client()
+        first = client.post(self.url("/api/opshell/open"),
+                            json={"agent": self.AGENT},
+                            headers=self.auth).get_json()["session"]
+        second = client.post(self.url("/api/opshell/open"),
+                             json={"agent": self.AGENT},
+                             headers=self.auth).get_json()["session"]
+        with unittest.mock.patch.object(opshell.Claims, "beat",
+                                        autospec=True) as beat:
+            client.get(self.url("/api/opshell/state?session=" + first),
+                       headers=self.auth)
+        beaten = [call.args[2] for call in beat.call_args_list]
+        self.assertEqual(beaten, [first])
+        self.assertNotIn(second, beaten)
+
+    def test_state_without_a_session_beats_nothing(self):
+        client = self.client()
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        with unittest.mock.patch.object(opshell.Claims, "beat",
+                                        autospec=True) as beat:
+            client.get(self.url("/api/opshell/state"), headers=self.auth)
+        self.assertEqual(beat.call_args_list, [])
+
+
+class TestAStaleTunnelReportIsNotADeadChild(_RouteCase):
+    def _target(self):
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+
+    def test_a_report_about_an_older_child_does_not_read_as_idle(self):
+        # The beacon builds its check-in, `tunnel` included, before it runs
+        # the tasks that check-in carries -- so the report arriving with a
+        # start's answer still describes the previous child. Read at face
+        # value it said `idle` over a channel coming up, for a whole
+        # interval.
+        self._target()
+        self.sm.history[self.AGENT] = [{
+            "task_id": "a", "cmd": "tunnel", "args": "start",
+            "status": "done", "output": "Tunnel started: pid 4242, task"}]
+        self.sm.agents[self.AGENT]["tunnel"] = {"pid": 991, "running": False,
+                                                "exit_code": 0}
+        state = self.get("/api/opshell/state",
+                         supervisor=self.configured_but_stopped()).get_json()
+        self.assertEqual(state["state"], "waiting")
+
+    def test_a_report_about_this_child_does_read_as_idle(self):
+        self._target()
+        self.sm.history[self.AGENT] = [{
+            "task_id": "a", "cmd": "tunnel", "args": "start",
+            "status": "done", "output": "Tunnel started: pid 4242, task"}]
+        self.sm.agents[self.AGENT]["tunnel"] = {"pid": 4242, "running": False,
+                                                "exit_code": 1}
+        state = self.get("/api/opshell/state",
+                         supervisor=self.configured_but_stopped()).get_json()
+        self.assertEqual(state["state"], "idle")
 
 
 if __name__ == "__main__":

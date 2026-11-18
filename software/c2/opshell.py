@@ -353,6 +353,96 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def decide_stop(claims, agent_id, endpoint_row, agent_reports_running,
+                task_queues, history, now):
+    """The stop is owed: queue it, or say why it cannot be queued yet.
+
+    Separate from `end_session` because the sweep's sessions are already
+    gone -- `lapsed` removed them -- and `Claims.close` answers False for a
+    session it no longer has, by design. The first version of this reached
+    the decision through a sentinel session id and therefore never reached
+    it at all: `close` said "not the last" and the sweep queued nothing.
+
+    Returns `(queued, reason)`. A refusal leaves ownership on file, so the
+    stop stays owed for the next caller.
+    """
+    owned = claims is None or agent_id in claims.owned()
+    allowed, why = may_stop(endpoint_row, owned)
+    if not allowed and owned and endpoint_row is None \
+            and agent_reports_running:
+        # `may_stop` refuses a row it has not got, by contract. The agent's
+        # own report is the second source: a channel it reports has no
+        # SOCKS session this server could drop.
+        allowed, why = True, ""
+    if not allowed:
+        return False, why
+    queue_tunnel(agent_id, "stop", task_queues, history, now)
+    return True, ""
+
+
+def end_session(claims, agent_id, session_id, endpoint_row,
+                agent_reports_running, task_queues, history, now):
+    """Close one session and, if it was the last, decide the stop.
+
+    The one place that decides it. Before this existed the decision lived
+    in four callers -- the close route, a stream's cleanup, the sweep and
+    the start-up reconcile -- each holding different knowledge, and two
+    successive attempts to fix one of them opened a hole in another: a
+    stream released a claim it had not created, and a reconnect released
+    the session the new stream was using. A refcount with four writers is
+    not a refcount.
+
+    Returns `(queued, last, reason)`.
+    """
+    last = claims.close(agent_id, session_id) if claims is not None else True
+    if not last:
+        return False, False, ""
+    queued, why = decide_stop(claims, agent_id, endpoint_row,
+                              agent_reports_running, task_queues, history,
+                              now)
+    return queued, True, why
+
+
+def sweep(claims, agents_now, endpoint_rows, reports_running, task_queues,
+          history, now, clock):
+    """Queue the stop for every claim nobody is watching any more.
+
+    `agents_now` is the fleet's agent ids, `endpoint_rows` maps an agent to
+    its relay row or None, and `reports_running` maps an agent to whether
+    its own check-in says a child is running. Returns the agents a stop was
+    queued for.
+
+    This is what makes a browser that stopped asking harmless, and it is
+    the half no route can do: a view that is gone sends nothing, so some
+    other request has to be what notices. An agent that has left the fleet
+    is forgotten rather than queued for, because a task cannot be handed to
+    a queue nobody reads.
+
+    Two clocks, because this module already has two: `now` is the ISO stamp
+    a task carries, `clock` is the float `lapsed` measures a grace against.
+    Passing one where the other belonged is how the first version of this
+    raised a TypeError on its first call.
+    """
+    queued = []
+
+    def owe(agent_id):
+        if agent_id in queued:
+            return
+        if decide_stop(claims, agent_id, endpoint_rows.get(agent_id),
+                       bool(reports_running.get(agent_id)), task_queues,
+                       history, now)[0]:
+            queued.append(agent_id)
+
+    for agent_id in list(claims.lapsed(clock)):
+        if agent_id not in agents_now:
+            claims.forget(agent_id)
+            continue
+        owe(agent_id)
+    for agent_id in reconcile(claims, agents_now):
+        owe(agent_id)
+    return queued
+
+
 def _dimension(value, default: int) -> int:
     """One terminal dimension, inside `1..SHELL_GEOMETRY_MAX`.
 

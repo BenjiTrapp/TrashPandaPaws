@@ -858,6 +858,10 @@ _AGENT_SOCKET_ENDPOINTS = frozenset({"beacon_handler", "api_dns_tasking"})
 # The anti-goal this code serves: a channel left open on the target while
 # the operator believes it closed. Every branch that refuses to queue a
 # stop keeps the claim on file so that something later will.
+# The pump's read slice, as a constant so a test can shorten it:
+# proving that a timeout does not end the stream otherwise costs a
+# real wait in a suite of three and a half thousand tests.
+_OPSHELL_READ_TIMEOUT = 5.0
 _OPSHELL_OWNED = "opshell-owned.json"
 _OPSHELL_TARGET = "opshell-target.json"
 
@@ -909,20 +913,38 @@ def _opshell_agent_reports_tunnel(agent_name: str) -> bool:
     return tunnel.get("running") is True
 
 
-def _opshell_tunnel_reported_gone(agent_name: str) -> bool:
-    """Whether the agent's last check-in said its tunnel child has exited.
+def _opshell_started_pid(entry) -> Optional[int]:
+    """The pid a `tunnel start` reported, from its own output."""
+    match = re.search(r"pid (\d+)", (entry or {}).get("output") or "")
+    return int(match.group(1)) if match else None
+
+
+def _opshell_tunnel_reported_gone(agent_name: str, expect_pid=None) -> bool:
+    """Whether the agent's last check-in said *that* child has exited.
 
     The other half of `_opshell_agent_reports_tunnel`, and not its
     negation: "no report at all" means the beacon has never started a
     child and says nothing about one this view asked for, while
     `running: False` is the beacon confirming it is gone. The state uses
     this to stop saying `waiting` or `closing` for ever.
+
+    `expect_pid` is what makes it safe to use after a start. The beacon
+    builds its check-in -- `info["tunnel"]` included -- *before* it runs
+    the tasks that check-in carries, so the report that arrives with a
+    start's answer still describes the previous child. Taken at face value
+    that read `idle` over a channel coming up, and said so for a whole
+    interval. A report about a different pid is a report about a different
+    child, and says nothing about this one.
     """
     info = agents.get(agent_name) or {}
     tunnel = info.get("tunnel")
     if not isinstance(tunnel, dict):
         return False
-    return tunnel.get("running") is False
+    if tunnel.get("running") is not False:
+        return False
+    if expect_pid is not None and tunnel.get("pid") != expect_pid:
+        return False
+    return True
 
 
 def _opshell_last_tunnel(agent_name: str):
@@ -1708,9 +1730,34 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             # Started, answered, and the relay has not shown a row yet --
             # unless the agent has since reported the child gone, which is
             # a start that died rather than one still arriving.
-            out["state"] = "idle" if _opshell_tunnel_reported_gone(target) \
-                else "waiting"
+            # The pid from the start's own output: a report about an older
+            # child must not be read as this one having died.
+            out["state"] = "idle" if _opshell_tunnel_reported_gone(
+                target, _opshell_started_pid(last)) else "waiting"
         return out
+
+    def opshell_sweep():
+        """Queue the stop for claims nobody is watching any more.
+
+        Driven by whatever request arrives, because a view that is gone
+        sends nothing. Brought forward from the next task: the routes were
+        written against a lapse that nothing performed, so several paths I
+        had argued were covered by it were covered by nothing.
+        """
+        claims = opshell_claims()
+        if claims is None:
+            return
+        rows, reports = {}, {}
+        for agent_name in set(list(agents) + claims.owned()):
+            row, _ = _opshell_endpoint_row(tunnel_supervisor, agent_name)
+            rows[agent_name] = row
+            reports[agent_name] = _opshell_agent_reports_tunnel(agent_name)
+        for agent_name in opshell.sweep(claims, list(agents), rows, reports,
+                                        task_queues, history, _now(),
+                                        time.time()):
+            _log_event("TASK", "cmd=tunnel args=stop (operator shell: no "
+                               "view is watching this channel any more)",
+                       agent_id=agent_name)
 
     @app.route("/api/opshell/state", methods=["GET"])
     @require_auth
@@ -1718,6 +1765,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         claims = opshell_claims()
         target = opshell_target()
         session_id = request.args.get("session")
+        opshell_sweep()
         if claims is not None and target and session_id:
             # The caller's own session, and only that one. Beating every
             # registered session would let any open tab keep a dead tab's
@@ -1804,28 +1852,22 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         bridge = opshell_bridges.pop(session_id, None)
         if bridge is not None:
             bridge.close()
-        last = claims.close(target, session_id) if claims is not None else True
-        if not last:
-            return jsonify(opshell_state())
-
         row, _ = _opshell_endpoint_row(tunnel_supervisor, target)
-        owned = claims is None or target in claims.owned()
-        allowed, why = opshell.may_stop(row, owned)
-        if not allowed and owned and row is None \
-                and _opshell_agent_reports_tunnel(target):
-            # `may_stop` refuses a row it has not got, by contract. The
-            # agent's own report is the second source, and a channel it
-            # reports has no SOCKS session this server could drop.
-            allowed, why = True, ""
-        if allowed:
-            opshell_queue(target, "stop")
-            return jsonify(opshell_state())
-
-        # Refused: the claim stays on file, so the stop is still owed and
-        # the next sweep or a later close will queue it. A route that
-        # treated this as "done" would be the anti-goal.
+        # One decision, in one place: `opshell.end_session` closes the
+        # session and, when it was the last, either queues the stop or says
+        # why it is still owed. Four callers used to decide this with
+        # different knowledge, and that is what produced two rounds of
+        # findings.
+        queued, _last, why = opshell.end_session(
+            claims, target, session_id, row,
+            _opshell_agent_reports_tunnel(target), task_queues, history,
+            _now())
+        if queued:
+            _log_event("TASK", "cmd=tunnel args=stop (operator shell, "
+                               "last session closed)", agent_id=target)
         answer = opshell_state()
-        answer["reason"] = why or answer["reason"]
+        if not queued and why:
+            answer["reason"] = why
         return jsonify(answer)
 
     @app.route("/api/opshell/stream", methods=["GET"])
@@ -1851,56 +1893,41 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return jsonify({"error": "could not attach: %s"
                                      % type(exc).__name__}), 502
 
-        # The session the operator already holds, when they pass one *and*
-        # it is really theirs. `claims.holds` and not `sessions(...) == 0`:
-        # the second asks whether anybody is live, so a stale or invented
-        # id was adopted whenever another tab was, and that stream then ran
-        # uncounted under the other tab's close.
+        # Borrowed, never created. The stream used to open a claim of its
+        # own when none was handed in, and then its cleanup had to decide
+        # whether the claim was "its" -- a flag that cannot survive the
+        # session changing hands, which is what a reconnect is. One creator
+        # (`/open`), one releaser (`/close` or the lapse), and the stream
+        # attaches a bridge to a session that already exists.
         asked = request.args.get("session")
-        own_claim = False
-        if asked and claims is not None and claims.holds(target, asked):
-            session_id = asked
-        elif claims is not None:
-            session_id = claims.open(target)
-            own_claim = True
-        else:
-            session_id = secrets.token_hex(8)
+        if claims is not None and not (asked and claims.holds(target, asked)):
+            bridge.close()
+            return jsonify({"error": "open a session first: /api/opshell/"
+                                     "open hands back the session this "
+                                     "stream attaches to"}), 400
+        session_id = asked or secrets.token_hex(8)
         opshell_bridges[session_id] = bridge
 
         def cleanup():
+            # The bridge, and nothing else. The claim belongs to whoever
+            # opened it; releasing it here is what lost an owed stop.
             if opshell_bridges.get(session_id) is bridge:
                 del opshell_bridges[session_id]
             bridge.close()
-            # Only a claim this stream opened itself. Releasing the
-            # browser's claim here is how the first version of this lost an
-            # owed stop: the stream ended, `close` answered "that was the
-            # last", nothing queued a stop, and the browser's later
-            # `/close` got False for a session that no longer existed. The
-            # browser's claim lapses on its own when the browser stops
-            # beating, and the sweep turns that into a stop.
-            if own_claim and claims is not None and \
-                    claims.close(target, session_id):
-                # This stream held the last claim, so the stop is owed now.
-                row_now, _ = _opshell_endpoint_row(tunnel_supervisor, target)
-                owned_now = target in claims.owned()
-                allowed, _why = opshell.may_stop(row_now, owned_now)
-                if not allowed and owned_now and row_now is None \
-                        and _opshell_agent_reports_tunnel(target):
-                    allowed = True
-                if allowed:
-                    opshell_queue(target, "stop")
 
         def pump():
             try:
                 while True:
                     if opshell_bridges.get(session_id) is not bridge:
-                        # The session was closed, or replaced. Without this
-                        # the loop below would keep reading a bridge nobody
-                        # owns: `read` answers a quiet peer with a timeout,
-                        # so "keep reading" has no natural end.
+                        return
+                    if claims is not None and \
+                            not claims.holds(target, session_id):
+                        # The claim lapsed: the browser stopped asking. Let
+                        # go of the thread and the shell port's slot rather
+                        # than waiting for the shell to print something.
                         return
                     try:
-                        chunk = bridge.read(timeout=5.0)
+                        chunk = bridge.read(timeout=_OPSHELL_READ_TIMEOUT)
                     except socket.timeout:
                         # A quiet peer, not a finished one. Only b"" ends
                         # the stream.
