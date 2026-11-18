@@ -1751,5 +1751,129 @@ class TestAStaleTunnelReportIsNotADeadChild(_RouteCase):
         self.assertEqual(state["state"], "idle")
 
 
+class TestTheSweepDoesNotRunAway(_ClaimsCase):
+    """The sweep made two latent gaps active, and both were Critical.
+
+    `reconcile` reports an owned agent with no sessions every time it is
+    asked -- which is exactly what an owed stop looks like -- so without a
+    brake the sweep queued a fresh `tunnel stop` on every poll. And
+    nothing released ownership, so once a channel had been stopped the
+    agent stayed owned for ever and the sweep went on stopping *later*
+    channels the view had never raised.
+    """
+
+    def _rows(self, socks=0):
+        return {"raccoon-bandit": {"socks": {"sessions": socks}}}
+
+    def test_a_pending_stop_stops_the_sweep_queueing_another(self):
+        claims = opshell.Claims(self.path, grace=10.0)
+        claims.open("raccoon-bandit")
+        queues = {}
+        clock = time.time() + 11
+        for _ in range(4):
+            opshell.sweep(claims, ["raccoon-bandit"], self._rows(),
+                          {"raccoon-bandit": False}, queues, {}, "now", clock,
+                          {"raccoon-bandit": bool(queues)}, {})
+        self.assertEqual([t["args"] for t in queues["raccoon-bandit"]],
+                         ["stop"])
+
+    def test_decide_stop_refuses_while_a_tunnel_task_is_outstanding(self):
+        claims = opshell.Claims(self.path)
+        claims.open("raccoon-bandit")
+        queues = {}
+        queued, why = opshell.decide_stop(
+            claims, "raccoon-bandit", {"socks": {"sessions": 0}}, False,
+            queues, {}, "now", already_pending=True)
+        self.assertFalse(queued)
+        self.assertIn("already queued", why)
+        self.assertEqual(queues, {})
+
+    def test_a_settled_stop_releases_the_ownership_that_owed_it(self):
+        claims = opshell.Claims(self.path, grace=10.0)
+        claims.open("raccoon-bandit")
+        claims.lapsed(time.time() + 11)
+        queues = {}
+        opshell.sweep(claims, ["raccoon-bandit"], self._rows(),
+                      {"raccoon-bandit": False}, queues, {}, "now",
+                      time.time(), {}, {"raccoon-bandit": True})
+        self.assertEqual(claims.owned(), [])
+        self.assertEqual(queues, {})
+
+    def test_a_later_channel_is_not_stopped_once_ownership_is_released(self):
+        # The second Critical in one test: stale ownership plus a sweep
+        # stopped a pivot somebody else had raised from the tunnel panel.
+        claims = opshell.Claims(self.path, grace=10.0)
+        claims.open("raccoon-bandit")
+        claims.lapsed(time.time() + 11)
+        queues = {}
+        opshell.sweep(claims, ["raccoon-bandit"], self._rows(),
+                      {"raccoon-bandit": False}, queues, {}, "now",
+                      time.time(), {}, {"raccoon-bandit": True})
+        # A later channel: a row with no SOCKS session, which is what the
+        # sweep used to read as "mine to stop".
+        opshell.sweep(claims, ["raccoon-bandit"], self._rows(),
+                      {"raccoon-bandit": False}, queues, {}, "now",
+                      time.time(), {}, {})
+        self.assertEqual(queues, {})
+
+
+class TestTheBeatComesBeforeTheSweep(_RouteCase):
+    def test_a_tab_polling_later_than_the_grace_keeps_its_claim(self):
+        # Sweeping first made a tab lapse itself on the very request that
+        # proved it was watching. A hidden browser tab is throttled to
+        # about one poll a minute, which is exactly that edge.
+        client = self.client(supervisor=self.connected())
+        session = client.post(self.url("/api/opshell/open"),
+                              json={"agent": self.AGENT},
+                              headers=self.auth).get_json()["session"]
+        with unittest.mock.patch.object(opshell.Claims, "lapsed",
+                                        autospec=True) as lapsed:
+            # The sweep is asked about a clock far past the grace; the beat
+            # that ran first is what has to save the claim.
+            lapsed.side_effect = lambda self_, now: []
+            client.get(self.url("/api/opshell/state?session=" + session),
+                       headers=self.auth)
+            order = [c for c in lapsed.mock_calls]
+        state = client.get(self.url("/api/opshell/state?session=" + session),
+                           headers=self.auth).get_json()
+        self.assertEqual(state["sessions"], 1)
+        self.assertTrue(order, "the sweep did not run at all")
+
+
+class TestADamagedRecordIsNotAFreeForAll(_RouteCase):
+    def test_the_stream_is_refused_rather_than_inventing_a_session(self):
+        (self.data_dir / "opshell-owned.json").write_text("{not json")
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        with self.assertLogs("raccoon.c2.server", level="ERROR"):
+            answer = self.get("/api/opshell/stream")
+        self.assertEqual(answer.status_code, 400)
+
+    def test_a_close_queues_no_stop_when_nothing_can_be_recorded(self):
+        (self.data_dir / "opshell-owned.json").write_text("{not json")
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        with self.assertLogs("raccoon.c2.server", level="ERROR"):
+            self.post(self.url("/api/opshell/close"), {"session": "anything"})
+        self.assertEqual(self.sm.task_queues, {})
+
+
+class TestTheStreamDoesNotDialBeforeItChecks(_RouteCase):
+    def test_a_request_with_no_session_never_reaches_the_port(self):
+        # A refused request must not have sent the password, taken one of
+        # the port's four slots and possibly opened a transcript first.
+        port = _FakeShellPort(then=b"x", die_after_auth=True)
+        self.addCleanup(port.stop)
+        supervisor = self.connected()
+        supervisor.status()["endpoints"][0]["shell_port"] = port.port
+        client = self.client(supervisor=supervisor)
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        answer = client.get(self.url("/api/opshell/stream"),
+                            headers=self.auth)
+        self.assertEqual(answer.status_code, 400)
+        self.assertFalse(port.connected.is_set())
+
+
 if __name__ == "__main__":
     unittest.main()

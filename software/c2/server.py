@@ -889,6 +889,25 @@ def _opshell_endpoint_row(tunnel_supervisor, agent_name):
     return None, state
 
 
+def _opshell_stop_settled(agent_name: str) -> bool:
+    """Whether the stop this view owed has demonstrably been carried out.
+
+    What releases ownership. Three things together, because any one of
+    them alone is a guess: the latest `tunnel` task was a `stop` and it has
+    been answered, there is no relay row for the agent, and the agent is
+    not reporting a running child. Until all three hold the stop stays
+    owed, which is the safe direction.
+    """
+    last = _opshell_last_tunnel(agent_name)
+    if last is None or (last.get("args") or "").strip() != "stop":
+        return False
+    if (last.get("status") or "") == "pending":
+        return False
+    if _opshell_agent_reports_tunnel(agent_name):
+        return False
+    return True
+
+
 def _opshell_agent_reports_tunnel(agent_name: str) -> bool:
     """Whether the agent itself last said its tunnel child was *running*.
 
@@ -945,6 +964,30 @@ def _opshell_tunnel_reported_gone(agent_name: str, expect_pid=None) -> bool:
     if expect_pid is not None and tunnel.get("pid") != expect_pid:
         return False
     return True
+
+
+def _opshell_report_is_stale_for(agent_name: str, entry) -> bool:
+    """Whether the agent's tunnel report predates the answer to `entry`.
+
+    The beacon builds its check-in -- `info["tunnel"]` included -- before
+    it runs the tasks that check-in carries. So the report arriving with a
+    task's answer describes the state *before* that task ran, in both
+    directions: `running: False` beside a start's answer is the child that
+    came before it, and `running: True` beside a stop's answer is the child
+    the stop has just killed. Taken at face value the first said `idle`
+    over a channel coming up and the second said `live` for a whole
+    interval after a successful stop.
+    """
+    if entry is None or (entry.get("status") or "") == "pending":
+        return False
+    info = agents.get(agent_name) or {}
+    tunnel = info.get("tunnel")
+    if not isinstance(tunnel, dict):
+        return False
+    if ((entry.get("args") or "").strip() or "start") == "stop":
+        return tunnel.get("running") is True
+    expect = _opshell_started_pid(entry)
+    return expect is not None and tunnel.get("pid") != expect
 
 
 def _opshell_last_tunnel(agent_name: str):
@@ -1656,9 +1699,20 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             the view say nothing was running while a child was.
             """
             out["reason"] = reason or why
-            if target and _opshell_agent_reports_tunnel(target):
+            if not target:
+                return out
+            if _opshell_agent_reports_tunnel(target):
                 out["channel"] = "open"
                 out["state"] = "live"
+                return out
+            # A task outstanding is a channel on its way, which this path
+            # used to call `idle`: a start queued before the port range was
+            # taken out of the configuration read as "nothing happening"
+            # while a child was coming up.
+            waiting = _tunnel_pending(target)
+            if waiting is not None:
+                action_now = (waiting.get("args") or "").strip() or "start"
+                out["state"] = "closing" if action_now == "stop" else "waiting"
             return out
 
         if tunnel_supervisor is None:
@@ -1697,10 +1751,13 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             out["root"] = row.get("user") == "root"
             out["recording"] = bool(row.get("shell_recording"))
             out["channel"] = "open"
-        elif _opshell_agent_reports_tunnel(target):
+        elif _opshell_agent_reports_tunnel(target) and \
+                not _opshell_report_is_stale_for(target, last):
             # The agent says its child is running even though the relay has
             # no row for it. Open, and stoppable -- see
-            # `_opshell_agent_reports_tunnel`.
+            # `_opshell_agent_reports_tunnel`. Unless that report predates
+            # the answer to the last task, in which case it describes a
+            # child the task has already dealt with.
             out["channel"] = "open"
         elif not _opshell["record_error"]:
             out["channel"] = "closed"
@@ -1747,14 +1804,19 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         claims = opshell_claims()
         if claims is None:
             return
-        rows, reports = {}, {}
+        rows, reports, pending, settled = {}, {}, {}, {}
         for agent_name in set(list(agents) + claims.owned()):
             row, _ = _opshell_endpoint_row(tunnel_supervisor, agent_name)
             rows[agent_name] = row
-            reports[agent_name] = _opshell_agent_reports_tunnel(agent_name)
+            reports[agent_name] = (
+                _opshell_agent_reports_tunnel(agent_name)
+                and not _opshell_report_is_stale_for(
+                    agent_name, _opshell_last_tunnel(agent_name)))
+            pending[agent_name] = _tunnel_pending(agent_name) is not None
+            settled[agent_name] = _opshell_stop_settled(agent_name)
         for agent_name in opshell.sweep(claims, list(agents), rows, reports,
                                         task_queues, history, _now(),
-                                        time.time()):
+                                        time.time(), pending, settled):
             _log_event("TASK", "cmd=tunnel args=stop (operator shell: no "
                                "view is watching this channel any more)",
                        agent_id=agent_name)
@@ -1765,13 +1827,17 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         claims = opshell_claims()
         target = opshell_target()
         session_id = request.args.get("session")
-        opshell_sweep()
         if claims is not None and target and session_id:
             # The caller's own session, and only that one. Beating every
             # registered session would let any open tab keep a dead tab's
             # claim alive for ever, and the lapse is what turns an
             # abandoned view into a queued stop.
             claims.beat(target, session_id)
+        # After the beat, never before: a tab polling later than the grace
+        # would otherwise lapse itself on the very request that proves it
+        # is watching, and a hidden browser tab is throttled to about one
+        # poll a minute, which is exactly that edge.
+        opshell_sweep()
         return jsonify(opshell_state())
 
     @app.route("/api/opshell/open", methods=["POST"])
@@ -1849,6 +1915,16 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                                      "session that open or stream gave "
                                      "you"}), 400
         claims = opshell_claims()
+        if claims is None:
+            # The ownership record is damaged, so this server cannot tell
+            # whose channel this is. `end_session` would read "no claims"
+            # as "that was the last session" and queue a stop under every
+            # other tab's stream. The bridge is still closed, because
+            # closing what this request names is always safe.
+            bridge = opshell_bridges.pop(session_id, None)
+            if bridge is not None:
+                bridge.close()
+            return jsonify({"error": _opshell["record_error"]}), 409
         bridge = opshell_bridges.pop(session_id, None)
         if bridge is not None:
             bridge.close()
@@ -1880,6 +1956,16 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         if row is None or not row.get("shell_port"):
             return jsonify({"error": "no shell port on this endpoint"}), 409
         claims = opshell_claims()
+        asked_first = request.args.get("session")
+        if claims is None or not (asked_first
+                                  and claims.holds(target, asked_first)):
+            # Checked before the dial, not after: a request that is going
+            # to be refused must not have sent the password, taken one of
+            # the port's four slots and possibly opened a transcript at the
+            # far end first.
+            return jsonify({"error": "open a session first: /api/opshell/"
+                                     "open hands back the session this "
+                                     "stream attaches to"}), 400
         bridge = opshell.Bridge(row["shell_port"], row.get("shell_password")
                                 or "", _as_int(request.args.get("cols"),
                                                SHELL_DEFAULT_COLS),
@@ -1899,13 +1985,12 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         # session changing hands, which is what a reconnect is. One creator
         # (`/open`), one releaser (`/close` or the lapse), and the stream
         # attaches a bridge to a session that already exists.
-        asked = request.args.get("session")
-        if claims is not None and not (asked and claims.holds(target, asked)):
-            bridge.close()
-            return jsonify({"error": "open a session first: /api/opshell/"
-                                     "open hands back the session this "
-                                     "stream attaches to"}), 400
-        session_id = asked or secrets.token_hex(8)
+        # Checked before the dial, above. `claims is None` means the
+        # ownership record is damaged, and the first version invented a
+        # session there -- which put the whole record-error mode outside
+        # the model: any tab's `/close` then counted as the last and
+        # stopped a channel under every other tab's stream.
+        session_id = asked_first
         opshell_bridges[session_id] = bridge
 
         def cleanup():
@@ -3365,6 +3450,19 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             }
             if agent_id and agent_id in agents:
                 agents[agent_id]["_last_request"] = req_meta
+
+            # The sweep's second driver, and the one that matters: a
+            # check-in is the moment a stop could actually be delivered,
+            # and it arrives whether or not a browser is open. Driven only
+            # from `/state`, a channel whose last tab is gone was never
+            # swept at all, and neither was one owed from before a restart.
+            #
+            # Wrapped, because nothing about this may change what a beacon
+            # sees: a prober must not be able to tell that it ran.
+            try:
+                opshell_sweep()
+            except Exception as exc:
+                logger.debug("opshell: sweep on check-in failed: %s", exc)
 
             if action == "register":
                 return _handle_register(payload, crypto)

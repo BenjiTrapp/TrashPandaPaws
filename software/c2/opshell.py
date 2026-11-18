@@ -354,7 +354,7 @@ def _now_iso() -> str:
 
 
 def decide_stop(claims, agent_id, endpoint_row, agent_reports_running,
-                task_queues, history, now):
+                task_queues, history, now, already_pending=False):
     """The stop is owed: queue it, or say why it cannot be queued yet.
 
     Separate from `end_session` because the sweep's sessions are already
@@ -365,7 +365,15 @@ def decide_stop(claims, agent_id, endpoint_row, agent_reports_running,
 
     Returns `(queued, reason)`. A refusal leaves ownership on file, so the
     stop stays owed for the next caller.
+
+    `already_pending` is the brake, and it is not optional. Without it the
+    sweep queued a fresh `tunnel stop` on *every* poll for as long as the
+    stop was outstanding -- measured as five identical tasks after four
+    polls -- because `reconcile` reports an owned agent with no sessions
+    every time it is asked, which is exactly what an owed stop looks like.
     """
+    if already_pending:
+        return False, "a tunnel task is already queued for this agent"
     owned = claims is None or agent_id in claims.owned()
     allowed, why = may_stop(endpoint_row, owned)
     if not allowed and owned and endpoint_row is None \
@@ -382,15 +390,15 @@ def decide_stop(claims, agent_id, endpoint_row, agent_reports_running,
 
 def end_session(claims, agent_id, session_id, endpoint_row,
                 agent_reports_running, task_queues, history, now):
-    """Close one session and, if it was the last, decide the stop.
+    """Close one session and, if it was the last, ask `decide_stop`.
 
-    The one place that decides it. Before this existed the decision lived
-    in four callers -- the close route, a stream's cleanup, the sweep and
-    the start-up reconcile -- each holding different knowledge, and two
-    successive attempts to fix one of them opened a hole in another: a
-    stream released a claim it had not created, and a reconnect released
-    the session the new stream was using. A refcount with four writers is
-    not a refcount.
+    The close route's entry point. `decide_stop` is where the decision
+    lives; this is the half that owns the refcount. Before the two were
+    split the decision sat in four callers with different knowledge, and
+    two successive attempts to fix one opened a hole in another: a stream
+    released a claim it had not created, and a reconnect released the
+    session the new stream was using. A refcount with four writers is not
+    a refcount.
 
     Returns `(queued, last, reason)`.
     """
@@ -404,7 +412,7 @@ def end_session(claims, agent_id, session_id, endpoint_row,
 
 
 def sweep(claims, agents_now, endpoint_rows, reports_running, task_queues,
-          history, now, clock):
+          history, now, clock, pending=None, settled=None):
     """Queue the stop for every claim nobody is watching any more.
 
     `agents_now` is the fleet's agent ids, `endpoint_rows` maps an agent to
@@ -423,6 +431,8 @@ def sweep(claims, agents_now, endpoint_rows, reports_running, task_queues,
     Passing one where the other belonged is how the first version of this
     raised a TypeError on its first call.
     """
+    pending = pending or {}
+    settled = settled or {}
     queued = []
 
     def owe(agent_id):
@@ -430,7 +440,8 @@ def sweep(claims, agents_now, endpoint_rows, reports_running, task_queues,
             return
         if decide_stop(claims, agent_id, endpoint_rows.get(agent_id),
                        bool(reports_running.get(agent_id)), task_queues,
-                       history, now)[0]:
+                       history, now,
+                       already_pending=bool(pending.get(agent_id)))[0]:
             queued.append(agent_id)
 
     for agent_id in list(claims.lapsed(clock)):
@@ -439,6 +450,15 @@ def sweep(claims, agents_now, endpoint_rows, reports_running, task_queues,
             continue
         owe(agent_id)
     for agent_id in reconcile(claims, agents_now):
+        if settled.get(agent_id):
+            # The stop this view owed has been carried out, so the
+            # ownership that made it owed is released here. Nothing called
+            # `release` before, so an agent stayed owned for ever -- and
+            # once a sweep existed, that stale ownership started stopping
+            # *later* channels the view never raised, including a pivot
+            # someone else had brought up from the tunnel panel.
+            claims.release(agent_id)
+            continue
         owe(agent_id)
     return queued
 
