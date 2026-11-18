@@ -3,8 +3,11 @@
 
 The channel to the implant is raised and dropped with beacon tasks that
 only take effect at the next check-in, up to 300 seconds away. This module
-decides nothing about tasks. It answers two questions the rest of the
-feature needs in order to know when a `tunnel stop` is owed:
+keeps the bookkeeping that tells it when a `tunnel stop` is owed
+(`Claims`, `reconcile`), and the helpers that queue the tasks and decide
+whether a stop is allowed at all (`queue_tunnel`, `may_stop`,
+`expected_checkin`). Nothing here sends a `sleep` task or writes a
+beacon's interval. The bookkeeping answers two questions:
 
 - how many browser sessions currently hold a claim on an agent's channel
   (a refcount, because one bearer token can mean two tabs), and
@@ -28,9 +31,12 @@ import secrets
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional, Tuple
+
+_DEFAULT_INTERVAL = 300
 
 
 class OwnershipRecordError(ValueError):
@@ -212,6 +218,93 @@ def reconcile(claims: Claims, agent_ids: Iterable[str]) -> List[str]:
         elif claims.sessions(agent_id) == 0:
             owed.append(agent_id)
     return owed
+
+
+def queue_tunnel(agent_id: str, action: str, task_queues: dict,
+                 history: dict, now: str) -> dict:
+    """Queue `tunnel <action>` for an agent and return the task.
+
+    The task and its history entry are built here in the shape
+    `api_create_task` in server.py builds them, key for key, rather than by
+    calling the route: a task missing a key the dispatcher reads is one the
+    implant never runs. The history entry is what lets the operator see
+    that this feature queued something. Only `start` and `stop` are the
+    feature's to queue; nothing here ever sends `sleep`.
+    """
+    if action not in ("start", "stop"):
+        raise ValueError("tunnel action must be 'start' or 'stop', got %r"
+                         % (action,))
+    task = {
+        "id": str(uuid.uuid4())[:8],
+        "cmd": "tunnel",
+        "args": action,
+        "data": "",
+        "timeout": 300,
+        "lane": "operator",
+        "queued": now,
+        "status": "pending",
+    }
+    task_queues.setdefault(agent_id, []).append(task)
+    history.setdefault(agent_id, []).append({
+        "task_id": task["id"],
+        "cmd": task["cmd"],
+        "args": task["args"],
+        "lane": task["lane"],
+        "timestamp": task["queued"],
+        "status": "pending",
+        "output": None,
+    })
+    return task
+
+
+def may_stop(endpoint_row: Optional[dict], owned: bool) -> Tuple[bool, str]:
+    """Whether a `tunnel stop` may be queued, and why not when it may not.
+
+    `tunnel start` and `tunnel stop` control one child process on the
+    implant that serves both the SOCKS port and the shell port, so a stop
+    is allowed only for a channel this view owns and only when the endpoint
+    reports no live SOCKS session; otherwise it would drop a pivot the
+    operator raised from the tunnel panel for something else.
+
+    `endpoint_row` is the tunnel server's row for the agent's endpoint, or
+    None when no endpoint is connected. A row whose `socks` is None says no
+    SOCKS port is open, so there is no session to protect. A row that does
+    not say how many sessions there are is not read as zero.
+    """
+    if not owned:
+        return False, "this channel was not started by the operator shell"
+    if endpoint_row is None:
+        return False, ("the endpoint is not connected, so its socks "
+                       "sessions cannot be checked")
+    if "socks" not in endpoint_row:
+        return False, "the endpoint row does not report its socks sessions"
+    socks = endpoint_row["socks"]
+    if socks is None:
+        return True, ""
+    sessions = socks.get("sessions") if isinstance(socks, dict) else None
+    if isinstance(sessions, bool) or not isinstance(sessions, int):
+        return False, "the endpoint reports no usable socks session count"
+    if sessions > 0:
+        return False, ("%d live socks session(s) ride this channel"
+                       % sessions)
+    return True, ""
+
+
+def expected_checkin(agent: dict, now: float) -> Optional[float]:
+    """Seconds until the agent's next check-in; negative when overdue.
+
+    From `_last_seen_ts` and `interval`; an absent or unreadable interval
+    is the server's own default of 300. None when the agent has never been
+    seen. The overdue case is returned as the negative number it is: the
+    view shows it. This reads the agent and never writes it.
+    """
+    last = agent.get("_last_seen_ts")
+    if isinstance(last, bool) or not isinstance(last, (int, float)):
+        return None
+    interval = agent.get("interval")
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+        interval = _DEFAULT_INTERVAL
+    return last + interval - now
 
 
 def _now_iso() -> str:
