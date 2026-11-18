@@ -1875,5 +1875,138 @@ class TestTheStreamDoesNotDialBeforeItChecks(_RouteCase):
         self.assertFalse(port.connected.is_set())
 
 
+class TestTheAgentsOwnReportArrivesThroughACheckIn(_RouteCase):
+    """End to end, because every other test set the field by hand.
+
+    The beacon has been sending `info["tunnel"]` since the tunnel feature
+    shipped and `_handle_beacon` never stored it. The operator shell's
+    whole second source for "is this channel still up" reads that field,
+    so the fallback meant to cover a relay outage was never true in
+    production -- and it was invisible because the tests wrote the field
+    themselves. This one makes the beacon's own path produce it.
+    """
+
+    def _check_in(self, tunnel):
+        crypto = self.crypto
+        app = self.app(supervisor=self.configured_but_stopped())
+        client = app.test_client()
+        payload = {"action": "beacon", "agent_id": self.AGENT,
+                   "tunnel": tunnel}
+        client.post("http://localhost:1/api/v1/beacon",
+                    json=crypto.wrap(payload))
+        return app
+
+    def test_a_check_in_stores_what_the_beacon_reported(self):
+        self._check_in({"pid": 991, "running": True, "source": "task"})
+        self.assertEqual(
+            (self.sm.agents[self.AGENT].get("tunnel") or {}).get("pid"), 991)
+
+    def test_the_view_then_reports_the_channel_without_a_relay_row(self):
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        app = self._check_in({"pid": 991, "running": True, "source": "task"})
+        state = self.operator_client(app).get(
+            self.url("/api/opshell/state"), headers=self.auth).get_json()
+        self.assertEqual(state["channel"], "open")
+
+    def test_a_report_of_a_dead_child_does_not_read_as_a_channel(self):
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        app = self._check_in({"pid": 991, "running": False, "exit_code": 0})
+        state = self.operator_client(app).get(
+            self.url("/api/opshell/state"), headers=self.auth).get_json()
+        self.assertEqual(state["channel"], "closed")
+
+
+class TestTheBrakeCanLetGo(_RouteCase):
+    """A brake that cannot release is worse than one stop too many.
+
+    A history entry leaves `pending` only when a result comes back, and
+    nothing expires it. `task_queues` is not persisted, so a restart loses
+    the task and keeps the entry -- and the first version of the brake then
+    answered "already queued" for ever: no stop would ever be sent again,
+    the channel would stay up and the view would say `closing` for good.
+    """
+
+    def _entry(self, queued_iso, in_queue):
+        self.sm.history[self.AGENT] = [{
+            "task_id": "t1", "cmd": "tunnel", "args": "stop",
+            "status": "pending", "queued": queued_iso}]
+        if in_queue:
+            self.sm.task_queues[self.AGENT] = [{"id": "t1", "cmd": "tunnel",
+                                                "args": "stop"}]
+
+    def test_a_task_still_in_the_queue_brakes(self):
+        self._entry("2026-11-18T00:00:00Z", True)
+        self.assertTrue(self.sm._opshell_stop_in_flight(self.AGENT))
+
+    def test_a_recent_answerless_task_still_brakes(self):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self._entry(now.replace("+00:00", "Z"), False)
+        self.assertTrue(self.sm._opshell_stop_in_flight(self.AGENT))
+
+    def test_a_task_older_than_two_intervals_lets_go(self):
+        self._entry("2020-01-01T00:00:00Z", False)
+        self.assertFalse(self.sm._opshell_stop_in_flight(self.AGENT))
+
+    def test_an_entry_with_no_timestamp_lets_go(self):
+        self.sm.history[self.AGENT] = [{"task_id": "t1", "cmd": "tunnel",
+                                        "args": "stop", "status": "pending"}]
+        self.assertFalse(self.sm._opshell_stop_in_flight(self.AGENT))
+
+
+class TestWhatReleasesOwnership(_RouteCase):
+    def test_a_relay_row_keeps_the_stop_owed(self):
+        # The first version promised this check in its docstring and did
+        # not make it, so a failed stop released the ownership that owed a
+        # retry.
+        self.sm.history[self.AGENT] = [{"task_id": "t1", "cmd": "tunnel",
+                                        "args": "stop", "status": "done",
+                                        "output": "could not stop"}]
+        row = {"identity": "x", "implant_id": self.IMPLANT}
+        self.assertFalse(self.sm._opshell_stop_settled(self.AGENT, row))
+        self.assertTrue(self.sm._opshell_stop_settled(self.AGENT, None))
+
+    def test_a_pending_stop_is_not_settled(self):
+        self.sm.history[self.AGENT] = [{"task_id": "t1", "cmd": "tunnel",
+                                        "args": "stop", "status": "pending"}]
+        self.assertFalse(self.sm._opshell_stop_settled(self.AGENT, None))
+
+    def test_a_child_the_agent_still_reports_is_not_settled(self):
+        self.sm.history[self.AGENT] = [{"task_id": "t1", "cmd": "tunnel",
+                                        "args": "stop", "status": "done",
+                                        "output": "stopped"}]
+        self.sm.agents[self.AGENT]["tunnel"] = {"pid": 9, "running": True}
+        self.assertFalse(self.sm._opshell_stop_settled(self.AGENT, None))
+
+
+class TestACheckInDoesNotRetireAWatchingTab(_ClaimsCase):
+    def test_lapsed_false_leaves_a_slow_tab_alone(self):
+        # A check-in carries no browser heartbeat, so it must not judge
+        # whether a browser is still watching. A tab polling slower than
+        # the grace would otherwise be retired by somebody else's agent.
+        claims = opshell.Claims(self.path, grace=10.0)
+        claims.open("raccoon-bandit")
+        queues = {}
+        opshell.sweep(claims, ["raccoon-bandit"],
+                      {"raccoon-bandit": {"socks": {"sessions": 0}}},
+                      {"raccoon-bandit": False}, queues, {}, "now",
+                      time.time() + 11, {}, {}, lapsed=False)
+        self.assertEqual(queues, {})
+        self.assertEqual(claims.sessions("raccoon-bandit"), 1)
+
+    def test_lapsed_true_does_retire_it(self):
+        claims = opshell.Claims(self.path, grace=10.0)
+        claims.open("raccoon-bandit")
+        queues = {}
+        opshell.sweep(claims, ["raccoon-bandit"],
+                      {"raccoon-bandit": {"socks": {"sessions": 0}}},
+                      {"raccoon-bandit": False}, queues, {}, "now",
+                      time.time() + 11, {}, {}, lapsed=True)
+        self.assertEqual([t["args"] for t in queues["raccoon-bandit"]],
+                         ["stop"])
+
+
 if __name__ == "__main__":
     unittest.main()

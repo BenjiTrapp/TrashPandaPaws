@@ -412,7 +412,7 @@ def end_session(claims, agent_id, session_id, endpoint_row,
 
 
 def sweep(claims, agents_now, endpoint_rows, reports_running, task_queues,
-          history, now, clock, pending=None, settled=None):
+          history, now, clock, pending=None, settled=None, lapsed=True):
     """Queue the stop for every claim nobody is watching any more.
 
     `agents_now` is the fleet's agent ids, `endpoint_rows` maps an agent to
@@ -444,11 +444,15 @@ def sweep(claims, agents_now, endpoint_rows, reports_running, task_queues,
                        already_pending=bool(pending.get(agent_id)))[0]:
             queued.append(agent_id)
 
-    for agent_id in list(claims.lapsed(clock)):
-        if agent_id not in agents_now:
-            claims.forget(agent_id)
-            continue
-        owe(agent_id)
+    if lapsed:
+        # Only a caller that carries a browser's heartbeat may judge a
+        # browser's liveness. `lapsed=False` is for the drivers that do
+        # not -- see the comment at the check-in.
+        for agent_id in list(claims.lapsed(clock)):
+            if agent_id not in agents_now:
+                claims.forget(agent_id)
+                continue
+            owe(agent_id)
     for agent_id in reconcile(claims, agents_now):
         if settled.get(agent_id):
             # The stop this view owed has been carried out, so the

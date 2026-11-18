@@ -889,7 +889,42 @@ def _opshell_endpoint_row(tunnel_supervisor, agent_name):
     return None, state
 
 
-def _opshell_stop_settled(agent_name: str) -> bool:
+def _opshell_stop_in_flight(agent_name: str) -> bool:
+    """Whether a tunnel task is outstanding *and* can still be delivered.
+
+    The brake on the sweep, and it has to be able to let go. A history
+    entry leaves `pending` only when a result comes back, and nothing
+    expires it: a task whose result was lost -- the beacon died, the queue
+    was dropped by a restart, which it is, since `task_queues` is not
+    persisted -- would otherwise read as "already queued" for ever, and no
+    stop would ever be sent again. That is worse than queueing one stop
+    too many: the channel stays up and the view says `closing` for good.
+
+    So: still in the queue, or answered recently enough that an answer is
+    plausibly still coming. One interval, doubled for jitter, measured
+    from when the task was queued.
+    """
+    task = _tunnel_pending(agent_name)
+    if task is None:
+        return False
+    # `task_id` in a history entry, `id` in a queued task. Comparing the
+    # wrong pair made this always fall through to the age test, which is
+    # the slower and weaker half of the answer.
+    task_id = task.get("task_id") or task.get("id")
+    for queued in task_queues.get(agent_name) or []:
+        if queued.get("id") == task_id:
+            return True
+    stamped = task.get("queued") or ""
+    interval = _as_int((agents.get(agent_name) or {}).get("interval"), 300)
+    try:
+        when = datetime.fromisoformat(stamped.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    age = (datetime.now(timezone.utc) - when).total_seconds()
+    return age < interval * 2
+
+
+def _opshell_stop_settled(agent_name: str, endpoint_row=None) -> bool:
     """Whether the stop this view owed has demonstrably been carried out.
 
     What releases ownership. Three things together, because any one of
@@ -902,6 +937,12 @@ def _opshell_stop_settled(agent_name: str) -> bool:
     if last is None or (last.get("args") or "").strip() != "stop":
         return False
     if (last.get("status") or "") == "pending":
+        return False
+    if endpoint_row is not None:
+        # The relay still shows the endpoint connected, so the channel is
+        # up whatever the stop's answer said. The first version promised
+        # this check in its docstring and did not make it, which let a
+        # failed stop release the ownership that owed a retry.
         return False
     if _opshell_agent_reports_tunnel(agent_name):
         return False
@@ -1793,7 +1834,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 target, _opshell_started_pid(last)) else "waiting"
         return out
 
-    def opshell_sweep():
+    def opshell_sweep(lapsed=True):
         """Queue the stop for claims nobody is watching any more.
 
         Driven by whatever request arrives, because a view that is gone
@@ -1805,18 +1846,25 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         if claims is None:
             return
         rows, reports, pending, settled = {}, {}, {}, {}
-        for agent_name in set(list(agents) + claims.owned()):
+        # Only the agents this view owns a channel for. The first version
+        # walked the whole fleet, and since a check-in now drives the sweep
+        # that was one relay round trip per agent per check-in -- N agents
+        # cost about N squared round trips an interval, nearly all of it on
+        # agents that could not be swept at all.
+        for agent_name in set(claims.owned()):
             row, _ = _opshell_endpoint_row(tunnel_supervisor, agent_name)
             rows[agent_name] = row
             reports[agent_name] = (
                 _opshell_agent_reports_tunnel(agent_name)
                 and not _opshell_report_is_stale_for(
                     agent_name, _opshell_last_tunnel(agent_name)))
-            pending[agent_name] = _tunnel_pending(agent_name) is not None
-            settled[agent_name] = _opshell_stop_settled(agent_name)
+            pending[agent_name] = _opshell_stop_in_flight(agent_name)
+            settled[agent_name] = _opshell_stop_settled(
+                agent_name, rows[agent_name])
         for agent_name in opshell.sweep(claims, list(agents), rows, reports,
                                         task_queues, history, _now(),
-                                        time.time(), pending, settled):
+                                        time.time(), pending, settled,
+                                        lapsed=lapsed):
             _log_event("TASK", "cmd=tunnel args=stop (operator shell: no "
                                "view is watching this channel any more)",
                        agent_id=agent_name)
@@ -3460,9 +3508,20 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             # Wrapped, because nothing about this may change what a beacon
             # sees: a prober must not be able to tell that it ran.
             try:
-                opshell_sweep()
+                # `lapsed=False`: a check-in must not judge whether a
+                # browser is still watching. It has no beat of its own, so
+                # sweeping the lapse here would retire a tab that polls
+                # slower than the grace -- a hidden browser tab is
+                # throttled to about one poll a minute, which is that edge
+                # exactly. What a check-in *can* settle is ownership with
+                # no claims behind it at all, which is the restart case and
+                # the no-browser case this driver exists for.
+                opshell_sweep(lapsed=False)
             except Exception as exc:
-                logger.debug("opshell: sweep on check-in failed: %s", exc)
+                # Warning, not debug: this driver runs precisely when no
+                # browser is open, so a failure here is the one nobody
+                # would otherwise see.
+                logger.warning("opshell: sweep on check-in failed: %s", exc)
 
             if action == "register":
                 return _handle_register(payload, crypto)
@@ -3765,6 +3824,14 @@ def _handle_beacon(payload: dict, crypto: ServerCrypto):
             agents[agent_id]["proxy_active"] = payload["proxy_active"]
         if payload.get("c2_profile") is not None:
             agents[agent_id]["c2_profile"] = payload["c2_profile"]
+        if isinstance(payload.get("tunnel"), dict):
+            # The beacon has been sending this since the tunnel feature
+            # shipped (`beacon.py:5309`) and nothing stored it. The
+            # operator shell's whole second source for "is a channel still
+            # up" reads it: without this the fallback that was supposed to
+            # cover a relay outage was never true in production, and every
+            # test that exercised it set the field by hand.
+            agents[agent_id]["tunnel"] = payload["tunnel"]
 
         dispatched = _dispatch_for(agent_id)
         if dispatched is not None:
