@@ -33,6 +33,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -46,6 +47,12 @@ from flask import Flask, request, jsonify, send_file, send_from_directory, Respo
 # all.
 from software.c2.listeners.errors import SupervisorError
 
+# The operator shell's server-side logic: the claim and its ownership
+# record, the two tunnel tasks, and the bridge to the shell port. A module
+# of its own because none of it is web-facing, and because `_log_event`
+# living here is what keeps the dependency one-way -- see `opshell_queue`.
+from software.c2 import opshell
+
 # The second artifact shape. The templates live beside the startup hook
 # in `stagers/` rather than here, because nothing in that package may
 # import this one: `tools/build_interpreter_bundle.py` is its other
@@ -54,10 +61,12 @@ from software.c2.stagers.stager import drop_list, render_stager
 from werkzeug.serving import generate_adhoc_ssl_context, make_server
 
 try:
-    from software.c2.beacon import decode_key, persistence_name
+    from software.c2.beacon import (decode_key, persistence_name,
+                                    SHELL_DEFAULT_COLS, SHELL_DEFAULT_ROWS)
 except ImportError:
     # The container ships server.py and beacon.py side by side, not as a package.
-    from beacon import decode_key, persistence_name
+    from beacon import (decode_key, persistence_name,
+                        SHELL_DEFAULT_COLS, SHELL_DEFAULT_ROWS)
 
 # The rescue record's format. Shared with the DNS listener; the beacon
 # carries a copy, because the generator serves it as source text.
@@ -837,6 +846,61 @@ def _tunnel_row(row: dict) -> dict:
 _AGENT_SOCKET_ENDPOINTS = frozenset({"beacon_handler", "api_dns_tasking"})
 
 
+# ── The operator shell ──
+#
+# One terminal, from the header of this interface onto the operator's own
+# hardware implant. The channel that carries it is raised and dropped with
+# `tunnel start` and `tunnel stop`, which are *tasks*: they take effect at
+# the implant's next check-in, up to a whole interval away. So opening and
+# closing are both requests with a delay, and the state below says which
+# of the four it is in rather than pretending either was instant.
+#
+# The anti-goal this code serves: a channel left open on the target while
+# the operator believes it closed. Every branch that refuses to queue a
+# stop keeps the claim on file so that something later will.
+_OPSHELL_OWNED = "opshell-owned.json"
+_OPSHELL_TARGET = "opshell-target.json"
+
+# session id -> opshell.Bridge. Module state beside `agents` and
+# `task_queues`, with the same lifetime, because a stream and the keystrokes
+# that feed it arrive as separate requests on separate threads.
+opshell_bridges = {}  # type: dict
+
+
+def _opshell_endpoint_row(tunnel_supervisor, agent_name):
+    """`(row, server_state)` for that agent's endpoint; row may be None.
+
+    A row exists only while the endpoint is connected: the identity is six
+    random bytes unrelated to the agent, and the link lives in the
+    channel's `implant_id` (see `_agent_for_implant`). So "no row" does not
+    mean "no channel" -- the agent's own check-in is the second source, and
+    `_opshell_agent_reports_tunnel` is where that is read.
+    """
+    if tunnel_supervisor is None:
+        return None, {}
+    state = tunnel_supervisor.status() or {}
+    for row in state.get("endpoints") or []:
+        if _agent_for_implant(row.get("implant_id")) == agent_name:
+            return row, state
+    return None, state
+
+
+def _opshell_agent_reports_tunnel(agent_name: str) -> bool:
+    """Whether the agent itself last said its tunnel child was running.
+
+    The beacon puts its tunnel's state in its check-in, so this is true of
+    a channel whose relay is down -- which is exactly the case a `None`
+    endpoint row cannot speak for. Without it a relay outage would leave a
+    channel open for ever, because `may_stop` refuses a row it has not got.
+    """
+    info = agents.get(agent_name) or {}
+    tunnel = info.get("tunnel")
+    if not isinstance(tunnel, dict):
+        return False
+    return bool(tunnel.get("running") or tunnel.get("pid"))
+
+
+
 def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                server_config: Optional[dict] = None,
                operator_port: Optional[int] = None,
@@ -1431,6 +1495,319 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                        "agent confirms."
                        % (action, agent, expected, agent, interval)),
         })
+
+    # ── The operator shell ──
+    #
+    # Five routes the header's terminal view talks to. They queue the two
+    # tunnel tasks, bridge the browser to the shell port, and report a
+    # state that never claims more than it knows.
+
+    opshell_owned_path = data_dir / _OPSHELL_OWNED
+    opshell_target_path = data_dir / _OPSHELL_TARGET
+    # The claim is built once and kept; a damaged record is remembered as a
+    # reason rather than retried on every request.
+    _opshell = {"claims": None, "record_error": ""}
+
+    def opshell_claims():
+        """The claim store, or None when its record could not be read.
+
+        `opshell.Claims` raises on a damaged or unreadable record, and that
+        is deliberate: reading it as "owns nothing" would silently drop
+        every stop this server owes. But a team server that refuses to boot
+        because a scratch file was corrupted is the wrong trade -- so the
+        failure is caught here, once, and surfaces in the view's state as
+        `channel: unknown` with a reason the operator can act on.
+        """
+        if _opshell["claims"] is None and not _opshell["record_error"]:
+            try:
+                _opshell["claims"] = opshell.Claims(opshell_owned_path)
+            except opshell.OwnershipRecordError as exc:
+                _opshell["record_error"] = (
+                    "the operator shell's ownership record could not be "
+                    "read (%s), so a channel may be open on a device this "
+                    "server can no longer name; move the file aside to "
+                    "clear this" % exc)
+                logger.error("opshell: %s", _opshell["record_error"])
+        return _opshell["claims"]
+
+    def opshell_target():
+        try:
+            with open(opshell_target_path) as handle:
+                return (json.load(handle) or {}).get("agent") or None
+        except (OSError, ValueError):
+            return None
+
+    def opshell_remember(agent_name: str):
+        """Persist the designation, so the glyph opens onto the same host.
+
+        Separate from the ownership record on purpose: that one answers
+        "whose channel do we owe a stop for", this one answers "which host
+        did the operator point this view at", and conflating them would
+        make forgetting a channel forget the designation too.
+        """
+        tmp = opshell_target_path.with_suffix(".tmp")
+        with open(tmp, "w") as handle:
+            json.dump({"agent": agent_name}, handle)
+        os.replace(tmp, opshell_target_path)
+
+    def opshell_queue(agent_name: str, action: str):
+        """Queue `tunnel <action>` and write the audit line for it.
+
+        `opshell.queue_tunnel` deliberately does not log: `_log_event`
+        lives here and calling it from that module would close an import
+        cycle. So the route is where an operator's action becomes findable
+        afterwards, the way `api_create_task` makes one findable.
+        """
+        task = opshell.queue_tunnel(agent_name, action, task_queues,
+                                    history, _now())
+        _log_event("TASK", "cmd=tunnel args=%s task_id=%s (operator shell)"
+                   % (action, task["id"]), agent_id=agent_name)
+        return task
+
+    def opshell_state():
+        """What the view renders. Four states, and no fifth that lies."""
+        claims = opshell_claims()
+        target = opshell_target()
+        reason = _opshell["record_error"]
+        out = {
+            "target": target,
+            "candidates": sorted(agents),
+            "state": "idle",
+            "sessions": 0,
+            "host": "",
+            "user": "",
+            "root": False,
+            "recording": False,
+            "transcript_dir": None,
+            "channel": "unknown" if _opshell["record_error"] else "closed",
+            "geometry": [SHELL_DEFAULT_COLS,
+                         SHELL_DEFAULT_ROWS],
+            "expected_checkin": None,
+            "reason": reason,
+        }
+        if tunnel_supervisor is None:
+            out["reason"] = reason or _TUNNEL_UNCONFIGURED
+            return out
+        row, state = _opshell_endpoint_row(tunnel_supervisor, target)
+        if state.get("shell_port_first") is None:
+            out["reason"] = reason or (
+                "the tunnel server has no shell port range configured, so "
+                "it opens no shell port: set shell_port_first and "
+                "shell_port_last in the tunnel server's block")
+            return out
+        out["transcript_dir"] = state.get("shell_transcript_dir") or None
+        if target is None:
+            return out
+        if target not in agents:
+            out["reason"] = reason or (
+                "%s is no longer in the fleet" % target)
+            return out
+
+        out["expected_checkin"] = opshell.expected_checkin(
+            agents.get(target) or {}, time.time())
+        if claims is not None:
+            out["sessions"] = claims.sessions(target)
+            owned = target in claims.owned()
+        else:
+            owned = False
+
+        pending = _tunnel_pending(target)
+        refusal = _tunnel_refusal(target)
+        if refusal:
+            out["reason"] = reason or refusal
+
+        if row is not None:
+            out["host"] = row.get("hostname") or ""
+            out["user"] = row.get("user") or ""
+            out["root"] = row.get("user") == "root"
+            out["recording"] = bool(row.get("shell_recording"))
+            out["channel"] = "open"
+        elif _opshell_agent_reports_tunnel(target):
+            # The agent says its child is running even though the relay has
+            # no row for it. Open, and stoppable -- see
+            # `_opshell_agent_reports_tunnel`.
+            out["channel"] = "open"
+        elif not _opshell["record_error"]:
+            out["channel"] = "closed"
+
+        if pending is not None:
+            action = (pending.get("args") or "").strip() or "start"
+            out["state"] = "waiting" if action == "start" else "closing"
+        elif out["channel"] == "open":
+            out["state"] = "live"
+        elif owned:
+            # Owned with no channel to show and no task outstanding: the
+            # stop was acknowledged, or the agent has not been heard from.
+            # Either way the operator is owed the truth, not "live".
+            out["state"] = "closing"
+        return out
+
+    @app.route("/api/opshell/state", methods=["GET"])
+    @require_auth
+    def api_opshell_state():
+        claims = opshell_claims()
+        target = opshell_target()
+        if claims is not None and target:
+            # The view's own poll is the claim's heartbeat: a browser that
+            # stops asking stops holding the channel. Task 5's sweep is
+            # what turns that into a queued stop.
+            for session_id in list(opshell_bridges):
+                claims.beat(target, session_id)
+        return jsonify(opshell_state())
+
+    @app.route("/api/opshell/open", methods=["POST"])
+    @require_auth
+    def api_opshell_open():
+        body = request.get_json(silent=True) or {}
+        agent_name = (body.get("agent") or opshell_target() or "").strip()
+        if not agent_name or agent_name not in agents:
+            return jsonify({"error": "no such agent",
+                            "refused": str(agent_name)[:64]}), 404
+        opshell_remember(agent_name)
+
+        state = tunnel_supervisor.status() if tunnel_supervisor else {}
+        if tunnel_supervisor is not None and state.get("state") != "running" \
+                and state.get("can_control"):
+            # Allowed, and it costs the implant nothing: the tunnel server
+            # is a process on this host. The configuration file is not
+            # touched -- a missing shell port range is reported as a reason
+            # by `opshell_state`, not fixed behind the operator's back.
+            try:
+                tunnel_supervisor.start()
+            except Exception as exc:  # SupervisorError and anything under it
+                logger.warning("opshell: could not start the tunnel server: "
+                               "%s", exc)
+
+        row, _ = _opshell_endpoint_row(tunnel_supervisor, agent_name)
+        pending = _tunnel_pending(agent_name)
+        if row is None and not _opshell_agent_reports_tunnel(agent_name) \
+                and pending is None:
+            # Not idempotent by itself: a second open while a start is
+            # outstanding must not queue another one.
+            opshell_queue(agent_name, "start")
+        claims = opshell_claims()
+        if claims is not None:
+            claims.open(agent_name)
+        return jsonify(opshell_state())
+
+    @app.route("/api/opshell/close", methods=["POST"])
+    @require_auth
+    def api_opshell_close():
+        body = request.get_json(silent=True) or {}
+        target = (body.get("agent") or opshell_target() or "").strip()
+        if not target:
+            return jsonify({"error": "nothing is open"}), 404
+        session_id = body.get("session")
+        claims = opshell_claims()
+        bridge = opshell_bridges.pop(session_id, None)
+        if bridge is not None:
+            bridge.close()
+        last = True
+        if claims is not None and session_id:
+            last = claims.close(target, session_id)
+        if not last:
+            return jsonify(opshell_state())
+
+        row, _ = _opshell_endpoint_row(tunnel_supervisor, target)
+        owned = claims is None or target in claims.owned()
+        allowed, why = opshell.may_stop(row, owned)
+        if not allowed and owned and row is None \
+                and _opshell_agent_reports_tunnel(target):
+            # `may_stop` refuses a row it has not got, by contract. The
+            # agent's own report is the second source, and a channel it
+            # reports has no SOCKS session this server could drop.
+            allowed, why = True, ""
+        if allowed:
+            opshell_queue(target, "stop")
+            return jsonify(opshell_state())
+
+        # Refused: the claim stays on file, so the stop is still owed and
+        # the next sweep or a later close will queue it. A route that
+        # treated this as "done" would be the anti-goal.
+        state = opshell_state()
+        state["reason"] = why or state["reason"]
+        return jsonify(state)
+
+    @app.route("/api/opshell/stream", methods=["GET"])
+    @require_auth
+    def api_opshell_stream():
+        target = opshell_target()
+        if not target or target not in agents:
+            return jsonify({"error": "nothing is open"}), 404
+        row, _ = _opshell_endpoint_row(tunnel_supervisor, target)
+        if row is None or not row.get("shell_port"):
+            return jsonify({"error": "no shell port on this endpoint"}), 409
+        claims = opshell_claims()
+        bridge = opshell.Bridge(row["shell_port"], row.get("shell_password")
+                                or "", _as_int(request.args.get("cols"),
+                                               SHELL_DEFAULT_COLS),
+                                _as_int(request.args.get("rows"),
+                                        SHELL_DEFAULT_ROWS))
+        try:
+            bridge.connect()
+        except OSError as exc:
+            # A failed connect leaves the bridge closed; a retry needs a
+            # new one, which the next request makes.
+            return jsonify({"error": "could not attach: %s"
+                                     % type(exc).__name__}), 502
+        session_id = claims.open(target) if claims is not None \
+            else secrets.token_hex(8)
+        opshell_bridges[session_id] = bridge
+
+        def pump():
+            try:
+                while True:
+                    if opshell_bridges.get(session_id) is not bridge:
+                        # The session was closed, or replaced. Without this
+                        # the loop below would keep reading a bridge nobody
+                        # owns: `read` answers a quiet peer with a timeout,
+                        # so "keep reading" has no natural end.
+                        return
+                    try:
+                        chunk = bridge.read(timeout=5.0)
+                    except socket.timeout:
+                        # A quiet peer, not a finished one. Only b"" ends
+                        # the stream.
+                        continue
+                    if not chunk:
+                        return
+                    yield chunk
+            finally:
+                opshell_bridges.pop(session_id, None)
+                bridge.close()
+
+        answer = Response(pump(), mimetype="application/octet-stream",
+                          direct_passthrough=True)
+        answer.headers["X-Opshell-Session"] = session_id
+        answer.headers["X-Opshell-Geometry"] = "%dx%d" % bridge.geometry
+        return answer
+
+    @app.route("/api/opshell/keys", methods=["POST"])
+    @require_auth
+    def api_opshell_keys():
+        body = request.get_json(silent=True) or {}
+        bridge = opshell_bridges.get(body.get("session"))
+        if bridge is None:
+            return jsonify({"error": "no such session"}), 404
+        try:
+            data = base64.b64decode(body.get("data") or "")
+        except Exception:
+            return jsonify({"error": "data must be base64"}), 400
+        try:
+            bridge.write(data)
+        except OSError as exc:
+            # Not fatal on its own: two of the far end's refusals are
+            # written from its accept loop before any prompt, so a bridge
+            # that was never accepted is holding text the operator needs to
+            # read. The stream carries it; this answer says so instead of
+            # reporting a broken pipe as the whole story.
+            if not bridge.accepted:
+                return jsonify({"refused": True,
+                                "detail": "the shell port refused this "
+                                          "session; its reason is on the "
+                                          "stream"}), 409
+            return jsonify({"error": type(exc).__name__}), 502
+        return jsonify({"written": len(data)})
 
     @app.route("/api/server/exec", methods=["POST"])
     @require_auth

@@ -778,5 +778,367 @@ class TestTheBridge(unittest.TestCase):
                              beacon._shell_geometry(value, 77), value)
 
 
+class _RouteCase(unittest.TestCase):
+    """A real app with the operator socket's own policy installed.
+
+    `operator_port` is passed so the socket split exists: without it
+    `create_app` allows everything on one socket, and the agent-socket test
+    below would prove nothing.
+    """
+
+    OPERATOR_PORT = 18999
+    TOKEN = "route-token"
+    AGENT = "clumsy-raccoon"
+    IMPLANT = "implant-1"
+    SHELL_PASSWORD = "C06d-ScunJ-TGDoFbKx5EQ"
+
+    ROUTES = (("/api/opshell/state", "GET"),
+              ("/api/opshell/open", "POST"),
+              ("/api/opshell/close", "POST"),
+              ("/api/opshell/stream", "GET"),
+              ("/api/opshell/keys", "POST"))
+
+    def setUp(self):
+        from software.c2 import server as server_mod
+
+        self.sm = server_mod
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.data_dir = Path(tmp.name)
+        self.crypto = server_mod.ServerCrypto(b"\x11" * 32)
+        self.auth = {"Authorization": "Bearer " + self.TOKEN}
+
+        server_mod.agents.clear()
+        server_mod.task_queues.clear()
+        server_mod.history.clear()
+        del server_mod.event_log[:]
+        self.addCleanup(server_mod.agents.clear)
+        self.addCleanup(server_mod.task_queues.clear)
+        self.addCleanup(server_mod.history.clear)
+        self.addCleanup(lambda: server_mod.event_log.clear())
+        server_mod.agents[self.AGENT] = {
+            "id": self.IMPLANT, "agent_id": self.AGENT, "hostname": "parrot",
+            "interval": 300, "_last_seen_ts": time.time(), "caps": ["batch"],
+        }
+
+    def app(self, supervisor="default"):
+        if supervisor == "default":
+            supervisor = self.connected()
+        return self.sm.create_app(
+            self.crypto, self.TOKEN, self.data_dir,
+            operator_port=self.OPERATOR_PORT,
+            tunnel_supervisor=supervisor)
+
+    def client(self, **kw):
+        return self.operator_client(self.app(**kw))
+
+    OPERATOR_URL = "http://localhost:18999"
+
+    def operator_client(self, app):
+        """A client whose requests look as if they arrived on the operator
+        socket.
+
+        `create_app` judges a request by `SERVER_PORT`, and the test client
+        goes through no socket at all -- so without this every request here
+        would get the beacon catch-all's cover answer and every assertion
+        would be about that instead of about the routes. Measured: setting
+        `SERVER_PORT` in `environ_base` does **not** work, because werkzeug
+        recomputes it from the URL; the port has to be in the URL itself.
+        """
+        client = app.test_client()
+        client.operator_url = self.OPERATOR_URL
+        return client
+
+    def url(self, path):
+        # Idempotent: the wrappers below prefix, and so do some call sites.
+        if path.startswith("http"):
+            return path
+        return self.OPERATOR_URL + path
+
+    # ── supervisors, in the states the routes must tell apart ──
+
+    def _supervisor(self, status):
+        class _Fake(object):
+            def __init__(self):
+                self.started = False
+
+            def status(self):
+                return status
+
+            def start(self):
+                self.started = True
+                status["state"] = "running"
+                return status
+
+        return _Fake()
+
+    def dead_port(self):
+        """A port nothing listens on, for certain.
+
+        Not a guessed number: 19630 is the first of the shipped shell range
+        and it was live on the machine this was written on, so a guessed
+        port made the stream route attach to a real service and the test
+        hung. Bind one, read its number, close it.
+        """
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        return port
+
+    def connected(self, sessions=0, socks_sessions=0, user="root"):
+        return self._supervisor({
+            "state": "running", "can_control": True, "pid": 4242,
+            "shell_port_first": 19630, "shell_port_last": 19640,
+            "shell_transcript_dir": "/tmp/transcripts",
+            "endpoints": [{
+                "identity": "parrot-box", "implant_id": self.IMPLANT,
+                "state": "connected", "user": user,
+                "shell_port": self.dead_port(),
+                "shell_password": self.SHELL_PASSWORD,
+                "shell_recording": True,
+                "shell": {"sessions": sessions, "max_sessions": 4},
+                "socks": {"sessions": socks_sessions, "max_sessions": 256},
+            }],
+        })
+
+    def configured_but_stopped(self):
+        return self._supervisor({
+            "state": "stopped", "can_control": True, "pid": None,
+            "shell_port_first": 19630, "shell_port_last": 19640,
+            "endpoints": [],
+        })
+
+    def running_without_shell_ports(self):
+        return self._supervisor({
+            "state": "running", "can_control": True, "pid": 4242,
+            "shell_port_first": None, "shell_port_last": None,
+            "endpoints": [],
+        })
+
+    def get(self, path, **kw):
+        return self.client(**kw).get(self.url(path), headers=self.auth)
+
+    def post(self, path, payload=None, **kw):
+        return self.client(**kw).post(self.url(path), json=payload or {},
+                                      headers=self.auth)
+
+
+class TestTheRoutesAreOperatorOnly(_RouteCase):
+    def test_every_route_needs_the_operator_token(self):
+        client = self.client()
+        for path, method in self.ROUTES:
+            answer = client.open(self.url(path), method=method)
+            self.assertEqual(answer.status_code, 401, path)
+
+    def test_no_route_answers_on_the_agent_socket(self):
+        # Exercised through the app, not compared against
+        # _AGENT_SOCKET_ENDPOINTS: a frozenset of two is trivially true
+        # today and would stay true if a route were added to it.
+        #
+        # The policy answers with the beacon catch-all's cover response
+        # rather than a refusal, on purpose -- "a 403 or a 404 would tell a
+        # prober what is listening" (server.py). So the assertion is that
+        # the cover answer came back and the route's own body did not.
+        client = self.client()
+        on_operator = client.get(self.url("/api/opshell/state"), headers=self.auth)
+        self.assertIn("channel", on_operator.get_json() or {},
+                      "the state route must answer on the operator socket, "
+                      "or this test cannot tell a hidden route from a "
+                      "missing one")
+        for path, method in self.ROUTES:
+            answer = client.open("http://localhost:9999" + path,
+                                 method=method, headers=self.auth)
+            body = answer.get_json() or {}
+            self.assertEqual(body.get("status"), "ok", path)
+            self.assertNotIn("channel", body, path)
+            self.assertNotIn("target", body, path)
+
+
+class TestTheStateTellsTheTruth(_RouteCase):
+    def test_no_response_body_carries_the_shell_password(self):
+        self.post(self.url("/api/opshell/open"), {"agent": self.AGENT})
+        state = self.get(self.url("/api/opshell/state"))
+        self.assertIn("channel", state.get_json() or {},
+                      "an empty body trivially contains no password; the "
+                      "state route has to answer for this test to mean "
+                      "anything")
+        for path, method in self.ROUTES:
+            answer = self.client().open(self.url(path), method=method,
+                                        json={}, headers=self.auth)
+            self.assertNotIn(self.SHELL_PASSWORD,
+                             answer.get_data(as_text=True), path)
+
+    def test_a_missing_tunnel_server_is_a_named_reason_not_a_500(self):
+        state = self.get(self.url("/api/opshell/state"), supervisor=None).get_json()
+        self.assertEqual(state["state"], "idle")
+        self.assertTrue(state["reason"])
+
+    def test_a_missing_shell_port_range_names_itself(self):
+        state = self.get(self.url("/api/opshell/state"),
+                         supervisor=self.running_without_shell_ports()
+                         ).get_json()
+        self.assertIn("shell port", state["reason"].lower())
+
+    def test_the_candidates_are_the_fleet_not_a_guess_at_their_builds(self):
+        # The design decided against pre-filtering: nothing at rest knows
+        # which build carries a tunnel, and a refusal arrives with the
+        # beacon's own answer instead.
+        state = self.get(self.url("/api/opshell/state")).get_json()
+        self.assertEqual(state["candidates"], [self.AGENT])
+
+    def test_a_beacons_refusal_reaches_the_reason(self):
+        self.sm.history[self.AGENT] = [{
+            "task_id": "aa", "cmd": "tunnel", "args": "start",
+            "status": "done",
+            "output": "[error] Not starting a tunnel child: no tunnel block",
+        }]
+        self.post(self.url("/api/opshell/open"), {"agent": self.AGENT})
+        state = self.get(self.url("/api/opshell/state")).get_json()
+        self.assertIn("no tunnel block", state["reason"])
+
+
+class TestOpeningTheChannel(_RouteCase):
+    def test_open_queues_one_tunnel_start_and_nothing_else(self):
+        self.post(self.url("/api/opshell/open"), {"agent": self.AGENT},
+                  supervisor=self.configured_but_stopped())
+        queued = [(t["cmd"], t["args"])
+                  for t in self.sm.task_queues[self.AGENT]]
+        self.assertEqual(queued, [("tunnel", "start")])
+
+    def test_open_writes_the_audit_line(self):
+        # queue_tunnel deliberately does not log -- _log_event lives in
+        # server.py and calling it from opshell would close an import
+        # cycle. The route is where the operator's action becomes findable.
+        self.post(self.url("/api/opshell/open"), {"agent": self.AGENT},
+                  supervisor=self.configured_but_stopped())
+        kinds = [e.get("cat") for e in self.sm.event_log]
+        self.assertIn("TASK", kinds)
+
+    def test_a_second_open_does_not_queue_a_second_start(self):
+        client = self.client(supervisor=self.configured_but_stopped())
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        self.sm.history[self.AGENT] = [{
+            "task_id": "aa", "cmd": "tunnel", "args": "start",
+            "status": "pending",
+        }]
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        starts = [t for t in self.sm.task_queues[self.AGENT]
+                  if t["args"] == "start"]
+        self.assertEqual(len(starts), 1)
+
+    def test_open_starts_the_tunnel_server_when_it_is_configured_and_down(self):
+        # The operator's rule: the server runs on this host, so starting it
+        # costs the implant nothing and the glyph stays one click.
+        supervisor = self.configured_but_stopped()
+        app = self.sm.create_app(self.crypto, self.TOKEN, self.data_dir,
+                                 operator_port=self.OPERATOR_PORT,
+                                 tunnel_supervisor=supervisor)
+        self.operator_client(app).post(self.url("/api/opshell/open"),
+                                       json={"agent": self.AGENT},
+                                       headers=self.auth)
+        self.assertTrue(supervisor.started)
+
+    def test_open_does_not_write_the_configuration_file(self):
+        config = self.data_dir / "raccoon.yaml"
+        config.write_text("c2:\n  tunnel_server:\n    enabled: false\n")
+        before = config.read_bytes()
+        self.post(self.url("/api/opshell/open"), {"agent": self.AGENT},
+                  supervisor=self.configured_but_stopped())
+        self.assertEqual(config.read_bytes(), before)
+
+    def test_the_designated_target_is_remembered_across_app_restarts(self):
+        self.post(self.url("/api/opshell/open"), {"agent": self.AGENT})
+        fresh = self.sm.create_app(self.crypto, self.TOKEN, self.data_dir,
+                                   operator_port=self.OPERATOR_PORT,
+                                   tunnel_supervisor=self.connected())
+        state = self.operator_client(fresh).get(
+            self.url("/api/opshell/state"), headers=self.auth).get_json()
+        self.assertEqual(state["target"], self.AGENT)
+
+    def test_an_unknown_agent_is_refused_by_name(self):
+        answer = self.post(self.url("/api/opshell/open"), {"agent": "no-such-raccoon"})
+        self.assertEqual(answer.status_code, 404)
+        self.assertEqual(self.sm.task_queues, {})
+
+
+class TestClosingTheChannel(_RouteCase):
+    def test_close_reports_closing_and_never_closed(self):
+        client = self.client()
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        state = client.post(self.url("/api/opshell/close"), json={},
+                            headers=self.auth).get_json()
+        self.assertEqual(state["state"], "closing")
+
+    def test_close_queues_the_stop_and_logs_it(self):
+        client = self.client()
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        client.post(self.url("/api/opshell/close"), json={}, headers=self.auth)
+        queued = [(t["cmd"], t["args"])
+                  for t in self.sm.task_queues[self.AGENT]]
+        self.assertIn(("tunnel", "stop"), queued)
+
+    def test_a_live_socks_session_leaves_the_stop_owed_and_says_so(self):
+        # The operator's rule: one child serves both ports, so closing the
+        # terminal must not drop a pivot. The claim stays on file.
+        client = self.client(supervisor=self.connected(socks_sessions=2))
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        state = client.post(self.url("/api/opshell/close"), json={},
+                            headers=self.auth).get_json()
+        queued = [t["args"] for t in self.sm.task_queues.get(self.AGENT, [])]
+        self.assertNotIn("stop", queued)
+        self.assertEqual(state["channel"], "open")
+        self.assertIn("socks", state["reason"].lower())
+
+    def test_a_channel_the_agent_reports_is_stoppable_without_a_relay_row(self):
+        # may_stop(None, owned=True) refuses by contract, because a None
+        # row carries no SOCKS report. The beacon reports its own tunnel
+        # state in its check-in, so the server can know without the relay
+        # -- otherwise a relay outage leaves a channel open for ever.
+        client = self.client(supervisor=self.configured_but_stopped())
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        self.sm.agents[self.AGENT]["tunnel"] = {"running": True, "pid": 991}
+        client.post(self.url("/api/opshell/close"), json={}, headers=self.auth)
+        queued = [t["args"] for t in self.sm.task_queues.get(self.AGENT, [])]
+        self.assertIn("stop", queued)
+
+
+class TestNothingTouchesTheInterval(_RouteCase):
+    def test_no_route_ever_queues_sleep(self):
+        # A stopped tunnel server, so that `open` really does queue
+        # something: with a channel already up it correctly queues nothing,
+        # and then this test would be asserting against an empty queue.
+        client = self.client(supervisor=self.configured_but_stopped())
+        for path, payload in (("/api/opshell/open", {"agent": self.AGENT}),
+                              ("/api/opshell/close", {}),
+                              ("/api/opshell/keys", {"session": "x",
+                                                     "data": ""})):
+            client.post(self.url(path), json=payload, headers=self.auth)
+        every = [t["cmd"] for q in self.sm.task_queues.values() for t in q]
+        self.assertIn("tunnel", every,
+                      "nothing was queued at all, so this test would pass "
+                      "against routes that do not exist")
+        self.assertNotIn("sleep", every)
+        self.assertEqual(self.sm.agents[self.AGENT]["interval"], 300)
+
+
+class TestADamagedOwnershipRecord(_RouteCase):
+    def test_the_server_still_starts_and_the_view_says_what_it_cannot_know(self):
+        # The module raises deliberately: reading a damaged record as "owns
+        # nothing" would silently drop every owed stop. A C2 server that
+        # refuses to boot because of a scratch file is the wrong trade, so
+        # the route reports it instead.
+        (self.data_dir / "opshell-owned.json").write_text("{not json")
+        state = self.get(self.url("/api/opshell/state")).get_json()
+        self.assertEqual(state["channel"], "unknown")
+        self.assertTrue(state["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()
