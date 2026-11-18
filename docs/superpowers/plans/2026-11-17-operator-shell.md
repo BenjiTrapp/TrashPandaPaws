@@ -190,7 +190,7 @@ git commit -m "feat(opshell): queue the channel's start and stop, with the stop'
 
 - [ ] **Step 1: Write the failing tests**
 
-A fake shell port is a `socket.socket` on loopback that writes `b"password: "`, reads one line, and then echoes. Put it in the test file as `_FakeShellPort`.
+A fake shell port is a helper class in the test file: it listens on loopback, writes `b"password: "`, reads one line, and then behaves as the case needs. It exposes `.port` (the integer to hand `Bridge`) and `.first_line()` (the auth line it received).
 
 ```python
 class TestTheBridge(unittest.TestCase):
@@ -206,26 +206,26 @@ class TestTheBridge(unittest.TestCase):
 
     def test_it_waits_for_the_prompt_before_sending(self):
         port = self._fake(prompt=b"password: ")
-        b = opshell.Bridge(port, "secret", 80, 24); b.connect()
+        b = opshell.Bridge(port.port, "secret", 80, 24); b.connect()
         self.assertEqual(port.first_line(), b"secret 80x24\n")
 
     def test_a_refusal_arrives_as_bytes_on_the_stream(self):
         # Review Focus 2. ShellFront writes its refusal onto the stream;
         # the bridge must pass it through, not turn it into an exception.
         port = self._fake(prompt=b"password: ", then=b"too many sessions\n")
-        b = opshell.Bridge(port, "secret", 80, 24); b.connect()
+        b = opshell.Bridge(port.port, "secret", 80, 24); b.connect()
         self.assertIn(b"too many sessions", b.read(timeout=2))
 
     def test_a_port_that_dies_ends_the_read_within_the_timeout(self):
         # Review Focus 4. A hang here is a view that lies about being live.
         port = self._fake(prompt=b"password: ", die_after_auth=True)
-        b = opshell.Bridge(port, "secret", 80, 24); b.connect()
+        b = opshell.Bridge(port.port, "secret", 80, 24); b.connect()
         self.assertEqual(b.read(timeout=2), b"")
 
     def test_a_port_that_never_prompts_raises_inside_the_timeout(self):
         port = self._fake(prompt=None)
         with self.assertRaises(OSError):
-            opshell.Bridge(port, "secret", 80, 24).connect(timeout=1.0)
+            opshell.Bridge(port.port, "secret", 80, 24).connect(timeout=1.0)
 ```
 
 - [ ] **Step 2: Run them and watch them fail**
@@ -272,11 +272,15 @@ class TestTheRoutes(unittest.TestCase):
         for path, method in self.ROUTES:
             self.assertEqual(self.unauth(path, method).status_code, 401)
 
-    def test_no_route_is_reachable_on_the_agent_socket(self):
-        # server.py:837 is an allow-list of two. Confirmed, not assumed.
-        from software.c2 import server as sm
-        for name in self.ENDPOINT_NAMES:
-            self.assertNotIn(name, sm._AGENT_SOCKET_ENDPOINTS)
+    def test_no_route_answers_on_the_agent_socket(self):
+        # Exercised, not compared: a frozenset of two is trivially true
+        # today and would stay true if a route were added to it. This asks
+        # the app, through the policy create_app installs.
+        agent_client = self.agent_socket_client()
+        for path, method in self.ROUTES:
+            answer = agent_client.open(path, method=method,
+                                       headers=self.auth)
+            self.assertIn(answer.status_code, (403, 404), path)
 
     def test_no_response_body_carries_the_shell_password(self):
         # A Global Constraint. The panel may show it; these routes may not.
@@ -538,7 +542,7 @@ Expected: FAIL — `showOperatorShell` is not in the source.
 
 - [ ] **Step 3: Implement the glyph and the view**
 
-The glyph uses the existing `.topbar-ico-btn` pattern with a terminal character and a `title`. The view renders the four states from `/api/opshell/state`, polls it at the console's existing 2000 ms cadence (which is also the claim's heartbeat), opens the stream with `fetch` and a `ReadableStream` — `EventSource` cannot send the `Authorization` header the operator socket requires (`server.py:880`) and a token in a URL is forbidden by `test_docs.py:424` — and posts batched keystrokes to `/api/opshell/keys`.
+The glyph uses the existing `.topbar-ico-btn` pattern with a terminal character and a `title`, and calls `showOperatorShell()`. The state rendering lives in `opshellRender(state)` — the name the tests read. The view renders the four states from `/api/opshell/state`, polls it at the console's existing 2000 ms cadence (which is also the claim's heartbeat), opens the stream with `fetch` and a `ReadableStream` — `EventSource` cannot send the `Authorization` header the operator socket requires (`server.py:880`) and a token in a URL is forbidden by `test_docs.py:424` — and posts batched keystrokes to `/api/opshell/keys`.
 
 - [ ] **Step 4: Run the tests and watch them pass**
 
