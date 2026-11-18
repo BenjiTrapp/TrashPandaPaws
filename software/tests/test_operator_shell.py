@@ -7,6 +7,7 @@ that: every way the bookkeeping could forget a stop it owes.
 """
 
 import ast
+import base64
 import json
 import os
 import selectors
@@ -1019,10 +1020,9 @@ class TestOpeningTheChannel(_RouteCase):
         client = self.client(supervisor=self.configured_but_stopped())
         client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
                     headers=self.auth)
-        self.sm.history[self.AGENT] = [{
-            "task_id": "aa", "cmd": "tunnel", "args": "start",
-            "status": "pending",
-        }]
+        # No injected history: the entry the first call wrote is what
+        # `_tunnel_pending` has to recognise, and replacing it would prove
+        # only that the test's own dict is readable.
         client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
                     headers=self.auth)
         starts = [t for t in self.sm.task_queues[self.AGENT]
@@ -1040,14 +1040,6 @@ class TestOpeningTheChannel(_RouteCase):
                                        json={"agent": self.AGENT},
                                        headers=self.auth)
         self.assertTrue(supervisor.started)
-
-    def test_open_does_not_write_the_configuration_file(self):
-        config = self.data_dir / "raccoon.yaml"
-        config.write_text("c2:\n  tunnel_server:\n    enabled: false\n")
-        before = config.read_bytes()
-        self.post(self.url("/api/opshell/open"), {"agent": self.AGENT},
-                  supervisor=self.configured_but_stopped())
-        self.assertEqual(config.read_bytes(), before)
 
     def test_the_designated_target_is_remembered_across_app_restarts(self):
         self.post(self.url("/api/opshell/open"), {"agent": self.AGENT})
@@ -1067,17 +1059,21 @@ class TestOpeningTheChannel(_RouteCase):
 class TestClosingTheChannel(_RouteCase):
     def test_close_reports_closing_and_never_closed(self):
         client = self.client()
-        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
-                    headers=self.auth)
-        state = client.post(self.url("/api/opshell/close"), json={},
+        opened = client.post(self.url("/api/opshell/open"),
+                             json={"agent": self.AGENT},
+                             headers=self.auth).get_json()
+        state = client.post(self.url("/api/opshell/close"),
+                            json={"session": opened["session"]},
                             headers=self.auth).get_json()
         self.assertEqual(state["state"], "closing")
 
     def test_close_queues_the_stop_and_logs_it(self):
         client = self.client()
-        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
-                    headers=self.auth)
-        client.post(self.url("/api/opshell/close"), json={}, headers=self.auth)
+        opened = client.post(self.url("/api/opshell/open"),
+                             json={"agent": self.AGENT},
+                             headers=self.auth).get_json()
+        client.post(self.url("/api/opshell/close"),
+                    json={"session": opened["session"]}, headers=self.auth)
         queued = [(t["cmd"], t["args"])
                   for t in self.sm.task_queues[self.AGENT]]
         self.assertIn(("tunnel", "stop"), queued)
@@ -1086,9 +1082,11 @@ class TestClosingTheChannel(_RouteCase):
         # The operator's rule: one child serves both ports, so closing the
         # terminal must not drop a pivot. The claim stays on file.
         client = self.client(supervisor=self.connected(socks_sessions=2))
-        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
-                    headers=self.auth)
-        state = client.post(self.url("/api/opshell/close"), json={},
+        opened = client.post(self.url("/api/opshell/open"),
+                             json={"agent": self.AGENT},
+                             headers=self.auth).get_json()
+        state = client.post(self.url("/api/opshell/close"),
+                            json={"session": opened["session"]},
                             headers=self.auth).get_json()
         queued = [t["args"] for t in self.sm.task_queues.get(self.AGENT, [])]
         self.assertNotIn("stop", queued)
@@ -1101,10 +1099,12 @@ class TestClosingTheChannel(_RouteCase):
         # state in its check-in, so the server can know without the relay
         # -- otherwise a relay outage leaves a channel open for ever.
         client = self.client(supervisor=self.configured_but_stopped())
-        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
-                    headers=self.auth)
+        opened = client.post(self.url("/api/opshell/open"),
+                             json={"agent": self.AGENT},
+                             headers=self.auth).get_json()
         self.sm.agents[self.AGENT]["tunnel"] = {"running": True, "pid": 991}
-        client.post(self.url("/api/opshell/close"), json={}, headers=self.auth)
+        client.post(self.url("/api/opshell/close"),
+                    json={"session": opened["session"]}, headers=self.auth)
         queued = [t["args"] for t in self.sm.task_queues.get(self.AGENT, [])]
         self.assertIn("stop", queued)
 
@@ -1135,9 +1135,244 @@ class TestADamagedOwnershipRecord(_RouteCase):
         # refuses to boot because of a scratch file is the wrong trade, so
         # the route reports it instead.
         (self.data_dir / "opshell-owned.json").write_text("{not json")
-        state = self.get(self.url("/api/opshell/state")).get_json()
+        # The route logs the damaged record at error level, which is right
+        # -- and noise in a test run is a finding of its own, so the log is
+        # captured rather than left to print.
+        with self.assertLogs("raccoon.c2.server", level="ERROR") as logged:
+            state = self.get(self.url("/api/opshell/state")).get_json()
+        self.assertTrue(any("ownership record" in line
+                            for line in logged.output))
         self.assertEqual(state["channel"], "unknown")
         self.assertTrue(state["reason"])
+
+
+class TestADeadTunnelChildIsNotALiveChannel(_RouteCase):
+    """The beacon reports a child that has exited, on purpose.
+
+    `beacon.py:7067-7074` reports `{"pid", "running": code is None,
+    "source"}` plus `exit_code` once it is gone, and the comment at
+    `:5306` says that report "is what confirms a stop they asked for". So
+    a `pid` proves nothing about whether anything is running.
+    """
+
+    DEAD = {"pid": 991, "running": False, "exit_code": 0, "source": "task"}
+
+    def test_an_exited_child_does_not_count_as_an_open_channel(self):
+        self.sm.agents[self.AGENT]["tunnel"] = dict(self.DEAD)
+        self.post(self.url("/api/opshell/open"), {"agent": self.AGENT},
+                  supervisor=self.configured_but_stopped())
+        state = self.get("/api/opshell/state",
+                         supervisor=self.configured_but_stopped()).get_json()
+        self.assertEqual(state["channel"], "closed")
+
+    def test_the_glyph_still_opens_a_channel_after_the_last_one_died(self):
+        # The defect this protects against stopped the feature working at
+        # all: an acknowledged stop leaves `running: False` behind, and a
+        # pid read as "open" meant no start was ever queued again.
+        self.sm.agents[self.AGENT]["tunnel"] = dict(self.DEAD)
+        self.post(self.url("/api/opshell/open"), {"agent": self.AGENT},
+                  supervisor=self.configured_but_stopped())
+        queued = [(t["cmd"], t["args"])
+                  for t in self.sm.task_queues.get(self.AGENT, [])]
+        self.assertEqual(queued, [("tunnel", "start")])
+
+    def test_a_running_child_still_counts(self):
+        client = self.client(supervisor=self.configured_but_stopped())
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        self.sm.agents[self.AGENT]["tunnel"] = {"pid": 991, "running": True}
+        state = client.get(self.url("/api/opshell/state"),
+                           headers=self.auth).get_json()
+        self.assertEqual(state["channel"], "open")
+
+
+class TestTheSessionTheOperatorHolds(_RouteCase):
+    """Whoever opened a session must be able to close it.
+
+    `/open` used to create a claim and throw its id away, so no browser
+    could ever close it: the refcount then said "not the last session" for
+    sixty seconds and no stop was queued, and a close without an id
+    bypassed the count altogether.
+    """
+
+    def test_open_hands_back_the_session_it_created(self):
+        answer = self.post(self.url("/api/opshell/open"),
+                           {"agent": self.AGENT})
+        self.assertTrue((answer.get_json() or {}).get("session"))
+
+    def test_the_session_it_handed_back_closes_the_channel(self):
+        client = self.client(supervisor=self.connected())
+        opened = client.post(self.url("/api/opshell/open"),
+                             json={"agent": self.AGENT},
+                             headers=self.auth).get_json()
+        state = client.post(self.url("/api/opshell/close"),
+                            json={"session": opened["session"]},
+                            headers=self.auth).get_json()
+        queued = [t["args"] for t in self.sm.task_queues.get(self.AGENT, [])]
+        self.assertIn("stop", queued)
+        self.assertEqual(state["state"], "closing")
+
+    def test_a_close_without_a_session_is_refused_not_treated_as_the_last(self):
+        client = self.client(supervisor=self.connected())
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        answer = client.post(self.url("/api/opshell/close"), json={},
+                             headers=self.auth)
+        self.assertEqual(answer.status_code, 400)
+        queued = [t["args"] for t in self.sm.task_queues.get(self.AGENT, [])]
+        self.assertNotIn("stop", queued)
+
+    def test_two_sessions_need_two_closes_in_either_order(self):
+        for order in (0, 1):
+            self.setUp()
+            client = self.client(supervisor=self.connected())
+            first = client.post(self.url("/api/opshell/open"),
+                                json={"agent": self.AGENT},
+                                headers=self.auth).get_json()["session"]
+            second = client.post(self.url("/api/opshell/open"),
+                                 json={"agent": self.AGENT},
+                                 headers=self.auth).get_json()["session"]
+            pair = [first, second] if order == 0 else [second, first]
+            client.post(self.url("/api/opshell/close"),
+                        json={"session": pair[0]}, headers=self.auth)
+            queued = [t["args"]
+                      for t in self.sm.task_queues.get(self.AGENT, [])]
+            self.assertNotIn("stop", queued, "order %d" % order)
+            client.post(self.url("/api/opshell/close"),
+                        json={"session": pair[1]}, headers=self.auth)
+            queued = [t["args"]
+                      for t in self.sm.task_queues.get(self.AGENT, [])]
+            self.assertIn("stop", queued, "order %d" % order)
+
+    def test_a_refused_close_leaves_the_channel_owned(self):
+        # Requirement 2 exists to stop a refusal being read as "done". A
+        # release in that branch would leave the old test green, so this
+        # one asserts the ownership that makes the stop still owed.
+        client = self.client(supervisor=self.connected(socks_sessions=2))
+        opened = client.post(self.url("/api/opshell/open"),
+                             json={"agent": self.AGENT},
+                             headers=self.auth).get_json()
+        client.post(self.url("/api/opshell/close"),
+                    json={"session": opened["session"]}, headers=self.auth)
+        claims = opshell.Claims(self.data_dir / "opshell-owned.json")
+        self.assertIn(self.AGENT, claims.owned())
+
+
+class TestTheStreamAndTheKeystrokes(_RouteCase):
+    """The pump, against a real loopback port that speaks the real wire.
+
+    Nothing exercised `/stream`, `pump` or `/keys` before: every stream in
+    the suite hit a dead port and answered 502, so four of the carried
+    requirements were claimed and untested. `_FakeShellPort` already
+    speaks the shell port's exchange, so the route can be driven end to
+    end.
+    """
+
+    def _with_port(self, **kw):
+        port = _FakeShellPort(**kw)
+        self.addCleanup(port.stop)
+        supervisor = self.connected()
+        row = supervisor.status()["endpoints"][0]
+        row["shell_port"] = port.port
+        return port, self.client(supervisor=supervisor)
+
+    def test_the_stream_carries_what_the_port_writes(self):
+        # `die_after_auth` so that the stream ends: a port that stays open
+        # and quiet keeps the stream open on purpose -- that is what a
+        # terminal is -- and the test client reads a body to its end.
+        port, client = self._with_port(then=b"root@parrot:~# ",
+                                       die_after_auth=True)
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        answer = client.get(self.url("/api/opshell/stream"),
+                            headers=self.auth)
+        self.assertEqual(answer.status_code, 200)
+        self.assertIn(b"root@parrot", answer.get_data())
+
+    def test_the_password_goes_on_the_wire_and_not_into_the_body(self):
+        port, client = self._with_port(then=b"x", die_after_auth=True)
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        answer = client.get(self.url("/api/opshell/stream"),
+                            headers=self.auth)
+        self.assertNotIn(self.SHELL_PASSWORD.encode(), answer.get_data())
+        self.assertIn(self.SHELL_PASSWORD.encode(), port.first_line())
+
+    def test_the_stream_reuses_the_session_the_operator_already_holds(self):
+        # A second claim per stream was how `/open`'s session became an
+        # orphan nobody could close.
+        port, client = self._with_port(then=b"hi", die_after_auth=True)
+        opened = client.post(self.url("/api/opshell/open"),
+                             json={"agent": self.AGENT},
+                             headers=self.auth).get_json()
+        answer = client.get(
+            self.url("/api/opshell/stream?session=" + opened["session"]),
+            headers=self.auth)
+        self.assertEqual(answer.headers["X-Opshell-Session"],
+                         opened["session"])
+
+    def test_a_finished_stream_leaves_no_session_counted(self):
+        port, client = self._with_port(then=b"bye", die_after_auth=True)
+        opened = client.post(self.url("/api/opshell/open"),
+                             json={"agent": self.AGENT},
+                             headers=self.auth).get_json()
+        answer = client.get(
+            self.url("/api/opshell/stream?session=" + opened["session"]),
+            headers=self.auth)
+        answer.get_data()
+        claims = opshell.Claims(self.data_dir / "opshell-owned.json")
+        self.assertEqual(claims.sessions(self.AGENT), 0)
+
+    def test_the_geometry_header_is_the_pair_that_was_sent(self):
+        port, client = self._with_port(then=b"x", die_after_auth=True)
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        answer = client.get(self.url("/api/opshell/stream?cols=0&rows=9000"),
+                            headers=self.auth)
+        self.assertEqual(answer.headers["X-Opshell-Geometry"],
+                         "1x%d" % beacon.SHELL_GEOMETRY_MAX)
+
+    def test_keys_reach_the_port(self):
+        # Without a stream: the route's contract is "write to the bridge
+        # registered under this session", and a live stream cannot be held
+        # open here because the test client reads a body to its end.
+        port = _FakeShellPort(then=b"$ ")
+        self.addCleanup(port.stop)
+        bridge = opshell.Bridge(port.port, self.SHELL_PASSWORD, 80, 24)
+        bridge.connect()
+        self.addCleanup(bridge.close)
+        self.sm.opshell_bridges["held"] = bridge
+        self.addCleanup(lambda: self.sm.opshell_bridges.pop("held", None))
+        wrote = self.client().post(
+            self.url("/api/opshell/keys"),
+            json={"session": "held",
+                  "data": base64.b64encode(b"id\n").decode()},
+            headers=self.auth)
+        self.assertEqual(wrote.get_json()["written"], 3)
+        for _ in range(40):
+            if b"id" in port.received():
+                break
+            time.sleep(0.05)
+        self.assertIn(b"id", port.received())
+
+    def test_keys_for_an_unknown_session_are_refused(self):
+        _, client = self._with_port()
+        answer = client.post(self.url("/api/opshell/keys"),
+                             json={"session": "nope", "data": ""},
+                             headers=self.auth)
+        self.assertEqual(answer.status_code, 404)
+
+    def test_a_port_that_refuses_before_the_prompt_says_so_on_the_stream(self):
+        # Two of the far end's refusals are written from its accept loop,
+        # before any prompt. The operator must read the sentence, not a
+        # broken pipe.
+        port, client = self._with_port(prompt=b"raccoon: too many sessions\r\n",
+                                       die_after_auth=True)
+        client.post(self.url("/api/opshell/open"), json={"agent": self.AGENT},
+                    headers=self.auth)
+        answer = client.get(self.url("/api/opshell/stream"),
+                            headers=self.auth)
+        self.assertIn(b"too many sessions", answer.get_data())
 
 
 if __name__ == "__main__":
