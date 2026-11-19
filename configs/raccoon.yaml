@@ -184,9 +184,14 @@ c2:
       # session gsocket negotiates end to end and the AES-256-GCM envelope
       # inside it, neither of which any carrier can read.
       scheme: "http"
-      # The loopback port the child forwards from, which the beacon then
-      # addresses. There is nothing special about 16443 beyond its not
-      # colliding with anything else this host listens on.
+      # The port the child forwards from, which the beacon then addresses on
+      # 127.0.0.1. It binds *every* interface, not loopback: measured in
+      # gs-netcat's own source at v1.4.43, and the tool has no bind-address
+      # flag. software/setup/gsocket_forward_firewall.sh closes it to
+      # everything but this host, from both provisioning paths; the GSRN
+      # section of docs/LISTENERS.md carries the citation and the reasons.
+      # There is nothing special about 16443 beyond its not colliding with
+      # anything else this host listens on.
       local_port: 16443
       # Zero would restart the child as fast as gs-netcat can fail -- a busy
       # loop on the implant's CPU and a flood of joins on the relay network,

@@ -237,13 +237,15 @@ git commit -m "feat(gsocket): configuration for both sides, refused loudly"
 - Consumes: `CarrierSpec` and `LEG_DEFAULTS` from Task 3; `SecretStore.secret_file_for` from Task 2.
 - Produces: `class GsocketCarrier(spec: CarrierSpec, secret_path: str)` with `argv() -> List[str]`, `verify_binary() -> Optional[str]` (a reason, or `None` when fine), `start() -> None`, `stop() -> None`, `is_running() -> bool`, `status() -> dict`, `probe(timeout: float = 5.0) -> bool`; `class CarrierError(Exception)`.
 
-- [ ] **Step 1: Verify how `gs-netcat -p` binds, and record the answer**
+- [x] **Step 1: Verify how `gs-netcat -p` binds, and record the answer** — **measured in source at v1.4.43: every interface.**
 
-Run a real `gs-netcat -k <file> -p 16443` and inspect the listening socket (`ss -ltnp` on Linux, `lsof -nP -iTCP -sTCP:LISTEN` on macOS). The man page does not say whether the client's forward binds `127.0.0.1` or every interface, and the spec's *Known limits* entry claims loopback.
+Settled by reading upstream rather than running anything: `tools/4_gs-netcat.c:1499` sets `gopt.is_multi_peer = 1` for `-p`; `tools/4_gs-netcat.c:1573-1585` takes the client branch and calls `fd_net_listen(gopt.listen_fd, &gopt.port, SOCK_STREAM)`; `tools/utils.c:1238-1259` binds `htonl(INADDR_ANY)` whenever `*port != 0`, and `inet_addr("127.0.0.1")` only when the port is 0. So the implant's own argv, `gs-netcat -k <file> -w -p <port>`, binds `0.0.0.0:16443`. (On a real implant, `ss -ltnp` on Linux or `lsof -nP -iTCP -sTCP:LISTEN` on macOS is how somebody would confirm it; the source answers it exactly, and running `gs-netcat` means dialling a third-party relay from the operator's machine.)
 
-**If it binds every interface:** stop and report it. The entry in `docs/AGENT.md` must then say so, and the implant needs a host firewall rule or the leg needs a different arrangement — that is a design change, not an implementation detail, and it goes back to the operator.
+**It binds every interface, so:** the implant's whole segment has an unauthenticated transport-level path into the beacon socket, bounded by the AES-256-GCM envelope to what a compromised listener can do — and, the worse consequence for this project, an unexpected port answering on every interface is an indicator on a device impersonating an IP phone. `gs-netcat` has no bind-address flag, so the remedy is a host firewall rule: `software/setup/gsocket_forward_firewall.sh`, run by `bootstrap.sh` and by `build_image.sh`'s first-boot. The entries in `docs/AGENT.md` and `docs/LISTENERS.md` state the measured answer with the citation. Not a design change: the arrangement and both argv shapes are unaffected.
 
-Record the finding as a comment above `argv()` either way, so the next reader does not have to re-run it.
+The same reading settled the server side favourably — `-l` sets `GSC_FL_IS_SERVER`, so the carrier opens no local socket at all — and confirmed that `is_multi_peer = 1` makes one carrier serve many sequential connections.
+
+The citation is recorded as a comment above `argv()`, so the next reader does not have to re-derive it.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -547,8 +549,8 @@ def test_the_gsrn_section_states_the_third_party_cost(self):
     # our C2 is, not that gsocket is in use
 def test_known_limits_records_the_four_gsocket_limits(self):
     # generated builds have four legs; the carrier is a second process;
-    # reachability depends on a third-party relay; the implant opens a
-    # loopback forward
+    # reachability depends on a third-party relay; the implant's forward
+    # binds every interface (measured in source at v1.4.43)
 def test_the_shipped_gsocket_blocks_are_disabled(self):
     # configs/raccoon.yaml: enabled false on the leg, no carrier configured
 def test_the_shipped_config_validates(self):
@@ -598,6 +600,7 @@ Nothing above touches the real GSRN. Before this is believed on an engagement, r
 2. Implant: enable the leg, disable `https`, `dns`, `smb` and `quic`, and watch it register, take a task and report a result.
 3. Kill the carrier child on the implant and confirm it comes back after `restart_delay_seconds`.
 4. Stop the server-side carrier and confirm the leg reports `carrier_failed` rather than hanging the cycle.
-5. **BLOCKING before engagement use** — which address the implant's local forward binds. Start a real `gs-netcat -k <file> -w -p <port>` — the implant's own argv, `-w` included, because `-w` makes that end a client that waits for its peer and a differently-shaped process is a different answer — and read the local address off the listening socket: `ss -ltnp` on Linux, `lsof -nP -iTCP -sTCP:LISTEN` on macOS. This is the one claim in the feature that was never measured, and *Known limits* says so rather than asserting loopback: if the forward binds every interface, an implant hands its whole subnet an unauthenticated path to the team server's beacon socket — bounded by the AES-256-GCM envelope to what a compromised listener can do, but a path all the same. The fix if it does is a host firewall rule on the implant plus a corrected entry; until somebody runs this, assume the worse answer. Not a nice-to-have, and not done here: `gs-netcat` is not installed on the machine this was built on, and installing one or running one is a side effect (a third-party binary system-wide, and a dialled relay network) that nobody asked for. The question, the check and what depends on it are recorded above `GsocketCarrier.argv` in `software/c2/gsocket/carrier.py`.
+5. **Measured in source at v1.4.43, so no longer blocking** — which address the implant's local forward binds. It binds **every interface**: `tools/4_gs-netcat.c:1499` sets `gopt.is_multi_peer = 1` for `-p`, `tools/4_gs-netcat.c:1573-1585` takes the client branch into `fd_net_listen(gopt.listen_fd, &gopt.port, SOCK_STREAM)`, and `tools/utils.c:1238-1259` binds `htonl(INADDR_ANY)` whenever `*port != 0` — `127.0.0.1` only for port 0. So the implant's own argv, `gs-netcat -k <file> -w -p <port>` (`-w` included, because `-w` makes that end a client that waits for its peer and a differently-shaped process is a different answer), listens on `0.0.0.0`. Consequences and the remedy are in *Known limits* in `docs/AGENT.md` and in the GSRN section of `docs/LISTENERS.md`: the implant's segment gets an unauthenticated transport-level path into the beacon socket, bounded by the AES-256-GCM envelope to what a compromised listener can do, and — the worse one — an unexpected port on every interface is an indicator against the cover identity. `gs-netcat` has no bind-address flag, so `software/setup/gsocket_forward_firewall.sh` applies a host firewall rule from both provisioning paths. Worth confirming once on a real implant with `ss -ltnp` (Linux) or `lsof -nP -iTCP -sTCP:LISTEN` (macOS) — that the rule holds, now, rather than what the bind is. The citation is also above `GsocketCarrier.argv` in `software/c2/gsocket/carrier.py`.
+
 
 Extend `tools/listener_rig.py`, or add a sibling rig, for steps 2 to 4 — and keep it out of CI, which must never need a relay operated by somebody else.

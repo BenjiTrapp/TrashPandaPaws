@@ -187,8 +187,8 @@ def implant_argv(binary_path: str, secret_path: str,
     there yet, and the normal case is exactly that: an implant powers up
     in a cupboard long before anybody starts the team server, and a
     carrier that exited at once would spend the whole engagement being
-    restarted on a timer. See the note above `GsocketCarrier.argv` for
-    what is and is not known about the address `-p` binds.
+    restarted on a timer. See the note above `GsocketCarrier.argv` for the
+    address `-p` binds, which is measured and is every interface.
 
     Lives here, next to the server side, because this is the one place
     the two shapes are written down together. `beacon.py` cannot import
@@ -247,34 +247,41 @@ class GsocketCarrier:
 
     # ── the command lines ──
 
-    # Which address `gs-netcat`'s own `-p` forward binds is **not
-    # verified**. The man page does not say whether a client's local
-    # forward binds `127.0.0.1` or every interface, and this repository's
-    # *Known limits* says exactly that rather than asserting loopback:
-    # the entry records the forward as reachable by any local user on the
-    # implant, with its reachability from *off* the host unverified, and
-    # names the check below as the thing that settles it.
+    # Which address `gs-netcat`'s own `-p` forward binds is **measured**,
+    # in upstream source at v1.4.43, and the answer is every interface:
     #
-    # The check that would settle it, in one line: start a real
-    # `gs-netcat -k <file> -w -p <port>` -- the implant's own shape, `-w`
-    # included, because a differently-shaped process is a different
-    # answer -- and look at the listening socket: `ss -ltnp` on Linux,
-    # `lsof -nP -iTCP -sTCP:LISTEN` on macOS. Read the local address off
-    # it.
+    #   tools/4_gs-netcat.c:1499       `case 'p':` sets gopt.port and
+    #                                  gopt.is_multi_peer = 1
+    #   tools/4_gs-netcat.c:1573-1585  the client branch --
+    #                                  `if (!(gopt.flags & GSC_FL_IS_SERVER))`
+    #                                  -- calls fd_net_listen(gopt.listen_fd,
+    #                                  &gopt.port, SOCK_STREAM)
+    #   tools/utils.c:1238-1259        fd_net_listen() binds
+    #                                  htonl(INADDR_ANY) whenever
+    #                                  *port != 0, and inet_addr("127.0.0.1")
+    #                                  only when the port is 0
     #
-    # It has not been run. `gs-netcat` is not installed here, and the
-    # two ways to answer it are both side effects nobody asked for:
-    # installing a third-party binary system-wide, or running one, which
-    # dials the Global Socket Relay Network from the operator's own
-    # machine. That traffic has real OPSEC meaning for this project, so
-    # the question is recorded rather than guessed at.
+    # So the implant's own shape, `gs-netcat -k <file> -w -p <port>`, binds
+    # `0.0.0.0:<local_port>`. It was read rather than run: running it means
+    # dialling the Global Socket Relay Network from the operator's own
+    # machine, which has OPSEC meaning for this project, and the source
+    # answers the question exactly. (`ss -ltnp` on Linux or
+    # `lsof -nP -iTCP -sTCP:LISTEN` on macOS is still how somebody would
+    # confirm it on a real implant.)
     #
-    # What depends on the answer: if the forward binds every interface,
-    # an implant exposes a path to the team server's beacon socket to
-    # its whole subnet, and the fix is a host firewall rule on the
-    # implant plus a corrected *Known limits* entry. It is not a redesign
-    # and it does not change this argv -- the server side below opens no
-    # forward at all -- which is why the work proceeded without it.
+    # What follows from it: the implant's whole segment can reach the team
+    # server's beacon socket through that forward -- bounded by the
+    # AES-256-GCM envelope to what a compromised listener can do -- and,
+    # worse for this project, an unexpected port answering on every
+    # interface is an indicator on a device impersonating an IP phone.
+    # `gs-netcat` has no bind-address flag, so the remedy is a host firewall
+    # rule: `software/setup/gsocket_forward_firewall.sh`, applied by both of
+    # the implant's provisioning paths. None of it changes this argv -- the
+    # server side below opens no forward at all -- which the same reading
+    # confirms: `-l` sets GSC_FL_IS_SERVER, so the listen above is in the
+    # branch this shape does not take. `is_multi_peer = 1` also confirms the
+    # other unchecked assumption of the design: one carrier serves many
+    # sequential connections.
     #
     # Note the asymmetry while reading the two shapes: this side is
     # `-l -d <host> -p <port>`, where `-p` is a *destination* port on

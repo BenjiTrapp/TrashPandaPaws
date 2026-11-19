@@ -33,13 +33,15 @@ constraints call out. Three stand-ins appear, and the split is deliberate:
     deliberately does not forward -- it models what a carrier can
     *observe* about its child -- and a full cycle needs bytes to move.
 
-**The bind address is not settled here.** Whether a real
-`gs-netcat -p` forward binds `127.0.0.1` or every interface is the open
-question recorded above `GsocketCarrier.argv` in
-`software/c2/gsocket/carrier.py`, along with the one-line check that would
-answer it and why it has not been run. The stand-ins here bind loopback
-because that is what this repository documents as the limit; nothing in
-this file is evidence about the real binary.
+**The bind address is settled elsewhere, and these stand-ins deliberately
+differ from it.** A real `gs-netcat -p` forward binds **every interface** —
+measured in upstream source at v1.4.43 and cited above `GsocketCarrier.argv`
+in `software/c2/gsocket/carrier.py`. The stand-ins here bind loopback anyway,
+because a test suite must not open a port to the network of whatever machine
+runs it; what is under test is the leg's behaviour against a forward it can
+reach on `127.0.0.1`, which is the address the beacon itself uses. So nothing
+in this file is evidence about the real binary's bind address, in either
+direction.
 
 **The latch is the operator's decision, so it is tested as behaviour.**
 The carrier does not run at beacon start. It starts the first time a cycle

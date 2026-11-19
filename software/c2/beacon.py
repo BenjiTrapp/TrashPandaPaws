@@ -6393,9 +6393,9 @@ class Beacon:
         if isinstance(port, bool) or not isinstance(port, int) \
                 or not 1 <= port <= 65535:
             return ("c2.fallback.gsocket.local_port is %r; it must be an "
-                    "integer between 1 and 65535, because it is the "
-                    "loopback port the forward comes out at and the port "
-                    "this leg then addresses" % (port,))
+                    "integer between 1 and 65535, because it is the port "
+                    "the forward comes out at and the port this leg then "
+                    "addresses on 127.0.0.1" % (port,))
         self.gsocket_local_port = port
 
         for key, minimum, attribute in (

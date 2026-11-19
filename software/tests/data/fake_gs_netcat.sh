@@ -19,8 +19,13 @@
 #     fight over that port and the loser's non-zero exit would read as a
 #     supervisor thrashing for reasons of its own;
 #   * in the **client** shape (`-w -p <port>`, the implant's side) it
-#     binds that loopback port and stays up, because there `-p` really
-#     is a local forward;
+#     binds that port on loopback and stays up, because there `-p` really
+#     is a local forward. The real binary binds every interface for it
+#     (measured in source at v1.4.43; see the same note), and this
+#     deliberately does not: a fixture must not open a port to the
+#     network of whatever machine runs the suite, and every test reaches
+#     the forward on `127.0.0.1`, which is also the address the beacon
+#     uses;
 #   * with `-t`, it exits immediately with $FAKE_GS_NETCAT_PROBE_EXIT
 #     (default 0), which is how the probe's answers are staged.
 #

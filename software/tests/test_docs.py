@@ -955,8 +955,10 @@ class TestTheGsocketLegIsDocumentedAndShipsDisabled(unittest.TestCase):
     infrastructure nobody here operates, which makes it the only one where
     reading the flags is not enough to decide whether to switch it on. So
     the guide has to state what it costs *before* it states a key, and the
-    *Known limits* entry about the implant's forward has to say that its
-    reachability is unverified rather than assert loopback.
+    *Known limits* entry about the implant's forward has to carry the
+    measured bind address with the upstream citation that settles it --
+    `0.0.0.0`, not loopback -- rather than either a guess or the
+    "unverified" it honestly said while nobody had read the source.
 
     The two shipped blocks are held to both halves of their contract:
     disabled, and valid. Valid is not cosmetic -- a `c2.gsocket_carrier`
@@ -1087,19 +1089,80 @@ class TestTheGsocketLegIsDocumentedAndShipsDisabled(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.present(flat, phrase, what, "the GSRN section")
 
-    def test_the_guide_calls_the_forward_check_blocking(self):
-        # The one claim in this feature that was never measured. Until it
-        # is, the honest status is "unverified", and verifying it is a
-        # blocking item rather than a nice-to-have: the answer decides
-        # whether an implant hands its subnet a path to the beacon socket.
+    def test_the_guide_states_the_measured_bind_with_its_citation(self):
+        # This was the one claim in the feature nobody had measured, and
+        # the guide used to say so. It is measured now -- read out of
+        # upstream source at v1.4.43, because running `gs-netcat` to find
+        # out means dialling a third-party relay from the operator's own
+        # machine -- and the answer is the worse one: the implant's
+        # forward binds every interface.
+        #
+        # Pinned as the *measured claim* rather than as "unverified",
+        # which is what these three assertions used to hold. A guess is
+        # what this cannot be allowed to decay back into, so the citation
+        # is part of what is pinned: a sentence that says `0.0.0.0` with
+        # no source is the same guess wearing a confident face.
         flat = " ".join(self._guide_section().split()).lower()
         for phrase, what in (
-                ("unverified", "the status of the claim"),
-                ("ss -ltnp", "the check that would settle it"),
-                ("blocking", "what kind of item it is"),
-                ("before engagement use", "by when")):
+                ("binds every interface", "the measured answer"),
+                ("v1.4.43", "the version it was measured at"),
+                ("tools/utils.c:1238-1259",
+                 "the function that chooses the bind address"),
+                ("tools/4_gs-netcat.c:1499",
+                 "where -p sets is_multi_peer"),
+                ("htonl(inaddr_any)", "what it binds"),
+                ("no bind-address flag",
+                 "why a firewall rule and not a flag"),
+                ("gsocket_forward_firewall.sh",
+                 "the remedy that ships with the implant"),
+                ("indicator",
+                 "the cover-identity consequence, which is the worse one"),
+                ("unauthenticated at the transport level",
+                 "what reaching the forward does not need")):
             with self.subTest(phrase=phrase):
                 self.present(flat, phrase, what, "the GSRN section")
+
+        # The old status, and the claim nobody had measured. Either one
+        # back in this section means the measurement was lost.
+        for stale in ("is unverified", "loopback only",
+                      "binds only 127.0.0.1"):
+            self.assertNotIn(
+                stale, flat,
+                "the guide says %r about the implant's forward again; it "
+                "is measured, and the citation is in this section" % stale)
+
+    def test_the_implants_provisioning_carries_the_firewall_rule(self):
+        # The docs promise a host firewall rule, because gs-netcat has no
+        # bind-address flag and the forward binds every interface. A
+        # promise in prose with nothing in the image is worse than no
+        # promise: an operator reads the limit as closed.
+        script = REPO / "software" / "setup" / "gsocket_forward_firewall.sh"
+        self.assertTrue(script.is_file(),
+                        "software/setup/gsocket_forward_firewall.sh is gone, "
+                        "and three documents say the implant applies it")
+        text = script.read_text()
+        self.assertIn("-j DROP", text,
+                      "the firewall script drops nothing")
+        self.assertIn("-i lo -j ACCEPT", text,
+                      "the firewall script does not keep the beacon's own "
+                      "path to its forward open, so it would close the leg "
+                      "it is protecting")
+
+        # Both provisioning paths, because an implant is either imaged or
+        # hand-built and the rule has to hold on both.
+        for where, provisioning in (
+                ("software/setup/bootstrap.sh",
+                 _read("software", "setup", "bootstrap.sh")),
+                ("build_image.sh's first-boot script",
+                 BUILD_IMAGE.read_text().split(
+                     "first-boot.sh\" <<'FBEOF'", 1)[1]
+                 .split("\nFBEOF", 1)[0])):
+            with self.subTest(provisioning=where):
+                self.assertIn(
+                    "gsocket_forward_firewall.sh", provisioning,
+                    "%s never applies the gsocket forward rule, so an "
+                    "implant provisioned that way answers on that port "
+                    "from the whole segment" % where)
 
     # ── Known limits ──
 
@@ -1123,16 +1186,28 @@ class TestTheGsocketLegIsDocumentedAndShipsDisabled(unittest.TestCase):
                  "what reaching that forward does not need"),
                 ("aes-256-gcm envelope",
                  "the bound on what reaching it buys"),
-                ("unverified",
-                 "that the off-host half of it was never measured"),
-                ("ss -ltnp",
-                 "the check that would settle it")):
+                ("it binds every interface",
+                 "the measured scope of that forward"),
+                ("v1.4.43",
+                 "the version the bind was measured at"),
+                ("tools/utils.c:1238-1259",
+                 "the source that settles it"),
+                ("indicator",
+                 "the cover-identity consequence, which no envelope bounds"),
+                ("gsocket_forward_firewall.sh",
+                 "the remedy, which ships with the provisioning")):
             with self.subTest(phrase=phrase):
                 self.present(flat, phrase, what, GSOCKET_LIMITS_HEADING)
 
-        # The entry must not claim the thing nobody checked.
-        self.assertNotIn("binds only 127.0.0.1", flat)
-        self.assertNotIn("loopback only", flat)
+        # What this entry used to say. It was honest while nobody had
+        # measured the bind; now it would be a guess undoing a
+        # measurement, in either direction.
+        for stale in ("binds only 127.0.0.1", "loopback only",
+                      "is unverified", "not known"):
+            self.assertNotIn(
+                stale, flat,
+                "the entry says %r about a forward that has been measured "
+                "in upstream source" % stale)
 
         # Its own section, above the hardening pass's groups and outside
         # them. Those five groups are counted bullet for bullet against
@@ -1321,26 +1396,36 @@ class TestTheGsocketLegIsDocumentedAndShipsDisabled(unittest.TestCase):
 
     def test_the_comment_the_docs_point_at_agrees_with_them(self):
         # Both *Known limits* and the guide send a reader to the comment
-        # above `GsocketCarrier.argv`. It used to say this repository
-        # documents the forward as loopback-only, which is the one claim
-        # the entry is not allowed to make, so a reader who followed the
-        # pointer was told the opposite of what they had just read.
+        # above `GsocketCarrier.argv`. It used to record the bind address
+        # as an open question, and before that as loopback-only; it now
+        # has to carry the measured answer and the source that settles
+        # it, because a reader who follows a pointer and finds an older
+        # story trusts the wrong one.
         text = _read("software", "c2", "gsocket", "carrier.py")
         comment = text.split("# \u2500\u2500 the command lines \u2500\u2500",
                              1)[1].split("def argv", 1)[0]
         flat = " ".join(" ".join(line.lstrip().lstrip("#").strip()
                                  for line in comment.splitlines()).split())
-        self.assertIn("not verified", flat.lower(),
-                      "the comment no longer records the question as open")
-        for claim in ("loopback-only", "loopback only"):
-            self.assertNotIn(claim, flat.lower(),
-                             "the comment claims the forward is %s, which is "
-                             "what nobody measured" % claim)
+        lowered = flat.lower()
+        for needle, what in (
+                ("measured", "that the question is settled"),
+                ("v1.4.43", "the version it was settled at"),
+                ("tools/utils.c:1238-1259", "the source that settles it"),
+                ("inaddr_any", "what the forward binds")):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, lowered,
+                              "the comment no longer records %s" % what)
+        for claim in ("loopback-only", "loopback only", "not verified",
+                      "unverified"):
+            self.assertNotIn(claim, lowered,
+                             "the comment calls the forward %s, which the "
+                             "source it cites contradicts" % claim)
         self.assertIn("gs-netcat -k <file> -w -p <port>", flat,
-                      "the comment shows a check that is not the implant's "
-                      "own argv")
+                      "the comment no longer shows the implant's own argv, "
+                      "which is the shape the measurement is about")
         self.assertIn("ss -ltnp", flat,
-                      "the comment no longer names the check")
+                      "the comment no longer names the check that confirms "
+                      "it on a real implant")
 
     # ── the front page ──
 

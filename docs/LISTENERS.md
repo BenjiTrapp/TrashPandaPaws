@@ -146,6 +146,19 @@ the operator's. **It does not buy looking like nothing.** Judge it as the last
 resort it is placed as: it runs when the other four have failed, which is
 exactly when being seen matters least.
 
+**It is the one leg that puts a listening port on the implant, and that is
+the cover identity's problem.** The implant's end of this leg opens a forward
+that binds **every interface** — measured in gsocket's own source, not
+assumed; the citation is in [*What the implant's forward
+exposes*](#what-the-implants-forward-exposes-measured) below. A device
+impersonating a Cisco IP phone or an HP printer does not answer on a
+four-digit high port, so a single `nmap` of the segment finds something that
+belongs to no printer, and that is the property the rest of this project is
+built around. The envelope bounds what a dialer can *do*; nothing bounds what
+being seen costs. `gs-netcat` has no bind-address flag, so the answer is a
+host firewall rule, and the implant's provisioning applies one — see the same
+section.
+
 ### One secret per implant, never fleet-wide
 
 Whoever holds an implant's secret can dial the port that fronts the team
@@ -255,7 +268,7 @@ c2:
 | `binary_path` | The `gs-netcat` this leg execs. Put there at image build time, never fetched on the target. |
 | `sha256` | Checked before every exec. Empty means "do not verify", as `c2.sliver.sha256` does — but this binary is handed the secret that fronts the beacon socket, so leaving it empty answers a question nobody asked. |
 | `scheme` | `http` or `https`, for the URL the beacon builds against its own forward. `http` by default because the team server's `--ssl` is off by default and every shipped `relay_url` is `http://127.0.0.1:8443`. |
-| `local_port` | The loopback port the child forwards from on the implant. |
+| `local_port` | The port the child forwards from on the implant. It binds **every interface**, not loopback — measured in upstream source at v1.4.43 (see below) — so the implant's provisioning closes it with a firewall rule. The beacon itself addresses it on `127.0.0.1`. |
 | `restart_delay_seconds` | At least 1. Zero would restart the child as fast as `gs-netcat` can fail — a busy loop on the implant's CPU and a flood of joins on somebody else's relay. |
 | `max_restarts` | `0` is unlimited, the meaning it has for `c2.sliver`. |
 | `ready_timeout_seconds` | How long the forward is given to come up before the leg counts as not ready for this cycle. |
@@ -325,37 +338,71 @@ an outage reports the leg as failed.** The rescue record and the panel say
 The cycle after that is the one that gets out. That is the warm-up, and it is
 **not a fault** — a leg reporting `not tried` there would be the lie.
 
-### What is not verified yet
+### What the implant's forward exposes, measured
 
-**Whether the implant's local forward is reachable from off the host is
-unverified.** The implant's carrier opens a local forward on `local_port`,
-and anything that reaches it reaches the team server's beacon socket
-unauthenticated at the transport level — bounded by the AES-256-GCM envelope
-to exactly what a compromised listener can do, which is to drop or replay
-messages, not to read or forge them. What is not known is the *scope*:
-gsocket's documentation does not say whether a client's `-p` forward binds
-`127.0.0.1` or every interface, and nothing in this repository has measured
-it. It was not measured on purpose — answering it means installing a
-third-party binary system-wide and dialling a relay network from the
-operator's own machine, which has OPSEC meaning of its own.
+**The implant's local forward binds every interface.** This repository
+recorded that as an open question for most of this feature's life. It is
+settled, from upstream source at **v1.4.43** — read rather than run, because
+running `gs-netcat` to find out means dialling a third-party relay network
+from the operator's own machine, which has OPSEC meaning of its own:
 
-Settle it before an engagement, in one line, and run the implant's own shape
-— `-w` included, because `-w` makes that end a client that waits for its peer
-and a differently-shaped process is a different answer:
+| Upstream | What it says |
+|---|---|
+| `tools/4_gs-netcat.c:1499` | `case 'p': gopt.port = htons(atoi(optarg)); gopt.is_multi_peer = 1;` |
+| `tools/4_gs-netcat.c:1573-1585` | the **client** branch — `if (!(gopt.flags & GSC_FL_IS_SERVER))` — calls `fd_net_listen(gopt.listen_fd, &gopt.port, SOCK_STREAM)` when `is_multi_peer` is set |
+| `tools/utils.c:1238-1259` | `fd_net_listen()` sets `addr.sin_addr.s_addr = htonl(INADDR_ANY)` whenever `*port != 0`, and binds `inet_addr("127.0.0.1")` **only** when the port is 0 |
 
-```sh
-gs-netcat -k <file> -w -p <port>
-```
+So the implant's own argv — `gs-netcat -k <file> -w -p <port>` — binds
+`0.0.0.0:<local_port>`, and there is **no bind-address flag** anywhere in
+that tool to narrow it with. Two things follow.
 
-Then read the local address off the listening socket — `ss -ltnp` on Linux,
-`lsof -nP -iTCP -sTCP:LISTEN` on macOS. **This is a blocking item before
-engagement use**, not a nice-to-have: if the forward binds every interface,
-an implant hands its whole subnet a path to the beacon socket, and the answer
-is a host firewall rule on the implant plus a corrected entry in *Known
-limits*. Until somebody runs it, assume the worse answer. The question, the
-check and what depends on it are also recorded above `GsocketCarrier.argv` in
-`software/c2/gsocket/carrier.py`, which now says the same thing this section
-does.
+**Every host on the implant's segment has a path into the team server's
+beacon socket, unauthenticated at the transport level**, not just the
+implant's local users. What that buys is still bounded by the AES-256-GCM
+envelope to exactly what a compromised listener can do — drop or replay
+messages, never read or forge one — so the bound in [*The one property
+everything else rests on*](#the-one-property-everything-else-rests-on)
+holds. The change is the reach, from "any local user" to "anything on the
+wire".
+
+**An unexpected port listening on every interface is itself an indicator, and
+that is the worse of the two here.** This device is impersonating a Cisco IP
+phone or an HP printer, and neither answers on 16443. One scan of the segment
+finds a service that belongs to no such device, which cuts against the cover
+identity the rest of this project is built around — and unlike the first
+consequence, no envelope bounds it.
+
+**The remedy ships with the implant's provisioning.**
+`software/setup/gsocket_forward_firewall.sh` applies one `iptables` INPUT
+rule — accept the forward's port on `lo`, drop it everywhere else — and
+installs a `raccoon-gsocket-forward.service` oneshot that reapplies it at
+every boot, because the rule does not survive a reboot on its own and this
+image carries no `iptables-persistent`. Both provisioning paths run it:
+`software/setup/bootstrap.sh` for a hand-built implant and
+`build_image.sh`'s first-boot script for an imaged one. It runs whether or
+not the leg is ever enabled, on purpose: the leg is lazy, so the forward
+appears for the first time *after* an outage, which is the worst possible
+moment to be configuring a firewall. It reads the port from
+`c2.fallback.gsocket.local_port`, so a changed port wants another run.
+
+**The same source settles the other half favourably**, and both answers came
+out of one reading:
+
+- **The carrier opens no local socket at all.** The server shape passes `-l`,
+  so `gopt.flags & GSC_FL_IS_SERVER` is set and the listen above is in the
+  branch that is not taken. The claim this document makes for the team
+  server's side, the fake fixture's behaviour in
+  `software/tests/test_gsocket_leg.py`, and `CarrierSpec` having no
+  `local_port` are therefore all verified correct rather than merely
+  consistent.
+- **One carrier serves many sequential connections.** `-p` sets
+  `is_multi_peer = 1`, which is the assumption the design made when it put a
+  single long-lived carrier per implant beside the beacon socket, and which
+  nobody had checked either.
+
+The citation is repeated above `GsocketCarrier.argv` in
+`software/c2/gsocket/carrier.py`, which the code side reads, and in *Known
+limits* in [`docs/AGENT.md`](AGENT.md#known-limits).
 
 Nothing in the test suite touches the real GSRN, and nothing in CI ever
 should: CI must not need a relay operated by somebody else. The rest of what
@@ -525,13 +572,16 @@ package manager. That is how "stdlib only" stays checkable.
   that can reach its source port can inject fragments. A listener cannot
   compensate for a client that trusts. Also in *Known limits*.
 - **A gsocket carrier depends on a relay network this project does not run,
-  and the implant's forward has not been measured.** Both are in
+  and the implant's forward binds every interface.** Both are in
   [*What it costs*](#what-it-costs) and
-  [*What is not verified yet*](#what-is-not-verified-yet) above, and in
+  [*What the implant's forward
+  exposes*](#what-the-implants-forward-exposes-measured) above, and in
   *Known limits* in [`docs/AGENT.md`](AGENT.md#known-limits). The second one
-  is a blocking item before engagement use rather than a note: the one-line
-  check decides whether an implant hands its subnet a path to the beacon
-  socket.
+  is measured in upstream source at v1.4.43 rather than assumed, and its
+  worse consequence is the cover identity: an unexpected port answering on
+  every interface does not belong to an IP phone. `gs-netcat` has no
+  bind-address flag, so the implant's provisioning applies a host firewall
+  rule instead.
 
 ---
 

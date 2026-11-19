@@ -262,8 +262,8 @@ def validate_leg(block: Optional[dict]) -> dict:
     leg["local_port"] = _checked_port(
         "%s.local_port" % _LEG_WHERE,
         block.get("local_port", LEG_DEFAULTS["local_port"]),
-        why="it is the loopback port `gs-netcat` forwards from on the "
-            "implant, which the beacon then addresses")
+        why="it is the port `gs-netcat` forwards from on the implant, "
+            "which the beacon then addresses on 127.0.0.1")
     leg["restart_delay_seconds"] = _checked_whole(
         "%s.restart_delay_seconds" % _LEG_WHERE,
         block.get("restart_delay_seconds",

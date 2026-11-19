@@ -487,6 +487,16 @@ sysctl -p /etc/sysctl.d/99-raccoon.conf 2>/dev/null || true
 # Load bridge module on boot
 echo "br_netfilter" > /etc/modules-load.d/raccoon-bridge.conf
 
+# Keep the gsocket C2 leg's local forward off the wire. Its `-p` binds every
+# interface (measured in upstream source at v1.4.43) and there is no
+# bind-address flag, and an unexpected listening port is an indicator on a
+# device impersonating an IP phone. One INPUT rule, applied now and
+# reapplied at every boot by the unit this installs, whether or not the leg
+# is ever enabled.
+echo "[+] Restricting the gsocket forward to this host..."
+/opt/raccoon/software/setup/gsocket_forward_firewall.sh || \
+    echo "[!] could not apply the gsocket forward rule"
+
 # Hostname from config
 CFG=/opt/raccoon/configs/raccoon.yaml
 COVER=$(grep -oP 'device_mode:\s*"\K[^"]+' "$CFG" 2>/dev/null || echo "cisco_phone")

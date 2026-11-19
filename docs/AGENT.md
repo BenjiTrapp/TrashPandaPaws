@@ -1000,8 +1000,9 @@ child and the Global Socket Relay Network
 These four are properties of that arrangement, not findings a review left
 open, which is why they are their own section and not filed under the
 hardening pass's severity groups below — those are that pass's, and counted
-against it. The fourth is the one that would hold a deployment: it is
-unmeasured rather than understood.
+against it. The fourth is the one that would hold a deployment, and it is now
+measured rather than assumed: the answer came out the worse way, and the
+remedy ships with the implant's provisioning.
 
 - **A generated build has four legs; the hardware implant has five.** The leg
   needs a child process and a binary on disk, and a build the team server
@@ -1029,26 +1030,32 @@ unmeasured rather than understood.
   is in use. Whether a client's traffic may cross a third party at all is a
   rules-of-engagement question; the shipped configuration leaves the leg
   disabled rather than deciding it.
-- **The implant's carrier opens a local forward, and how far it reaches is
-  unverified.** `gs-netcat -p <local_port>` on the implant is a listening
+- **The implant's carrier opens a local forward, and it binds every
+  interface.** `gs-netcat -p <local_port>` on the implant is a listening
   socket, and whatever reaches it reaches the team server's beacon socket
   **unauthenticated at the transport level** — bounded by the AES-256-GCM
   envelope to exactly what a compromised listener can do (drop or replay
   messages; it can neither read them nor forge one), but a path all the same.
-  Any local user on that host has it. Whether it is reachable from *off* the
-  host is **not known**: gsocket's documentation does not say which address a
-  client's forward binds, and nothing here has measured it — doing so means
-  installing a third-party binary system-wide and dialling a relay network
-  from the operator's own machine, which has OPSEC meaning of its own. The
-  check is one line, and it is a blocking item before engagement use: start a
-  real `gs-netcat -k <file> -w -p <port>` — the implant's own argv, `-w`
-  included, since a differently-shaped process is a different answer — and
-  read the local address off the listening socket with `ss -ltnp` (Linux) or
-  `lsof -nP -iTCP -sTCP:LISTEN` (macOS). If it binds every interface, an
-  implant hands its subnet that path, and the answer is a host firewall rule
-  on the implant and a correction to this entry. The question is also
-  recorded above `GsocketCarrier.argv` in `software/c2/gsocket/carrier.py`,
-  with what depends on it.
+  How far it reaches is **measured in upstream source at v1.4.43**, not
+  assumed: `tools/4_gs-netcat.c:1499` sets `gopt.is_multi_peer = 1` for `-p`,
+  `tools/4_gs-netcat.c:1573-1585` takes the client branch and calls
+  `fd_net_listen(gopt.listen_fd, &gopt.port, SOCK_STREAM)`, and
+  `tools/utils.c:1238-1259` binds `htonl(INADDR_ANY)` whenever `*port != 0`
+  — `127.0.0.1` only for port 0. So the implant's own argv,
+  `gs-netcat -k <file> -w -p <port>`, binds `0.0.0.0:<local_port>`: not the
+  host's local users but the whole segment has that path. **The consequence
+  that matters more here is the cover identity**, because no envelope bounds
+  it: an unexpected port answering on every interface is an indicator in its
+  own right, and it belongs to no Cisco IP phone and no HP printer, so one
+  scan of the segment finds it. `gs-netcat`
+  offers no bind-address flag, so the remedy is a host firewall rule —
+  `software/setup/gsocket_forward_firewall.sh`, run by both of the implant's
+  provisioning paths, which drops that port on everything but `lo` and
+  reapplies the rule at every boot. The same reading settled the server side
+  favourably: `-l` takes the other branch and the carrier opens no local
+  socket at all. The citation is repeated above `GsocketCarrier.argv` in
+  `software/c2/gsocket/carrier.py` and in the GSRN section of
+  [`docs/LISTENERS.md`](LISTENERS.md#what-the-implants-forward-exposes-measured).
 
 
 ### Left open by the security hardening
