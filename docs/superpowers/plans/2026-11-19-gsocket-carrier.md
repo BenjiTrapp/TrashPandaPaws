@@ -182,7 +182,9 @@ git commit -m "feat(gsocket): a per-implant secret store"
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `@dataclass CarrierSpec(name, identity, enabled, beacon_host, beacon_port, binary_path, sha256, local_port=0)`; `load_carriers(config: Optional[dict]) -> List[CarrierSpec]` reading `c2.gsocket_carrier`; `validate_leg(block: Optional[dict]) -> dict` for `c2.fallback.gsocket`, returning the block with defaults filled; `LEG_DEFAULTS` holding `scheme="http"`, `local_port=16443`, `restart_delay_seconds=30`, `max_restarts=0`, `ready_timeout_seconds=20`.
+- Produces: `@dataclass CarrierSpec(name, identity, enabled, beacon_host, beacon_port, binary_path, sha256)`; `load_carriers(config: Optional[dict]) -> List[CarrierSpec]` reading `c2.gsocket_carrier`; `validate_leg(block: Optional[dict]) -> dict` for `c2.fallback.gsocket`, returning the block with defaults filled; `LEG_DEFAULTS` holding `scheme="http"`, `local_port=16443`, `restart_delay_seconds=30`, `max_restarts=0`, `ready_timeout_seconds=20`.
+
+`CarrierSpec` deliberately has **no** `local_port`: the server side runs `-l -d <host> -p <beacon_port>` and opens no forward of its own. The implant's forward port is `c2.fallback.gsocket.local_port`, read in Task 6.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -353,8 +355,8 @@ git commit -m "feat(gsocket): the team server supervises carriers and the panel 
 - Test: `software/tests/test_gsocket_leg.py`
 
 **Interfaces:**
-- Consumes: the fake binary fixture from Task 4. Nothing from the `software.c2.gsocket` package — `beacon.py` may not import it.
-- Produces: `Beacon._beacon_gsocket() -> Optional[dict]`, `Beacon._send_result_gsocket(task_id, status, output, data=None)`, `Beacon._gsocket_start() -> bool`, `Beacon._gsocket_ready() -> bool`.
+- Consumes: the fake binary fixture from Task 4. Nothing from the `software.c2.gsocket` package — `beacon.py` may not import it, so this task carries its **own** binary check (existence, executable bit, SHA-256) as a deliberate copy of `carrier.verify_binary`, in the same class as the rescue-format copy. Give both the same reason strings and pin them with a test that compares the two.
+- Produces: `Beacon._beacon_gsocket() -> Optional[dict]`, `Beacon._send_result_gsocket(task_id, status, output, data=None)`, `Beacon._gsocket_start() -> bool`, `Beacon._gsocket_ready() -> bool`, `Beacon._gsocket_binary_problem() -> Optional[str]`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -377,6 +379,9 @@ def test_a_bound_local_port_records_carrier_failed_and_the_cycle_moves_on(self):
     # bind local_port first, then run one cycle
 def test_a_missing_binary_disables_the_leg_and_logs_once(self):
     # two cycles, one log line, class binary_missing
+def test_the_two_binary_checks_give_the_same_reasons(self):
+    # beacon.py's copy against carrier.verify_binary: the copy is
+    # deliberate, so a test holds it, as the rescue format's is held
 def test_a_killed_child_is_restarted_after_the_delay(self):
 def test_a_gsocket_failure_is_filed_against_gsocket_not_https(self):
     # _https_post hardcodes "https" in three _record_leg calls today
@@ -407,7 +412,7 @@ def _https_post(self, endpoint: str, data: dict,
 
 The malleable C2 profile therefore applies inside the pipe too, unchanged — which is correct: the far end is the same beacon socket.
 
-Record classes on every failure path beside the debug log, as `_https_post` does: `binary_missing` when `verify_binary` gives a reason, `carrier_failed` when the child is up but the port does not accept, and `_rescue_class_of(e)` otherwise.
+Record classes on every failure path beside the debug log, as `_https_post` does: `binary_missing` when `_gsocket_binary_problem()` returns a reason, `carrier_failed` when the child is up but the port does not accept, and `_rescue_class_of(e)` otherwise.
 
 The latch: start the carrier where `_beacon_loop` already decides `delivered_by not in _RESCUE_UPSTREAM`, and never stop it.
 
