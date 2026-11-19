@@ -36,10 +36,13 @@ afterwards, and every rewrite goes through a fresh 0600 file that is moved
 into place, so there is no window in which the secrets are readable by
 another user. The directory is created 0700; a directory that already
 exists is left as it is, because it may be shared with things this module
-does not own. And a store that *is* readable by another user is refused
-rather than quietly re-moded: a file that other users could read has to
-be assumed read, and the answer to that is new secrets and new builds,
-not a `chmod` that hides that it happened.
+does not own. And a secret-bearing file that *is* readable by another
+user -- the store, or one of the key files under it -- is refused rather
+than quietly re-moded. Both hold the same credential, so both get the
+same answer, from the same function and in the same words: a file other
+users could read has to be assumed read, and the answer to that is a new
+secret and a reflashed implant, not a `chmod` that repairs the mode and
+erases the evidence.
 
 **The minimum length is enforced on registration, not only in
 `generate`.** The floor exists because a guessed secret is a dialable
@@ -160,6 +163,31 @@ _SLUG_CHARACTERS = frozenset(string.ascii_letters + string.digits + "-_")
 _SLUG_MAX = 32
 
 
+def _refuse_loose_mode(path, mode: int) -> None:
+    """Raise if `mode` lets anyone but the owner read a secret-bearing file.
+
+    One refusal, in one wording, for both files that hold secrets: the
+    store and a key file. They hold the *same* credential, so an answer
+    that differs between them is a hole -- and the cheaper answer is
+    always the wrong one. A `chmod` back to 0600 looks like a repair but
+    erases the only evidence that the secret was ever exposed, and this
+    module has no logger to mention it in, so after the "repair" nothing
+    anywhere knows it happened.
+
+    Refusing is the answer because the disclosure is not undoable: a file
+    other users could read has to be assumed read, and what that calls
+    for is a new secret and a reflashed implant.
+    """
+    if mode & 0o077:
+        raise ValueError(
+            "%s: mode is 0o%03o, so users other than its owner can read the "
+            "gsocket secrets in it. Every secret in this file is a dialable "
+            "path to the beacon socket of the implant it belongs to, so "
+            "treat it as disclosed: register a new secret and reflash that "
+            "implant, rather than only tightening the file to 0o600"
+            % (os.fspath(path), mode))
+
+
 def _write_private(path, data: bytes, exclusive: bool) -> os.stat_result:
     """Put `data` at `path` atomically, 0600, and return its `stat`.
 
@@ -274,17 +302,34 @@ class SecretStore:
         """Write the implant's secret to a 0600 file and return its path.
 
         This is what `gs-netcat -k` is pointed at, so that the secret
-        never appears in an argument vector. Rewritten on every call: the
-        file is a cache of the store and nothing else, and the two ways
-        it can go stale are both silent. A secret that no longer matches
-        the store is a carrier that never finds its peer; a file somebody
-        has loosened to 0644 is the credential handed to every user on
-        the box. Rewriting costs one small atomic write per carrier
-        start, which is not a hot path.
+        never appears in an argument vector.
+
+        Rewritten on every call, because the file is a cache of the store
+        and nothing else: a secret left from an earlier registration is
+        one the store no longer agrees with, and the symptom of that is a
+        carrier that joins the relay network and waits forever for a peer
+        dialling a different address. Rewriting costs one small atomic
+        write per carrier start, which is not a hot path.
+
+        An existing file that other users can read is a different matter
+        and is **refused**, exactly as the store itself is on load. That
+        file holds one of the same secrets, so a `chmod` back to 0600
+        here would be a repair of the mode and a loss of the only
+        evidence that the secret was exposed -- the disclosure the store's
+        own check insists must trigger a re-key, erased one directory
+        down. Only an *existing* file can have been read: on the first
+        write there is nothing to have been exposed, so the refusal
+        cannot fire there.
         """
         secret = self.secret_for(identity)
         path = self._keyfile_path(identity)
         os.makedirs(str(path.parent), mode=_DIR_MODE, exist_ok=True)
+        try:
+            existing = os.stat(str(path))
+        except FileNotFoundError:
+            pass  # The first write for this implant; nothing to disclose.
+        else:
+            _refuse_loose_mode(path, stat.S_IMODE(existing.st_mode))
         _write_private(path, secret.encode("ascii"), exclusive=False)
         return path
 
@@ -339,14 +384,7 @@ class SecretStore:
             status = os.fstat(handle.fileno())
             text = handle.read()
         mode = stat.S_IMODE(status.st_mode)
-        if mode & 0o077:
-            raise self._fail(
-                "(file)",
-                "mode is 0o%03o, so users other than its owner can read the "
-                "secrets in it. Every secret in this file is a dialable path "
-                "to the beacon socket of the implant it belongs to, so treat "
-                "them as disclosed: register new ones and reflash, rather "
-                "than only tightening the file to 0o600" % mode)
+        _refuse_loose_mode(self._path, mode)
         try:
             document = json.loads(text)
         except ValueError as exc:

@@ -318,21 +318,81 @@ class TestSecretFiles(SecretStoreTestCase):
             paths[identity] = path
         self.assertEqual(len(set(paths.values())), len(awkward))
 
-    def test_the_file_is_rewritten_so_a_tampered_one_is_repaired(self):
+    def test_the_file_is_rewritten_so_a_stale_one_cannot_linger(self):
         # Written on every call rather than only when absent: the file is
-        # a cache of the store, and a stale or loosened copy of it is a
-        # carrier that either cannot find its peer or hands the secret to
-        # every user on the box.
+        # a cache of the store, and a secret left from an earlier
+        # registration is one the store no longer agrees with. The
+        # symptom is a carrier that joins the relay network and waits
+        # forever for a peer dialling a different address.
         store = SecretStore(self.path)
         secret = store.generate()
         store.register_implant("gs-a", secret)
         path = store.secret_file_for("gs-a")
         path.write_text("not the secret")
-        os.chmod(path, 0o644)
 
         again = store.secret_file_for("gs-a")
         self.assertEqual(again, path)
         self.assertEqual(path.read_text(), secret)
+        self.assertEqual(_mode(path), 0o600)
+
+    def test_a_world_readable_key_file_is_refused_not_repaired(self):
+        # A key file holds one of the store's own secrets, and the store
+        # refuses to load from a file other users can read on the grounds
+        # that such a file has to be assumed read. Tightening this one
+        # back to 0600 would repair the mode and destroy the only
+        # evidence of the disclosure -- and with no logger in the module,
+        # nothing anywhere would ever know it happened.
+        store = SecretStore(self.path)
+        secret = store.generate()
+        store.register_implant("gs-a", secret)
+        path = store.secret_file_for("gs-a")
+        os.chmod(str(path), 0o644)
+
+        with self.assertRaises(ValueError) as caught:
+            store.secret_file_for("gs-a")
+        message = str(caught.exception)
+        self.assertIn(str(path), message)
+        self.assertIn("644", message)
+        # Left exactly as found: the operator has to see what was there.
+        self.assertEqual(_mode(path), 0o644)
+        self.assertEqual(path.read_text(), secret)
+
+    def test_a_loose_store_and_a_loose_key_file_are_refused_alike(self):
+        # The same credential refused two different ways is how the two
+        # answers drift apart again, so this compares the words.
+        store = SecretStore(self.path)
+        store.register_implant("gs-a", store.generate())
+        path = store.secret_file_for("gs-a")
+
+        os.chmod(str(path), 0o644)
+        with self.assertRaises(ValueError) as from_key_file:
+            store.secret_file_for("gs-a")
+        os.chmod(self.path, 0o644)
+        with self.assertRaises(ValueError) as from_store:
+            SecretStore(self.path)
+
+        def anonymised(caught, named):
+            return str(caught.exception).replace(str(named), "<path>")
+
+        self.assertEqual(anonymised(from_key_file, path),
+                         anonymised(from_store, self.path))
+
+    def test_the_first_write_cannot_be_refused_for_a_mode(self):
+        # Only an existing file can have been read by somebody, so a
+        # fresh one must not inherit the refusal -- under a permissive
+        # umask least of all, or an implant could never be given its
+        # first key file at all.
+        self.open_permissive_umask()
+        store = SecretStore(self.path)
+        secret = store.generate()
+        store.register_implant("gs-a", secret)
+        path = store.secret_file_for("gs-a")
+        self.assertEqual(_mode(path), 0o600)
+
+        # And again once the file is gone rather than loosened: deleting
+        # it is not a disclosure.
+        os.unlink(str(path))
+        self.assertEqual(store.secret_file_for("gs-a").read_text(), secret)
         self.assertEqual(_mode(path), 0o600)
 
     def test_a_secret_registered_by_another_instance_can_be_written_out(self):
