@@ -113,7 +113,15 @@ RECORD_BYTES = _STRUCT.size
 # optimistically. Each entry is (version, struct, transports named).
 _LAYOUTS = {
     _STRUCT_V1.size: (1, _STRUCT_V1, TRANSPORTS_V1),
-    _STRUCT.size: (VERSION, _STRUCT, TRANSPORTS),
+    # The version is the literal 2, not `VERSION`, exactly as the row
+    # above is the literal 1. A v3 that appends a sixth transport changes
+    # `VERSION` and `_STRUCT` together; written as `VERSION` this row
+    # would then quietly *become* the v3 row and the 19-byte v2 layout
+    # would disappear from the table, so every record from an implant
+    # deployed today would read as unreadable. That is the regression this
+    # table exists to prevent, one version later. (A v3 renames this
+    # struct to `_STRUCT_V2` and keeps this row, the way v1 was kept.)
+    _STRUCT.size: (2, _STRUCT, TRANSPORTS),
 }
 
 # What the full chain produces, so a change to the record or to `_encrypt`'s

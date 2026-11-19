@@ -235,11 +235,19 @@ c2:
       secret_file: "/etc/raccoon/gsocket.secret"   # 0600, never argv
       local_port: 16443                # binds every interface; see Known limits
       scheme: "http"                   # the beacon socket's default; see above
-      verify_ssl: false
       restart_delay_seconds: 30
       max_restarts: 0                  # 0 = unlimited, as sliver
       ready_timeout_seconds: 20
 ```
+
+*(Corrected after approval: this block listed `verify_ssl: false`, and the
+implementation's `_LEG_KEYS` refuses that key — so an operator copying the
+block verbatim got a refusal. Dropping it was the right call: the beacon's
+`_HttpSession._build_opener` sets `check_hostname = False` and
+`verify_mode = CERT_NONE` unconditionally, so `https_cfg.verify_ssl` has had
+no reader for a long time and a fifth copy of a dead setting would only look
+like a promise. What that means for this leg is stated on the `scheme` row of
+the guide: `scheme: "https"` is TLS with no verification.)*
 
 ### Where it sits in the chain, and what that means for the rescue
 

@@ -295,11 +295,11 @@ c2:
 | `secret_file` | The path to the 0600 file holding this implant's secret, written by hand on the implant — nothing in this repository creates it. Required while the leg is enabled; a bare key means "absent", which is what the file in git has to say. |
 | `binary_path` | The `gs-netcat` this leg execs. Put there at image build time, never fetched on the target. |
 | `sha256` | Checked before every exec. Empty means "do not verify", as `c2.sliver.sha256` does — but this binary is handed the secret that fronts the beacon socket, so leaving it empty answers a question nobody asked. |
-| `scheme` | `http` or `https`, for the URL the beacon builds against its own forward. `http` by default because the team server's `--ssl` is off by default and every shipped `relay_url` is `http://127.0.0.1:8443`. |
+| `scheme` | `http` or `https`, for the URL the beacon builds against its own forward. `http` by default because the team server's `--ssl` is off by default and every shipped `relay_url` is `http://127.0.0.1:8443`. **`https` here means TLS with no verification**: the beacon's HTTP session sets `check_hostname = False` and `verify_mode = CERT_NONE` for every leg, and there is deliberately no `verify_ssl` key on this block — the one on `c2.https` has had no reader for a long time, and this block refuses the key rather than carrying a second dead switch. |
 | `local_port` | The port the child forwards from on the implant. It binds **every interface**, not loopback — measured in upstream source at v1.4.43 (see below) — so the implant's provisioning closes it with a firewall rule. The beacon itself addresses it on `127.0.0.1`. |
 | `restart_delay_seconds` | At least 1. Zero would restart the child as fast as `gs-netcat` can fail — a busy loop on the implant's CPU and a flood of joins on somebody else's relay. |
 | `max_restarts` | `0` is unlimited, the meaning it has for `c2.sliver`. |
-| `ready_timeout_seconds` | How long the forward is given to come up before the leg counts as not ready for this cycle. |
+| `ready_timeout_seconds` | How long `_gsocket_ready` will **block** waiting for a freshly started carrier's forward to accept. The window is measured from the start, and the latch starts the carrier at the *end* of a failed cycle — a whole beacon interval (300 s by default) before the next one — so on the ordinary tasking path it has always closed and the leg gets one connect attempt and no wait. The place it really waits is the arm that starts the carrier and then tries to register over it in the same pass, every fifth failed cycle. |
 
 **`c2.gsocket_carrier` is this host as a server** — the carrier processes run
 beside this host's own beacon socket, one per implant.

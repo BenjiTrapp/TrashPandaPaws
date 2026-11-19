@@ -6701,10 +6701,16 @@ class Beacon:
         into it would send this implant's envelope to whatever bound the
         port. Then the forward itself.
 
-        `ready_timeout_seconds` bounds the wait and only ever applies to
-        the cycle that follows a start: the window is measured from the
-        start, so once it has closed this returns at once, and once the
-        forward has answered once it is not probed again. That is the warm
+        `ready_timeout_seconds` bounds the wait, and the wait is rarer than
+        the setting's name suggests: the window is measured from the
+        carrier's start, so once it has closed this returns at once, and
+        once the forward has answered once it is not probed again. The
+        latch starts the carrier at the *end* of a failed cycle, a whole
+        beacon interval before the next one, so on the ordinary tasking
+        path the window has always closed and this costs one connect
+        attempt. The one place it really blocks is the fifth-failure
+        re-registration, which starts the carrier and then walks
+        `_registration_legs()` in the same pass. That is the warm
         half of the latch -- the second outage pays nothing, because the
         request about to go through the forward is a better probe than a
         connect that is thrown away, and a connect-and-close on every

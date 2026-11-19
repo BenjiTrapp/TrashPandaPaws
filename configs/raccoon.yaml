@@ -199,8 +199,13 @@ c2:
       restart_delay_seconds: 30
       # 0 = unlimited, the meaning c2.sliver.max_restarts has above.
       max_restarts: 0
-      # How long the forward is given to come up before the leg is counted
-      # not-ready for this cycle.
+      # How long a cycle will block waiting for a freshly started carrier's
+      # forward to accept. Measured from the start, and the latch starts the
+      # carrier at the end of a failed cycle -- a whole beacon interval
+      # earlier -- so on the tasking path the window has closed and the leg
+      # gets one connect attempt. The arm that really waits is the
+      # re-registration every fifth failed cycle, which starts the carrier
+      # and then tries to register over it in the same pass.
       ready_timeout_seconds: 20
 
   beacon_interval_seconds: 300
