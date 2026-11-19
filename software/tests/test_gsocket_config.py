@@ -22,11 +22,25 @@ implant's `secret_file` is minted per build by the generator, so a
 disabled leg may not have one yet -- the same rule `c2.encryption_key`
 already follows ("required while fallback.enabled is true").
 
+**Both ends carry a digest, and that is deliberate symmetry rather than
+duplication.** The server verifies the `gs-netcat` a carrier execs and
+the implant verifies its own, with a copy of the same check rather than
+an import of it, because `beacon.py` may use only the standard library.
+So `sha256` is a key on both sides here: a copy with nowhere to read the
+expected digest from would fall back to "the file exists and is
+executable" while reporting the same reasons as the real check.
+
 **Every refusal is asked to name the offending value.** A config error
 here surfaces at runtime as a carrier that joins the relay network and
 never finds its peer, which reads as a relay problem rather than as a
-wrong number. So `assertIn` is used on the message for the value that was
-refused, not merely `assertRaises`.
+wrong number, so the message has to carry what it read and not only
+which key it read. Asserting the *setting's name* alone would not hold
+that: the name is in the label and survives any change that drops the
+value. So every refusal family asserts the value as the message prints
+it -- `repr`, since the module interpolates `%r` -- alongside the name.
+Where a value is empty, `''` and `'   '` are different mistakes and the
+second is invisible in the file it came from, so the refusal prints that
+too.
 
 **The defaults are checked as values, not as behaviour.** `beacon.py` is
 served to a target as source text and may import only the standard
@@ -166,14 +180,27 @@ class TestCarrierBlock(unittest.TestCase):
                     del entry["identity"]
                 with self.assertRaises(ValueError) as caught:
                     load_carriers(config_with(entry))
-                self.assertIn("identity", str(caught.exception))
+                message = str(caught.exception)
+                self.assertIn("identity", message)
+                # The value, not only the setting's name: a message that
+                # says which key is wrong but not what it holds sends an
+                # operator back to the file to guess what it read.
+                self.assertIn(repr(bad["identity"] if bad else None), message)
+                self.assertIn("gs-pi-01", message)
 
     def test_a_carrier_without_a_name_is_refused(self):
-        entry = carrier_entry()
-        del entry["name"]
-        with self.assertRaises(ValueError) as caught:
-            load_carriers(config_with(entry))
-        self.assertIn("name", str(caught.exception))
+        # The index is the offending value here: with no name there is
+        # nothing else to call the entry by, and `c2.gsocket_carrier[0]`
+        # is what an operator can find in the file.
+        for entries in ([{"identity": "pi-01"}],
+                        [carrier_entry(), {"identity": "pi-02"}]):
+            with self.subTest(count=len(entries)):
+                with self.assertRaises(ValueError) as caught:
+                    load_carriers(config_with(*entries))
+                message = str(caught.exception)
+                self.assertIn("name", message)
+                self.assertIn("c2.gsocket_carrier[%d]" % (len(entries) - 1),
+                              message)
 
     def test_a_beacon_port_outside_1_65535_is_refused(self):
         for bad in (0, -1, 65536, 99999, "8443", 8443.0, None, True):
@@ -200,7 +227,9 @@ class TestCarrierBlock(unittest.TestCase):
             with self.subTest(beacon_host=bad):
                 with self.assertRaises(ValueError) as caught:
                     load_carriers(config_with(carrier_entry(beacon_host=bad)))
-                self.assertIn("beacon_host", str(caught.exception))
+                message = str(caught.exception)
+                self.assertIn("beacon_host", message)
+                self.assertIn(repr(bad), message)
 
     def test_an_unknown_carrier_setting_is_refused_rather_than_ignored(self):
         # `local_port` in particular: it is a real setting on the *other*
@@ -217,7 +246,10 @@ class TestCarrierBlock(unittest.TestCase):
             with self.subTest(sha256=bad):
                 with self.assertRaises(ValueError) as caught:
                     load_carriers(config_with(carrier_entry(sha256=bad)))
-                self.assertIn("sha256", str(caught.exception))
+                message = str(caught.exception)
+                self.assertIn("sha256", message)
+                self.assertIn(repr(bad), message)
+                self.assertIn("gs-pi-01", message)
 
     def test_an_absent_or_empty_sha256_skips_the_check(self):
         # The same meaning `c2.sliver.sha256` has: empty is "do not
@@ -286,6 +318,7 @@ class TestLegBlock(unittest.TestCase):
                 self.assertFalse(leg["enabled"])
                 self.assertEqual(leg["secret_file"], "")
                 self.assertEqual(leg["binary_path"], "")
+                self.assertEqual(leg["sha256"], "")
                 for key, value in LEG_DEFAULTS.items():
                     self.assertEqual(leg[key], value)
 
@@ -297,12 +330,14 @@ class TestLegBlock(unittest.TestCase):
 
     def test_an_explicit_value_survives_validation(self):
         leg = validate_leg(leg_block(
-            scheme="https", local_port=20000, restart_delay_seconds=5,
-            max_restarts=3, ready_timeout_seconds=45))
+            sha256="b" * 64, scheme="https", local_port=20000,
+            restart_delay_seconds=5, max_restarts=3,
+            ready_timeout_seconds=45))
         self.assertEqual(leg, {
             "enabled": True,
             "secret_file": "/var/lib/raccoon/gsocket.key",
             "binary_path": "/opt/raccoon/bin/gs-netcat",
+            "sha256": "b" * 64,
             "scheme": "https",
             "local_port": 20000,
             "restart_delay_seconds": 5,
@@ -310,18 +345,57 @@ class TestLegBlock(unittest.TestCase):
             "ready_timeout_seconds": 45,
         })
 
+    def test_the_leg_carries_a_sha256_for_the_binary_it_execs(self):
+        # The implant verifies the `gs-netcat` it is about to exec with
+        # its own copy of the carrier's check -- `beacon.py` may import
+        # only the standard library, so it cannot share the server's --
+        # and a copy with nowhere to read the expected digest from would
+        # degrade to "the file exists and is executable" while claiming
+        # parity with the real one. So the key exists on this side too,
+        # is validated by the same checker, and is normalised the same
+        # way.
+        self.assertIn("sha256", validate_leg(leg_block()))
+        self.assertEqual(
+            validate_leg(leg_block(sha256="A" * 64))["sha256"], "a" * 64)
+        for bad in ("nothex", "a" * 63, "a" * 65, 7, "a b" + "c" * 61):
+            with self.subTest(sha256=bad):
+                with self.assertRaises(ValueError) as caught:
+                    validate_leg(leg_block(sha256=bad))
+                message = str(caught.exception)
+                self.assertIn("sha256", message)
+                self.assertIn(repr(bad), message)
+                # Which block, so a refusal is never ambiguous between
+                # the two that look alike.
+                self.assertIn("c2.fallback.gsocket", message)
+
+    def test_an_absent_leg_sha256_means_do_not_verify(self):
+        # Never required, on either side: a deployment that has not
+        # pinned a digest yet must still start. `None` is included
+        # because a bare `sha256:` in YAML parses to it.
+        for absent in ("", "   ", None):
+            with self.subTest(sha256=absent):
+                self.assertEqual(
+                    validate_leg(leg_block(sha256=absent))["sha256"], "")
+        self.assertEqual(validate_leg(leg_block())["sha256"], "")
+        self.assertEqual(validate_leg({})["sha256"], "")
+        self.assertEqual(validate_leg(None)["sha256"], "")
+
     def test_an_enabled_leg_without_a_secret_file_is_refused(self):
-        for bad in ({}, {"secret_file": ""}, {"secret_file": "   "},
-                    {"secret_file": None}, {"secret_file": 7}):
+        for bad, shown in ((None, ""), ({"secret_file": ""}, ""),
+                           ({"secret_file": "   "}, "   "),
+                           ({"secret_file": None}, ""),
+                           ({"secret_file": 7}, 7)):
             with self.subTest(bad=bad):
                 block = leg_block()
-                if bad:
-                    block.update(bad)
-                else:
+                if bad is None:
                     del block["secret_file"]
+                else:
+                    block.update(bad)
                 with self.assertRaises(ValueError) as caught:
                     validate_leg(block)
-                self.assertIn("secret_file", str(caught.exception))
+                message = str(caught.exception)
+                self.assertIn("secret_file", message)
+                self.assertIn(repr(shown), message)
 
     def test_a_disabled_leg_may_have_no_secret_file_yet(self):
         # The generator mints one secret file per build, so the block
@@ -412,7 +486,9 @@ class TestLegBlock(unittest.TestCase):
             with self.subTest(restart_delay_seconds=bad):
                 with self.assertRaises(ValueError) as caught:
                     validate_leg(leg_block(restart_delay_seconds=bad))
-                self.assertIn("restart_delay_seconds", str(caught.exception))
+                message = str(caught.exception)
+                self.assertIn("restart_delay_seconds", message)
+                self.assertIn(repr(bad), message)
 
     def test_max_restarts_of_zero_means_unlimited_and_is_accepted(self):
         # The meaning `c2.sliver.max_restarts` already has in this file.
@@ -422,7 +498,9 @@ class TestLegBlock(unittest.TestCase):
             with self.subTest(max_restarts=bad):
                 with self.assertRaises(ValueError) as caught:
                     validate_leg(leg_block(max_restarts=bad))
-                self.assertIn("max_restarts", str(caught.exception))
+                message = str(caught.exception)
+                self.assertIn("max_restarts", message)
+                self.assertIn(repr(bad), message)
 
     def test_a_ready_timeout_of_zero_is_refused(self):
         # A zero timeout declares every carrier not-ready the instant it
@@ -432,7 +510,9 @@ class TestLegBlock(unittest.TestCase):
             with self.subTest(ready_timeout_seconds=bad):
                 with self.assertRaises(ValueError) as caught:
                     validate_leg(leg_block(ready_timeout_seconds=bad))
-                self.assertIn("ready_timeout_seconds", str(caught.exception))
+                message = str(caught.exception)
+                self.assertIn("ready_timeout_seconds", message)
+                self.assertIn(repr(bad), message)
 
     def test_a_leg_block_that_is_not_a_mapping_is_refused(self):
         for bad in ([], "enabled", 7, True):
@@ -461,30 +541,42 @@ class TestBothSides(unittest.TestCase):
                 self.assertIn(bad, str(caught.exception))
 
     def test_an_enabled_leg_needs_a_binary_path(self):
-        for bad in ({}, {"binary_path": ""}, {"binary_path": None},
-                    {"binary_path": 7}):
+        # `shown` is what the refusal must print: an absent key and an
+        # explicit `None` both read as the empty string, which is what a
+        # bare `binary_path:` in YAML means.
+        for bad, shown in ((None, ""), ({"binary_path": ""}, ""),
+                           ({"binary_path": "   "}, "   "),
+                           ({"binary_path": None}, ""),
+                           ({"binary_path": 7}, 7)):
             with self.subTest(bad=bad):
                 block = leg_block()
-                if bad:
-                    block.update(bad)
-                else:
+                if bad is None:
                     del block["binary_path"]
+                else:
+                    block.update(bad)
                 with self.assertRaises(ValueError) as caught:
                     validate_leg(block)
-                self.assertIn("binary_path", str(caught.exception))
+                message = str(caught.exception)
+                self.assertIn("binary_path", message)
+                self.assertIn(repr(shown), message)
 
     def test_a_carrier_needs_a_binary_path(self):
-        for bad in ({}, {"binary_path": ""}, {"binary_path": None},
-                    {"binary_path": 7}):
+        for bad, shown in ((None, ""), ({"binary_path": ""}, ""),
+                           ({"binary_path": "   "}, "   "),
+                           ({"binary_path": None}, ""),
+                           ({"binary_path": 7}, 7)):
             with self.subTest(bad=bad):
                 entry = carrier_entry()
-                if bad:
-                    entry.update(bad)
-                else:
+                if bad is None:
                     del entry["binary_path"]
+                else:
+                    entry.update(bad)
                 with self.assertRaises(ValueError) as caught:
                     load_carriers(config_with(entry))
-                self.assertIn("binary_path", str(caught.exception))
+                message = str(caught.exception)
+                self.assertIn("binary_path", message)
+                self.assertIn(repr(shown), message)
+                self.assertIn("gs-pi-01", message)
 
     def test_neither_side_is_asked_whether_the_binary_exists(self):
         # The carrier block is validated on the team server and the leg

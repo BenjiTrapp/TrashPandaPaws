@@ -90,8 +90,9 @@ LEG_DEFAULTS = {
 # that the key they wrote is real but lives on the other side.
 _CARRIER_KEYS = ("name", "identity", "enabled", "beacon_host", "beacon_port",
                  "binary_path", "sha256")
-_LEG_KEYS = ("enabled", "secret_file", "binary_path", "scheme", "local_port",
-             "restart_delay_seconds", "max_restarts", "ready_timeout_seconds")
+_LEG_KEYS = ("enabled", "secret_file", "binary_path", "sha256", "scheme",
+             "local_port", "restart_delay_seconds", "max_restarts",
+             "ready_timeout_seconds")
 
 _CARRIER_WHERE = "c2.gsocket_carrier"
 _LEG_WHERE = "c2.fallback.gsocket"
@@ -206,6 +207,13 @@ def validate_leg(block: Optional[dict]) -> dict:
     block that ships in git therefore cannot name them. Every other
     check runs whether the leg is enabled or not: the value is wrong now,
     and switching the leg on will not make it right.
+
+    `sha256` is never required and is `""` when absent, which means "do
+    not verify" -- the meaning it has on the carrier side and in
+    `c2.sliver.sha256`. It is here because the implant verifies the
+    `gs-netcat` it execs with its own copy of the carrier's check, and a
+    copy with no configured digest to read would be an existence check
+    wearing the name of a hash check.
     """
     if block is None:
         block = {}
@@ -229,6 +237,13 @@ def validate_leg(block: Optional[dict]) -> dict:
         "%s.binary_path" % _LEG_WHERE, block.get("binary_path"),
         required=enabled,
         why="it is the `gs-netcat` this leg execs")
+    # Not in `LEG_DEFAULTS`: those five are values an operator may leave
+    # out and still get a working leg, whereas a digest has no sensible
+    # default -- an absent one means "do not verify", which is the empty
+    # string and not a number. See the docstring for why the key exists
+    # on this side at all.
+    leg["sha256"] = _checked_sha256(
+        "%s.sha256" % _LEG_WHERE, block.get("sha256", ""))
 
     scheme = block.get("scheme", LEG_DEFAULTS["scheme"])
     # Normalised rather than compared as written: a URL scheme is
@@ -336,7 +351,9 @@ def _spec_of(entry: dict, index: int) -> CarrierSpec:
                        enabled=bool(entry.get("enabled", False)),
                        beacon_host=beacon_host, beacon_port=beacon_port,
                        binary_path=binary_path,
-                       sha256=_checked_sha256(name, entry.get("sha256", "")))
+                       sha256=_checked_sha256(
+                           "carrier %r: sha256" % name,
+                           entry.get("sha256", "")))
 
 
 def _refuse_unknown(label: str, mapping: dict, accepted, role: str,
@@ -406,7 +423,12 @@ def _checked_path(label: str, value, required: bool, why: str) -> str:
     text = value.strip()
     if not text:
         if required:
-            raise ValueError("%s is empty and is needed: %s" % (label, why))
+            # The value is shown even though it is empty: `''` and
+            # `'   '` are different mistakes, and the second one is
+            # invisible in the file it came from.
+            raise ValueError(
+                "%s is %r, which is empty, and it is needed: %s"
+                % (label, value, why))
         return ""
     if not os.path.isabs(text):
         raise ValueError(
@@ -419,21 +441,36 @@ def _checked_path(label: str, value, required: bool, why: str) -> str:
     return text
 
 
-def _checked_sha256(name: str, value) -> str:
-    """A lower-cased hex digest, or "" for "do not verify"."""
+def _checked_sha256(label: str, value) -> str:
+    """A lower-cased hex digest, or "" for "do not verify".
+
+    Both sides use this, and both for the same reason: each end verifies
+    the `gs-netcat` it is about to exec, so each end needs somewhere to
+    read the expected digest from. The implant's check is a deliberate
+    copy of the server's rather than a shared import -- `beacon.py` is
+    served to a target as source text -- and a copy that had no
+    configured digest to compare against would quietly degrade to an
+    existence-and-exec-bit check while claiming parity with it.
+
+    `None` counts as absent, as it does in `_checked_path`: a bare
+    `sha256:` in YAML parses to `None`, and a block written before
+    anybody had a digest to put there is written exactly that way.
+    """
+    if value is None:
+        value = ""
     if not isinstance(value, str):
         raise ValueError(
-            "carrier %r has sha256 %r, which is %s and not a hex digest"
-            % (name, value, type(value).__name__))
+            "%s is %r, which is %s and not a hex digest"
+            % (label, value, type(value).__name__))
     digest = value.strip().lower()
     if not digest:
         # Empty is "do not verify", the meaning `c2.sliver.sha256` has.
         return ""
     if len(digest) != _SHA256_LEN or set(digest) - _HEX:
         raise ValueError(
-            "carrier %r has sha256 %r; it must be %d hex characters, which "
-            "is what `sha256sum` prints, or empty to skip the check"
-            % (name, value, _SHA256_LEN))
+            "%s is %r; it must be %d hex characters, which is what "
+            "`sha256sum` prints, or empty to skip the check"
+            % (label, value, _SHA256_LEN))
     # Lower-cased because what it is compared against is
     # `hashlib.sha256(...).hexdigest()`, and an upper-case digest pasted
     # out of a Windows tool would never match.
