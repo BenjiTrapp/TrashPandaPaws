@@ -10,13 +10,7 @@ fi
 echo "[*] Removing Raccoon Implant services and persistence"
 
 # systemd services
-# raccoon-gsocket is in this list even though install.sh never enables it: a
-# host that was given a carrier by hand has to lose it here, and a unit file
-# left behind after an uninstall is a unit somebody re-enables by accident.
-# The secret path in /etc/raccoon/gsocket.env is left alone, with the tunnel's
-# PSK and the listener's token -- removing an operator's engagement files is
-# not this script's business.
-for svc in raccoon-implant raccoon-beacon raccoon-watchdog raccoon-gsocket raccoon-macspoof raccoon-beacon-check; do
+for svc in raccoon-implant raccoon-beacon raccoon-watchdog raccoon-macspoof raccoon-beacon-check; do
     systemctl stop "${svc}.service" 2>/dev/null || true
     systemctl disable "${svc}.service" 2>/dev/null || true
     rm -f "/etc/systemd/system/${svc}.service"

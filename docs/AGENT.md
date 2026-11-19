@@ -1041,8 +1041,9 @@ unmeasured rather than understood.
   installing a third-party binary system-wide and dialling a relay network
   from the operator's own machine, which has OPSEC meaning of its own. The
   check is one line, and it is a blocking item before engagement use: start a
-  real `gs-netcat -k <file> -p <port>` and read the local address off the
-  listening socket with `ss -ltnp` (Linux) or
+  real `gs-netcat -k <file> -w -p <port>` — the implant's own argv, `-w`
+  included, since a differently-shaped process is a different answer — and
+  read the local address off the listening socket with `ss -ltnp` (Linux) or
   `lsof -nP -iTCP -sTCP:LISTEN` (macOS). If it binds every interface, an
   implant hands its subnet that path, and the answer is a host firewall rule
   on the implant and a correction to this entry. The question is also

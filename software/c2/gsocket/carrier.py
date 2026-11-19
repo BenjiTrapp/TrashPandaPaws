@@ -249,14 +249,18 @@ class GsocketCarrier:
 
     # Which address `gs-netcat`'s own `-p` forward binds is **not
     # verified**. The man page does not say whether a client's local
-    # forward binds `127.0.0.1` or every interface, and this repository
-    # documents the implant's forward as loopback-only in its *Known
-    # limits*. That claim rests on this question and nothing else.
+    # forward binds `127.0.0.1` or every interface, and this repository's
+    # *Known limits* says exactly that rather than asserting loopback:
+    # the entry records the forward as reachable by any local user on the
+    # implant, with its reachability from *off* the host unverified, and
+    # names the check below as the thing that settles it.
     #
     # The check that would settle it, in one line: start a real
-    # `gs-netcat -k <file> -p <port>` and look at the listening socket --
-    # `ss -ltnp` on Linux, `lsof -nP -iTCP -sTCP:LISTEN` on macOS -- and
-    # read the local address off it.
+    # `gs-netcat -k <file> -w -p <port>` -- the implant's own shape, `-w`
+    # included, because a differently-shaped process is a different
+    # answer -- and look at the listening socket: `ss -ltnp` on Linux,
+    # `lsof -nP -iTCP -sTCP:LISTEN` on macOS. Read the local address off
+    # it.
     #
     # It has not been run. `gs-netcat` is not installed here, and the
     # two ways to answer it are both side effects nobody asked for:

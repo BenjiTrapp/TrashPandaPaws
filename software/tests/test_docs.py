@@ -1042,12 +1042,30 @@ class TestTheGsocketLegIsDocumentedAndShipsDisabled(unittest.TestCase):
                 ("never fleet-wide", "and its other half"),
                 ("a recovered implant image", "whose damage the rule bounds"),
                 ("aes-256-gcm envelope", "what bounds the damage either way"),
-                ("gs-netcat -g", "how an operator mints one")):
+                ("gs-netcat -g", "how an operator mints one"),
+                # Who puts each copy where. The guide used to answer this
+                # with "the build generator writes the implant's copy",
+                # which nothing does -- and the generator is the one
+                # component that refuses this leg outright, which the same
+                # page says fifty lines further down. An operator who
+                # follows a mechanism that does not exist finds out on the
+                # engagement.
+                ("nothing in this repository writes the implant's copy",
+                 "who writes the implant's secret file: nobody"),
+                ("register_implant", "how the server's half is registered"),
+                ("no cli", "that there is no tool for that yet"),
+                ("trailing newline",
+                 "the byte that makes the two ends disagree")):
             with self.subTest(phrase=phrase):
                 self.present(flat, phrase, what, "the GSRN section")
         # A chosen password is the one thing nobody should be invited to
         # do here: the secret is the whole address on the relay network.
         self.assertNotIn("choose a password", flat)
+        for false in ("the build generator writes",
+                      "generator writes the implant"):
+            self.assertNotIn(false, flat,
+                             "the guide credits the build generator with "
+                             "writing the implant's secret file again")
 
     def test_the_gsrn_section_warns_about_the_warm_up_cycle(self):
         # The leg is lazy with a warm latch, so the first cycle after an
@@ -1254,18 +1272,75 @@ class TestTheGsocketLegIsDocumentedAndShipsDisabled(unittest.TestCase):
         self.assertNotIn(" -s ", directives,
                          "the carrier unit passes a secret on a command "
                          "line, which /proc/<pid>/cmdline publishes")
-        for name, script in (("install.sh", _read("services", "install.sh")),
-                             ("uninstall.sh",
-                              _read("services", "uninstall.sh"))):
-            with self.subTest(script=name):
-                self.assertIn("raccoon-gsocket", script,
-                              "services/%s does not know about the carrier "
-                              "unit" % name)
-        self.assertNotIn("systemctl enable raccoon-gsocket",
-                         _read("services", "install.sh"),
-                         "the installer enables the carrier, so a host joins "
-                         "a third-party relay network because an installer "
-                         "ran")
+        # The implant installer places implant units only. This one is the
+        # team server's side, and it reaches a host two other ways -- the
+        # repository checkout, and build_image.sh's rsync of services/ into
+        # the image -- so dropping it into /etc/systemd/system on a
+        # drop-box buys nothing and risks the one thing nobody wants: a
+        # unit with `WantedBy=multi-user.target` and `Restart=always` that
+        # makes an *implant* run the server side of this leg. The
+        # installer tells a team server what to do instead, which is the
+        # useful half.
+        installer = _read("services", "install.sh")
+        self.assertIn("raccoon-gsocket", installer,
+                      "services/install.sh says nothing about the carrier "
+                      "unit, so nothing tells a team server it exists")
+        for banned in ('cp "${SCRIPT_DIR}/raccoon-gsocket.service"',
+                       "systemctl enable raccoon-gsocket"):
+            self.assertNotIn(
+                banned, installer,
+                "services/install.sh runs %r: the implant installer places "
+                "the server side of this leg, which the listener and tunnel "
+                "units are deliberately not given either" % banned)
+
+    def test_the_blocking_check_is_the_implants_own_argv(self):
+        from software.c2.gsocket.carrier import implant_argv
+
+        # The value of that check is entirely that somebody runs the
+        # process the implant runs. `-w` went missing from all three
+        # copies of the line once: it makes that end a client that
+        # *waits* for its peer, so a line without it measures a different
+        # process -- and the project then trusts the answer.
+        flags = [word for word in implant_argv("/opt/gs-netcat", "/f", 1)
+                 if word.startswith("-")]
+        self.assertEqual(
+            flags, ["-k", "-w", "-p"],
+            "the implant's argv is no longer -k/-w/-p, so the command the "
+            "documentation tells somebody to measure is the wrong process. "
+            "Update the three places that show it and this list")
+        shown = "gs-netcat -k <file> -w -p <port>"
+        for where, text in (("docs/LISTENERS.md", self.guide),
+                            ("docs/AGENT.md", self.limits),
+                            ("the plan's manual-verification list",
+                             _read("docs", "superpowers", "plans",
+                                   "2026-11-19-gsocket-carrier.md"))):
+            with self.subTest(document=where):
+                self.assertIn(shown, text,
+                              "%s does not show the blocking check as %r"
+                              % (where, shown))
+
+    def test_the_comment_the_docs_point_at_agrees_with_them(self):
+        # Both *Known limits* and the guide send a reader to the comment
+        # above `GsocketCarrier.argv`. It used to say this repository
+        # documents the forward as loopback-only, which is the one claim
+        # the entry is not allowed to make, so a reader who followed the
+        # pointer was told the opposite of what they had just read.
+        text = _read("software", "c2", "gsocket", "carrier.py")
+        comment = text.split("# \u2500\u2500 the command lines \u2500\u2500",
+                             1)[1].split("def argv", 1)[0]
+        flat = " ".join(" ".join(line.lstrip().lstrip("#").strip()
+                                 for line in comment.splitlines()).split())
+        self.assertIn("not verified", flat.lower(),
+                      "the comment no longer records the question as open")
+        for claim in ("loopback-only", "loopback only"):
+            self.assertNotIn(claim, flat.lower(),
+                             "the comment claims the forward is %s, which is "
+                             "what nobody measured" % claim)
+        self.assertIn("gs-netcat -k <file> -w -p <port>", flat,
+                      "the comment shows a check that is not the implant's "
+                      "own argv")
+        self.assertIn("ss -ltnp", flat,
+                      "the comment no longer names the check")
 
     # ── the front page ──
 

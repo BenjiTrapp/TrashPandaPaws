@@ -147,13 +147,19 @@ c2:
       # not here: a config file is something people paste into tickets. It
       # names a file instead, so `gs-netcat` can be handed `-k <path>` rather
       # than `-s <secret>`, which would put the credential in a world-readable
-      # `ps` line. 0600, one secret per implant, minted with `gs-netcat -g`
-      # and registered on the team server.
+      # `ps` line. 0600, one secret per implant, minted with `gs-netcat -g`.
       #
-      # Empty here, and deliberately: no build has been generated from this
-      # checkout, so there is no file to name. A bare key reads as None, which
-      # counts as absent and is allowed only while the leg is disabled -- the
-      # same rule c2.encryption_key states a screen below.
+      # Empty here, and it stays empty until somebody writes that file: this
+      # is the one step of the leg nothing in the repository automates. The
+      # build generator does not write it -- the generator is what *refuses*
+      # this leg -- and the team server's secret store only writes its own
+      # carrier's copy. So the implant's copy is created by hand (0600, the
+      # secret and no trailing newline) and named here. The GSRN section of
+      # docs/LISTENERS.md gives both commands.
+      #
+      # A bare key reads as None, which counts as absent and is allowed only
+      # while the leg is disabled -- the same rule c2.encryption_key states a
+      # screen below.
       secret_file:
       # Installed into the image by software/setup/build_image.sh at *build*
       # time, from a pinned release with the digest below. Never fetched on

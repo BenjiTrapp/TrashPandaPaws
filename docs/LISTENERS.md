@@ -168,12 +168,55 @@ Mint one with gsocket's own generator, on the team server:
 gs-netcat -g
 ```
 
-Then register it against that implant's identity, and the build generator
-writes the implant's copy into a 0600 file. Do not type a secret you chose
-yourself: this is a credential on a relay network anybody may join, a guessed
-one is a dialable path to the beacon socket, and the store enforces a floor of
-24 characters precisely because the one secret somebody hand-writes is the one
-that matters.
+Do not type a secret you chose yourself: this is a credential on a relay
+network anybody may join, a guessed one is a dialable path to the beacon
+socket, and the store enforces a floor of 24 characters precisely because the
+one secret somebody hand-writes is the one that matters.
+
+**Both copies of it are placed by hand, and that is worth knowing before you
+plan an engagement around this leg.** The team server keeps its secrets in
+`<data dir>/gsocket/secrets.json` (`~/.raccoon-c2` by default), and
+registering one is `SecretStore.register_implant` — a Python API with no CLI,
+no route and no panel button yet. On the team server:
+
+```sh
+cd /opt/raccoon && PYTHONPATH=. python3 - <<'EOF'
+import getpass, os
+from software.c2.gsocket.secrets import SecretStore, secretstore_path
+# The directory the team server was started with (--data-dir, default this).
+store = SecretStore(secretstore_path(os.path.expanduser("~/.raccoon-c2")))
+store.register_implant("implant-01", getpass.getpass("secret: "))
+EOF
+```
+
+`getpass` rather than an argument, for the reason the whole feature keeps
+repeating: an argument is in `ps` and in the shell history. The identity is
+the name a `c2.gsocket_carrier` entry refers to; the store writes the
+carrier's own 0600 key file itself, when the carrier starts.
+
+**Nothing in this repository writes the implant's copy.** Not the build
+generator — that is the one component which *refuses* this leg (see the
+`enabled` row below), because a generated build spawns no child. So on the
+implant, as root, create the file the leg's `secret_file` names:
+
+```sh
+umask 077
+read -rsp 'secret: ' GS_SECRET          # bash builtins: no argv, no ps line
+printf '%s' "$GS_SECRET" > /etc/raccoon/gsocket.secret
+unset GS_SECRET
+```
+
+`printf '%s'` and not `echo`: the file must hold the secret and **nothing
+else**. `gs-netcat -k` reads those bytes back on both ends, so a trailing
+newline is a byte the two ends can disagree about — and the symptom of that
+is a carrier that reaches the relay network and never finds its peer, which
+looks nothing like a typo. The store refuses whitespace and control
+characters inside a secret for the same reason.
+
+Then point `c2.fallback.gsocket.secret_file` at that path and leave the file
+0600. It is a cheap step to automate and nobody has; until somebody does,
+this is two manual edits per implant, and both of them have to carry the same
+24 characters exactly.
 
 The secret appears in no configuration file, in no command line and on no
 panel. Both sides are handed `gs-netcat -k <path>`, never `-s <secret>`:
@@ -195,7 +238,7 @@ c2:
   fallback:
     gsocket:
       enabled: false
-      secret_file:                      # 0600, written by the generator
+      secret_file:                      # 0600, placed by hand; see above
       binary_path: "/opt/raccoon/bin/gs-netcat"
       sha256: "d4a7dfda…"                # verified before every exec
       scheme: "http"
@@ -208,7 +251,7 @@ c2:
 | Field | Meaning |
 |---|---|
 | `enabled` | Ships `false`. **Hardware implant only**: a build the team server generates is a single file that spawns no child, and the generator refuses an enabled leg with a reason rather than shipping one that does nothing. |
-| `secret_file` | The path to the 0600 file holding this implant's secret. Required while the leg is enabled; a bare key means "absent", which is what the file in git has to say. |
+| `secret_file` | The path to the 0600 file holding this implant's secret, written by hand on the implant — nothing in this repository creates it. Required while the leg is enabled; a bare key means "absent", which is what the file in git has to say. |
 | `binary_path` | The `gs-netcat` this leg execs. Put there at image build time, never fetched on the target. |
 | `sha256` | Checked before every exec. Empty means "do not verify", as `c2.sliver.sha256` does — but this binary is handed the secret that fronts the beacon socket, so leaving it empty answers a question nobody asked. |
 | `scheme` | `http` or `https`, for the URL the beacon builds against its own forward. `http` by default because the team server's `--ssl` is off by default and every shipped `relay_url` is `http://127.0.0.1:8443`. |
@@ -296,15 +339,23 @@ it. It was not measured on purpose — answering it means installing a
 third-party binary system-wide and dialling a relay network from the
 operator's own machine, which has OPSEC meaning of its own.
 
-Settle it before an engagement, in one line: start a real
-`gs-netcat -k <file> -p <port>` and read the local address off the listening
-socket — `ss -ltnp` on Linux, `lsof -nP -iTCP -sTCP:LISTEN` on macOS. **This
-is a blocking item before engagement use**, not a nice-to-have: if the
-forward binds every interface, an implant hands its whole subnet a path to
-the beacon socket, and the answer is a host firewall rule on the implant plus
-a corrected entry in *Known limits*. Until somebody runs it, assume the worse
-answer. The question, the check and what depends on it are also recorded
-above `GsocketCarrier.argv` in `software/c2/gsocket/carrier.py`.
+Settle it before an engagement, in one line, and run the implant's own shape
+— `-w` included, because `-w` makes that end a client that waits for its peer
+and a differently-shaped process is a different answer:
+
+```sh
+gs-netcat -k <file> -w -p <port>
+```
+
+Then read the local address off the listening socket — `ss -ltnp` on Linux,
+`lsof -nP -iTCP -sTCP:LISTEN` on macOS. **This is a blocking item before
+engagement use**, not a nice-to-have: if the forward binds every interface,
+an implant hands its whole subnet a path to the beacon socket, and the answer
+is a host firewall rule on the implant plus a corrected entry in *Known
+limits*. Until somebody runs it, assume the worse answer. The question, the
+check and what depends on it are also recorded above `GsocketCarrier.argv` in
+`software/c2/gsocket/carrier.py`, which now says the same thing this section
+does.
 
 Nothing in the test suite touches the real GSRN, and nothing in CI ever
 should: CI must not need a relay operated by somebody else. The rest of what
