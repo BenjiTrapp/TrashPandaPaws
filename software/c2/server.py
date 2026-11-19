@@ -4641,6 +4641,33 @@ header .info{font-size:11px;color:var(--text2)}
 }
 .topbar-ico-btn:hover{color:var(--text)}
 
+/* The Operator Shell's glyph.
+   Every other button in this bar is a colour emoji. This one was two bare
+   characters -- U+25AE and an underscore -- which took the bar's grey from
+   `color` and sat on the 18px line box's baseline, so between a plug and a
+   diamond it read as stray text rather than a button.
+   It is not made into an emoji because it is not another tool: it is the
+   only terminal in the header, and the page's own monospace and red say so.
+   The size is set here rather than inherited, because the button's 18px is
+   an emoji size and this is type. */
+.opshell-glyph{
+  display:inline-block;vertical-align:middle;
+  font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:0.5px;
+  color:#ff4d4d;border:1px solid rgba(255,26,26,0.45);border-radius:3px;
+  padding:3px 4px 3px 3px;background:rgba(255,26,26,0.08);
+  transition:color 0.15s,border-color 0.15s,background 0.15s;
+}
+.topbar-ico-btn:hover .opshell-glyph{
+  color:#ff6b6b;border-color:rgba(255,26,26,0.8);background:rgba(255,26,26,0.16);
+}
+.opshell-cursor{animation:opshell-blink 1.1s steps(1) infinite}
+@keyframes opshell-blink{50%{opacity:0}}
+/* A blinking element is what this query exists for, and the glyph still
+   reads as a prompt standing still. */
+@media (prefers-reduced-motion:reduce){
+  .opshell-cursor{animation:none}
+}
+
 /* Notification bell */
 .bell-wrap{position:relative;margin-left:8px}
 .bell-btn{
@@ -5177,7 +5204,7 @@ header .info{font-size:11px;color:var(--text2)}
     <button class="topbar-ico-btn" onclick="showBeaconGen()" title="Beacon Generator">&#128640;</button>
     <button class="topbar-ico-btn" onclick="showListeners()" title="Listeners">&#128225;</button>
     <button class="topbar-ico-btn" onclick="showTunnel()" title="Tunnel">&#128268;</button>
-    <button class="topbar-ico-btn" onclick="showOperatorShell()" title="Operator Shell">&#9646;_</button>
+    <button class="topbar-ico-btn" onclick="showOperatorShell()" title="Operator Shell"><span class="opshell-glyph">&gt;<span class="opshell-cursor">_</span></span></button>
     <button class="topbar-ico-btn" onclick="showLootViewer()" title="Loot">&#128142;</button>
     <button class="topbar-ico-btn" onclick="showServerLog()" title="Server Log">&#128220;</button>
     <div class="bell-wrap">
@@ -8406,7 +8433,8 @@ async function showOperatorShell(){
   panel.className = "loot-panel panel-wide";
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
-  panel.innerHTML = '<h2>&#9646;_ Operator Shell</h2>'
+  panel.innerHTML = '<h2><span class="opshell-glyph">&gt;'
+    + '<span class="opshell-cursor">_</span></span> Operator Shell</h2>'
     + '<button class="loot-close" onclick="opshellTeardown('
     + 'this.closest(\'.loot-overlay\'))">&#10005;</button>'
     + '<div id="opshell-body" class="loot-loading">Loading...</div>';

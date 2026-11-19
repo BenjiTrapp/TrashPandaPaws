@@ -423,7 +423,7 @@ three artifacts above, though, are real and are the cost of the session.
 ## Opening one from the interface, without reading a port out of a panel
 
 Everything above is reachable with `tools/raccoon_shell.py` and a port the
-tunnel panel shows. The **Operator Shell** glyph (`▮_`) in the header is
+tunnel panel shows. The **Operator Shell** glyph (`>_`) in the header is
 the same session without that detour, and it exists because the detour was
 the reason nobody found the feature: you had to know a tunnel existed, type
 `tunnel start` into a command line that never advertised it, wait without
