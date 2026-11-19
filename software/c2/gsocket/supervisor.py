@@ -68,12 +68,27 @@ Stdlib only, like the rest of this package. Nothing here may import from
 `software.c2.server`.
 """
 
+import logging
 import threading
 import time
 from typing import Dict, List
 
 from .carrier import CarrierError, GsocketCarrier
 from .config import CarrierSpec
+
+# The one logger in this package, and it exists for exactly one message:
+# the carrier that could not be stopped on the way out. `secrets.py` says
+# in as many words that it has no logger, and `carrier.py` has none
+# either -- both of them answer their callers with a reason instead, and
+# a caller is always there to read it. `stop_all` is the exception: it is
+# called from the team server's shutdown path, after the serving loop has
+# returned, so there is nobody left to hand a refusal to. Without this
+# the one failure that path exists to prevent -- a `gs-netcat` that
+# survived SIGTERM and SIGKILL, still holding its implant's address on
+# the relay network -- would be noticed first by the *next* start, which
+# would pair that implant against a process with nothing behind it and no
+# antecedent anywhere in the log.
+logger = logging.getLogger("raccoon.gsocket.supervisor")
 
 # What the panel calls this transport. One spelling, here, because the
 # row is merged into a list of listener rows and the page branches on it.
@@ -191,6 +206,14 @@ class CarrierSupervisor:
         rest: a `gs-netcat` left behind holds its implant's relay address
         against the next start, and there would be no panel left to stop
         it from.
+
+        A carrier that could not be stopped is **logged**, not swallowed.
+        `GsocketCarrier.stop` raises in one case only -- a child that
+        survived SIGTERM and SIGKILL -- and that is exactly the orphan
+        this method exists to prevent, so it is the one message here
+        worth more than the rest. Everything else in this module hands
+        its reason to a caller; this path has none, because it runs after
+        the serving loop has returned.
         """
         with self._lock:
             for name in list(self._carriers):
@@ -198,8 +221,15 @@ class CarrierSupervisor:
                 self._started.pop(name, None)
                 try:
                     carrier.stop()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Broad on purpose: the next carrier must be stopped
+                    # whatever went wrong with this one, and a shutdown
+                    # path that raised would leave the rest running. What
+                    # changes with the log line is only that the reason
+                    # survives.
+                    logger.warning(
+                        "carrier %s could not be stopped on shutdown: %s",
+                        name, exc)
 
     # ── internals ──
 

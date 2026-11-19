@@ -9702,10 +9702,14 @@ def _build_carrier_supervisor(args, parser):
     """A CarrierSupervisor for `c2.gsocket_carrier` in `--config`, or None.
 
     Imported here rather than at the top of the file for the reason
-    `_build_supervisor` is, though the weight is different: this package
-    holds no protocol code at all and nothing beyond the standard
-    library, so what the lazy import buys is that a deployment which
-    configures no carriers never touches the module that spawns one.
+    `_build_supervisor` is, though less of it applies: `config`,
+    `secrets` and `supervisor` are deferred to a deployment that
+    actually configures a carrier, while `carrier.py` itself is already
+    loaded at module scope -- the import at the top of this file takes
+    `CarrierError` from it, so that a refusal can be turned into a
+    status code. That is cheap and deliberate: the module is standard
+    library plus `gsocket/config.py`, with none of the protocol code the
+    listeners' split exists to keep out of this process.
 
     A block that cannot be run is fatal with the offending value named,
     rather than a warning. This is also the only place anything calls

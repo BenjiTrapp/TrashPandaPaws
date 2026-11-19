@@ -586,6 +586,55 @@ class TestTheCarrierSupervisor(CarrierFixture):
         for row in supervisor.status():
             self.assertFalse(row["running"])
 
+    def test_a_carrier_that_cannot_be_stopped_is_logged_on_shutdown(self):
+        # `GsocketCarrier.stop` raises in exactly one case: a child that
+        # survived SIGTERM and SIGKILL. That is the orphan `stop_all`
+        # exists to prevent -- it still holds its implant's address on
+        # the relay network -- so the reason cannot be swallowed on the
+        # way out. Swallowed, the next start pairs that implant against a
+        # process with nothing behind it, and nothing anywhere says why.
+        # This is also the one path in this module with no caller left to
+        # hand a refusal to: it runs after the serving loop has returned.
+        #
+        # Provoked by stubbing that one carrier's `stop`, because the
+        # condition itself is a `gs-netcat` ignoring SIGKILL and cannot
+        # be produced on demand. The real `stop` is kept and run as
+        # cleanup, so the stand-in child is still reaped.
+        supervisor = self.supervisor([
+            self.spec(name="alpha", identity="raccoon-01"),
+            self.spec(name="zeta", identity="raccoon-02"),
+        ])
+        wedged_pid = supervisor.start("alpha")["pid"]
+        healthy_pid = supervisor.start("zeta")["pid"]
+
+        def survived():
+            raise CarrierError(
+                "carrier 'alpha' (pid %d) survived SIGTERM and SIGKILL and "
+                "is still running; its relay address is still taken"
+                % wedged_pid)
+
+        carrier = supervisor._carriers["alpha"]
+        self.addCleanup(carrier.stop)
+        carrier.stop = survived
+
+        with self.assertLogs("raccoon.gsocket.supervisor",
+                             level=logging.WARNING) as caught:
+            supervisor.stop_all()
+        message = "\n".join(caught.output)
+        self.assertIn("alpha", message,
+                      "the warning does not name the carrier that is still "
+                      "holding a relay address")
+        self.assertIn("survived SIGTERM and SIGKILL", message,
+                      "the reason the carrier gave was thrown away")
+
+        # And the control flow is unchanged: one carrier that will not
+        # die must not keep the others alive.
+        self.assertFalse(_alive(healthy_pid),
+                         "a wedged carrier kept pid %d alive" % healthy_pid)
+        self.assertTrue(_alive(wedged_pid),
+                        "the stub did not stand in for a surviving child, so "
+                        "this test proves nothing")
+
     def test_stop_all_is_safe_when_nothing_was_ever_started(self):
         # The shutdown path calls this without working out which carriers
         # it managed to start, so the first one that was never started
