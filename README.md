@@ -641,7 +641,7 @@ flowchart LR
 | **DNS** | Raw DNS queries via `socket`. Agent ID Base32-encoded into subdomain, tasking via encrypted TXT records. ~200 bytes/query. | Egress-restricted networks. Hard to block. |
 | **SMB** | Full SMB2 stack (`socket` + `struct`). Negotiate → anonymous session → IPC$ tree connect → named pipe I/O. Configurable pipe name. | Internal pivoting between beacons. |
 | **QUIC** | UDP with QUIC-style framing. AES-GCM encrypted, fragmented into 1200-byte datagrams with stream IDs for reassembly. | Bypassing TCP-only DPI and proxies. |
-| **gsocket** | A `gs-netcat` child forwards a loopback port to a carrier beside the team server, paired by a per-implant secret over the Global Socket Relay Network. The same HTTP client as HTTPS, aimed at that forward. Hardware implant only; started lazily, after the other four have failed. | A network where every address we could name is blocked or burned — at the cost of a third-party relay, and of being recognisable as gsocket. |
+| **gsocket** | A `gs-netcat` child forwards a local port to a carrier beside the team server, paired by a per-implant secret over the Global Socket Relay Network. The same HTTP client as HTTPS, aimed at that forward on `127.0.0.1`. That forward binds every interface, so the implant's provisioning closes it with a firewall rule. Hardware implant only; started lazily, after the other four have failed. | A network where every address we could name is blocked or burned — at the cost of a third-party relay, and of being recognisable as gsocket. |
 
 #### Malleable C2 Profiles
 
