@@ -2819,19 +2819,21 @@ _TUNNEL_MODE_ENV = "RACCOON_TUNNEL_MODE"
 # The generated config block cannot carry it. An implant's id is minted
 # when the beacon object is built, on the target, and the block is written
 # by the generator long before any beacon exists -- so there is no value to
-# put in `c2.tunnel.implant_id` at generation time, and the key stayed
-# empty in every build. The child is the only process that talks to the
+# put in `c2.tunnel.implant_id` at generation time, and no generated block
+# emits the key at all. The child is the only process that talks to the
 # tunnel server and the beacon is the only one that knows who it is, so
 # the one place the two can meet is between them. The fleet is keyed on
 # this id, and an endpoint that does not announce it matches no agent: it
 # is shown as started from a unit, unmanageable from the panel, and the
 # operator shell refuses to attach to a shell port that is plainly open.
 #
-# Only a fallback. A host configured by file may set `c2.tunnel.implant_id`
-# deliberately -- to link a unit-started endpoint to the agent on the same
-# machine -- and that is a decision somebody made, where this is a value a
-# parent filled in. A beacon-spawned child has no such key, so for it the
-# variable is the only source; for the other the file wins.
+# Only a fallback. Nothing today puts `c2.tunnel.implant_id` in a config
+# but a hand-built dict: the generator does not emit it, and
+# `tunnel_config_from_yaml` drops it. Were a config to carry one, though,
+# it is somebody's statement about this endpoint's identity, where the
+# variable is a value a parent filled in, so the config keeps precedence
+# for whoever builds it. A beacon-spawned child has no such key, and for
+# it the variable is the only source.
 _TUNNEL_IMPLANT_ENV = "RACCOON_TUNNEL_IMPLANT_ID"
 
 # Where the endpoint's PSK comes from on a host configured by file rather
@@ -3548,10 +3550,10 @@ class TunnelEndpoint(object):
                                 "this build's pre-shared key")
         implant_id = tunnel.get("implant_id")
         implant_id = implant_id.strip() if isinstance(implant_id, str) else ""
-        # The file wins; see `_TUNNEL_IMPLANT_ENV` for why there is a
-        # second source at all. Blank is absent on both sides, because a
-        # generated block may carry the key empty and that must not shadow
-        # the variable the beacon set.
+        # The config wins; see `_TUNNEL_IMPLANT_ENV` for why there is a
+        # second source at all. Blank is absent on both sides, so a config
+        # that carries the key empty cannot shadow the variable the beacon
+        # set.
         self.implant_id = (implant_id
                            or os.environ.get(_TUNNEL_IMPLANT_ENV, "").strip())
         self.keepalive_interval = _tunnel_seconds(

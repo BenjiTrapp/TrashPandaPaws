@@ -967,8 +967,8 @@ class TestRegistration(TunnelEndpointTestCase):
         """A beacon's child has no `implant_id` in its config, ever.
 
         The id is minted when the beacon starts, and the block the child
-        reads was written by the generator before that, so the key is
-        empty in every generated build. The beacon hands the id down in
+        reads was written by the generator before that, so no generated
+        block emits the key at all. The beacon hands the id down in
         the environment instead, and the endpoint announces it: without
         that, the server sees an endpoint no fleet agent owns.
         """
@@ -980,20 +980,21 @@ class TestRegistration(TunnelEndpointTestCase):
         self.assertEqual(row["implant_id"], "implant-from-the-beacon")
 
     def test_the_config_wins_over_the_environment(self):
-        # A host configured by file sets the key deliberately, to link an
-        # endpoint it started itself to the agent on the same machine. The
-        # variable is what a parent filled in; the file is somebody's say.
+        # No generated config carries the key today, so this is the rule
+        # for a config built by hand or by a future source: a value
+        # written into the config is a statement about this endpoint's
+        # identity, and the variable is only what a parent filled in.
         self.with_environment_implant_id("implant-from-the-beacon")
         server = self.start_server()
-        self.start_endpoint(self.config_for(server.port,
-                                            implant_id="implant-from-file"))
+        self.start_endpoint(self.config_for(
+            server.port, implant_id="implant-from-the-config"))
 
         row = self.wait_connected(server)
-        self.assertEqual(row["implant_id"], "implant-from-file")
+        self.assertEqual(row["implant_id"], "implant-from-the-config")
 
     def test_a_blank_config_id_does_not_shadow_the_environment(self):
-        # Whitespace is absent on both sides. A generated block that
-        # carries `"implant_id": ""` must not stop the fallback.
+        # Whitespace is absent on both sides: a config that carries
+        # `"implant_id": "  "` must not stop the fallback.
         self.with_environment_implant_id("implant-from-the-beacon")
         server = self.start_server()
         self.start_endpoint(self.config_for(server.port, implant_id="  "))

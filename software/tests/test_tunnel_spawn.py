@@ -904,9 +904,10 @@ class TestTheTunnelChild(SpawnTestCase):
                          "and not the child's")
 
     def test_a_beacon_with_no_id_leaves_the_variable_unset(self):
-        # An empty value is not "no value": a child that read it as one
-        # would announce an id of nothing, which `_agent_for_implant`
-        # treats as unlinked for a reason nobody could find.
+        # Tidiness, not correctness: the endpoint strips a blank and
+        # announces nothing either way, so an empty variable would link
+        # no differently. It would still be a key in the child's
+        # environment that says nothing, and the beacon leaves none.
         for missing in (None, "", "  "):
             with self.subTest(implant_id=missing):
                 self.set_src(self.env_proof_source(
