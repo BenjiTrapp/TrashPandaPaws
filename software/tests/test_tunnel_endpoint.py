@@ -77,6 +77,7 @@ import time
 import traceback
 import pwd
 import unittest
+from unittest import mock
 
 from software.c2 import beacon as beacon_mod
 from software.c2.beacon import (
@@ -954,6 +955,59 @@ class TestRegistration(TunnelEndpointTestCase):
 
         row = self.wait_connected(server)
         self.assertEqual(row["implant_id"], "implant-abcd")
+
+    def with_environment_implant_id(self, value):
+        """The variable a beacon sets on the child it spawns."""
+        patch = mock.patch.dict(
+            os.environ, {beacon_mod._TUNNEL_IMPLANT_ENV: value})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_endpoint_sends_the_implant_id_from_the_environment(self):
+        """A beacon's child has no `implant_id` in its config, ever.
+
+        The id is minted when the beacon starts, and the block the child
+        reads was written by the generator before that, so the key is
+        empty in every generated build. The beacon hands the id down in
+        the environment instead, and the endpoint announces it: without
+        that, the server sees an endpoint no fleet agent owns.
+        """
+        self.with_environment_implant_id("implant-from-the-beacon")
+        server = self.start_server()
+        self.start_endpoint(self.config_for(server.port))
+
+        row = self.wait_connected(server)
+        self.assertEqual(row["implant_id"], "implant-from-the-beacon")
+
+    def test_the_config_wins_over_the_environment(self):
+        # A host configured by file sets the key deliberately, to link an
+        # endpoint it started itself to the agent on the same machine. The
+        # variable is what a parent filled in; the file is somebody's say.
+        self.with_environment_implant_id("implant-from-the-beacon")
+        server = self.start_server()
+        self.start_endpoint(self.config_for(server.port,
+                                            implant_id="implant-from-file"))
+
+        row = self.wait_connected(server)
+        self.assertEqual(row["implant_id"], "implant-from-file")
+
+    def test_a_blank_config_id_does_not_shadow_the_environment(self):
+        # Whitespace is absent on both sides. A generated block that
+        # carries `"implant_id": ""` must not stop the fallback.
+        self.with_environment_implant_id("implant-from-the-beacon")
+        server = self.start_server()
+        self.start_endpoint(self.config_for(server.port, implant_id="  "))
+
+        row = self.wait_connected(server)
+        self.assertEqual(row["implant_id"], "implant-from-the-beacon")
+
+    def test_a_blank_environment_id_is_no_id(self):
+        self.with_environment_implant_id("   ")
+        server = self.start_server()
+        self.start_endpoint(self.config_for(server.port))
+
+        row = self.wait_connected(server)
+        self.assertIsNone(row["implant_id"])
 
     def test_hello_advertises_the_shell_feature(self):
         # Port 1234 is never dialled: nothing here runs the endpoint.
