@@ -461,7 +461,35 @@ def _beacon_gen_config(body: dict, protocols: dict, c2_url: str,
     `_beacon_config_block` and `_obfuscate_layer` were both hoisted out of
     those same two routes for the same reason. The tunnel block is one
     more fact that has to reach both.
+
+    Raises `ValueError` -- which both routes turn into a 400 carrying the
+    message -- when the request enables the gsocket leg. That is the one
+    leg a generated build can never run: it reaches the team server
+    through a `gs-netcat` child process, and a generated build is a
+    single file of obfuscated source with no binary beside it. Refused
+    here rather than dropped, because a build whose fifth leg is silently
+    dead is the failure this repository keeps paying for -- a channel
+    that looks configured and delivers nothing -- and the operator's next
+    move is a bug report about the leg rather than a second request
+    without it.
     """
+    # Only an *enabled* leg is refused. Every config in this repository
+    # carries `enabled: false`, generator requests included, and those
+    # have to keep being accepted unchanged.
+    #
+    # First thing in the function, before the tunnel block below mints a
+    # PSK: a refusal raised after that would leave a credential in the
+    # store that no artifact holds -- the same ordering the two routes
+    # keep their drop-list check in for.
+    if protocols.get("gsocket", {}).get("enabled"):
+        raise ValueError(
+            "the gsocket leg cannot be generated: it needs a gs-netcat "
+            "binary on disk beside the beacon, and a generated build is a "
+            "single file with no binary beside it. The leg is available on "
+            "the hardware implant, whose image carries gs-netcat -- enable "
+            "it there, under c2.fallback.gsocket, and generate this build "
+            "without it.")
+
     https_cfg = protocols.get("https", {})
     dns_cfg = protocols.get("dns", {})
     smb_cfg = protocols.get("smb", {})
