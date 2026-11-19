@@ -992,6 +992,64 @@ have to be distinguishable.
   run. The record is complete either way.
 
 
+### The gsocket leg
+
+The beacon's fifth transport reaches the team server through a `gs-netcat`
+child and the Global Socket Relay Network
+([`docs/LISTENERS.md`](LISTENERS.md#the-fifth-transport-gsocket-over-the-gsrn)).
+These four are properties of that arrangement, not findings a review left
+open, which is why they are their own section and not filed under the
+hardening pass's severity groups below — those are that pass's, and counted
+against it. The fourth is the one that would hold a deployment: it is
+unmeasured rather than understood.
+
+- **A generated build has four legs; the hardware implant has five.** The leg
+  needs a child process and a binary on disk, and a build the team server
+  generates is a single file that is pasted into a shell. So the generator
+  refuses an enabled `gsocket` leg with a 400 naming the reason rather than
+  producing a build whose fifth leg silently does nothing. An operator
+  comparing the two will find a transport in `configs/raccoon.yaml` that the
+  Beacon Gen form cannot offer, and that asymmetry is deliberate.
+- **The carrier is a second process, so killing it kills the leg.** Both ends
+  are a `gs-netcat` the project spawns and does not contain: kill the
+  implant's child and the forward is gone until the beacon notices on its
+  next failed cycle and starts another, no sooner than
+  `restart_delay_seconds` (30 by default) after the last start. There is no
+  watcher thread and no timer, deliberately — a restart in two places is a
+  child that reappears after an operator stopped it — but the cost is that an
+  implant whose carrier was killed is unreachable over this leg for at least
+  one beacon interval, and the panel reports the carrier, not the implant's
+  copy of it, which nothing on the team server can see.
+- **Reachability now depends on a third-party relay network.** The GSRN is
+  operated by The Hacker's Choice, not by this project: if it is down,
+  blocked, or no longer willing to carry this traffic, the leg is down with
+  it, and nothing in the repository can route around that. It is also
+  recognisable — the relay hosts are published and gsocket is well-known
+  tooling to defenders — so this leg hides where the C2 is, not that gsocket
+  is in use. Whether a client's traffic may cross a third party at all is a
+  rules-of-engagement question; the shipped configuration leaves the leg
+  disabled rather than deciding it.
+- **The implant's carrier opens a local forward, and how far it reaches is
+  unverified.** `gs-netcat -p <local_port>` on the implant is a listening
+  socket, and whatever reaches it reaches the team server's beacon socket
+  **unauthenticated at the transport level** — bounded by the AES-256-GCM
+  envelope to exactly what a compromised listener can do (drop or replay
+  messages; it can neither read them nor forge one), but a path all the same.
+  Any local user on that host has it. Whether it is reachable from *off* the
+  host is **not known**: gsocket's documentation does not say which address a
+  client's forward binds, and nothing here has measured it — doing so means
+  installing a third-party binary system-wide and dialling a relay network
+  from the operator's own machine, which has OPSEC meaning of its own. The
+  check is one line, and it is a blocking item before engagement use: start a
+  real `gs-netcat -k <file> -p <port>` and read the local address off the
+  listening socket with `ss -ltnp` (Linux) or
+  `lsof -nP -iTCP -sTCP:LISTEN` (macOS). If it binds every interface, an
+  implant hands its subnet that path, and the answer is a host firewall rule
+  on the implant and a correction to this entry. The question is also
+  recorded above `GsocketCarrier.argv` in `software/c2/gsocket/carrier.py`,
+  with what depends on it.
+
+
 ### Left open by the security hardening
 
 The hardening pass of November 2026 closed most of what an audit of the C2

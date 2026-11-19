@@ -31,6 +31,19 @@ cp "${SCRIPT_DIR}/raccoon-implant.service" /etc/systemd/system/
 cp "${SCRIPT_DIR}/raccoon-beacon.service" /etc/systemd/system/
 cp "${SCRIPT_DIR}/raccoon-watchdog.service" /etc/systemd/system/
 
+# ── The gsocket carrier: copied, never enabled ──
+# The team server's side of c2.fallback.gsocket, for a host that wants a
+# carrier without the 📡 panel. It is put in place here because this script
+# is the only thing in the repository that installs units, and left disabled
+# on purpose: a carrier joins the Global Socket Relay Network, a third party,
+# and nothing should join one because an installer ran. It also needs a
+# secret file this script cannot invent -- see /etc/raccoon/gsocket.env in
+# the unit, and the GSRN section of docs/LISTENERS.md.
+#
+# A drop-box needs no unit for this leg at all: the beacon starts its own
+# gs-netcat child, lazily, and restarts it itself.
+cp "${SCRIPT_DIR}/raccoon-gsocket.service" /etc/systemd/system/
+
 systemctl daemon-reload
 
 systemctl enable raccoon-implant.service
@@ -63,6 +76,14 @@ echo "  sudo systemctl start raccoon-beacon     # beacon only"
 echo "  sudo systemctl status raccoon-implant"
 echo "  sudo systemctl status raccoon-beacon"
 echo "  sudo journalctl -u raccoon-implant -f"
+echo ""
+echo -e "${YELLOW}raccoon-gsocket is installed and deliberately not enabled:${NC}"
+echo "  It is the team server's side of the gsocket C2 leg, and starting it"
+echo "  dials the Global Socket Relay Network — a third party. An implant"
+echo "  needs no unit for that leg; the beacon runs its own gs-netcat child."
+echo "  Read the GSRN section of docs/LISTENERS.md first, then on a team"
+echo "  server: write /etc/raccoon/gsocket.env (0600) and"
+echo "  sudo systemctl enable --now raccoon-gsocket"
 echo ""
 echo -e "${YELLOW}After reboot, the beacon starts automatically via:${NC}"
 echo "  1. systemd raccoon-beacon.service"
