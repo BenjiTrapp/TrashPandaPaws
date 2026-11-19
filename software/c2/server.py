@@ -2987,6 +2987,14 @@ _RESCUE_LEG_WORDS = {
     "auth_required": "wanted authentication",
     "bad_payload": "answered with something unreadable",
     "resolve_failed": "did not resolve (RCODE %d)",
+    # The two a leg that needs a helper process has and no socket does.
+    # Without them `_rescue_summary` renders both as "unknown" through the
+    # fallback below, which would lose the carrier leg's single most
+    # useful diagnostic: an implant that cannot reach anywhere and whose
+    # fifth leg is missing its `gs-netcat` is telling an operator exactly
+    # what to fix, and "GSOCKET: unknown" is telling them nothing.
+    "binary_missing": "has no gs-netcat binary",
+    "carrier_failed": "its gs-netcat did not come up",
 }
 
 

@@ -1231,10 +1231,15 @@ class TestKeyMustBeSupplied(unittest.TestCase):
         # two bytes, because the full id does not fit in a DNS label beside
         # the rescue record; it leaks strictly less than the ordinary DNS
         # query, which already carries that id base32-encoded in full, in
-        # the clear, every cycle. None of the three has ever seen the
-        # callback URL.
+        # the clear, every cycle. `_gsocket_binary_problem` digests the
+        # `gs-netcat` binary the carrier leg is about to exec and compares
+        # it with the digest in the config block -- a deliberate copy of
+        # `gsocket/carrier.binary_problem`, which this file may not import
+        # because it is served to a target as source text. None of the
+        # four has ever seen the callback URL.
         self.assertEqual(self._sha256_callers(beacon_mod.__file__),
-                         {"_generate_id", "mix_hash", "_rescue_fingerprint"})
+                         {"_generate_id", "mix_hash", "_rescue_fingerprint",
+                          "_gsocket_binary_problem"})
 
     # ── Beacon ──
 
