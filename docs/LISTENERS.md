@@ -182,9 +182,14 @@ gs-netcat -g
 ```
 
 Do not type a secret you chose yourself: this is a credential on a relay
-network anybody may join, a guessed one is a dialable path to the beacon
-socket, and the store enforces a floor of 24 characters precisely because the
-one secret somebody hand-writes is the one that matters.
+network anybody may join, and a guessed one is a dialable path to the beacon
+socket. The store's floor is **21 characters**, which is exactly what
+`gs-netcat -g` emits — gsocket truncates its own base58 output to 21
+(`lib/gsocket-util.c:153-170`) — so a minted secret clears it and a
+hand-written one has to be at least as long. Twenty-one base58 characters is
+about 123 bits, and every guess costs an attacker a fresh TCP connection to
+the relay network; the floor is there for the secret somebody writes by hand,
+which is the only one that was ever going to be weak.
 
 **Both copies of it are placed by hand, and that is worth knowing before you
 plan an engagement around this leg.** The team server keeps its secrets in
@@ -228,8 +233,9 @@ characters inside a secret for the same reason.
 
 Then point `c2.fallback.gsocket.secret_file` at that path and leave the file
 0600. It is a cheap step to automate and nobody has; until somebody does,
-this is two manual edits per implant, and both of them have to carry the same
-24 characters exactly.
+this is two manual edits per implant, and both copies have to hold **the same
+bytes exactly** — the whole secret, however long it is, never a truncation of
+it to the store's 21-character floor.
 
 The secret appears in no configuration file, in no command line and on no
 panel. Both sides are handed `gs-netcat -k <path>`, never `-s <secret>`:

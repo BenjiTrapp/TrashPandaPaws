@@ -156,7 +156,7 @@ Expected: FAIL — `ModuleNotFoundError: software.c2.gsocket`.
 
 - [ ] **Step 3: Implement `software/c2/gsocket/secrets.py`**
 
-Mirror `software/c2/tunnel/keys.py`: one JSON file, `_DIR_MODE = 0o700`, `_FILE_MODE = 0o600`, atomic write, refuse a duplicate identity and a duplicate secret rather than overwriting either. `generate()` returns a secret of at least 24 characters from `secrets.choice` over an unambiguous alphabet; the minimum length is enforced in `register_implant` too, so a hand-written secret cannot be weaker than a generated one. `secret_file_for` writes the secret to a `0o600` file for `gs-netcat -k` and returns its path.
+Mirror `software/c2/tunnel/keys.py`: one JSON file, `_DIR_MODE = 0o700`, `_FILE_MODE = 0o600`, atomic write, refuse a duplicate identity and a duplicate secret rather than overwriting either. `generate()` returns a secret of at least `SECRET_MIN_LEN` characters from `secrets.choice` over an unambiguous alphabet; the minimum length is enforced in `register_implant` too, so a hand-written secret cannot be weaker than a generated one. `secret_file_for` writes the secret to a `0o600` file for `gs-netcat -k` and returns its path. (*The floor was built as 24 and corrected to 21 in the final fix wave: `gs-netcat -g`, the generator the guide tells an operator to run, emits 21 characters — upstream `lib/gsocket-util.c:153-170` — so a floor of 24 refused every secret minted the documented way.*)
 
 Write the module docstring in the house style: say that this store exists because a fleet-wide secret would let one recovered implant image reach the beacon socket for the whole fleet, and that the bound is the AES-256-GCM envelope — exactly as far as a compromised listener reaches.
 

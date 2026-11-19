@@ -163,6 +163,29 @@ class TestSecretStrength(SecretStoreTestCase):
         self.assertEqual(store.identities(), [])
         self.assertEqual(SecretStore(self.path).identities(), [])
 
+    def test_the_floor_accepts_what_gs_netcat_g_mints(self):
+        # The guide's only credential path is `gs-netcat -g`, and that
+        # emits **21** characters: upstream `lib/gsocket-util.c:153-170`
+        # base58-encodes its random bytes and then writes
+        # `b58[22] = '\0';` -- "shorten secret to 21 characters". With a
+        # floor of 24 the two commands the guide gives in order could not
+        # both succeed, and the documented fallback was the one the guide
+        # forbids ("do not type a secret you chose yourself").
+        #
+        # So the floor is pinned at 21 from both sides: a 21-character
+        # base58 secret registers, and the constant is not allowed to
+        # drift above the length of a minted one.
+        self.assertLessEqual(
+            SECRET_MIN_LEN, 21,
+            "the floor is above the 21 characters `gs-netcat -g` emits "
+            "(upstream lib/gsocket-util.c:153-170), so the only documented "
+            "way to mint a secret produces one this store refuses")
+        store = SecretStore(self.path)
+        minted = "7Ps9kQxFbT2mNcVhR4dZa"  # 21 base58 characters
+        self.assertEqual(len(minted), 21)
+        store.register_implant("gs-a", minted)
+        self.assertEqual(store.secret_for("gs-a"), minted)
+
     def test_a_secret_of_the_minimum_length_is_accepted(self):
         store = SecretStore(self.path)
         secret = "x" * SECRET_MIN_LEN

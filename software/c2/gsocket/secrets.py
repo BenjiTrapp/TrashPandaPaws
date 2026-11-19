@@ -49,7 +49,19 @@ erases the evidence.
 path to the beacon socket, and a floor that only the generator respects
 is no floor at all -- the one secret anybody hand-writes is the one that
 matters. The same check runs when the file is read, so hand-editing the
-store is not the way around it. Whitespace and control characters are
+store is not the way around it.
+
+The number is 21, which is what `gs-netcat -g` emits: upstream
+`lib/gsocket-util.c:153-170` truncates its base58 encoding with
+`b58[22] = '\0';` ("shorten secret to 21 characters"), and that generator
+is what the operator guide tells an operator to run. A floor above it
+would refuse every secret minted the documented way. It is still a floor
+worth having: 21 base58 characters is about 123 bits, and every guess
+against it costs the guesser a fresh TCP connection to the relay network,
+so the length is not the thing that will fail -- a secret somebody chose
+by hand is, which is what the floor catches.
+
+Whitespace and control characters are
 refused for a different reason: `secret_file_for` writes the secret and
 nothing else, `gs-netcat -k` reads that file back, and a secret carrying
 a newline or a stray space is one the two ends can disagree about byte
@@ -113,7 +125,23 @@ from typing import Any, Dict, List, Optional, Tuple
 # module's constants: whoever mints an implant's secret has to agree with
 # `register_implant`, which refuses anything shorter, and `generate`
 # reads this rather than repeating the number.
-SECRET_MIN_LEN = 24
+#
+# **21, because that is what `gs-netcat -g` emits** -- the generator the
+# operator guide tells an operator to use, and the only credential path
+# this feature has. Upstream `lib/gsocket-util.c:153-170` base58-encodes
+# its random bytes and then writes `b58[22] = '\0';` with the comment
+# "shorten secret to 21 characters". A floor of 24 refused every secret
+# minted the documented way, which left the guide's two commands unable
+# both to succeed and its fallback the one the guide forbids.
+#
+# The floor is still a real floor. 21 characters of base58 is about 123
+# bits (21 * log2(58)), and this alphabet is 57 characters, so a
+# generated one is about 122; against an attacker who needs a fresh TCP
+# connection to the relay network for every guess, that is not a number
+# anybody works through. What the floor is for is the hand-written
+# secret, where the risk is a word somebody chose, not a few bits of
+# length.
+SECRET_MIN_LEN = 21
 
 # Where the store lives under a team-server data directory, as the one
 # spelling of it. The build generator writes an implant's secret into
@@ -237,9 +265,10 @@ class SecretStore:
 
         The generated length *is* the enforced minimum on purpose. Two
         numbers here would invite the version of this module whose
-        generator is weaker than the floor it enforces, and 24 characters
-        over this alphabet is about 140 bits -- far past anything a
-        guesser on the relay network could work through.
+        generator is weaker than the floor it enforces, and 21 characters
+        over this 57-character alphabet is about 122 bits -- against an
+        attacker who needs a fresh TCP connection to the relay network
+        for every guess, far past anything that can be worked through.
         """
         return "".join(secrets.choice(_ALPHABET) for _ in range(SECRET_MIN_LEN))
 
