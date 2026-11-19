@@ -784,6 +784,35 @@ class CiTests(unittest.TestCase):
         body = yaml.dump(self.doc["jobs"]["lab"])
         self.assertIn("tools/e2e_lab.py", body)
 
+    def test_ci_does_not_float_the_runner_under_a_pinned_python(self):
+        """A floating image under a pinned old Python is how this broke.
+
+        Measured, not supposed: every CI run since this workflow was added
+        failed at `actions/setup-python`, with
+
+            The version '3.9' with architecture 'x64' was not found for
+            Ubuntu 26.04.
+
+        `ubuntu-latest` had moved to 26.04, and `actions/python-versions`
+        builds 3.9 for 22.04 and 24.04 only. So the suite this workflow
+        exists to run had never once run -- the file was green in review
+        and red in every execution.
+
+        The pin above says which Python; this one says the image has to be
+        one that still carries it. Naming the image is the whole fix: a
+        version pinned against a moving base is not pinned.
+        """
+        carries_39 = ("ubuntu-22.04", "ubuntu-24.04")
+        for job in ("tests", "lab"):
+            with self.subTest(job=job):
+                runner = self.doc["jobs"][job].get("runs-on")
+                self.assertIn(
+                    runner, carries_39,
+                    "%s runs on %r; actions/python-versions builds 3.9 for "
+                    "%s only, and a floating image already took this "
+                    "workflow out for its whole life"
+                    % (job, runner, " and ".join(carries_39)))
+
     def test_ci_passes_no_secret_to_either_job(self):
         # The lab generates its key per run with os.urandom, and nothing
         # here needs a credential. What must be absent is a REFERENCE --

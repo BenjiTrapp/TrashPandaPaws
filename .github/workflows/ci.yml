@@ -32,7 +32,19 @@ jobs:
   # nobody develops against would report failures nobody asked for.
   tests:
     name: suite (python 3.9, linux)
-    runs-on: ubuntu-latest
+    # Named, not `ubuntu-latest`, and the reason is that every run of this
+    # workflow since it was added failed before reaching a single test:
+    #
+    #   The version '3.9' with architecture 'x64' was not found for
+    #   Ubuntu 26.04.
+    #
+    # `ubuntu-latest` had moved to 26.04 and `actions/python-versions`
+    # builds 3.9 for 22.04 and 24.04 only. A version pinned against a
+    # moving base is not pinned -- so the suite this file exists to run had
+    # never once run, and the file looked right the whole time.
+    #
+    # 24.04 is the newest image that still carries 3.9.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -127,7 +139,9 @@ jobs:
   # different from a red suite.
   lab:
     name: end-to-end lab (docker, linux)
-    runs-on: ubuntu-latest
+    # The same image as the suite, for the same reason: this job pins 3.9
+    # too, and `ubuntu-latest` has no 3.9.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
