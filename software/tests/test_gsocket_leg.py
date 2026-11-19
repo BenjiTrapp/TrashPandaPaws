@@ -496,6 +496,26 @@ class TestTheChain(LegFixture):
                 self.assertEqual(len(caught.records), 1, caught.output)
                 self.assertIn("gsocket", caught.output[0].lower())
 
+    def test_an_enabled_that_is_not_a_bool_leaves_the_leg_off(self):
+        # `bool("false")` is True, and YAML does not unquote a quoted
+        # scalar, so this read `enabled: "false"` as *enabled*: a file
+        # that says false dialling a third-party relay network, in the
+        # one leg where that is what being enabled means. The team
+        # server's `config.validate_leg` refuses such a value by name;
+        # here a raised exception would cost the whole beacon, so the leg
+        # is off and says why once -- which is how the other unusable
+        # blocks are treated two tests up.
+        for bad in ("false", "true", "no", "off", 1, 0, None, []):
+            with self.subTest(enabled=bad):
+                with self.assertLogs("raccoon.c2", level="WARNING") as caught:
+                    beacon = self.a_raw_beacon(
+                        {"enabled": bad, "secret_file": self.secret_file,
+                         "binary_path": self.binary})
+                self.assertIs(beacon.gsocket_enabled, False)
+                self.assertEqual(len(caught.records), 1, caught.output)
+                self.assertIn("enabled", caught.output[0])
+                self.assertIn(repr(bad), caught.output[0])
+
     def test_an_absent_block_is_simply_off(self):
         config = {"c2": {"encryption_key": base64.b64encode(b"\x11" * 32)
                          .decode(), "https": {"enabled": False}}}

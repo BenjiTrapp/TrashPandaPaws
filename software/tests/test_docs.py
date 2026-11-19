@@ -1069,6 +1069,108 @@ class TestTheGsocketLegIsDocumentedAndShipsDisabled(unittest.TestCase):
                              "the guide credits the build generator with "
                              "writing the implant's secret file again")
 
+    def test_no_gsocket_code_credits_the_generator_with_the_secret_file(self):
+        # The same false premise, in the four operator-visible places
+        # under `software/c2/` that the guide's own guard could not see:
+        # a reason string the implant *logs*, the `why=` a config author
+        # reads when their block is refused, the docstring that justifies
+        # the enabled/disabled strictness rule, and the comment over the
+        # store's path. Nothing writes either copy of a gsocket secret,
+        # and the build generator is the one component that *refuses*
+        # this leg -- so an operator told to wait for it waits for a
+        # mechanism that does not exist, and finds out on the engagement.
+        #
+        # Scoped to this leg's own modules, because `tunnel/` says the
+        # same words truthfully about build PSKs, which the generator
+        # really does write.
+        banned = ("the build generator writes", "generator writes the implant",
+                  "generator writes that file", "comes from the build "
+                  "generator")
+        for parts, required in (
+                (("software", "c2", "beacon.py"), None),
+                (("software", "c2", "gsocket", "config.py"),
+                 "created by hand on the implant"),
+                (("software", "c2", "gsocket", "secrets.py"),
+                 "created by hand on the implant"),
+                (("software", "c2", "gsocket", "carrier.py"), None),
+                (("software", "c2", "gsocket", "supervisor.py"), None)):
+            where = "/".join(parts)
+            text = _read(*parts)
+            flat = " ".join(text.split()).lower()
+            for false in banned:
+                with self.subTest(file=where, phrase=false):
+                    self.assertNotIn(
+                        false, flat,
+                        "%s credits the build generator with writing a "
+                        "gsocket secret file; nothing writes it, and that "
+                        "component refuses this leg outright" % where)
+            if required is not None:
+                with self.subTest(file=where, says=required):
+                    self.assertIn(
+                        required, flat,
+                        "%s no longer says who creates the implant's secret "
+                        "file; the answer an operator needs is 'by hand, "
+                        "0600', and the GSRN section of docs/LISTENERS.md"
+                        % where)
+            if required is not None:
+                with self.subTest(file=where, says="where to read"):
+                    self.assertIn(
+                        "docs/listeners.md", flat,
+                        "%s says nothing creates the file but does not point "
+                        "at the page that says how to" % where)
+
+        # The reason the implant logs has to answer the same question,
+        # because a host nobody can read is where it lands.
+        beacon_text = _read("software", "c2", "beacon.py")
+        self.assertIn("Nothing in this repository writes that file", beacon_text,
+                      "the beacon's empty-secret_file reason no longer says "
+                      "who writes it, which is the question it raises")
+
+    def test_the_hand_placement_recipe_cannot_make_an_empty_credential(self):
+        # Both halves of this feature's only credential path are hand
+        # recipes, and this one could produce a 0-byte 0600 file in
+        # silence: the block was fenced ```sh while `read -rsp` is a bash
+        # builtin, so under dash -- /bin/sh on Debian and Parrot -- it
+        # fails with "Illegal option -s", $GS_SECRET stays unset and the
+        # next line writes nothing. An empty secret file makes
+        # `gs-netcat -k` read nothing, which is the hardest failure in
+        # this feature to tell from a hostile network.
+        section = self._guide_section()
+        fences = re.findall(r"```(\w*)\n(.*?)```", section, re.S)
+        recipes = [(lang, body) for lang, body in fences
+                   if "read -rsp" in body]
+        self.assertEqual(len(recipes), 1,
+                         "the guide no longer has exactly one hand-placement "
+                         "recipe for the implant's secret")
+        lang, body = recipes[0]
+        self.assertEqual(lang, "bash",
+                         "the recipe is fenced %r but uses `read -rsp`, a "
+                         "bash builtin that dash refuses -- and the next "
+                         "line then writes an empty secret file" % lang)
+        self.assertIn("[ -s ", body,
+                      "the recipe does not check that the file it wrote is "
+                      "non-empty, which is where an empty credential is "
+                      "cheapest to catch")
+        self.assertIn("chmod 600", body,
+                      "the recipe relies on `umask` alone, which does not "
+                      "retighten a file that already exists with a looser "
+                      "mode")
+
+        # And the installer's half: a printed line that creates an *empty*
+        # env file is the one thing the unit's own comment says it chose
+        # the strict `EnvironmentFile=` form to avoid.
+        installer = _read("services", "install.sh")
+        self.assertNotIn(
+            "install -m 600 /dev/null /etc/raccoon/gsocket.env", installer,
+            "services/install.sh prints a line that creates an empty env "
+            "file, which starts `gs-netcat -k ''` and restarts for ever")
+        self.assertIn("RACCOON_GSOCKET_SECRET_FILE=", installer,
+                      "the installer no longer shows how to write the env "
+                      "file the carrier unit reads")
+        self.assertIn("install -d -m 755 /etc/raccoon", installer,
+                      "the installer writes into /etc/raccoon without "
+                      "creating it; `install` does not create parents")
+
     def test_the_gsrn_section_warns_about_the_warm_up_cycle(self):
         # The leg is lazy with a warm latch, so the first cycle after an
         # outage reports it as failed -- the carrier is started *after*

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Orchestrator tools for a beacon that cannot get out.
 
-A beacon whose HTTPS, SMB and QUIC legs have all failed sends one
+A beacon whose upstream legs have all failed — HTTPS, SMB, QUIC and, on a
+hardware implant, gsocket — sends one
 encrypted diagnostic over DNS (see `software/c2/dns_rescue.py`), and the
 team server attaches it to that agent's record as `stuck`. These two tools
 are the other half: the orchestrator reads the diagnosis and queues **one**
@@ -24,6 +25,7 @@ import json
 from software.agent.c2client import C2Unauthorized, C2Unavailable
 from software.agent.llm.provider import ToolSpec
 from software.agent.tools import CORE, Entry
+from software.c2.dns_rescue import TRANSPORTS
 
 # What the model may ask for, mapped to the verb the implant actually
 # dispatches. This mapping is the whole reason this constant exists: the
@@ -61,8 +63,15 @@ def _leg_report(record):
         # queued attempt will never reach it either.
         "dns_answered": bool(record.get("dns_answered")),
         "reported_at": record.get("at", ""),
-        "legs": {leg: record.get(leg) for leg in
-                 ("https", "dns", "smb", "quic")},
+        # Read off `dns_rescue.TRANSPORTS` rather than written out here.
+        # This dict was `("https", "dns", "smb", "quic")` for the whole of
+        # the gsocket leg's life, so a beacon stuck with `binary_missing`
+        # or `carrier_failed` handed the campaign model four keys and no
+        # mention of the leg that failed -- the class survived only inside
+        # `summary`. `beacon.py`'s own comment on the config mapping names
+        # the shape: two copies of one mapping, both missing the same
+        # half, is how that survives a year.
+        "legs": {leg: record.get(leg) for leg in TRANSPORTS},
     }
 
 

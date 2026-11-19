@@ -2259,6 +2259,29 @@ class TestTheAgentReadsTheDiagnosis(unittest.TestCase):
         self.assertIn("407", got["stuck"][0]["summary"])
         self.assertEqual(got["stuck"][0]["beacon_id"], "b1")
 
+    def test_the_leg_report_names_every_transport_in_the_record(self):
+        # The dict the campaign model reads to pick its next attempt. It
+        # was written out as `("https", "dns", "smb", "quic")` for the
+        # whole of the gsocket leg's life, so a beacon stuck with
+        # `binary_missing` or `carrier_failed` handed the model four keys
+        # with no mention of the leg that had failed -- the class survived
+        # only inside the `summary` string, which nothing parses.
+        #
+        # Pinned against `dns_rescue.TRANSPORTS` rather than against a
+        # list written here, because a list written here is the second
+        # copy that made this possible. A sixth transport now fails this
+        # test until the tool reports it.
+        c2 = _StuckC2({"b1": _stuck_agent(
+            stuck=dict(_stuck_agent()["stuck"],
+                       gsocket=["carrier_failed", 0]))})
+        entry = self._tool(c2, "get_stuck_beacons")()["stuck"][0]
+        self.assertEqual(set(entry["legs"]), set(dns_rescue.TRANSPORTS),
+                         "the leg report's key set is not the record's "
+                         "transports; a leg that failed is invisible to the "
+                         "model that has to choose the next attempt")
+        self.assertEqual(entry["legs"]["gsocket"], ["carrier_failed", 0],
+                         "the gsocket diagnosis is dropped from the report")
+
     def test_a_fleet_with_nothing_stuck_is_not_an_error(self):
         # Most beacons are fine and have nothing to report.
         c2 = _StuckC2({"b1": _stuck_agent(stuck=None)})

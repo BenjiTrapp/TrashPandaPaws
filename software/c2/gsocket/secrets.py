@@ -144,13 +144,19 @@ from typing import Any, Dict, List, Optional, Tuple
 SECRET_MIN_LEN = 21
 
 # Where the store lives under a team-server data directory, as the one
-# spelling of it. The build generator writes an implant's secret into
-# this file and the carrier supervisor reads it out, and they are
-# different processes; two copies of the path that agree today are two
-# copies. The cost of drift is not obvious from either side -- the
-# generator registers a secret in a file the supervisor never reads, and
-# the symptom is a carrier whose peer never appears on the relay network,
-# which reads as a relay problem rather than as a wrong path.
+# spelling of it. `SecretStore.register_implant` writes an implant's
+# secret into this file and the carrier supervisor reads it out, and they
+# are different processes -- registration is an operator running a Python
+# snippet on the team server (the GSRN section of `docs/LISTENERS.md`
+# gives it), the read is the supervisor starting a carrier. Two copies of
+# the path that agree today are two copies. The cost of drift is not
+# obvious from either side -- a secret registered in a file the supervisor
+# never reads, and the symptom is a carrier whose peer never appears on
+# the relay network, which reads as a relay problem rather than as a
+# wrong path.
+#
+# Nothing here writes the *implant's* copy of a secret, and nothing in
+# this repository does: that file is created by hand on the implant, 0600.
 SECRETSTORE_RELPATH = ("gsocket", "secrets.json")
 
 

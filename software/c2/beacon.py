@@ -5053,7 +5053,24 @@ class Beacon:
         # here, and whose answer reaches the operator as a
         # `binary_missing` rescue record rather than only as a log line
         # on a host nobody can read.
-        self.gsocket_enabled = bool(gsocket_cfg.get("enabled", False))
+        # `enabled` is read **by value**, never as `bool(...)`: a
+        # `bool("false")` is `True`, and YAML does not unquote a quoted
+        # scalar, so `enabled: "false"` would have switched this leg on
+        # out of a file that says the opposite. "Everything ships
+        # disabled" is a constraint of this project, and this is the one
+        # leg whose enabled state is an outbound connection to a third
+        # party's relay network -- the one direction in which guessing
+        # costs something nobody can take back. `config.validate_leg`
+        # refuses such a value by name on the team server; here, where a
+        # raised exception would cost the whole beacon, anything that is
+        # not the boolean `true` is off and says why once.
+        raw_enabled = gsocket_cfg.get("enabled", False)
+        self.gsocket_enabled = raw_enabled is True
+        if "enabled" in gsocket_cfg and not isinstance(raw_enabled, bool):
+            logger.warning(
+                "The gsocket leg is off: c2.fallback.gsocket.enabled is %r, "
+                "and only the boolean true enables this leg -- an unquoted "
+                "true or false is what this setting takes", raw_enabled)
         self.gsocket_secret_file = str(gsocket_cfg.get("secret_file") or "")
         self.gsocket_binary_path = str(gsocket_cfg.get("binary_path") or "")
         # Lower-cased here for the same reason `config._checked_sha256`
@@ -6375,7 +6392,10 @@ class Beacon:
             return ("c2.fallback.gsocket.secret_file is empty, and the "
                     "secret is this leg's whole address on the relay "
                     "network -- `gs-netcat -k <path>` has nothing to read. "
-                    "The build generator writes that file")
+                    "Nothing in this repository writes that file: create it "
+                    "by hand on this host, mode 0600, holding the secret "
+                    "and nothing else. The GSRN section of "
+                    "docs/LISTENERS.md gives the command")
 
         scheme = block.get("scheme", _GSOCKET_DEFAULTS["scheme"])
         # Normalised rather than compared as written: a URL scheme is

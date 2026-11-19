@@ -217,19 +217,41 @@ generator — that is the one component which *refuses* this leg (see the
 `enabled` row below), because a generated build spawns no child. So on the
 implant, as root, create the file the leg's `secret_file` names:
 
-```sh
+```bash
+# bash, not sh: `read -rsp` is a bash builtin, and under dash -- which is
+# /bin/sh on Debian and Parrot -- it fails with "Illegal option -s",
+# leaving $GS_SECRET unset and the next line writing a 0-byte file.
+install -d -m 755 /etc/raccoon
 umask 077
-read -rsp 'secret: ' GS_SECRET          # bash builtins: no argv, no ps line
+read -rsp 'secret: ' GS_SECRET          # a builtin: no argv, no ps line
 printf '%s' "$GS_SECRET" > /etc/raccoon/gsocket.secret
 unset GS_SECRET
+chmod 600 /etc/raccoon/gsocket.secret   # umask does not retighten an
+                                        # existing looser file
+[ -s /etc/raccoon/gsocket.secret ] \
+    && echo 'ok: the secret file is not empty' \
+    || echo 'EMPTY: gs-netcat would be handed nothing; write it again'
 ```
 
+The last two lines are not ceremony. `umask` applies to a file being
+*created*, so re-running this over a file that is already 0644 leaves it
+0644; and an empty credential is the failure this recipe can produce
+silently, which is why it is checked where it is made. An empty
+`secret_file` makes `gs-netcat -k` read nothing, and upstream's
+`GS_user_secret` returns NULL for an unreadable key file rather than falling
+through to a generated one — so the process exits, and under systemd with
+`Restart=always` that is a carrier restarting for ever with a third-party
+binary's message, which this page calls the hardest failure in the feature
+to diagnose.
+
 `printf '%s'` and not `echo`: the file must hold the secret and **nothing
-else**. `gs-netcat -k` reads those bytes back on both ends, so a trailing
-newline is a byte the two ends can disagree about — and the symptom of that
-is a carrier that reaches the relay network and never finds its peer, which
-looks nothing like a typo. The store refuses whitespace and control
-characters inside a secret for the same reason.
+else**. A single trailing newline would in fact survive — upstream's
+`user_secret_from_file` strips exactly one — but nothing promises that for
+the next byte somebody adds, and the store refuses whitespace and control
+characters inside a secret precisely so that the two ends cannot disagree
+about one byte of a credential whose mismatch shows up as a carrier that
+reaches the relay network and never finds its peer. Write the secret and
+stop.
 
 Then point `c2.fallback.gsocket.secret_file` at that path and leave the file
 0600. It is a cheap step to automate and nobody has; until somebody does,
@@ -320,6 +342,18 @@ the three listener units, which inherit a bound descriptor because 53 and 445
 are privileged. A carrier binds nothing at all, so it needs no privilege and
 runs as `nobody`. It reads the path to its key file from
 `/etc/raccoon/gsocket.env`, which must not be world-readable; a unit file is.
+
+That file has to **name a key file**. `EnvironmentFile=` without a leading
+`-` fails only on a *missing* file, so an empty one starts
+`gs-netcat -k '' -l …`; upstream's `GS_user_secret` returns NULL for an
+unreadable key file rather than generating one, so the process exits, and
+`Restart=always` with `RestartSec=30` then gives a carrier restarting for
+ever every thirty seconds with a third-party binary's message — the
+diagnosis this page calls the hardest in the feature. Write it with
+`echo RACCOON_GSOCKET_SECRET_FILE=<path>`, not with
+`install -m 600 /dev/null`, and create `/etc/raccoon` first: `install` does
+not create parent directories. The key file itself has to be readable by
+`nobody` (`install -o nobody -g nogroup -m 600`).
 
 The binary comes from the image build: `software/setup/build_image.sh` fetches
 a **pinned** `gs-netcat` release, checks it against a recorded SHA-256 and

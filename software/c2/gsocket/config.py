@@ -27,9 +27,13 @@ network that is simply hostile.
 **A disabled entry is validated exactly as strictly as an enabled one**,
 because a typo that waits until the day somebody switches it on has
 chosen the worst possible moment to appear. What `enabled` changes is
-only whether a *value that nothing has minted yet* may be absent: the
-implant's `secret_file` comes from the build generator, so the block
-shipped in git cannot name one. That is the rule `c2.encryption_key`
+only whether a value that *cannot exist yet* may be absent: the implant's
+`secret_file` names a 0600 file created by hand on that implant, and the
+block shipped in git cannot name a file that does not exist on any host
+yet. (Nothing in this repository writes either copy of a gsocket secret
+-- not the build generator, which is the one component that *refuses*
+this leg. The GSRN section of `docs/LISTENERS.md` is where both copies
+are placed.) That is the rule `c2.encryption_key`
 already states one screen up in the same file -- required while the
 fallback is enabled, and there is no default.
 
@@ -203,8 +207,10 @@ def validate_leg(block: Optional[dict]) -> dict:
     carriers.
 
     `secret_file` and `binary_path` are required only while the leg is
-    enabled, because neither exists before a build is generated and the
-    block that ships in git therefore cannot name them. Every other
+    enabled, because neither file exists on any host until an implant is
+    provisioned -- the secret is written by hand on the implant, the
+    binary is installed into its image -- and the block that ships in git
+    therefore cannot name them. Every other
     check runs whether the leg is enabled or not: the value is wrong now,
     and switching the leg on will not make it right.
 
@@ -223,7 +229,8 @@ def validate_leg(block: Optional[dict]) -> dict:
     _refuse_unknown(_LEG_WHERE, block, _LEG_KEYS, _LEG_ROLE,
                     _CARRIER_WHERE, _CARRIER_KEYS, _CARRIER_ROLE)
 
-    enabled = bool(block.get("enabled", False))
+    enabled = _checked_flag("%s.enabled" % _LEG_WHERE,
+                            block.get("enabled", False))
     leg = {"enabled": enabled}  # type: Dict[str, Any]
 
     leg["secret_file"] = _checked_path(
@@ -232,7 +239,9 @@ def validate_leg(block: Optional[dict]) -> dict:
         why="the secret is this leg's whole address on the relay network, "
             "and it is passed to `gs-netcat -k <path>` rather than "
             "`-s <secret>` so that it never reaches a world-readable `ps` "
-            "line. The build generator writes the file")
+            "line. Nothing in this repository writes that file: it is "
+            "created by hand on the implant, mode 0600, as the GSRN "
+            "section of docs/LISTENERS.md describes")
     leg["binary_path"] = _checked_path(
         "%s.binary_path" % _LEG_WHERE, block.get("binary_path"),
         required=enabled,
@@ -348,7 +357,9 @@ def _spec_of(entry: dict, index: int) -> CarrierSpec:
         why="it is the `gs-netcat` the supervisor execs")
 
     return CarrierSpec(name=name, identity=identity,
-                       enabled=bool(entry.get("enabled", False)),
+                       enabled=_checked_flag(
+                           "carrier %r: enabled" % name,
+                           entry.get("enabled", False)),
                        beacon_host=beacon_host, beacon_port=beacon_port,
                        binary_path=binary_path,
                        sha256=_checked_sha256(
@@ -383,6 +394,39 @@ def _refuse_unknown(label: str, mapping: dict, accepted, role: str,
             ". %s belongs to %s, which is %s, while this block is %s"
             % (", ".join(crossed), other_where, other_role, role))
     raise ValueError(message)
+
+
+def _checked_flag(label: str, value) -> bool:
+    """`value` as a bool, or raise naming it.
+
+    By value and not by `bool(value)`, which is what both blocks used to
+    do and what `listeners/registry.py` still does. `bool("false")` is
+    `True`, and YAML does not unquote a quoted scalar, so
+    `enabled: "false"` -- or `"no"`, or `"off"` -- read as *enabled*. In
+    this module that is the worst available failure: the thesis of the
+    whole file is that a setting misread looks exactly like one that was
+    applied, "everything ships disabled" is a constraint of this project,
+    and this is the one leg whose enabled state is an outbound connection
+    to a third party's relay network. A file that says false must not
+    dial one.
+
+    `None` is refused too, because a bare `enabled:` is a line somebody
+    did not finish rather than a decision to leave the leg off -- and the
+    cost of saying so is one clear message at startup.
+
+    (`registry.py` keeps its coercion. The same tightening there would be
+    an improvement, but it guards blocks with no third party in them, and
+    propagating the laxity in this direction is the mistake worth
+    avoiding; propagating the strictness is a separate change to a file
+    this feature does not own.)
+    """
+    if not isinstance(value, bool):
+        raise ValueError(
+            "%s is %r; it must be true or false, unquoted. A quoted "
+            "\"false\" is a non-empty string, which the old coercion read "
+            "as *enabled* -- and for this leg being enabled means dialling "
+            "a third-party relay network" % (label, value))
+    return value
 
 
 def _checked_port(label: str, value, why: str) -> int:

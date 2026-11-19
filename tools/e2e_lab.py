@@ -42,6 +42,10 @@ import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+
+from software.c2.dns_rescue import TRANSPORTS  # noqa: E402
+
 COMPOSE_FILE = REPO / "software" / "tests" / "lab" / "docker-compose.yml"
 
 # One fixed project name, so a crashed run's containers are findable and
@@ -285,8 +289,9 @@ _CYCLE_LINE = re.compile(r"cycle \d+ \w+ agent=\S+ legs=(?P<legs>\S*)")
 
 # The order the beacon tries its transports in. A leg below the one that
 # delivered is never reached, so finding one in the failures disproves the
-# delivery.
-_LADDER = ("https", "dns", "smb", "quic")
+# delivery. Taken from `dns_rescue.TRANSPORTS`, which is the same order and
+# the one place it is written down.
+_LADDER = TRANSPORTS
 
 
 def _resolver_log(compose, env=None):
@@ -480,7 +485,7 @@ def run_scenario(name, *, compose, env, keep):
     else:
         _say("    Stuck: %s" % stuck.get("summary", ""))
         _say("    dns_answered: %s" % stuck.get("dns_answered"))
-        legs = {leg: stuck.get(leg) for leg in ("https", "dns", "smb", "quic")}
+        legs = {leg: stuck.get(leg) for leg in TRANSPORTS}
         _say("    legs: %s" % legs)
         if not spec["rescues"]:
             problems.append(

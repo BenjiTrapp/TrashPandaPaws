@@ -676,12 +676,12 @@ class TestMalformedStore(SecretStoreTestCase):
 class TestTheOnePathBothSidesUse(unittest.TestCase):
     """The store's location, as the one spelling of it.
 
-    The build generator writes an implant's secret into this file and the
+    `register_implant` writes an implant's secret into this file and the
     carrier supervisor reads it out, and they are different processes. Two
     copies of the path that agree today are two copies, and the cost of
-    drift is not obvious from either side: the generator registers a
-    secret in a file the supervisor never reads, and the symptom is a
-    carrier whose peer never appears on the relay network.
+    drift is not obvious from either side: a secret registered in a file
+    the supervisor never reads, and the symptom is a carrier whose peer
+    never appears on the relay network.
     """
 
     def test_the_relpath_is_the_agreed_one(self):

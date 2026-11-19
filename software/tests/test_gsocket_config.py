@@ -477,6 +477,40 @@ class TestLegBlock(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     validate_leg(block)
 
+    def test_an_enabled_that_is_not_a_bool_is_refused_on_both_blocks(self):
+        # `bool("false")` is True, and YAML does not unquote a quoted
+        # scalar, so `enabled: "false"` used to read as *enabled* -- in
+        # the one module whose thesis is that a misread setting looks
+        # exactly like an applied one, and in the unsafe direction for the
+        # one leg that dials a third party's relay network. "Everything
+        # ships disabled" is a constraint of this project, and this was
+        # the one way a file that says false produced a relay dial.
+        #
+        # `None` is in the list because a bare `enabled:` is an unfinished
+        # line, and 0/1 because a YAML author who means a flag writes a
+        # flag.
+        for bad in ("false", "true", "no", "off", "", 0, 1, None, [], {}):
+            with self.subTest(enabled=bad):
+                with self.assertRaises(ValueError) as caught:
+                    validate_leg(leg_block(enabled=bad))
+                message = str(caught.exception)
+                self.assertIn("c2.fallback.gsocket.enabled", message)
+                self.assertIn(repr(bad), message)
+
+                with self.assertRaises(ValueError) as caught:
+                    load_carriers(config_with(carrier_entry(enabled=bad)))
+                message = str(caught.exception)
+                self.assertIn("enabled", message)
+                self.assertIn(repr(bad), message)
+
+        # And the two values that are flags still work, on both sides.
+        self.assertIs(validate_leg(leg_block(enabled=True))["enabled"], True)
+        self.assertIs(validate_leg(leg_block(enabled=False))["enabled"], False)
+        self.assertEqual(
+            [spec.enabled for spec in
+             load_carriers(config_with(carrier_entry(enabled=True)))],
+            [True])
+
     def test_a_restart_delay_of_zero_is_refused(self):
         # Zero is a restart as fast as `gs-netcat` can fail, which is a
         # busy loop on the implant's CPU and a flood of joins on the
