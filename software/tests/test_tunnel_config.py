@@ -201,11 +201,12 @@ class _GeneratorCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.data[:400])
         body = response.get_json()
         if route == "gen":
-            prefix = 'python3 -c "'
+            prefix = 'printf %s "'
+            suffix = '" | python3 -'
             one = body["oneliner_unix"]
-            self.assertTrue(one.startswith(prefix) and one.endswith('"'),
+            self.assertTrue(one.startswith(prefix) and one.endswith(suffix),
                             one[:80])
-            stage = one[len(prefix):-1]
+            stage = one[len(prefix):-len(suffix)]
         else:
             self.assertIsNotNone(self._uploaded,
                                  "the gist route uploaded nothing")
@@ -1096,8 +1097,9 @@ class TestTheTwoPathsAgree(unittest.TestCase):
                              "port": 8446}},
             headers=_AUTH)
         self.assertEqual(response.status_code, 200, response.data[:400])
-        prefix = 'python3 -c "'
-        stage = response.get_json()["oneliner_unix"][len(prefix):-1]
+        prefix = 'printf %s "'
+        suffix = '" | python3 -'
+        stage = response.get_json()["oneliner_unix"][len(prefix):-len(suffix)]
         baked = _baked_config(_innermost(stage))["tunnel"]
 
         from_yaml = tunnel_config_from_yaml(

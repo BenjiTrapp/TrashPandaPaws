@@ -1,0 +1,111 @@
+# The shipped team-server image, built and started.
+#
+# This file exists because of a measurement, not a policy. The first time
+# anyone built `software/c2/Dockerfile` on a machine that was not the one
+# it was written on, it failed six different ways. Four of those failures
+# hit every architecture, and they had been there long enough that the
+# image's own base had changed Debian release underneath it. Nothing in
+# this repository ever built it, so nothing ever said so.
+#
+# A separate workflow rather than a job inside ci.yml, deliberately: this
+# guards one artefact, it is the only thing that needs Docker and a long
+# apt step, and a reader looking at a red run should be able to tell from
+# the name alone that the image is what broke.
+#
+# It builds AND starts. Defect 5 built cleanly and then died at import
+# with "No module named 'software'", so a job that stopped at a green
+# build would have reported success over an image that could not run.
+# That is the whole reason for the second step.
+name: Shipped image
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "software/c2/Dockerfile"
+      - "software/c2/docker-compose.yml"
+      - "software/c2/docker-entrypoint.sh"
+      - "software/c2/server.py"
+      - "software/c2/beacon.py"
+      - ".github/workflows/shipped-image.yml"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: build and start (docker, linux)
+    runs-on: ubuntu-latest
+    # The apt step alone pulls ~140 MB and the NetExec install compiles,
+    # so this is not a two-minute job. Measured locally at 8-14 minutes
+    # from a cold cache.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: What docker is here
+        run: |
+          docker --version
+          echo "runner arch: $(uname -m)"
+
+      # The context is the repository root, because the image needs the
+      # software/ package: server.py imports software.c2.listeners and
+      # software.c2.stagers. Building with a context of software/c2 is
+      # exactly what made the image unable to start.
+      - name: Build software/c2/Dockerfile
+        run: |
+          docker build \
+            -f software/c2/Dockerfile \
+            -t raccoon-c2:ci \
+            .
+
+      # Not a smoke test of the entrypoint: this runs the module the way
+      # the entrypoint runs it, so every top-level import in server.py is
+      # executed. --help returns 0 and exits, which is all that is needed
+      # to prove the imports resolve inside the image.
+      - name: The server starts inside the image
+        run: |
+          docker run --rm --entrypoint python3 raccoon-c2:ci \
+            -m software.c2.server --help > /tmp/help.txt
+          echo "--- first lines of --help:"
+          head -5 /tmp/help.txt
+          grep -q -- "--operator-port" /tmp/help.txt
+
+      # Reported, not asserted. Which tools resolve depends on the
+      # runner's architecture -- NetExec has no aarch64 wheel and is
+      # allowed to be absent -- so this prints the truth rather than
+      # demanding a particular answer. The entrypoint's banner is built
+      # the same way for the same reason.
+      - name: What the image actually carries
+        run: |
+          docker run --rm --entrypoint sh raccoon-c2:ci -c '
+            for t in nmap xfreerdp xfreerdp3 vncviewer responder \
+                     relayking nxc secretsdump.py; do
+              if command -v "$t" >/dev/null 2>&1; then
+                printf "  %-18s %s\n" "$t" "$(command -v "$t")"
+              else
+                printf "  %-18s absent\n" "$t"
+              fi
+            done
+            python3 - <<PY
+          import importlib
+          for name in ("impacket", "ldap3", "lsassy", "flask",
+                       "cryptography", "requests_ntlm"):
+              try:
+                  importlib.import_module(name)
+              except Exception as exc:
+                  print("  %-18s ABSENT (%s)" % (name, type(exc).__name__))
+              else:
+                  print("  %-18s ok" % name)
+          PY
+          '
+
+      # The compose file is the documented way to run this, and its build
+      # context is part of the defect that stopped the server from
+      # starting. A config parse catches a broken context or a renamed
+      # dockerfile path without a second full build.
+      - name: docker-compose.yml still resolves
+        working-directory: software/c2
+        run: docker compose config --quiet

@@ -19,8 +19,10 @@ import base64
 import json
 import math
 import os
+import shutil
 import socket
 import struct
+import subprocess
 import sys
 import unittest
 import unittest.mock
@@ -1387,6 +1389,17 @@ class TestTheServerDecodesARescue(unittest.TestCase):
         self.assertEqual(stuck["https"], ["auth_required", 407])
         self.assertTrue(stuck["dns_answered"])
 
+    def test_the_agent_is_marked_as_last_heard_over_dns(self):
+        # `_handle_rescue` sets `last_channel = "dns"` and then calls
+        # `_handle_beacon`, which sets it to "http" on every check-in --
+        # so the mark the rescue path deliberately made was destroyed one
+        # line later, and the interface showed "http" for a beacon whose
+        # only working leg was DNS. Exactly backwards, and exactly in the
+        # situation this channel exists for.
+        self._deliver(self._record())
+        self.assertEqual(
+            self.server_mod.agents[self.agent].get("last_channel"), "dns")
+
     def test_it_reads_as_a_sentence_an_operator_can_act_on(self):
         self._deliver(self._record())
         summary = self.server_mod.agents[self.agent]["stuck"]["summary"]
@@ -1434,6 +1447,215 @@ class TestTheServerDecodesARescue(unittest.TestCase):
 
         src = inspect.getsource(self.server_mod.create_app)
         self.assertIn("WRAPPER_KEY", src)
+
+
+class TestARescueNobodyCanClaim(unittest.TestCase):
+    """The diagnosis of the beacon that never registered, made visible.
+
+    It used to be appended to a list nothing read: received, decrypted and
+    decoded, then discarded into memory. Every record here is built by the
+    real path -- the beacon's own `_encrypt`, POSTed to `/` -- rather than
+    appended to the list.
+    """
+
+    TOKEN = "operator-token"
+
+    def setUp(self):
+        import tempfile
+
+        from software.c2 import server as server_mod
+
+        self.server_mod = server_mod
+        self.crypto = server_mod.ServerCrypto(_KEY)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.app = server_mod.create_app(self.crypto, self.TOKEN,
+                                         pathlib_Path(tmp.name))
+        self.beacon = _a_beacon()
+        server_mod.agents.clear()
+        self.addCleanup(server_mod.agents.clear)
+        del server_mod.unattributed_rescues[:]
+        self.addCleanup(server_mod.unattributed_rescues.clear)
+        before = len(server_mod.event_log)
+        self.addCleanup(lambda: server_mod.event_log.__delitem__(
+            slice(before, None)))
+        self._first_new_log = before
+
+    def _auth(self):
+        return {"Authorization": "Bearer %s" % self.TOKEN}
+
+    def _send(self, agent="a-box-that-never-registered", status=407,
+              fingerprint=None):
+        raw = dns_rescue.pack(
+            {"https": (dns_rescue.CLASSES["http_status"], status),
+             "dns": (dns_rescue.CLASSES["answered"], 0)},
+            dns_rescue.FLAG_DNS_ANSWERED,
+            dns_rescue.fingerprint(agent) if fingerprint is None
+            else fingerprint)
+        blob = self.beacon._encrypt(
+            {dns_rescue.WRAPPER_KEY: base64.b64encode(raw).decode()})
+        with self.app.test_client() as client:
+            response = client.post("/", json={"cipher_text": blob})
+        self.assertEqual(response.status_code, 200)
+
+    def _served(self, client=None, **kw):
+        client = client or self.app.test_client()
+        return client.get("/api/rescues/unattributed",
+                          headers=self._auth(), **kw)
+
+    def _rescue_log(self):
+        return [e for e in self.server_mod.event_log[self._first_new_log:]
+                if e["cat"] == "RESCUE"]
+
+    def test_an_unattributed_rescue_is_logged_so_it_is_not_silent(self):
+        # It used to be appended to a list nothing read: decoded, stored and
+        # discarded. The beacon that cannot be attributed is the one most
+        # likely to be stuck, because never registering means the way out
+        # was never open.
+        self._send(status=407)
+        entries = self._rescue_log()
+        self.assertEqual(len(entries), 1)
+        self.assertIn("407", entries[0]["msg"])
+        self.assertIn("HTTPS", entries[0]["msg"])
+        self.assertIn("%04x" % dns_rescue.fingerprint(
+            "a-box-that-never-registered"), entries[0]["msg"])
+
+    def test_an_attributed_rescue_is_not_logged_as_unclaimed(self):
+        self.server_mod.agents["clumsy-raccoon"] = {
+            "id": "implant-1", "hostname": "h", "last_seen": "now",
+            "caps": []}
+        self._send(agent="clumsy-raccoon")
+        self.assertEqual(self._rescue_log(), [])
+        self.assertEqual(self._served().get_json(), {"unattributed": []})
+
+    def test_the_route_returns_it_newest_first(self):
+        self._send(agent="first", status=401)
+        self._send(agent="second", status=402)
+        self._send(agent="third", status=403)
+        response = self._served()
+        self.assertEqual(response.status_code, 200)
+        records = response.get_json()["unattributed"]
+        self.assertEqual([r["fingerprint"] for r in records],
+                         [dns_rescue.fingerprint(a)
+                          for a in ("third", "second", "first")])
+        self.assertIn("403", records[0]["summary"])
+        for record in records:
+            for key in ("summary", "dns_answered", "fingerprint", "at",
+                        "https", "dns", "smb", "quic"):
+                self.assertIn(key, record)
+        self.assertEqual(records[0]["https"], ["http_status", 403])
+
+    def test_the_route_is_empty_when_nothing_has_been_received(self):
+        self.assertEqual(self._served().get_json(), {"unattributed": []})
+
+    def test_premise_a_get_to_an_unrouted_path_is_405(self):
+        # A premise, not a feature. The agent tool's degradation against an
+        # older team server rests on what such a server answers to GET
+        # /api/rescues/unattributed: 405, because its catch-all
+        # /<path:path> accepts only POST, so a GET to an unrouted path is
+        # a method error. `C2Client._request` tolerates only 404 as
+        # "missing", which is why the tool has to absorb the 405 itself,
+        # and why the client's docstring says what it says. If someone adds
+        # a GET catch-all, the handling still works (every non-2xx raises)
+        # but that rationale quietly stops being true; this test must break
+        # first. The path is one no route will ever claim.
+        client = self.app.test_client()
+        for headers in ({}, self._auth()):
+            with self.subTest(authenticated=bool(headers)):
+                response = client.get(
+                    "/never-a-route-405-premise/x", headers=headers)
+                self.assertEqual(response.status_code, 405)
+
+    def test_the_route_needs_the_operator_token(self):
+        self._send()
+        client = self.app.test_client()
+        self.assertEqual(
+            client.get("/api/rescues/unattributed").status_code, 401)
+        wrong = client.get("/api/rescues/unattributed",
+                           headers={"Authorization": "Bearer nope"})
+        self.assertEqual(wrong.status_code, 401)
+        self.assertNotIn(b"summary", wrong.data)
+
+    def test_the_route_is_not_on_the_agent_socket(self):
+        # Same policy as every other /api/ route: a request judged by the
+        # socket it arrived on, refused with the catch-all's own answer.
+        import tempfile
+
+        self._send()
+        with tempfile.TemporaryDirectory() as tmp:
+            split = self.server_mod.create_app(
+                self.crypto, self.TOKEN, pathlib_Path(tmp),
+                operator_port=8444)
+        client = split.test_client()
+        cover = client.post("/", json={"not": "a beacon"},
+                            environ_overrides={"SERVER_PORT": "9444"})
+        refused = client.get("/api/rescues/unattributed",
+                             headers=self._auth(),
+                             environ_overrides={"SERVER_PORT": "9444"})
+        self.assertEqual((refused.status_code, refused.data),
+                         (cover.status_code, cover.data))
+        self.assertNotIn(b"unattributed", refused.data)
+        served = client.get("/api/rescues/unattributed",
+                            headers=self._auth(),
+                            environ_overrides={"SERVER_PORT": "8444"})
+        self.assertEqual(served.status_code, 200)
+        self.assertEqual(len(served.get_json()["unattributed"]), 1)
+
+    def test_a_rescue_for_a_deleted_agent_is_reported_not_dropped(self):
+        # Review Focus 3. Attribution matches the live fleet, so a record
+        # for an agent the operator has removed lands here.
+        agent = "clumsy-raccoon"
+        self.server_mod.agents[agent] = {
+            "id": "implant-1", "hostname": "h", "last_seen": "now",
+            "caps": []}
+        self._send(agent=agent)
+        self.assertIn("stuck", self.server_mod.agents[agent])
+        self.assertEqual(self._served().get_json(), {"unattributed": []})
+
+        del self.server_mod.agents[agent]
+        self._send(agent=agent, status=503)
+        records = self._served().get_json()["unattributed"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["fingerprint"],
+                         dns_rescue.fingerprint(agent))
+        self.assertIn("503", records[0]["summary"])
+        self.assertEqual(len(self._rescue_log()), 1)
+
+    def test_nothing_in_the_record_is_treated_as_an_agent_id(self):
+        # Review Focus 3. The record carries a 2-byte fingerprint and leg
+        # codes. No string from the target can reach it, and the route must
+        # not invent an id from the fingerprint.
+        fp = dns_rescue.fingerprint("a-box-that-never-registered")
+        lookalikes = ("%04x" % fp, "%d" % fp, "0x%04x" % fp)
+        for name in lookalikes:
+            self.server_mod.agents[name] = {
+                "id": "impl-" + name, "hostname": "h", "last_seen": "now",
+                "caps": []}
+        self._send()
+        record = self._served().get_json()["unattributed"][0]
+        for key in ("agent_id", "agent", "id", "name"):
+            self.assertNotIn(key, record)
+        self.assertEqual(sorted(k for k, v in record.items()
+                                if isinstance(v, str)), ["at", "summary"])
+        self.assertEqual(self._rescue_log()[0]["agent"], "")
+        for name in lookalikes:
+            self.assertNotIn("stuck", self.server_mod.agents[name])
+        self.assertEqual(set(self.server_mod.agents), set(lookalikes))
+        with self.app.test_client() as client:
+            for name in lookalikes:
+                logs = client.get("/api/logs/agent/" + name,
+                                  headers=self._auth()).get_json()
+                self.assertEqual(logs, [])
+
+    def test_the_list_stays_capped(self):
+        # Review Focus 2's other half: 51 records leave 50.
+        cap = self.server_mod._RESCUE_UNATTRIBUTED_MAX
+        for n in range(cap + 1):
+            self._send(fingerprint=n)
+        records = self._served().get_json()["unattributed"]
+        self.assertEqual(len(records), cap)
+        self.assertEqual(records[0]["fingerprint"], cap)
+        self.assertEqual(records[-1]["fingerprint"], 1)
 
 
 def _operator_script(cache={}):
@@ -1500,6 +1722,120 @@ def _strip_js_literals(js):
             out.append(c)
             i += 1
     return "".join(out)
+
+
+class TestARescueFromABeaconThatNeverLearnedItsName(unittest.TestCase):
+    """The fingerprint may be of the implant id, and the server knows it.
+
+    An implant stamps `fingerprint(self._agent_id or self._implant_id)`, and
+    `_agent_id` is set in exactly one place: the HTTPS registration reply.
+    No other transport sends `action=register`, so a beacon whose HTTPS leg
+    is down for the whole life of its process never learns its fleet name
+    and stamps its implant id instead.
+
+    That is not a rare shape. An implant id is one per host and stable
+    across restarts (a known limit in its own right), so the agent record
+    from an earlier process is still in the fleet, holding that very id in
+    `info["id"]`. The server compared the record only against fleet names,
+    dropped the diagnosis into the unattributable list, and showed the
+    operator "a stuck beacon nobody can claim" about a host it could name.
+
+    Matching an implant id to a fleet name is not new here: `_handle_beacon`
+    does it for a check-in that arrives without one, and `_handle_register`
+    does it to recognise a returning host. The rescue path was the one that
+    did not.
+    """
+
+    def setUp(self):
+        import tempfile
+
+        from software.c2 import server as server_mod
+
+        self.server_mod = server_mod
+        self.crypto = server_mod.ServerCrypto(_KEY)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.app = server_mod.create_app(self.crypto, "operator-token",
+                                         pathlib_Path(tmp.name))
+        server_mod.agents.clear()
+        del server_mod.unattributed_rescues[:]
+        self.addCleanup(server_mod.agents.clear)
+        self.addCleanup(lambda: server_mod.unattributed_rescues.clear())
+        self.agent = "clumsy-raccoon"
+        self.implant = "3948e54c95459fd4"
+        server_mod.agents[self.agent] = {
+            "id": self.implant, "hostname": "h", "last_seen": "now",
+            "caps": [],
+        }
+
+    def _deliver(self, stamped_with):
+        raw = dns_rescue.pack(
+            {"https": (dns_rescue.CLASSES["timed_out"], 0),
+             "dns": (dns_rescue.CLASSES["answered"], 0)},
+            dns_rescue.FLAG_DNS_ANSWERED,
+            dns_rescue.fingerprint(stamped_with))
+        wrapped = self.crypto.wrap(
+            {dns_rescue.WRAPPER_KEY: base64.b64encode(raw).decode()})
+        with self.app.test_request_context("/api/v1/beacon", json=wrapped):
+            return self.server_mod._handle_rescue(
+                self.crypto.unwrap(wrapped) or {}, self.crypto)
+
+    def test_a_rescue_stamped_with_the_implant_id_reaches_its_agent(self):
+        self._deliver(self.implant)
+        stuck = self.server_mod.agents[self.agent].get("stuck")
+        self.assertIsNotNone(
+            stuck, "the server holds this implant id in info['id'] and "
+                   "still could not place the diagnosis")
+        self.assertEqual(stuck["https"], ["timed_out", 0])
+
+    def test_it_is_not_also_filed_as_unattributable(self):
+        # Both would be worse than neither: the operator would see a claim
+        # that nobody owns this record next to the record on its own row.
+        self._deliver(self.implant)
+        self.assertEqual(self.server_mod.unattributed_rescues, [])
+
+    def test_the_agents_last_channel_says_dns(self):
+        # The same bookkeeping a fleet-name match does. A rescue only ever
+        # arrives over the DNS relay.
+        self._deliver(self.implant)
+        self.assertEqual(
+            self.server_mod.agents[self.agent].get("last_channel"), "dns")
+
+    def test_a_fleet_name_still_matches(self):
+        self._deliver(self.agent)
+        self.assertIsNotNone(self.server_mod.agents[self.agent].get("stuck"))
+
+    def test_an_id_matching_neither_is_still_unattributable(self):
+        self._deliver("a-host-that-never-registered")
+        self.assertIsNone(self.server_mod.agents[self.agent].get("stuck"))
+        self.assertEqual(len(self.server_mod.unattributed_rescues), 1)
+
+    def test_a_record_with_no_implant_id_does_not_swallow_the_fingerprint(self):
+        # `fingerprint("")` is a fixed value, so an agent record carrying no
+        # id would match every rescue a beacon sent before it knew who it
+        # was -- and the first such record in the dict would claim all of
+        # them. An empty id identifies nobody.
+        self.server_mod.agents["nameless-raccoon"] = {
+            "id": "", "hostname": "", "last_seen": "now", "caps": [],
+        }
+        self._deliver("")
+        self.assertIsNone(
+            self.server_mod.agents["nameless-raccoon"].get("stuck"))
+        self.assertEqual(len(self.server_mod.unattributed_rescues), 1)
+
+    def test_the_fleet_name_wins_when_two_records_could_claim_it(self):
+        # Two bytes of fingerprint collide once in 65536, and adding a
+        # second candidate per agent doubles the chance. When both kinds
+        # match, the fleet name is the stronger signal: the beacon only
+        # stamps one if the server told it that name.
+        other = "tidy-raccoon"
+        self.server_mod.agents[other] = {
+            "id": self.agent, "hostname": "h2", "last_seen": "now",
+            "caps": [],
+        }
+        self._deliver(self.agent)
+        self.assertIsNotNone(self.server_mod.agents[self.agent].get("stuck"))
+        self.assertIsNone(self.server_mod.agents[other].get("stuck"))
 
 
 class TestTheTwoGuisDoNotShareHelpers(unittest.TestCase):
@@ -1603,18 +1939,229 @@ class TestWhatTheOperatorSees(unittest.TestCase):
         self.assertIn("nothing can leave", self.src[i:i + 400])
 
 
+_RESCUE_ROUTE = "/api/rescues/unattributed"
+
+
+def _the_function_that_polls_rescues():
+    """(name, source) of the operator-console function that asks the route.
+
+    Found by what it does -- it is the one function that requests the
+    route -- not by a name chosen here, so a rename cannot make the
+    tests below vacuous and they never assert their own spelling.
+    """
+    import re
+
+    from software.c2 import server as server_mod
+
+    html = server_mod._OPERATOR_HTML
+    if _RESCUE_ROUTE not in html:
+        raise AssertionError("the operator console never asks for %s, so "
+                             "nothing tells the operator" % _RESCUE_ROUTE)
+    at = html.index(_RESCUE_ROUTE)
+    starts = list(re.finditer(r"(?:async\s+)?function\s+([A-Za-z_$][\w$]*)"
+                              r"\s*\([^)]*\)\s*\{", html[:at]))
+    start = starts[-1]
+    depth, i = 1, start.end()
+    while depth:
+        depth += {"{": 1, "}": -1}.get(html[i], 0)
+        i += 1
+    return start.group(1), html[start.start():i]
+
+
+class TestTheOperatorIsToldAboutRescuesNobodyCanClaim(unittest.TestCase):
+    """The drawer is a place you have to open; the console should speak up.
+
+    Source-level for what can be read off the page (that the name called
+    is defined where it is called -- the defect this feature already
+    shipped once), and run under node for what cannot (that a record is
+    announced once, not on every tick).
+    """
+
+    def test_the_poll_is_started_beside_the_agent_poll(self):
+        import re
+
+        from software.c2 import server as server_mod
+
+        name, _ = _the_function_that_polls_rescues()
+        html = server_mod._OPERATOR_HTML
+        self.assertRegex(html, r"setInterval\(%s\s*,\s*\d+\)" % re.escape(name))
+        self.assertRegex(html, r"setInterval\(refreshAgents\s*,\s*\d+\)")
+
+    def test_the_notification_escapes_with_a_helper_that_exists(self):
+        # The rule this feature's worst defect earned: escHtml(...) was an
+        # invented spelling, the operator console calls its escaper `esc`,
+        # and the whole agent panel threw and rendered nothing. So: every
+        # function the poll calls must be one this page defines.
+        import re
+
+        _, source = _the_function_that_polls_rescues()
+        code = _strip_js_literals(source)
+        called = set(re.findall(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(", code))
+        called -= _JS_KEYWORDS
+        called.discard(_the_function_that_polls_rescues()[0])
+        defined = TestTheTwoGuisDoNotShareHelpers()._names(_operator_script())
+        undefined = sorted(called - defined)
+        self.assertEqual(
+            undefined, [],
+            "the rescue poll calls %s, which the operator console does not "
+            "define -- the poll will throw" % undefined)
+        # And it must actually escape the one field a target influences.
+        self.assertTrue(
+            re.search(r"\b(?:%s)\(\s*\w+\.summary\s*\)"
+                      % "|".join(map(re.escape, sorted(called))), code),
+            "the summary is not passed through any function")
+
+    def _run(self, polls):
+        """Run the real poll under node against scripted responses.
+
+        `polls` is a list of what the route answers on successive ticks.
+        The page's own `esc` is lifted out of the page, so a name the poll
+        calls that the page lacks throws here as it would in the browser.
+        """
+        import re
+
+        from software.c2 import server as server_mod
+
+        name, source = _the_function_that_polls_rescues()
+        esc = re.search(r"function esc\(s\)\{.*?\n\}\n",
+                        server_mod._OPERATOR_HTML, re.S).group(0)
+        # The page-level `let` the poll keeps its memory in: whichever
+        # declaration in the page the poll's own source mentions.
+        state = "".join(
+            d.group(0) + "\n" for d in re.finditer(
+                r"^let\s+([A-Za-z_$][\w$]*)\s*=\s*[{\[][}\]];",
+                server_mod._OPERATOR_HTML, re.M)
+            if re.search(r"\b%s\b" % re.escape(d.group(1)), source))
+        self.assertTrue(state, "the poll keeps no memory of what it has told")
+        script = """
+const toasts = [];
+const seen_paths = [];
+const polls = %s;
+let tick = 0;
+function storedToken(){ return "t"; }
+function toast(type, title, msg, duration){ toasts.push({type, title, msg}); }
+async function api(path){ seen_paths.push(path); return polls[tick++]; }
+%s
+%s
+%s
+(async () => {
+  const counts = [];
+  for(let i = 0; i < polls.length; i++){ await %s(); counts.push(toasts.length); }
+  console.log(JSON.stringify({counts, toasts, seen_paths}));
+})().catch(e => { console.error(e.stack); process.exit(1); });
+""" % (json.dumps(polls), state, esc, source, name)
+        done = subprocess.run(["node", "-e", script], capture_output=True,
+                              text=True, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout)
+
+    @staticmethod
+    def _rec(fingerprint=1234, at="2026-01-01T00:00:00Z",
+             summary="HTTPS: wanted authentication (407)"):
+        return {"summary": summary, "dns_answered": True,
+                "fingerprint": fingerprint, "at": at,
+                "https": ["auth_required", 407]}
+
+    def _unattributed(self, *records):
+        return {"unattributed": list(records)}
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_record_is_announced_once_with_a_warning(self):
+        got = self._run([self._unattributed(self._rec())])
+        self.assertEqual(got["seen_paths"], [_RESCUE_ROUTE])
+        self.assertEqual(len(got["toasts"]), 1)
+        self.assertEqual(got["toasts"][0]["type"], "warning")
+        self.assertIn("407", got["toasts"][0]["msg"])
+        self.assertIn("%04x" % 1234, got["toasts"][0]["msg"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_record_already_seen_raises_no_second_notification(self):
+        # The list is capped at 50 and never cleared, so a poll that
+        # announces everything it is given re-fires every record on every
+        # tick. One record three times, then one new record at the front.
+        old = self._rec(fingerprint=1, at="2026-01-01T00:00:01Z")
+        new = self._rec(fingerprint=3, at="2026-01-01T00:00:02Z")
+        same = self._unattributed(old)
+        got = self._run([same, same, same, self._unattributed(new, old)])
+        self.assertEqual(got["counts"], [1, 1, 1, 2])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_two_records_are_told_apart_by_beacon_and_by_time(self):
+        # The key is per record: the same beacon stuck again later is news,
+        # and two beacons stuck in the same second are two beacons.
+        a = self._rec(fingerprint=7, at="2026-01-01T00:00:00Z")
+        later = self._rec(fingerprint=7, at="2026-01-01T00:00:09Z")
+        other = self._rec(fingerprint=8, at="2026-01-01T00:00:09Z")
+        got = self._run([self._unattributed(a),
+                         self._unattributed(later, a),
+                         self._unattributed(other, later, a)])
+        self.assertEqual(got["counts"], [1, 2, 3])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_several_unseen_records_in_one_poll_raise_one_notification(self):
+        # One rule, not a special case for the first load: a console opened
+        # on a server that has been up for a week meets up to 50 records at
+        # once, and so does a burst. toast() shows the element and files it
+        # in the panel in one call, so there is no per-record route into the
+        # panel without new plumbing; one notification says how many.
+        records = [self._rec(fingerprint=n, at="2026-01-01T00:00:%02dZ" % n,
+                             summary="leg %d is stuck" % n)
+                   for n in (9, 8, 7, 6, 5)]
+        got = self._run([self._unattributed(*records)])
+        self.assertEqual(len(got["toasts"]), 1, got["toasts"])
+        note = got["toasts"][0]
+        self.assertEqual(note["type"], "warning")
+        text = note["title"] + " " + note["msg"]
+        self.assertIn(str(len(records)), text)
+        self.assertRegex(text, r"(?i)match no agent|nobody can claim|unclaim")
+        # It counts them; it does not pretend to name them.
+        for n in range(5, 10):
+            self.assertNotIn("leg %d" % n, text)
+            self.assertNotIn("%04x" % n, text)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_batch_is_not_announced_again_one_by_one(self):
+        # Records folded into a batch are still *seen*: the next tick must
+        # not re-raise them singly, and a later arrival is announced alone.
+        batch = [self._rec(fingerprint=n, at="2026-01-01T00:00:%02dZ" % n)
+                 for n in (3, 2, 1)]
+        later = self._rec(fingerprint=4, at="2026-01-01T00:00:04Z")
+        got = self._run([self._unattributed(*batch),
+                         self._unattributed(*batch),
+                         self._unattributed(later, *batch)])
+        self.assertEqual(got["counts"], [1, 1, 2])
+        self.assertIn("%04x" % 4, got["toasts"][1]["msg"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_what_a_target_sent_is_escaped_in_the_notification(self):
+        got = self._run([self._unattributed(
+            self._rec(summary="<img src=x onerror=alert(1)>"))])
+        msg = got["toasts"][0]["msg"]
+        self.assertNotIn("<img", msg)
+        self.assertIn("&lt;img", msg)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_no_records_raises_nothing(self):
+        got = self._run([{"unattributed": []}])
+        self.assertEqual(got["toasts"], [])
+
+
 # ── The agent reads it (Task 6) ──
 
 
 class _StuckC2:
     """Just enough C2 for the tool: a fleet and a task queue."""
 
-    def __init__(self, agents):
+    def __init__(self, agents, unattributed=()):
         self._agents = agents
+        self._unattributed = list(unattributed)
         self.queued = []
 
     async def list_agents(self):
         return list(self._agents.values())
+
+    async def unattributed_rescues(self):
+        return list(self._unattributed)
 
     async def get_agent(self, agent_id):
         return self._agents.get(agent_id)
@@ -1644,20 +2191,24 @@ def _stuck_agent(**over):
     return agent
 
 
+def _orchestrator_tool(c2, name):
+    import asyncio as _asyncio
+
+    from software.agent.tools import registry
+
+    tools = registry.orchestrator_tools(
+        None, 1, dispatch_single=None, dispatch_parallel=None,
+        tier="full", scope_key="k", c2=c2)
+    for tool in tools:
+        if tool.spec.name == name:
+            return lambda **kw: _asyncio.run(tool.fn(**kw))
+    raise AssertionError("no tool %r; got %s"
+                         % (name, [t.spec.name for t in tools]))
+
+
 class TestTheAgentReadsTheDiagnosis(unittest.TestCase):
     def _tool(self, c2, name):
-        import asyncio as _asyncio
-
-        from software.agent.tools import registry
-
-        tools = registry.orchestrator_tools(
-            None, 1, dispatch_single=None, dispatch_parallel=None,
-            tier="full", scope_key="k", c2=c2)
-        for tool in tools:
-            if tool.spec.name == name:
-                return lambda **kw: _asyncio.run(tool.fn(**kw))
-        raise AssertionError("no tool %r; got %s"
-                            % (name, [t.spec.name for t in tools]))
+        return _orchestrator_tool(c2, name)
 
     def test_it_reports_the_diagnosis_for_a_stuck_beacon(self):
         c2 = _StuckC2({"b1": _stuck_agent()})
@@ -1776,6 +2327,234 @@ class TestTheAgentReadsTheDiagnosis(unittest.TestCase):
         names = {t.spec.name for t in tools}
         self.assertNotIn("get_stuck_beacons", names)
         self.assertIn("log_score", names)
+
+
+def _unattributed_record(**over):
+    record = {
+        "summary": "HTTPS: unreachable; DNS: answered; SMB: unreachable; "
+                   "QUIC: timed out.",
+        "dns_answered": True, "fingerprint": 4242, "at": "now",
+        "https": ["unreachable", 0], "dns": ["answered", 0],
+        "smb": ["unreachable", 0], "quic": ["timed_out", 0],
+    }
+    record.update(over)
+    return record
+
+
+class TestTheAgentReadsRescuesNobodyCanClaim(unittest.TestCase):
+    """Rescues from a beacon that never registered, so there is no id."""
+
+    def _tool(self, c2, name):
+        return _orchestrator_tool(c2, name)
+
+    def test_the_tool_reports_unattributed_rescues_under_their_own_key(self):
+        # Separate from "stuck" on purpose: there is no beacon id to task, so
+        # a model must not be able to mistake one for something it can act on.
+        c2 = _StuckC2({"b1": _stuck_agent()},
+                      unattributed=[_unattributed_record()])
+        got = self._tool(c2, "get_stuck_beacons")()
+        self.assertEqual(len(got["stuck"]), 1)
+        self.assertEqual(len(got["unattributed"]), 1)
+        self.assertEqual(got["stuck"][0]["beacon_id"], "b1")
+        self.assertIn("unreachable", got["unattributed"][0]["summary"])
+        self.assertTrue(got["unattributed"][0]["dns_answered"])
+        self.assertEqual(got["unattributed"][0]["legs"]["quic"],
+                         ["timed_out", 0])
+
+    def test_unattributed_entries_are_never_mixed_into_stuck(self):
+        c2 = _StuckC2({}, unattributed=[_unattributed_record()])
+        got = self._tool(c2, "get_stuck_beacons")()
+        self.assertEqual(got["stuck"], [])
+        self.assertEqual(len(got["unattributed"]), 1)
+
+    def test_an_unattributed_entry_carries_no_beacon_id_field(self):
+        # A field named like an id invites queueing work against it.
+        c2 = _StuckC2({}, unattributed=[_unattributed_record()])
+        entry = self._tool(c2, "get_stuck_beacons")()["unattributed"][0]
+        for key in entry:
+            with self.subTest(key=key):
+                self.assertNotIn("id", key.lower().split("_"))
+        self.assertNotIn("hostname", entry)
+
+    def test_no_unattributed_rescues_is_an_empty_list(self):
+        got = self._tool(_StuckC2({}), "get_stuck_beacons")()
+        self.assertEqual(got["unattributed"], [])
+
+    def _tool_over_the_real_client(self, status):
+        # The real client against a server that answers `status` for the
+        # route, so the failure is the one the client itself raises.
+        import types
+
+        from software.agent import c2client
+
+        class Session:
+            def request(self, method, url, **kw):
+                if url.endswith("/api/agents"):
+                    body = [_stuck_agent()]
+                    return types.SimpleNamespace(
+                        status_code=200, json=lambda: body)
+                return types.SimpleNamespace(
+                    status_code=status, json=lambda: {})
+
+        client = c2client.C2Client("http://127.0.0.1:8099", "tok",
+                                   session=Session())
+        return self._tool(client, "get_stuck_beacons")
+
+    def test_the_tool_still_works_against_a_server_without_the_route_405(self):
+        # An older team server answers 405, not 404: its catch-all
+        # /<path:path> accepts only POST, so a GET to an unrouted path is a
+        # method error. The client treats only 404 as "missing", so this
+        # arrives as a C2Unavailable and the tool has to absorb it.
+        got = self._tool_over_the_real_client(405)()
+        self.assertEqual(len(got["stuck"]), 1)
+        self.assertNotIn("unattributed", got)
+        self.assertNotIn("error", got)
+
+    def test_the_tool_still_works_against_a_server_without_the_route_404(self):
+        got = self._tool_over_the_real_client(404)()
+        self.assertEqual(len(got["stuck"]), 1)
+        self.assertNotIn("unattributed", got)
+
+    def test_the_tool_still_works_when_the_route_fails_outright(self):
+        got = self._tool_over_the_real_client(500)()
+        self.assertEqual(len(got["stuck"]), 1)
+        self.assertNotIn("unattributed", got)
+
+    def test_a_failed_fetch_omits_the_key_rather_than_emptying_it(self):
+        # Present and empty means "I asked, there are none"; absent means
+        # "I could not ask". Emptying it would make the two the same.
+        asked = self._tool(_StuckC2({}), "get_stuck_beacons")()
+        self.assertEqual(asked["unattributed"], [])
+        could_not = self._tool_over_the_real_client(405)()
+        self.assertNotIn("unattributed", could_not)
+
+    def test_a_rejected_token_on_that_route_also_omits_the_key(self):
+        from software.agent import c2client
+
+        class Rejected(_StuckC2):
+            async def unattributed_rescues(self):
+                raise c2client.C2Unauthorized("no")
+
+        got = self._tool(Rejected({"b1": _stuck_agent()}),
+                         "get_stuck_beacons")()
+        self.assertEqual(len(got["stuck"]), 1)
+        self.assertNotIn("unattributed", got)
+
+    def test_a_programming_error_in_that_call_is_not_swallowed(self):
+        # Only the client's own failures degrade. Anything else is a bug
+        # and must surface, not read as "no unattributed rescues".
+        class Buggy(_StuckC2):
+            async def unattributed_rescues(self):
+                raise KeyError("a bug")
+
+        with self.assertRaises(KeyError):
+            self._tool(Buggy({}), "get_stuck_beacons")()
+
+    def test_an_entry_carries_the_fingerprint_as_the_server_logs_it(self):
+        c2 = _StuckC2({}, unattributed=[_unattributed_record(fingerprint=0xBEE)])
+        entry = self._tool(c2, "get_stuck_beacons")()["unattributed"][0]
+        self.assertEqual(entry["fingerprint"], "0bee")
+
+    def test_repeats_from_one_beacon_share_a_fingerprint(self):
+        c2 = _StuckC2({}, unattributed=[
+            _unattributed_record(fingerprint=7, at="t1"),
+            _unattributed_record(fingerprint=7, at="t2"),
+            _unattributed_record(fingerprint=9, at="t3")])
+        got = self._tool(c2, "get_stuck_beacons")()["unattributed"]
+        self.assertEqual([e["fingerprint"] for e in got],
+                         ["0007", "0007", "0009"])
+
+    def test_a_fingerprint_that_is_not_two_bytes_is_not_passed_through(self):
+        # Whatever the server sent, only a two-byte number is rendered.
+        for bad in ("<script>", -1, 0x10000, None, True, 1.5):
+            with self.subTest(bad=bad):
+                c2 = _StuckC2({}, unattributed=[
+                    _unattributed_record(fingerprint=bad)])
+                entry = self._tool(c2, "get_stuck_beacons")()[
+                    "unattributed"][0]
+                self.assertEqual(entry["fingerprint"], "")
+
+    def test_the_stuck_list_is_not_swallowed_with_it(self):
+        # Only the unattributed fetch degrades. A failing fleet listing is
+        # still a failure of the whole call.
+        from software.agent import c2client
+
+        class Broken(_StuckC2):
+            async def list_agents(self):
+                raise c2client.C2Unavailable("down")
+
+        with self.assertRaises(c2client.C2Unavailable):
+            self._tool(Broken({}), "get_stuck_beacons")()
+
+    def test_the_tool_description_says_they_cannot_be_tasked(self):
+        from software.agent.tools import egress
+
+        spec = next(e.spec for e in egress.entries()
+                    if e.spec.name == "get_stuck_beacons")
+        text = spec.description.lower()
+        self.assertIn("unattributed", text)
+        self.assertIn("no id", text)
+        self.assertIn("cannot be tasked", text)
+
+    def test_the_description_explains_an_absent_key(self):
+        # The model cannot infer that convention; the description is the
+        # only place it reads.
+        from software.agent.tools import egress
+
+        spec = next(e.spec for e in egress.entries()
+                    if e.spec.name == "get_stuck_beacons")
+        text = " ".join(spec.description.lower().split())
+        self.assertIn("key is absent the server could not be asked", text)
+        self.assertIn("present and empty means it was asked and there are "
+                      "none", text)
+        self.assertIn("same `fingerprint`", text)
+
+
+class TestTheClientAsksForUnattributedRescues(unittest.IsolatedAsyncioTestCase):
+    def _client(self, status=200, payload=None):
+        import types
+
+        from software.agent import c2client
+
+        calls = []
+
+        class Session:
+            def request(self, method, url, **kw):
+                calls.append((method, url))
+                return types.SimpleNamespace(
+                    status_code=status, json=lambda: payload)
+
+        return (c2client.C2Client("http://127.0.0.1:8099", "tok",
+                                  session=Session()), calls)
+
+    async def test_it_returns_the_records_from_the_route(self):
+        client, calls = self._client(
+            payload={"unattributed": [_unattributed_record()]})
+        got = await client.unattributed_rescues()
+        self.assertEqual(got, [_unattributed_record()])
+        self.assertEqual(calls, [
+            ("GET", "http://127.0.0.1:8099/api/rescues/unattributed")])
+
+    async def test_a_missing_route_is_an_error_not_an_empty_list(self):
+        # "Could not ask" must not read as "asked, none": 404 and the 405
+        # an older team server gives both raise. (405 also stays an error
+        # in `_request` generally; allow_missing is not widened.)
+        from software.agent import c2client
+
+        for status in (404, 405):
+            with self.subTest(status=status):
+                client, _ = self._client(status=status)
+                with self.assertRaises(c2client.C2Unavailable):
+                    await client.unattributed_rescues()
+
+    async def test_an_answer_without_the_list_is_rejected(self):
+        from software.agent import c2client
+
+        for payload in ([], {"oops": 1}, {"unattributed": "no"}):
+            with self.subTest(payload=payload):
+                client, _ = self._client(payload=payload)
+                with self.assertRaises(c2client.C2Unavailable):
+                    await client.unattributed_rescues()
 
 
 class TestTheOrchestratorOffersThem(unittest.TestCase):

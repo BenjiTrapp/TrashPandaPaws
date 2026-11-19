@@ -818,10 +818,20 @@ RACCOON_PORT=443 RACCOON_SSL=1 docker compose up -d
 docker compose logs -f raccoon-c2
 ```
 
-The Docker image (`python:3.12-slim`) includes all tools pre-installed:
-Impacket, NetExec, Lsassy, RelayKing, and Responder. It runs with
-`network_mode: host` and `NET_RAW`/`NET_ADMIN` capabilities (required for
-Responder).
+The Docker image (`python:3.12-slim-bookworm`) includes all tools
+pre-installed: Impacket, Lsassy, RelayKing, and Responder, plus NetExec on
+the architectures PyPI serves it for. The start-up banner lists what is
+actually present rather than what is intended, so read it rather than this
+paragraph. It runs with `network_mode: host` and `NET_RAW`/`NET_ADMIN`
+capabilities (required for Responder).
+
+The Debian release in that tag is deliberate. The image used to say
+`python:3.12-slim`, which moved from Debian 12 to Debian 13 underneath it;
+`freerdp2-x11` does not exist in 13, and the build stopped working for
+everyone without a commit in this repository. NetExec is the one tool that
+may be missing: its RDP library `aardwolf` publishes no Linux `aarch64`
+wheel and wants a Rust toolchain, so on arm64 the install is skipped and
+the image builds without it.
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|

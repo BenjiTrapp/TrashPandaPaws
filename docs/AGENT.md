@@ -1069,7 +1069,11 @@ more.
   bounds or none at all, and no file pins an exact version. The
   server image installs six packages with no version constraint at all and
   builds NetExec, Responder and RelayKing from moving git branches with no
-  tag. A rebuild a month later is a different image.
+  tag. A rebuild a month later is a different image. The base image's
+  Debian release is now pinned, and that is not a fix for this: it was
+  pinned because `python:3.12-slim` had already moved from Debian 12 to
+  13, taking `freerdp2-x11` with it and breaking the build on every
+  architecture. The dependencies above are still unpinned.
 - **Two dependencies are old, and neither is imported here.** `netifaces`
   0.11.0 (May 2021) is its last release, and being a C extension it breaks on
   new CPython rather than merely ageing. Nothing in the repository imports it:

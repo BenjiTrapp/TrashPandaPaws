@@ -3060,6 +3060,36 @@ class TestTheGlyphAndTheView(_GuiCase):
         opened = self.js_function("showOperatorShell")
         self.assertNotIn("/api/opshell/open", opened)
 
+    def test_no_browser_feature_newer_than_the_page_is_used_unguarded(self):
+        """The baseline this interface already had, and I raised it once.
+
+        Measured across the page: optional chaining and the Clipboard API,
+        both Safari 13.1, and nothing newer -- until `AbortSignal.timeout`
+        (Safari 16) went in uncalled-for. It threw inside the poll on an
+        older browser and killed the heartbeat.
+
+        So each 2022-or-later name must sit behind a check. The list is
+        short on purpose: it names what this feature introduced rather than
+        trying to police the whole file.
+        """
+        # Call sites, not mentions. The first version of this searched for
+        # the name and matched the comment explaining why the name needs a
+        # guard -- the third time on this branch that a check of mine
+        # forbade describing a thing rather than doing it. A call is the
+        # name followed by `(`.
+        for name in ("AbortSignal.timeout", "structuredClone",
+                     "Array.fromAsync", "Promise.withResolvers"):
+            call = name + "("
+            at = SERVER_SRC.find(call)
+            while at >= 0:
+                window = SERVER_SRC[max(0, at - 260):at]
+                self.assertRegex(
+                    window, r'typeof\s+%s' % re.escape(name),
+                    "%s is called without a feature check at offset %d; it "
+                    "is newer than this page's own baseline of Safari 13.1"
+                    % (name, at))
+                at = SERVER_SRC.find(call, at + 1)
+
     def test_the_page_loads_the_vendored_terminal(self):
         self.assertIn('/static/xterm.js', SERVER_SRC)
         self.assertIn('/static/xterm.css', SERVER_SRC)
@@ -4093,6 +4123,38 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(got["scheduled"], [2000],
                          "a stalled poll did not reschedule itself")
         self.assertEqual(got["deadline"], 8000)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_an_older_browser_loses_the_deadline_and_not_the_heartbeat(self):
+        """`AbortSignal.timeout` is Safari 16; this interface is Safari 13.1.
+
+        Measured against the rest of the page: 164 uses of optional
+        chaining (2020) and the Clipboard API (Safari 13.1), and nothing
+        newer than that -- until I added a 2022 feature and called it
+        unconditionally. On an older browser that throws a TypeError inside
+        the poll, which kills the heartbeat: the exact failure the deadline
+        was added to prevent, arriving by a different door.
+
+        So it is used when it exists and skipped when it does not. A poll
+        with no deadline is what the view had last week; a poll that throws
+        is worse than both.
+        """
+        got = self._node(
+            "delete AbortSignal.timeout;\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "opshellSession = 'sid';\n"
+            "nextReply = {ok:true, status:200, body:{state:'waiting',"
+            " channel:'closed', host:'parrot', expected_checkin:9}};\n"
+            "await opshellPoll();\n"
+            "await runTimers(1);\n"
+            "console.log(JSON.stringify({polls: posted.filter("
+            "p => p.url.includes('/state')).length, scheduled,"
+            " deadlines: posted.map(p => p.timeout),"
+            " shown: els['opshell-body'].innerHTML.slice(0, 40)}));")
+        self.assertEqual(got["polls"], 2,
+                         "the heartbeat stopped without AbortSignal.timeout")
+        self.assertEqual(got["scheduled"], [2000, 2000])
+        self.assertEqual(got["deadlines"], [None, None])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_one_failed_poll_does_not_end_the_heartbeat(self):
