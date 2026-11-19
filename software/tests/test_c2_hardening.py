@@ -153,6 +153,13 @@ class TestAeadIsNotOptional(unittest.TestCase):
                 b = _smb_beacon()
                 self._enter(self._smb_returning(b, response))
                 self.assertIsNone(b._beacon_smb())
+                # Already registered, so that `_one_checkin` really runs a
+                # cycle: SMB is an upstream leg, so the loop's
+                # registration preamble now tries it, and a preamble that
+                # failed would spend this helper's one mocked sleep and
+                # leave the assertion below true of a loop that never
+                # ran. What is under test here is the check-in path.
+                b._registered = True
                 self.assertEqual(_one_checkin(b), [])
 
     def test_quic_plaintext_tasking_is_refused(self):
@@ -161,17 +168,27 @@ class TestAeadIsNotOptional(unittest.TestCase):
                 b = _quic_beacon()
                 self._enter(self._quic_returning(b, response))
                 self.assertIsNone(b._beacon_quic())
+                # See the SMB case above.
+                b._registered = True
                 self.assertEqual(_one_checkin(b), [])
 
     def test_undecryptable_response_is_a_failed_checkin_not_an_empty_one(self):
         # An empty-but-successful check-in resets the failure counter, so the
         # fifth consecutive failure would never trigger re-registration.
+        #
+        # `_register_upstream` and not `_register_https`: this beacon has
+        # DNS alone, which carries nothing upstream, and the fifth failure
+        # used to call the HTTPS registration regardless -- posting to an
+        # empty callback URL and filing an `https` failure about a leg
+        # this configuration does not have. The re-registration attempt
+        # is what is pinned here; which legs it has to try is the
+        # generalisation's business, and `test_gsocket_leg` holds it.
         b = _dns_beacon()
         b._registered = True
         b._consecutive_failures = 4
         with patch.object(beacon_mod, "_dns_query",
                           return_value=[_plaintext_b64().decode()]), \
-                patch.object(b, "_register_https") as register:
+                patch.object(b, "_register_upstream") as register:
             executed = _one_checkin(b)
         self.assertEqual(executed, [])
         self.assertEqual(b._consecutive_failures, 5)

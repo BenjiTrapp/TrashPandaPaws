@@ -881,6 +881,196 @@ class TestAFullCycle(LegFixture):
         self.assertEqual(server_mod.agents[agent]["last_channel"], "http")
 
 
+class TestRegisteringOverTheFirstUpstreamLeg(LegFixture):
+    """Registration is a property of the chain, not of HTTPS.
+
+    The registration preamble used to be gated on `https_enabled`, which
+    was true enough while HTTPS was the only leg that carried an
+    `action=register` of its own. The configuration this feature exists
+    for is the one where it is *off*: four legs blocked, gsocket the only
+    way out. An implant like that never registered, never appeared in the
+    fleet, and looked healthy from every other angle.
+
+    Four properties are held here, and the third is the one that is easy
+    to get wrong.
+
+    **Every upstream leg can register**, in chain order, and `dns` is not
+    one of them: it is receive-only, so a registration sent over it could
+    never be followed by a result.
+
+    **A registration adopts the id the server assigned.** `_agent_id` was
+    set in `_register_https` and nowhere else, while the SMB, QUIC and
+    gsocket rungs promoted `_registered` on their own -- so an implant
+    that registered over any leg but HTTPS filed its results under its
+    *implant* id. The server's `history` is keyed by the agent name, so
+    that work never appeared against the agent at all.
+
+    **Registration does not start the carrier.** The latch is the
+    operator's decision: a healthy implant holds no GSRN connection, so
+    nothing may bring `gs-netcat` up before the chain has been tried. For
+    a gsocket-only implant that means its carrier is not a candidate at
+    beacon start -- the preamble finds nothing to try, skips, and the leg
+    registers from inside the loop on the cycle after the latch started
+    the child.
+
+    **A leg that is not configured is never blamed.** The re-registration
+    every fifth failed cycle is on the same generalisation, because an
+    `https` failure in the rescue record of an implant with no HTTPS leg
+    describes a callback URL the operator never set.
+    """
+
+    def test_a_gsocket_only_beacon_registers(self):
+        # https, dns, smb and quic all disabled: the case the whole
+        # feature exists for. The agent must appear in the fleet, under
+        # the name the server assigned -- and the beacon must then file
+        # its work under that name, because registering without adopting
+        # the id is half a registration.
+        server = self.team_server()
+        beacon = self.a_beacon(gsocket={"binary_path":
+                                        self.forwarder(server.port)},
+                               key=server.key)
+
+        # Cycle one brings the carrier up; cycle two registers through it.
+        self.run_cycles(beacon, 2)
+
+        agent = server.agent_of(beacon._implant_id)
+        self.assertIsNotNone(agent, "the beacon never reached the fleet")
+        self.assertTrue(beacon._registered)
+        self.assertEqual(beacon._agent_id, agent,
+                         "registered without adopting the assigned id")
+
+        # And the consequence of that id, which is the part an operator
+        # sees: a result filed under the implant id misses `history`,
+        # which `_handle_result` keys by the agent name. Queued the way
+        # `api_create_task` does it, including the history entry it
+        # writes beside the task.
+        server_mod.task_queues.setdefault(agent, []).append(
+            {"id": "task-upstream-1", "cmd": "pwd", "args": "",
+             "status": "queued"})
+        server_mod.history.setdefault(agent, []).append(
+            {"task_id": "task-upstream-1", "cmd": "pwd", "status": "queued"})
+        self.run_cycles(beacon, 1)
+
+        result = server_mod.results.get("task-upstream-1")
+        self.assertIsNotNone(result, "no result came back over the forward")
+        self.assertEqual(result["agent_id"], agent,
+                         "the result was filed under the implant id")
+        entry = [record for record in server_mod.history[agent]
+                 if record.get("task_id") == "task-upstream-1"]
+        self.assertEqual([record["status"] for record in entry], ["ok"],
+                         "the agent's history never learned the task ran")
+
+    def test_the_preamble_is_skipped_when_no_upstream_leg_is_enabled(self):
+        # Nothing here carries a registration: the four upstream legs are
+        # off and `dns` is receive-only. The preamble must not run at all
+        # -- a generalisation that walked an empty chain would spend its
+        # ten attempts and ten backoff sleeps before the first cycle, and
+        # then warn about a registration nothing could have attempted.
+        beacon = self.a_beacon(gsocket={"enabled": False})
+
+        self.assertEqual(beacon._registration_legs(), [])
+        with mock.patch.object(beacon_mod.logger, "warning") as warned:
+            self.run_cycles(beacon, 1)
+
+        self.assertFalse(beacon._registered)
+        self.assertEqual(warned.call_args_list, [],
+                         "a skipped preamble warned about registration")
+        # One cycle ran and counted its one failure, which is only
+        # possible if the preamble spent none of the mocked sleeps.
+        self.assertEqual(beacon._consecutive_failures, 1)
+
+    def test_registration_does_not_start_the_carrier(self):
+        # The lazy half of the latch, from registration's side. An
+        # implant whose only leg is gsocket has nothing to register over
+        # at beacon start, and that is the correct answer rather than a
+        # gap: starting the carrier here would hold a GSRN connection for
+        # the life of every healthy implant, which is the thing the
+        # operator decided against.
+        beacon = self.a_beacon()
+
+        self.assertEqual(beacon._registration_legs(), [])
+        self.assertFalse(beacon._register_upstream())
+
+        self.assertIsNone(beacon._gsocket_proc)
+        self.assertFalse(os.path.exists(self.argv_file),
+                         "registration spawned a gs-netcat of its own")
+
+    def test_the_upstream_legs_are_walked_in_chain_order(self):
+        # Four properties in one story, because they are one state.
+        #
+        # Before the latch has run there is nothing to register over,
+        # which is the test above. After it the carrier is warm and its
+        # leg is a candidate -- that is what makes a re-registration over
+        # gsocket possible on a later cycle. When the other three legs
+        # come back the order is the chain's and comes from one place.
+        # And `dns` is in none of them, for the reason
+        # `_RESCUE_UPSTREAM` excludes it: it carries nothing out, so a
+        # registration over it could never be followed by a result.
+        beacon = self.a_beacon()
+        self.assertEqual(beacon._registration_legs(), [])
+
+        self.run_cycles(beacon, 1)
+
+        self.assertIsNotNone(beacon._gsocket_proc)
+        self.assertTrue(_accepts(beacon.gsocket_local_port),
+                        "the forward never came up")
+        self.assertEqual(beacon._registration_legs(), ["gsocket"])
+
+        # The outage ends, as in `test_the_carrier_stays_up_once_started`:
+        # flipped rather than reconfigured, because what is under test is
+        # the order of a list and not the reading of a config block.
+        beacon.https_enabled = True
+        beacon.smb_enabled = True
+        beacon.quic_enabled = True
+        beacon.dns_enabled = True
+
+        self.assertEqual(beacon._registration_legs(),
+                         list(beacon_mod._RESCUE_UPSTREAM))
+        self.assertNotIn("dns", beacon._registration_legs())
+
+    def test_the_ten_attempt_ceiling_is_still_the_ceiling(self):
+        # Ten attempts, one walk of the chain each, and then the loop
+        # proceeds unregistered rather than holding an implant on a
+        # server that is not there for ever. The HTTPS leg here is
+        # configured and dead, so the attempts are real ones.
+        beacon = self.a_beacon(
+            gsocket={"enabled": False},
+            https={"enabled": True,
+                   "callback_url": "http://127.0.0.1:%d/api/v1/beacon"
+                                   % _free_port()})
+
+        with self.assertLogs("raccoon.c2", level="WARNING") as caught:
+            self.run_cycles(beacon, 11)
+
+        self.assertFalse(beacon._registered)
+        # Eleven sleeps were on offer and the preamble took ten: the
+        # eleventh belongs to the first cycle, which counted its own one
+        # failure. Without the ceiling the preamble would have spent that
+        # sleep too, no cycle would have run, and the reset below it
+        # would have left this at zero.
+        self.assertEqual(beacon._consecutive_failures, 1)
+        self.assertTrue(any("proceeding unregistered" in line
+                            for line in caught.output), caught.output)
+
+    def test_a_beacon_with_no_https_leg_files_no_https_failure(self):
+        # Every fifth failed cycle re-registers. That used to call
+        # `_register_https` whatever the configuration, so a beacon whose
+        # only leg is gsocket posted to an empty callback URL and filed an
+        # `https` failure into its own rescue record -- a diagnostic about
+        # a leg the operator never configured, sitting beside the real
+        # reason. The forward here is up and leads nowhere, which is a
+        # real `gs-netcat` whose peer is not there.
+        beacon = self.a_beacon(gsocket={"binary_path":
+                                        self.forwarder(_free_port())})
+
+        self.run_cycles(beacon, 5)
+
+        self.assertEqual(beacon._consecutive_failures, 5,
+                         "the fifth failed cycle was never reached")
+        self.assertIn("gsocket", beacon._leg_status)
+        self.assertNotIn("https", beacon._leg_status)
+
+
 class TestTheServersWords(unittest.TestCase):
     """The two classes only this leg can emit have words on the server."""
 
