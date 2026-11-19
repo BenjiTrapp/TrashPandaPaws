@@ -9,11 +9,17 @@ What these tests are careful about.
 needed the GSRN would be a suite that sends traffic to a third-party
 relay from whatever machine runs it, which is the one thing this feature's
 constraints say carries OPSEC meaning. So every process these tests spawn
-is `software/tests/data/fake_gs_netcat.sh`, a stand-in that parses `-p`,
-listens on that loopback port until it is killed, and records the argv
-and the environment it was handed. The recording is what makes the two
-properties below testable against a real spawn rather than against the
-argv builder alone.
+is `software/tests/data/fake_gs_netcat.sh`, a stand-in that stays up
+until it is killed and records the argv, the environment and the pid it
+was given. It follows the same asymmetry the module documents: in the
+server shape (`-l`) it binds nothing, because that `-p` is a destination
+port, and only in the implant's client shape (`-w`) does `-p` become a
+listening socket. Two tests below pin that, since a stand-in which bound
+the server shape's `-p` would have several carriers forwarding into one
+beacon socket fight over it -- the normal deployment, and a failure that
+would read as a supervisor thrashing on its own. The recording is what
+makes the two properties below testable against a real spawn rather than
+against the argv builder alone.
 
 **The secret is never on a command line.** `gs-netcat` accepts
 `-s <secret>` and its own documentation warns against it, because `ps` is
@@ -412,6 +418,55 @@ class TestLifecycle(CarrierFixture):
         with self.assertRaises(CarrierError) as caught:
             carrier.start()
         self.assertIn("already running", str(caught.exception))
+        self.assertTrue(carrier.is_running())
+
+    def test_two_server_shape_fakes_share_one_beacon_port(self):
+        # The Task 5 scenario, and the reason the stand-in must not bind
+        # the server shape's `-p`: the realistic supervisor config is
+        # several carriers all forwarding into one beacon socket,
+        # `127.0.0.1:8443`, which is this fixture's default. A stand-in
+        # that bound `-p` would have them fight over that port, and the
+        # loser's non-zero exit would read as a supervisor thrashing for
+        # reasons of its own.
+        first = self.carrier()
+        second = self.carrier(name="raccoon-02-carrier")
+        self.assertEqual(first.spec.beacon_port, second.spec.beacon_port)
+        first.start()
+        second.start()
+        # Long enough that a stand-in which tried to bind would have
+        # failed and exited: the loser's bind error arrives as soon as
+        # the interpreter is up.
+        time.sleep(1.5)
+        for carrier in (first, second):
+            self.assertTrue(
+                carrier.is_running(),
+                "%s died while sharing beacon port %d: %s"
+                % (carrier.spec.name, carrier.spec.beacon_port,
+                   carrier.status()["detail"]))
+        self.assertNotEqual(first.status()["pid"], second.status()["pid"])
+
+    def test_the_server_shape_binds_nothing_of_its_own(self):
+        # Stated directly, because it is the property `carrier.py`'s own
+        # note above `argv()` claims: on this side `-p` is a destination
+        # port and binds nothing, and only the implant's `-p` opens a
+        # listening socket. The port is therefore still ours to take
+        # while the carrier is up.
+        port = _free_port()
+        carrier = self.carrier(beacon_port=port)
+        carrier.start()
+        self.recorded_pid()     # the child is up and past its argument parse
+        time.sleep(0.3)         # and past the bind it must not have done
+        taker = socket.socket()
+        taker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            taker.bind(("127.0.0.1", port))
+            taker.listen(1)
+        except OSError as exc:
+            self.fail("the server-shape stand-in bound beacon port %d, which "
+                      "a real `gs-netcat -l -d host -p port` does not: %s"
+                      % (port, exc))
+        finally:
+            taker.close()
         self.assertTrue(carrier.is_running())
 
     def test_status_reports_the_exit_code_of_a_process_that_died(self):

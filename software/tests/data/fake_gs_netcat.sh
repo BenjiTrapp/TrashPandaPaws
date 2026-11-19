@@ -4,15 +4,28 @@
 # The anti-goal is a test suite that needs the Global Socket Relay
 # Network: that would send traffic to a third-party relay from whatever
 # machine runs the suite, which is the one thing this feature's
-# constraints say carries OPSEC meaning. So this script does the two
+# constraints say carries OPSEC meaning. So this script does the three
 # things the carrier can observe about a real `gs-netcat` and nothing
 # else:
 #
-#   * with `-p <port>` and no `-t`, it binds that loopback port and
-#     stays up until it is killed, so `is_running()` and `stop()` have a
-#     live process to be right or wrong about;
+#   * in the **server** shape (`-l -d <host> -p <port>`) it stays up
+#     until it is killed and **binds nothing**, because that `-p` is a
+#     destination port on this machine rather than a port to listen on.
+#     See the note above `GsocketCarrier.argv` in
+#     `software/c2/gsocket/carrier.py`, which is the model this has to
+#     agree with. It matters beyond tidiness: the realistic deployment
+#     is several carriers all pointed at one beacon socket,
+#     `127.0.0.1:8443`, so a stand-in that bound `-p` would have them
+#     fight over that port and the loser's non-zero exit would read as a
+#     supervisor thrashing for reasons of its own;
+#   * in the **client** shape (`-w -p <port>`, the implant's side) it
+#     binds that loopback port and stays up, because there `-p` really
+#     is a local forward;
 #   * with `-t`, it exits immediately with $FAKE_GS_NETCAT_PROBE_EXIT
-#     (default 0), which is how the probe's two answers are staged.
+#     (default 0), which is how the probe's answers are staged.
+#
+# Either long-lived shape gives `is_running()` and `stop()` a live
+# process to be right or wrong about.
 #
 # It records its argv and its environment when asked, because the two
 # properties the carrier must hold -- the secret never on a command
@@ -51,6 +64,7 @@ fi
 
 port=""
 probe=""
+server=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -p)
@@ -62,6 +76,12 @@ while [ $# -gt 0 ]; do
             ;;
         -t)
             probe="yes"
+            shift
+            ;;
+        -l)
+            # The server shape. What follows from it is *not* binding
+            # `-p`; see the header.
+            server="yes"
             shift
             ;;
         *)
@@ -83,11 +103,27 @@ while True:
     exit "${FAKE_GS_NETCAT_PROBE_EXIT:-0}"
 fi
 
+# Required in both long-lived shapes, because both argv the carrier
+# builds carry it: an argv without `-p` is a bug in the carrier and
+# should fail loudly rather than produce a process that looks healthy.
 if [ -z "$port" ]; then
     echo "fake_gs_netcat.sh: no -p <port> in: $*" >&2
     exit 64
 fi
 
+if [ -n "$server" ]; then
+    # The server shape: stay up, bind nothing. A real `gs-netcat -l`
+    # listens on the relay network, which this stand-in cannot and must
+    # not do, and connects what arrives to `-d`/`-p` -- so the only
+    # locally observable thing it does is exist. `exec` for the same
+    # reason as above: one process, and the pid recorded above stays
+    # correct.
+    exec python3 -c 'import time
+while True:
+    time.sleep(3600)'
+fi
+
+# The client shape: `-p` is the implant's local forward, so bind it.
 # Bind before going quiet, and let the failure out on stderr: a
 # stand-in that silently did not listen would make a test asserting the
 # forward is up pass for the wrong reason.
