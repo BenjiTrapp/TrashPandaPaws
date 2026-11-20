@@ -3438,7 +3438,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """Fifty-two tests hide behind `skipUnless(node)`.
+        """Fifty-three tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3446,7 +3446,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of fifty-two quiet skips.
+        One loud failure instead of fifty-three quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3464,9 +3464,10 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # total still looked plausible, and later a single named safety
         # test deleted while the total *rose* from 231 to 246. So the floor
         # sits close to the real count -- 48 against 50 when it was set,
-        # carried with the controller's nod --
+        # carried with the controller's nod, and 51 against 53 once the
+        # harness's DOM brought two tests of its own --
         self.assertGreaterEqual(
-            len(names), 48,
+            len(names), 51,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -3555,6 +3556,97 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(got["kids"], 1)
         self.assertEqual(got["box"], [820, 600])
         self.assertTrue(got["found"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_harness_dom_answers_when_a_node_is_changed_or_taken_apart(self):
+        """The other half of the harness's promise.
+
+        The test before this one covers what a node does when it is built:
+        a class added, a style set, a child appended, a box measured. This
+        one covers what it does when it is changed or taken apart -- a class
+        removed or toggled back, a node removed, a node moved to another
+        host, a selector that has to find the right thing and not just
+        something -- and that a faked box is spent on one node and not
+        inherited by the next. Between them every stub the harness's DOM
+        has is exercised in a way that fails if the stub does nothing, so
+        that a later task's test never has to be the one that finds out.
+        """
+        got = self._node(
+            "const a = el('a'), b = el('b');\n"
+            "const n = document.createElement('div');\n"
+            "n.classList.add('x'); n.classList.add('y');\n"
+            "n.classList.remove('x');\n"
+            "const t1 = n.classList.toggle('z');\n"
+            "const afterOne = n.classList.contains('z');\n"
+            "const t2 = n.classList.toggle('z');\n"
+            "const afterTwo = n.classList.contains('z');\n"
+            "const f1 = n.classList.toggle('f', true);\n"
+            "const f2 = n.classList.toggle('f', true);\n"
+            "const f3 = n.classList.toggle('f', false);\n"
+            "const other = document.createElement('div');\n"
+            "other.style.display = 'none';\n"
+            "n.style.display = 'block';\n"
+            "n.innerHTML = 'one'; n.innerHTML = 'two';\n"
+            "const mover = document.createElement('i');\n"
+            "a.appendChild(mover); b.appendChild(mover);\n"
+            "const reparented = [a.children.length, b.children.length,"
+            " mover.parent === b];\n"
+            "const gone = el('gone'); a.appendChild(gone);\n"
+            "const before = a.children.length; gone.remove();\n"
+            "const afterRemove = [before, a.children.length,"
+            " gone.parent === null, removed.includes('gone')];\n"
+            "document.body.appendChild(other);\n"
+            "const registered = Object.keys(els).sort();\n"
+            "const sidebar = el('sidebar');\n"
+            "const carrier = el('carrier'); carrier.classList.add('content');\n"
+            "fakeBox(820, 600);\n"
+            "const first = document.createElement('span');\n"
+            "const r1 = first.getBoundingClientRect();\n"
+            "const second = document.createElement('span');\n"
+            "const r2 = second.getBoundingClientRect();\n"
+            "fakeBox(5, 6);\n"
+            "const viaEl = el('measured').getBoundingClientRect();\n"
+            "const after = el('unmeasured').getBoundingClientRect();\n"
+            "second.box = {width: 3, height: 4};\n"
+            "const r3 = second.getBoundingClientRect();\n"
+            "console.log(JSON.stringify({\n"
+            " cls: [n.classList.contains('x'), n.classList.contains('y')],\n"
+            " toggled: [t1, afterOne, t2, afterTwo, f1, f2, f3,"
+            " n.classList.contains('f')],\n"
+            " styles: [n.style.display, other.style.display],\n"
+            " writes: n.htmlWrites, html: n.innerHTML,\n"
+            " reparented, afterRemove,\n"
+            " body: document.body.children.length,\n"
+            " byId: document.querySelector('#a') === a,\n"
+            " byName: document.querySelector('.sidebar') === sidebar,\n"
+            " byClass: document.querySelector('.content') === carrier,\n"
+            " missing: [document.querySelector('.nothing') === null,"
+            " document.querySelector('#nothing') === null],\n"
+            " registered: registered,\n"
+            " first: [r1.width, r1.height], second: [r2.width, r2.height],\n"
+            " viaEl: [viaEl.width, viaEl.height],\n"
+            " after: [after.width, after.height], set: [r3.width, r3.height]}));")
+        self.assertEqual(got["cls"], [False, True])
+        self.assertEqual(got["toggled"],
+                         [True, True, False, False, True, True, False, False])
+        self.assertEqual(got["styles"], ["block", "none"])
+        self.assertEqual(got["writes"], ["one", "two"])
+        self.assertEqual(got["html"], "two")
+        self.assertEqual(got["reparented"], [0, 1, True])
+        self.assertEqual(got["afterRemove"], [1, 0, True, True])
+        self.assertEqual(got["body"], 1)
+        self.assertTrue(got["byId"])
+        self.assertTrue(got["byName"])
+        self.assertTrue(got["byClass"])
+        self.assertEqual(got["missing"], [True, True])
+        # createElement makes nodes that belong to nobody's registry: only
+        # the three the script asked `el` for are in it.
+        self.assertEqual(got["registered"], ["a", "b", "gone"])
+        self.assertEqual(got["first"], [820, 600])
+        self.assertEqual(got["second"], [0, 0])
+        self.assertEqual(got["viaEl"], [5, 6])
+        self.assertEqual(got["after"], [0, 0])
+        self.assertEqual(got["set"], [3, 4])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_closing_the_view_closes_the_session(self):
