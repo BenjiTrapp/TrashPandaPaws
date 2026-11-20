@@ -2025,15 +2025,14 @@ class TestARefusedShellSession(_ShellChoice, TunnelEndpointTestCase):
     def test_the_operator_is_told_the_login_shell_changed_under_them(self):
         """`chsh` between the HELLO and the session, which is the whole
         reason the reported guard is checked again here. The sentence has
-        to name the shell, say that it changed since the tunnel connected,
-        and say that reconnecting reports the new one -- the operator is
-        looking at a panel that is now out of date and nothing else will
-        tell them."""
+        to say that it changed since the tunnel connected, show both
+        answers, and say that reconnecting reports the new one -- the
+        operator is looking at a panel that is now out of date and nothing
+        else will tell them."""
         _, reported, refusals, _ = self._serve_after_the_login_shell_changed(
             "/bin/bash", "/bin/zsh")
         self.assertEqual(reported, "off")
         self.assertEqual(len(refusals), 1)
-        self.assertRegex(refusals[0], r"(?i)login shell")
         self.assertRegex(refusals[0], r"(?i)histor")
         self.assertRegex(refusals[0], r"(?i)reconnect")
         self.assertRegex(refusals[0], r"(?i)since the tunnel connected")
@@ -2050,7 +2049,8 @@ class TestARefusedShellSession(_ShellChoice, TunnelEndpointTestCase):
             "/bin/zsh", "/bin/bash")
         self.assertEqual(reported, "weak")
         self.assertEqual(len(refusals), 1)
-        self.assertRegex(refusals[0], r"(?i)login shell")
+        self.assertIn("'weak' (/bin/zsh is not bash", refusals[0])
+        self.assertIn("'off'", refusals[0])
 
     def test_a_login_shell_that_changed_between_two_weak_ones_is_refused(self):
         """The word is `weak` before and after, and the reason is what
@@ -2063,6 +2063,67 @@ class TestARefusedShellSession(_ShellChoice, TunnelEndpointTestCase):
         self.assertEqual(len(refusals), 1)
         self.assertIn("(/bin/zsh is not bash", refusals[0])
         self.assertIn("(/usr/local/bin/zsh is not bash", refusals[0])
+
+    def test_the_refusal_claims_no_cause_it_has_not_established(self):
+        """Only `/dev/fd` went, and the shell is the same bash. The pair
+        differs, so the session is refused, but a sentence that said the
+        login shell changed would be untrue of this host. What it may say
+        is what it knows: the two answers, which carry the cause."""
+        refusals = []
+        endpoint = TunnelEndpoint(self.config_for(1234))
+        self.addCleanup(endpoint.stop)
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(True):
+            endpoint._hello()
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(False), \
+                mock.patch.object(TunnelEndpoint, "_refuse_shell",
+                                  lambda self, sock, noise, reason:
+                                  refusals.append(reason)):
+            endpoint._serve_shell(None, None, 80, 24)
+        self.assertEqual(len(refusals), 1)
+        self.assertNotRegex(refusals[0], r"(?i)login shell")
+        self.assertNotRegex(refusals[0], r"is not bash")
+        self.assertIn(beacon_mod._DEV_FD, refusals[0])
+        self.assertRegex(refusals[0], r"(?i)reconnect")
+
+    def test_reconnecting_after_a_refusal_reports_the_new_shell(self):
+        """The refusal promises it: reconnect, and the tunnel reports what
+        the host does now. Held here as a sequence -- HELLO on one shell,
+        a refused session on another, the HELLO again on the new one, and
+        then a session that starts -- because an endpoint that remembered
+        only its first answer would make the refusal permanent, and every
+        other test here passes one HELLO."""
+        refusals = []
+        bridged = []
+        endpoint = TunnelEndpoint(self.config_for(1234))
+        self.addCleanup(endpoint.stop)
+
+        def session():
+            with self._passwd("/bin/bash"), \
+                    self._executable({"/bin/bash"}), self._dev_fd(True), \
+                    mock.patch.object(TunnelEndpoint, "_refuse_shell",
+                                      lambda self, sock, noise, reason:
+                                      refusals.append(reason)), \
+                    mock.patch.object(TunnelEndpoint, "_shell_bridge",
+                                      lambda self, sock, noise, master,
+                                      select_mod: bridged.append(master)):
+                endpoint._serve_shell(None, None, 80, 24)
+
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
+                self._dev_fd(True):
+            self.assertEqual(endpoint._hello()["history"], "weak")
+        session()
+        self.assertEqual((len(refusals), len(bridged)), (1, 0))
+
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(True):
+            self.assertEqual(endpoint._hello()["history"], "off")
+        session()
+        self.assertEqual((len(refusals), len(bridged)), (1, 1),
+                         "a session after the reconnect was refused: %r"
+                         % refusals)
+        self.assertEqual(endpoint._shells, 0)
 
     def test_a_session_refused_for_a_changed_shell_leaves_nothing_taken(self):
         """As for the pipe: no slot held and no descriptor open. A
@@ -2649,7 +2710,8 @@ class TestAShellSession(TunnelEndpointTestCase):
         # bash is what this test means; a host that lost it mid-tunnel is
         # `TestARefusedShellSession`'s business.
         self.patched("_shell_executable", lambda path: False)
-        server, channel = self.an_endpoint_that_connected_under_this_tests_patches()
+        server, channel = \
+            self.an_endpoint_that_connected_under_this_tests_patches()
         stream = self.ask_for_a_shell(server=server, channel=channel)
 
         data = self.run_in_the_shell(

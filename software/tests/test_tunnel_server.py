@@ -414,8 +414,8 @@ class TestRegistration(TunnelServerTestCase):
         self.assertIsNone(self.row(server, "build-alpha")["user"])
 
     def test_the_row_carries_the_history_guard_from_the_hello(self):
-        row = self._row_after_hello(history="weak",
-                                    history_detail="/bin/zsh takes no --rcfile")
+        row = self._row_after_hello(
+            history="weak", history_detail="/bin/zsh takes no --rcfile")
         self.assertEqual(row["history"], "weak")
         self.assertIn("zsh", row["history_detail"])
 
@@ -432,6 +432,15 @@ class TestRegistration(TunnelServerTestCase):
             row = self._row_after_hello(history=sent)
             self.assertEqual(row["history"], "weak", repr(sent))
 
+    def test_a_reason_that_is_not_a_string_is_not_carried(self):
+        """The reason goes out in the row and on to a page, so it is read
+        as text or not at all: a number, a list or a dict from the far end
+        would otherwise reach the page as itself."""
+        for sent in (5, ["x"], {}, {"a": [1]}, True):
+            row = self._row_after_hello(history="weak", history_detail=sent)
+            self.assertEqual((row["history"], row["history_detail"]),
+                             ("weak", ""), repr(sent))
+
     def test_an_endpoint_from_an_older_build_reports_no_guard(self):
         row = self._row_after_hello()  # no history keyword at all
         self.assertEqual(row["history"], "weak")
@@ -442,8 +451,8 @@ class TestRegistration(TunnelServerTestCase):
         a reason why it is not is a sentence that cannot be rendered
         truthfully. The word is validated, so a reason arriving with it
         is from something this server does not know the shape of."""
-        row = self._row_after_hello(history="off",
-                                    history_detail="/bin/zsh takes no --rcfile")
+        row = self._row_after_hello(
+            history="off", history_detail="/bin/zsh takes no --rcfile")
         self.assertEqual((row["history"], row["history_detail"]), ("off", ""))
 
     def test_a_disconnected_row_reports_no_guard_at_all(self):

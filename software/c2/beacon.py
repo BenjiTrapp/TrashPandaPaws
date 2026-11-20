@@ -3414,7 +3414,7 @@ class _HistoryGuardChanged(Exception):
     So the guard is remembered and checked again where a session is built,
     and this is what a disagreement raises rather than running the session
     under a claim nobody has rechecked. `_serve_shell` turns it into a
-    refusal naming the shell.
+    refusal that shows both answers.
 
     Not `_HistoryPipeError` and not an `OSError`: nothing here failed, and
     that one's refusal reads an errno off the error to decide what to
@@ -3427,7 +3427,7 @@ class _HistoryGuardChanged(Exception):
             self, "reported %r when the tunnel connected and would be %r "
                   "now" % (reported, now))
         self.reported = reported
-        self.guard, self.detail = now
+        self.now = now
 
 
 def _guard_of(program: str) -> Tuple[str, str]:
@@ -3988,10 +3988,12 @@ class TunnelEndpoint(object):
                 "history_detail": weaker,
                 "crypto": self._crypto_path(),
                 "features": list(TUNNEL_FEATURES)}
-        with self._lock:
-            self._reported_history = (guard, weaker)
         if self.implant_id:
             body["implant_id"] = self.implant_id
+        # Last, so that what is remembered is what is about to be sent and
+        # nothing after this line can make the two differ.
+        with self._lock:
+            self._reported_history = (guard, weaker)
         return body
 
     def _control_loop(self, channel: _TunnelChannel) -> None:
@@ -4518,17 +4520,17 @@ class TunnelEndpoint(object):
                 # operator, and a session that quietly contradicts it is
                 # the whole reason that answer is reported at all.
                 was, why_was = exc.reported
+                now, why_now = exc.now
                 self._refuse_shell(
                     sock, noise,
-                    "no session was started, because the login shell on "
-                    "this host has changed since the tunnel connected, and "
-                    "what the interface shows about command history is "
-                    "out of date. It was told history is %r%s; a session "
-                    "now would have it %r%s. Reconnect the tunnel and it "
-                    "will report the login shell the host has now."
+                    "no session was started, because what a session here "
+                    "would do about command history has changed since the "
+                    "tunnel connected, and what the interface shows about "
+                    "it is out of date. It was told history is %r%s; a "
+                    "session now would have it %r%s. Reconnect the tunnel "
+                    "and it will report what the host does now."
                     % (was, " (%s)" % why_was if why_was else "",
-                       exc.guard,
-                       " (%s)" % exc.detail if exc.detail else ""))
+                       now, " (%s)" % why_now if why_now else ""))
                 return
             except _HistoryPipeError as exc:
                 # Only this one: see `_shell_invocation`. Any other

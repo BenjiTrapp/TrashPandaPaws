@@ -1495,7 +1495,7 @@ def _features(value) -> Tuple[str, ...]:
 
 
 def _history(value, detail) -> Tuple[str, str]:
-    """A `HELLO`'s history guard and its reason: `("off", "")` or `("weak", why)`.
+    """A `HELLO`'s history guard and reason: `("off", "")`, `("weak", why)`.
 
     Two words and no third. `"off"` says that a session on that endpoint
     cannot write the operator's commands to a history file, and an
