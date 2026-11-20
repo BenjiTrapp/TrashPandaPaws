@@ -3305,16 +3305,73 @@ async function fetch(url, opts){
           }};
 }
 
+// A node that does what a browser's does, so that a view which toggles a
+// class, sets a style, appends a card or measures a probe is observable.
+// Every method here acts and is exercised by
+// `test_the_harness_dom_answers_like_a_browser`: a stub that returned
+// undefined is the shape of the two lies this harness has already told.
+let nextBox = null;
+function fakeBox(w, h){ nextBox = {width: w, height: h}; }
+function makeNode(id){
+  const classes = new Set();
+  let html = '';
+  const node = {
+    id, value: '', style: {}, children: [], parent: null, htmlWrites: [],
+    box: nextBox || {width: 0, height: 0},
+    classList: {
+      add(...names){ names.forEach(c => classes.add(c)); },
+      remove(...names){ names.forEach(c => classes.delete(c)); },
+      contains: c => classes.has(c),
+      toggle(c, force){
+        const on = force === undefined ? !classes.has(c) : !!force;
+        if(on) classes.add(c); else classes.delete(c);
+        return on;
+      },
+    },
+    get innerHTML(){ return html; },
+    set innerHTML(v){ html = String(v); node.htmlWrites.push(html); },
+    appendChild(child){
+      if(child.parent) child.parent.children.splice(
+        child.parent.children.indexOf(child), 1);
+      child.parent = node;
+      node.children.push(child);
+      return child;
+    },
+    remove(){
+      removed.push(id);
+      if(node.parent){
+        node.parent.children.splice(node.parent.children.indexOf(node), 1);
+        node.parent = null;
+      }
+    },
+    getBoundingClientRect(){
+      const b = node.box;
+      return {width: b.width, height: b.height, top: 0, left: 0,
+              right: b.width, bottom: b.height};
+    },
+  };
+  nextBox = null;
+  return node;
+}
+
+// `els` stays the one registry of nodes, and `el(id)` the one way into it:
+// the tests that set `els['opshell-body']` by hand and read `.innerHTML`
+// back depend on both.
 const els = {};
 function el(id){
-  return els[id] || (els[id] = {id, innerHTML: '', value: '',
-                               remove(){ removed.push(id); }});
+  return els[id] || (els[id] = makeNode(id));
+}
+function queried(sel){
+  if(sel[0] === '#') return els[sel.slice(1)] || null;
+  const name = sel[0] === '.' ? sel.slice(1) : sel;
+  if(els[name]) return els[name];
+  return Object.values(els).find(n => n.classList.contains(name)) || null;
 }
 const document = {
   getElementById: id => els[id] || null,
-  createElement: () => ({classList: {}, appendChild(){},
-                         set innerHTML(v){}, get innerHTML(){ return ''; }}),
-  body: {appendChild(){}},
+  querySelector: queried,
+  createElement: () => makeNode(null),
+  body: makeNode('body'),
 };
 const window = {listeners: {}, addEventListener(name, fn){
   (this.listeners[name] = this.listeners[name] || []).push(fn); }};
@@ -3381,7 +3438,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """Fifty tests hide behind `skipUnless(node)`.
+        """Fifty-two tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3389,7 +3446,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of fifty quiet skips.
+        One loud failure instead of fifty-two quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3468,6 +3525,36 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(out.returncode, 0,
                          "node failed:\n" + out.stderr[-1500:])
         return json.loads(out.stdout.strip().splitlines()[-1])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_harness_dom_answers_like_a_browser(self):
+        """The harness has lied twice, in the same way both times.
+
+        Its `fetch` could not reject and its `abort()` only recorded a
+        string, and six mutations survived because of it. Every stub this
+        task adds is therefore exercised here, so that a stub which
+        quietly does nothing fails this test rather than a later one.
+        """
+        got = self._node(
+            "const n = document.createElement('div');\n"
+            "n.classList.add('a'); n.classList.toggle('b');\n"
+            "n.style.display = 'none';\n"
+            "n.innerHTML = '<p>x</p>';\n"
+            "const host = el('host'); host.appendChild(n);\n"
+            "fakeBox(820, 600);\n"
+            "const probe = document.createElement('span');\n"
+            "const box = probe.getBoundingClientRect();\n"
+            "console.log(JSON.stringify({cls: [n.classList.contains('a'),"
+            " n.classList.contains('b'), n.classList.contains('c')],"
+            " style: n.style.display, html: n.innerHTML,"
+            " kids: host.children.length, box: [box.width, box.height],"
+            " found: document.querySelector('#host') === host}));")
+        self.assertEqual(got["cls"], [True, True, False])
+        self.assertEqual(got["style"], "none")
+        self.assertEqual(got["html"], "<p>x</p>")
+        self.assertEqual(got["kids"], 1)
+        self.assertEqual(got["box"], [820, 600])
+        self.assertTrue(got["found"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_closing_the_view_closes_the_session(self):
