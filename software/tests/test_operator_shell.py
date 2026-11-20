@@ -3701,9 +3701,11 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # its cap, the hidden card's fallback, the probe's removal, the
         # pair that is sent and the host's box -- and 87 against 89 once the
         # attach said when it had not fitted the card, and said nothing when
-        # it had, and told a probe failure from a hidden card --
+        # it had, and told a probe failure from a hidden card -- and 89
+        # against 91 once the pair was pinned to the probe's own box by
+        # division rounded down, and the probe to the terminal's own font --
         self.assertGreaterEqual(
-            len(names), 87,
+            len(names), 89,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -3729,7 +3731,11 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
                      # The size is fixed for the life of the connection, so
                      # a measurement taken in a hidden card is wrong for the
                      # whole session and nothing can correct it.
-                     "test_a_host_inside_a_hidden_card_falls_back_rather_than_guessing"):
+                     "test_a_host_inside_a_hidden_card_falls_back_rather_than_guessing",
+                     # Without the stylesheet's box the host is 0 tall when
+                     # measured, and every session in every browser is
+                     # floored at five rows while the rest stay green.
+                     "test_the_terminal_host_has_a_box_to_be_measured_in"):
             self.assertIn(must, names,
                           "%s named a property that cost this branch a "
                           "Critical. It may not be removed without another "
@@ -5955,10 +5961,10 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         got = self._node(
             "const small = el('opshell-term');\n"
             "small.box = {width: 800, height: 400};\n"
-            "fakeBox(8, 16);\n"
+            "fakeBox(256, 16);\n"
             "const a = opshellMeasure(small);\n"
             "small.box = {width: 1600, height: 800};\n"
-            "fakeBox(8, 16);\n"
+            "fakeBox(256, 16);\n"
             "const b = opshellMeasure(small);\n"
             "console.log(JSON.stringify({a, b}));")
         (ac, ar), (bc, br) = got["a"], got["b"]
@@ -5976,12 +5982,15 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         A 0 or a negative would be clamped server-side by
         `opshell._dimension` to 1, so the operator would get a one-column
         terminal and no explanation. The floor is on this side.
+
+        (0, 0) returns through the fallback, not through the floor, so only
+        (1, 1) and (120, 40) exercise what this docstring is about.
         """
         for w, h in ((120, 40), (1, 1), (0, 0)):
             got = self._node(
                 "const host = el('opshell-term');\n"
                 "host.box = {width: %d, height: %d};\n"
-                "fakeBox(8, 16);\n"
+                "fakeBox(256, 16);\n"
                 "console.log(JSON.stringify({pair: opshellMeasure(host)}));"
                 % (w, h))
             cols, rows = got["pair"]
@@ -5999,7 +6008,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         got = self._node(
             "const host = el('opshell-term');\n"
             "host.box = {width: 400000, height: 400000};\n"
-            "fakeBox(8, 16);\n"
+            "fakeBox(256, 16);\n"
             "console.log(JSON.stringify({pair: opshellMeasure(host)}));")
         self.assertEqual(got["pair"], [1000, 1000])
 
@@ -6015,7 +6024,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "els['opshell-card'].appendChild(host);\n"
             "host.box = {width: 1600, height: 800};\n"
             "els['opshell-card'].style.display = 'none';\n"
-            "fakeBox(8, 16);\n"
+            "fakeBox(256, 16);\n"
             "console.log(JSON.stringify({pair: opshellMeasure(host)}));")
         self.assertEqual(got["pair"], [120, 40],
                          "a hidden card was measured instead of falling back")
@@ -6028,7 +6037,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         got = self._node(
             "const host = el('opshell-term');\n"
             "host.box = {width: 800, height: 400};\n"
-            "fakeBox(8, 16);\n"
+            "fakeBox(256, 16);\n"
             "const before = document.body.children.length;\n"
             "opshellMeasure(host); opshellMeasure(host);\n"
             "console.log(JSON.stringify({before,"
@@ -6046,7 +6055,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "globalThis.Terminal = function(o){ globalThis.made = o;"
             " return fakeTerm(); };\n"
             "opshellSession = 'sid';\n"
-            "fakeBox(8, 16);\n"
+            "fakeBox(256, 16);\n"
             "nextReply = {ok:true, status:200, stream: fakeStream(['x'])};\n"
             "await opshellAttach({state:'live', host:'parrot'});\n"
             "const url = posted.find(p => p.url.includes('/stream')).url;\n"
@@ -6057,14 +6066,11 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertNotEqual([cols, rows], [120, 40],
                             "the measurement never replaced the old default")
 
-    @unittest.skipUnless(shutil.which("node"), "node is not installed")
-    def test_a_terminal_that_was_not_fitted_says_so_once_and_a_fitted_one_does_not(self):
-        """The size is fixed for the life of the connection, so an operator
-        who restores a card that was hidden at the attach sees a small
-        terminal in a wide box with no way to resize it and no way to know
-        why. Driven through `opshellAttach`, both ways: a note that always
-        fires is the same defect as one that never does."""
-        script = (
+    def _attach_lines(self, card_display, probe_box):
+        """What `opshellAttach` writes into the terminal, driven for real:
+        the host sits in a card with this `display`, and the probe the page
+        creates gets this box (None leaves it 0x0)."""
+        return self._node(
             "const card = el('opshell-card');\n"
             "const host = el('opshell-term');\n"
             "card.appendChild(host);\n"
@@ -6073,34 +6079,99 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "globalThis.Terminal = function(o){ globalThis.t = fakeTerm();"
             " return t; };\n"
             "opshellSession = 'sid';\n"
-            "fakeBox(8, 16);\n"
+            "%s\n"
             "nextReply = {ok:true, status:200, stream: fakeStream(['x'])};\n"
             "await opshellAttach({state:'live', host:'parrot'});\n"
-            "console.log(JSON.stringify({lines: t.lines}));")
-        hidden = self._node(script % "none")["lines"]
+            "console.log(JSON.stringify({lines: t.lines}));"
+            % (card_display, "fakeBox(%d, %d);" % probe_box
+               if probe_box else ""))["lines"]
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_terminal_that_was_not_fitted_says_so_once_and_a_fitted_one_does_not(self):
+        """The size is fixed for the life of the connection, so an operator
+        who restores a card that was hidden at the attach sees a small
+        terminal in a wide box with no way to resize it and no way to know
+        why. Driven through `opshellAttach`, both ways: a note that always
+        fires is the same defect as one that never does."""
+        hidden = self._attach_lines("none", (256, 16))
         notes = [l for l in hidden if "not fitted" in l]
         self.assertEqual(len(notes), 1, hidden)
-        self.assertIn("not visible", notes[0])
-        self.assertIn("120x40", notes[0])
-        self.assertIn("keeps", notes[0])
-        shown = self._node(script % "")["lines"]
+        self.assertIn("keeps that size", notes[0])
+        shown = self._attach_lines("", (256, 16))
         self.assertEqual([l for l in shown if "not fitted" in l], [], shown)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
-    def test_a_probe_that_measures_nothing_is_not_blamed_on_the_card(self):
+    def test_the_notice_names_a_cause_it_has_established_and_the_two_differ(self):
+        """A host with no box is a hidden card *or* a card on screen in a
+        window too short to give it room, so the note may not say the card
+        was not visible; and a probe that measured nothing is not the
+        card's doing at all. The property is that the two reasons differ
+        and neither claims the other's cause -- not a literal."""
+        nobox = [l for l in self._attach_lines("none", (256, 16))
+                 if "not fitted" in l]
+        noprobe = [l for l in self._attach_lines("", None)
+                   if "not fitted" in l]
+        self.assertEqual((len(nobox), len(noprobe)), (1, 1))
+        self.assertNotEqual(nobox[0], noprobe[0])
+        self.assertIn("no room", nobox[0])
+        self.assertNotIn("not visible", nobox[0],
+                         "a host with no room is not necessarily hidden")
+        self.assertNotIn("no room", noprobe[0],
+                         "a probe failure was blamed on the card")
+        self.assertNotIn("normal window", noprobe[0],
+                         "a probe failure was promised a cure it does not get")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_pair_comes_from_the_probe_by_division_rounded_down(self):
+        """Each of these is a one-token change that kept the suite green:
+        the axes swapped, the probe's box replaced by the harness's own
+        numbers, and `floor` made `ceil` -- which puts the last column and
+        the bottom row outside an `overflow:hidden` host. The probe is the
+        32-character run xterm measures, so a 256-wide box is an 8px cell."""
+        cases = (((800, 400), (256, 16), [100, 25]),
+                 # 101.25 columns and 25.6 rows: down, never up.
+                 ((810, 410), (256, 16), [101, 25]),
+                 # Another probe box is another pair: not the harness's 8x16.
+                 ((800, 400), (128, 16), [200, 25]))
+        for host, probe, want in cases:
+            got = self._node(
+                "const host = el('opshell-term');\n"
+                "host.box = {width: %d, height: %d};\n"
+                "fakeBox(%d, %d);\n"
+                "console.log(JSON.stringify({pair: opshellMeasure(host)}));"
+                % (host + probe))
+            self.assertEqual(got["pair"], want, (host, probe))
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_probe_is_made_the_way_the_terminal_is(self):
+        """Nothing else ties the two: a `fontSize: 13` in the `Terminal`
+        options, or a probe that lost its font, would measure the wrong cell
+        for every session and every test above would stay green. Read off
+        the nodes the real attach creates, not off the source text."""
         got = self._node(
-            "const host = el('opshell-term');\n"
-            "host.box = {width: 1600, height: 800};\n"
-            "globalThis.Terminal = function(o){ globalThis.t = fakeTerm();"
-            " return t; };\n"
+            "const made_nodes = [];\n"
+            "const _ce = document.createElement;\n"
+            "document.createElement = () => {"
+            " const n = _ce(); made_nodes.push(n); return n; };\n"
+            "els['opshell-term'] = el('opshell-term');\n"
+            "els['opshell-term'].box = {width: 1000, height: 500};\n"
+            "globalThis.Terminal = function(o){ globalThis.made = o;"
+            " return fakeTerm(); };\n"
             "opshellSession = 'sid';\n"
+            "fakeBox(256, 16);\n"
             "nextReply = {ok:true, status:200, stream: fakeStream(['x'])};\n"
             "await opshellAttach({state:'live', host:'parrot'});\n"
-            "console.log(JSON.stringify({lines: t.lines}));")
-        notes = [l for l in got["lines"] if "not fitted" in l]
-        self.assertEqual(len(notes), 1, got["lines"])
-        self.assertNotIn("not visible", notes[0],
-                         "a visible card was said to be hidden")
+            "console.log(JSON.stringify({style: made_nodes[0].style,"
+            " text: made_nodes[0].textContent, term: made}));")
+        style, term = got["style"], got["term"]
+        self.assertEqual(style.get("fontFamily"), term["fontFamily"])
+        self.assertEqual(style.get("fontSize"), "%dpx" % term["fontSize"])
+        # What xterm's own measurement element is: a run, in a box that
+        # keeps its spaces and takes the font's own line height.
+        self.assertEqual(style.get("display"), "inline-block")
+        self.assertEqual(style.get("whiteSpace"), "pre")
+        self.assertEqual(style.get("lineHeight"), "normal")
+        self.assertEqual(got["text"], "W" * 32)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_terminal_host_has_a_box_to_be_measured_in(self):
@@ -6109,7 +6180,15 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         as tall as nothing and `opshellMeasure` would answer the five-row
         floor for every session, in every browser, while every test above
         stayed green on a host the harness had given a box by hand. The
-        host has to be given its room by the stylesheet."""
+        host has to be given its room by the stylesheet.
+
+        The declarations are one mechanism and are asserted as one:
+        `display:flex` on the wrapper and `flex:1` on the body are what the
+        `min-height:100%` and the host's `flex:1` hang on, and deleting
+        either zeroes the host in a browser while the two that remain read
+        as a complete answer. `min-height` and not `height` on the wrapper,
+        and a floor on the host, so a short card scrolls the body instead of
+        clipping the terminal away."""
         got = self._node(
             "opshellSession = 'mine';\n"
             "console.log(JSON.stringify({html: opshellRender({state:'live',"
@@ -6118,12 +6197,21 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         wrapper = html.index('class="opshell-live"')
         self.assertLess(wrapper, html.index('id="opshell-term"'),
                         "the host is outside the box that gives it a height")
-        live = " ".join(self.css_rules("opshell-live"))
-        self.assertIn("height:100%", live.replace(" ", ""))
-        self.assertIn("flex-direction:column", live.replace(" ", ""))
-        host = " ".join(self.css_rules("opshell-term")).replace(" ", "")
-        self.assertIn("flex:1", host, "the host takes no room of its own")
-        self.assertIn("min-height:0", host)
+        flat = lambda name: "".join(
+            self.css_rules(name)).replace(" ", "").replace("\n", "")
+        live, host, body = (flat("opshell-live"), flat("opshell-term"),
+                            flat("opshell-body"))
+        for need in ("display:flex", "flex-direction:column",
+                     "min-height:100%"):
+            self.assertIn(need, live)
+        self.assertNotIn(";height:", ";" + live,
+                         "a fixed height clips the terminal on a short card")
+        for need in ("flex:1", "min-height:72px", "overflow:hidden"):
+            self.assertIn(need, host)
+        self.assertIn("flex:1", body,
+                      "the body is what min-height:100% resolves against")
+        self.assertIn("overflow:auto", body,
+                      "a short card has nothing to scroll")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_minimising_twice_parks_one_card(self):

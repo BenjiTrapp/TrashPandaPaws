@@ -4689,11 +4689,18 @@ header .info{font-size:11px;color:var(--text2)}
 #opshell-body{flex:1;min-height:0;overflow:auto;padding:12px 16px}
 /* The live terminal's room. #opshell-term is empty when the page measures
    it, so as a plain block it is as tall as nothing and every session would
-   be measured at the floor. The wrapper is the body's height and the host
-   takes what the strip and the footnote leave; overflow is hidden because
-   the terminal inside is a whole number of rows and the host is not. */
-.opshell-live{display:flex;flex-direction:column;height:100%}
-#opshell-term{flex:1;min-height:0;overflow:hidden}
+   be measured at the floor. The wrapper is at least the body's height --
+   which is why #opshell-body above is flex:1, the definite height the
+   percentage resolves against -- and the host takes what the strip and the
+   footnote leave. Four declarations, one mechanism: delete display:flex or
+   that flex:1 and the host measures 0. min-height and not height, so that a
+   card too short for the terminal gives the host its 72px floor and the
+   body's own overflow:auto scrolls, as it did before the wrapper; with
+   height:100% the host shrank toward 0 and the terminal was clipped away
+   with nothing to scroll. overflow is hidden because the terminal inside is
+   a whole number of rows and the host is not. */
+.opshell-live{display:flex;flex-direction:column;min-height:100%}
+#opshell-term{flex:1;min-height:72px;overflow:hidden}
 
 /* The card, parked.
    The dock sits in the sidebar under .agent-list and never inside it:
@@ -8482,7 +8489,8 @@ let opshellKeys = "";
 let opshellFlushing = false;
 let opshellTrouble = "";
 let opshellNoted = "";
-// Why the last measurement fell back to the default, or "" when it fitted.
+// What the terminal should be told when the last measurement fell back to
+// the default -- the reason and what follows from it -- or "" when it fitted.
 // Set by `opshellMeasure`, read once by `opshellAttach` to say so in the
 // terminal: the size is fixed for the connection, so an operator who finds a
 // small terminal in a wide box has no other way to learn why.
@@ -9374,12 +9382,20 @@ function opshellMeasure(host){
   opshellUnfitted = "";
   const room = host.getBoundingClientRect();
   if(!(room.width > 0) || !(room.height > 0)){
-    opshellUnfitted = "it was not visible when this session attached";
+    opshellUnfitted = "the card gave it no room when this session attached "
+      + "(hidden, or a window too small), so this session keeps that size; "
+      + "one opened with the card open on a normal window is fitted to it";
     return fallback;
   }
-  // One character of the terminal's own font. It has to be in the page to
-  // have a size, so it is appended, read and taken out again.
+  // Measured the way xterm measures its own cell: an inline-block, whose
+  // rect height is the line box and not the font's content area, holding a
+  // run of 32 characters whose width is divided back down, so a fractional
+  // advance is not rounded away on one glyph. It has to be in the page to
+  // have a size, so it is appended, read and taken out again. Family and
+  // size are the Terminal's own, below; a test holds the two together.
+  const RUN = 32;
   const probe = document.createElement("span");
+  probe.style.display = "inline-block";
   probe.style.position = "absolute";
   probe.style.left = "-9999px";
   probe.style.visibility = "hidden";
@@ -9387,17 +9403,21 @@ function opshellMeasure(host){
   probe.style.lineHeight = "normal";
   probe.style.fontFamily = "var(--mono)";
   probe.style.fontSize = "12px";
-  probe.textContent = "W";
+  probe.textContent = "W".repeat(RUN);
   document.body.appendChild(probe);
   let cell;
   try { cell = probe.getBoundingClientRect(); } finally { probe.remove(); }
   if(!(cell.width > 0) || !(cell.height > 0)){
-    opshellUnfitted = "the page could not measure a character of its font";
+    opshellUnfitted = "the page could not measure a character of its font, "
+      + "so this session keeps that size";
     return fallback;
   }
-  const fit = (room, one, floor) =>
-    Math.min(1000, Math.max(floor, Math.floor(room / one)));
-  return [fit(room.width, cell.width, 20), fit(room.height, cell.height, 5)];
+  // Floor, never round: a sub-pixel error may cost a column and may not
+  // make the terminal wide enough to sit outside the host.
+  const fit = (space, size, least) =>
+    Math.min(1000, Math.max(least, Math.floor(space / size)));
+  return [fit(room.width, cell.width / RUN, 20),
+          fit(room.height, cell.height, 5)];
 }
 
 async function opshellAttach(state){
@@ -9417,8 +9437,7 @@ async function opshellAttach(state){
   if(opshellUnfitted){
     // Said once, here, because this is the only moment the size is chosen.
     opshellTerm.writeln("\x1b[2m-- not fitted to the card: " + opshellUnfitted
-      + ", so this session keeps " + cols + "x" + rows + ". A session "
-      + "opened while the card is visible is fitted to it --\x1b[0m");
+      + " --\x1b[0m");
   }
   if(opshellFresh){
     // Said once, beside the line above, on a session the page picked back
