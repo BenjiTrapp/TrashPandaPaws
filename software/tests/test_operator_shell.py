@@ -3307,17 +3307,23 @@ async function fetch(url, opts){
 
 // A node that does what a browser's does, so that a view which toggles a
 // class, sets a style, appends a card or measures a probe is observable.
-// Every method here acts and is exercised by
-// `test_the_harness_dom_answers_like_a_browser`: a stub that returned
-// undefined is the shape of the two lies this harness has already told.
+// Every method here acts, and the three `test_the_harness_dom_*` tests
+// exercise each so that a stub returning undefined -- the shape of the two
+// lies this harness has already told -- fails there and not in a later task.
 let nextBox = null;
 function fakeBox(w, h){ nextBox = {width: w, height: h}; }
-function makeNode(id){
+// What the browser does with an id: a node in the page can be found by it,
+// and one taken out of the page cannot. `els` is that index.
+function adopt(n){ if(n.id) els[n.id] = n; }
+function forget(n){ if(n.id && els[n.id] === n) delete els[n.id]; }
+function makeNode(id, box){
   const classes = new Set();
   let html = '';
   const node = {
-    id, value: '', style: {}, children: [], parent: null, htmlWrites: [],
-    box: nextBox || {width: 0, height: 0},
+    id, value: '', style: {}, children: [], parent: null,
+    // Not a browser property: a hook so a test can see every write.
+    htmlWrites: [],
+    box: box || {width: 0, height: 0},
     classList: {
       add(...names){ names.forEach(c => classes.add(c)); },
       remove(...names){ names.forEach(c => classes.delete(c)); },
@@ -3329,28 +3335,44 @@ function makeNode(id){
       },
     },
     get innerHTML(){ return html; },
-    set innerHTML(v){ html = String(v); node.htmlWrites.push(html); },
+    // Assigning replaces the children, whatever the value: the page
+    // rebuilds `#agent-list` this way every three seconds, and a card
+    // inside the list goes with it while one beside it does not.
+    set innerHTML(v){
+      html = String(v);
+      node.htmlWrites.push(html);
+      node.children.forEach(c => { c.parent = null; forget(c); });
+      node.children = [];
+    },
     appendChild(child){
       if(child.parent) child.parent.children.splice(
         child.parent.children.indexOf(child), 1);
       child.parent = node;
       node.children.push(child);
+      adopt(child);
       return child;
     },
     remove(){
-      removed.push(id);
+      removed.push(node.id);
+      forget(node);
       if(node.parent){
         node.parent.children.splice(node.parent.children.indexOf(node), 1);
         node.parent = null;
       }
     },
+    // A node that is not in the page, or is hidden by itself or by any
+    // ancestor, measures nothing -- as in Safari. A registered node counts
+    // as in the page: `els` nodes have no parent, and `.content` is one.
     getBoundingClientRect(){
-      const b = node.box;
+      let shown = !!node.parent || els[node.id] === node;
+      for(let n = node; n; n = n.parent){
+        if(n.style.display === 'none') shown = false;
+      }
+      const b = shown ? node.box : {width: 0, height: 0};
       return {width: b.width, height: b.height, top: 0, left: 0,
               right: b.width, bottom: b.height};
     },
   };
-  nextBox = null;
   return node;
 }
 
@@ -3361,16 +3383,27 @@ const els = {};
 function el(id){
   return els[id] || (els[id] = makeNode(id));
 }
+// `.sidebar` resolves `els['sidebar']` even if that node does not carry the
+// class, which a browser would not match. That looseness is deliberate: the
+// registry is how a test names a node, and making each one also carry its
+// class would only restate the name. A bare word takes the same two routes.
 function queried(sel){
   if(sel[0] === '#') return els[sel.slice(1)] || null;
   const name = sel[0] === '.' ? sel.slice(1) : sel;
   if(els[name]) return els[name];
   return Object.values(els).find(n => n.classList.contains(name)) || null;
 }
+// `fakeBox` goes to the next `createElement`, which is how the page makes
+// nodes; `el()` registrations are test set-up and must not take it, so a
+// registered node is given its size through `.box`.
 const document = {
   getElementById: id => els[id] || null,
   querySelector: queried,
-  createElement: () => makeNode(null),
+  createElement: () => {
+    const box = nextBox;
+    nextBox = null;
+    return makeNode(null, box);
+  },
   body: makeNode('body'),
 };
 const window = {listeners: {}, addEventListener(name, fn){
@@ -3438,7 +3471,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """Fifty-three tests hide behind `skipUnless(node)`.
+        """Fifty-four tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3446,7 +3479,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of fifty-three quiet skips.
+        One loud failure instead of fifty-four quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3464,10 +3497,10 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # total still looked plausible, and later a single named safety
         # test deleted while the total *rose* from 231 to 246. So the floor
         # sits close to the real count -- 48 against 50 when it was set,
-        # carried with the controller's nod, and 51 against 53 once the
-        # harness's DOM brought two tests of its own --
+        # carried with the controller's nod, and 52 against 54 once the
+        # harness's DOM brought three tests of its own --
         self.assertGreaterEqual(
-            len(names), 51,
+            len(names), 52,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -3532,9 +3565,15 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         """The harness has lied twice, in the same way both times.
 
         Its `fetch` could not reject and its `abort()` only recorded a
-        string, and six mutations survived because of it. Every stub this
-        task adds is therefore exercised here, so that a stub which
-        quietly does nothing fails this test rather than a later one.
+        string, and six mutations survived because of it. Every stub the
+        harness's DOM has is therefore exercised, so that a stub which
+        quietly does nothing fails here rather than in a later task. This
+        test covers what a node does when it is built; the two that follow
+        cover what it does when it is changed or taken apart, and what it
+        reports about being in the page.
+
+        The probe is appended to a host before it is measured, because a
+        node that is not in the page measures nothing, as in Safari.
         """
         got = self._node(
             "const n = document.createElement('div');\n"
@@ -3544,6 +3583,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "const host = el('host'); host.appendChild(n);\n"
             "fakeBox(820, 600);\n"
             "const probe = document.createElement('span');\n"
+            "el('stage').appendChild(probe);\n"
             "const box = probe.getBoundingClientRect();\n"
             "console.log(JSON.stringify({cls: [n.classList.contains('a'),"
             " n.classList.contains('b'), n.classList.contains('c')],"
@@ -3559,23 +3599,28 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_harness_dom_answers_when_a_node_is_changed_or_taken_apart(self):
-        """The other half of the harness's promise.
+        """What a node does when it is changed or taken apart.
 
-        The test before this one covers what a node does when it is built:
-        a class added, a style set, a child appended, a box measured. This
-        one covers what it does when it is changed or taken apart -- a class
-        removed or toggled back, a node removed, a node moved to another
-        host, a selector that has to find the right thing and not just
-        something -- and that a faked box is spent on one node and not
-        inherited by the next. Between them every stub the harness's DOM
-        has is exercised in a way that fails if the stub does nothing, so
-        that a later task's test never has to be the one that finds out.
+        A class removed or toggled back, a style that belongs to one node, an
+        `innerHTML` that stores, records and coerces, a node moved to another
+        host or removed, and a selector that finds the right thing and
+        answers exactly `null` when there is none. Each assertion names the
+        stub it pins; a stub that returned undefined or did nothing fails.
         """
         got = self._node(
             "const a = el('a'), b = el('b');\n"
             "const n = document.createElement('div');\n"
+            # classList.add / remove with two names at once
+            "n.classList.add('p', 'q');\n"
+            "const added = [n.classList.contains('p'),"
+            " n.classList.contains('q')];\n"
+            "n.classList.remove('p', 'q');\n"
+            "const removedBoth = [n.classList.contains('p'),"
+            " n.classList.contains('q')];\n"
+            # classList.remove of one of two
             "n.classList.add('x'); n.classList.add('y');\n"
             "n.classList.remove('x');\n"
+            # toggle, twice, with its return values; and with force
             "const t1 = n.classList.toggle('z');\n"
             "const afterOne = n.classList.contains('z');\n"
             "const t2 = n.classList.toggle('z');\n"
@@ -3583,70 +3628,189 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "const f1 = n.classList.toggle('f', true);\n"
             "const f2 = n.classList.toggle('f', true);\n"
             "const f3 = n.classList.toggle('f', false);\n"
+            "const f4 = n.classList.toggle('never', false);\n"
+            "const neverThere = n.classList.contains('never');\n"
+            # style belongs to one node
             "const other = document.createElement('div');\n"
             "other.style.display = 'none';\n"
             "n.style.display = 'block';\n"
+            # innerHTML stores and records, and coerces to a string
             "n.innerHTML = 'one'; n.innerHTML = 'two';\n"
+            "const m = document.createElement('div'); m.innerHTML = 42;\n"
+            # appendChild returns its child, and moving leaves the first host
             "const mover = document.createElement('i');\n"
-            "a.appendChild(mover); b.appendChild(mover);\n"
+            "const ret = a.appendChild(mover);\n"
+            "b.appendChild(mover);\n"
             "const reparented = [a.children.length, b.children.length,"
-            " mover.parent === b];\n"
+            " mover.parent === b, ret === mover];\n"
+            # remove() takes a node out of its parent and records it
             "const gone = el('gone'); a.appendChild(gone);\n"
             "const before = a.children.length; gone.remove();\n"
             "const afterRemove = [before, a.children.length,"
             " gone.parent === null, removed.includes('gone')];\n"
             "document.body.appendChild(other);\n"
             "const registered = Object.keys(els).sort();\n"
+            # node identity
+            "const v = el('v');\n"
+            "const ids = [v.id, v.value, document.createElement('p').id];\n"
+            # querySelector, every route
             "const sidebar = el('sidebar');\n"
             "const carrier = el('carrier'); carrier.classList.add('content');\n"
-            "fakeBox(820, 600);\n"
-            "const first = document.createElement('span');\n"
-            "const r1 = first.getBoundingClientRect();\n"
-            "const second = document.createElement('span');\n"
-            "const r2 = second.getBoundingClientRect();\n"
-            "fakeBox(5, 6);\n"
-            "const viaEl = el('measured').getBoundingClientRect();\n"
-            "const after = el('unmeasured').getBoundingClientRect();\n"
-            "second.box = {width: 3, height: 4};\n"
-            "const r3 = second.getBoundingClientRect();\n"
+            "const phantom = el('holder'); phantom.classList.add('phantom');\n"
             "console.log(JSON.stringify({\n"
+            " added, removedBoth,\n"
             " cls: [n.classList.contains('x'), n.classList.contains('y')],\n"
             " toggled: [t1, afterOne, t2, afterTwo, f1, f2, f3,"
-            " n.classList.contains('f')],\n"
+            " n.classList.contains('f'), f4, neverThere],\n"
             " styles: [n.style.display, other.style.display],\n"
             " writes: n.htmlWrites, html: n.innerHTML,\n"
-            " reparented, afterRemove,\n"
+            " coerced: [m.innerHTML, typeof m.innerHTML],\n"
+            " reparented, afterRemove, registered, ids,\n"
             " body: document.body.children.length,\n"
             " byId: document.querySelector('#a') === a,\n"
             " byName: document.querySelector('.sidebar') === sidebar,\n"
+            " bare: document.querySelector('sidebar') === sidebar,\n"
             " byClass: document.querySelector('.content') === carrier,\n"
+            " bareClass: document.querySelector('phantom') === phantom,\n"
             " missing: [document.querySelector('.nothing') === null,"
-            " document.querySelector('#nothing') === null],\n"
-            " registered: registered,\n"
-            " first: [r1.width, r1.height], second: [r2.width, r2.height],\n"
-            " viaEl: [viaEl.width, viaEl.height],\n"
-            " after: [after.width, after.height], set: [r3.width, r3.height]}));")
+            " document.querySelector('#nothing') === null,"
+            " document.querySelector('#phantom') === null,"
+            " document.querySelector('#content') === null]}));")
+        self.assertEqual(got["added"], [True, True])
+        self.assertEqual(got["removedBoth"], [False, False])
         self.assertEqual(got["cls"], [False, True])
         self.assertEqual(got["toggled"],
-                         [True, True, False, False, True, True, False, False])
+                         [True, True, False, False, True, True, False, False,
+                          False, False])
         self.assertEqual(got["styles"], ["block", "none"])
         self.assertEqual(got["writes"], ["one", "two"])
         self.assertEqual(got["html"], "two")
-        self.assertEqual(got["reparented"], [0, 1, True])
+        self.assertEqual(got["coerced"], ["42", "string"])
+        self.assertEqual(got["reparented"], [0, 1, True, True])
         self.assertEqual(got["afterRemove"], [1, 0, True, True])
+        # createElement makes nodes that belong to nobody's registry, and a
+        # removed node has left it.
+        self.assertEqual(got["registered"], ["a", "b"])
+        self.assertEqual(got["ids"], ["v", "", None])
         self.assertEqual(got["body"], 1)
         self.assertTrue(got["byId"])
         self.assertTrue(got["byName"])
+        self.assertTrue(got["bare"])
         self.assertTrue(got["byClass"])
-        self.assertEqual(got["missing"], [True, True])
-        # createElement makes nodes that belong to nobody's registry: only
-        # the three the script asked `el` for are in it.
-        self.assertEqual(got["registered"], ["a", "b", "gone"])
-        self.assertEqual(got["first"], [820, 600])
-        self.assertEqual(got["second"], [0, 0])
-        self.assertEqual(got["viaEl"], [5, 6])
-        self.assertEqual(got["after"], [0, 0])
-        self.assertEqual(got["set"], [3, 4])
+        self.assertTrue(got["bareClass"])
+        # A miss is exactly `null`, and `#x` is an id, never a class.
+        self.assertEqual(got["missing"], [True, True, True, True])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_harness_dom_knows_whether_a_node_is_in_the_page(self):
+        """What a node reports about being in the page.
+
+        Task 5 minimises a card by hiding it and Task 6 measures: a hidden
+        probe that answered its box here and nothing in Safari would size
+        the terminal to nothing on restore. So a node measures nothing
+        unless it is in the page (it has a parent, or it is a registered
+        node) and neither it nor any ancestor is `display: none`. Also here:
+        `fakeBox` is spent by the next `createElement` and by nothing else,
+        an id appended into the page can be found and one removed cannot,
+        and assigning `innerHTML` empties the node, so a card inside the
+        agent list is told from one parked beside it.
+        """
+        got = self._node(
+            "const host = el('host');\n"
+            "const rect = n => { const r = n.getBoundingClientRect();\n"
+            "  return [r.width, r.height, r.top, r.left, r.right, r.bottom]; };\n"
+            "const wh = n => rect(n).slice(0, 2);\n"
+            # fakeBox goes to the next createElement, not to a registration
+            "fakeBox(820, 600);\n"
+            "const reg = el('some-new-id');\n"
+            "const made = document.createElement('div');\n"
+            "host.appendChild(made);\n"
+            "const next = document.createElement('div'); host.appendChild(next);\n"
+            "const spent = [wh(made), wh(reg), wh(next)];\n"
+            "reg.box = {width: 3, height: 4};\n"
+            "const viaBox = wh(reg);\n"
+            "el('content').box = {width: 900, height: 700};\n"
+            "const registeredRoot = wh(el('content'));\n"
+            # the rect's five fields
+            "fakeBox(10, 20);\n"
+            "const sized = document.createElement('div'); host.appendChild(sized);\n"
+            "const fields = rect(sized);\n"
+            # in the page, out of it, and taken out again
+            "fakeBox(7, 8);\n"
+            "const loose = document.createElement('div');\n"
+            "const unattached = wh(loose);\n"
+            "host.appendChild(loose);\n"
+            "const attached = wh(loose);\n"
+            "loose.style.display = 'none';\n"
+            "const hiddenSelf = wh(loose);\n"
+            "loose.style.display = 'block';\n"
+            "const shown = wh(loose);\n"
+            "loose.style.display = '';\n"
+            "loose.remove();\n"
+            "const afterRemove = wh(loose);\n"
+            # hidden by an ancestor, at either level
+            "const top = el('card'), mid = document.createElement('div');\n"
+            "fakeBox(820, 600);\n"
+            "const probe = document.createElement('div');\n"
+            "top.appendChild(mid); mid.appendChild(probe);\n"
+            "const visible = wh(probe);\n"
+            "top.style.display = 'none';\n"
+            "const topHidden = wh(probe);\n"
+            "top.style.display = ''; mid.style.display = 'none';\n"
+            "const midHidden = wh(probe);\n"
+            "mid.style.display = 'block';\n"
+            "const restored = wh(probe);\n"
+            # an id appended into the page is found; removed, it is not
+            "const card = document.createElement('div');\n"
+            "const beforeAppend = document.getElementById('opshell-card');\n"
+            "card.id = 'opshell-card'; host.appendChild(card);\n"
+            "const found = document.getElementById('opshell-card') === card;\n"
+            "card.remove();\n"
+            "const afterCardRemove = document.getElementById('opshell-card');\n"
+            "const t1 = document.createElement('div'); t1.id = 'twin';\n"
+            "const t2 = document.createElement('div'); t2.id = 'twin';\n"
+            "host.appendChild(t1); host.appendChild(t2); t1.remove();\n"
+            "const twinKept = document.getElementById('twin') === t2;\n"
+            # innerHTML empties: a card in the list goes, one beside it stays
+            "const list = el('list'), side = el('side');\n"
+            "const inner = document.createElement('div'); inner.id = 'inner';\n"
+            "const parked = document.createElement('div'); parked.id = 'parked';\n"
+            "list.appendChild(inner); side.appendChild(list);\n"
+            "side.appendChild(parked);\n"
+            "list.innerHTML = '';\n"
+            "const emptied = [list.children.length, inner.parent === null,"
+            " document.getElementById('inner') === null,"
+            " parked.parent === side, side.children.length,"
+            " document.getElementById('parked') === parked];\n"
+            "const again = document.createElement('div'); list.appendChild(again);\n"
+            "list.innerHTML = '<p>x</p>';\n"
+            "const refilled = [list.children.length, again.parent === null];\n"
+            "console.log(JSON.stringify({spent, viaBox, registeredRoot, fields,"
+            " unattached, attached, hiddenSelf, shown, afterRemove,"
+            " visible, topHidden, midHidden, restored,"
+            " beforeAppend, found, afterCardRemove, twinKept,"
+            " emptied, refilled, removed}));")
+        self.assertEqual(got["spent"], [[820, 600], [0, 0], [0, 0]])
+        self.assertEqual(got["viaBox"], [3, 4])
+        self.assertEqual(got["registeredRoot"], [900, 700])
+        # width, height, top, left, right, bottom
+        self.assertEqual(got["fields"], [10, 20, 0, 0, 10, 20])
+        self.assertEqual(got["unattached"], [0, 0])
+        self.assertEqual(got["attached"], [7, 8])
+        self.assertEqual(got["hiddenSelf"], [0, 0])
+        self.assertEqual(got["shown"], [7, 8])
+        self.assertEqual(got["afterRemove"], [0, 0])
+        self.assertEqual(got["visible"], [820, 600])
+        self.assertEqual(got["topHidden"], [0, 0])
+        self.assertEqual(got["midHidden"], [0, 0])
+        self.assertEqual(got["restored"], [820, 600])
+        self.assertIsNone(got["beforeAppend"])
+        self.assertTrue(got["found"])
+        self.assertIsNone(got["afterCardRemove"])
+        self.assertTrue(got["twinKept"])
+        self.assertEqual(got["emptied"], [0, True, True, True, 2, True])
+        self.assertEqual(got["refilled"], [0, True])
+        self.assertIn("opshell-card", got["removed"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_closing_the_view_closes_the_session(self):
