@@ -400,6 +400,43 @@ class TestWhenItMayAct(DeciderCase):
                                  "a rescue went out, so this is not the case "
                                  "the test is about")
 
+    def test_it_acts_when_the_reachable_server_answered_the_rescue_empty(self):
+        # The one boundary the whole design turns on, and the only reading
+        # of "the server decides" that is a decision. The resolver answers
+        # and the rescue reaches a server that has nothing queued, so the
+        # tasking route hands back an encrypted body that decrypts to `{}`
+        # on purpose -- the route is not an existence oracle. That body is
+        # falsy, so `_rescue_answered` stays False and the decider acts
+        # from the second stuck cycle, exactly as it does when the rescue
+        # could not be sent at all.
+        #
+        # This is the correct semantics, not a gap: an answer that carries
+        # no instruction *is* nothing brought back, and a server with an
+        # empty queue has decided nothing -- while `try_egress` can still
+        # override the moment it decides something. The sibling test above
+        # pins the opposite side, a non-empty answer that holds the window;
+        # between the two this case had no test, and it is the one an
+        # off-by-one in the falsiness check would silently flip.
+        beacon = self.a_beacon(
+            policy=self.policy([_HOLDS]),
+            dns={"enabled": True, "domain": "rescue.example",
+                 "resolver": "127.0.0.1"})
+        asked = self.record_attempts(beacon)
+        query, sent = self.a_resolver_that_answers(
+            rescue_answer=beacon._encrypt({}))
+
+        self.run_cycles(beacon, 1, query=query)
+        self.assertEqual(asked, [], "it acted on the first stuck cycle")
+        self.assertEqual(len(sent), 1, "no rescue went out, so this proves "
+                                       "nothing")
+        self.assertFalse(beacon._rescue_answered,
+                         "an empty answer was read as the server deciding")
+
+        self.run_cycles(beacon, 1, query=query)
+        self.assertEqual(asked, ["rediscover"])
+        self.assertEqual(beacon._egress_spent, 1)
+        self.assertEqual(beacon._stuck_cycles, 2)
+
 
 class TestHowMuchItMayDo(DeciderCase):
     """One attempt per cycle, and a budget per stuck window."""
