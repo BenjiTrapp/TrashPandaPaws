@@ -1500,13 +1500,13 @@ class TestWritingToATerminal(unittest.TestCase):
                          "reported success")
 
 
-class TestTheLoginShell(unittest.TestCase):
-    """Which shell a session runs, chosen without spawning one.
+class _ShellChoice(object):
+    """The stand-ins for the host that the shell choice is tested against.
 
-    Apart from `TestAShellSession`, which pins the choice to bash so that
-    its assertions do not depend on whose account runs the suite: here
-    the choice itself is under test, with the passwd entry and the
-    executable probe both stood in for.
+    Each one answers for the paths it is told about and leaves every other
+    path to the real function. A patch of `os.path` is process-wide, so
+    one that answered for everything would also lie to whatever else asks
+    while it is in force.
     """
 
     @contextlib.contextmanager
@@ -1522,12 +1522,41 @@ class TestTheLoginShell(unittest.TestCase):
 
         The probe and `os.path.isfile` both, because the chooser asks
         both and a path like `/usr/local/bin/bash` is not on every host.
+        `isfile` is the host's own for a path that is not one of these:
+        the chooser needs both answers to be yes, and the probe is no for
+        every such path.
         """
+        real_isfile = os.path.isfile
+
+        def isfile(path):
+            return True if path in paths else real_isfile(path)
+
         with mock.patch.object(beacon_mod, "_shell_executable",
                                lambda path: path in paths), \
-                mock.patch.object(os.path, "isfile",
-                                  lambda path: path in paths):
+                mock.patch.object(os.path, "isfile", isfile):
             yield
+
+    @contextlib.contextmanager
+    def _dev_fd(self, present):
+        """The host has, or has not, a `/dev/fd` directory."""
+        real_isdir = os.path.isdir
+
+        def isdir(path):
+            return present if path == beacon_mod._DEV_FD else real_isdir(path)
+
+        with mock.patch.object(os.path, "isdir", isdir):
+            yield
+
+
+class TestTheLoginShell(_ShellChoice, unittest.TestCase):
+    """Which shell a session runs, chosen without spawning one.
+
+    Apart from `TestAShellSession`, which turns the login shell off so
+    that the choice is bash where the host has one and `/bin/sh` where it
+    does not, and its assertions do not depend on whose account runs the
+    suite: here the choice itself is under test, with the passwd entry
+    and the executable probe both stood in for.
+    """
 
     @contextlib.contextmanager
     def _passwd_of(self, lookup):
@@ -1659,6 +1688,55 @@ class TestTheLoginShell(unittest.TestCase):
         self.assertEqual(argv, ["/bin/zsh", "-i"])
         self.assertEqual((env["HISTFILE"], held), (os.devnull, ()))
 
+    def test_a_pipe_that_cannot_be_opened_refuses_rather_than_records(self):
+        """The downgrade this replaces was the worst trade available: a
+        session that quietly wrote the operator's commands to their own
+        history file while the view said history was off."""
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(True), \
+                mock.patch.object(beacon_mod, "_shell_rcfile_fd",
+                                  side_effect=OSError("too many files")):
+            with self.assertRaises(OSError):
+                beacon_mod._shell_invocation(80, 24)
+
+    def test_the_guard_a_host_reports_is_the_guard_a_session_gets(self):
+        """What `HELLO` carries has to be what the spawn does, or the
+        view states a fact about the wrong thing."""
+        cases = (("/bin/bash", True, "off"),
+                 ("/usr/local/bin/bash", True, "off"),
+                 ("/bin/zsh", True, "weak"),
+                 ("/bin/bash", False, "weak"))
+        for shell, has_dev_fd, expected in cases:
+            with self._passwd(shell), self._executable({shell}), \
+                    self._dev_fd(has_dev_fd):
+                guard, detail = beacon_mod._history_guard()
+                argv, env, held = beacon_mod._shell_invocation(80, 24)
+            for fd in held:
+                os.close(fd)
+            case = (shell, has_dev_fd)
+            self.assertEqual(guard, expected, case)
+            self.assertEqual("--rcfile" in argv, guard == "off",
+                             "the spawn disagreed with the report")
+            self.assertEqual(env.get("HISTFILE") == os.devnull,
+                             guard == "weak", case)
+            self.assertEqual(bool(detail), guard == "weak", case)
+
+    def test_a_zsh_session_blames_the_shell_and_not_the_host(self):
+        """The operator can tell a login zsh apart from an ancient host
+        only if the reason says which it was."""
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
+                self._dev_fd(True):
+            _, detail = beacon_mod._history_guard()
+        self.assertIn("zsh", detail)
+        self.assertNotIn(beacon_mod._DEV_FD, detail)
+
+    def test_a_host_without_dev_fd_blames_the_host_and_not_the_shell(self):
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(False):
+            _, detail = beacon_mod._history_guard()
+        self.assertIn(beacon_mod._DEV_FD, detail)
+        self.assertNotIn("is not bash", detail)
+
     # A guard that reads source is only worth what it reads. Mutating
     # `beacon.py` and re-running can silently run the *old* code: a `.pyc`
     # is trusted when the source's size and mtime-second match, and a
@@ -1667,18 +1745,87 @@ class TestTheLoginShell(unittest.TestCase):
     # the wrong test because it had not run at all. Between mutations,
     # delete `software/c2/__pycache__/beacon*` and run with `-B`.
     def test_the_environments_shell_variable_is_never_consulted(self):
+        """By behaviour through the invocation, and by scan of every
+        function that chooses a shell. `_shell_invocation` is not scanned:
+        it reads `os.environ` for the child's environment, which is the
+        right reading of it."""
         with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
                 mock.patch.dict(os.environ, {"SHELL": "/bin/ksh"}):
             self.assertEqual(beacon_mod._shell_program(), "/bin/zsh")
-        code = self._code_of(beacon_mod._login_shell)
-        for reading in ("environ", "getenv"):
-            self.assertNotIn(reading, code)
+            self.assertEqual(beacon_mod._shell_invocation(80, 24)[0][0],
+                             "/bin/zsh")
+        for chooser in (beacon_mod._login_shell, beacon_mod._shell_program,
+                        beacon_mod._history_guard, beacon_mod._guard_of):
+            code = self._code_of(chooser)
+            for reading in ("environ", "getenv"):
+                self.assertNotIn(reading, code, chooser.__name__)
 
     def test_a_passwd_lookup_that_raises_falls_back_rather_than_throwing(self):
         with mock.patch.object(pwd, "getpwuid",
                                side_effect=KeyError("no such uid")), \
                 self._executable({"/bin/bash"}):
             self.assertEqual(beacon_mod._shell_program(), "/bin/bash")
+
+
+@unittest.skipUnless(_HAS_PTY, _NO_PTY)
+class TestARefusedShellSession(_ShellChoice, TunnelEndpointTestCase):
+    """What `_serve_shell` does when the history guard cannot be built.
+
+    The socket and the noise session are `None`: the refusal is the only
+    thing that would touch them and it is stood in for, so a session that
+    reached for either anywhere else would fail here.
+    """
+
+    def _serve_with_a_pipe_that_fails(self, error):
+        """Run `_serve_shell` with bash chosen and its rcfile pipe failing.
+
+        Returns the reasons given for refusing, and the master descriptors
+        `openpty` handed out so the caller can see they were closed.
+        """
+        refusals = []
+        masters = []
+        pty_mod = beacon_mod._shell_modules()[0]
+        real_openpty = pty_mod.openpty
+
+        def openpty():
+            master, slave = real_openpty()
+            masters.extend((master, slave))
+            return master, slave
+
+        endpoint = TunnelEndpoint(self.config_for(1234))
+        self.addCleanup(endpoint.stop)
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(True), \
+                mock.patch.object(pty_mod, "openpty", openpty), \
+                mock.patch.object(beacon_mod, "_shell_rcfile_fd",
+                                  side_effect=error), \
+                mock.patch.object(TunnelEndpoint, "_refuse_shell",
+                                  lambda self, sock, noise, reason:
+                                  refusals.append(reason)):
+            endpoint._serve_shell(None, None, 80, 24)
+        return endpoint, refusals, masters
+
+    def test_the_operator_is_told_why_the_session_was_refused(self):
+        """A stream that simply goes quiet is the one failure worse than
+        a wrong answer: `_refuse_shell`'s own docstring says a terminal
+        can only read a sentence."""
+        _, refusals, _ = self._serve_with_a_pipe_that_fails(
+            OSError("too many files"))
+        self.assertEqual(len(refusals), 1)
+        self.assertRegex(refusals[0], r"(?i)histor")
+        self.assertNotRegex(refusals[0], r"Traceback|OSError\(")
+
+    def test_a_refused_session_leaves_nothing_taken(self):
+        """No slot held and no descriptor open: a host that is out of
+        descriptors is the one that cannot afford to lose more."""
+        endpoint, refusals, masters = self._serve_with_a_pipe_that_fails(
+            OSError("too many files"))
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(endpoint._shells, 0)
+        self.assertEqual(len(masters), 2)
+        for fd in masters:
+            with self.assertRaises(OSError, msg="descriptor %d" % fd):
+                os.fstat(fd)
 
 
 class TestAShellSession(TunnelEndpointTestCase):

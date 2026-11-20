@@ -3393,6 +3393,42 @@ def _shell_rcfile_fd() -> int:
     return read_fd
 
 
+def _guard_of(program: str) -> Tuple[str, str]:
+    """`_history_guard`'s answer for a shell already chosen.
+
+    Separate so that `_shell_invocation` can ask about the program it is
+    about to run and not about whatever the passwd entry says a moment
+    later. Bash is recognised by basename, as `_login_shell` recognises
+    it: the chooser accepts `/usr/local/bin/bash`, and a path comparison
+    here would call that "not bash" and withhold the rcfile from it.
+    """
+    if os.path.basename(program) != os.path.basename(_SHELL_BASH):
+        return "weak", "%s is not bash, and only bash takes --rcfile" % program
+    if not os.path.isdir(_DEV_FD):
+        return "weak", ("this host has no %s to hand a pipe to bash on"
+                        % _DEV_FD)
+    return "off", ""
+
+
+def _history_guard() -> Tuple[str, str]:
+    """How history is held off in a session here: `(guard, why)`.
+
+    `("off", "")` where the generated rcfile described at `_SHELL_RCFILE`
+    is used: the shell is bash and the host has a `/dev/fd` to hand it a
+    pipe on. Otherwise `("weak", reason)` and the session sets
+    `HISTFILE=/dev/null` in the environment, which the user's own rc files
+    run after and are free to undo.
+
+    Both reasons are facts about the host that cannot change from one
+    session to the next, which is what lets them be reported once and not
+    per attempt. The reason says which it was -- the shell, or the host --
+    because the operator can do something about one and not the other. A
+    pipe that cannot be opened is not here: that is per attempt, and it
+    refuses the session.
+    """
+    return _guard_of(_shell_program())
+
+
 def _shell_invocation(cols: int, rows: int) -> Tuple[list, dict, tuple]:
     """What to run for a PTY session: argv, environment, descriptors.
 
@@ -3402,12 +3438,18 @@ def _shell_invocation(cols: int, rows: int) -> Tuple[list, dict, tuple]:
     them before it has seen a window-size change.
 
     History is held off with the generated rcfile described at
-    `_SHELL_RCFILE`. Where that construction is not available -- a host
-    with no `/dev/fd`, a host with only `/bin/sh`, which has no
-    `--rcfile`, or a pipe that could not be made -- the session falls
-    back to `HISTFILE=/dev/null` in the environment and logs that it took
-    the weaker path, because the host's own rc files run after that and
-    are free to set `HISTFILE` again.
+    `_SHELL_RCFILE`. `_history_guard` says where that is not available --
+    a shell that is not bash, or a host with no `/dev/fd` -- and there the
+    session falls back to `HISTFILE=/dev/null` in the environment and logs
+    that it took the weaker path, because the host's own rc files run
+    after that and are free to set `HISTFILE` again. Those two are facts
+    about the host, so the view can say so before a session is asked for.
+
+    A pipe that cannot be opened is neither. It is a moment's shortage of
+    descriptors on a host that otherwise would have held history off, and
+    falling back would record the operator's commands while everything
+    they were shown said it did not. The `OSError` propagates, and the
+    caller refuses the session.
 
     `--rcfile` comes before `-i`: bash 3.2 stops reading long options
     after the first short one and answers `--: invalid option`, which
@@ -3421,23 +3463,14 @@ def _shell_invocation(cols: int, rows: int) -> Tuple[list, dict, tuple]:
     env["TERM"] = _SHELL_TERM
     env["COLUMNS"] = str(cols)
     env["LINES"] = str(rows)
-    rc_fd = -1
-    weaker = ""
-    if os.path.basename(program) != os.path.basename(_SHELL_BASH):
-        weaker = "%s is not bash, and only bash takes --rcfile" % program
-    elif not os.path.isdir(_DEV_FD):
-        weaker = "this host has no %s to hand a pipe to bash on" % _DEV_FD
-    else:
-        try:
-            rc_fd = _shell_rcfile_fd()
-        except OSError as exc:
-            weaker = "the rcfile pipe could not be opened (%s)" % exc
-    if weaker:
+    guard, weaker = _guard_of(program)
+    if guard != "off":
         env["HISTFILE"] = os.devnull
         logger.info("tunnel: a shell session is holding history off with "
                     "HISTFILE=%s rather than a generated rcfile: %s",
                     os.devnull, weaker)
         return [program, "-i"], env, ()
+    rc_fd = _shell_rcfile_fd()
     return ([program, "--rcfile", "%s/%d" % (_DEV_FD, rc_fd), "-i"],
             env, (rc_fd,))
 
@@ -4388,7 +4421,21 @@ class TunnelEndpoint(object):
             # bites -- and both pumps wait in `select` instead, where the
             # end of the session is visible.
             os.set_blocking(master, False)
-            argv, env, child_fds = _shell_invocation(cols, rows)
+            try:
+                argv, env, child_fds = _shell_invocation(cols, rows)
+            except OSError as exc:
+                # The one failure in there that is not the host's
+                # nature: see `_shell_invocation`. A refusal that names
+                # history, because "could not start" would leave the
+                # operator to guess what was being protected.
+                self._refuse_shell(
+                    sock, noise,
+                    "this host could not set up the pipe that keeps the "
+                    "session's command history off (%s), so no session "
+                    "was started rather than one that records what you "
+                    "type. Attach again; if it keeps happening the "
+                    "host is out of file descriptors." % exc)
+                return
             program = argv[0]
             leader = _setsid_program()
             if leader:
