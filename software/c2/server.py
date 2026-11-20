@@ -8443,8 +8443,9 @@ async function showOperatorShell(){
 
 async function opshellEndSession(){
   // One releaser on this side, as there is one on the server's: the ✕, a
-  // click outside the panel, a closed tab, `exit`, and the End button all
-  // arrive here. The previous version had none -- teardown cleared a timer
+  // click outside the panel, `exit`, and the End button all arrive here. A
+  // closed tab does not: it is indistinguishable from a reload, and the
+  // lapse retires that claim. The previous version had none -- teardown cleared a timer
   // and returned, so the channel stayed up on the device while the panel's
   // own text promised that closing it queued the shutdown, and teardown's
   // own comment claimed the lapse would do it. The lapse could not: it ran
@@ -10925,15 +10926,6 @@ async function refreshRescues(){
       "fingerprint "+esc(fp)+" matches no agent<br>"+esc(rec.summary), 10000);
   }
 }
-
-// A closed tab is one of the two ordinary ways of leaving the operator
-// shell, and it sends no click. `pagehide` rather than `beforeunload`:
-// that one is not fired reliably for a tab the browser discards, and this
-// is the path where "usually" is not good enough -- the channel stays up
-// on the device otherwise, which is the one outcome this feature exists to
-// prevent. `opshellEndSession` posts with keepalive so the request
-// survives the page.
-window.addEventListener("pagehide", () => { opshellEndSession(); });
 
 if(storedToken()){
   setInterval(refreshAgents, 3000);

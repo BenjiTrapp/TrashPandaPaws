@@ -3040,17 +3040,28 @@ class TestTheGlyphAndTheView(_GuiCase):
         comment = SERVER_SRC[start:SERVER_SRC.index("-->", start)].lower()
         self.assertIn("stylesheet is not", comment)
 
-    def test_a_closed_tab_ends_the_session_too(self):
-        # A tab that is closed sends no click, and it is one of the two
-        # ordinary ways of leaving. `pagehide` rather than `beforeunload`:
-        # the latter is not fired reliably for a discarded tab, and this is
-        # the one path where "usually" is not good enough -- the channel
-        # stays up on the device otherwise.
-        self.assertRegex(SERVER_SRC,
-                         r'addEventListener\("pagehide"[^)]*\)')
-        at = SERVER_SRC.index('addEventListener("pagehide"')
-        self.assertIn("opshellEndSession", SERVER_SRC[at:at + 200])
-        # And the request has to survive the page going away.
+    def test_no_page_transition_ends_the_session(self):
+        """A reload is not a decision to stop working.
+
+        `pagehide` fires on a reload and on any navigation, not only on a
+        closed tab, and no browser signal tells them apart. Measured
+        before this change: attach, reload, and the log shows
+        `POST /api/opshell/close` with `sessions: 0` -- the session died
+        because the page was replaced by itself.
+
+        The closed tab is covered by the lapse instead:
+        `opshell.LAPSE_GRACE` seconds of silence and the next check-in
+        retires the claim.
+        """
+        self.assertNotRegex(
+            SERVER_SRC, r'addEventListener\("(pagehide|beforeunload|unload)"',
+            "a page-transition handler is back; it cannot tell a reload "
+            "from a closed tab")
+
+    def test_the_close_survives_a_page_that_is_going_away(self):
+        # `opshellEndSession` runs from the ✕ and from `exit`; both can
+        # coincide with a page being torn down, and a close that is
+        # cancelled with the page leaves the claim held until the lapse.
         self.assertIn("keepalive:true", self.js_function("opshellEndSession"))
 
     def test_the_view_dials_nothing_until_the_operator_asks(self):
