@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import inspect
 import json
+import logging
 import os
 import re
 import sys
@@ -931,6 +932,11 @@ class TestTheListenersGuide(_DocCase):
 # four with an index error.
 GSOCKET_GUIDE_HEADING = "## The fifth transport: gsocket over the GSRN"
 GSOCKET_LIMITS_HEADING = "### The gsocket leg"
+# The egress decider: its own page, and its own Known-limits section. Written
+# here for the same reason the gsocket headings are -- the tests below cut a
+# section out by heading, and a rename should fail in one readable place.
+EGRESS_GUIDE = REPO / "docs" / "EGRESS_DECIDER.md"
+EGRESS_LIMITS_HEADING = "### The egress decider"
 HARDENING_HEADING = "### Left open by the security hardening"
 BUILD_IMAGE = REPO / "software" / "setup" / "build_image.sh"
 GSOCKET_UNIT = REPO / "services" / "raccoon-gsocket.service"
@@ -1548,6 +1554,203 @@ class TestTheGsocketLegIsDocumentedAndShipsDisabled(unittest.TestCase):
         self.assertIn("hardware implant", flat,
                       "the row does not say the fifth leg is the hardware "
                       "implant's only")
+
+
+class TestTheEgressDeciderIsDocumentedAndShipsDisabled(unittest.TestCase):
+    """The decider's page, its shipped block, and its Known-limits section.
+
+    The decider takes connection-establishing actions on a dropped device
+    with nobody watching, so the page has to state what it may *never* do
+    before it states a rule -- the same discipline the gsocket guide keeps
+    about a leg nobody here can see. The four refusals and the one-cycle
+    cost are held here; the shipped block is held against the implant's own
+    reader -- the full assertion that it reads cleanly is in
+    `test_egress_policy.py`'s `TestTheShippedPolicy`, so this one only
+    pins that the block exists, ships disabled, and is accepted with no
+    warning logged.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.guide = _read("docs", "EGRESS_DECIDER.md")
+        cls.readme = README.read_text()
+        cls.limits = AGENT_DOC.read_text()
+        cls.config = _config()
+
+    def _limits_section(self):
+        self.assertIn("\n" + EGRESS_LIMITS_HEADING, self.limits,
+                      "docs/AGENT.md has no %r section under Known limits"
+                      % EGRESS_LIMITS_HEADING)
+        return self.limits.split(
+            EGRESS_LIMITS_HEADING, 1)[1].split("\n### ", 1)[0]
+
+    def present(self, flat, phrase, what, where):
+        self.assertIn(" ".join(phrase.split()).lower(), flat,
+                      "%s: %r is not in %s" % (what, phrase, where))
+
+    # ── the page exists and is reachable ──
+
+    def test_the_guide_exists_and_the_readme_links_it(self):
+        self.assertTrue(EGRESS_GUIDE.is_file(),
+                        "docs/EGRESS_DECIDER.md is missing")
+        self.assertGreater(len(self.guide), 2000,
+                           "the guide is a stub")
+        self.assertIn("docs/EGRESS_DECIDER.md", self.readme,
+                      "the README does not link the guide")
+
+    # ── what it may never do, before a single rule ──
+
+    def test_the_guide_states_what_the_decider_may_never_do(self):
+        flat = " ".join(self.guide.split()).lower()
+
+        # Where the guide first shows a rule. The four refusals have to
+        # stand above it: a reader who has reached a `try:` has already
+        # started composing a policy, and the gate they cannot widen is
+        # the thing they must read first.
+        rule_marks = [flat.index(mark) for mark in ("try:", "rules:")
+                      if mark in flat]
+        self.assertTrue(rule_marks,
+                        "the guide shows no rule at all, so it is not the "
+                        "page that configures the decider")
+        first_rule = min(rule_marks)
+
+        for phrase, what in (
+                ("sleep", "the pointed refusal: the decider may never sleep"),
+                ("the only verb the server-side model has for a stuck beacon",
+                 "why sleep is the one that matters -- the two deciders are "
+                 "not equivalent"),
+                ("disabling or deprioritising a leg",
+                 "the second refusal: it may not weaken the chain"),
+                ("persistence",
+                 "the third refusal names persistence"),
+                ("watchdog",
+                 "the third refusal names the watchdog"),
+                ("tunnel",
+                 "the third refusal names the tunnel"),
+                ("in code",
+                 "that the gate is in code"),
+                ("cannot add to it",
+                 "that configuration selects from the set and cannot widen "
+                 "it")):
+            with self.subTest(phrase=phrase):
+                self.present(flat, phrase, what, "docs/EGRESS_DECIDER.md")
+                at = flat.index(" ".join(phrase.split()).lower())
+                self.assertLess(
+                    at, first_rule,
+                    "%r comes after the guide's first rule: what the decider "
+                    "may never do has to be read before a policy is written"
+                    % phrase)
+
+    # ── the one-cycle cost ──
+
+    def test_the_guide_states_the_one_cycle_cost(self):
+        flat = " ".join(self.guide.split()).lower()
+        for phrase, what in (
+                ("may not act on the first stuck cycle",
+                 "the cause of the cost"),
+                ("one cycle later",
+                 "the cost itself: the carrier may come up a cycle later"),
+                ("a policy whose first rule",
+                 "that a policy can undo it"),
+                ("gsocket",
+                 "the rule that restores the old timing"),
+                ("restores",
+                 "that such a policy restores today's timing")):
+            with self.subTest(phrase=phrase):
+                self.present(flat, phrase, what, "docs/EGRESS_DECIDER.md")
+
+    # ── the shipped block ──
+
+    def test_the_shipped_block_is_disabled_and_reads(self):
+        from software.c2 import beacon as beacon_mod
+
+        block = self.config["c2"]["egress_decider"]
+
+        # Accepted by the implant's own reader, and with nothing logged:
+        # a shipped block the beacon warns about is a shipped block that
+        # would be refused on the one host nobody can debug remotely.
+        handler = _CountingWarnings()
+        logger = beacon_mod.logger
+        propagate = logger.propagate
+        logger.addHandler(handler)
+        logger.propagate = False
+        try:
+            policy = beacon_mod.read_egress_policy(block)
+        finally:
+            logger.removeHandler(handler)
+            logger.propagate = propagate
+
+        self.assertEqual(handler.messages, [],
+                         "the implant's reader warned about the shipped "
+                         "block: %r" % handler.messages)
+        self.assertFalse(policy["enabled"],
+                         "the shipped decider is enabled; a fresh checkout "
+                         "must decide nothing")
+        self.assertTrue(policy["rules"],
+                        "the shipped block ships no rules, so enabling it "
+                        "would be refused")
+
+    # ── Known limits: the three the decider adds ──
+
+    def test_known_limits_records_the_three_gsocket_decider_limits(self):
+        section = self._limits_section()
+        flat = " ".join(section.split()).lower()
+        for phrase, what in (
+                # 1. drop-box only.
+                ("drop-box only",
+                 "the first limit: a generated build has no decider"),
+                ("a generated build has no decider",
+                 "what drop-box-only means for the build the server makes"),
+                ("where a proxy is most likely",
+                 "the cost of it: the proxy verbs are gone on exactly the "
+                 "corporate host a proxy is likeliest on"),
+                # 2. sleep.
+                ("sleep",
+                 "the second limit names sleep"),
+                ("the two deciders are not equivalent",
+                 "that the implant decider and the server decider differ"),
+                # 3. the two dead flags.
+                ("dot1x_seen",
+                 "the third limit names the first dead flag"),
+                ("portal_answered",
+                 "the third limit names the second dead flag"),
+                ("nothing sets them",
+                 "why the two flags are refused"),
+                ("a separate piece of work",
+                 "that making them live is a follow-up")):
+            with self.subTest(phrase=phrase):
+                self.present(flat, phrase, what, EGRESS_LIMITS_HEADING)
+
+        # Its own section, not filed under the hardening pass's groups,
+        # whose bullets are counted against that pass -- the same rule the
+        # gsocket section is held to.
+        self.assertIn(EGRESS_LIMITS_HEADING, self.limits)
+        self.assertLess(self.limits.index(EGRESS_LIMITS_HEADING),
+                        self.limits.index(HARDENING_HEADING),
+                        "the egress-decider section sits inside the "
+                        "hardening pass's section, whose bullets are counted")
+
+
+class _CountingWarnings(logging.Handler):
+    """Every message the beacon's logger emitted, so a count can be zero.
+
+    `assertNoLogs` arrived in 3.10 and this repository is on 3.9, and the
+    claim here is that the shipped block logs *nothing* -- a count of
+    zero, which `assertLogs` cannot make. The same handler shape
+    `test_egress_policy.py` uses, kept local because this is its only
+    caller here.
+    """
+
+    def __init__(self):
+        logging.Handler.__init__(self, level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+    @property
+    def messages(self):
+        return [record.getMessage() for record in self.records]
 
 
 TUNNEL_DOC = REPO / "docs" / "TUNNEL.md"

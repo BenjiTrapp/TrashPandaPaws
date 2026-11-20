@@ -729,13 +729,6 @@ class TestTheShippedPolicy(PolicyCase):
     """What `configs/raccoon.yaml` ships has to read on the implant."""
 
     def test_the_policy_shipped_in_raccoon_yaml_reads(self):
-        self.skipTest(
-            "configs/raccoon.yaml has no c2.egress_decider block yet: the "
-            "last task of this plan writes it together with the operator "
-            "guide that explains it, and removes this skip. The assertions "
-            "below are written now so that the block cannot be shipped "
-            "without them.")
-
         config = yaml.safe_load(SHIPPED_CONFIG.read_text(encoding="utf-8"))
         block = config["c2"]["egress_decider"]
 

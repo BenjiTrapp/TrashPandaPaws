@@ -1065,6 +1065,40 @@ remedy ships with the implant's provisioning.
   [`docs/LISTENERS.md`](LISTENERS.md#what-the-implants-forward-exposes-measured).
 
 
+### The egress decider
+
+When no operator and no server-side model can be reached, a dropped implant
+can decide for itself what to try next, from `c2.egress_decider` of
+`configs/raccoon.yaml` — the operator's policy over the three
+connection-establishing verbs `egress_control` covers (select a discovered
+proxy, re-run discovery, bring the gsocket carrier up). It is off in the
+shipped file; see [`docs/EGRESS_DECIDER.md`](EGRESS_DECIDER.md). These three
+are limits of that decider, not findings a review left open, which is why they
+are their own entries and not filed under the hardening pass's groups below.
+
+- **The decider is drop-box only.** A generated build has no decider and no
+  way to be given one: it is a single file with no `raccoon.yaml` to read, and
+  `beacon_config_from_fallback` is what reads the block. The cost is honest —
+  the two proxy verbs are unavailable on exactly the corporate target host
+  where a proxy is most likely, because that is the host the generator builds
+  for. Reaching it would mean a generator request field, panel work and
+  validation, and that is not built.
+- **The decider may never `sleep`.** `sleep` is the one verb the team server's
+  model reaches for on a stuck beacon — on the server, where an operator is
+  present to be asked. The implant's own decider is refused it in code: an
+  implant that can slow its own check-ins with nobody to ask can talk itself
+  into silence. So the two deciders are not equivalent, and a policy cannot
+  add `sleep` back, because the allowed set is fixed in the beacon rather than
+  read from the file.
+- **Two rescue flags are dead, and a rule naming one is refused.** `dot1x_seen`
+  and `portal_answered` are in the rescue record's format and the team server
+  renders them, so the panel invites a rule that names them — but nothing sets
+  them in the beacon, because no 802.1X sensing and no captive-portal
+  detection exists here. A rule that could never match is refused by name when
+  the policy is read. Making them live is a separate piece of work, and the one
+  that would make this decider much smarter.
+
+
 ### Left open by the security hardening
 
 The hardening pass of November 2026 closed most of what an audit of the C2

