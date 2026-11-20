@@ -3636,7 +3636,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """Seventy-three tests hide behind `skipUnless(node)`.
+        """Seventy-five tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3644,7 +3644,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of seventy-three quiet skips.
+        One loud failure instead of seventy-five quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3666,10 +3666,10 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # harness's DOM brought three tests of its own, and 57 against 59
         # once the card, its double-press guard and its missing-mount guard
         # brought five more, and 59 against 61 once the card's restore and
-        # its title brought two, and 71 against 73 once minimise, the park
-        # and the restore brought twelve --
+        # its title brought two, and 73 against 75 once minimise, the park,
+        # the restore and the remnant's own cross brought fourteen --
         self.assertGreaterEqual(
-            len(names), 71,
+            len(names), 73,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -5596,6 +5596,99 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertFalse(got["minimised"],
                          "a reload parked a card the operator left open")
         self.assertEqual(got["parked"], 0)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_session_that_ends_while_parked_says_so_without_waiting(self):
+        # The parked label is the only thing on screen while the card is
+        # hidden, and `exit` lands between two ticks: waiting for the next
+        # poll leaves "channel open" standing over a shell that is gone,
+        # for up to two seconds, and the ✕ that dismisses the remnant
+        # arrives that late too. No timer is run here, and the queue holds
+        # exactly the poll and the close, so a poll sneaking in would be an
+        # error rather than a free pass.
+        got = self._node(
+            "opshellSession = 'sid';\n"
+            "opshellStarted = Date.now() - 92000;\n"
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['sidebar'] = el('sidebar');\n"
+            "els['main'].appendChild(els['content']);\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot'}},"
+            " {ok:true, status:200, body:{}}];\n"
+            "await showOperatorShell();\n"
+            "opshellMinimise();\n"
+            "const parked = els['sidebar'].children[0];\n"
+            "const before = parked.innerHTML;\n"
+            "await opshellEndSession();\n"
+            "console.log(JSON.stringify({before, after: parked.innerHTML,"
+            " urls: posted.map(p => p.url.split('?')[0])}));")
+        self.assertRegex(got["before"], r"(?i)channel open")
+        self.assertRegex(got["after"], r"(?i)session ended")
+        self.assertIn("92", got["after"])
+        # The remnant still names the device its session ran on.
+        self.assertIn("parrot", got["after"])
+        # And the ✕ arrives with the end, never over a live session: a
+        # dismiss beside a running shell would end it in one press from
+        # the sidebar, with none of the card's sentence about what that
+        # queues.
+        self.assertNotIn("opshellClose(", got["before"])
+        self.assertIn("opshellClose(", got["after"])
+        self.assertEqual(got["urls"],
+                         ["/api/opshell/state", "/api/opshell/close"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_parked_cross_dismisses_what_the_session_left(self):
+        """`design:196`: the remnant carries the ✕ that dismisses it.
+
+        Without it a session that ended while parked leaves an entry
+        nothing can remove -- the design's second anti-goal -- and
+        restoring the card only to close it is not an answer. The design's
+        own condition comes with it: the dismiss path must not clear
+        `opshellLast` before the duration has been shown, and
+        `opshellTeardown` is what clears it.
+        """
+        got = self._node(
+            "opshellSession = 'sid';\n"
+            "opshellStarted = Date.now() - 92000;\n"
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['sidebar'] = el('sidebar');\n"
+            "els['main'].appendChild(els['content']);\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot'}},"
+            " {ok:true, status:200, body:{}}];\n"
+            "await showOperatorShell();\n"
+            "opshellMinimise();\n"
+            "await opshellEndSession();\n"
+            "const shown = els['sidebar'].children[0].innerHTML;\n"
+            "const heldWhenShown = opshellLast && opshellLast.duration;\n"
+            "await opshellClose();\n"
+            "console.log(JSON.stringify({shown, heldWhenShown,"
+            " minimised: opshellMinimised,"
+            " left: els['sidebar'].children.length,"
+            " card: document.getElementById('opshell-card'),"
+            " column: els['content'].style.display,"
+            " last: opshellLast,"
+            " urls: posted.map(p => p.url.split('?')[0])}));")
+        # The duration was on screen, in the entry the operator presses,
+        # while `opshellLast` still held it.
+        self.assertRegex(got["shown"], r"(?i)session ended")
+        self.assertIn("92", got["shown"])
+        self.assertEqual(got["heldWhenShown"], 92)
+        # The ✕ is in the markup and not only in the handler this test
+        # calls: the harness does not parse markup, so the button is
+        # pinned the way the chrome's two controls are.
+        self.assertIn("opshellClose(", got["shown"])
+        # And then the remnant goes, with the hidden card behind it, and
+        # the column stays the operator's.
+        self.assertEqual(got["left"], 0, "the remnant could not be dismissed")
+        self.assertIsNone(got["card"])
+        self.assertFalse(got["minimised"])
+        self.assertEqual(got["column"], "")
+        self.assertIsNone(got["last"])
+        # Nothing is posted for a session that has already ended: the
+        # close above is `opshellEndSession`'s, not the dismiss's.
+        self.assertEqual(got["urls"],
+                         ["/api/opshell/state", "/api/opshell/close"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_page_with_nowhere_to_park_keeps_the_card(self):

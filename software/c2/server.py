@@ -4701,14 +4701,25 @@ header .info{font-size:11px;color:var(--text2)}
    the >_ glyph, by its monospace, and by having no status dot. Its
    background is the panel grey and not the selected card's red tint, for
    the same reason. Seen side by side in the browser against a selected
-   agent, which is the only place that comparison can be made. */
+   agent, which is the only place that comparison can be made.
+   A row of real buttons and not one button with an onclick div in it: the
+   restore takes the whole row, and the ✕ that dismisses a remnant is its
+   own button beside it. The ✕ borrows .opshell-ctl from the card's header,
+   because it is the same control, one size down for the sidebar's type. */
 .opshell-dock{flex:none}
 .opshell-parked{
-  display:flex;align-items:center;gap:8px;width:100%;text-align:left;
-  padding:10px 12px;border:1px solid var(--red-dim);border-radius:0;
-  background:var(--surface2);cursor:pointer;
+  display:flex;align-items:stretch;width:100%;
+  border:1px solid var(--red-dim);background:var(--surface2);
   font-family:var(--mono);font-size:11px;color:var(--text);
 }
+.opshell-parked > button{
+  background:none;border:none;color:inherit;font:inherit;cursor:pointer;
+}
+.opshell-parked-restore{
+  flex:1;min-width:0;display:flex;align-items:center;gap:8px;
+  padding:10px 12px;text-align:left;
+}
+.opshell-parked .opshell-ctl{flex:none;font-size:14px;padding:0 10px}
 
 /* Notification bell */
 .bell-wrap{position:relative;margin-left:8px}
@@ -8467,9 +8478,12 @@ let opshellNoted = "";
 // Whether the card is parked in the sidebar rather than shown. Hidden and
 // not taken down: see `opshellMinimise`.
 let opshellMinimised = false;
-// The last state `opshellPoll` read. Its one reader is `opshellMinimise`,
-// which draws the parked label from it: a label drawn from nothing would
-// say "channel unknown" for two seconds over a channel that is open.
+// The last state `opshellPoll` read. The parked label is drawn from it --
+// by `opshellMinimise`, and by `opshellEndSession` when a session ends
+// under a parked card -- so the label is the truth from the moment it
+// appears, and a remnant still names the device its session ran on. It is
+// not cleared when a session ends, for that reason: what it is, always, is
+// the last thing this view was told.
 let opshellSeen = null;
 // Where this tab remembers the session it is holding, so a reload can put
 // the card back instead of leaving a live root shell on the device with
@@ -8624,11 +8638,13 @@ async function showOperatorShell(){
 }
 
 async function opshellClose(ev){
-  // The cross, and the only path it uses. `ev` is deliberately unused: the
-  // parameter is the `onclick="opshellClose(event)"` shape and is kept so
-  // the call site and the signature agree. Teardown takes the card down and
-  // gives the column back before its request goes out, so the column is
-  // not left hidden behind a request that takes a moment.
+  // The card's cross, and the parked card's once the session has ended:
+  // both are "take this away", and a remnant has no session left to end.
+  // `ev` is deliberately unused: the parameter is the
+  // `onclick="opshellClose(event)"` shape and is kept so the call site and
+  // the signature agree. Teardown takes the card down and gives the column
+  // back before its request goes out, so the column is not left hidden
+  // behind a request that takes a moment.
   return opshellTeardown(document.getElementById("opshell-card"));
 }
 
@@ -8717,14 +8733,14 @@ function opshellParked(state){
     ? ("session ended" + (secs === null || secs === undefined
        ? "" : " \u00b7 " + esc(secs) + "s"))
     : ("channel " + chan);
-  // A button, not a div with an onclick: the header's glyph was corrected
-  // from stray text to a button once already (ca65f70).
-  return '<button class="opshell-parked"'
+  // A row of real buttons, not a div with an onclick: the header's glyph
+  // was corrected from stray text to a button once already (ca65f70).
+  return '<div class="opshell-parked"'
     // The red border is the selected agent's, so it goes when the session
     // does: what is left is a remnant to dismiss, not a live shell.
     + (ended ? ' style="border-color:var(--border)"' : '')
-    + ' title="' + (ended ? 'Show what the session left'
-                          : 'Restore the shell')
+    + '><button class="opshell-parked-restore" title="'
+    + (ended ? 'Show what the session left' : 'Restore the shell')
     + '" onclick="opshellRestore(event)">'
     + '<span class="opshell-glyph">&gt;'
     // The cursor blinks while the shell is alive and stands still when it
@@ -8735,7 +8751,18 @@ function opshellParked(state){
     + 'text-overflow:ellipsis;white-space:nowrap">'
     + esc(state.host || state.target || "operator shell")
     + '<span style="display:block;color:var(--text2)">' + line + '</span>'
-    + '</span></button>';
+    + '</span></button>'
+    // And the ✕ that takes the remnant away, only once there is a remnant:
+    // it is `opshellClose`, the card's own cross, which takes the hidden
+    // card down with it and gives the column back. It is not offered over
+    // a live parked session, because ending one is a decision made in the
+    // card, beside the sentence saying it queues the channel's shutdown --
+    // not in one press from the sidebar. Without this, a session that
+    // ended while parked left an entry nothing could remove, and
+    // restoring the card first only to close it is not an answer.
+    + (ended ? '<button class="opshell-ctl" title="Dismiss this" '
+               + 'onclick="opshellClose(event)">&#10005;</button>' : '')
+    + '</div>';
 }
 
 async function opshellEndSession(){
@@ -8771,10 +8798,6 @@ async function opshellEndSession(){
   // standing because the terminal never opened would announce a new shell
   // to a session that has nothing before it.
   opshellFresh = false;
-  // And the last state read, so a card parked after this draws what
-  // `opshellLast` says -- the session ended, and how long it lasted --
-  // rather than the host and channel of the session that just went.
-  opshellSeen = null;
   if(opshellAbort){
     // The stream outlived the view otherwise: the bridge, the pty, one of
     // the shell port's slots, the transcript and a worker thread all
@@ -8788,6 +8811,15 @@ async function opshellEndSession(){
     opshellLast = {duration: Math.round((Date.now() - opshellStarted)/1000)};
     opshellStarted = 0;
   }
+  // Said in the sidebar at once if the card is parked, and not at the
+  // poll's next tick: that label is the only thing on screen then, and
+  // `exit` lands between two ticks -- so without this it goes on saying
+  // "channel open" over a shell that is gone, for up to two seconds, and
+  // the ✕ that dismisses the remnant arrives that late too. Before the
+  // request below, for the same reason the cross takes the card down
+  // before its own: the screen is not left wrong behind a round trip.
+  const parked = document.getElementById("opshell-dock");
+  if(parked) parked.innerHTML = opshellParked(opshellSeen);
   // The answer is read, not merely awaited. The first version discarded
   // it, so every one of the three ways a stop can be refused was silent:
   // a rejected request, a `reason` from `may_stop` ("live socks sessions
