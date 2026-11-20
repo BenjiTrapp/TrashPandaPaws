@@ -3696,9 +3696,12 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # its title brought two, and 78 against 80 once minimise, the park,
         # the restore, the remnant's own cross and two reviews' six
         # bypasses brought nineteen -- one of which, a grep that ran no
-        # node, left for the class that reads the source --
+        # node, left for the class that reads the source -- and 85 against
+        # 87 once the measured geometry brought seven: its ratio, its floor,
+        # its cap, the hidden card's fallback, the probe's removal, the
+        # pair that is sent and the host's box --
         self.assertGreaterEqual(
-            len(names), 78,
+            len(names), 85,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -3720,7 +3723,11 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
                      # it is appended to: without it one deleted line ships
                      # a window-control card with no window controls, and
                      # the grep of `opshellChrome` cannot see that.
-                     "test_the_card_sits_in_the_content_column_and_not_inside_content"):
+                     "test_the_card_sits_in_the_content_column_and_not_inside_content",
+                     # The size is fixed for the life of the connection, so
+                     # a measurement taken in a hidden card is wrong for the
+                     # whole session and nothing can correct it.
+                     "test_a_host_inside_a_hidden_card_falls_back_rather_than_guessing"):
             self.assertIn(must, names,
                           "%s named a property that cost this branch a "
                           "Critical. It may not be removed without another "
@@ -3758,7 +3765,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "opshellResume", "showOperatorShell", "opshellChrome",
             "opshellClose", "opshellMinimise", "opshellRestore",
             "opshellParked", "opshellRetitle", "opshellPoll",
-            "opshellAttach")]) + "\n"
+            "opshellAttach", "opshellMeasure")]) + "\n"
         # The one module constant the keystroke path reads.
         const = re.search(r"^const OPSHELL_KEYS_CEILING = .*$",
                           SERVER_SRC, re.M)
@@ -5930,11 +5937,146 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # text, inside a span; the `title` beside it is a literal string
         # and the host never reaches an attribute. The two quotes are
         # checked because they are what tells `esc()` apart from a
-        # hand-rolled `<`-only replacement: all five of its substitutions
-        # ran on this value, so moving the host into an attribute later
-        # cannot open a hole that was never closed.
+        # hand-rolled `<`-only replacement. What the assertions bear out is
+        # `<`, `"` and `'` -- the payload has no `&` and `>` is not
+        # asserted -- so a hole through either of those two is not covered
+        # here.
         self.assertIn("&quot;", got["html"])
         self.assertIn("&#39;", got["html"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_geometry_is_measured_from_the_card(self):
+        # Twice the room is twice the terminal. Pinning the ratio rather
+        # than two literals keeps this test honest whatever the probe is
+        # made of -- a test written against the probe's own constants
+        # would only restate the implementation.
+        got = self._node(
+            "const small = el('opshell-term');\n"
+            "small.box = {width: 800, height: 400};\n"
+            "fakeBox(8, 16);\n"
+            "const a = opshellMeasure(small);\n"
+            "small.box = {width: 1600, height: 800};\n"
+            "fakeBox(8, 16);\n"
+            "const b = opshellMeasure(small);\n"
+            "console.log(JSON.stringify({a, b}));")
+        (ac, ar), (bc, br) = got["a"], got["b"]
+        self.assertGreater(ac, 20)
+        self.assertGreater(ar, 5)
+        self.assertAlmostEqual(bc, ac * 2, delta=1,
+                               msg="twice the width was not twice the columns")
+        self.assertAlmostEqual(br, ar * 2, delta=1,
+                               msg="twice the height was not twice the rows")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_window_too_narrow_still_gets_a_terminal(self):
+        """Review Focus 3.
+
+        A 0 or a negative would be clamped server-side by
+        `opshell._dimension` to 1, so the operator would get a one-column
+        terminal and no explanation. The floor is on this side.
+        """
+        for w, h in ((120, 40), (1, 1), (0, 0)):
+            got = self._node(
+                "const host = el('opshell-term');\n"
+                "host.box = {width: %d, height: %d};\n"
+                "fakeBox(8, 16);\n"
+                "console.log(JSON.stringify({pair: opshellMeasure(host)}));"
+                % (w, h))
+            cols, rows = got["pair"]
+            self.assertGreaterEqual(cols, 20, (w, h))
+            self.assertGreaterEqual(rows, 5, (w, h))
+            self.assertLessEqual(cols, 1000, (w, h))
+            self.assertLessEqual(rows, 1000, (w, h))
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_window_too_wide_is_capped_where_the_server_caps_it(self):
+        # The brief's floor test only reaches the cap from below: no box it
+        # uses is large enough to cross 1000, so deleting the cap went
+        # unseen. The server clamps to 1000 too, but a pair that arrives as
+        # a different number than the page printed is a strip that lies.
+        got = self._node(
+            "const host = el('opshell-term');\n"
+            "host.box = {width: 400000, height: 400000};\n"
+            "fakeBox(8, 16);\n"
+            "console.log(JSON.stringify({pair: opshellMeasure(host)}));")
+        self.assertEqual(got["pair"], [1000, 1000])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_host_inside_a_hidden_card_falls_back_rather_than_guessing(self):
+        """Fact 3: a reload whose first poll fails attaches into a card
+        that is still `display:none`, and the size is fixed for the life of
+        the connection, so a wrong measurement here is wrong for the whole
+        session."""
+        got = self._node(
+            "els['opshell-card'] = el('opshell-card');\n"
+            "const host = el('opshell-term');\n"
+            "els['opshell-card'].appendChild(host);\n"
+            "host.box = {width: 1600, height: 800};\n"
+            "els['opshell-card'].style.display = 'none';\n"
+            "fakeBox(8, 16);\n"
+            "console.log(JSON.stringify({pair: opshellMeasure(host)}));")
+        self.assertEqual(got["pair"], [120, 40],
+                         "a hidden card was measured instead of falling back")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_probe_does_not_stay_behind(self):
+        """The probe is a span in the page for the length of one
+        measurement. One left behind on every attach is a leak the operator
+        never sees."""
+        got = self._node(
+            "const host = el('opshell-term');\n"
+            "host.box = {width: 800, height: 400};\n"
+            "fakeBox(8, 16);\n"
+            "const before = document.body.children.length;\n"
+            "opshellMeasure(host); opshellMeasure(host);\n"
+            "console.log(JSON.stringify({before,"
+            " after: document.body.children.length,"
+            " removedAny: removed.length > 0}));")
+        self.assertEqual(got["after"], got["before"],
+                         "a probe was left in the page")
+        self.assertTrue(got["removedAny"], "the probe was never removed")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_pair_that_is_measured_is_the_pair_that_is_sent(self):
+        got = self._node(
+            "els['opshell-term'] = el('opshell-term');\n"
+            "els['opshell-term'].box = {width: 1000, height: 500};\n"
+            "globalThis.Terminal = function(o){ globalThis.made = o;"
+            " return fakeTerm(); };\n"
+            "opshellSession = 'sid';\n"
+            "fakeBox(8, 16);\n"
+            "nextReply = {ok:true, status:200, stream: fakeStream(['x'])};\n"
+            "await opshellAttach({state:'live', host:'parrot'});\n"
+            "const url = posted.find(p => p.url.includes('/stream')).url;\n"
+            "console.log(JSON.stringify({made: [made.cols, made.rows],"
+            " url}));")
+        cols, rows = got["made"]
+        self.assertIn("cols=%d&rows=%d" % (cols, rows), got["url"])
+        self.assertNotEqual([cols, rows], [120, 40],
+                            "the measurement never replaced the old default")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_terminal_host_has_a_box_to_be_measured_in(self):
+        """Not in the brief, found by reading the markup: `#opshell-term` is
+        an empty block when the page measures it, so as a plain `div` it is
+        as tall as nothing and `opshellMeasure` would answer the five-row
+        floor for every session, in every browser, while every test above
+        stayed green on a host the harness had given a box by hand. The
+        host has to be given its room by the stylesheet."""
+        got = self._node(
+            "opshellSession = 'mine';\n"
+            "console.log(JSON.stringify({html: opshellRender({state:'live',"
+            " channel:'open', host:'parrot'})}));")
+        html = got["html"]
+        wrapper = html.index('class="opshell-live"')
+        self.assertLess(wrapper, html.index('id="opshell-term"'),
+                        "the host is outside the box that gives it a height")
+        live = " ".join(self.css_rules("opshell-live"))
+        self.assertIn("height:100%", live.replace(" ", ""))
+        self.assertIn("flex-direction:column", live.replace(" ", ""))
+        host = " ".join(self.css_rules("opshell-term")).replace(" ", "")
+        self.assertIn("flex:1", host, "the host takes no room of its own")
+        self.assertIn("min-height:0", host)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_minimising_twice_parks_one_card(self):

@@ -4687,6 +4687,13 @@ header .info{font-size:11px;color:var(--text2)}
 }
 .opshell-ctl:hover{color:var(--text);background:rgba(255,26,26,0.12)}
 #opshell-body{flex:1;min-height:0;overflow:auto;padding:12px 16px}
+/* The live terminal's room. #opshell-term is empty when the page measures
+   it, so as a plain block it is as tall as nothing and every session would
+   be measured at the floor. The wrapper is the body's height and the host
+   takes what the strip and the footnote leave; overflow is hidden because
+   the terminal inside is a whole number of rows and the host is not. */
+.opshell-live{display:flex;flex-direction:column;height:100%}
+#opshell-term{flex:1;min-height:0;overflow:hidden}
 
 /* The card, parked.
    The dock sits in the sidebar under .agent-list and never inside it:
@@ -8493,8 +8500,11 @@ let opshellSeen = null;
 // tick, rewriting the dock every two seconds and destroying the buttons in
 // it, which is the defect the guard exists to prevent. Nothing else in the
 // page writes the dock, so this is the node's content. Every write to the
-// dock sets it, and both places the dock is removed clear it, or the next
-// tick skips a change or draws nothing into a fresh tray.
+// dock sets it, and both places the dock is removed clear it. What the
+// clearing holds is no dock and no remembered markup, so that a later
+// conditional park cannot skip its first write; today the park writes
+// unconditionally, so a stale value would not be drawn empty -- the
+// resets keep the invariant and nothing observable depends on them yet.
 let opshellDockHtml = "";
 // Where this tab remembers the session it is holding, so a reload can put
 // the card back instead of leaving a live root shell on the device with
@@ -9102,10 +9112,10 @@ function opshellRender(state){
         + 'them -- and a channel this view did not raise comes back with the '
         + 'reason it cannot be dropped.</p>';
     }
-    return strip + '<div id="opshell-term"></div>'
+    return '<div class="opshell-live">' + strip + '<div id="opshell-term"></div>'
       + '<p class="loot-empty">exit, or Ctrl-D, ends the session. Closing it '
       + 'queues the channel\'s shutdown, which takes effect at the next '
-      + 'check-in.</p>';
+      + 'check-in.</p></div>';
   }
   if(state.state === "waiting"){
     const secs = state.expected_checkin;
@@ -9340,13 +9350,50 @@ async function opshellFlushKeys(){
   } finally { opshellFlushing = false; }
 }
 
+// The terminal's size, in columns and rows, from the room the card has.
+//
+// Measured once, here, and never again: the pair rides the bridge's first
+// line (opshell.py: `<password> <cols>x<rows>`), the port clamps it and
+// holds it "fixed for good", and none of the five routes resizes. A window
+// resized after this does not change the terminal, so there is no resize
+// handler to look for.
+//
+// That makes a wrong answer permanent, so a host with no box -- a card that
+// is still display:none, which a reload whose first poll failed reaches --
+// is not measured at all: it gets the server's own default, and the strip
+// says that size, which is what it is. The floor is on this side because
+// the server clamps 0 to 1 and the operator would get a one-column terminal
+// with no explanation.
+function opshellMeasure(host){
+  const fallback = [120, 40];
+  const room = host.getBoundingClientRect();
+  if(!(room.width > 0) || !(room.height > 0)) return fallback;
+  // One character of the terminal's own font. It has to be in the page to
+  // have a size, so it is appended, read and taken out again.
+  const probe = document.createElement("span");
+  probe.style.position = "absolute";
+  probe.style.left = "-9999px";
+  probe.style.visibility = "hidden";
+  probe.style.whiteSpace = "pre";
+  probe.style.lineHeight = "normal";
+  probe.style.fontFamily = "var(--mono)";
+  probe.style.fontSize = "12px";
+  probe.textContent = "W";
+  document.body.appendChild(probe);
+  let cell;
+  try { cell = probe.getBoundingClientRect(); } finally { probe.remove(); }
+  if(!(cell.width > 0) || !(cell.height > 0)) return fallback;
+  const fit = (room, one, floor) =>
+    Math.min(1000, Math.max(floor, Math.floor(room / one)));
+  return [fit(room.width, cell.width, 20), fit(room.height, cell.height, 5)];
+}
+
 async function opshellAttach(state){
   const host = document.getElementById("opshell-term");
   if(!host || typeof Terminal === "undefined") return;
   opshellAttached = true;
   opshellStarted = Date.now();
-  const cols = (state.geometry||[120,40])[0];
-  const rows = (state.geometry||[120,40])[1];
+  const [cols, rows] = opshellMeasure(host);
   opshellTerm = new Terminal({cols, rows, cursorBlink:true,
                               fontFamily:"var(--mono)", fontSize:12});
   opshellTerm.open(host);
