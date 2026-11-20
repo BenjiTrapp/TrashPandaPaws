@@ -2995,6 +2995,65 @@ class TestTheVendoredTerminal(unittest.TestCase):
 
 
 SERVER_SRC = (Path(__file__).resolve().parents[1] / "c2" / "server.py").read_text()
+#: The page's one stylesheet. Read on its own, because the regex that used
+#: to run over the whole file also matched every `if(x){...}` in the
+#: JavaScript below it.
+STYLE_BLOCK = SERVER_SRC[SERVER_SRC.index("<style>")
+                         + len("<style>"):SERVER_SRC.index("</style>")]
+
+
+def _css_blocks(css):
+    """`(selector, body)` for every rule, descending into at-rules.
+
+    A real parse and not one regex, because a regex that stops at the
+    first `}` reads `@media (min-width:1px){.opshell-card{position:
+    absolute}}` as one rule whose selector is the `@media` -- so the rule
+    inside it is never examined, and a layout a test forbids goes green
+    by being nested. `@keyframes` is descended into as well, which costs
+    a `50%` "selector" nobody asks about.
+    """
+    out, i = [], 0
+    while True:
+        at = css.find("{", i)
+        if at < 0:
+            return out
+        selector, depth, j = css[i:at].strip(), 0, at
+        while j < len(css):
+            if css[j] == "{":
+                depth += 1
+            elif css[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        body = css[at + 1:j]
+        if selector.startswith("@") and "{" in body:
+            out.extend(_css_blocks(body))
+        else:
+            out.append((selector, body))
+        i = j + 1
+
+
+def _css_rules(css, name, selector=None):
+    """The body of every rule whose own selector is this class or id.
+
+    Its own: `.name`, `#name`, and either of them in a state such as
+    `:hover`, but never a descendant of them -- `.agent-card .dot` styles
+    the dot and not the card. `selector` narrows it to one exact spelling.
+    """
+    out = []
+    for sel, body in _css_blocks(re.sub(r"/\*.*?\*/", "", css, flags=re.S)):
+        for part in (p.strip() for p in sel.split(",")):
+            if selector is not None:
+                hit = part == selector
+            else:
+                hit = bool(re.match(r"[.#]%s(?![\w-])(?![ >+~])"
+                                    % re.escape(name), part)) \
+                    and " " not in part
+            if hit:
+                out.append(body)
+                break
+    return out
 
 
 class _GuiCase(unittest.TestCase):
@@ -3024,6 +3083,16 @@ class _GuiCase(unittest.TestCase):
                 if started and depth == 0:
                     return SERVER_SRC[at:j + 1]
         self.fail("unbalanced braces reading %s" % name)
+
+    def css_rules(self, name, selector=None):
+        """Every stylesheet rule whose own selector is this class or id.
+
+        One reader, used by the card's test and the parked card's, rather
+        than a slice from the name to the first `}`: both names also appear
+        in the markup the JavaScript emits, and a rule nested inside an
+        `@media` block was swallowed whole by the parse this replaces.
+        """
+        return _css_rules(STYLE_BLOCK, name, selector)
 
 
 class TestTheGlyphAndTheView(_GuiCase):
@@ -3113,24 +3182,57 @@ class TestTheGlyphAndTheView(_GuiCase):
         # may position it, inset it or give it a z-index: a rule by id
         # beats the class rule, and `position:fixed` with four edges is the
         # same layer by another spelling.
-        rules = re.findall(r"(?m)^\s*([^{}\n]+)\{([^}]*)\}", SERVER_SRC)
-        card = [(sel.strip(), body) for sel, body in rules
-                if any(re.match(r"[.#]opshell-card(?![\w-])(?![ >+~])",
-                                part.strip())
-                       and " " not in part.strip()
-                       for part in sel.split(","))]
-        by_class = [body for sel, body in card if sel == ".opshell-card"]
+        by_class = self.css_rules("opshell-card", ".opshell-card")
         self.assertEqual(len(by_class), 1,
                          "expected exactly one .opshell-card rule, got %d"
                          % len(by_class))
         self.assertIn("flex:1", by_class[0])
-        self.assertGreaterEqual(len(card), 1)
-        for sel, body in card:
+        rules = self.css_rules("opshell-card")
+        self.assertGreaterEqual(len(rules), 1)
+        for body in rules:
             for prop in ("position", "inset", "z-index"):
                 self.assertNotRegex(
                     body, r"(?<![\w-])%s\s*:" % prop,
-                    "%s sets %s; the card is a flex sibling in the content "
-                    "column, not a layer over the page" % (sel, prop))
+                    "a rule on the card sets %s; it is a flex sibling in "
+                    "the content column, not a layer over the page" % prop)
+
+    def test_the_stylesheet_reader_sees_inside_a_media_block(self):
+        """The bypass the test above was green through.
+
+        Its first version ran one regex over the file -- selector, `{`,
+        everything up to the first `}` -- so a rule nested in an at-rule
+        was read as the at-rule's own body and its selector was the
+        `@media`, which matches no class. The layout the test forbids
+        shipped by being indented one level further in. Both spellings are
+        checked here, so the reader cannot quietly lose the descent.
+        """
+        nested = ("@media (min-width:1px){.opshell-card{position:absolute;"
+                  "inset:0;z-index:50}}")
+        self.assertEqual(_css_rules(nested, "opshell-card"),
+                         ["position:absolute;inset:0;z-index:50"])
+        # What the old parse saw instead: one rule, selector `@media ...`,
+        # which the card filter then rejected.
+        self.assertEqual(
+            [sel for sel, _ in re.findall(r"(?m)^\s*([^{}\n]+)\{([^}]*)\}",
+                                          nested)],
+            ["@media (min-width:1px)"])
+        # And a plain rule is still found, at either spelling, while a
+        # descendant of it is not.
+        self.assertEqual(_css_rules(".x{a:1}#x{b:2}.x .y{c:3}", "x"),
+                         ["a:1", "b:2"])
+
+    def test_the_parked_card_is_not_mistakable_for_a_selected_agent(self):
+        # Use the rule helper from Step 0, not a slice to the first `}`:
+        # `.opshell-parked` also appears in the markup this function emits.
+        rules = self.css_rules("opshell-parked")
+        self.assertEqual(len(rules), 1)
+        self.assertIn("--red-dim", rules[0])
+        # `.agent-card.active` is the other thing with that border, and it
+        # carries a status dot -- `<span class="dot ${a.status}">` at
+        # `server.py:5431`, styled by `.agent-card .dot` at `:4298`. This
+        # one does not.
+        parked = self.js_function("opshellParked")
+        self.assertNotIn('class="dot', parked)
 
     def test_the_view_dials_nothing_until_the_operator_asks(self):
         # The goal: nothing happens on open, on hover, or on page load. The
@@ -3359,7 +3461,14 @@ function forget(n){ if(n.id && els[n.id] === n) delete els[n.id]; }
 function forgetTree(n){ forget(n); n.children.forEach(forgetTree); }
 function makeNode(id, box){
   const classes = new Set();
-  let html = '';
+  let html = '', text = '';
+  // What both content setters do: in a browser, assigning `innerHTML` or
+  // `textContent` replaces everything inside the node, and the subtree
+  // that leaves takes its ids out of the page with it.
+  const empty = () => {
+    node.children.forEach(c => { c.parentNode = null; forgetTree(c); });
+    node.children = [];
+  };
   const node = {
     id, value: '', style: {}, children: [], parentNode: null,
     // Not a browser property: a hook so a test can see every write.
@@ -3386,9 +3495,19 @@ function makeNode(id, box){
     set innerHTML(v){
       html = String(v);
       node.htmlWrites.push(html);
-      node.children.forEach(c => { c.parentNode = null; forgetTree(c); });
-      node.children = [];
+      // Markup is not parsed here, so the text a browser would find inside
+      // it is not invented: the write leaves no text rather than the text
+      // that happened to be there before it.
+      text = '';
+      empty();
     },
+    // A real accessor and not an inert own property: `opshellRetitle`
+    // writes the card's title this way on every poll tick, and what it
+    // must not disturb -- the buttons beside the title -- can only be
+    // shown to survive if a write here replaces the children, as a
+    // browser's does.
+    get textContent(){ return text; },
+    set textContent(v){ text = String(v); html = text; empty(); },
     appendChild(child){
       if(child.parentNode) child.parentNode.children.splice(
         child.parentNode.children.indexOf(child), 1);
@@ -3517,7 +3636,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """Sixty-one tests hide behind `skipUnless(node)`.
+        """Seventy-three tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3525,7 +3644,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of sixty-one quiet skips.
+        One loud failure instead of seventy-three quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3547,9 +3666,10 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # harness's DOM brought three tests of its own, and 57 against 59
         # once the card, its double-press guard and its missing-mount guard
         # brought five more, and 59 against 61 once the card's restore and
-        # its title brought two --
+        # its title brought two, and 71 against 73 once minimise, the park
+        # and the restore brought twelve --
         self.assertGreaterEqual(
-            len(names), 59,
+            len(names), 71,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -3560,7 +3680,18 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
                      "test_closing_the_view_closes_the_session",
                      "test_the_poll_keeps_beating_on_the_path_that_usually_runs",
                      "test_keystrokes_do_not_cross_from_one_session_into_the_next",
-                     "test_the_end_button_actually_ends_something"):
+                     "test_the_end_button_actually_ends_something",
+                     # A parked session whose heartbeat stops is a channel
+                     # stopped under a working operator: `opshellPoll`
+                     # returns when `#opshell-body` is missing, so a
+                     # minimise that took the card apart would let the
+                     # lapse fire four minutes later.
+                     "test_minimising_keeps_the_body_so_the_heartbeat_keeps_beating",
+                     # And the only pin tying the card's chrome to the card
+                     # it is appended to: without it one deleted line ships
+                     # a window-control card with no window controls, and
+                     # the grep of `opshellChrome` cannot see that.
+                     "test_the_card_sits_in_the_content_column_and_not_inside_content"):
             self.assertIn(must, names,
                           "%s named a property that cost this branch a "
                           "Critical. It may not be removed without another "
@@ -3596,7 +3727,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "opshellSay", "opshellDropRest", "opshellFlushKeys",
             "opshellEndAfterAttach", "opshellRemember", "opshellRecall",
             "opshellResume", "showOperatorShell", "opshellChrome",
-            "opshellClose", "opshellRetitle", "opshellPoll",
+            "opshellClose", "opshellMinimise", "opshellRestore",
+            "opshellParked", "opshellRetitle", "opshellPoll",
             "opshellAttach")]) + "\n"
         # The one module constant the keystroke path reads.
         const = re.search(r"^const OPSHELL_KEYS_CEILING = .*$",
@@ -3652,7 +3784,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         """What a node does when it is changed or taken apart.
 
         A class removed or toggled back, a style that belongs to one node, an
-        `innerHTML` that stores, records and coerces, a node moved to another
+        `innerHTML` that stores, records and coerces, a `textContent` that
+        reads back and clears the children, a node moved to another
         host or removed, and a selector that finds the right thing and
         answers exactly `null` when there is none. Each assertion names the
         stub it pins; a stub that returned undefined or did nothing fails.
@@ -3727,6 +3860,15 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "const sidebar = el('sidebar');\n"
             "const carrier = el('carrier'); carrier.classList.add('content');\n"
             "const phantom = el('holder'); phantom.classList.add('phantom');\n"
+            # textContent: it reads back, it replaces the children, and an
+            # innerHTML write leaves no text behind
+            "const t = el('t');\n"
+            "const inTitle = document.createElement('b'); t.appendChild(inTitle);\n"
+            "t.textContent = 'parrot';\n"
+            "const titled = [t.textContent, t.innerHTML, t.children.length,"
+            " inTitle.parentNode === null];\n"
+            "t.innerHTML = '<b>x</b>';\n"
+            "const afterHtml = [t.textContent, t.innerHTML];\n"
             "console.log(JSON.stringify({\n"
             " added, removedBoth,\n"
             " cls: [n.classList.contains('x'), n.classList.contains('y')],\n"
@@ -3735,6 +3877,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " styles: [n.style.display, other.style.display],\n"
             " writes: n.htmlWrites, html: n.innerHTML,\n"
             " coerced: [m.innerHTML, typeof m.innerHTML],\n"
+            " titled, afterHtml,\n"
             " reparented, afterRemove, registered, ids,"
             " treeIn, afterTree, kidsIn, afterEmpty,\n"
             " body: document.body.children.length,\n"
@@ -3757,6 +3900,14 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(got["writes"], ["one", "two"])
         self.assertEqual(got["html"], "two")
         self.assertEqual(got["coerced"], ["42", "string"])
+        # `textContent` reads back what was written and replaces the
+        # children, as the `innerHTML` setter does: the card's header is
+        # retitled this way on every poll tick, so "the buttons beside the
+        # title survive it" has to be drivable rather than argued. And an
+        # `innerHTML` write leaves no text behind, because this harness
+        # does not parse the markup it is given.
+        self.assertEqual(got["titled"], ["parrot", "parrot", 0, True])
+        self.assertEqual(got["afterHtml"], ["", "<b>x</b>"])
         # A browser node has `parentNode` and `parentElement`, never `parent`.
         self.assertEqual(got["reparented"], [0, 1, True, True, True, False])
         self.assertEqual(got["afterRemove"], [1, 0, True, True, True])
@@ -5144,11 +5295,45 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertIsNone(got["card"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_taking_the_card_down_takes_the_park_with_it(self):
+        # The other half of the invariant the test above pins: no card
+        # without a visible column, and no park without a card. Nothing
+        # reaches teardown while parked today -- the ✕ is inside the card
+        # and a hidden card has no clickable buttons -- so this is here to
+        # keep it true for the next caller, which is how the parked flag
+        # would otherwise come to say "parked" over the next card drawn.
+        got = self._node(
+            "opshellSession = 'sid';\n"
+            "els['content'] = el('content');\n"
+            "els['main'] = el('main'); els['main'].appendChild(els['content']);\n"
+            "els['sidebar'] = el('sidebar');\n"
+            "await showOperatorShell();\n"
+            "opshellMinimise();\n"
+            "const parked = els['sidebar'].children.length;\n"
+            "await opshellTeardown(document.getElementById('opshell-card'));\n"
+            "console.log(JSON.stringify({parked,"
+            " minimised: opshellMinimised,"
+            " left: els['sidebar'].children.length,"
+            " shown: els['content'].style.display,"
+            " card: document.getElementById('opshell-card')}));")
+        self.assertEqual(got["parked"], 1)
+        self.assertFalse(got["minimised"])
+        self.assertEqual(got["left"], 0, "a parked card outlived its card")
+        self.assertEqual(got["shown"], "")
+        self.assertIsNone(got["card"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_card_names_the_device_once_the_state_does(self):
         # The header row's job is to say which device this is. Until the
         # state names one it says what the card is; the buttons beside the
         # title are not touched. The harness does not parse markup, so the
         # title is registered by hand, as `#opshell-body` could not be.
+        #
+        # And a tick that changes nothing writes nothing: assigning
+        # `textContent` replaces the node's text even when the string is
+        # identical, which in a browser drops a selection the operator made
+        # in the header -- every two seconds. What the harness can show is
+        # the write itself, through what a write destroys.
         got = self._node(
             "els['opshell-body'] = el('opshell-body');\n"
             "els['opshell-title'] = el('opshell-title');\n"
@@ -5156,13 +5341,23 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "els['opshell-title'].textContent = 'Operator Shell';\n"
             "replies = [{ok:true, status:200, body:{state:'live',"
             " channel:'open', host:'parrot', sessions:0}},"
+            " {ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot', sessions:0}},"
             " {ok:true, status:200, body:{state:'idle', channel:'closed'}}];\n"
             "await opshellPoll();\n"
             "const named = els['opshell-title'].textContent;\n"
+            "const mark = document.createElement('b');\n"
+            "els['opshell-title'].appendChild(mark);\n"
             "await opshellPoll();\n"
-            "console.log(JSON.stringify({named,"
+            "const unchanged = [els['opshell-title'].textContent,"
+            " mark.parentNode !== null];\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({named, unchanged,"
             " after: els['opshell-title'].textContent}));")
         self.assertEqual(got["named"], "parrot")
+        self.assertEqual(got["unchanged"], ["parrot", True],
+                         "the title was rewritten with the string it "
+                         "already had")
         self.assertEqual(got["after"], "Operator Shell")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
@@ -5190,6 +5385,247 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             self.assertEqual(got["polled"], 0, why)
             self.assertEqual(len(got["warned"]), 1, why)
             self.assertIn("Operator Shell", got["warned"][0])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_minimising_keeps_the_body_so_the_heartbeat_keeps_beating(self):
+        """`opshellPoll` returns when `#opshell-body` is missing, and that
+        poll is the claim's heartbeat. Taking the card apart would let the
+        240-second lapse fire under a parked session."""
+        got = self._node(
+            "opshellSession = 'sid';\n"
+            "els['opshell-card'] = el('opshell-card');\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['sidebar'] = el('sidebar'); els['content'] = el('content');\n"
+            "els['content'].style.display = 'none';\n"
+            "opshellMinimise();\n"
+            "nextReply = {ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot'}};\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({minimised: opshellMinimised,"
+            " hidden: els['opshell-card'].style.display,"
+            " column: els['content'].style.display,"
+            " polls: posted.filter(p => p.url.includes('/state')).length,"
+            " carries: posted[0] && posted[0].url.includes('session=')}));")
+        self.assertTrue(got["minimised"])
+        self.assertEqual(got["hidden"], "none")
+        self.assertEqual(got["column"], "",
+                         "a parked shell left the content column blank")
+        self.assertEqual(got["polls"], 1)
+        self.assertTrue(got["carries"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_reload_comes_back_parked_and_as_one_card(self):
+        """Review Focus 1."""
+        got = self._node(
+            "sessionStorage.setItem(opshellStore, 'kept');\n"
+            "sessionStorage.setItem(opshellStore + '_min', '1');\n"
+            "els['main'] = el('main');\n"
+            "els['sidebar'] = el('sidebar'); els['content'] = el('content');\n"
+            "els['main'].appendChild(els['content']);\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot', sessions:1}}];\n"
+            "await opshellResume();\n"
+            "console.log(JSON.stringify({minimised: opshellMinimised,"
+            " parked: els['sidebar'].children.length,"
+            " cards: els['main'].children.filter(c =>"
+            " c.classList.contains('opshell-card')).length}));")
+        self.assertTrue(got["minimised"])
+        self.assertEqual(got["parked"], 1)
+        self.assertEqual(got["cards"], 1, "a reload drew two cards")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_session_that_ended_while_parked_says_so(self):
+        got = self._node(
+            "opshellLast = {duration: 92};\n"
+            "const html = opshellParked({state:'closed', channel:'closed',"
+            " host:'parrot'});\n"
+            "console.log(JSON.stringify({html}));")
+        self.assertRegex(got["html"], r"(?i)session ended")
+        self.assertIn("92", got["html"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_parked_card_does_not_claim_an_end_another_tab_refused(self):
+        """Review Focus 4.
+
+        Two tabs are two claims. The other tab's close answers "not the
+        last", the channel stays up, and this parked card must keep saying
+        the channel is open rather than announcing an end that did not
+        happen.
+        """
+        got = self._node(
+            "opshellLast = null;\n"
+            "const html = opshellParked({state:'live', channel:'open',"
+            " host:'parrot', reason:'another view is holding this channel'});\n"
+            "console.log(JSON.stringify({html}));")
+        self.assertNotRegex(got["html"], r"(?i)session ended")
+        self.assertRegex(got["html"], r"(?i)open")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_header_glyph_restores_a_parked_card(self):
+        """[added] `showOperatorShell` returns when `#opshell-card` exists,
+        and a parked card exists. Without this the operator presses the
+        glyph and nothing happens."""
+        got = self._node(
+            "opshellSession = 'sid';\n"
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['sidebar'] = el('sidebar');\n"
+            "els['main'].appendChild(els['content']);\n"
+            "await showOperatorShell();\n"
+            "opshellMinimise();\n"
+            "const parkedAfterMin = els['sidebar'].children.length;\n"
+            "await showOperatorShell();\n"
+            "console.log(JSON.stringify({parkedAfterMin,"
+            " minimised: opshellMinimised,"
+            " card: document.getElementById('opshell-card').style.display,"
+            " column: els['content'].style.display,"
+            " parked: els['sidebar'].children.length,"
+            " cards: els['main'].children.filter(c =>"
+            " c.classList.contains('opshell-card')).length}));")
+        self.assertEqual(got["parkedAfterMin"], 1)
+        self.assertFalse(got["minimised"], "the glyph did not restore")
+        self.assertEqual(got["card"], "")
+        self.assertEqual(got["column"], "none")
+        self.assertEqual(got["parked"], 0, "the parked card stayed behind")
+        self.assertEqual(got["cards"], 1)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_parked_card_survives_the_agent_list_being_rebuilt(self):
+        """[added] `refreshAgents` assigns `#agent-list.innerHTML` every
+        three seconds. That is the reason the parked card goes after the
+        list rather than inside it, and the harness can now drive it
+        instead of leaving it to be argued about."""
+        got = self._node(
+            "opshellSession = 'sid';\n"
+            "els['opshell-card'] = el('opshell-card');\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['sidebar'] = el('sidebar');\n"
+            "els['agent-list'] = el('agent-list');\n"
+            "els['sidebar'].appendChild(els['agent-list']);\n"
+            "els['content'] = el('content');\n"
+            "opshellMinimise();\n"
+            "const before = els['sidebar'].children.length;\n"
+            "els['agent-list'].innerHTML = '<div class=\"agent-card\">a</div>';\n"
+            "console.log(JSON.stringify({before,"
+            " after: els['sidebar'].children.length,"
+            " inList: els['agent-list'].children.length}));")
+        self.assertEqual(got["before"], 2, "list plus parked card")
+        self.assertEqual(got["after"], 2,
+                         "the agent list's rebuild took the parked card")
+        self.assertEqual(got["inList"], 0)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_parked_card_keeps_telling_the_truth_about_the_channel(self):
+        """[added] The parked label is the only thing on screen while the
+        card is hidden. A label written once and never refreshed would go
+        on saying `open` after the channel dropped -- the lying interface
+        this whole feature exists to avoid."""
+        got = self._node(
+            "opshellSession = 'sid';\n"
+            "els['opshell-card'] = el('opshell-card');\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['sidebar'] = el('sidebar'); els['content'] = el('content');\n"
+            "opshellMinimise();\n"
+            "const parked = els['sidebar'].children[0];\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot'}},"
+            " {ok:true, status:200, body:{state:'live',"
+            " channel:'closed', host:'parrot'}}];\n"
+            "await opshellPoll();\n"
+            "const first = parked.innerHTML;\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({first, second: parked.innerHTML}));")
+        self.assertRegex(got["first"], r"(?i)open")
+        self.assertNotEqual(got["first"], got["second"],
+                            "the parked label never refreshed")
+        self.assertNotRegex(got["second"], r"(?i)\bopen\b")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_parked_card_is_a_button(self):
+        """[added] `design:187`: a `<button>`, not a div with an `onclick`.
+        The header glyph was already corrected from stray text to a button
+        once, in the operator's own commit `ca65f70`."""
+        parked = self.js_function("opshellParked")
+        self.assertIn("<button", parked)
+        self.assertNotIn("<div onclick", parked)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_session_that_ended_before_the_server_caught_up_says_so_too(self):
+        # The other half of Review Focus 4, and the one a mutation walked
+        # through: keying the parked label off the *state* instead of off
+        # `opshellLast` survives both tests above, because the poll only
+        # ever merges `closed` when `opshellLast` is set. It is wrong the
+        # moment `exit` ends a parked session -- the stop is queued and the
+        # server goes on reporting the channel open until the next
+        # check-in, which is minutes away -- and the parked card would
+        # spend those minutes saying the shell is there.
+        got = self._node(
+            "opshellLast = {duration: 7};\n"
+            "const html = opshellParked({state:'live', channel:'open',"
+            " host:'parrot'});\n"
+            "console.log(JSON.stringify({html}));")
+        self.assertRegex(got["html"], r"(?i)session ended")
+        self.assertIn("7", got["html"])
+        self.assertNotRegex(got["html"], r"(?i)channel open")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_card_the_operator_left_open_does_not_come_back_parked(self):
+        # The minimised flag is remembered beside the session id, so it
+        # dies with it. A session that ended while parked leaves the flag
+        # behind: `opshellResume` then finds no id, draws nothing and never
+        # reaches it, so the only thing that can clear it is the next
+        # session that starts -- and without that, the next reload parks a
+        # card the operator was working in.
+        got = self._node(
+            "sessionStorage.setItem(opshellStore + '_min', '1');\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['opshell-agent'] = el('opshell-agent');\n"
+            "nextReply = {ok:true, status:200, body:{session:'new-one'}};\n"
+            "await opshellOpen();\n"
+            "const stale = sessionStorage.getItem(opshellStore + '_min');\n"
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['sidebar'] = el('sidebar');\n"
+            "els['main'].appendChild(els['content']);\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot', sessions:1}}];\n"
+            "await opshellResume();\n"
+            "console.log(JSON.stringify({stale, session: opshellSession,"
+            " minimised: opshellMinimised,"
+            " parked: els['sidebar'].children.length}));")
+        self.assertIsNone(got["stale"])
+        self.assertEqual(got["session"], "new-one")
+        self.assertFalse(got["minimised"],
+                         "a reload parked a card the operator left open")
+        self.assertEqual(got["parked"], 0)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_page_with_nowhere_to_park_keeps_the_card(self):
+        # Minimise is reached from the card's own header, so a throw here
+        # would be a dead button and not the dead page the mount-point
+        # guard above is about. What it must not do is hide the card with
+        # no parked entry beside it: that is a root shell running with
+        # nothing on screen and nothing to press, which is the state this
+        # whole feature exists to make impossible.
+        got = self._node(
+            "const warned = []; console.warn = m => warned.push(String(m));\n"
+            "opshellSession = 'sid';\n"
+            "els['opshell-card'] = el('opshell-card');\n"
+            "els['opshell-card'].style.display = '';\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['content'] = el('content');\n"
+            "els['content'].style.display = 'none';\n"
+            "let threw = null;\n"
+            "try { opshellMinimise(); } catch(e) { threw = String(e); }\n"
+            "console.log(JSON.stringify({threw, warned,"
+            " minimised: opshellMinimised,"
+            " card: els['opshell-card'].style.display,"
+            " column: els['content'].style.display}));")
+        self.assertIsNone(got["threw"])
+        self.assertFalse(got["minimised"])
+        self.assertEqual(got["card"], "", "the card was hidden with no "
+                                          "parked entry to bring it back")
+        self.assertEqual(got["column"], "none")
+        self.assertEqual(len(got["warned"]), 1)
+        self.assertIn("Operator Shell", got["warned"][0])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_non_ascii_keystrokes_survive_the_encoding(self):

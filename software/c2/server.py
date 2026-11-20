@@ -4688,6 +4688,28 @@ header .info{font-size:11px;color:var(--text2)}
 .opshell-ctl:hover{color:var(--text);background:rgba(255,26,26,0.12)}
 #opshell-body{flex:1;min-height:0;overflow:auto;padding:12px 16px}
 
+/* The card, parked.
+   The dock sits in the sidebar under .agent-list and never inside it:
+   `refreshAgents` assigns #agent-list.innerHTML every three seconds, which
+   takes every child of the list with it, so a parked card tidied in there
+   would vanish at the next refresh and leave the hidden card with nothing
+   to bring it back. flex:none, because .agent-list is the flex:1 that eats
+   the column.
+   The border is --red-dim, which is also .agent-card.active's (:4295), so
+   this is told from a selected agent by spanning the sidebar edge to edge
+   with no radius -- a tray under the list rather than a row in it -- by
+   the >_ glyph, by its monospace, and by having no status dot. Its
+   background is the panel grey and not the selected card's red tint, for
+   the same reason. Seen side by side in the browser against a selected
+   agent, which is the only place that comparison can be made. */
+.opshell-dock{flex:none}
+.opshell-parked{
+  display:flex;align-items:center;gap:8px;width:100%;text-align:left;
+  padding:10px 12px;border:1px solid var(--red-dim);border-radius:0;
+  background:var(--surface2);cursor:pointer;
+  font-family:var(--mono);font-size:11px;color:var(--text);
+}
+
 /* Notification bell */
 .bell-wrap{position:relative;margin-left:8px}
 .bell-btn{
@@ -8442,6 +8464,13 @@ let opshellKeys = "";
 let opshellFlushing = false;
 let opshellTrouble = "";
 let opshellNoted = "";
+// Whether the card is parked in the sidebar rather than shown. Hidden and
+// not taken down: see `opshellMinimise`.
+let opshellMinimised = false;
+// The last state `opshellPoll` read. Its one reader is `opshellMinimise`,
+// which draws the parked label from it: a label drawn from nothing would
+// say "channel unknown" for two seconds over a channel that is open.
+let opshellSeen = null;
 // Where this tab remembers the session it is holding, so a reload can put
 // the card back instead of leaving a live root shell on the device with
 // nothing on screen. `sessionStorage` and not `localStorage`: it is per
@@ -8469,6 +8498,13 @@ function opshellRemember(session){
   // load.
   if(session) sessionStorage.setItem(opshellStore, session);
   else sessionStorage.removeItem(opshellStore);
+  // The minimised flag is the "beside it" key the comment above promises
+  // to clear, and it is cleared on both branches: a session that starts or
+  // ends is a card that is open or gone, never a parked one. Left standing
+  // after an end, it would bring the next reload back parked onto nothing;
+  // left standing after a disowned id, it would park the next session the
+  // operator opened with the card in front of them.
+  sessionStorage.removeItem(opshellStore + "_min");
 }
 
 function opshellRecall(){
@@ -8515,6 +8551,12 @@ async function opshellResume(){
   // the Attach button by whether this page holds a session, and the poll
   // inside the card puts the id in its own query string.
   await showOperatorShell();
+  // And it comes back in the state it was left in. Here rather than after
+  // the attach below, which does not return until the stream ends; the
+  // poll inside `showOperatorShell` has already started the attach in the
+  // usual case, so the terminal is opened into a card that is still
+  // visible and then hidden, and not opened into a hidden one.
+  if(sessionStorage.getItem(opshellStore + "_min")) opshellMinimise();
   // That poll attaches by itself when it finds the terminal host, and it
   // sets `opshellAttached` before its first await -- so this is the other
   // order, not a second terminal on the same session.
@@ -8541,7 +8583,13 @@ async function showOperatorShell(){
   //
   // The header button is reachable while the card is up, since the card is
   // no longer a modal: a second press must not draw a second `#opshell-body`.
-  if(document.getElementById("opshell-card")) return;
+  if(document.getElementById("opshell-card")){
+    // A parked card is still a card, so returning here would make the
+    // header's `>_` a button that does nothing precisely when the operator
+    // is pressing it to get the shell back. It brings the card back.
+    if(opshellMinimised) opshellRestore();
+    return;
+  }
   const main = document.querySelector(".main");
   const content = document.querySelector("#content");
   // `opshellResume` calls this from the startup branch beside the agent
@@ -8584,6 +8632,112 @@ async function opshellClose(ev){
   return opshellTeardown(document.getElementById("opshell-card"));
 }
 
+function opshellMinimise(ev){
+  // The `_`. The card is hidden and **not taken down**: `opshellPoll`
+  // returns when `#opshell-body` is missing, and that poll is the claim's
+  // heartbeat. A minimise that removed the card would stop the beat, and
+  // the 240-second lapse would then retire the session -- stopping the
+  // channel on the device under an operator who believes their shell is
+  // parked and waiting, with the stream and everything in the terminal's
+  // buffer gone with it. `ev` is unused, as in `opshellClose`: the
+  // parameter is the `onclick="opshellMinimise(event)"` shape.
+  const card = document.getElementById("opshell-card");
+  // The sidebar, after `.agent-list` and never inside it: `refreshAgents`
+  // assigns `#agent-list.innerHTML` every three seconds, which takes every
+  // child of the list with it, so a parked card tidied in there would
+  // vanish at the next refresh and leave the hidden card with nothing to
+  // bring it back.
+  const sidebar = document.querySelector(".sidebar");
+  if(!card || !sidebar){
+    // Nothing is hidden until there is somewhere to park it: a hidden card
+    // with no parked entry beside it is a root shell running with nothing
+    // on screen. Only the page's own markup changing can get here, so the
+    // console is the only place that can say why.
+    console.warn("Operator Shell: no " + (card ? ".sidebar" : "#opshell-card")
+      + " in the page, so there is nowhere to park the card");
+    return;
+  }
+  opshellMinimised = true;
+  // Beside the session id, under that key's own prefix, so a reload comes
+  // back parked rather than open over the work. Cleared with the id in
+  // `opshellRemember`.
+  sessionStorage.setItem(opshellStore + "_min", "1");
+  card.style.display = "none";
+  // And the column the card took is given back, the way `opshellTeardown`
+  // gives it back: `renderAgentView` keeps writing into `#content` whether
+  // it is visible or not, so a parked shell over a hidden column is the
+  // blank page that cost this branch a Critical once already.
+  const content = document.querySelector("#content");
+  if(content) content.style.display = "";
+  const dock = document.createElement("div");
+  dock.id = "opshell-dock";
+  dock.classList.add("opshell-dock");
+  // Drawn from the last state the poll read, so the label is right from
+  // the moment it appears; the poll rewrites it every two seconds.
+  dock.innerHTML = opshellParked(opshellSeen);
+  sidebar.appendChild(dock);
+}
+
+function opshellRestore(ev){
+  // The parked card's own button, and the header's `>_` while the card is
+  // parked, both arrive here. `ev` is unused, as above.
+  const card = document.getElementById("opshell-card");
+  opshellMinimised = false;
+  sessionStorage.removeItem(opshellStore + "_min");
+  const dock = document.getElementById("opshell-dock");
+  if(dock) dock.remove();
+  // A restore with no card to show hides nothing. Hiding `#content` with
+  // nothing over it is the blank column by the other door.
+  if(!card) return;
+  card.style.display = "";
+  const content = document.querySelector("#content");
+  if(content) content.style.display = "none";
+}
+
+function opshellParked(state){
+  // What the parked card says, rewritten on every poll tick: it is the
+  // only thing on screen while the card is hidden, so a label written once
+  // would go on saying `open` long after the channel dropped.
+  state = state || {};
+  // `opshellLast` is this page's own record of a session that ended --
+  // `opshellEndSession` stashes the duration there -- and it is the only
+  // thing that may say the session is over. A second tab's close comes
+  // back "not the last session" with the channel still up, and a parked
+  // card announcing an end that did not happen is the overclaim this whole
+  // view exists to avoid.
+  const ended = !!opshellLast;
+  const secs = ended ? opshellLast.duration : null;
+  // Not `opshellRender`'s mapping, which folds everything that is not
+  // `open` or `unknown` into `closed`: that one is handed a state the
+  // server sent, and this one can be drawn before the first poll has
+  // answered. What it has not been told is `unknown`, not `closed`.
+  const chan = state.channel === "open" ? "open"
+             : state.channel === "closed" ? "closed" : "unknown";
+  const line = ended
+    ? ("session ended" + (secs === null || secs === undefined
+       ? "" : " \u00b7 " + esc(secs) + "s"))
+    : ("channel " + chan);
+  // A button, not a div with an onclick: the header's glyph was corrected
+  // from stray text to a button once already (ca65f70).
+  return '<button class="opshell-parked"'
+    // The red border is the selected agent's, so it goes when the session
+    // does: what is left is a remnant to dismiss, not a live shell.
+    + (ended ? ' style="border-color:var(--border)"' : '')
+    + ' title="' + (ended ? 'Show what the session left'
+                          : 'Restore the shell')
+    + '" onclick="opshellRestore(event)">'
+    + '<span class="opshell-glyph">&gt;'
+    // The cursor blinks while the shell is alive and stands still when it
+    // is not.
+    + (ended ? '_' : '<span class="opshell-cursor">_</span>')
+    + '</span>'
+    + '<span style="flex:1;min-width:0;overflow:hidden;'
+    + 'text-overflow:ellipsis;white-space:nowrap">'
+    + esc(state.host || state.target || "operator shell")
+    + '<span style="display:block;color:var(--text2)">' + line + '</span>'
+    + '</span></button>';
+}
+
 async function opshellEndSession(){
   // One releaser on this side, as there is one on the server's: the ✕
   // (through `opshellClose`), `exit`, and the End button all arrive here. The
@@ -8617,6 +8771,10 @@ async function opshellEndSession(){
   // standing because the terminal never opened would announce a new shell
   // to a session that has nothing before it.
   opshellFresh = false;
+  // And the last state read, so a card parked after this draws what
+  // `opshellLast` says -- the session ended, and how long it lasted --
+  // rather than the host and channel of the session that just went.
+  opshellSeen = null;
   if(opshellAbort){
     // The stream outlived the view otherwise: the bridge, the pty, one of
     // the shell port's slots, the transcript and a worker thread all
@@ -8677,6 +8835,14 @@ function opshellTeardown(card){
   // Otherwise reopening the panel an hour later still says "the session
   // lasted 92s" above the picker.
   opshellLast = null;
+  // The park goes with the card. No reachable path takes a card down while
+  // it is parked -- the ✕ lives inside the card, and a `display:none` card
+  // has no clickable buttons -- but a dock left standing would be a button
+  // pointing at a card that is gone, and the flag would say parked over
+  // the next card that opens.
+  opshellMinimised = false;
+  const dock = document.getElementById("opshell-dock");
+  if(dock) dock.remove();
   if(card) card.remove();
   // Where the card comes down and not in the caller: a card gone with
   // `#content` still hidden is a blank column that agent clicks keep
@@ -8691,7 +8857,13 @@ function opshellRetitle(state){
   // says what the card is until then. Only the title is written: the
   // buttons beside it are not rebuilt.
   const title = document.querySelector(".opshell-title");
-  if(title) title.textContent = (state && state.host) || "Operator Shell";
+  if(!title) return;
+  const next = (state && state.host) || "Operator Shell";
+  // And only when it changed. Assigning `textContent` replaces the node's
+  // text even when the string is the same, which drops a selection the
+  // operator made in the header -- every two seconds, for as long as the
+  // card is open.
+  if(title.textContent !== next) title.textContent = next;
 }
 
 async function opshellPoll(){
@@ -8759,6 +8931,13 @@ async function opshellPoll(){
     // the remnant belongs to the page that ran the session anyway.
     state = Object.assign({}, state, opshellLast, {state: "closed"});
   }
+  opshellSeen = state;
+  // The parked label, while the card is hidden. It is the only thing the
+  // operator can see of a parked session, so it is redrawn here with
+  // everything this tick learned -- a channel that dropped, a session that
+  // ended -- rather than written once at the minimise and left to rot.
+  const dock = document.getElementById("opshell-dock");
+  if(dock) dock.innerHTML = opshellParked(state);
   if(!opshellAttached){
     body.innerHTML = opshellRender(state);
   } else {
