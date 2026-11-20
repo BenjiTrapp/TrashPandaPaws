@@ -33,6 +33,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -46,6 +47,12 @@ from flask import Flask, request, jsonify, send_file, send_from_directory, Respo
 # all.
 from software.c2.listeners.errors import SupervisorError
 
+# The operator shell's server-side logic: the claim and its ownership
+# record, the two tunnel tasks, and the bridge to the shell port. A module
+# of its own because none of it is web-facing, and because `_log_event`
+# living here is what keeps the dependency one-way -- see `opshell_queue`.
+from software.c2 import opshell
+
 # The second artifact shape. The templates live beside the startup hook
 # in `stagers/` rather than here, because nothing in that package may
 # import this one: `tools/build_interpreter_bundle.py` is its other
@@ -54,10 +61,12 @@ from software.c2.stagers.stager import drop_list, render_stager
 from werkzeug.serving import generate_adhoc_ssl_context, make_server
 
 try:
-    from software.c2.beacon import decode_key, persistence_name
+    from software.c2.beacon import (decode_key, persistence_name,
+                                    SHELL_DEFAULT_COLS, SHELL_DEFAULT_ROWS)
 except ImportError:
     # The container ships server.py and beacon.py side by side, not as a package.
-    from beacon import decode_key, persistence_name
+    from beacon import (decode_key, persistence_name,
+                        SHELL_DEFAULT_COLS, SHELL_DEFAULT_ROWS)
 
 # The rescue record's format. Shared with the DNS listener; the beacon
 # carries a copy, because the generator serves it as source text.
@@ -840,6 +849,222 @@ def _tunnel_row(row: dict) -> dict:
 _AGENT_SOCKET_ENDPOINTS = frozenset({"beacon_handler", "api_dns_tasking"})
 
 
+# ── The operator shell ──
+#
+# One terminal, from the header of this interface onto the operator's own
+# hardware implant. The channel that carries it is raised and dropped with
+# `tunnel start` and `tunnel stop`, which are *tasks*: they take effect at
+# the implant's next check-in, up to a whole interval away. So opening and
+# closing are both requests with a delay, and the state below says which
+# of the four it is in rather than pretending either was instant.
+#
+# The anti-goal this code serves: a channel left open on the target while
+# the operator believes it closed. Every branch that refuses to queue a
+# stop keeps the claim on file so that something later will.
+# The pump's read slice, as a constant so a test can shorten it:
+# proving that a timeout does not end the stream otherwise costs a
+# real wait in a suite of three and a half thousand tests.
+_OPSHELL_READ_TIMEOUT = 5.0
+#: The most base64 one `/keys` request may carry. 256 KB of encoded text is
+#: about 192 KB of keystrokes -- far more than any paste a person makes, and
+#: far less than enough to hold a worker thread for the write timeout.
+_OPSHELL_MAX_KEYS = 256 * 1024
+_OPSHELL_OWNED = "opshell-owned.json"
+_OPSHELL_TARGET = "opshell-target.json"
+
+# session id -> opshell.Bridge. Module state beside `agents` and
+# `task_queues`, with the same lifetime, because a stream and the keystrokes
+# that feed it arrive as separate requests on separate threads.
+opshell_bridges = {}  # type: dict
+
+
+def _opshell_endpoint_row(tunnel_supervisor, agent_name):
+    """`(row, server_state)` for that agent's endpoint; row may be None.
+
+    A row exists only while the endpoint is connected: the identity is six
+    random bytes unrelated to the agent, and the link lives in the
+    channel's `implant_id` (see `_agent_for_implant`). So "no row" does not
+    mean "no channel" -- the agent's own check-in is the second source, and
+    `_opshell_agent_reports_tunnel` is where that is read.
+    """
+    if tunnel_supervisor is None:
+        return None, {}
+    state = tunnel_supervisor.status() or {}
+    if not agent_name:
+        # A guard, not a behaviour change: `_agent_for_implant` answers
+        # None for a row whose implant is not linked to an agent, so asking
+        # for None matched the first such row. Every caller passes a target
+        # today, which is what made this a trap rather than a defect.
+        return None, state
+    for row in state.get("endpoints") or []:
+        if _agent_for_implant(row.get("implant_id")) == agent_name:
+            return row, state
+    return None, state
+
+
+def _opshell_stop_in_flight(agent_name: str) -> bool:
+    """Whether a tunnel task is outstanding *and* can still be delivered.
+
+    The brake on the sweep, and it has to be able to let go. A history
+    entry leaves `pending` only when a result comes back, and nothing
+    expires it: a task whose result was lost -- the beacon died, the queue
+    was dropped by a restart, which it is, since `task_queues` is not
+    persisted -- would otherwise read as "already queued" for ever, and no
+    stop would ever be sent again. That is worse than queueing one stop
+    too many: the channel stays up and the view says `closing` for good.
+
+    So: still in the queue, or answered recently enough that an answer is
+    plausibly still coming. One interval, doubled for jitter, measured
+    from when the task was queued.
+    """
+    task = _tunnel_pending(agent_name)
+    if task is None:
+        return False
+    # `task_id` in a history entry, `id` in a queued task. Comparing the
+    # wrong pair made this always fall through to the age test, which is
+    # the slower and weaker half of the answer.
+    task_id = task.get("task_id") or task.get("id")
+    for queued in task_queues.get(agent_name) or []:
+        if queued.get("id") == task_id:
+            return True
+    # "timestamp", not "queued": that is the key every history writer
+    # uses (`opshell.py:295`, `server.py:1188`, `:1620`, `:3357`). Reading
+    # the queue's name here made the parse raise and the age window never
+    # fire -- the same class of mistake as the `id`/`task_id` mix-up this
+    # replaced, and found the same way.
+    stamped = task.get("timestamp") or task.get("queued") or ""
+    interval = _as_int((agents.get(agent_name) or {}).get("interval"), 300)
+    try:
+        when = datetime.fromisoformat(stamped.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    age = (datetime.now(timezone.utc) - when).total_seconds()
+    return age < interval * 2
+
+
+def _opshell_stop_settled(agent_name: str, endpoint_row=None) -> bool:
+    """Whether the stop this view owed has demonstrably been carried out.
+
+    What releases ownership. Three things together, because any one of
+    them alone is a guess: the latest `tunnel` task was a `stop` and it has
+    been answered, there is no relay row for the agent, and the agent is
+    not reporting a running child. Until all three hold the stop stays
+    owed, which is the safe direction.
+    """
+    last = _opshell_last_tunnel(agent_name)
+    if last is None or (last.get("args") or "").strip() != "stop":
+        return False
+    if (last.get("status") or "") == "pending":
+        return False
+    if endpoint_row is not None:
+        # The relay still shows the endpoint connected, so the channel is
+        # up whatever the stop's answer said. The first version promised
+        # this check in its docstring and did not make it, which let a
+        # failed stop release the ownership that owed a retry.
+        return False
+    if _opshell_agent_reports_tunnel(agent_name):
+        return False
+    return True
+
+
+def _opshell_agent_reports_tunnel(agent_name: str) -> bool:
+    """Whether the agent itself last said its tunnel child was *running*.
+
+    The beacon puts its tunnel's state in its check-in, so this is true of
+    a channel whose relay is down -- which is exactly the case a `None`
+    endpoint row cannot speak for. Without it a relay outage would leave a
+    channel open for ever, because `may_stop` refuses a row it has not got.
+
+    `running`, and nothing else. A child that has exited is still reported,
+    deliberately: `{"pid", "running": False, "exit_code"}`
+    (`beacon.py:7067`), because "a child that has died is reported rather
+    than forgotten: that is the only signal an operator gets for a tunnel
+    that crashed, and it is what confirms a stop they asked for". So a pid
+    proves nothing. Reading one as "open" made every acknowledged stop
+    leave a channel this view believed was still up, and the glyph then
+    never queued another start.
+    """
+    info = agents.get(agent_name) or {}
+    tunnel = info.get("tunnel")
+    if not isinstance(tunnel, dict):
+        return False
+    return tunnel.get("running") is True
+
+
+def _opshell_started_pid(entry) -> Optional[int]:
+    """The pid a `tunnel start` reported, from its own output."""
+    match = re.search(r"pid (\d+)", (entry or {}).get("output") or "")
+    return int(match.group(1)) if match else None
+
+
+def _opshell_tunnel_reported_gone(agent_name: str, expect_pid=None) -> bool:
+    """Whether the agent's last check-in said *that* child has exited.
+
+    The other half of `_opshell_agent_reports_tunnel`, and not its
+    negation: "no report at all" means the beacon has never started a
+    child and says nothing about one this view asked for, while
+    `running: False` is the beacon confirming it is gone. The state uses
+    this to stop saying `waiting` or `closing` for ever.
+
+    `expect_pid` is what makes it safe to use after a start. The beacon
+    builds its check-in -- `info["tunnel"]` included -- *before* it runs
+    the tasks that check-in carries, so the report that arrives with a
+    start's answer still describes the previous child. Taken at face value
+    that read `idle` over a channel coming up, and said so for a whole
+    interval. A report about a different pid is a report about a different
+    child, and says nothing about this one.
+    """
+    info = agents.get(agent_name) or {}
+    tunnel = info.get("tunnel")
+    if not isinstance(tunnel, dict):
+        return False
+    if tunnel.get("running") is not False:
+        return False
+    if expect_pid is not None and tunnel.get("pid") != expect_pid:
+        return False
+    return True
+
+
+def _opshell_report_is_stale_for(agent_name: str, entry) -> bool:
+    """Whether the agent's tunnel report predates the answer to `entry`.
+
+    The beacon builds its check-in -- `info["tunnel"]` included -- before
+    it runs the tasks that check-in carries. So the report arriving with a
+    task's answer describes the state *before* that task ran, in both
+    directions: `running: False` beside a start's answer is the child that
+    came before it, and `running: True` beside a stop's answer is the child
+    the stop has just killed. Taken at face value the first said `idle`
+    over a channel coming up and the second said `live` for a whole
+    interval after a successful stop.
+    """
+    if entry is None or (entry.get("status") or "") == "pending":
+        return False
+    info = agents.get(agent_name) or {}
+    tunnel = info.get("tunnel")
+    if not isinstance(tunnel, dict):
+        return False
+    if ((entry.get("args") or "").strip() or "start") == "stop":
+        return tunnel.get("running") is True
+    expect = _opshell_started_pid(entry)
+    return expect is not None and tunnel.get("pid") != expect
+
+
+def _opshell_last_tunnel(agent_name: str):
+    """That agent's most recent `tunnel` history entry, or None.
+
+    `_tunnel_pending` answers "is one outstanding"; this answers "what was
+    the last one, and how did it end". The state needs both: a start the
+    beacon refused is neither pending nor open, and without this it looked
+    exactly like a channel on its way down.
+    """
+    for entry in reversed(history.get(agent_name) or []):
+        if entry.get("cmd") == "tunnel":
+            return entry
+    return None
+
+
+
+
 def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                server_config: Optional[dict] = None,
                operator_port: Optional[int] = None,
@@ -1439,6 +1664,598 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                        "agent confirms."
                        % (action, agent, expected, agent, interval)),
         })
+
+    # ── The operator shell ──
+    #
+    # Five routes the header's terminal view talks to. They queue the two
+    # tunnel tasks, bridge the browser to the shell port, and report a
+    # state that never claims more than it knows.
+
+    opshell_owned_path = data_dir / _OPSHELL_OWNED
+    opshell_target_path = data_dir / _OPSHELL_TARGET
+    # The claim is built once and kept; a damaged record is remembered as a
+    # reason rather than retried on every request.
+    _opshell = {"claims": None, "record_error": ""}
+
+    def opshell_claims():
+        """The claim store, or None when its record could not be read.
+
+        `opshell.Claims` raises on a damaged or unreadable record, and that
+        is deliberate: reading it as "owns nothing" would silently drop
+        every stop this server owes. But a team server that refuses to boot
+        because a scratch file was corrupted is the wrong trade -- so the
+        failure is caught here, once, and surfaces in the view's state as
+        `channel: unknown` with a reason the operator can act on.
+        """
+        if _opshell["claims"] is None and not _opshell["record_error"]:
+            try:
+                _opshell["claims"] = opshell.Claims(opshell_owned_path)
+            except opshell.OwnershipRecordError as exc:
+                _opshell["record_error"] = (
+                    "the operator shell's ownership record could not be "
+                    "read (%s), so a channel may be open on a device this "
+                    "server can no longer name; move the file aside to "
+                    "clear this" % exc)
+                logger.error("opshell: %s", _opshell["record_error"])
+        return _opshell["claims"]
+
+    def opshell_target():
+        try:
+            with open(opshell_target_path) as handle:
+                return (json.load(handle) or {}).get("agent") or None
+        except (OSError, ValueError):
+            return None
+
+    def opshell_remember(agent_name: str):
+        """Persist the designation, so the glyph opens onto the same host.
+
+        Separate from the ownership record on purpose: that one answers
+        "whose channel do we owe a stop for", this one answers "which host
+        did the operator point this view at", and conflating them would
+        make forgetting a channel forget the designation too.
+        """
+        # 0600, like its sibling. A hostname is not a secret, but "which
+        # host is the operator working on" does not belong to everyone with
+        # a login, and one of the two files being laxer than the other
+        # invites someone to relax the other to match.
+        tmp = opshell_target_path.with_suffix(".tmp")
+        handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(handle, "w") as out:
+            json.dump({"agent": agent_name}, out)
+        os.replace(tmp, opshell_target_path)
+
+    def opshell_queue(agent_name: str, action: str):
+        """Queue `tunnel <action>` and write the audit line for it.
+
+        `opshell.queue_tunnel` deliberately does not log: `_log_event`
+        lives here and calling it from that module would close an import
+        cycle. So the route is where an operator's action becomes findable
+        afterwards, the way `api_create_task` makes one findable.
+        """
+        task = opshell.queue_tunnel(agent_name, action, task_queues,
+                                    history, _now())
+        _log_event("TASK", "cmd=tunnel args=%s task_id=%s (operator shell)"
+                   % (action, task["id"]), agent_id=agent_name)
+        return task
+
+    def opshell_state(session_id=None):
+        """What the view renders. Four states, and no fifth that lies."""
+        claims = opshell_claims()
+        target = opshell_target()
+        reason = _opshell["record_error"]
+        out = {
+            "target": target,
+            "candidates": sorted(agents),
+            "state": "idle",
+            "sessions": 0,
+            "host": "",
+            "user": "",
+            "root": False,
+            "recording": False,
+            "transcript_dir": None,
+            "channel": "unknown" if _opshell["record_error"] else "closed",
+            # None, not the default pair: nothing has a geometry while
+            # nothing is open, and the default is what the *next* session
+            # would be given. Reported as "the geometry" it read as a fact
+            # about the device, and was honest only because the view sent
+            # back the same numbers it had just been handed.
+            "geometry": None,
+            "expected_checkin": None,
+            "reason": reason,
+        }
+        def _blind(why):
+            """An early answer that still reports a channel it can see.
+
+            The first version returned `idle` here, before it had looked at
+            the agent's own report -- so a supervisor removed under a live
+            channel, or a port range taken out of the configuration, made
+            the view say nothing was running while a child was.
+            """
+            out["reason"] = reason or why
+            if not target:
+                return out
+            if _opshell_agent_reports_tunnel(target):
+                out["channel"] = "open"
+                out["state"] = "live"
+                return out
+            # A task outstanding is a channel on its way, which this path
+            # used to call `idle`: a start queued before the port range was
+            # taken out of the configuration read as "nothing happening"
+            # while a child was coming up.
+            waiting = _tunnel_pending(target)
+            if waiting is not None:
+                action_now = (waiting.get("args") or "").strip() or "start"
+                out["state"] = "closing" if action_now == "stop" else "waiting"
+            return out
+
+        if tunnel_supervisor is None:
+            return _blind(_TUNNEL_UNCONFIGURED)
+        row, state = _opshell_endpoint_row(tunnel_supervisor, target)
+        if state.get("shell_port_first") is None:
+            return _blind(
+                "the tunnel server has no shell port range configured, so "
+                "it opens no shell port: set shell_port_first and "
+                "shell_port_last in the tunnel server's block")
+        # `shell_transcripts`, which is what `TunnelSupervisor.status()`
+        # reports. `shell_transcript_dir` is the *config* key it reads to
+        # build it, and asking the status for that name returned None every
+        # time -- so the Closed state named a transcript directory that was
+        # always absent, while the strip badged "recording" from a field
+        # that is real. Invisible because the fixture had invented the same
+        # wrong name: a typo checked against a typo, for the third time on
+        # this branch.
+        out["transcript_dir"] = state.get("shell_transcripts") or None
+        # The pair a live session actually sent, when there is one. The
+        # default below is what the *next* session would get, and reporting
+        # that as "the geometry" was honest only by coincidence: the view
+        # happened to send back the same numbers it had been given.
+        mine = opshell_bridges.get(session_id) if session_id else None
+        if mine is None:
+            # No session named, or one that is not streaming: any live
+            # bridge is still a better answer than the default, but the
+            # caller's own comes first. Taking the first of the dict
+            # returned another tab's pty for a caller that named its own.
+            others = [b for b in list(opshell_bridges.values())
+                      if b is not None]
+            mine = others[0] if others else None
+        if mine is not None:
+            out["geometry"] = list(mine.geometry)
+        if target is None:
+            return out
+        if target not in agents:
+            # Not "closed": nothing here has seen the channel go down. The
+            # agent leaving the fleet says nothing about the child process
+            # on it, and this view's rule is that it never reports a state
+            # it has not got.
+            out["channel"] = "unknown"
+            out["reason"] = reason or (
+                "%s is no longer in the fleet" % target)
+            return out
+
+        out["expected_checkin"] = opshell.expected_checkin(
+            agents.get(target) or {}, time.time())
+        # A device that has gone two of its own intervals past due cannot
+        # speak for its channel any more, and every conclusion below is
+        # drawn from its last report. Measured before this: an agent two
+        # hours overdue, still in the fleet, came back `state: live,
+        # channel: open` -- a positive claim about a device nothing had
+        # heard from, with the overdue number computed and rendered only in
+        # the waiting state. The operator's close then queued a stop that
+        # could never be delivered.
+        overdue = opshell.report_is_overdue(agents.get(target) or {},
+                                           time.time())
+        if claims is not None:
+            out["sessions"] = claims.sessions(target)
+        # No `owned` local: it was computed here and never read, and a dead
+        # name beside a rule this delicate invites someone to use it for
+        # the wrong question. `decide_stop` asks `claims.raised`, which is
+        # the question that decides a stop.
+
+        if overdue:
+            # The silence, not the lateness. The first version printed
+            # `-expected_checkin`, which is seconds *past due*, under the
+            # words "has not checked in for" -- so 7200 s of silence on a
+            # 300 s interval was reported as 6900, one whole interval out,
+            # and the documentation describes it as the silence.
+            seen = (agents.get(target) or {}).get("_last_seen_ts")
+            silent = time.time() - seen if isinstance(seen, (int, float)) \
+                and not isinstance(seen, bool) else None
+            out["channel"] = "unknown"
+            out["reason"] = reason or (
+                "%s has not checked in for %s, so nothing here can speak "
+                "for its channel. A shutdown cannot be delivered to a "
+                "device that is not calling home."
+                % (target, "%d seconds" % silent if silent is not None
+                   else "a while"))
+            if claims is not None:
+                out["sessions"] = claims.sessions(target)
+            # And it does not return: a queued start still has to read as
+            # `waiting`, or the operator sees nothing happen after the
+            # click and presses the button again, taking a fresh claim each
+            # time. Only the channel and the reason are the overdue
+            # device's to decide; what this view has *asked for* is still
+            # true, and `reason` is held so the branches below cannot
+            # overwrite it.
+            reason = out["reason"]
+            overdue_channel = True
+        else:
+            overdue_channel = False
+
+        pending = _tunnel_pending(target)
+        last = _opshell_last_tunnel(target)
+        refusal = _tunnel_refusal(target)
+        if refusal:
+            out["reason"] = reason or refusal
+
+        if row is not None:
+            out["host"] = row.get("hostname") or ""
+            out["user"] = row.get("user") or ""
+            out["root"] = row.get("user") == "root"
+            out["recording"] = bool(row.get("shell_recording"))
+            out["channel"] = "open"
+        elif _opshell_agent_reports_tunnel(target) and \
+                not _opshell_report_is_stale_for(target, last):
+            # The agent says its child is running even though the relay has
+            # no row for it. Open, and stoppable -- see
+            # `_opshell_agent_reports_tunnel`. Unless that report predates
+            # the answer to the last task, in which case it describes a
+            # child the task has already dealt with.
+            out["channel"] = "open"
+        elif not _opshell["record_error"]:
+            out["channel"] = "closed"
+
+        # The four states are read off the last tunnel task, not off
+        # ownership. Owning a channel says a stop is owed one day; it does
+        # not say one is on its way, and deriving `closing` from ownership
+        # alone showed "closing" to an operator who had just clicked open
+        # and whose start the beacon had refused.
+        action = ((last.get("args") or "").strip() or "start") if last else ""
+        if pending is not None:
+            out["state"] = "closing" if action == "stop" else "waiting"
+        elif out["channel"] == "open":
+            out["state"] = "live"
+        elif action == "stop":
+            # A stop that has been answered. The agent's own report is what
+            # ends this: once it says the child is gone, the channel is
+            # closed and saying "closing" for ever would be the same kind of
+            # overclaim in the other direction.
+            out["state"] = "idle" if _opshell_tunnel_reported_gone(target) \
+                else "closing"
+        elif refusal:
+            # The beacon refused the start. Not on its way anywhere, and
+            # the reason is already in `reason`.
+            out["state"] = "idle"
+        elif action == "start":
+            # Started, answered, and the relay has not shown a row yet --
+            # unless the agent has since reported the child gone, which is
+            # a start that died rather than one still arriving.
+            # The pid from the start's own output: a report about an older
+            # child must not be read as this one having died.
+            out["state"] = "idle" if _opshell_tunnel_reported_gone(
+                target, _opshell_started_pid(last)) else "waiting"
+        if overdue_channel:
+            # Whatever the state machine concluded about what was asked
+            # for, nothing here has heard from the device.
+            out["channel"] = "unknown"
+            out["reason"] = reason
+        return out
+
+    def opshell_sweep():
+        """Queue the stop for claims nobody is watching any more.
+
+        Driven by whatever request arrives, because a view that is gone
+        sends nothing. Brought forward from the next task: the routes were
+        written against a lapse that nothing performed, so several paths I
+        had argued were covered by it were covered by nothing.
+        """
+        claims = opshell_claims()
+        if claims is None:
+            return
+        rows, reports, pending, settled = {}, {}, {}, {}
+        # Only the agents this view owns a channel for. The first version
+        # walked the whole fleet, and since a check-in now drives the sweep
+        # that was one relay round trip per agent per check-in -- N agents
+        # cost about N squared round trips an interval, nearly all of it on
+        # agents that could not be swept at all.
+        for agent_name in set(claims.owned()):
+            row, _ = _opshell_endpoint_row(tunnel_supervisor, agent_name)
+            rows[agent_name] = row
+            reports[agent_name] = (
+                _opshell_agent_reports_tunnel(agent_name)
+                and not _opshell_report_is_stale_for(
+                    agent_name, _opshell_last_tunnel(agent_name)))
+            pending[agent_name] = _opshell_stop_in_flight(agent_name)
+            settled[agent_name] = _opshell_stop_settled(
+                agent_name, rows[agent_name])
+        for agent_name in opshell.sweep(claims, list(agents), rows, reports,
+                                        task_queues, history, _now(),
+                                        time.time(), pending, settled,
+                                        ):
+            # The task id, so the line can be tied to the task. The
+            # queue is read before the dispatcher can empty it.
+            last_task = (task_queues.get(agent_name) or [{}])[-1]
+            _log_event("TASK", "cmd=tunnel args=stop task_id=%s (operator "
+                               "shell: no view is watching this channel "
+                               "any more)" % last_task.get("id", "?"),
+                       agent_id=agent_name)
+
+    @app.route("/api/opshell/state", methods=["GET"])
+    @require_auth
+    def api_opshell_state():
+        claims = opshell_claims()
+        target = opshell_target()
+        session_id = request.args.get("session")
+        if claims is not None and target and session_id:
+            # The caller's own session, and only that one. Beating every
+            # registered session would let any open tab keep a dead tab's
+            # claim alive for ever, and the lapse is what turns an
+            # abandoned view into a queued stop.
+            claims.beat(target, session_id)
+        # After the beat, never before: a tab polling later than the grace
+        # would otherwise lapse itself on the very request that proves it
+        # is watching, and a hidden browser tab is throttled to about one
+        # poll a minute, which is exactly that edge.
+        opshell_sweep()
+        return jsonify(opshell_state(session_id))
+
+    @app.route("/api/opshell/open", methods=["POST"])
+    @require_auth
+    def api_opshell_open():
+        body = request.get_json(silent=True) or {}
+        agent_name = (body.get("agent") or opshell_target() or "").strip()
+        if not agent_name or agent_name not in agents:
+            return jsonify({"error": "no such agent",
+                            "refused": str(agent_name)[:64]}), 404
+        claims = opshell_claims()
+        if _opshell["record_error"]:
+            # `opshell_claims()` first, on purpose: the error is filled in
+            # lazily there, so checking the flag before calling it meant the
+            # very first request after a restart sailed past this guard and
+            # queued a start with nothing owning it.
+            #
+            # Refused rather than started: a channel raised now could not be
+            # recorded, and an unrecorded channel is one nothing will ever
+            # queue a stop for.
+            return jsonify({"error": _opshell["record_error"]}), 409
+        if tunnel_supervisor is None:
+            return jsonify({"error": _TUNNEL_UNCONFIGURED}), 409
+
+        state = tunnel_supervisor.status() or {}
+        if state.get("state") != "running" and state.get("can_control"):
+            # Allowed, and it costs the implant nothing: the tunnel server
+            # is a process on this host. The configuration file is not
+            # touched -- a missing shell port range is reported as a reason
+            # by `opshell_state`, not fixed behind the operator's back.
+            try:
+                state = tunnel_supervisor.start() or \
+                    tunnel_supervisor.status() or {}
+            except Exception as exc:  # SupervisorError and anything under it
+                logger.warning("opshell: could not start the tunnel server: "
+                               "%s", exc)
+                return jsonify({"error": "the tunnel server would not "
+                                         "start: %s" % exc}), 409
+        if state.get("shell_port_first") is None:
+            return jsonify({"error": "the tunnel server has no shell port "
+                                     "range configured, so it opens no "
+                                     "shell port"}), 409
+
+        opshell_remember(agent_name)
+        # The claim before the task, in that order. `Claims.open` saves the
+        # ownership record before it hands back a session, "so a channel is
+        # never started on the strength of a record that was not saved" --
+        # queueing first would mean a failed save left a start queued and
+        # nothing owning it.
+        # Whether this claim raises the channel or adopts one that is
+        # already up, decided *before* the claim so the record says which.
+        # Only a channel this view raised may be stopped: one child process
+        # on the device serves both the SOCKS port and the shell port.
+        row, _ = _opshell_endpoint_row(tunnel_supervisor, agent_name)
+        raising = (row is None
+                   and not _opshell_agent_reports_tunnel(agent_name)
+                   and _tunnel_pending(agent_name) is None)
+        session_id = claims.open(agent_name, raised=raising) \
+            if claims is not None else None
+        if raising:
+            # Not idempotent by itself: a second open while a start is
+            # outstanding must not queue another one.
+            opshell_queue(agent_name, "start")
+        answer = opshell_state()
+        answer["session"] = session_id
+        return jsonify(answer)
+
+    @app.route("/api/opshell/close", methods=["POST"])
+    @require_auth
+    def api_opshell_close():
+        body = request.get_json(silent=True) or {}
+        target = (body.get("agent") or opshell_target() or "").strip()
+        if not target:
+            return jsonify({"error": "nothing is open"}), 404
+        session_id = body.get("session")
+        if not session_id:
+            # Refused rather than treated as the last session. Without the
+            # id there is nothing to decrement, and assuming "last" let one
+            # tab's close queue a stop under another tab's live stream.
+            return jsonify({"error": "session is required: close the "
+                                     "session that open or stream gave "
+                                     "you"}), 400
+        claims = opshell_claims()
+        if claims is None:
+            # The ownership record is damaged, so this server cannot tell
+            # whose channel this is. `end_session` would read "no claims"
+            # as "that was the last session" and queue a stop under every
+            # other tab's stream. The bridge is still closed, because
+            # closing what this request names is always safe.
+            bridge = opshell_bridges.pop(session_id, None)
+            if bridge is not None:
+                bridge.close()
+            return jsonify({"error": _opshell["record_error"]}), 409
+        bridge = opshell_bridges.pop(session_id, None)
+        if bridge is not None:
+            bridge.close()
+        row, _ = _opshell_endpoint_row(tunnel_supervisor, target)
+        # One decision, in one place: `opshell.end_session` closes the
+        # session and, when it was the last, either queues the stop or says
+        # why it is still owed. Four callers used to decide this with
+        # different knowledge, and that is what produced two rounds of
+        # findings.
+        queued, _last, why = opshell.end_session(
+            claims, target, session_id, row,
+            _opshell_agent_reports_tunnel(target), task_queues, history,
+            _now())
+        if queued:
+            _log_event("TASK", "cmd=tunnel args=stop (operator shell, "
+                               "last session closed)", agent_id=target)
+        answer = opshell_state()
+        if not queued and why:
+            answer["reason"] = why
+        return jsonify(answer)
+
+    @app.route("/api/opshell/stream", methods=["GET"])
+    @require_auth
+    def api_opshell_stream():
+        target = opshell_target()
+        if not target or target not in agents:
+            return jsonify({"error": "nothing is open"}), 404
+        row, _ = _opshell_endpoint_row(tunnel_supervisor, target)
+        if row is None or not row.get("shell_port"):
+            return jsonify({"error": "no shell port on this endpoint"}), 409
+        claims = opshell_claims()
+        asked_first = request.args.get("session")
+        if claims is None or not (asked_first
+                                  and claims.holds(target, asked_first)):
+            # Checked before the dial, not after: a request that is going
+            # to be refused must not have sent the password, taken one of
+            # the port's four slots and possibly opened a transcript at the
+            # far end first.
+            return jsonify({"error": "open a session first: /api/opshell/"
+                                     "open hands back the session this "
+                                     "stream attaches to"}), 400
+        bridge = opshell.Bridge(row["shell_port"], row.get("shell_password")
+                                or "", _as_int(request.args.get("cols"),
+                                               SHELL_DEFAULT_COLS),
+                                _as_int(request.args.get("rows"),
+                                        SHELL_DEFAULT_ROWS))
+        try:
+            bridge.connect()
+        except OSError as exc:
+            # A failed connect leaves the bridge closed; a retry needs a
+            # new one, which the next request makes.
+            return jsonify({"error": "could not attach: %s"
+                                     % type(exc).__name__}), 502
+
+        # Borrowed, never created. The stream used to open a claim of its
+        # own when none was handed in, and then its cleanup had to decide
+        # whether the claim was "its" -- a flag that cannot survive the
+        # session changing hands, which is what a reconnect is. One creator
+        # (`/open`), one releaser (`/close` or the lapse), and the stream
+        # attaches a bridge to a session that already exists.
+        # Checked before the dial, above. `claims is None` means the
+        # ownership record is damaged, and the first version invented a
+        # session there -- which put the whole record-error mode outside
+        # the model: any tab's `/close` then counted as the last and
+        # stopped a channel under every other tab's stream.
+        session_id = asked_first
+        opshell_bridges[session_id] = bridge
+
+        def cleanup():
+            # The bridge, and nothing else. The claim belongs to whoever
+            # opened it; releasing it here is what lost an owed stop.
+            if opshell_bridges.get(session_id) is bridge:
+                del opshell_bridges[session_id]
+            bridge.close()
+
+        def pump():
+            try:
+                while True:
+                    if opshell_bridges.get(session_id) is not bridge:
+                        return
+                    if claims is not None and \
+                            not claims.holds(target, session_id):
+                        # The claim lapsed: the browser stopped asking. Let
+                        # go of the thread and the shell port's slot rather
+                        # than waiting for the shell to print something.
+                        return
+                    try:
+                        chunk = bridge.read(timeout=_OPSHELL_READ_TIMEOUT)
+                    except socket.timeout:
+                        # A quiet peer, not a finished one. Only b"" ends
+                        # the stream.
+                        continue
+                    except OSError as exc:
+                        # The tunnel went, rather than the shell exiting.
+                        # `Bridge.read` draws that distinction on purpose --
+                        # "a shell that exited and a tunnel that was lost
+                        # are not the same news" -- and catching only the
+                        # timeout threw it away: a reset raised out of the
+                        # generator and aborted the chunked response
+                        # mid-flight, so the browser saw a truncated body
+                        # and printed the same "session ended" that an
+                        # orderly `exit` prints.
+                        logger.info("opshell: stream %s lost its tunnel: %s",
+                                    session_id, exc)
+                        yield (b"\r\n\x1b[2m-- the tunnel was lost (%s). "
+                               b"The channel's shutdown is still owed and is "
+                               b"queued at the next check-in. --\x1b[0m\r\n"
+                               % str(exc).encode("utf-8", "replace"))
+                        return
+                    if not chunk:
+                        return
+                    yield chunk
+            finally:
+                cleanup()
+
+        answer = Response(pump(), mimetype="application/octet-stream",
+                          direct_passthrough=True)
+        # `finally` in the generator covers a stream that ran; this covers
+        # one that never started -- a HEAD request, or a client gone before
+        # the first chunk -- which would otherwise hold a bridge and a
+        # counted session with nothing to end them.
+        answer.call_on_close(cleanup)
+        answer.headers["X-Opshell-Session"] = session_id
+        answer.headers["X-Opshell-Geometry"] = "%dx%d" % bridge.geometry
+        return answer
+
+    @app.route("/api/opshell/keys", methods=["POST"])
+    @require_auth
+    def api_opshell_keys():
+        body = request.get_json(silent=True) or {}
+        # The ceiling before the lookup: it is the cheaper check, and it is
+        # the one that stops a request holding a worker thread.
+        raw = body.get("data") or ""
+        if not isinstance(raw, str):
+            # The ceiling below introduced this: `len()` on a number raises
+            # TypeError, which Flask turns into 500, where the base64
+            # decode's `except Exception` had answered 400.
+            return jsonify({"error": "data must be base64"}), 400
+        if len(raw) > _OPSHELL_MAX_KEYS:
+            # A ceiling above any paste a person makes, below anything that
+            # could hold a worker thread for the whole write timeout. No
+            # ceiling at all meant one request could occupy a thread for
+            # 15 seconds.
+            return jsonify({"error": "that is more than one write's worth of "
+                                     "keystrokes"}), 413
+        bridge = opshell_bridges.get(body.get("session"))
+        if bridge is None:
+            return jsonify({"error": "no such session"}), 404
+        try:
+            data = base64.b64decode(raw)
+        except Exception:
+            return jsonify({"error": "data must be base64"}), 400
+        try:
+            bridge.write(data)
+        except OSError as exc:
+            # Not fatal on its own: two of the far end's refusals are
+            # written from its accept loop before any prompt, so a bridge
+            # that was never accepted is holding text the operator needs to
+            # read. The stream carries it; this answer says so instead of
+            # reporting a broken pipe as the whole story.
+            if not bridge.accepted:
+                return jsonify({"refused": True,
+                                "detail": "the shell port refused this "
+                                          "session; its reason is on the "
+                                          "stream"}), 409
+            return jsonify({"error": type(exc).__name__}), 502
+        return jsonify({"written": len(data)})
 
     @app.route("/api/server/exec", methods=["POST"])
     @require_auth
@@ -2850,6 +3667,39 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             if agent_id and agent_id in agents:
                 agents[agent_id]["_last_request"] = req_meta
 
+            # The sweep's second driver, and the one that matters: a
+            # check-in is the moment a stop could actually be delivered,
+            # and it arrives whether or not a browser is open. Driven only
+            # from `/state`, a channel whose last tab is gone was never
+            # swept at all, and neither was one owed from before a restart.
+            #
+            # Wrapped, because nothing about this may change what a beacon
+            # sees: a prober must not be able to tell that it ran.
+            try:
+                # A wider grace, not an abstention. This driver carries
+                # no browser's heartbeat, and the first version drew the
+                # conclusion that it must therefore not judge liveness at
+                # all -- which made closing a browser the one way to leave
+                # a channel up for ever, because this is the only driver
+                # that arrives when no browser exists and the only moment a
+                # stop can be delivered. `opshell.LAPSE_GRACE` carries the
+                # reasoning for the number, and there is only one of them:
+                # a second, tighter margin on this view's own poll was the
+                # defect that followed, because a panel polling every two
+                # seconds then retired a hidden tab's session.
+                # Only a check-in. `register` and `result` arrive on the
+                # same route, and a busy agent posts many results per
+                # interval -- each one paying a relay round trip per owned
+                # agent for a claim that cannot have changed since the last
+                # one.
+                if action == "beacon":
+                    opshell_sweep()
+            except Exception as exc:
+                # Warning, not debug: this driver runs precisely when no
+                # browser is open, so a failure here is the one nobody
+                # would otherwise see.
+                logger.warning("opshell: sweep on check-in failed: %s", exc)
+
             if action == "register":
                 return _handle_register(payload, crypto)
             elif action == "beacon":
@@ -3036,6 +3886,10 @@ def _handle_register(payload: dict, crypto: ServerCrypto):
 
     for aid, info in agents.items():
         if info.get("id") == implant_id:
+            # A re-registration is a new beacon process, so whatever the
+            # old one last said about its tunnel child is about a child
+            # that no longer exists. `info.update` would have kept it.
+            info.pop("tunnel", None)
             info.update({
                 "hostname": payload.get("hostname", ""),
                 "os": payload.get("os", ""),
@@ -3194,6 +4048,23 @@ def _handle_beacon(payload: dict, crypto: ServerCrypto):
             agents[agent_id]["proxy_active"] = payload["proxy_active"]
         if payload.get("c2_profile") is not None:
             agents[agent_id]["c2_profile"] = payload["c2_profile"]
+        if payload.get("tunnel") is None and "tunnel" in agents[agent_id]:
+            # An absent key is authoritative: the beacon leaves it out
+            # when *this process* has never started a child
+            # (`beacon.py:5304`). Keeping the last report instead meant a
+            # target reboot left a dead `running: True` behind for ever --
+            # the view showed the channel open, `/open` never queued
+            # another start for that agent, and the close never settled, so
+            # stale ownership could later stop a teammate's pivot.
+            del agents[agent_id]["tunnel"]
+        if isinstance(payload.get("tunnel"), dict):
+            # The beacon has been sending this since the tunnel feature
+            # shipped (`beacon.py:5309`) and nothing stored it. The
+            # operator shell's whole second source for "is a channel still
+            # up" reads it: without this the fallback that was supposed to
+            # cover a relay outage was never true in production, and every
+            # test that exercised it set the field by hand.
+            agents[agent_id]["tunnel"] = payload["tunnel"]
 
         dispatched = _dispatch_for(agent_id)
         if dispatched is not None:
@@ -3353,6 +4224,12 @@ _OPERATOR_HTML = r"""<!DOCTYPE html>
 <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
 <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png">
 <link rel="apple-touch-icon" href="/static/favicon-128.png">
+<!-- The vendored terminal, pinned by hash in static/VENDOR.md. The script
+     is deferred, because the operator shell is opened from the header and
+     nothing on first paint needs it; the stylesheet is not, and saying so
+     is cheaper than a wrong comment on 7 KB served locally. -->
+<link rel="stylesheet" href="/static/xterm.css">
+<script src="/static/xterm.js" defer></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -3763,6 +4640,103 @@ header .info{font-size:11px;color:var(--text2)}
   color:var(--text2);transition:color 0.15s;padding:4px;margin-left:8px;
 }
 .topbar-ico-btn:hover{color:var(--text)}
+
+/* The Operator Shell's glyph.
+   Every other button in this bar is a colour emoji. This one was two bare
+   characters -- U+25AE and an underscore -- which took the bar's grey from
+   `color` and sat on the 18px line box's baseline, so between a plug and a
+   diamond it read as stray text rather than a button.
+   It is not made into an emoji because it is not another tool: it is the
+   only terminal in the header, and the page's own monospace and red say so.
+   The size is set here rather than inherited, because the button's 18px is
+   an emoji size and this is type. */
+.opshell-glyph{
+  display:inline-block;vertical-align:middle;
+  font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:0.5px;
+  color:#ff4d4d;border:1px solid rgba(255,26,26,0.45);border-radius:3px;
+  padding:3px 4px 3px 3px;background:rgba(255,26,26,0.08);
+  transition:color 0.15s,border-color 0.15s,background 0.15s;
+}
+.topbar-ico-btn:hover .opshell-glyph{
+  color:#ff6b6b;border-color:rgba(255,26,26,0.8);background:rgba(255,26,26,0.16);
+}
+.opshell-cursor{animation:opshell-blink 1.1s steps(1) infinite}
+@keyframes opshell-blink{50%{opacity:0}}
+/* A blinking element is what this query exists for, and the glyph still
+   reads as a prompt standing still. */
+@media (prefers-reduced-motion:reduce){
+  .opshell-cursor{animation:none}
+}
+
+/* The Operator Shell's card.
+   A flex sibling of .content inside .main, and .content is hidden while it
+   is there: .main is a row holding the 260px agent list beside .content, so
+   a layer positioned over .main would cover the list this layout keeps
+   clickable, and two flex:1 siblings would split the column in half. */
+.opshell-card{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+.opshell-chrome{
+  display:flex;align-items:center;gap:10px;flex:none;
+  padding:8px 16px;background:var(--surface);border-bottom:1px solid var(--border);
+  font-family:var(--mono);font-size:12px;color:var(--text);
+}
+.opshell-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.opshell-ctl{
+  background:none;border:none;cursor:pointer;font-family:var(--mono);
+  font-size:18px;line-height:1;color:var(--text2);padding:4px 8px;
+  border-radius:3px;transition:color 0.15s,background 0.15s;
+}
+.opshell-ctl:hover{color:var(--text);background:rgba(255,26,26,0.12)}
+#opshell-body{flex:1;min-height:0;overflow:auto;padding:12px 16px}
+/* The one-off note above the body, for what a reload could not put back.
+   flex:none so it takes its own height and leaves the body the rest. */
+.opshell-note{flex:none;padding:10px 16px 0}
+/* The live terminal's room. #opshell-term is empty when the page measures
+   it, so as a plain block it is as tall as nothing and every session would
+   be measured at the floor. The wrapper is at least the body's height --
+   which is why #opshell-body above is flex:1, the definite height the
+   percentage resolves against -- and the host takes what the strip and the
+   footnote leave. Four declarations, one mechanism: delete display:flex or
+   that flex:1 and the host measures 0. min-height and not height, so that a
+   card too short for the terminal gives the host its 72px floor and the
+   body's own overflow:auto scrolls, as it did before the wrapper; with
+   height:100% the host shrank toward 0 and the terminal was clipped away
+   with nothing to scroll. overflow is hidden because the terminal inside is
+   a whole number of rows and the host is not. */
+.opshell-live{display:flex;flex-direction:column;min-height:100%}
+#opshell-term{flex:1;min-height:72px;overflow:hidden}
+
+/* The card, parked.
+   The dock sits in the sidebar under .agent-list and never inside it:
+   `refreshAgents` assigns #agent-list.innerHTML every three seconds, which
+   takes every child of the list with it, so a parked card tidied in there
+   would vanish at the next refresh and leave the hidden card with nothing
+   to bring it back. flex:none, because .agent-list is the flex:1 that eats
+   the column.
+   The border is --red-dim, which is also .agent-card.active's (:4295), so
+   this is told from a selected agent by spanning the sidebar edge to edge
+   with no radius -- a tray under the list rather than a row in it -- by
+   the >_ glyph, by its monospace, and by having no status dot. Its
+   background is the panel grey and not the selected card's red tint, for
+   the same reason. Seen side by side in the browser against a selected
+   agent, which is the only place that comparison can be made.
+   A row of real buttons and not one button with an onclick div in it: the
+   restore takes the whole row, and the ✕ that dismisses a remnant is its
+   own button beside it. The ✕ borrows .opshell-ctl from the card's header,
+   because it is the same control, one size down for the sidebar's type. */
+.opshell-dock{flex:none}
+.opshell-parked{
+  display:flex;align-items:stretch;width:100%;
+  border:1px solid var(--red-dim);background:var(--surface2);
+  font-family:var(--mono);font-size:11px;color:var(--text);
+}
+.opshell-parked > button{
+  background:none;border:none;color:inherit;font:inherit;cursor:pointer;
+}
+.opshell-parked-restore{
+  flex:1;min-width:0;display:flex;align-items:center;gap:8px;
+  padding:10px 12px;text-align:left;
+}
+.opshell-parked .opshell-ctl{flex:none;font-size:14px;padding:0 10px}
 
 /* Notification bell */
 .bell-wrap{position:relative;margin-left:8px}
@@ -4300,6 +5274,7 @@ header .info{font-size:11px;color:var(--text2)}
     <button class="topbar-ico-btn" onclick="showBeaconGen()" title="Beacon Generator">&#128640;</button>
     <button class="topbar-ico-btn" onclick="showListeners()" title="Listeners">&#128225;</button>
     <button class="topbar-ico-btn" onclick="showTunnel()" title="Tunnel">&#128268;</button>
+    <button class="topbar-ico-btn" onclick="showOperatorShell()" title="Operator Shell"><span class="opshell-glyph">&gt;<span class="opshell-cursor">_</span></span></button>
     <button class="topbar-ico-btn" onclick="showLootViewer()" title="Loot">&#128142;</button>
     <button class="topbar-ico-btn" onclick="showServerLog()" title="Server Log">&#128220;</button>
     <div class="bell-wrap">
@@ -7498,6 +8473,1172 @@ async function drawListeners(panel){
   });
 }
 
+// ── The operator shell ──
+//
+// One terminal, onto the operator's own hardware implant. The channel it
+// rides is raised and dropped with beacon tasks that only take effect at
+// the implant's next check-in, so opening and closing are both requests
+// with a delay -- and this view's whole job is to say which of the four
+// states it is in without overstating any of them.
+
+let opshellSession = null;
+let opshellTerm = null;
+let opshellTimer = null;
+let opshellAttached = false;
+let opshellAbort = null;
+let opshellStarted = 0;
+let opshellLast = null;
+let opshellKeys = "";
+let opshellFlushing = false;
+let opshellTrouble = "";
+let opshellNoted = "";
+// What the terminal should be told when the last measurement fell back to
+// the default -- the reason and what follows from it -- or "" when it fitted.
+// Set by `opshellMeasure`, read once by `opshellAttach` to say so in the
+// terminal: the size is fixed for the connection, so an operator who finds a
+// small terminal in a wide box has no other way to learn why.
+let opshellUnfitted = "";
+// Whether the card is parked in the sidebar rather than shown. Hidden and
+// not taken down: see `opshellMinimise`.
+let opshellMinimised = false;
+// The last state `opshellPoll` read. The parked label is drawn from it --
+// by `opshellMinimise`, and by `opshellEndSession` when a session ends
+// under a parked card -- so the label is the truth from the moment it
+// appears, and a remnant still names the device its session ran on. It is
+// not cleared when a session ends, for that reason: what it is, always, is
+// the last thing this view was told.
+let opshellSeen = null;
+// The markup this page last wrote into the dock, and what the poll decides
+// against. Not `dock.innerHTML`: a browser's getter re-serializes the DOM,
+// so a remnant's `&#10005;` reads back as `✕` and an `&#39;` in a hostname
+// reads back as `'` -- measured in a browser at offsets 474 and 293 -- and
+// a guard comparing the two would find them different on every single
+// tick, rewriting the dock every two seconds and destroying the buttons in
+// it, which is the defect the guard exists to prevent. Nothing else in the
+// page writes the dock, so this is the node's content. Every write to the
+// dock sets it, and both places the dock is removed clear it. What the
+// clearing holds is no dock and no remembered markup, so that a later
+// conditional park cannot skip its first write; today the park writes
+// unconditionally, so a stale value would not be drawn empty -- the
+// resets keep the invariant and nothing observable depends on them yet.
+let opshellDockHtml = "";
+// Where this tab remembers the session it is holding, so a reload can put
+// the card back instead of leaving a live root shell on the device with
+// nothing on screen. `sessionStorage` and not `localStorage`: it is per
+// tab and it dies with the tab, which is the lifetime of a claim this page
+// holds. Anything else the card has to remember across a reload belongs
+// beside it under this key's own prefix, and is cleared with it in
+// `opshellRemember` -- with one exception, `_gone`, which is written by
+// the very path that clears the id and has to outlive it: it is the
+// sentence saying why the card did not come back, and `showOperatorShell`
+// clears it when it says it.
+let opshellStore = "raccoon_opshell_session";
+// Set by `opshellResume`, read once by `opshellAttach`. A resumed card is
+// a **new** shell: the bridge's TCP connection is the shell, so the stream
+// going away with the old page killed the pty. Measured across a reload:
+// pid 75 to 78, the working directory back to / from /etc, and a variable
+// that had been set gone. A terminal that comes back looking like the one
+// that was there is the lie this whole feature exists to remove.
+let opshellFresh = false;
+
+function opshellRemember(session){
+  // Three call sites, and they are the three places a session starts or
+  // stops being this page's: `opshellOpen` when one is adopted,
+  // `opshellResume` when the server disowns the one that was remembered,
+  // and `opshellEndSession` when one ends. Not every assignment of
+  // `opshellSession` -- the hand-back branch in `opshellOpen` sets the
+  // field only so the close has an id to post, and remembering an id this
+  // page is giving straight back would draw a card over it on the next
+  // load.
+  if(session) sessionStorage.setItem(opshellStore, session);
+  else sessionStorage.removeItem(opshellStore);
+  // The minimised flag is the "beside it" key the comment above promises
+  // to clear, and it is cleared whenever an id stops being this page's: a
+  // session that ended, or one the server disowned, leaves nothing to
+  // park, and a flag left standing would bring the next reload back parked
+  // onto it. A session that *starts* clears it too, because a new shell is
+  // opened with the card in front of the operator -- unless they parked
+  // the card while the open was still in flight, which the await straddles
+  // and which is the one way a park and a new id coexist. Measured: press
+  // Open, press `_`, and without this the flag was gone by the time the
+  // open landed, so a reload came back open over the operator's work.
+  if(!session || !opshellMinimised){
+    sessionStorage.removeItem(opshellStore + "_min");
+  }
+}
+
+function opshellRecall(){
+  return sessionStorage.getItem(opshellStore) || "";
+}
+
+async function opshellResume(){
+  // Called once from startup. A reload is not a decision to stop working:
+  // the claim is still held, the channel is still up on the device, and
+  // without this the page comes back with an empty screen over both.
+  const session = opshellRecall();
+  if(!session) return false;
+  // Raw `fetch` with `H()`, the shape `opshellOpen` already uses, and not
+  // `api()`: `api()` throws on a 401, this is called bare, and a rejection
+  // here would be an unhandled one in the middle of startup. The token
+  // gate is `refreshAgents`' business, just above in the same block.
+  let r, state;
+  try {
+    // The poll's deadline, for the poll's reason and one of its own: while
+    // this is outstanding the operator can press `>_`, be told the channel
+    // is up and this page is not holding it, and press Attach. A resume
+    // that then wrote its remembered id over the adopted one would orphan
+    // the new claim -- every close answers "not the last", and nothing is
+    // stopped until the lapse. The deadline bounds that window; the check
+    // after the await closes it.
+    const deadline = typeof AbortSignal !== "undefined"
+      && typeof AbortSignal.timeout === "function"
+      ? AbortSignal.timeout(8000) : undefined;
+    r = await fetch("/api/opshell/state?session="
+      + encodeURIComponent(session), {headers: H(), signal: deadline});
+    state = await r.json();
+  } catch(e) {
+    // Nothing is given up on a request that never arrived. A blip says
+    // nothing about the session, and forgetting the id here would turn one
+    // unlucky reload into a channel this page can no longer put back by
+    // itself -- the operator would have to open the panel and press Attach.
+    return false;
+  }
+  // And the operator may have been faster than the server. Anything this
+  // page did while the answer was in flight wins: it is a decision, and
+  // this is a memory.
+  if(opshellSession){
+    return false;
+  }
+  // Nor on an answer that is not about the session: a 401 is the token,
+  // a 5xx is the server, and neither of them is news that the shell ended.
+  // The id is surrendered below, on the server's word and nothing else.
+  if(!r.ok || !state) return false;
+  // `sessions` and not just `state`, because a live channel is not proof
+  // that *this* id is on it: two team servers on one origin -- a port
+  // change on localhost -- write into the same `sessionStorage`, and an id
+  // the server counts zero sessions for is somebody else's.
+  if(state.state !== "live" || !(state.sessions > 0)){
+    opshellRemember("");
+    // And say so, at the next open. The page knows why the card is not
+    // back -- the server answered about this very id -- and `docs/TUNNEL.md`
+    // promises the card comes back the way it was left, so silence here
+    // leaves the operator wondering whether a shell is still running
+    // somewhere, which is the doubt this whole feature exists to remove.
+    // Written and not shown: this runs inside page startup, and the panel
+    // opens on an explicit action only. Read and cleared by
+    // `showOperatorShell`, so it is said once and not for ever.
+    sessionStorage.setItem(opshellStore + "_gone", state.state === "live"
+      ? "The shell this tab had open is no longer this page's: the channel "
+        + "is up, and the team server counts no session on it for the id "
+        + "this tab was holding."
+      : "The shell this tab had open is gone: the team server does not "
+        + "report that session as live, so no shell is running behind this "
+        + "page.");
+    return false;
+  }
+  opshellSession = session;
+  // Nothing to explain: this page is putting a card back. A `_gone` left
+  // from an earlier reload -- written while the panel was already open, so
+  // `showOperatorShell` returned early and nothing read it -- would
+  // otherwise be appended above a restored, live terminal.
+  sessionStorage.removeItem(opshellStore + "_gone");
+  opshellFresh = true;
+  // Before the card is drawn: `opshellRender` chooses the terminal over
+  // the Attach button by whether this page holds a session, and the poll
+  // inside the card puts the id in its own query string.
+  await showOperatorShell();
+  // And it comes back in the state it was left in. Here rather than after
+  // the attach below, which does not return until the stream ends; the
+  // poll inside `showOperatorShell` has already started the attach in the
+  // usual case, so the terminal is opened into a card that is still
+  // visible and then hidden, and not opened into a hidden one.
+  if(sessionStorage.getItem(opshellStore + "_min")) opshellMinimise();
+  // That poll attaches by itself when it finds the terminal host, and it
+  // sets `opshellAttached` before its first await -- so this is the other
+  // order, not a second terminal on the same session.
+  if(!opshellAttached) await opshellAttach(state);
+  return true;
+}
+
+function opshellChrome(name){
+  // The card's own header. Both controls call their handler directly with
+  // the event. The cross goes to `opshellClose`, which also takes the card
+  // down, and not to the bare session ender; the underscore goes to
+  // `opshellMinimise`, which keeps the session.
+  return '<span class="opshell-glyph">&gt;<span class="opshell-cursor">_'
+    + '</span></span><span class="opshell-title">' + esc(name) + '</span>'
+    + '<button class="opshell-ctl" title="Minimise" '
+    + 'onclick="opshellMinimise(event)">_</button>'
+    + '<button class="opshell-ctl" title="Close and end the session" '
+    + 'onclick="opshellClose(event)">&#10005;</button>';
+}
+
+async function showOperatorShell(){
+  // Dials nothing. The channel is raised only when the operator presses
+  // the button in the view below, which says so.
+  //
+  // The header button is reachable while the card is up, since the card is
+  // no longer a modal: a second press must not draw a second `#opshell-body`.
+  if(document.getElementById("opshell-card")){
+    // A parked card is still a card, so returning here would make the
+    // header's `>_` a button that does nothing precisely when the operator
+    // is pressing it to get the shell back. It brings the card back.
+    if(opshellMinimised) opshellRestore();
+    return;
+  }
+  const main = document.querySelector(".main");
+  const content = document.querySelector("#content");
+  // `opshellResume` calls this from the startup branch beside the agent
+  // refresh timer, so a throw here would leave a dead page and not just a
+  // shell that did not open. Only the page's own markup changing can get
+  // here, and then the console is the only place that can say why.
+  if(!main || !content){
+    console.warn("Operator Shell: no " + (main ? "#content" : ".main")
+      + " in the page, so there is nowhere to draw it");
+    return;
+  }
+  const card = document.createElement("div");
+  card.id = "opshell-card";
+  card.classList.add("opshell-card");
+  const chrome = document.createElement("div");
+  chrome.classList.add("opshell-chrome");
+  chrome.innerHTML = opshellChrome("Operator Shell");
+  // Its own element with its `id` set before it is appended, and not a
+  // child born inside some parent's `innerHTML`: the render fills this one
+  // node and the poll finds it by id.
+  const body = document.createElement("div");
+  body.id = "opshell-body";
+  body.classList.add("loot-loading");
+  body.innerHTML = "Loading...";
+  card.appendChild(chrome);
+  // What the last reload could not put back, said once. `opshellResume`
+  // leaves this behind when the server says the remembered session is not
+  // live: the operator left a shell open, came back to no card, and
+  // nothing told them whether anything was still running. A sibling of
+  // `#opshell-body` and not inside it, because the poll rewrites that node
+  // every two seconds and this is not state; and taken out of storage as
+  // it is read, so the next open says it and the one after that does not.
+  const gone = sessionStorage.getItem(opshellStore + "_gone");
+  if(gone){
+    sessionStorage.removeItem(opshellStore + "_gone");
+    const note = document.createElement("div");
+    note.classList.add("opshell-note");
+    note.innerHTML = '<p class="loot-empty">' + esc(gone) + '</p>';
+    card.appendChild(note);
+  }
+  card.appendChild(body);
+  main.appendChild(card);
+  // Hidden and not emptied: `renderAgentView` rewrites its children on
+  // every agent click, and they are what comes back when the card goes.
+  content.style.display = "none";
+  await opshellPoll();
+}
+
+async function opshellClose(ev){
+  // The card's cross, and the parked card's once the session has ended:
+  // both are "take this away", and a remnant has no session left to end.
+  // `ev` is deliberately unused: the parameter is the
+  // `onclick="opshellClose(event)"` shape and is kept so the call site and
+  // the signature agree. Teardown takes the card down and gives the column
+  // back before its request goes out, so the column is not left hidden
+  // behind a request that takes a moment.
+  return opshellTeardown(document.getElementById("opshell-card"));
+}
+
+function opshellMinimise(ev){
+  // The `_`. The card is hidden and **not taken down**: `opshellPoll`
+  // returns when `#opshell-body` is missing, and that poll is the claim's
+  // heartbeat. A minimise that removed the card would stop the beat, and
+  // the 240-second lapse would then retire the session -- stopping the
+  // channel on the device under an operator who believes their shell is
+  // parked and waiting, with the stream and everything in the terminal's
+  // buffer gone with it. `ev` is unused, as in `opshellClose`: the
+  // parameter is the `onclick="opshellMinimise(event)"` shape.
+  //
+  // One park at a time, the standard `showOperatorShell` holds itself to:
+  // two docks would be two "Restore the shell" buttons, and a restore
+  // removes only the one it finds by id -- so the operator would get the
+  // shell back with a button beside the list still offering it.
+  if(opshellMinimised) return;
+  const card = document.getElementById("opshell-card");
+  // The sidebar, after `.agent-list` and never inside it: `refreshAgents`
+  // assigns `#agent-list.innerHTML` every three seconds, which takes every
+  // child of the list with it, so a parked card tidied in there would
+  // vanish at the next refresh and leave the hidden card with nothing to
+  // bring it back.
+  const sidebar = document.querySelector(".sidebar");
+  if(!card || !sidebar){
+    // Nothing is hidden until there is somewhere to park it: a hidden card
+    // with no parked entry beside it is a root shell running with nothing
+    // on screen. Only the page's own markup changing can get here, so the
+    // console is the only place that can say why.
+    console.warn("Operator Shell: no " + (card ? ".sidebar" : "#opshell-card")
+      + " in the page, so there is nowhere to park the card");
+    return;
+  }
+  opshellMinimised = true;
+  // Beside the session id, under that key's own prefix, so a reload comes
+  // back parked rather than open over the work. Cleared with the id in
+  // `opshellRemember`.
+  sessionStorage.setItem(opshellStore + "_min", "1");
+  card.style.display = "none";
+  // And the column the card took is given back, the way `opshellTeardown`
+  // gives it back: `renderAgentView` keeps writing into `#content` whether
+  // it is visible or not, so a parked shell over a hidden column is the
+  // blank page that cost this branch a Critical once already.
+  const content = document.querySelector("#content");
+  if(content) content.style.display = "";
+  const dock = document.createElement("div");
+  dock.id = "opshell-dock";
+  dock.classList.add("opshell-dock");
+  // Drawn from the last state the poll read, so the label is right from
+  // the moment it appears; the poll rewrites it when it changes. The write
+  // is unconditional here, whatever the remembered markup says, because
+  // this tray is new and empty.
+  opshellDockHtml = opshellParked(opshellSeen);
+  dock.innerHTML = opshellDockHtml;
+  sidebar.appendChild(dock);
+}
+
+function opshellRestore(ev){
+  // The parked card's own button, and the header's `>_` while the card is
+  // parked, both arrive here. `ev` is unused, as above.
+  const card = document.getElementById("opshell-card");
+  opshellMinimised = false;
+  sessionStorage.removeItem(opshellStore + "_min");
+  const dock = document.getElementById("opshell-dock");
+  if(dock) dock.remove();
+  opshellDockHtml = "";
+  // A restore with no card to show hides nothing. Hiding `#content` with
+  // nothing over it is the blank column by the other door.
+  if(!card) return;
+  card.style.display = "";
+  const content = document.querySelector("#content");
+  if(content) content.style.display = "none";
+}
+
+function opshellParked(state){
+  // What the parked card says, rewritten on every poll tick: it is the
+  // only thing on screen while the card is hidden, so a label written once
+  // would go on saying `open` long after the channel dropped.
+  state = state || {};
+  // `opshellLast` is this page's own record of a session that ended --
+  // `opshellEndSession` stashes the duration there -- and it is the only
+  // thing that may say the session is over. A second tab's close comes
+  // back "not the last session" with the channel still up, and a parked
+  // card announcing an end that did not happen is the overclaim this whole
+  // view exists to avoid.
+  const ended = !!opshellLast;
+  const secs = ended ? opshellLast.duration : null;
+  // Whether there is a shell behind this entry at all. The card can be
+  // parked over the picker -- no session, nothing running -- and then the
+  // live border, a blinking cursor and "Restore the shell" would each
+  // claim more than the view knows.
+  const live = !ended && !!opshellSession;
+  // Not `opshellRender`'s mapping, which folds everything that is not
+  // `open` or `unknown` into `closed`: that one is handed a state the
+  // server sent, and this one can be drawn before the first poll has
+  // answered. What it has not been told is `unknown`, not `closed`.
+  const chan = state.channel === "open" ? "open"
+             : state.channel === "closed" ? "closed" : "unknown";
+  const line = ended
+    ? ("session ended" + (secs === null || secs === undefined
+       ? "" : " \u00b7 " + esc(secs) + "s"))
+    : ("channel " + chan);
+  // A row of real buttons, not a div with an onclick: the header's glyph
+  // was corrected from stray text to a button once already (ca65f70).
+  return '<div class="opshell-parked"'
+    // The red border is the selected agent's, so it goes when the session
+    // does: what is left is a remnant to dismiss, not a live shell.
+    + (ended ? ' style="border-color:var(--border)"' : '')
+    + '><button class="opshell-parked-restore" title="'
+    + (ended ? 'Show what the session left'
+             : live ? 'Restore the shell' : 'Restore the panel')
+    + '" onclick="opshellRestore(event)">'
+    + '<span class="opshell-glyph">&gt;'
+    // The cursor blinks while a shell is alive and stands still when
+    // there is none -- ended, or never opened.
+    + (live ? '<span class="opshell-cursor">_</span>' : '_')
+    + '</span>'
+    + '<span style="flex:1;min-width:0;overflow:hidden;'
+    + 'text-overflow:ellipsis;white-space:nowrap">'
+    + esc(state.host || state.target || "operator shell")
+    + '<span style="display:block;color:var(--text2)">' + line + '</span>'
+    + '</span></button>'
+    // And the ✕ that takes the remnant away, only once there is a remnant:
+    // it is `opshellClose`, the card's own cross, which takes the hidden
+    // card down with it and gives the column back. It is not offered over
+    // a live parked session, because ending one is a decision made in the
+    // card, beside the sentence saying it queues the channel's shutdown --
+    // not in one press from the sidebar. Without this, a session that
+    // ended while parked left an entry nothing could remove, and
+    // restoring the card first only to close it is not an answer.
+    + (ended ? '<button class="opshell-ctl" title="Dismiss this" '
+               + 'onclick="opshellClose(event)">&#10005;</button>' : '')
+    + '</div>';
+}
+
+async function opshellEndSession(){
+  // One releaser on this side, as there is one on the server's: the ✕
+  // (through `opshellClose`), `exit`, and the End button all arrive here. The
+  // card is a flex sibling and not a modal, so there is no click outside it
+  // to release anything. A closed tab does not arrive: it is
+  // indistinguishable from a reload, and the lapse retires that claim. The
+  // previous version had none -- teardown cleared a timer
+  // and returned, so the channel stayed up on the device while the panel's
+  // own text promised that closing it queued the shutdown, and teardown's
+  // own comment claimed the lapse would do it. The lapse could not: it ran
+  // only from this view's poll, which had just stopped.
+  const session = opshellSession;
+  opshellSession = null;
+  opshellAttached = false;
+  // And it is forgotten, so a reload after this draws the picker rather
+  // than a card over a session that was handed back.
+  opshellRemember("");
+  // Whatever was typed and not yet delivered dies with the session.
+  // Measured: "more" left over from a session that dropped, prepended to
+  // the next session's "ls", went out as "morels" -- injected input into a
+  // root shell on the operator's own device.
+  opshellKeys = "";
+  // And the two "say it once" memories, for the same reason, which is the
+  // reason the line above exists. Measured without this: session A warns
+  // once about an outage, session B hits the identical outage and is
+  // warned zero times while its claim lapses underneath -- and a fresh
+  // panel announces "answering again" for trouble it never saw.
+  opshellTrouble = "";
+  opshellNoted = "";
+  // Including the resume's own note, which is read once: a flag left
+  // standing because the terminal never opened would announce a new shell
+  // to a session that has nothing before it.
+  opshellFresh = false;
+  if(opshellAbort){
+    // The stream outlived the view otherwise: the bridge, the pty, one of
+    // the shell port's slots, the transcript and a worker thread all
+    // survived a closed panel, because the pump ends only on handover,
+    // lapse or EOF.
+    try { opshellAbort.abort(); } catch(e) {}
+    opshellAbort = null;
+  }
+  if(!session) return false;
+  if(opshellStarted){
+    opshellLast = {duration: Math.round((Date.now() - opshellStarted)/1000)};
+    opshellStarted = 0;
+  }
+  // Said in the sidebar at once if the card is parked, and not at the
+  // poll's next tick: that label is the only thing on screen then, and
+  // `exit` lands between two ticks -- so without this it goes on saying
+  // "channel open" over a shell that is gone, for up to two seconds, and
+  // the ✕ that dismisses the remnant arrives that late too. Before the
+  // request below, for the same reason the cross takes the card down
+  // before its own: the screen is not left wrong behind a round trip.
+  const parked = document.getElementById("opshell-dock");
+  if(parked){
+    // Remembered as well as written, or the poll's next tick compares its
+    // label with a string this never replaced and skips a real change.
+    opshellDockHtml = opshellParked(opshellSeen);
+    parked.innerHTML = opshellDockHtml;
+  }
+  // The answer is read, not merely awaited. The first version discarded
+  // it, so every one of the three ways a stop can be refused was silent:
+  // a rejected request, a `reason` from `may_stop` ("live socks sessions
+  // ride this channel"), and another view still holding the session --
+  // while the paragraph beside the button promised the reason would come
+  // back. A button that may refuse and says nothing either way is the
+  // defect this whole view exists to avoid.
+  let r, answer = null;
+  try {
+    // keepalive, so a close this page has already started still goes out
+    // when the page goes away under it -- the ✕, the End button or `exit`
+    // landing as the operator navigates. Nothing runs on page teardown any
+    // more, so that race is all this flag is for; it has not been measured,
+    // it costs nothing, and a close cancelled with the page leaves the
+    // claim held until the lapse. Not `api()`, which cannot carry it.
+    r = await fetch("/api/opshell/close", {method:"POST", headers:H(),
+      body: JSON.stringify({session}), keepalive:true});
+    answer = await r.json();
+  } catch(e) {
+    opshellSay("the shutdown could not be requested ("
+               + ((e && e.message) || e) + "). The channel may still be up; "
+               + "it is dropped at a later check-in.");
+    return true;
+  }
+  const why = (answer && (answer.error || answer.reason)) || "";
+  if(why){
+    opshellSay(why);
+    // And beside the duration, because the terminal cannot hold it. On a
+    // parked card this runs with `opshellTerm` still set -- the poll
+    // disposes on its *next* tick -- so `opshellSay` wrote the sentence
+    // into the terminal, the panel fallback below was skipped as
+    // `!opshellTerm` was false, and two seconds later that tick disposed
+    // the terminal and replaced the body: measured, the reason was
+    // nowhere and the parked entry said only `session ended`.
+    // `opshellLast` is the one thing that crosses a tick, which is why the
+    // duration already rides on it, so the reason rides with it and
+    // `opshellRender` states it where it states the duration. Under its
+    // own key, not `reason`: the state's own `reason` is the server's
+    // view of now and must not be overwritten by the merge in the poll.
+    if(opshellLast) opshellLast.why = why;
+  } else if(r.ok){
+    opshellSay("the channel's shutdown is queued for the next check-in");
+  }
+  // Said in the panel too, for a view that has no terminal to write into:
+  // the picker, or a channel this page never attached to.
+  const body = document.getElementById("opshell-body");
+  if(body && !opshellTerm && why){
+    body.innerHTML = '<p class="loot-empty">' + esc(why) + '</p>';
+  }
+  return true;
+}
+
+function opshellTeardown(card){
+  // The view goes away and so does the session. Closing the panel is one
+  // of the two ways the design says a session ends.
+  if(opshellTimer){ clearTimeout(opshellTimer); opshellTimer = null; }
+  if(opshellTerm){ opshellTerm.dispose(); opshellTerm = null; }
+  // Otherwise reopening the panel an hour later still says "the session
+  // lasted 92s" above the picker.
+  opshellLast = null;
+  // The park goes with the card. No reachable path takes a card down while
+  // it is parked -- the ✕ lives inside the card, and a `display:none` card
+  // has no clickable buttons -- but a dock left standing would be a button
+  // pointing at a card that is gone, and the flag would say parked over
+  // the next card that opens.
+  opshellMinimised = false;
+  const dock = document.getElementById("opshell-dock");
+  if(dock) dock.remove();
+  opshellDockHtml = "";
+  // And the last state read, for the same reason the line above drops the
+  // duration: the view is going away, so what it was told goes with it.
+  // Without this, reopening the panel and pressing `_` before its first
+  // poll has answered -- or during an outage, which the poll's catch rides
+  // out without touching this -- draws a dock naming the device of the
+  // session that is over, which is a claim that a shell is live there.
+  // After the dock has gone, so the redraw in `opshellEndSession` still
+  // has the host it names when a session ends under a parked card.
+  opshellSeen = null;
+  if(card) card.remove();
+  // Where the card comes down and not in the caller: a card gone with
+  // `#content` still hidden is a blank column that agent clicks keep
+  // writing into.
+  const content = document.querySelector("#content");
+  if(content) content.style.display = "";
+  return opshellEndSession();
+}
+
+function opshellRetitle(state){
+  // The card's header names the device once the view's own state does, and
+  // says what the card is until then. Only the title is written: the
+  // buttons beside it are not rebuilt.
+  const title = document.querySelector(".opshell-title");
+  if(!title) return;
+  const next = (state && state.host) || "Operator Shell";
+  // And only when it changed. Assigning `textContent` replaces the node's
+  // text even when the string is the same, which drops a selection the
+  // operator made in the header -- every two seconds, for as long as the
+  // card is open.
+  if(title.textContent !== next) title.textContent = next;
+}
+
+async function opshellPoll(){
+  const body = document.getElementById("opshell-body");
+  if(!body){ if(opshellTimer) clearTimeout(opshellTimer); return; }
+  let state;
+  try {
+    // A deadline, because the whole lapse margin rests on this poll
+    // running. A proxy that accepts and never answers produces no
+    // rejection at all, so without this the heartbeat stopped silently and
+    // the claim lapsed under a live root shell.
+    //
+    // Used where it exists, skipped where it does not: `AbortSignal.timeout`
+    // is Safari 16, and this page's own baseline is Safari 14.1 -- 164 uses
+    // of optional chaining and the Clipboard API in the JavaScript, and
+    // flexbox `gap` in the CSS, which is what makes it 14.1 and not 13.1,
+    // and nothing newer until this line. Calling it unconditionally threw a TypeError
+    // inside the poll on an older browser, which killed the heartbeat: the
+    // very failure the deadline was added to prevent, by a different door.
+    // Measured: zero polls instead of two.
+    const deadline = typeof AbortSignal !== "undefined"
+      && typeof AbortSignal.timeout === "function"
+      ? AbortSignal.timeout(8000) : undefined;
+    state = await fetch("/api/opshell/state"
+      + (opshellSession ? "?session=" + encodeURIComponent(opshellSession) : ""),
+      {headers: H(), signal: deadline})
+      .then(r => {
+        if(r.status === 401){ tokenRejected(); throw new Error("operator token rejected"); }
+        return r.json();
+      });
+    // Checked in here, where the catch arm below can say so and
+    // reschedule. Everything after this try reads `state.state` and
+    // `state.geometry`, and that tail runs *after* the only
+    // `setTimeout` has been consumed: an answer that parsed but is not a
+    // state -- a bare `null`, a string, an array from a proxy -- threw
+    // there instead, and the heartbeat stopped for good with nothing
+    // written anywhere. The claim then lapsed 240 seconds later under an
+    // operator sitting in the session. Measured: `rescheduled: 0`.
+    //
+    // An array is an object to `typeof`, and it renders as an idle picker
+    // with no device in it rather than throwing -- which is a state the
+    // server never sent, shown as if it had. Named instead.
+    if(!state || typeof state !== "object" || Array.isArray(state)){
+      throw new Error("the state answer was not an object");
+    }
+  } catch(e) {
+    // Rescheduled, not abandoned. The first version returned here, so one
+    // network blip -- or a proxy answering with an HTML error page, which
+    // makes `api()` reject on the JSON parse -- stopped the heartbeat for
+    // good: the claim then lapsed and a session the operator was sitting
+    // in was stopped on the device. The whole grace argument assumes this
+    // poll keeps running.
+    const why = esc(String((e && e.message) || e));
+    if(opshellAttached){
+      // Never over an attached terminal: replacing the body took the
+      // terminal's own node with it, and the stream then wrote into a
+      // detached element. And once, not every two seconds: a sustained
+      // outage wrote thirty lines in a minute and scrolled the operator's
+      // own work off the screen exactly when they needed to read it.
+      if(opshellTrouble !== why){
+        opshellTrouble = why;
+        opshellSay("the view lost contact with the team server (" + why
+                   + "). The session is unaffected until it lapses.");
+      }
+    } else {
+      body.innerHTML = '<p class="loot-empty">' + why + '</p>';
+    }
+    opshellTimer = setTimeout(opshellPoll, 2000);
+    return;
+  }
+  opshellRetitle(state);
+  if(opshellTrouble){
+    // Recovery is worth one line, or the operator is left reading the
+    // last complaint with no sign it ended.
+    opshellTrouble = "";
+    opshellSay("the team server is answering again");
+  }
+  if(opshellLast && state.state === "idle"){
+    // What a session this page ran left behind. The server has no Closed
+    // state of its own -- an acknowledged stop is simply idle again -- and
+    // the remnant belongs to the page that ran the session anyway.
+    state = Object.assign({}, state, opshellLast, {state: "closed"});
+  }
+  opshellSeen = state;
+  // The parked label, while the card is hidden. It is the only thing the
+  // operator can see of a parked session, so it is redrawn here with
+  // everything this tick learned -- a channel that dropped, a session that
+  // ended -- rather than written once at the minimise and left to rot.
+  //
+  // And only when it changed, as the title eleven lines above, for a worse
+  // reason: this node holds the restore button and, on a remnant, the ✕.
+  // Assigning `innerHTML` destroys and recreates them, so focus goes back
+  // to `<body>` every two seconds and a keyboard-only operator cannot
+  // reliably reach the button and press Enter -- and the label's selection
+  // and the cursor's animation restart with it.
+  //
+  // Against the markup this page last wrote and not against
+  // `dock.innerHTML`, which in a browser is the DOM read back: a remnant's
+  // `&#10005;` returns as `✕`, so comparing with the node would have found
+  // a difference on every tick and rewritten exactly the label that has
+  // two buttons in it.
+  const dock = document.getElementById("opshell-dock");
+  if(dock){
+    const next = opshellParked(state);
+    if(next !== opshellDockHtml){
+      opshellDockHtml = next;
+      dock.innerHTML = next;
+    }
+  }
+  if(!opshellAttached){
+    // The terminal goes before the node it lives in. `body.innerHTML`
+    // replaces `#opshell-term`, so without this `opshellTerm` stayed
+    // non-null over a DOM node that no longer existed -- and `dispose()`
+    // had one call site, `opshellTeardown`, which a card that survives
+    // between sessions no longer reaches. Three things were broken by
+    // that: `opshellEndSession`'s `!opshellTerm` fallback could never
+    // fire, so the End button's refusal went into a detached terminal and
+    // the operator saw nothing; a refusal that arrived while parked was
+    // gone within two seconds rather than waiting for the restore; and
+    // every open-end-open cycle in a long-lived card leaked an xterm and
+    // its observers.
+    if(opshellTerm){ opshellTerm.dispose(); opshellTerm = null; }
+    body.innerHTML = opshellRender(state);
+  } else {
+    // The body is not redrawn under an attached terminal, so everything
+    // this view learns -- the channel going `unknown`, a queued shutdown,
+    // a device that stopped calling home -- used to be invisible to
+    // exactly the person who needed it. Said once per change, in the
+    // terminal, where they are looking.
+    const note = (state.channel === "unknown" || state.state === "closing")
+      ? (state.reason || ("the channel is now " + state.channel)) : "";
+    if(note !== opshellNoted){
+      opshellNoted = note;
+      if(note) opshellSay(note);
+    }
+  }
+  if(state.state === "live" && opshellSession && !opshellAttached){
+    opshellAttach(state);
+  }
+  // The same cadence the agent console polls at, and it doubles as the
+  // claim's heartbeat: a view that stops asking stops holding the channel.
+  opshellTimer = setTimeout(opshellPoll, 2000);
+}
+
+function opshellPicker(state){
+  const pick = (state.candidates || []).map(a =>
+    '<option value="' + esc(a) + '"' + (a === state.target ? ' selected' : '')
+    + '>' + esc(a) + '</option>').join("");
+  return '<label>Device <select id="opshell-agent">' + pick + '</select></label> '
+    + '<button class="fd-btn" onclick="opshellOpen(event)">Open a shell</button>'
+    + '<p class="loot-empty">This raises the channel on that device and '
+    + 'drops it again when the session ends. Both cost one check-in.</p>';
+}
+
+function opshellRender(state){
+  const geom = (state.geometry || []).join("x");
+  const chan = state.channel === "open" ? "open"
+             : state.channel === "unknown" ? "unknown" : "closed";
+  // Its own row, not `.pcard-kv`: that class is a label/value grid, and
+  // borrowing it stacked the whole strip into one narrow column. Seen in
+  // the browser, which is the only place a layout can be seen.
+  let strip = '<div style="display:flex;gap:10px;flex-wrap:wrap;'
+    + 'align-items:center;font-size:11px;color:var(--text2);'
+    + 'margin:0 0 10px">'
+    + '<span>' + esc(state.host || state.target || "no device chosen") + '</span>'
+    + (state.user ? '<span>' + esc(state.user) + '</span>' : '')
+    + (state.root ? '<span style="color:var(--orange)">root</span>' : '')
+    + '<span>' + esc(geom) + '</span>'
+    + (state.recording ? '<span style="color:var(--red)">&#9679; recording</span>' : '')
+    + '<span>channel ' + esc(chan) + '</span>'
+    + '</div>';
+  if(state.reason){
+    strip += '<p class="loot-empty">' + esc(state.reason) + '</p>';
+  }
+  if(state.state === "live"){
+    if(!opshellSession){
+      // A channel this page can see but does not hold: after a reload, in
+      // a second tab, or when it was raised from the tunnel panel. The
+      // first version drew the live strip with an empty terminal box and
+      // no control at all, so the operator could neither join the session
+      // they could see nor drop it -- and a minute later the stale claim
+      // lapsed and stopped it without anyone asking.
+      return strip
+        + '<p>This channel is up, and this page is not holding it.</p>'
+        + '<button class="fd-btn" onclick="opshellOpen(event)">Attach</button> '
+        + '<button class="fd-btn" onclick="opshellEndAfterAttach(event)">'
+        + 'End the session</button>'
+        + '<p class="loot-empty">Ending it takes the channel over and then '
+        + 'drops it, so the shutdown goes through the one place that decides '
+        + 'them -- and a channel this view did not raise comes back with the '
+        + 'reason it cannot be dropped.</p>';
+    }
+    return '<div class="opshell-live">' + strip + '<div id="opshell-term"></div>'
+      + '<p class="loot-empty">exit, or Ctrl-D, ends the session. The '
+      + '&#10005; above closes the card and queues the channel\'s '
+      + 'shutdown, which takes effect at the next check-in; the _ parks '
+      + 'the card and the session keeps running.</p></div>';
+  }
+  if(state.state === "waiting"){
+    const secs = state.expected_checkin;
+    const when = (secs === null || secs === undefined) ? "unknown"
+      : secs <= 0 ? "due now" : Math.round(secs) + "s";
+    // A number, not a spinner: a spinner invites the operator to help it
+    // along, and the wait is the price of leaving the beacon's interval
+    // alone.
+    return strip + '<p>Waiting for the next check-in: <b>' + esc(when)
+      + '</b>. The channel is raised then and this view opens by itself. '
+      + 'The beacon\'s interval is not changed.</p>';
+  }
+  if(state.state === "closing"){
+    return strip + '<p>The shutdown is queued and takes effect at the next '
+      + 'check-in. Until the agent confirms it, this says <b>closing</b> '
+      + 'and not closed.</p>';
+  }
+  if(state.state === "closed"){
+    // What remains. The transcript's directory only when the session was
+    // actually recorded: a path with no file at the end of it is worse
+    // than no path, and `transcript_dir` is reported whether or not
+    // anything was written to it.
+    let left = '';
+    if(state.duration !== null && state.duration !== undefined){
+      left += '<p>The session lasted <b>' + esc(state.duration)
+        + 's</b>.</p>';
+    }
+    // Why it ended, when the end had one to give. A refused close comes
+    // back with the server's own sentence and `opshellEndSession` parks it
+    // on `opshellLast`, which the poll folds in here: on a card that was
+    // parked, this is the only place that sentence survives, because the
+    // terminal it was written into is disposed by the same tick that draws
+    // this. Only when there is one -- an ordinary `exit` has nothing to
+    // explain -- and not when the strip above has already said it, which
+    // happens when the server's `reason` is the same sentence.
+    if(state.why && state.why !== state.reason){
+      left += '<p class="loot-empty">' + esc(state.why) + '</p>';
+    }
+    if(state.recording && state.transcript_dir){
+      left += '<p class="loot-empty">Its transcript is in <code>'
+        + esc(state.transcript_dir) + '</code> on the team server.</p>';
+    }
+    return strip + left + opshellPicker(state);
+  }
+  return strip + opshellPicker(state);
+}
+
+async function opshellOpen(ev){
+  // A double-click took two claims, and the first was orphaned: the
+  // operator's next close then answered "not the last", so no stop was
+  // queued until the orphan lapsed.
+  const button = ev && ev.currentTarget;
+  if(button){
+    if(button.disabled) return;
+    button.disabled = true;
+  }
+  const pick = document.getElementById("opshell-agent");
+  const agent = pick ? pick.value : null;
+  const body = document.getElementById("opshell-body");
+  const fail = why => {
+    if(body) body.innerHTML = '<p class="loot-empty">' + esc(why) + '</p>';
+  };
+  // Raw fetch and `r.ok`, the pattern `drawListeners` already uses, not
+  // `api()`: that helper throws only on 401, so a 404 ("no such agent") or
+  // a 409 ("the tunnel server would not start: ...") resolved normally,
+  // `answer.session` was undefined, and the catch never ran. The button
+  // did nothing and the server's carefully worded reason was discarded --
+  // which is the one thing this interface is not allowed to do.
+  let r, answer;
+  try {
+    r = await fetch("/api/opshell/open", {method:"POST", headers:H(),
+      body: JSON.stringify(agent ? {agent} : {})});
+    answer = await r.json();
+  } catch(e) { fail(String((e && e.message) || e)); return false; }
+  if(r.status === 401){ tokenRejected(); return false; }
+  if(!r.ok || !answer || answer.error){
+    fail((answer && answer.error) || ("the server refused this: HTTP "
+                                      + r.status));
+    return false;
+  }
+  // Above the `if`, and not inside it: the operator picked a device and
+  // pressed Open, so what the last session on another device lasted is no
+  // longer theirs to be shown. Driven when it was inside: end a session on
+  // one device, pick a second, press Open with that channel down so no
+  // session comes back, and the card drew the new device's name beside
+  // "The session lasted 92s".
+  opshellLast = null;
+  if(answer.session){
+    if(!document.getElementById("opshell-body")){
+      // The view went away while this was in flight. Adopting the session
+      // now would leave the claim held by a page that no longer exists,
+      // and the channel would come down only via the lapse four minutes
+      // later. Hand it straight back instead.
+      opshellSession = answer.session;
+      await opshellEndSession();
+      return false;
+    }
+    opshellSession = answer.session;
+    opshellRemember(answer.session);
+    // Nothing typed before this session existed belongs inside it.
+    opshellKeys = "";
+  }
+  return true;
+}
+
+async function opshellEndAfterAttach(ev){
+  // The button used to call `opshellEndSession` directly, and that branch
+  // is drawn precisely when there is no session -- so it returned false
+  // before aborting or posting anything, and the button promised a
+  // shutdown it never queued. The claim has to exist before it can be
+  // given back: `/open` adopts the live channel without queueing a second
+  // start, and the close that follows runs through `decide_stop` like
+  // every other one. A channel this view did not raise comes back from
+  // there with the server's own refusal, which is the sentence the
+  // operator needs rather than a silent nothing.
+  if(await opshellOpen(ev) === false) return;
+  await opshellEndSession();
+}
+
+function opshellDropRest(text){
+  // One place for "this batch failed", because the thing that matters is
+  // not the message -- it is the line below it.
+  //
+  // Everything typed while the failing batch was in flight goes with it.
+  // The shape before the atomic rewrite had this, under its own comment,
+  // and the rewrite deleted the line **and the test that named it**: a
+  // 502 comes from a `sendall` with a fifteen-second timeout, so fifteen
+  // seconds of typing -- Enters included -- accumulated and was then
+  // delivered without the batch it belonged to. Reproduced as `rm -rf /`
+  // and an Enter typed mid-flight: the Enter went out alone.
+  const pending = opshellKeys.length;
+  opshellKeys = "";
+  opshellSay(text + (pending
+    ? " Anything typed since has been dropped too, so no part of a command "
+      + "can arrive without the rest of it."
+    : ""));
+}
+
+function opshellSay(text){
+  // Out of band, in the terminal, where the operator is looking. The dim
+  // sequence is what this view already uses for its own notes, so it
+  // cannot be mistaken for something the shell printed.
+  if(opshellTerm) opshellTerm.writeln("\r\n\x1b[2m-- " + text + " --\x1b[0m");
+}
+
+function opshellB64(text){
+  // TextEncoder rather than `btoa(unescape(encodeURIComponent(s)))`: the
+  // old spelling works for UTF-8 but leans on a function that has been
+  // deprecated for years.
+  const bytes = new TextEncoder().encode(text);
+  let out = "";
+  for(const b of bytes) out += String.fromCharCode(b);
+  return btoa(out);
+}
+
+//: The most base64 one `/keys` request may carry -- the server's own
+//: ceiling, in the server's own units. The client used to slice 131072
+//: UTF-16 code units against a server counting base64 of UTF-8, so 200000
+//: accented characters made a 349528-character body: refused, and under
+//: the old splitting rule the rest of the paste was discarded with it.
+const OPSHELL_KEYS_CEILING = 256 * 1024;
+
+async function opshellFlushKeys(){
+  // One POST in flight at a time, carrying everything that accumulated
+  // while the last one was flying -- and **whole or not at all**.
+  //
+  // This is the fourth shape of this function, and the first three each
+  // added a failure mode rather than removing one:
+  //
+  //   1. one POST per keystroke: independent requests over six parallel
+  //      connections can complete out of order, which in a terminal is
+  //      transposed characters;
+  //   2. coalesced: a refused batch vanished with no echo and no message;
+  //   3. coalesced with the batch put back: an unbounded buffer that was
+  //      reported as "still waiting" for ever, and would have replayed
+  //      into a root shell as one batch if the cause cleared;
+  //   4. coalesced, dropped on refusal, split when oversized: a split that
+  //      failed part way **delivered a prefix** -- measured, 262144 bytes
+  //      of a pasted script executed while the view said nothing had been
+  //      delivered and told the operator to type it again.
+  //
+  // The lesson of the fourth is that a terminal cannot express partial
+  // delivery, so this does not try. No splitting, so there is no prefix to
+  // half-deliver. No retry, so there is nothing to duplicate -- a rejected
+  // request may well have been delivered, and `/keys` has no idempotency
+  // of any kind, so re-sending `reboot\r` is not a recovery. What is left
+  // is one honest sentence in each case.
+  if(opshellFlushing) return;
+  opshellFlushing = true;
+  try {
+    while(opshellKeys && opshellSession){
+      const batch = opshellKeys;
+      opshellKeys = "";
+      const encoded = opshellB64(batch);
+      if(encoded.length > OPSHELL_KEYS_CEILING){
+        // Refused here, before anything is sent, and measured in the
+        // units the route measures. Splitting is what produced the
+        // partial-delivery defect; letting the server refuse it would
+        // produce the same loss one round trip later.
+        opshellSay("that paste is too large to send in one piece: "
+                   + batch.length + " characters, and about "
+                   + Math.floor(OPSHELL_KEYS_CEILING * 3 / 4 / 1024)
+                   + " KB of text is the most one request may carry. "
+                   + "Nothing was sent. Send it in smaller pieces, or put "
+                   + "the file on the host another way.");
+        continue;
+      }
+      let r;
+      try {
+        r = await fetch("/api/opshell/keys", {method:"POST", headers:H(),
+          body: JSON.stringify({session: opshellSession, data: encoded})});
+      } catch(e) {
+        // Honest about the one thing nobody can know here: a rejected
+        // request may have reached the shell before the connection broke.
+        opshellDropRest("those keystrokes may or may not have reached the "
+                        + "shell (" + ((e && e.message) || e) + "). Nothing "
+                        + "was sent again -- check the session before "
+                        + "retyping.");
+        return;
+      }
+      if(!r.ok){
+        // Every field the route sends: a 409 for a bridge that was never
+        // accepted carries `refused` and a `detail` saying where the
+        // reason is ("its reason is on the stream"), and printing only the
+        // status threw away the sentence that tells the operator where to
+        // look.
+        let said = "";
+        try {
+          const body = (await r.json()) || {};
+          said = [body.error, body.refused, body.detail]
+            .filter(Boolean).join(" -- ");
+        } catch(e) {}
+        // 5xx is the one shape that means a write was *attempted*: the
+        // route answers 502 only when the bridge was accepted and
+        // `sendall` raised, and a `sendall` that times out mid-write has
+        // already put bytes on the wire and cannot say how many. Claiming
+        // nothing arrived there is the same false assurance this whole
+        // path was rewritten to remove.
+        const attempted = r.status >= 500;
+        opshellDropRest("those keystrokes were not delivered (HTTP "
+          + r.status + (said ? ": " + said : "") + "). "
+          + (attempted
+             ? "Some of them may already have reached the shell -- check "
+               + "the session before retyping."
+               : "Nothing reached the shell."));
+        return;
+      }
+    }
+  } finally { opshellFlushing = false; }
+}
+
+// The font stack as a list of names, for the terminal and for the probe alike.
+// Not `var(--mono)`: the vendored xterm prefers an OffscreenCanvas strategy
+// that measures with `ctx.font = "12px " + fontFamily`, and a canvas cannot
+// resolve a custom property, so the assignment is ignored and the cell is
+// measured in the canvas's default 10px sans-serif. Resolved here once and
+// handed to both, the two agree whichever strategy the library picks. An
+// empty answer -- a stylesheet that failed to load -- is the literal stack,
+// not an empty font name. It is the same stack `:root{--mono}` declares, and
+// a test holds the two together.
+function opshellFont(){
+  const stack = (getComputedStyle(document.body).getPropertyValue("--mono")
+                 || "").trim();
+  return stack || "'Cascadia Code','Fira Code','JetBrains Mono',"
+    + "'Courier New',monospace";
+}
+
+// The terminal's size, in columns and rows, from the room the card has.
+//
+// Measured once, here, and never again: the pair rides the bridge's first
+// line (opshell.py: `<password> <cols>x<rows>`), the port clamps it and
+// holds it "fixed for good", and none of the five routes resizes. A window
+// resized after this does not change the terminal, so there is no resize
+// handler to look for.
+//
+// That makes a wrong answer permanent, so a host with no box -- a card that
+// is still display:none, which a reload whose first poll failed reaches --
+// is not measured at all: it gets the server's own default, and the strip
+// says that size, which is what it is. The floor is on this side because
+// the server clamps 0 to 1 and the operator would get a one-column terminal
+// with no explanation.
+function opshellMeasure(host, font){
+  const fallback = [120, 40];
+  font = font || opshellFont();
+  opshellUnfitted = "";
+  const room = host.getBoundingClientRect();
+  if(!(room.width > 0) || !(room.height > 0)){
+    opshellUnfitted = "the card gave it no room when this session attached "
+      + "(hidden, or a window too small), so this session keeps that size; "
+      + "one opened with the card open on a normal window is fitted to it";
+    return fallback;
+  }
+  // Measured the way xterm measures its own cell: an inline-block, whose
+  // rect height is the line box and not the font's content area, holding a
+  // run of 32 characters whose width is divided back down, so a fractional
+  // advance is not rounded away on one glyph. It has to be in the page to
+  // have a size, so it is appended, read and taken out again. Family and
+  // size are the Terminal's own, in `opshellAttach`; a test holds them
+  // together.
+  const RUN = 32;
+  const probe = document.createElement("span");
+  probe.style.display = "inline-block";
+  probe.style.position = "absolute";
+  probe.style.left = "-9999px";
+  probe.style.visibility = "hidden";
+  probe.style.whiteSpace = "pre";
+  probe.style.lineHeight = "normal";
+  probe.style.fontFamily = font;
+  probe.style.fontSize = "12px";
+  probe.textContent = "W".repeat(RUN);
+  document.body.appendChild(probe);
+  let cell;
+  try { cell = probe.getBoundingClientRect(); } finally { probe.remove(); }
+  if(!(cell.width > 0) || !(cell.height > 0)){
+    opshellUnfitted = "the page could not measure a character of its font, "
+      + "so this session keeps that size";
+    return fallback;
+  }
+  // Floor, never round: a sub-pixel error may cost a column and may not
+  // make the terminal wide enough to sit outside the host.
+  const fit = (space, size, least) =>
+    Math.min(1000, Math.max(least, Math.floor(space / size)));
+  return [fit(room.width, cell.width / RUN, 20),
+          fit(room.height, cell.height, 5)];
+}
+
+async function opshellAttach(state){
+  const host = document.getElementById("opshell-term");
+  if(!host || typeof Terminal === "undefined") return;
+  opshellAttached = true;
+  opshellStarted = Date.now();
+  const font = opshellFont();
+  const [cols, rows] = opshellMeasure(host, font);
+  opshellTerm = new Terminal({cols, rows, cursorBlink:true,
+                              fontFamily:font, fontSize:12});
+  opshellTerm.open(host);
+  // Claims only what the code does: the session's rc files run, then
+  // `unset HISTFILE` and `set +o history` (beacon.py:3228).
+  opshellTerm.writeln("\x1b[2m-- live on " + (state.host || state.target || "?")
+    + " \u00b7 history is off in this session \u00b7 " + cols + "x" + rows
+    + ", fixed for this session --\x1b[0m");
+  if(opshellUnfitted){
+    // Said once, here, because this is the only moment the size is chosen.
+    opshellTerm.writeln("\x1b[2m-- not fitted to the card: " + opshellUnfitted
+      + " --\x1b[0m");
+  }
+  if(opshellFresh){
+    // Said once, beside the line above, on a session the page picked back
+    // up after a reload. The shell is not the one that was there: the
+    // bridge's connection *is* the shell, so closing the stream killed the
+    // pty -- measured, pid 75 to 78, /etc back to /, a set variable gone.
+    // Reconnecting silently would leave the operator reading a prompt and
+    // believing their work was still behind it.
+    opshellFresh = false;
+    opshellTerm.writeln("\x1b[2m-- a new shell. The previous session ended "
+      + "with the page that held it: its directory, variables and "
+      + "processes are gone --\x1b[0m");
+  }
+  opshellTerm.onData(d => { opshellKeys += d; opshellFlushKeys(); });
+  // fetch and a ReadableStream, not EventSource: this socket
+  // authenticates by Authorization header only and a token in a URL is
+  // forbidden by a test, so EventSource cannot be used here at all.
+  let res;
+  opshellAbort = new AbortController();
+  try {
+    res = await fetch("/api/opshell/stream?session="
+      + encodeURIComponent(opshellSession) + "&cols=" + cols + "&rows=" + rows,
+      {headers: H(), signal: opshellAbort.signal});
+  } catch(e) {
+    if(opshellTerm){
+      opshellTerm.writeln("\r\n\x1b[2m-- the stream failed ("
+        + ((e && e.message) || e) + ") --\x1b[0m");
+    }
+    await opshellEndSession();
+    return;
+  }
+  if(!res.ok || !res.body){
+    // The end of the session, not a state to sit in. The first version
+    // wrote the line and returned with `opshellAttached` and
+    // `opshellSession` still set and no reader loop to clear them -- so
+    // every keystroke after that got 404, and the claim was held until the
+    // lapse four minutes later.
+    if(opshellTerm){
+      opshellTerm.writeln("\r\n\x1b[2m-- the shell port refused this "
+        + "session (HTTP " + res.status + ") --\x1b[0m");
+    }
+    await opshellEndSession();
+    return;
+  }
+  const reader = res.body.getReader();
+  for(;;){
+    let step;
+    try { step = await reader.read(); } catch(e) { break; }
+    if(step.done) break;
+    // The terminal is gone when the view was torn down under this loop.
+    // Without the guard the first chunk after that threw a TypeError
+    // outside the try, the promise rejected unhandled, and the close
+    // below never ran.
+    if(!opshellTerm) return;
+    opshellTerm.write(step.value);
+  }
+  if(opshellTerm) opshellTerm.writeln("\r\n\x1b[2m-- session ended --\x1b[0m");
+  await opshellEndSession();
+}
+
 async function showTunnel(){
   const overlay = document.createElement("div");
   overlay.className = "loot-overlay";
@@ -9466,12 +11607,25 @@ async function refreshRescues(){
   }
 }
 
+// The block below has its shape pinned by
+// `test_the_page_prompts_when_no_token_is_stored` in
+// `software/tests/test_c2_hardening.py`: its regex requires the agent
+// refresh timer as the first line of the branch and allows at most 400
+// characters between that and the `else`. This branch has taken it to 323,
+// and a comment inside the block counts -- which is why this one is out
+// here, and why it does not quote that line either: two tests find it by
+// searching for its text, and one of them counts the hits. A line added in
+// there that overruns the bound fails a test in a file nobody would think
+// to open from this one, so raise the bound there in the same commit, or
+// put the work in a function and call it from here.
 if(storedToken()){
   setInterval(refreshAgents, 3000);
   setInterval(refreshRescues, 3000);
   setInterval(checkTaskResults, 2500);
   refreshAgents();
   refreshRescues();
+  // A shell the operator had open before a reload goes back on screen.
+  opshellResume();
   toast("info","Server Online","Listening for beacon connections<br>Beacon traffic accepted on any POST path",6000);
 } else {
   askForToken(false);

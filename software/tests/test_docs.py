@@ -926,6 +926,8 @@ class TestTheListenersGuide(_DocCase):
 
 
 TUNNEL_DOC = REPO / "docs" / "TUNNEL.md"
+DESIGN_DOC = (REPO / "docs" / "superpowers" / "specs"
+              / "2026-11-19-operator-shell-window-design.md")
 
 
 class TestTheTunnelPageDocumentsTheShellSession(unittest.TestCase):
@@ -1047,6 +1049,277 @@ class TestTheTunnelPageDocumentsTheShellSession(unittest.TestCase):
                       "the capability row does not point at docs/TUNNEL.md")
 
 
+class TestTheOperatorShellIsDocumentedAsAWindow(unittest.TestCase):
+    """The panel became a window, and three pages still described a modal.
+
+    It died on every page load; now the card survives a reload, `_` parks
+    it with the shell still running, and only `✕` ends it. Each of those
+    changed a promise a reader relies on -- and one of them, "leaving the
+    session queues the shutdown", was left standing as a page promising
+    behaviour the code no longer has. These are the claims the prose may
+    not soften back: what a closed tab costs, that a reattach is a new
+    shell, and what a parked session holds while it waits.
+    """
+
+    def test_the_tunnel_page_states_what_a_closed_tab_now_costs(self):
+        """The bound changed, and a page that still says "immediately"
+        would be the lying documentation this branch keeps finding."""
+        text = (REPO / "docs" / "TUNNEL.md").read_text()
+        self.assertRegex(text, r"(?i)minimis|parked|window")
+        self.assertRegex(text, r"240|four minutes")
+        self.assertNotRegex(
+            text, r"(?i)closing the (view|panel)[^.]*queues the shutdown",
+            "the page still promises that closing the view queues the "
+            "shutdown; only the cross does that now")
+        # The three above are the task brief's, and measured against the
+        # page as this task found it, two of them could not fail and the
+        # third was red for the wrong reason:
+        #   * "window" was already there, in the geometry paragraph;
+        #   * `240|four minutes` failed only because the page's "four
+        #     minutes" is wrapped across a line, so what answered that
+        #     regex is prose reflowing and not the bound;
+        #   * the forbidden sentence read "queues the channel's shutdown",
+        #     which the pattern does not match, so it was green over the
+        #     very page it was written to forbid.
+        # The claims the six tasks actually changed are below, on a
+        # whitespace-flattened copy for the reason the second one above
+        # demonstrates: a phrase that reads as one sentence is two lines
+        # in the file.
+        flat = " ".join(text.split())
+        self.assertNotRegex(
+            flat, r"(?i)clicking outside it",
+            "the card is a flex sibling of the content column and not a "
+            "modal, so there is no outside to click")
+        self.assertNotRegex(
+            flat, r"(?i)closing the browser tab all post the same close",
+            "a closed tab posts nothing now -- the pagehide handler is "
+            "gone -- so the page may not go on charging it nothing")
+        self.assertRegex(
+            flat, r"240\s*(?:s\b|seconds)",
+            "the page does not state, in seconds, the lapse a closed tab "
+            "now costs")
+        # This half the page already had right, and it is pinned so that a
+        # rewrite around it cannot drop it: the lapse is noticed by a
+        # check-in, so the margin is only ever paid with one on top.
+        self.assertRegex(
+            flat, r"(?i)plus one (?:check-in|interval)",
+            "the bound is the lapse plus one check-in, and the check-in is "
+            "the half an operator waits through")
+
+    def test_the_demo_page_no_longer_promises_that_leaving_ends_it(self):
+        """`docs/C2_DEMO.md:89` carried "Leaving the session queues the
+        shutdown", which six tasks made false: leaving parks it, and only
+        the cross ends it."""
+        text = (REPO / "docs" / "C2_DEMO.md").read_text()
+        self.assertNotRegex(text, r"(?i)leaving the session queues")
+        self.assertRegex(text, r"(?i)minimis|parked")
+        # The two above are the brief's, and the second is a floor rather
+        # than a pin: "parked" also appears in the reload sentence, so
+        # deleting the minimise sentence outright left it green -- measured,
+        # not assumed. So the pair that actually changed is named, and in
+        # the section that describes the header rather than anywhere on a
+        # 1,200-line page.
+        header = text.split("### Header Bar", 1)
+        self.assertEqual(len(header), 2, "the tour has no Header Bar "
+                         "section any more")
+        flat = " ".join(header[1].split("\n###", 1)[0].split()).lower()
+        for pattern, what in (
+                (r"minimis", "that `_` parks the card and the shell keeps "
+                             "running"),
+                # Tied to the glyph, not to the words: "ends the session"
+                # alone is answered by the sentence about a reload no
+                # longer ending it, which measured green with the cross's
+                # own clause deleted.
+                (r"\u2715[^.]{0,80}end", "that `\u2715` is what ends it")):
+            self.assertRegex(flat, pattern, "the tour's Header Bar section "
+                             "does not say %s" % what)
+
+    def test_the_tunnel_page_says_a_reload_gives_a_new_shell(self):
+        """The connection *is* the shell, so a reattach is a fresh `bash`.
+
+        Measured for the design: the pid went 75 -> 78, the working
+        directory was back at `/`, and a variable that had been set was
+        gone. A page that said a reload "restores your session" would be
+        worse than one that said nothing at all, because the operator
+        would type into a prompt believing their work was behind it.
+
+        Scoped to the paragraphs that make the claim: "process" and
+        "variable" each appear elsewhere on this page, so a
+        document-wide search for them proves nothing about this sentence.
+        """
+        text = TUNNEL_DOC.read_text()
+        said = [" ".join(p.split()) for p in text.split("\n\n")
+                if re.search(r"(?i)a new shell", " ".join(p.split()))]
+        self.assertTrue(said, "the page does not say anywhere that what a "
+                        "reload attaches is a new shell")
+        flat = " ".join(said).lower()
+        for lost, what in (("director", "that the working directory resets"),
+                           ("variable", "that the variables are gone"),
+                           ("process", "that the processes went with it")):
+            self.assertIn(lost, flat, "the page says the shell is a new one "
+                          "and not %s" % what)
+
+    def test_the_tunnel_page_prices_a_parked_session(self):
+        """Parking is the answer the page recommends, so it costs something.
+
+        A parked session is not a paused one: the stream stays up, which
+        means a worker thread on the team server, the connection to the
+        shell port, a pty on the device and one of that port's four
+        session slots (`beacon.py:_SHELL_MAX_SESSIONS`,
+        `tunnel/shell.py:DEFAULT_MAX_SESSIONS`, both 4), for as long as it
+        is parked.
+
+        Scoped to the paragraph that makes the claim, and not to every
+        paragraph containing "parked": the first version took the latter,
+        which swept in the reload paragraph ("open or parked") and got
+        `connection` and `pseudo-terminal` from there for free. Measured by
+        the review: with that scope, cutting the cost list down to the
+        thread and the four slots left this green, so two of the four costs
+        were held by nothing.
+        """
+        text = TUNNEL_DOC.read_text()
+        held = [" ".join(p.split()) for p in text.split("\n\n")
+                if re.search(r"(?i)parked session is not a free one",
+                             " ".join(p.split()))]
+        self.assertEqual(len(held), 1, "the page has no one paragraph that "
+                         "prices a parked session")
+        flat = held[0].lower()
+        for cost, what in (("thread", "the worker thread the stream holds"),
+                           ("connection", "the connection to the shell port"),
+                           ("pseudo-terminal", "the pty on the device"),
+                           ("four", "one of the port's four session slots")):
+            self.assertIn(cost, flat, "a parked session is not a free one, "
+                          "and the page does not name %s" % what)
+
+    def test_the_readme_row_says_the_card_can_be_parked(self):
+        """The front page's one clause about the window.
+
+        Read off the row rather than the page: "minimise" and "reload"
+        both appear elsewhere in the README, so a row rewritten without
+        them would pass a document-wide search. Emphasis is stripped
+        first -- `a **new** shell` is the same claim as `a **new shell**`,
+        and a test that can be defeated by moving a pair of asterisks is
+        a test about formatting.
+        """
+        row = next((line for line in README.read_text().splitlines()
+                    if line.startswith("| Operator Shell |")), None)
+        self.assertIsNotNone(row, "the GUI feature table has no Operator "
+                             "Shell row")
+        flat = re.sub(r"[*`]", "", row).lower()
+        for claim, what in (("minimis", "that `_` parks it and the shell "
+                                        "keeps running"),
+                            ("reload", "that a reload brings the card back"),
+                            ("new shell", "that what it attaches is a new "
+                                          "shell")):
+            self.assertIn(claim, flat,
+                          "the capability row does not say %s" % what)
+
+    def _window_prose(self):
+        """The three passages that describe the window, and nothing else.
+
+        Scoped, because the patterns in the test below are unambiguous
+        only here: "come back" is a true statement about the generator's
+        response further up `docs/TUNNEL.md`, and "it is restored" is a
+        true statement about the card in the tour's own paragraph. A
+        page-wide `assertNotRegex` for either would be a test about the
+        rest of the page.
+        """
+        section = TUNNEL_DOC.read_text().split(
+            "\n## Opening one from the interface", 1)
+        self.assertEqual(len(section), 2, "docs/TUNNEL.md no longer has the "
+                         "section that describes the window")
+        found = [("docs/TUNNEL.md", section[1].split("\n## ", 1)[0])]
+        for doc, lead in ((DEMO_DOC, "The **Operator Shell** panel"),
+                          (README, "| Operator Shell |")):
+            lines = [line for line in doc.read_text().splitlines()
+                     if line.startswith(lead)]
+            self.assertEqual(len(lines), 1, "%s has no single passage "
+                             "starting %r" % (doc.name, lead))
+            found.append((doc.name, lines[0]))
+        return [(name, " ".join(text.split())) for name, text in found]
+
+    def test_no_page_reverses_the_claims_these_tests_pin(self):
+        """Softening is caught above; a reversal was not.
+
+        Measured by the review against four of the nine assertions in this
+        class: "`_` cannot minimise it: the card is hidden and the shell is
+        torn down", "your directory, your variables and your running
+        processes all come back", "are restored for you", and "the shell is
+        killed ... attaches the same shell, never a new shell" each left
+        the file green. Every assertion above asks whether a subject is
+        mentioned, and none of them asks what is said about it -- so a page
+        that stated the opposite of the measurement would pass. These ask
+        the other question, on all three passages.
+
+        The pairs are subject-then-verb inside one sentence rather than two
+        separate searches, because "the card survives a page load" and
+        "until it is restored" are both true and both sit next to these.
+        """
+        for name, flat in self._window_prose():
+            for lie, what in (
+                    (r"(?i)(director|variable|process)\w*[^.;]{0,70}"
+                     r"(come back|restored|survive)",
+                     "that the shell's own directory, variables or "
+                     "processes survive a reload -- the pid went 75 to 78"),
+                    (r"(?i)the same shell",
+                     "that a reattach gets the same shell"),
+                    (r"(?i)never a new shell",
+                     "that a reattach is never a new shell"),
+                    (r"(?i)cannot minimis",
+                     "that the card cannot be parked"),
+                    (r"(?i)minimis\w*[^.;]{0,70}"
+                     r"(torn down|tears? down|killed|ends the session)",
+                     "that `_` ends the session, which is what `\u2715` is "
+                     "for")):
+                self.assertNotRegex(flat, lie, "%s claims %s" % (name, what))
+            # And the positive half of the same claim, so the passage has to
+            # say what `_` does and not merely avoid saying the opposite.
+            self.assertRegex(flat, r"(?i)keeps running|still running",
+                             "%s does not say the shell keeps running while "
+                             "the card is parked" % name)
+
+    def test_the_design_records_the_six_things_this_cannot_do(self):
+        """The six known limitations, which nothing else holds.
+
+        A design is not usually tested here. These six are the only
+        written record of what the feature deliberately cannot do -- each
+        one ruled during execution, against a change the plan forbade --
+        and the three operator claims above are now pinned while these
+        were held by nothing, so they could rot or be dropped silently.
+        Subjects, not sentences: the reasoning is free to be rewritten,
+        the six subjects are not.
+        """
+        section = DESIGN_DOC.read_text().split(
+            "\n## Known limitations, as built\n", 1)
+        self.assertEqual(len(section), 2, "the design no longer records what "
+                         "this feature cannot do")
+        body = section[1].split("\n## ", 1)[0].split("\n---", 1)[0]
+        entries = re.findall(r"^\d+\. \*\*", body, re.M)
+        self.assertEqual(len(entries), 6, "the section has %d entries; six "
+                         "limitations were ruled" % len(entries))
+        flat = " ".join(body.split()).lower()
+        for subject, what in (
+                ("count, not an identity",
+                 "that the resume checks how many sessions the claim has, "
+                 "not whether this id is one of them"),
+                ("duplicated tab", "that Duplicate Tab clones the id and "
+                                   "both tabs resume it"),
+                ("content column is hidden",
+                 "that an agent clicked while the card is open renders "
+                 "into a hidden node"),
+                ("fixed for the life of the connection",
+                 "that nothing resizes a terminal after it is attached"),
+                ("while parked is read after a restore",
+                 "that a refusal is read on the restore and not in the "
+                 "parked entry -- the subject changed with the merge "
+                 "blocker: the sentence used to be written only into a "
+                 "terminal the next poll tick disposed, and now rides on "
+                 "`opshellLast` into the card"),
+                ("not a free one", "what a parked session holds")):
+            self.assertIn(subject, flat,
+                          "the section does not record %s" % what)
+
+
 class TestTheGuiTourKeepsUpWithTheHeader(unittest.TestCase):
     """The tour lists the header buttons; the page defines them.
 
@@ -1085,6 +1358,44 @@ class TestTheGuiTourKeepsUpWithTheHeader(unittest.TestCase):
             self.assertTrue(title.lower() in flat,
                             "the tour's Header Bar section never mentions "
                             "the %r button" % title)
+
+    def test_no_heading_has_its_paragraph_glued_to_it(self):
+        """A heading and its text need the blank line between them.
+
+        Found by a reviewer, not by a test: an edit on this branch removed
+        the newline after `### Agent Sidebar (left)` and the whole
+        paragraph became part of the H3 -- 302 characters of prose
+        rendered as a heading. Nothing noticed, because every docs test
+        here searches for substrings and the substrings were all still
+        there; only the rendering was wrong.
+
+        Two signals, because one alone misfires. Length catches it on its
+        own (the next longest heading in these three files is 89
+        characters, and that one is a shell comment), and the sentence
+        rule catches a short run-on that length would let through.
+        `#` lines inside a fenced block are shell comments, not headings,
+        so the fences are tracked rather than assumed away -- without that
+        the rule flagged four code comments and no real defect.
+        """
+        for doc in (DEMO_DOC, REPO / "docs" / "TUNNEL.md", REPO / "README.md"):
+            fenced = False
+            for n, line in enumerate(doc.read_text().splitlines(), 1):
+                if line.lstrip().startswith("```"):
+                    fenced = not fenced
+                    continue
+                if fenced or not line.startswith("#"):
+                    continue
+                where = "%s:%d: %r" % (doc.name, n, line[:80])
+                self.assertLessEqual(
+                    len(line), 120,
+                    "a heading this long is a paragraph with a lost "
+                    "newline -- " + where)
+                # A title does not end in a full stop and carry on. The
+                # lookbehind spares "## 1. Operator Dashboard", which is a
+                # numbered heading and not a sentence.
+                self.assertNotRegex(
+                    line.lstrip("#"), r"(?<![0-9])[.!?]\s+\S",
+                    "a heading does not contain a sentence break -- " + where)
 
     def test_the_tour_links_the_listener_guide(self):
         self.assertIn("LISTENERS.md", self.tour,
