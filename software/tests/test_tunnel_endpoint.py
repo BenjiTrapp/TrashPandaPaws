@@ -1566,21 +1566,26 @@ class TestTheLoginShell(_ShellChoice, unittest.TestCase):
                 mock.patch.object(os, "getuid", return_value=1):
             yield
 
-    def _code_of(self, function):
-        """`function`'s code as the parser sees it: no docstring, no comments.
+    def _names_used_by(self, function):
+        """Every name `function` reads or imports, as the parser sees it.
 
-        The guard is about what the function does. Its prose is free to
-        name `$SHELL` -- saying why it is not read is the docstring's job
-        -- and so is any name it likes, so the scan looks for the reading
-        of the environment and not for a word.
+        Identifiers and not text: a docstring, a comment and a variable
+        that merely contains the letters are not the function doing
+        anything. What is collected is each `ast.Name`, each attribute
+        accessed (`os.environ` gives `environ`) and each name imported, so
+        a test can ask whether the environment is *named* and an unrelated
+        local called `environment` is not.
         """
-        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
-        body = tree.body[0].body
-        if (isinstance(body[0], ast.Expr)
-                and isinstance(body[0].value, ast.Constant)
-                and isinstance(body[0].value.value, str)):
-            del body[0]
-        return ast.dump(tree)
+        names = set()
+        for node in ast.walk(ast.parse(
+                textwrap.dedent(inspect.getsource(function)))):
+            if isinstance(node, ast.Name):
+                names.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                names.add(node.attr)
+            elif isinstance(node, ast.alias):
+                names.add(node.name.split(".")[-1])
+        return names
 
     def test_the_login_shell_of_the_effective_user_is_what_runs(self):
         """`$SHELL` under the shipped service unit is the service
@@ -1721,6 +1726,30 @@ class TestTheLoginShell(_ShellChoice, unittest.TestCase):
                              guard == "weak", case)
             self.assertEqual(bool(detail), guard == "weak", case)
 
+    def test_the_invocation_acts_on_the_shell_it_chose_not_on_a_second_look(self):
+        """`_guard_of` exists so that the program and the guard come from
+        one passwd lookup. Every other test holds the entry constant, where
+        one lookup and two cannot differ; a login shell changed between
+        the two (`chsh` on a service that has run for months) is the case
+        that can."""
+        for first, second, rcfile in (("/bin/bash", "/bin/zsh", True),
+                                      ("/bin/zsh", "/bin/bash", False)):
+            lookups = [mock.Mock(pw_shell=first)] + (
+                [mock.Mock(pw_shell=second)] * 5)
+            with self._executable({"/bin/bash", "/bin/zsh"}), \
+                    self._dev_fd(True), \
+                    mock.patch.object(pwd, "getpwuid",
+                                      side_effect=lookups) as lookup:
+                argv, env, held = beacon_mod._shell_invocation(80, 24)
+            for fd in held:
+                os.close(fd)
+            case = (first, second)
+            self.assertEqual(argv[0], first, case)
+            self.assertEqual("--rcfile" in argv, rcfile, case)
+            self.assertEqual(env.get("HISTFILE") == os.devnull, not rcfile,
+                             case)
+            self.assertEqual(lookup.call_count, 1, case)
+
     def test_a_zsh_session_blames_the_shell_and_not_the_host(self):
         """The operator can tell a login zsh apart from an ancient host
         only if the reason says which it was."""
@@ -1756,9 +1785,29 @@ class TestTheLoginShell(_ShellChoice, unittest.TestCase):
                              "/bin/zsh")
         for chooser in (beacon_mod._login_shell, beacon_mod._shell_program,
                         beacon_mod._history_guard, beacon_mod._guard_of):
-            code = self._code_of(chooser)
+            used = self._names_used_by(chooser)
             for reading in ("environ", "getenv"):
-                self.assertNotIn(reading, code, chooser.__name__)
+                self.assertNotIn(reading, used, chooser.__name__)
+
+    def test_a_scan_for_the_environment_is_not_fooled_by_a_name(self):
+        """The scan above has been tripped three times by text that was
+        not a reading. It must see through a local called `environment`
+        and still catch both ways of reading the variable."""
+        def innocent():
+            """Says os.environ and getenv in prose."""
+            environment = 1  # os.environ
+            return environment
+
+        def reads_environ():
+            return os.environ.get("SHELL")
+
+        def reads_getenv():
+            return os.getenv("SHELL")
+
+        self.assertFalse({"environ", "getenv"}
+                         & self._names_used_by(innocent))
+        self.assertIn("environ", self._names_used_by(reads_environ))
+        self.assertIn("getenv", self._names_used_by(reads_getenv))
 
     def test_a_passwd_lookup_that_raises_falls_back_rather_than_throwing(self):
         with mock.patch.object(pwd, "getpwuid",
@@ -1814,6 +1863,38 @@ class TestARefusedShellSession(_ShellChoice, TunnelEndpointTestCase):
         self.assertEqual(len(refusals), 1)
         self.assertRegex(refusals[0], r"(?i)histor")
         self.assertNotRegex(refusals[0], r"Traceback|OSError\(")
+
+    def test_the_refusal_claims_only_the_cause_the_error_gives(self):
+        """Out of descriptors is said of `EMFILE` and `ENFILE` and of
+        nothing else."""
+        cases = ((OSError(errno.EMFILE, "Too many open files"), True),
+                 (OSError(errno.ENFILE, "Too many open files in system"),
+                  True),
+                 (OSError(errno.ENOMEM, "Cannot allocate memory"), False),
+                 (OSError("no errno at all"), False))
+        for error, says_so in cases:
+            _, refusals, _ = self._serve_with_a_pipe_that_fails(error)
+            self.assertEqual(len(refusals), 1)
+            self.assertEqual(bool(re.search(r"file descriptors",
+                                            refusals[0])), says_so,
+                             (error, refusals[0]))
+            self.assertRegex(refusals[0], r"(?i)histor")
+
+    def test_an_oserror_that_is_not_the_pipe_is_not_called_the_pipe(self):
+        """The refusal that names history is for the pipe only; anything
+        else the invocation raises takes the generic one."""
+        refusals = []
+        endpoint = TunnelEndpoint(self.config_for(1234))
+        self.addCleanup(endpoint.stop)
+        with mock.patch.object(beacon_mod, "_shell_invocation",
+                               side_effect=OSError("something else")), \
+                mock.patch.object(TunnelEndpoint, "_refuse_shell",
+                                  lambda self, sock, noise, reason:
+                                  refusals.append(reason)):
+            endpoint._serve_shell(None, None, 80, 24)
+        self.assertEqual(len(refusals), 1)
+        self.assertNotRegex(refusals[0], r"(?i)histor")
+        self.assertEqual(endpoint._shells, 0)
 
     def test_a_refused_session_leaves_nothing_taken(self):
         """No slot held and no descriptor open: a host that is out of

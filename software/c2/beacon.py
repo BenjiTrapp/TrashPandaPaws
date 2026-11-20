@@ -3393,6 +3393,14 @@ def _shell_rcfile_fd() -> int:
     return read_fd
 
 
+class _HistoryPipeError(OSError):
+    """The pipe that carries the generated rcfile could not be made.
+
+    What `_shell_invocation` raises, and the only thing `_serve_shell`
+    reads as "history cannot be held off for this session".
+    """
+
+
 def _guard_of(program: str) -> Tuple[str, str]:
     """`_history_guard`'s answer for a shell already chosen.
 
@@ -3419,11 +3427,15 @@ def _history_guard() -> Tuple[str, str]:
     `HISTFILE=/dev/null` in the environment, which the user's own rc files
     run after and are free to undo.
 
-    Both reasons are facts about the host that cannot change from one
-    session to the next, which is what lets them be reported once and not
-    per attempt. The reason says which it was -- the shell, or the host --
-    because the operator can do something about one and not the other. A
-    pipe that cannot be opened is not here: that is per attempt, and it
+    The two reasons differ in how long they hold. `/dev/fd` is the
+    host's, and does not change under a running service. "Not bash" is
+    the login shell's, and that can: `chsh`, or a bash removed or made
+    non-executable, takes effect on the next session of a service that
+    has run for months. So an answer given once is not good for ever, and
+    a caller that reports it once has to notice when a session's guard no
+    longer matches. The reason says which it was -- the shell, or the host
+    -- because the operator can do something about one and not the other.
+    A pipe that cannot be opened is not here: that is per attempt, and it
     refuses the session.
     """
     return _guard_of(_shell_program())
@@ -3442,14 +3454,16 @@ def _shell_invocation(cols: int, rows: int) -> Tuple[list, dict, tuple]:
     a shell that is not bash, or a host with no `/dev/fd` -- and there the
     session falls back to `HISTFILE=/dev/null` in the environment and logs
     that it took the weaker path, because the host's own rc files run
-    after that and are free to set `HISTFILE` again. Those two are facts
-    about the host, so the view can say so before a session is asked for.
+    after that and are free to set `HISTFILE` again. Of those two,
+    `/dev/fd` is the host's and stable, and the shell is the login shell's
+    and is not: see `_history_guard`.
 
     A pipe that cannot be opened is neither. It is a moment's shortage of
     descriptors on a host that otherwise would have held history off, and
     falling back would record the operator's commands while everything
-    they were shown said it did not. The `OSError` propagates, and the
-    caller refuses the session.
+    they were shown said it did not. It propagates as `_HistoryPipeError`,
+    an `OSError`, and the caller refuses the session. A class of its own,
+    so that any other `OSError` from here is not taken for this one.
 
     `--rcfile` comes before `-i`: bash 3.2 stops reading long options
     after the first short one and answers `--: invalid option`, which
@@ -3470,7 +3484,10 @@ def _shell_invocation(cols: int, rows: int) -> Tuple[list, dict, tuple]:
                     "HISTFILE=%s rather than a generated rcfile: %s",
                     os.devnull, weaker)
         return [program, "-i"], env, ()
-    rc_fd = _shell_rcfile_fd()
+    try:
+        rc_fd = _shell_rcfile_fd()
+    except OSError as exc:
+        raise _HistoryPipeError(*exc.args) from exc
     return ([program, "--rcfile", "%s/%d" % (_DEV_FD, rc_fd), "-i"],
             env, (rc_fd,))
 
@@ -4423,18 +4440,23 @@ class TunnelEndpoint(object):
             os.set_blocking(master, False)
             try:
                 argv, env, child_fds = _shell_invocation(cols, rows)
-            except OSError as exc:
-                # The one failure in there that is not the host's
-                # nature: see `_shell_invocation`. A refusal that names
-                # history, because "could not start" would leave the
-                # operator to guess what was being protected.
+            except _HistoryPipeError as exc:
+                # Only this one: see `_shell_invocation`. Any other
+                # `OSError` from there takes the generic refusal below.
+                # This one names history, because "could not start"
+                # would leave the operator to guess what was being
+                # protected.
+                if exc.errno in (errno.EMFILE, errno.ENFILE):
+                    advice = ("The host is out of file descriptors; "
+                              "attach again once some are free.")
+                else:
+                    advice = "Attach again."
                 self._refuse_shell(
                     sock, noise,
-                    "this host could not set up the pipe that keeps the "
-                    "session's command history off (%s), so no session "
-                    "was started rather than one that records what you "
-                    "type. Attach again; if it keeps happening the "
-                    "host is out of file descriptors." % exc)
+                    "no session was started, because the pipe that keeps "
+                    "its command history off could not be set up (%s) "
+                    "and a session without it could record what you "
+                    "type. %s" % (exc, advice))
                 return
             program = argv[0]
             leader = _setsid_program()
