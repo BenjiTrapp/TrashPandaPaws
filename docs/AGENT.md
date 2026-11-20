@@ -992,6 +992,72 @@ have to be distinguishable.
   run. The record is complete either way.
 
 
+### The gsocket leg
+
+The beacon's fifth transport reaches the team server through a `gs-netcat`
+child and the Global Socket Relay Network
+([`docs/LISTENERS.md`](LISTENERS.md#the-fifth-transport-gsocket-over-the-gsrn)).
+These four are properties of that arrangement, not findings a review left
+open, which is why they are their own section and not filed under the
+hardening pass's severity groups below — those are that pass's, and counted
+against it. The fourth is the one that would hold a deployment, and it is now
+measured rather than assumed: the answer came out the worse way, and the
+remedy ships with the implant's provisioning.
+
+- **A generated build has four legs; the hardware implant has five.** The leg
+  needs a child process and a binary on disk, and a build the team server
+  generates is a single file that is pasted into a shell. So the generator
+  refuses an enabled `gsocket` leg with a 400 naming the reason rather than
+  producing a build whose fifth leg silently does nothing. An operator
+  comparing the two will find a transport in `configs/raccoon.yaml` that the
+  Beacon Gen form cannot offer, and that asymmetry is deliberate.
+- **The carrier is a second process, so killing it kills the leg.** Both ends
+  are a `gs-netcat` the project spawns and does not contain: kill the
+  implant's child and the forward is gone until the beacon notices on its
+  next failed cycle and starts another, no sooner than
+  `restart_delay_seconds` (30 by default) after the last start. There is no
+  watcher thread and no timer, deliberately — a restart in two places is a
+  child that reappears after an operator stopped it — but the cost is that an
+  implant whose carrier was killed is unreachable over this leg for at least
+  one beacon interval, and the panel reports the carrier, not the implant's
+  copy of it, which nothing on the team server can see.
+- **Reachability now depends on a third-party relay network.** The GSRN is
+  operated by The Hacker's Choice, not by this project: if it is down,
+  blocked, or no longer willing to carry this traffic, the leg is down with
+  it, and nothing in the repository can route around that. It is also
+  recognisable — the relay hosts are published and gsocket is well-known
+  tooling to defenders — so this leg hides where the C2 is, not that gsocket
+  is in use. Whether a client's traffic may cross a third party at all is a
+  rules-of-engagement question; the shipped configuration leaves the leg
+  disabled rather than deciding it.
+- **The implant's carrier opens a local forward, and it binds every
+  interface.** `gs-netcat -p <local_port>` on the implant is a listening
+  socket, and whatever reaches it reaches the team server's beacon socket
+  **unauthenticated at the transport level** — bounded by the AES-256-GCM
+  envelope to exactly what a compromised listener can do (drop or replay
+  messages; it can neither read them nor forge one), but a path all the same.
+  How far it reaches is **measured in upstream source at v1.4.43**, not
+  assumed: `tools/4_gs-netcat.c:1499` sets `gopt.is_multi_peer = 1` for `-p`,
+  `tools/4_gs-netcat.c:1573-1585` takes the client branch and calls
+  `fd_net_listen(gopt.listen_fd, &gopt.port, SOCK_STREAM)`, and
+  `tools/utils.c:1238-1259` binds `htonl(INADDR_ANY)` whenever `*port != 0`
+  — `127.0.0.1` only for port 0. So the implant's own argv,
+  `gs-netcat -k <file> -w -p <port>`, binds `0.0.0.0:<local_port>`: not the
+  host's local users but the whole segment has that path. **The consequence
+  that matters more here is the cover identity**, because no envelope bounds
+  it: an unexpected port answering on every interface is an indicator in its
+  own right, and it belongs to no Cisco IP phone and no HP printer, so one
+  scan of the segment finds it. `gs-netcat`
+  offers no bind-address flag, so the remedy is a host firewall rule —
+  `software/setup/gsocket_forward_firewall.sh`, run by both of the implant's
+  provisioning paths, which drops that port on everything but `lo` and
+  reapplies the rule at every boot. The same reading settled the server side
+  favourably: `-l` takes the other branch and the carrier opens no local
+  socket at all. The citation is repeated above `GsocketCarrier.argv` in
+  `software/c2/gsocket/carrier.py` and in the GSRN section of
+  [`docs/LISTENERS.md`](LISTENERS.md#what-the-implants-forward-exposes-measured).
+
+
 ### Left open by the security hardening
 
 The hardening pass of November 2026 closed most of what an audit of the C2

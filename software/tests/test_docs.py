@@ -925,6 +925,631 @@ class TestTheListenersGuide(_DocCase):
                         "the README never mentions the listeners")
 
 
+# The gsocket leg: where its documentation lives, by heading. Written once
+# here because four tests below cut a section out by it, and a renamed
+# heading should fail in one place with a readable message rather than in
+# four with an index error.
+GSOCKET_GUIDE_HEADING = "## The fifth transport: gsocket over the GSRN"
+GSOCKET_LIMITS_HEADING = "### The gsocket leg"
+HARDENING_HEADING = "### Left open by the security hardening"
+BUILD_IMAGE = REPO / "software" / "setup" / "build_image.sh"
+GSOCKET_UNIT = REPO / "services" / "raccoon-gsocket.service"
+
+
+def _directive_lines(text):
+    """A unit file's directives, with its prose dropped.
+
+    These files argue at length about what they do *not* do -- no secret
+    on the command line, no capability -- so a check for a directive that
+    read the whole file would pass on the comment explaining why the
+    directive is absent. `test_listeners.py` learned this the same way.
+    """
+    return "\n".join(line for line in text.splitlines()
+                     if line.strip() and not line.lstrip().startswith("#"))
+
+
+class TestTheGsocketLegIsDocumentedAndShipsDisabled(unittest.TestCase):
+    """The fifth leg's costs, its limits, its unit and the blocks it ships.
+
+    This is the only transport in the project whose traffic crosses
+    infrastructure nobody here operates, which makes it the only one where
+    reading the flags is not enough to decide whether to switch it on. So
+    the guide has to state what it costs *before* it states a key, and the
+    *Known limits* entry about the implant's forward has to carry the
+    measured bind address with the upstream citation that settles it --
+    `0.0.0.0`, not loopback -- rather than either a guess or the
+    "unverified" it honestly said while nobody had read the source.
+
+    The two shipped blocks are held to both halves of their contract:
+    disabled, and valid. Valid is not cosmetic -- a `c2.gsocket_carrier`
+    the validators refuse is a fatal startup error for the team server --
+    and the two key shapes that are refused are easy to ship by accident,
+    because `None` means "absent" for the path-ish keys and is invalid for
+    the five that have defaults.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.guide = _read("docs", "LISTENERS.md")
+        cls.limits = AGENT_DOC.read_text()
+        cls.readme = README.read_text()
+        cls.yaml_text = _read("configs", "raccoon.yaml")
+        cls.config = _config()
+
+    # ── the sections ──
+
+    def _guide_section(self):
+        self.assertIn(GSOCKET_GUIDE_HEADING, self.guide,
+                      "docs/LISTENERS.md has no GSRN section; it is the one "
+                      "place an operator is told what this leg costs")
+        body = self.guide.split(GSOCKET_GUIDE_HEADING, 1)[1]
+        return body.split("\n## ", 1)[0]
+
+    def _limits_section(self):
+        self.assertIn("\n" + GSOCKET_LIMITS_HEADING, self.limits,
+                      "docs/AGENT.md has no %r section under Known limits"
+                      % GSOCKET_LIMITS_HEADING)
+        return self.limits.split(
+            GSOCKET_LIMITS_HEADING, 1)[1].split("\n### ", 1)[0]
+
+    def present(self, flat, phrase, what, where):
+        self.assertIn(" ".join(phrase.split()).lower(), flat,
+                      "%s: %r is not in %s" % (what, phrase, where))
+
+    # ── the cost, before the flags ──
+
+    def test_the_gsrn_section_states_the_third_party_cost(self):
+        section = self._guide_section()
+        flat = " ".join(section.split()).lower()
+
+        # Where the section first names a setting. Everything about what
+        # this leg costs has to stand above it: an operator who has read
+        # as far as a key has already started deciding.
+        keys = [flat.index(key) for key in
+                ("c2.fallback.gsocket", "c2.gsocket_carrier", "enabled:",
+                 "secret_file", "local_port")
+                if key in flat]
+        self.assertTrue(keys, "the GSRN section names no setting at all, so "
+                              "it is not the section that configures this leg")
+        first_key = min(keys)
+
+        for phrase, what in (
+                ("the client's traffic crosses a third party",
+                 "the first cost, in those words"),
+                ("negotiates it with srp",
+                 "what makes the relay see ciphertext only"),
+                ("the relay sees ciphertext only",
+                 "the confidentiality answer"),
+                ("rules of engagement",
+                 "where the question that is left actually belongs"),
+                ("where our c2 is, not that gsocket is in use",
+                 "the second cost, in those words"),
+                ("the handshake to known gsrn hosts is recognisable",
+                 "why the second cost is a cost"),
+                ("it does not buy looking like nothing",
+                 "the sentence that stops a reader over-reading this leg")):
+            with self.subTest(phrase=phrase):
+                self.present(flat, phrase, what, "the GSRN section")
+                at = flat.index(" ".join(phrase.split()).lower())
+                self.assertLess(
+                    at, first_key,
+                    "%r comes after the section's first setting: the cost of "
+                    "this leg has to be read before its flags" % phrase)
+
+    def test_the_gsrn_section_says_one_secret_per_implant_and_how_to_mint_one(
+            self):
+        flat = " ".join(self._guide_section().split()).lower()
+        for phrase, what in (
+                ("one secret per implant", "the rule"),
+                ("never fleet-wide", "and its other half"),
+                ("a recovered implant image", "whose damage the rule bounds"),
+                ("aes-256-gcm envelope", "what bounds the damage either way"),
+                ("gs-netcat -g", "how an operator mints one"),
+                # Who puts each copy where. The guide used to answer this
+                # with "the build generator writes the implant's copy",
+                # which nothing does -- and the generator is the one
+                # component that refuses this leg outright, which the same
+                # page says fifty lines further down. An operator who
+                # follows a mechanism that does not exist finds out on the
+                # engagement.
+                ("nothing in this repository writes the implant's copy",
+                 "who writes the implant's secret file: nobody"),
+                ("register_implant", "how the server's half is registered"),
+                ("no cli", "that there is no tool for that yet"),
+                ("trailing newline",
+                 "the byte that makes the two ends disagree")):
+            with self.subTest(phrase=phrase):
+                self.present(flat, phrase, what, "the GSRN section")
+        # A chosen password is the one thing nobody should be invited to
+        # do here: the secret is the whole address on the relay network.
+        self.assertNotIn("choose a password", flat)
+        for false in ("the build generator writes",
+                      "generator writes the implant"):
+            self.assertNotIn(false, flat,
+                             "the guide credits the build generator with "
+                             "writing the implant's secret file again")
+
+    def test_no_gsocket_code_credits_the_generator_with_the_secret_file(self):
+        # The same false premise, in the four operator-visible places
+        # under `software/c2/` that the guide's own guard could not see:
+        # a reason string the implant *logs*, the `why=` a config author
+        # reads when their block is refused, the docstring that justifies
+        # the enabled/disabled strictness rule, and the comment over the
+        # store's path. Nothing writes either copy of a gsocket secret,
+        # and the build generator is the one component that *refuses*
+        # this leg -- so an operator told to wait for it waits for a
+        # mechanism that does not exist, and finds out on the engagement.
+        #
+        # Scoped to this leg's own modules, because `tunnel/` says the
+        # same words truthfully about build PSKs, which the generator
+        # really does write.
+        banned = ("the build generator writes", "generator writes the implant",
+                  "generator writes that file", "comes from the build "
+                  "generator")
+        for parts, required in (
+                (("software", "c2", "beacon.py"), None),
+                (("software", "c2", "gsocket", "config.py"),
+                 "created by hand on the implant"),
+                (("software", "c2", "gsocket", "secrets.py"),
+                 "created by hand on the implant"),
+                (("software", "c2", "gsocket", "carrier.py"), None),
+                (("software", "c2", "gsocket", "supervisor.py"), None)):
+            where = "/".join(parts)
+            text = _read(*parts)
+            flat = " ".join(text.split()).lower()
+            for false in banned:
+                with self.subTest(file=where, phrase=false):
+                    self.assertNotIn(
+                        false, flat,
+                        "%s credits the build generator with writing a "
+                        "gsocket secret file; nothing writes it, and that "
+                        "component refuses this leg outright" % where)
+            if required is not None:
+                with self.subTest(file=where, says=required):
+                    self.assertIn(
+                        required, flat,
+                        "%s no longer says who creates the implant's secret "
+                        "file; the answer an operator needs is 'by hand, "
+                        "0600', and the GSRN section of docs/LISTENERS.md"
+                        % where)
+            if required is not None:
+                with self.subTest(file=where, says="where to read"):
+                    self.assertIn(
+                        "docs/listeners.md", flat,
+                        "%s says nothing creates the file but does not point "
+                        "at the page that says how to" % where)
+
+        # The reason the implant logs has to answer the same question,
+        # because a host nobody can read is where it lands.
+        beacon_text = _read("software", "c2", "beacon.py")
+        self.assertIn("Nothing in this repository writes that file", beacon_text,
+                      "the beacon's empty-secret_file reason no longer says "
+                      "who writes it, which is the question it raises")
+
+    def test_the_hand_placement_recipe_cannot_make_an_empty_credential(self):
+        # Both halves of this feature's only credential path are hand
+        # recipes, and this one could produce a 0-byte 0600 file in
+        # silence: the block was fenced ```sh while `read -rsp` is a bash
+        # builtin, so under dash -- /bin/sh on Debian and Parrot -- it
+        # fails with "Illegal option -s", $GS_SECRET stays unset and the
+        # next line writes nothing. An empty secret file makes
+        # `gs-netcat -k` read nothing, which is the hardest failure in
+        # this feature to tell from a hostile network.
+        section = self._guide_section()
+        fences = re.findall(r"```(\w*)\n(.*?)```", section, re.S)
+        recipes = [(lang, body) for lang, body in fences
+                   if "read -rsp" in body]
+        self.assertEqual(len(recipes), 1,
+                         "the guide no longer has exactly one hand-placement "
+                         "recipe for the implant's secret")
+        lang, body = recipes[0]
+        self.assertEqual(lang, "bash",
+                         "the recipe is fenced %r but uses `read -rsp`, a "
+                         "bash builtin that dash refuses -- and the next "
+                         "line then writes an empty secret file" % lang)
+        self.assertIn("[ -s ", body,
+                      "the recipe does not check that the file it wrote is "
+                      "non-empty, which is where an empty credential is "
+                      "cheapest to catch")
+        self.assertIn("chmod 600", body,
+                      "the recipe relies on `umask` alone, which does not "
+                      "retighten a file that already exists with a looser "
+                      "mode")
+
+        # And the installer's half: a printed line that creates an *empty*
+        # env file is the one thing the unit's own comment says it chose
+        # the strict `EnvironmentFile=` form to avoid.
+        installer = _read("services", "install.sh")
+        self.assertNotIn(
+            "install -m 600 /dev/null /etc/raccoon/gsocket.env", installer,
+            "services/install.sh prints a line that creates an empty env "
+            "file, which starts `gs-netcat -k ''` and restarts for ever")
+        self.assertIn("RACCOON_GSOCKET_SECRET_FILE=", installer,
+                      "the installer no longer shows how to write the env "
+                      "file the carrier unit reads")
+        self.assertIn("install -d -m 755 /etc/raccoon", installer,
+                      "the installer writes into /etc/raccoon without "
+                      "creating it; `install` does not create parents")
+
+    def test_the_gsrn_section_warns_about_the_warm_up_cycle(self):
+        # The leg is lazy with a warm latch, so the first cycle after an
+        # outage reports it as failed -- the carrier is started *after*
+        # the chain has been tried. Without this paragraph an operator
+        # reads the server's own words for it as a fault.
+        #
+        # Those words are read out of the server rather than written here:
+        # the point of quoting them in the guide is that an operator can
+        # match what they see, and a reworded message with an unchanged
+        # guide is the drift this file exists to catch.
+        said = "gsocket: %s" % c2_server._RESCUE_LEG_WORDS["carrier_failed"]
+        flat = " ".join(self._guide_section().split()).lower()
+        for phrase, what in (
+                ("the first cycle after an outage",
+                 "when the warning appears"),
+                (said, "what the panel says, verbatim"),
+                ("not a fault", "what it is not")):
+            with self.subTest(phrase=phrase):
+                self.present(flat, phrase, what, "the GSRN section")
+
+    def test_the_guide_states_the_measured_bind_with_its_citation(self):
+        # This was the one claim in the feature nobody had measured, and
+        # the guide used to say so. It is measured now -- read out of
+        # upstream source at v1.4.43, because running `gs-netcat` to find
+        # out means dialling a third-party relay from the operator's own
+        # machine -- and the answer is the worse one: the implant's
+        # forward binds every interface.
+        #
+        # Pinned as the *measured claim* rather than as "unverified",
+        # which is what these three assertions used to hold. A guess is
+        # what this cannot be allowed to decay back into, so the citation
+        # is part of what is pinned: a sentence that says `0.0.0.0` with
+        # no source is the same guess wearing a confident face.
+        flat = " ".join(self._guide_section().split()).lower()
+        for phrase, what in (
+                ("binds every interface", "the measured answer"),
+                ("v1.4.43", "the version it was measured at"),
+                ("tools/utils.c:1238-1259",
+                 "the function that chooses the bind address"),
+                ("tools/4_gs-netcat.c:1499",
+                 "where -p sets is_multi_peer"),
+                ("htonl(inaddr_any)", "what it binds"),
+                ("no bind-address flag",
+                 "why a firewall rule and not a flag"),
+                ("gsocket_forward_firewall.sh",
+                 "the remedy that ships with the implant"),
+                ("indicator",
+                 "the cover-identity consequence, which is the worse one"),
+                ("unauthenticated at the transport level",
+                 "what reaching the forward does not need")):
+            with self.subTest(phrase=phrase):
+                self.present(flat, phrase, what, "the GSRN section")
+
+        # The old status, and the claim nobody had measured. Either one
+        # back in this section means the measurement was lost.
+        for stale in ("is unverified", "loopback only",
+                      "binds only 127.0.0.1"):
+            self.assertNotIn(
+                stale, flat,
+                "the guide says %r about the implant's forward again; it "
+                "is measured, and the citation is in this section" % stale)
+
+    def test_the_implants_provisioning_carries_the_firewall_rule(self):
+        # The docs promise a host firewall rule, because gs-netcat has no
+        # bind-address flag and the forward binds every interface. A
+        # promise in prose with nothing in the image is worse than no
+        # promise: an operator reads the limit as closed.
+        script = REPO / "software" / "setup" / "gsocket_forward_firewall.sh"
+        self.assertTrue(script.is_file(),
+                        "software/setup/gsocket_forward_firewall.sh is gone, "
+                        "and three documents say the implant applies it")
+        text = script.read_text()
+        self.assertIn("-j DROP", text,
+                      "the firewall script drops nothing")
+        self.assertIn("-i lo -j ACCEPT", text,
+                      "the firewall script does not keep the beacon's own "
+                      "path to its forward open, so it would close the leg "
+                      "it is protecting")
+
+        # Both provisioning paths, because an implant is either imaged or
+        # hand-built and the rule has to hold on both.
+        for where, provisioning in (
+                ("software/setup/bootstrap.sh",
+                 _read("software", "setup", "bootstrap.sh")),
+                ("build_image.sh's first-boot script",
+                 BUILD_IMAGE.read_text().split(
+                     "first-boot.sh\" <<'FBEOF'", 1)[1]
+                 .split("\nFBEOF", 1)[0])):
+            with self.subTest(provisioning=where):
+                self.assertIn(
+                    "gsocket_forward_firewall.sh", provisioning,
+                    "%s never applies the gsocket forward rule, so an "
+                    "implant provisioned that way answers on that port "
+                    "from the whole segment" % where)
+
+    # ── Known limits ──
+
+    def test_known_limits_records_the_four_gsocket_limits(self):
+        section = self._limits_section()
+        bullets = re.findall(r"^- \*\*", section, re.M)
+        self.assertEqual(len(bullets), 4,
+                         "%r holds %d entries; this leg has four limits"
+                         % (GSOCKET_LIMITS_HEADING, len(bullets)))
+        flat = " ".join(section.split()).lower()
+        for phrase, what in (
+                ("a generated build has four legs",
+                 "the generator cannot carry this one"),
+                ("the carrier is a second process",
+                 "what killing it costs"),
+                ("third-party relay network",
+                 "what reachability now depends on"),
+                ("the implant's carrier opens a local forward",
+                 "what the implant exposes locally"),
+                ("unauthenticated at the transport level",
+                 "what reaching that forward does not need"),
+                ("aes-256-gcm envelope",
+                 "the bound on what reaching it buys"),
+                ("it binds every interface",
+                 "the measured scope of that forward"),
+                ("v1.4.43",
+                 "the version the bind was measured at"),
+                ("tools/utils.c:1238-1259",
+                 "the source that settles it"),
+                ("indicator",
+                 "the cover-identity consequence, which no envelope bounds"),
+                ("gsocket_forward_firewall.sh",
+                 "the remedy, which ships with the provisioning")):
+            with self.subTest(phrase=phrase):
+                self.present(flat, phrase, what, GSOCKET_LIMITS_HEADING)
+
+        # What this entry used to say. It was honest while nobody had
+        # measured the bind; now it would be a guess undoing a
+        # measurement, in either direction.
+        for stale in ("binds only 127.0.0.1", "loopback only",
+                      "is unverified", "not known"):
+            self.assertNotIn(
+                stale, flat,
+                "the entry says %r about a forward that has been measured "
+                "in upstream source" % stale)
+
+        # Its own section, above the hardening pass's groups and outside
+        # them. Those five groups are counted bullet for bullet against
+        # _OPEN_FINDINGS, and these four are not findings that pass left
+        # open -- they are properties of a transport written after it.
+        self.assertLess(self.limits.index(GSOCKET_LIMITS_HEADING),
+                        self.limits.index(HARDENING_HEADING),
+                        "the gsocket section sits inside the hardening "
+                        "pass's section, whose bullets are counted")
+        hardening = self.limits.split(HARDENING_HEADING, 1)[1]
+        self.assertNotIn("gs-netcat", hardening,
+                         "a gsocket limit has been filed under the hardening "
+                         "pass's severity groups, which are that pass's")
+
+    # ── the shipped blocks ──
+
+    def test_the_shipped_gsocket_blocks_are_disabled(self):
+        from software.c2.gsocket.config import load_carriers
+
+        leg = self.config["c2"]["fallback"]["gsocket"]
+        self.assertIs(leg["enabled"], False,
+                      "the shipped gsocket leg is enabled; a fresh checkout "
+                      "must dial no relay network")
+        self.assertEqual(
+            load_carriers(self.config), [],
+            "the shipped config configures a gsocket carrier, so a team "
+            "server started from it would join the relay network under "
+            "somebody's secret because a file mentioned it")
+        self.assertIn("gsocket_carrier", self.config["c2"],
+                      "the carrier block is absent from the shipped file, so "
+                      "nothing tells an operator the server side exists")
+        self.assertFalse(self.config["c2"]["gsocket_carrier"],
+                         "the carrier block ships with an entry in it")
+        # No secret, and no path to one: this file is in git and is pasted
+        # into tickets.
+        self.assertFalse(leg.get("secret_file"),
+                         "the shipped leg names a secret file")
+        self.assertEqual([key for key in leg if "secret" in key],
+                         ["secret_file"],
+                         "the shipped leg carries a secret-bearing key other "
+                         "than the path to a 0600 file")
+
+    def test_the_shipped_config_validates(self):
+        from software.c2.gsocket.config import (LEG_DEFAULTS, load_carriers,
+                                                validate_leg)
+
+        # Both halves of what the server does at startup, on the real
+        # file. `load_carriers` is a `parser.error` away from a refused
+        # start, and `validate_leg` is what the implant reads.
+        self.assertEqual(load_carriers(self.config), [])
+        leg = validate_leg(self.config["c2"]["fallback"]["gsocket"])
+        self.assertFalse(leg["enabled"])
+
+        # The five defaulted keys are shipped written out, and they agree
+        # with the defaults. A bare `scheme:` or `local_port:` is `None`,
+        # which these five refuse -- unlike `secret_file`, where `None`
+        # means "absent" and is correct in a file that predates every
+        # build.
+        for key, value in LEG_DEFAULTS.items():
+            with self.subTest(key=key):
+                self.assertIn(
+                    key, self.config["c2"]["fallback"]["gsocket"],
+                    "the shipped leg leaves %s out; written out, it is one "
+                    "fewer thing to read the source for" % key)
+                self.assertEqual(
+                    leg[key], value,
+                    "the shipped %s is not the documented default" % key)
+
+    # ── provisioning and the unit ──
+
+    def test_the_binary_is_pinned_at_build_time_and_never_fetched_on_target(
+            self):
+        build = BUILD_IMAGE.read_text()
+        version = re.search(r'^GSNETCAT_VERSION="([^"]+)"', build, re.M)
+        digest = re.search(r'^GSNETCAT_SHA256="([0-9a-f]{64})"', build, re.M)
+        self.assertIsNotNone(version, "build_image.sh pins no gs-netcat "
+                                      "version")
+        self.assertIsNotNone(digest, "build_image.sh records no gs-netcat "
+                                     "sha256, so the download is checked "
+                                     "against nothing")
+        url = [line for line in build.splitlines()
+               if line.startswith("GSNETCAT_URL=")]
+        self.assertTrue(url, "build_image.sh has no gs-netcat URL")
+        self.assertIn("${GSNETCAT_VERSION}", url[0],
+                      "the URL does not fetch the pinned version, so the pin "
+                      "and the download can drift apart")
+        self.assertLess(build.index("GSNETCAT_VERSION="),
+                        build.index("# \u2500\u2500 Defaults \u2500\u2500"),
+                        "the pin is not up with PARROT_VERSION, where the "
+                        "other pinned download lives")
+
+        # The shipped configuration expects the binary the image installs.
+        # Two digests that disagree are a leg that refuses to start with a
+        # reason that reads as a replaced binary.
+        self.assertEqual(
+            self.config["c2"]["fallback"]["gsocket"]["sha256"],
+            digest.group(1),
+            "configs/raccoon.yaml expects a different gs-netcat than "
+            "build_image.sh installs")
+
+        # Nothing about the binary may happen on the target. The
+        # first-boot script is the part of this file that runs there.
+        first_boot = build.split("first-boot.sh\" <<'FBEOF'", 1)[1] \
+                          .split("\nFBEOF", 1)[0]
+        for needle in ("gs-netcat", "hackerschoice", "GSNETCAT"):
+            self.assertNotIn(needle, first_boot,
+                             "the first-boot script, which runs on the "
+                             "implant, touches the gs-netcat download")
+
+    def test_the_carrier_unit_needs_no_socket_and_carries_no_secret(self):
+        self.assertTrue(GSOCKET_UNIT.is_file(),
+                        "services/raccoon-gsocket.service is missing")
+        unit = GSOCKET_UNIT.read_text()
+        directives = _directive_lines(unit)
+
+        self.assertFalse(
+            (REPO / "services" / "raccoon-gsocket.socket").exists(),
+            "the carrier unit has a .socket sibling; it binds nothing and "
+            "needs no privileged port, so there is no descriptor to inherit")
+        self.assertNotIn(".socket", directives,
+                         "the carrier unit refers to a socket unit")
+
+        user = [line.split("=", 1)[1].strip()
+                for line in directives.splitlines()
+                if line.startswith("User=")]
+        self.assertTrue(user, "the carrier unit names no user, so it is root")
+        self.assertNotIn(user[0], ("root", "0"),
+                         "the carrier unit runs as root; it binds nothing "
+                         "and holds no key")
+
+        self.assertIn("EnvironmentFile=/etc/raccoon/gsocket.env", directives,
+                      "the carrier unit does not read its secret file's path "
+                      "from /etc/raccoon/gsocket.env")
+        self.assertIn("-k ${RACCOON_GSOCKET_SECRET_FILE}", directives,
+                      "the carrier unit does not point gs-netcat -k at the "
+                      "path from that file")
+        self.assertNotIn(" -s ", directives,
+                         "the carrier unit passes a secret on a command "
+                         "line, which /proc/<pid>/cmdline publishes")
+        # The implant installer places implant units only. This one is the
+        # team server's side, and it reaches a host two other ways -- the
+        # repository checkout, and build_image.sh's rsync of services/ into
+        # the image -- so dropping it into /etc/systemd/system on a
+        # drop-box buys nothing and risks the one thing nobody wants: a
+        # unit with `WantedBy=multi-user.target` and `Restart=always` that
+        # makes an *implant* run the server side of this leg. The
+        # installer tells a team server what to do instead, which is the
+        # useful half.
+        installer = _read("services", "install.sh")
+        self.assertIn("raccoon-gsocket", installer,
+                      "services/install.sh says nothing about the carrier "
+                      "unit, so nothing tells a team server it exists")
+        for banned in ('cp "${SCRIPT_DIR}/raccoon-gsocket.service"',
+                       "systemctl enable raccoon-gsocket"):
+            self.assertNotIn(
+                banned, installer,
+                "services/install.sh runs %r: the implant installer places "
+                "the server side of this leg, which the listener and tunnel "
+                "units are deliberately not given either" % banned)
+
+    def test_the_blocking_check_is_the_implants_own_argv(self):
+        from software.c2.gsocket.carrier import implant_argv
+
+        # The value of that check is entirely that somebody runs the
+        # process the implant runs. `-w` went missing from all three
+        # copies of the line once: it makes that end a client that
+        # *waits* for its peer, so a line without it measures a different
+        # process -- and the project then trusts the answer.
+        flags = [word for word in implant_argv("/opt/gs-netcat", "/f", 1)
+                 if word.startswith("-")]
+        self.assertEqual(
+            flags, ["-k", "-w", "-p"],
+            "the implant's argv is no longer -k/-w/-p, so the command the "
+            "documentation tells somebody to measure is the wrong process. "
+            "Update the three places that show it and this list")
+        shown = "gs-netcat -k <file> -w -p <port>"
+        for where, text in (("docs/LISTENERS.md", self.guide),
+                            ("docs/AGENT.md", self.limits),
+                            ("the plan's manual-verification list",
+                             _read("docs", "superpowers", "plans",
+                                   "2026-11-19-gsocket-carrier.md"))):
+            with self.subTest(document=where):
+                self.assertIn(shown, text,
+                              "%s does not show the blocking check as %r"
+                              % (where, shown))
+
+    def test_the_comment_the_docs_point_at_agrees_with_them(self):
+        # Both *Known limits* and the guide send a reader to the comment
+        # above `GsocketCarrier.argv`. It used to record the bind address
+        # as an open question, and before that as loopback-only; it now
+        # has to carry the measured answer and the source that settles
+        # it, because a reader who follows a pointer and finds an older
+        # story trusts the wrong one.
+        text = _read("software", "c2", "gsocket", "carrier.py")
+        comment = text.split("# \u2500\u2500 the command lines \u2500\u2500",
+                             1)[1].split("def argv", 1)[0]
+        flat = " ".join(" ".join(line.lstrip().lstrip("#").strip()
+                                 for line in comment.splitlines()).split())
+        lowered = flat.lower()
+        for needle, what in (
+                ("measured", "that the question is settled"),
+                ("v1.4.43", "the version it was settled at"),
+                ("tools/utils.c:1238-1259", "the source that settles it"),
+                ("inaddr_any", "what the forward binds")):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, lowered,
+                              "the comment no longer records %s" % what)
+        for claim in ("loopback-only", "loopback only", "not verified",
+                      "unverified"):
+            self.assertNotIn(claim, lowered,
+                             "the comment calls the forward %s, which the "
+                             "source it cites contradicts" % claim)
+        self.assertIn("gs-netcat -k <file> -w -p <port>", flat,
+                      "the comment no longer shows the implant's own argv, "
+                      "which is the shape the measurement is about")
+        self.assertIn("ss -ltnp", flat,
+                      "the comment no longer names the check that confirms "
+                      "it on a real implant")
+
+    # ── the front page ──
+
+    def test_the_readme_counts_five_channels_and_says_who_gets_the_fifth(self):
+        badge = [line for line in self.readme.splitlines()
+                 if "badge/transport" in line]
+        self.assertTrue(badge, "the README has no transport badge")
+        self.assertIn("gsocket", badge[0],
+                      "the transport badge does not name gsocket")
+
+        rows = [line for line in self.readme.splitlines()
+                if line.startswith("| **C2 Transport**")]
+        self.assertEqual(len(rows), 1, "no single C2 Transport row")
+        flat = " ".join(rows[0].split()).lower()
+        self.assertIn("5 channels", flat,
+                      "the C2 Transport row does not say five channels")
+        self.assertIn("gsocket", flat)
+        self.assertIn("hardware implant", flat,
+                      "the row does not say the fifth leg is the hardware "
+                      "implant's only")
+
+
 TUNNEL_DOC = REPO / "docs" / "TUNNEL.md"
 
 

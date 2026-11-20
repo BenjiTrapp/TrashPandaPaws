@@ -1,6 +1,6 @@
 # The reverse SOCKS tunnel
 
-The beacon's four transports carry *messages* — a registration, a
+The beacon's five transports carry *messages* — a registration, a
 check-in, a result. This carries *traffic*: an operator points
 `proxychains`, `nmap` or a browser at a port on the team server and
 reaches the network an implant sits in, with every byte inside a Noise

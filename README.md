@@ -9,8 +9,8 @@
   <a href="https://benjitrapp.github.io/trashpandapaws-network-implant/"><img src="https://img.shields.io/badge/write--up-the%20why%20behind%20it-ff8c00?logo=jekyll&logoColor=white" alt="Write-up"></a>
   <img src="https://img.shields.io/badge/platform-Raspberry%20Pi%204%20%7C%20CM4-c51a4a?logo=raspberrypi&logoColor=white" alt="Platform">
   <img src="https://img.shields.io/badge/OS-ParrotOS%20ARM64-00e5ff?logo=linux&logoColor=white" alt="OS">
-  <a href="docs/C2_DEMO.md"><img src="https://img.shields.io/badge/C2%20Demo-32%20stills%20%2B%202%20GIFs-blueviolet" alt="C2 Demo"></a>
-  <img src="https://img.shields.io/badge/transport-HTTPS%20%7C%20DNS%20%7C%20SMB%20%7C%20QUIC-blue" alt="Transports">
+  <a href="docs/C2_DEMO.md"><img src="https://img.shields.io/badge/C2%20Demo-33%20stills%20%2B%202%20GIFs-blueviolet" alt="C2 Demo"></a>
+  <img src="https://img.shields.io/badge/transport-HTTPS%20%7C%20DNS%20%7C%20SMB%20%7C%20QUIC%20%7C%20gsocket-blue" alt="Transports">
   <img src="https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen" alt="No Dependencies">
   <img src="https://img.shields.io/badge/license-use%20responsibly-red" alt="License">
 </p>
@@ -40,7 +40,7 @@ or an HP network printer to blend into enterprise infrastructure.
 |------|------------|
 | **Hardware** | Custom PoE HAT (SI3402-B + TPS54302), USB-GbE via RTL8153B, 3 build variants (Lite / v1 HAT / v2 CM4) |
 | **Cover Identity** | Cisco IP Phone 7960 (SIP, RTP, HTTP) or HP LaserJet MFP M478 (PJL, LPD, IPP, SNMP, Telnet) |
-| **C2 Transport** | 3 independent channels — HTTPS, SMB named pipes, QUIC-style UDP — plus DNS as a tasking-only side channel, with automatic fallback. Each non-HTTPS channel has a listener that terminates it; see [`docs/LISTENERS.md`](docs/LISTENERS.md) |
+| **C2 Transport** | 5 channels — HTTPS, SMB named pipes, QUIC-style UDP and gsocket (a `gs-netcat` forward over the Global Socket Relay Network, **hardware implant only**: a generated build spawns no child, so the generator refuses that leg), plus DNS as a tasking-only side channel, with automatic fallback. Each non-HTTPS channel has a listener or a carrier that terminates it; see [`docs/LISTENERS.md`](docs/LISTENERS.md). gsocket reaches the team server through a third-party relay, which is a rules-of-engagement question before it is a setting — [what it costs](docs/LISTENERS.md#the-fifth-transport-gsocket-over-the-gsrn) |
 | **Encryption** | AES-256-GCM on all channels, keys auto-generated or operator-defined |
 | **Beacon** | Pure Python stdlib, zero external dependencies, multi-layer obfuscation (1–6 layers zlib+base64) |
 | **Operator GUI** | Flask-based team server with embedded SPA: terminal, file browser, pivot map (a visualisation of scan results, not a pivot), profile editor, 16 Impacket tools |
@@ -499,14 +499,17 @@ graph LR
     subgraph "Raccoon Implant (Target Network)"
         PI --> MGR["sliver.py<br/>SliverManager"]
         MGR -->|"primary"| SLIVER["Sliver Beacon<br/>mTLS / HTTPS / DNS"]
-        MGR -->|"if binary missing"| FALLBACK["beacon.py<br/>Python Fallback<br/>HTTPS / DNS"]
+        MGR -->|"if binary missing"| FALLBACK["beacon.py<br/>Python Fallback<br/>HTTPS / DNS / SMB / QUIC / gsocket"]
     end
 
     SLIVER -->|"mTLS :8888<br/>HTTPS :443<br/>DNS"| SERVER
-    FALLBACK -->|"HTTPS / DNS"| SERVER
+    FALLBACK -->|"HTTPS / DNS / SMB / QUIC"| SERVER
+    FALLBACK -->|"gsocket:<br/>gs-netcat dials out"| GSRN["Global Socket<br/>Relay Network<br/>(third party)"]
+    GSRN -->|"paired by shared secret"| SERVER
 
     style SLIVER fill:#c44,stroke:#333,color:#fff
     style FALLBACK fill:#fa0,stroke:#333,color:#000
+    style GSRN fill:#777,stroke:#333,color:#fff
     style SERVER fill:#47a,stroke:#333,color:#fff
 ```
 
@@ -609,11 +612,11 @@ asked for again.
 
 #### Transport Protocols
 
-The beacon supports four C2 transport channels, all implemented in pure Python stdlib with zero external dependencies. Multiple protocols can be enabled simultaneously; the beacon tries them in order and falls through to the next on failure.
+The beacon supports five C2 transport channels, all implemented in pure Python stdlib with zero external dependencies. Multiple protocols can be enabled simultaneously; the beacon tries them in order and falls through to the next on failure.
 
-**Three of the four are independent; DNS is not.** HTTPS, SMB and QUIC each carry a registration, a check-in and a result, so a beacon configured with any one of them alone completes a full cycle. DNS carries tasking only: `_beacon_dns` queries a TXT record and decrypts the answer, but there is no `_send_result_dns` and no registration over DNS. A beacon that falls through to DNS alone will execute what it is given and report nothing. Use DNS alongside another channel, not instead of one.
+**Four of the five are independent; DNS is not.** HTTPS, SMB, QUIC and gsocket each carry a registration, a check-in and a result, so a beacon configured with any one of them alone completes a full cycle. DNS carries tasking only: `_beacon_dns` queries a TXT record and decrypts the answer, but there is no `_send_result_dns` and no registration over DNS. A beacon that falls through to DNS alone will execute what it is given and report nothing. Use DNS alongside another channel, not instead of one.
 
-All four transports now have a server counterpart. The team server answers HTTPS on its beacon socket; SMB, QUIC and DNS are answered by **listeners** — separate processes that terminate one protocol each and relay the encrypted payload to that same socket. **None of them is given the encryption key**, which is what makes one safe to put on an exposed forwarding host. How to configure and run them, including the limits of each, is [`docs/LISTENERS.md`](docs/LISTENERS.md); the design and the alternatives it rejected are [`docs/superpowers/specs/2026-11-07-c2-listeners-design.md`](docs/superpowers/specs/2026-11-07-c2-listeners-design.md). For what is still open elsewhere in the project, see *Known limits* in [`docs/AGENT.md`](docs/AGENT.md#known-limits), a section held by a test that fails if an entry is fixed and left in the list.
+All five transports have a server counterpart. The team server answers HTTPS on its beacon socket; SMB, QUIC and DNS are answered by **listeners** — separate processes that terminate one protocol each and relay the encrypted payload to that same socket. gsocket is answered by a **carrier**: a `gs-netcat` beside the beacon socket that meets the implant's own on the Global Socket Relay Network, so that leg needs no address and no inbound port — at the price of traffic crossing a third party, which belongs in the rules of engagement and not in a config default. **None of them is given the encryption key**, which is what makes one safe to put on an exposed forwarding host. How to configure and run them, including the limits of each and what the relay costs, is [`docs/LISTENERS.md`](docs/LISTENERS.md); the design and the alternatives it rejected are [`docs/superpowers/specs/2026-11-07-c2-listeners-design.md`](docs/superpowers/specs/2026-11-07-c2-listeners-design.md). For what is still open elsewhere in the project, see *Known limits* in [`docs/AGENT.md`](docs/AGENT.md#known-limits), a section held by a test that fails if an entry is fixed and left in the list.
 
 ```mermaid
 flowchart LR
@@ -621,12 +624,14 @@ flowchart LR
     HTTPS -->|fail| DNS["DNS<br/>raw socket TXT<br/>port 53"]
     DNS -->|fail| SMB["SMB<br/>named pipe IPC$<br/>port 445"]
     SMB -->|fail| QUIC["QUIC-style<br/>UDP datagrams<br/>port 4433"]
-    QUIC -->|fail| SLEEP["💤 backoff"]
+    QUIC -->|fail| GS["gsocket<br/>gs-netcat forward<br/>via the GSRN<br/>(lazy: next cycle)"]
+    GS -->|fail| SLEEP["💤 backoff"]
 
     HTTPS -->|success| OK["✔ tasking"]
     DNS -->|success| OK
     SMB -->|success| OK
     QUIC -->|success| OK
+    GS -->|success| OK
 
     style B fill:#c44,stroke:#333,color:#fff
     style OK fill:#4a9,stroke:#333,color:#fff
@@ -639,6 +644,7 @@ flowchart LR
 | **DNS** | Raw DNS queries via `socket`. Agent ID Base32-encoded into subdomain, tasking via encrypted TXT records. ~200 bytes/query. | Egress-restricted networks. Hard to block. |
 | **SMB** | Full SMB2 stack (`socket` + `struct`). Negotiate → anonymous session → IPC$ tree connect → named pipe I/O. Configurable pipe name. | Internal pivoting between beacons. |
 | **QUIC** | UDP with QUIC-style framing. AES-GCM encrypted, fragmented into 1200-byte datagrams with stream IDs for reassembly. | Bypassing TCP-only DPI and proxies. |
+| **gsocket** | A `gs-netcat` child forwards a local port to a carrier beside the team server, paired by a per-implant secret over the Global Socket Relay Network. The same HTTP client as HTTPS, aimed at that forward on `127.0.0.1`. That forward binds every interface, so the implant's provisioning closes it with a firewall rule. Hardware implant only; started lazily, after the other four have failed. | A network where every address we could name is blocked or burned — at the cost of a third-party relay, and of being recognisable as gsocket. |
 
 #### Malleable C2 Profiles
 
@@ -658,7 +664,7 @@ The GUI-based beacon generator produces fully configured, multi-layer obfuscated
 
 | Option | Description |
 |--------|-------------|
-| **Transport Selection** | Enable any combination of HTTPS, DNS, SMB, QUIC with per-protocol configuration |
+| **Transport Selection** | Enable any combination of HTTPS, DNS, SMB, QUIC with per-protocol configuration. gsocket is not offered: a generated build is one file that spawns no child, so an enabled `gsocket` leg is refused with the reason rather than baked in dead |
 | **Encryption** | AES-256-GCM with auto-generated or custom Base64 key |
 | **Obfuscation** | 1–6 layers of nested zlib + base64 encoding with randomized variable names |
 | **Anti-Analysis** | Sandbox detection (VM artifacts, debugger), process name randomization, jittered sleep |
@@ -876,7 +882,7 @@ the image builds without it.
 
 </details>
 
-> **Full walkthrough:** [`docs/C2_DEMO.md`](docs/C2_DEMO.md) — 23 sections covering every feature, command reference, Mermaid diagrams, and a full attack flow sequence diagram.
+> **Full walkthrough:** [`docs/C2_DEMO.md`](docs/C2_DEMO.md) — 24 sections covering every feature, command reference, Mermaid diagrams, and a full attack flow sequence diagram.
 
 ### C2: Automated Attack (autonomous agent)
 
