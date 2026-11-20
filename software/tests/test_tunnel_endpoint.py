@@ -63,7 +63,9 @@ process table afterwards.
 """
 
 import base64
+import contextlib
 import errno
+import inspect
 import logging
 import os
 import re
@@ -1496,6 +1498,62 @@ class TestWritingToATerminal(unittest.TestCase):
                          "reported success")
 
 
+class TestTheLoginShell(unittest.TestCase):
+    """Which shell a session runs, chosen without spawning one.
+
+    Apart from `TestAShellSession`, which pins the choice to bash so that
+    its assertions do not depend on whose account runs the suite: here
+    the choice itself is under test, with the passwd entry and the
+    executable probe both stood in for.
+    """
+
+    @contextlib.contextmanager
+    def _passwd(self, shell):
+        """The effective user's passwd entry names `shell` as login shell."""
+        entry = mock.Mock(pw_shell=shell)
+        with mock.patch.object(pwd, "getpwuid", return_value=entry):
+            yield
+
+    @contextlib.contextmanager
+    def _executable(self, paths):
+        """Only the paths given are executable, whatever this host has."""
+        with mock.patch.object(beacon_mod, "_shell_executable",
+                               lambda path: path in paths):
+            yield
+
+    def test_the_login_shell_of_the_effective_user_is_what_runs(self):
+        """`$SHELL` under the shipped service unit is the service
+        manager's environment, not a user's choice, so the passwd entry
+        is what is asked."""
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}):
+            self.assertEqual(beacon_mod._shell_program(), "/bin/zsh")
+
+    def test_a_login_shell_that_is_not_there_does_not_cost_the_session(self):
+        for shell in ("/usr/bin/fish", "", "/nonexistent/zsh"):
+            with self._passwd(shell), self._executable({"/bin/bash"}):
+                self.assertEqual(beacon_mod._shell_program(), "/bin/bash",
+                                 shell)
+
+    def test_a_shell_nobody_has_driven_with_flags_is_not_driven(self):
+        """fish and tcsh take neither `--rcfile` nor bash's `-i`
+        semantics, so the preference runs rather than an untested flag."""
+        with self._passwd("/usr/bin/fish"), \
+                self._executable({"/usr/bin/fish", "/bin/bash"}):
+            self.assertEqual(beacon_mod._shell_program(), "/bin/bash")
+
+    def test_the_environments_shell_variable_is_never_consulted(self):
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
+                mock.patch.dict(os.environ, {"SHELL": "/bin/ksh"}):
+            self.assertEqual(beacon_mod._shell_program(), "/bin/zsh")
+        self.assertNotIn("SHELL", inspect.getsource(beacon_mod._login_shell))
+
+    def test_a_passwd_lookup_that_raises_falls_back_rather_than_throwing(self):
+        with mock.patch.object(pwd, "getpwuid",
+                               side_effect=KeyError("no such uid")), \
+                self._executable({"/bin/bash"}):
+            self.assertEqual(beacon_mod._shell_program(), "/bin/bash")
+
+
 class TestAShellSession(TunnelEndpointTestCase):
     """`MSG_OPEN_SHELL`: a real PTY on the endpoint, dialled out like a relay.
 
@@ -1510,6 +1568,13 @@ class TestAShellSession(TunnelEndpointTestCase):
 
     def setUp(self):
         super(TestAShellSession, self).setUp()
+        # These tests talk to bash, or to `/bin/sh` where they remove it,
+        # and were written when that was the only choice. The login shell
+        # is the host's -- zsh on the machine this is developed on -- so
+        # leaving it to the host would make every assertion below depend
+        # on whose account runs the suite. The login-shell tests patch
+        # the passwd entry themselves.
+        self.patched("_login_shell", lambda: "")
         self.server = _FakeTunnelServer(self.store)
         self.addCleanup(self.assert_server_was_quiet)
         self.addCleanup(self.server.close)

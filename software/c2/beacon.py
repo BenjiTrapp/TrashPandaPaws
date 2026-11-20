@@ -3180,6 +3180,7 @@ _SHELL_TERM = "xterm-256color"
 _SHELL_CWD = "/"
 _SHELL_BASH = "/bin/bash"
 _SHELL_SH = "/bin/sh"
+_SHELL_ZSH = "/bin/zsh"
 _DEV_FD = "/dev/fd"
 
 # Where `setsid(1)` is, and why the shell is started through it.
@@ -3285,15 +3286,57 @@ def _shell_executable(path: str) -> bool:
     return os.access(path, os.X_OK)
 
 
-def _shell_program() -> str:
-    """The shell a session runs: bash where there is one, else `/bin/sh`.
+def _login_shell() -> str:
+    """The effective user's login shell if it is one this can drive, else "".
 
-    bash because the point of the session is the host's own line editing
-    and completion, and `bash-completion` is what knows `nmap`'s flags.
-    `/bin/sh` is the floor every POSIX host has: a session without
-    completion still beats one command per check-in.
+    The passwd entry and not the environment's shell variable: under the
+    shipped `services/raccoon-beacon.service` the environment is the
+    service manager's, so that variable is nobody's choice there, and a
+    test pins that this function never reads it. The unit runs as
+    root, which makes "the login shell" root's -- on most Linux hosts
+    `/bin/bash`, so the behaviour is unchanged there. What this helps is
+    the operator's own machine, which is the device the feature is for:
+    their prompt, colours and completion live in the rc files of the
+    shell they chose, and a different shell never reads them.
+
+    Only bash and zsh are answered, by basename, because those are the
+    two whose flags are known to work here; fish and tcsh take neither
+    `--rcfile` nor bash's `-i` semantics, and an untested flag costs a
+    session that dies on the spot. The effective uid, as in
+    `_process_user`, because that is the one a session would run with.
+    `""` on any failure, a shell that is not there, or one not driven:
+    the caller has a preference of its own, and a lookup that fails must
+    cost the choice and never the whole connection.
     """
-    return _SHELL_BASH if _shell_executable(_SHELL_BASH) else _SHELL_SH
+    try:
+        if platform.system() == "Windows":
+            return ""
+        import pwd
+        shell = pwd.getpwuid(os.geteuid()).pw_shell
+        if (shell and os.path.basename(shell) in ("bash", "zsh")
+                and _shell_executable(shell)):
+            return shell
+        return ""
+    except Exception:
+        return ""
+
+
+def _shell_program() -> str:
+    """The shell a session runs: the login shell, else bash, else `/bin/sh`.
+
+    The user's own login shell first when it is bash or zsh, because the
+    point of the session is that the prompt, colours and completion are
+    theirs, and those live in the rc files of the shell they chose.
+
+    Otherwise bash where there is one, because the point of the session
+    is the host's own line editing and completion, and `bash-completion`
+    is what knows `nmap`'s flags. `/bin/sh` is the floor every POSIX host
+    has: a session without completion still beats one command per
+    check-in.
+    """
+    return (_login_shell()
+            or (_SHELL_BASH if _shell_executable(_SHELL_BASH)
+                else _SHELL_SH))
 
 
 def _setsid_program() -> str:
