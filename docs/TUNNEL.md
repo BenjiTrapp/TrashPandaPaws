@@ -508,7 +508,12 @@ coming back to it, and end it when you are not.
 
 **A reload gives you a new shell, and the page says so.** The card survives
 a page load: the session id is kept in that tab, and on the next load the
-card comes back the way you left it — open or parked — and attaches. What
+card comes back the way you left it — open or parked — and attaches, as
+long as the team server still reports that session as live. If it does not
+— the claim lapsed while the tab was shut, another view's close took the
+channel down, or the id belonged to a team server on the same port that
+is no longer this one — the page does not open a card; the next time you
+open the panel, it says that in a line above the picker, once. What
 it attaches to is a **fresh shell**. The team server's connection to the
 shell port *is* the shell, so when the page went away and took the stream
 with it, the pseudo-terminal on the device died; measured across one

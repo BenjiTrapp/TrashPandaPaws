@@ -183,10 +183,14 @@ device's name (`Operator Shell` until the first `/state` answer names the
 host), and `_` and `✕` at the right; under it the strip that already exists
 (host, user, a `root` marker only when the endpoint reported one, the
 geometry that was sent, recording, channel state); then the terminal,
-filling the rest; then the existing line about how the session ends,
-verbatim. The terminal's own opening lines carry what only it can say: the
-host, that history is off, the pair that was sent — and, when the
-measurement fell back, that this session is not fitted to the card and why.
+filling the rest; then the line about how the session ends. That line was
+to be carried over verbatim, and the final review found it could not be:
+it said "closing it queues the channel's shutdown" in a card whose two
+buttons are a `✕` that closes and a `_` that does not, so it names the
+`✕` now and says what the `_` does instead. The terminal's own opening
+lines carry what only it can say: the host, that history is off, the pair
+that was sent — and, when the measurement fell back, that this session is
+not fitted to the card and why.
 
 The agent list stays visible to its left, so an agent going offline is
 visible while working — which matters here, because a channel that drops is
@@ -290,8 +294,9 @@ previous one is gone.
   honest; the second avoids a stream request that cannot succeed.
 - Where the minimised flag lives: page state, as a module-level
   `let opshellMinimised = …` — it must be a single-line `let opshell… = …`
-  or the harness's `decls` regex (`test_operator_shell.py:3776`) will not
-  lift it, and the server must not learn what "minimised" means.
+  or the harness's `decls` regex (the `re.findall(r"^let opshell\w+ = .*$")`
+  in `_node`, `test_operator_shell.py`) will not lift it, and the server
+  must not learn what "minimised" means.
 
 **As built**, all three: the border is `--red-dim`, told apart from a
 selected agent by spanning the sidebar edge to edge with no radius, by the
@@ -416,8 +421,18 @@ change the plan or the task forbade, and the view fails safe in all six.
    the fallback 120×40. The view says that once, in the terminal, rather
    than leaving the operator to wonder.
 5. **A refusal that arrives while parked is written to the terminal**, not
-   to the parked entry, so the entry says the session ended and the
-   server's reason is visible only after a restore. Recoverable, not lost.
+   to the parked entry, so the parked entry says the session ended and the
+   server's reason is in the terminal's buffer behind the hidden card. The
+   final review found the version of this claim that said the reason was
+   "visible only after a restore" to be false as built: the poll's next
+   tick replaced the card's body within two seconds and took the
+   terminal's DOM node with it, so a restore showed the closed render and
+   the reason was gone. The poll now disposes the terminal before it
+   replaces the body, which is what makes `opshellEndSession`'s own panel
+   fallback reachable — the reason is written into the card as well, so
+   what a restore shows is the reason and not a terminal that no longer
+   exists. What remains is the ordering: it is in the card, not in the
+   sidebar entry, so it is read after a restore and not before one.
 6. **A parked session is not a free one**: a worker thread, a bridge, a pty
    on the device and one of the shell port's four session slots, held for
    as long as it is parked. It belongs where an operator reads it, so it is

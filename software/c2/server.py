@@ -4687,6 +4687,9 @@ header .info{font-size:11px;color:var(--text2)}
 }
 .opshell-ctl:hover{color:var(--text);background:rgba(255,26,26,0.12)}
 #opshell-body{flex:1;min-height:0;overflow:auto;padding:12px 16px}
+/* The one-off note above the body, for what a reload could not put back.
+   flex:none so it takes its own height and leaves the body the rest. */
+.opshell-note{flex:none;padding:10px 16px 0}
 /* The live terminal's room. #opshell-term is empty when the page measures
    it, so as a plain block it is as tall as nothing and every session would
    be measured at the floor. The wrapper is at least the body's height --
@@ -8525,7 +8528,10 @@ let opshellDockHtml = "";
 // tab and it dies with the tab, which is the lifetime of a claim this page
 // holds. Anything else the card has to remember across a reload belongs
 // beside it under this key's own prefix, and is cleared with it in
-// `opshellRemember`.
+// `opshellRemember` -- with one exception, `_gone`, which is written by
+// the very path that clears the id and has to outlive it: it is the
+// sentence saying why the card did not come back, and `showOperatorShell`
+// clears it when it says it.
 let opshellStore = "raccoon_opshell_session";
 // Set by `opshellResume`, read once by `opshellAttach`. A resumed card is
 // a **new** shell: the bridge's TCP connection is the shell, so the stream
@@ -8577,14 +8583,30 @@ async function opshellResume(){
   // gate is `refreshAgents`' business, just above in the same block.
   let r, state;
   try {
+    // The poll's deadline, for the poll's reason and one of its own: while
+    // this is outstanding the operator can press `>_`, be told the channel
+    // is up and this page is not holding it, and press Attach. A resume
+    // that then wrote its remembered id over the adopted one would orphan
+    // the new claim -- every close answers "not the last", and nothing is
+    // stopped until the lapse. The deadline bounds that window; the check
+    // after the await closes it.
+    const deadline = typeof AbortSignal !== "undefined"
+      && typeof AbortSignal.timeout === "function"
+      ? AbortSignal.timeout(8000) : undefined;
     r = await fetch("/api/opshell/state?session="
-      + encodeURIComponent(session), {headers: H()});
+      + encodeURIComponent(session), {headers: H(), signal: deadline});
     state = await r.json();
   } catch(e) {
     // Nothing is given up on a request that never arrived. A blip says
     // nothing about the session, and forgetting the id here would turn one
     // unlucky reload into a channel this page can no longer put back by
     // itself -- the operator would have to open the panel and press Attach.
+    return false;
+  }
+  // And the operator may have been faster than the server. Anything this
+  // page did while the answer was in flight wins: it is a decision, and
+  // this is a memory.
+  if(opshellSession){
     return false;
   }
   // Nor on an answer that is not about the session: a 401 is the token,
@@ -8597,6 +8619,21 @@ async function opshellResume(){
   // the server counts zero sessions for is somebody else's.
   if(state.state !== "live" || !(state.sessions > 0)){
     opshellRemember("");
+    // And say so, at the next open. The page knows why the card is not
+    // back -- the server answered about this very id -- and `docs/TUNNEL.md`
+    // promises the card comes back the way it was left, so silence here
+    // leaves the operator wondering whether a shell is still running
+    // somewhere, which is the doubt this whole feature exists to remove.
+    // Written and not shown: this runs inside page startup, and the panel
+    // opens on an explicit action only. Read and cleared by
+    // `showOperatorShell`, so it is said once and not for ever.
+    sessionStorage.setItem(opshellStore + "_gone", state.state === "live"
+      ? "The shell this tab had open is no longer this page's: the channel "
+        + "is up, and the team server counts no session on it for the id "
+        + "this tab was holding."
+      : "The shell this tab had open is gone: the team server does not "
+        + "report that session as live, so no shell is running behind this "
+        + "page.");
     return false;
   }
   opshellSession = session;
@@ -8669,6 +8706,21 @@ async function showOperatorShell(){
   body.classList.add("loot-loading");
   body.innerHTML = "Loading...";
   card.appendChild(chrome);
+  // What the last reload could not put back, said once. `opshellResume`
+  // leaves this behind when the server says the remembered session is not
+  // live: the operator left a shell open, came back to no card, and
+  // nothing told them whether anything was still running. A sibling of
+  // `#opshell-body` and not inside it, because the poll rewrites that node
+  // every two seconds and this is not state; and taken out of storage as
+  // it is read, so the next open says it and the one after that does not.
+  const gone = sessionStorage.getItem(opshellStore + "_gone");
+  if(gone){
+    sessionStorage.removeItem(opshellStore + "_gone");
+    const note = document.createElement("div");
+    note.classList.add("opshell-note");
+    note.innerHTML = '<p class="loot-empty">' + esc(gone) + '</p>';
+    card.appendChild(note);
+  }
   card.appendChild(body);
   main.appendChild(card);
   // Hidden and not emptied: `renderAgentView` rewrites its children on
@@ -8773,6 +8825,11 @@ function opshellParked(state){
   // view exists to avoid.
   const ended = !!opshellLast;
   const secs = ended ? opshellLast.duration : null;
+  // Whether there is a shell behind this entry at all. The card can be
+  // parked over the picker -- no session, nothing running -- and then the
+  // live border, a blinking cursor and "Restore the shell" would each
+  // claim more than the view knows.
+  const live = !ended && !!opshellSession;
   // Not `opshellRender`'s mapping, which folds everything that is not
   // `open` or `unknown` into `closed`: that one is handed a state the
   // server sent, and this one can be drawn before the first poll has
@@ -8790,12 +8847,13 @@ function opshellParked(state){
     // does: what is left is a remnant to dismiss, not a live shell.
     + (ended ? ' style="border-color:var(--border)"' : '')
     + '><button class="opshell-parked-restore" title="'
-    + (ended ? 'Show what the session left' : 'Restore the shell')
+    + (ended ? 'Show what the session left'
+             : live ? 'Restore the shell' : 'Restore the panel')
     + '" onclick="opshellRestore(event)">'
     + '<span class="opshell-glyph">&gt;'
-    // The cursor blinks while the shell is alive and stands still when it
-    // is not.
-    + (ended ? '_' : '<span class="opshell-cursor">_</span>')
+    // The cursor blinks while a shell is alive and stands still when
+    // there is none -- ended, or never opened.
+    + (live ? '<span class="opshell-cursor">_</span>' : '_')
     + '</span>'
     + '<span style="flex:1;min-width:0;overflow:hidden;'
     + 'text-overflow:ellipsis;white-space:nowrap">'
@@ -8974,9 +9032,10 @@ async function opshellPoll(){
     // the claim lapsed under a live root shell.
     //
     // Used where it exists, skipped where it does not: `AbortSignal.timeout`
-    // is Safari 16, and this page's own baseline is Safari 13.1 -- 164 uses
-    // of optional chaining and the Clipboard API, and nothing newer than
-    // 2020 until this line. Calling it unconditionally threw a TypeError
+    // is Safari 16, and this page's own baseline is Safari 14.1 -- 164 uses
+    // of optional chaining and the Clipboard API in the JavaScript, and
+    // flexbox `gap` in the CSS, which is what makes it 14.1 and not 13.1,
+    // and nothing newer until this line. Calling it unconditionally threw a TypeError
     // inside the poll on an older browser, which killed the heartbeat: the
     // very failure the deadline was added to prevent, by a different door.
     // Measured: zero polls instead of two.
@@ -8990,6 +9049,21 @@ async function opshellPoll(){
         if(r.status === 401){ tokenRejected(); throw new Error("operator token rejected"); }
         return r.json();
       });
+    // Checked in here, where the catch arm below can say so and
+    // reschedule. Everything after this try reads `state.state` and
+    // `state.geometry`, and that tail runs *after* the only
+    // `setTimeout` has been consumed: an answer that parsed but is not a
+    // state -- a bare `null`, a string, an array from a proxy -- threw
+    // there instead, and the heartbeat stopped for good with nothing
+    // written anywhere. The claim then lapsed 240 seconds later under an
+    // operator sitting in the session. Measured: `rescheduled: 0`.
+    //
+    // An array is an object to `typeof`, and it renders as an idle picker
+    // with no device in it rather than throwing -- which is a state the
+    // server never sent, shown as if it had. Named instead.
+    if(!state || typeof state !== "object" || Array.isArray(state)){
+      throw new Error("the state answer was not an object");
+    }
   } catch(e) {
     // Rescheduled, not abandoned. The first version returned here, so one
     // network blip -- or a proxy answering with an HTML error page, which
@@ -9055,6 +9129,18 @@ async function opshellPoll(){
     }
   }
   if(!opshellAttached){
+    // The terminal goes before the node it lives in. `body.innerHTML`
+    // replaces `#opshell-term`, so without this `opshellTerm` stayed
+    // non-null over a DOM node that no longer existed -- and `dispose()`
+    // had one call site, `opshellTeardown`, which a card that survives
+    // between sessions no longer reaches. Three things were broken by
+    // that: `opshellEndSession`'s `!opshellTerm` fallback could never
+    // fire, so the End button's refusal went into a detached terminal and
+    // the operator saw nothing; a refusal that arrived while parked was
+    // gone within two seconds rather than waiting for the restore; and
+    // every open-end-open cycle in a long-lived card leaked an xterm and
+    // its observers.
+    if(opshellTerm){ opshellTerm.dispose(); opshellTerm = null; }
     body.innerHTML = opshellRender(state);
   } else {
     // The body is not redrawn under an attached terminal, so everything
@@ -9126,9 +9212,10 @@ function opshellRender(state){
         + 'reason it cannot be dropped.</p>';
     }
     return '<div class="opshell-live">' + strip + '<div id="opshell-term"></div>'
-      + '<p class="loot-empty">exit, or Ctrl-D, ends the session. Closing it '
-      + 'queues the channel\'s shutdown, which takes effect at the next '
-      + 'check-in.</p></div>';
+      + '<p class="loot-empty">exit, or Ctrl-D, ends the session. The '
+      + '&#10005; above closes the card and queues the channel\'s '
+      + 'shutdown, which takes effect at the next check-in; the _ parks '
+      + 'the card and the session keeps running.</p></div>';
   }
   if(state.state === "waiting"){
     const secs = state.expected_checkin;
@@ -9198,6 +9285,13 @@ async function opshellOpen(ev){
                                       + r.status));
     return false;
   }
+  // Above the `if`, and not inside it: the operator picked a device and
+  // pressed Open, so what the last session on another device lasted is no
+  // longer theirs to be shown. Driven when it was inside: end a session on
+  // one device, pick a second, press Open with that channel down so no
+  // session comes back, and the card drew the new device's name beside
+  // "The session lasted 92s".
+  opshellLast = null;
   if(answer.session){
     if(!document.getElementById("opshell-body")){
       // The view went away while this was in flight. Adopting the session
@@ -9210,7 +9304,6 @@ async function opshellOpen(ev){
     }
     opshellSession = answer.session;
     opshellRemember(answer.session);
-    opshellLast = null;
     // Nothing typed before this session existed belongs inside it.
     opshellKeys = "";
   }
@@ -11485,6 +11578,17 @@ async function refreshRescues(){
   }
 }
 
+// The block below has its shape pinned by
+// `test_the_page_prompts_when_no_token_is_stored` in
+// `software/tests/test_c2_hardening.py`: its regex requires the agent
+// refresh timer as the first line of the branch and allows at most 400
+// characters between that and the `else`. This branch has taken it to 323,
+// and a comment inside the block counts -- which is why this one is out
+// here, and why it does not quote that line either: two tests find it by
+// searching for its text, and one of them counts the hits. A line added in
+// there that overruns the bound fails a test in a file nobody would think
+// to open from this one, so raise the bound there in the same commit, or
+// put the work in a function and call it from here.
 if(storedToken()){
   setInterval(refreshAgents, 3000);
   setInterval(refreshRescues, 3000);

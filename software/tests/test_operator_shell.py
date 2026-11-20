@@ -3187,9 +3187,7 @@ class TestTheGlyphAndTheView(_GuiCase):
                          "expected exactly one .opshell-card rule, got %d"
                          % len(by_class))
         self.assertIn("flex:1", by_class[0])
-        rules = self.css_rules("opshell-card")
-        self.assertGreaterEqual(len(rules), 1)
-        for body in rules:
+        for body in self.css_rules("opshell-card"):
             for prop in ("position", "inset", "z-index"):
                 self.assertNotRegex(
                     body, r"(?<![\w-])%s\s*:" % prop,
@@ -3271,10 +3269,12 @@ class TestTheGlyphAndTheView(_GuiCase):
     def test_no_browser_feature_newer_than_the_page_is_used_unguarded(self):
         """The baseline this interface already had, and I raised it once.
 
-        Measured across the page: optional chaining and the Clipboard API,
-        both Safari 13.1, and nothing newer -- until `AbortSignal.timeout`
-        (Safari 16) went in uncalled-for. It threw inside the poll on an
-        older browser and killed the heartbeat.
+        Measured across the page: optional chaining and the Clipboard API
+        in the JavaScript, and flexbox `gap` in the CSS, which is Safari
+        14.1 and is what makes the baseline 14.1 rather than 13.1 -- and
+        nothing newer than that, until `AbortSignal.timeout` (Safari 16)
+        went in uncalled-for. It threw inside the poll on an older browser and
+        killed the heartbeat.
 
         So each 2022-or-later name must sit behind a check. The list is
         short on purpose: it names what this feature introduced rather than
@@ -3294,7 +3294,7 @@ class TestTheGlyphAndTheView(_GuiCase):
                 self.assertRegex(
                     window, r'typeof\s+%s' % re.escape(name),
                     "%s is called without a feature check at offset %d; it "
-                    "is newer than this page's own baseline of Safari 13.1"
+                    "is newer than this page's own baseline of Safari 14.1"
                     % (name, at))
                 at = SERVER_SRC.find(call, at + 1)
 
@@ -3393,6 +3393,24 @@ class TestTheViewDoesNotOverclaim(_GuiCase):
     def test_the_reason_is_shown_whenever_the_server_sends_one(self):
         render = self.js_function("opshellRender")
         self.assertIn("state.reason", render)
+
+    def test_the_cards_footer_names_the_control_that_closes(self):
+        # The card has two buttons and only one of them closes anything,
+        # but the line under the terminal still read "Closing it queues
+        # the channel's shutdown" -- written when the panel was a modal
+        # with one way out. `test_docs` forbids
+        # `closing the (view|panel)...queues the shutdown`, which that
+        # spelling does not match: its own comment records the pattern as
+        # having been green over the very page it was written to forbid.
+        # So the pin is here, on the sentence, in the file that reads it.
+        render = self.js_function("opshellRender")
+        self.assertNotRegex(
+            render, r"(?i)closing it queues",
+            "the card's footer says 'closing it' where `_` closes nothing")
+        self.assertRegex(render, r"&#10005;[^<]*closes the card",
+                         "the footer does not say which control closes")
+        self.assertRegex(render, r"_ parks",
+                         "the footer does not say what `_` does instead")
 
 
 #: The browser the view is executed against.
@@ -3695,7 +3713,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """Eighty tests hide behind `skipUnless(node)`.
+        """Ninety-nine tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3703,7 +3721,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of eighty quiet skips.
+        One loud failure instead of ninety-nine quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3737,9 +3755,15 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # against 91 once the pair was pinned to the probe's own box by
         # division rounded down, and the probe to the terminal's own font --
         # and 90 against 92 once that font was resolved for both, because
-        # the canvas strategy cannot read `var(--mono)` --
+        # the canvas strategy cannot read `var(--mono)` -- and 97 against 99
+        # once the final review's five Important brought six (the terminal
+        # disposed where its node is replaced and not inherited by the next
+        # session, an answer that is not a state, a duration that cannot
+        # outlive its device, a claim the resume may not overwrite, and the
+        # sentence saying why a card did not come back) and a parked panel
+        # with no session brought the seventh --
         self.assertGreaterEqual(
-            len(names), 90,
+            len(names), 97,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -5017,12 +5041,12 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_an_older_browser_loses_the_deadline_and_not_the_heartbeat(self):
-        """`AbortSignal.timeout` is Safari 16; this interface is Safari 13.1.
+        """`AbortSignal.timeout` is Safari 16; this interface is Safari 14.1.
 
         Measured against the rest of the page: 164 uses of optional
-        chaining (2020) and the Clipboard API (Safari 13.1), and nothing
-        newer than that -- until I added a 2022 feature and called it
-        unconditionally. On an older browser that throws a TypeError inside
+        chaining and the Clipboard API in its JavaScript, flexbox `gap`
+        in its CSS -- which is the 14.1 -- and nothing newer than that,
+        until I added a 2022 feature and called it unconditionally. On an older browser that throws a TypeError inside
         the poll, which kills the heartbeat: the exact failure the deadline
         was added to prevent, arriving by a different door.
 
@@ -6348,6 +6372,259 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(got["column"], "none")
         self.assertEqual(len(got["warned"]), 1)
         self.assertIn("Operator Shell", got["warned"][0])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_refusal_reaches_the_operator_once_the_body_has_been_redrawn(self):
+        """The final review's first Important.
+
+        The poll replaces `#opshell-body`, and `#opshell-term` goes with
+        it. `opshellTerm` stayed non-null over that dead node, and
+        `dispose()` had one call site -- `opshellTeardown` -- which a card
+        that survives between sessions no longer reaches. So
+        `opshellEndSession`'s panel fallback, `!opshellTerm`, could never
+        be true: pressing **End the session** on a channel another view
+        holds wrote the server's refusal into a detached terminal and the
+        operator saw nothing at all.
+        """
+        got = self._node(
+            "opshellSession = null;\n"
+            "const term = fakeTerm(); opshellTerm = term;\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot'}},"
+            " {ok:true, status:200, body:{session:'adopted'}},"
+            " {ok:true, status:200, body:{reason:'another view is holding "
+            "this channel, so it stays up'}}];\n"
+            "await opshellPoll();\n"
+            "const gone = [term.disposed === true, opshellTerm === null];\n"
+            "await opshellEndAfterAttach();\n"
+            "console.log(JSON.stringify({gone,"
+            " shown: els['opshell-body'].innerHTML,"
+            " urls: posted.map(p => p.url.split('?')[0])}));")
+        # The terminal goes with the node it lived in.
+        self.assertEqual(got["gone"], [True, True],
+                         "the poll replaced the terminal's node and left "
+                         "the terminal undisposed")
+        # And the reason the operator pressed a button for is on screen.
+        self.assertRegex(got["shown"], r"(?i)another view is holding")
+        self.assertEqual(got["urls"], ["/api/opshell/state",
+                                       "/api/opshell/open",
+                                       "/api/opshell/close"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_second_session_does_not_inherit_the_first_terminal(self):
+        # The other half of the same Important: a card that outlives its
+        # session used to keep the xterm instance and its observers for
+        # every open-end-open cycle, and the next attach wrote into a
+        # terminal whose node had been replaced. Driven through a real
+        # attach, a real end -- the stream runs out -- a poll, and a second
+        # attach.
+        got = self._node(
+            "els['opshell-term'] = el('opshell-term');\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "const built = [];\n"
+            "globalThis.Terminal = function(o){ const t = fakeTerm();"
+            " built.push(t); return t; };\n"
+            "opshellSession = 'sid-1';\n"
+            "nextReply = {ok:true, status:200, stream: fakeStream(['hi'])};\n"
+            "await opshellAttach({state:'live', host:'parrot',"
+            " geometry:[80,24]});\n"
+            "const afterFirst = [built.length, built[0].disposed === true,"
+            " opshellTerm === built[0]];\n"
+            "nextReply = {ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot'}};\n"
+            "await opshellPoll();\n"
+            "const afterPoll = [built[0].disposed === true,"
+            " opshellTerm === null];\n"
+            "opshellSession = 'sid-2';\n"
+            "nextReply = {ok:true, status:200, stream: fakeStream(['ho'])};\n"
+            "await opshellAttach({state:'live', host:'parrot',"
+            " geometry:[80,24]});\n"
+            "console.log(JSON.stringify({afterFirst, afterPoll,"
+            " built: built.length, same: built[1] === built[0],"
+            " current: opshellTerm === built[1]}));")
+        # The session ended with the stream and the terminal was still
+        # there: that is the state the poll has to clean up.
+        self.assertEqual(got["afterFirst"], [1, False, True])
+        self.assertEqual(got["afterPoll"], [True, True])
+        # A second attach builds its own, and the first is not reused.
+        self.assertEqual(got["built"], 2)
+        self.assertFalse(got["same"], "the second session inherited the "
+                                      "first session's terminal")
+        self.assertTrue(got["current"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_an_answer_that_is_not_a_state_does_not_kill_the_heartbeat(self):
+        """The final review's second Important.
+
+        Everything after the poll's `try` reads `state.state` and
+        `state.geometry`, and that tail runs after the only `setTimeout`
+        has been consumed. A `/state` answer of `null` -- valid JSON, and
+        what a proxy or a route change can hand back -- threw there, the
+        rejection was unhandled, and the heartbeat stopped for good: the
+        claim then lapsed 240 seconds later under an operator sitting in
+        the session. Measured before the check: `rescheduled: 0`.
+        """
+        for body in ("null", "'<html>maintenance</html>'", "[1,2]", "42"):
+            got = self._node(
+                "els['opshell-body'] = el('opshell-body');\n"
+                "nextReply = {ok:true, status:200, body:%s};\n"
+                "let threw = null;\n"
+                "try { await opshellPoll(); } catch(e) { threw = String(e); }\n"
+                "console.log(JSON.stringify({threw, scheduled,"
+                " beating: opshellTimer !== null,"
+                " shown: els['opshell-body'].innerHTML}));" % body)
+            self.assertIsNone(got["threw"], body)
+            self.assertEqual(got["scheduled"], [2000],
+                             "the poll did not reschedule itself after %s"
+                             % body)
+            self.assertTrue(got["beating"], body)
+            self.assertRegex(got["shown"], r"(?i)not an object", body)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_new_device_is_not_shown_the_last_ones_duration(self):
+        """The final review's third Important.
+
+        `opshellLast` was cleared inside `if(answer.session)`, so an open
+        that came back without one -- the channel is down, the start is
+        queued -- left the previous session's duration standing, and the
+        poll folded it over the next idle answer: the card then said "The
+        session lasted 92s" beside a device that never ran it.
+        """
+        got = self._node(
+            "opshellLast = {duration: 92};\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['opshell-agent'] = el('opshell-agent');\n"
+            "els['opshell-agent'].value = 'badger';\n"
+            "replies = [{ok:true, status:200, body:{state:'waiting'}},"
+            " {ok:true, status:200, body:{state:'idle', channel:'closed',"
+            " host:'badger', candidates:['badger'], target:'badger'}}];\n"
+            "await opshellOpen();\n"
+            "const held = opshellLast;\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({held,"
+            " shown: els['opshell-body'].innerHTML}));")
+        self.assertIsNone(got["held"],
+                          "the duration survived the device that ran it")
+        self.assertNotIn("92", got["shown"])
+        self.assertNotRegex(got["shown"], r"(?i)session lasted")
+        self.assertIn("badger", got["shown"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_claim_taken_while_the_resume_is_in_flight_is_not_overwritten(self):
+        """The final review's fourth Important.
+
+        The resume's `/state` had no deadline, and while it is outstanding
+        the view is usable: the operator presses `>_`, is told the channel
+        is up and this page is not holding it, and presses Attach. A
+        resume that then wrote its remembered id over the adopted one
+        orphaned the new claim -- every close answers "not the last" and
+        nothing is stopped until the lapse four minutes later. What the
+        page did wins; what it remembered does not.
+        """
+        got = self._node(
+            "sessionStorage.setItem(opshellStore, 'remembered');\n"
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['main'].appendChild(els['content']);\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot', sessions:1}}];\n"
+            "const resuming = opshellResume();\n"
+            # What Attach leaves behind while that request is in flight:
+            # `opshellOpen`'s own two lines, set here rather than awaited,
+            # because which of two pending fetches resolves first is not
+            # something a test should depend on.
+            "opshellSession = 'adopted'; opshellRemember('adopted');\n"
+            "const resumed = await resuming;\n"
+            "console.log(JSON.stringify({resumed, session: opshellSession,"
+            " remembered: sessionStorage.getItem(opshellStore),"
+            " card: !!document.getElementById('opshell-card'),"
+            " deadline: posted[0] && posted[0].timeout}));")
+        self.assertFalse(got["resumed"])
+        self.assertEqual(got["session"], "adopted",
+                         "the resume overwrote a claim this page had "
+                         "already taken")
+        self.assertEqual(got["remembered"], "adopted")
+        self.assertFalse(got["card"])
+        # And the window is bounded, as the poll's is.
+        self.assertEqual(got["deadline"], 8000)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_session_that_did_not_come_back_is_explained_at_the_next_open(self):
+        """The final review's fifth Important, its ruling.
+
+        A reload whose session has gone adopts nothing and clears both
+        keys, which is the half that matters -- but nothing was said,
+        while `docs/TUNNEL.md` promises the card comes back the way it was
+        left. The operator was left wondering whether a shell was still
+        running somewhere, which is the doubt this feature exists to
+        remove, and the page knows the answer: the server said that
+        session was not live.
+
+        Said at the next open and not at load, because this feature opens
+        only on an explicit action; and said once, because the fact is
+        taken out of storage as it is read.
+        """
+        got = self._node(
+            "sessionStorage.setItem(opshellStore, 'gone-1');\n"
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['main'].appendChild(els['content']);\n"
+            "replies = [{ok:true, status:200, body:{state:'idle',"
+            " channel:'closed', sessions:0}},"
+            " {ok:true, status:200, body:{state:'idle', channel:'closed'}},"
+            " {ok:true, status:200, body:{state:'idle', channel:'closed'}}];\n"
+            "const resumed = await opshellResume();\n"
+            "const atLoad = !!document.getElementById('opshell-card');\n"
+            "const kept = sessionStorage.getItem(opshellStore + '_gone');\n"
+            "await showOperatorShell();\n"
+            "const first = document.getElementById('opshell-card')"
+            ".children.map(c => c.innerHTML).join(' ');\n"
+            "const cleared = sessionStorage.getItem(opshellStore + '_gone');\n"
+            "await opshellTeardown(document.getElementById('opshell-card'));\n"
+            "await showOperatorShell();\n"
+            "const card = document.getElementById('opshell-card');\n"
+            "console.log(JSON.stringify({resumed, atLoad, kept: !!kept,"
+            " first, cleared,"
+            " second: card.children.map(c => c.innerHTML).join(' '),"
+            " parts: card.children.length}));")
+        self.assertFalse(got["resumed"])
+        # Nothing opens itself at load: that is the feature's own rule.
+        self.assertFalse(got["atLoad"], "a card opened itself at load")
+        self.assertTrue(got["kept"], "the reason was not remembered")
+        # The next open says it, and says what the page actually knows.
+        self.assertRegex(got["first"], r"(?i)gone|no longer")
+        self.assertRegex(got["first"], r"(?i)team server")
+        self.assertIsNone(got["cleared"])
+        # The one after that does not.
+        self.assertNotRegex(got["second"], r"(?i)gone|no longer")
+        self.assertEqual(got["parts"], 2, "the note outlived its one open")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_parked_panel_with_no_session_does_not_claim_a_shell(self):
+        # The card can be parked over the picker: no session, nothing
+        # running. The live border, a cursor whose own comment says it
+        # blinks while the shell is alive, and "Restore the shell" each
+        # claimed more than the view knew.
+        got = self._node(
+            "opshellSession = null; opshellLast = null;\n"
+            "const idle = opshellParked({state:'idle', channel:'closed'});\n"
+            "opshellSession = 'sid';\n"
+            "const live = opshellParked({state:'live', channel:'open',"
+            " host:'parrot'});\n"
+            "opshellSession = null; opshellLast = {duration: 92};\n"
+            "const ended = opshellParked({state:'idle', channel:'closed',"
+            " host:'parrot'});\n"
+            "console.log(JSON.stringify({idle, live, ended}));")
+        # No session: it restores the panel, and nothing blinks.
+        self.assertNotRegex(got["idle"], r"(?i)restore the shell")
+        self.assertRegex(got["idle"], r"(?i)restore the panel")
+        self.assertNotIn("opshell-cursor", got["idle"])
+        # A session this page holds: both.
+        self.assertRegex(got["live"], r"(?i)restore the shell")
+        self.assertIn("opshell-cursor", got["live"])
+        # And a remnant is neither.
+        self.assertNotRegex(got["ended"], r"(?i)restore the")
+        self.assertNotIn("opshell-cursor", got["ended"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_non_ascii_keystrokes_survive_the_encoding(self):
