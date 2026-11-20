@@ -8543,6 +8543,16 @@ async function showOperatorShell(){
   // no longer a modal: a second press must not draw a second `#opshell-body`.
   if(document.getElementById("opshell-card")) return;
   const main = document.querySelector(".main");
+  const content = document.querySelector("#content");
+  // `opshellResume` calls this from the startup branch beside the agent
+  // refresh timer, so a throw here would leave a dead page and not just a
+  // shell that did not open. Only the page's own markup changing can get
+  // here, and then the console is the only place that can say why.
+  if(!main || !content){
+    console.warn("Operator Shell: no " + (main ? "#content" : ".main")
+      + " in the page, so there is nowhere to draw it");
+    return;
+  }
   const card = document.createElement("div");
   card.id = "opshell-card";
   card.classList.add("opshell-card");
@@ -8561,7 +8571,7 @@ async function showOperatorShell(){
   main.appendChild(card);
   // Hidden and not emptied: `renderAgentView` rewrites its children on
   // every agent click, and they are what comes back when the card goes.
-  document.querySelector("#content").style.display = "none";
+  content.style.display = "none";
   await opshellPoll();
 }
 
@@ -8571,7 +8581,8 @@ async function opshellClose(ev){
   // request that takes a moment.
   const card = document.getElementById("opshell-card");
   const ended = opshellTeardown(card);
-  document.querySelector("#content").style.display = "";
+  const content = document.querySelector("#content");
+  if(content) content.style.display = "";
   return ended;
 }
 

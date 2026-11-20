@@ -3338,6 +3338,9 @@ function fakeBox(w, h){ nextBox = {width: w, height: h}; }
 // and one taken out of the page cannot. `els` is that index.
 function adopt(n){ if(n.id) els[n.id] = n; }
 function forget(n){ if(n.id && els[n.id] === n) delete els[n.id]; }
+// A removed or emptied node takes its whole subtree out of the page, so a
+// grandchild's id stops answering too, as `getElementById` does in Safari.
+function forgetTree(n){ forget(n); n.children.forEach(forgetTree); }
 function makeNode(id, box){
   const classes = new Set();
   let html = '';
@@ -3367,7 +3370,7 @@ function makeNode(id, box){
     set innerHTML(v){
       html = String(v);
       node.htmlWrites.push(html);
-      node.children.forEach(c => { c.parentNode = null; forget(c); });
+      node.children.forEach(c => { c.parentNode = null; forgetTree(c); });
       node.children = [];
     },
     appendChild(child){
@@ -3380,7 +3383,7 @@ function makeNode(id, box){
     },
     remove(){
       removed.push(node.id);
-      forget(node);
+      forgetTree(node);
       if(node.parentNode){
         node.parentNode.children.splice(
           node.parentNode.children.indexOf(node), 1);
@@ -3524,10 +3527,12 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # total still looked plausible, and later a single named safety
         # test deleted while the total *rose* from 231 to 246. So the floor
         # sits close to the real count -- 48 against 50 when it was set,
-        # carried with the controller's nod, and 52 against 54 once the
-        # harness's DOM brought three tests of its own --
+        # carried with the controller's nod, 52 against 54 once the
+        # harness's DOM brought three tests of its own, and 57 against 59
+        # once the card, its double-press guard and its missing-mount guard
+        # brought five more --
         self.assertGreaterEqual(
-            len(names), 52,
+            len(names), 57,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -3679,6 +3684,24 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " removed.includes('gone')];\n"
             "document.body.appendChild(other);\n"
             "const registered = Object.keys(els).sort();\n"
+            # a subtree leaves the page whole: remove() and an innerHTML
+            # write each unregister a grandchild, not just the child
+            "const outer = document.createElement('div'); outer.id = 'outer';\n"
+            "const inner = document.createElement('div'); inner.id = 'inner';\n"
+            "outer.appendChild(inner); a.appendChild(outer);\n"
+            "const treeIn = [document.getElementById('outer') === outer,"
+            " document.getElementById('inner') === inner];\n"
+            "outer.remove();\n"
+            "const afterTree = [document.getElementById('outer'),"
+            " document.getElementById('inner')];\n"
+            "const kid = document.createElement('div'); kid.id = 'kid';\n"
+            "const grand = document.createElement('div'); grand.id = 'grand';\n"
+            "kid.appendChild(grand); b.appendChild(kid);\n"
+            "const kidsIn = [document.getElementById('kid') === kid,"
+            " document.getElementById('grand') === grand];\n"
+            "b.innerHTML = '';\n"
+            "const afterEmpty = [document.getElementById('kid'),"
+            " document.getElementById('grand')];\n"
             # node identity
             "const v = el('v');\n"
             "const ids = [v.id, v.value, document.createElement('p').id];\n"
@@ -3694,7 +3717,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " styles: [n.style.display, other.style.display],\n"
             " writes: n.htmlWrites, html: n.innerHTML,\n"
             " coerced: [m.innerHTML, typeof m.innerHTML],\n"
-            " reparented, afterRemove, registered, ids,\n"
+            " reparented, afterRemove, registered, ids,"
+            " treeIn, afterTree, kidsIn, afterEmpty,\n"
             " body: document.body.children.length,\n"
             " byId: document.querySelector('#a') === a,\n"
             " byName: document.querySelector('.sidebar') === sidebar,\n"
@@ -3721,6 +3745,12 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # createElement makes nodes that belong to nobody's registry, and a
         # removed node has left it.
         self.assertEqual(got["registered"], ["a", "b"])
+        # And the whole subtree goes with it: a grandchild's id must not
+        # answer once its ancestor has been removed or emptied.
+        self.assertEqual(got["treeIn"], [True, True])
+        self.assertEqual(got["afterTree"], [None, None])
+        self.assertEqual(got["kidsIn"], [True, True])
+        self.assertEqual(got["afterEmpty"], [None, None])
         self.assertEqual(got["ids"], ["v", "", None])
         self.assertEqual(got["body"], 1)
         self.assertTrue(got["byId"])
@@ -5068,6 +5098,32 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " c.classList.contains('opshell-card')).length}));")
         self.assertEqual(got["cards"], 1)
         self.assertEqual(got["inMain"], 2)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_page_without_its_mount_point_gets_no_card_and_no_throw(self):
+        # `opshellResume` runs in the startup branch beside the agent
+        # refresh timer, so a throw here is a dead page -- no device list,
+        # no refresh -- and not merely a shell that failed to open. It can
+        # only happen if the page's own markup changed, which is why the
+        # console is told rather than the operator left with nothing.
+        for setup, why in (
+                ("", "no .main"),
+                ("els['main'] = el('main');\n", "no #content")):
+            got = self._node(
+                "const warned = []; console.warn = m => warned.push(String(m));\n"
+                + setup +
+                "let threw = null;\n"
+                "try { await showOperatorShell(); } catch(e) { threw = String(e); }\n"
+                "console.log(JSON.stringify({threw, warned,"
+                " card: !!document.getElementById('opshell-card'),"
+                " body: !!document.getElementById('opshell-body'),"
+                " polled: posted.length}));")
+            self.assertIsNone(got["threw"], why)
+            self.assertFalse(got["card"], why)
+            self.assertFalse(got["body"], why)
+            self.assertEqual(got["polled"], 0, why)
+            self.assertEqual(len(got["warned"]), 1, why)
+            self.assertIn("Operator Shell", got["warned"][0])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_non_ascii_keystrokes_survive_the_encoding(self):
