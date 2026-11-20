@@ -163,7 +163,8 @@ class _CommandPeer(_Peer):
         self._thread = None
 
     def hello(self, identity, implant_id=None, hostname="raccoon-host",
-              os_name="Linux-6.1", features=None, user=None):
+              os_name="Linux-6.1", features=None, user=None, history=None,
+              history_detail=None):
         body = {"identity": identity, "hostname": hostname, "os": os_name}
         if implant_id is not None:
             body["implant_id"] = implant_id
@@ -172,6 +173,14 @@ class _CommandPeer(_Peer):
         # row that invented one would be the claim this field removes.
         if user is not None:
             body["user"] = user
+        # The same pattern, and for the same reason: an endpoint built
+        # before the history guard sends neither key, and that is the case
+        # the server has to read as the weaker guard rather than as a
+        # claim that history is off.
+        if history is not None:
+            body["history"] = history
+        if history_detail is not None:
+            body["history_detail"] = history_detail
         # Left out entirely when None: an endpoint built before the shell
         # sends no `features` key at all, and that is the case to cover.
         if features is not None:
@@ -338,6 +347,18 @@ class TunnelServerTestCase(unittest.TestCase):
                 return row
         return {"identity": identity, "state": "absent"}
 
+    def _row_after_hello(self, identity="build-alpha", **hello):
+        """The row for one endpoint whose HELLO carried `hello`.
+
+        A server per call, because what is under test is a registration
+        and the table is keyed by identity. The keywords are
+        `_CommandPeer.hello`'s, and one left out is a key the HELLO does
+        not carry at all rather than one carried empty.
+        """
+        server = self.start_server()
+        self.command_peer(server, identity, **hello)
+        return self.row(server, identity)
+
     def wait_for(self, predicate, timeout=5.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -391,6 +412,55 @@ class TestRegistration(TunnelServerTestCase):
         self.command_peer(server, "build-alpha")
 
         self.assertIsNone(self.row(server, "build-alpha")["user"])
+
+    def test_the_row_carries_the_history_guard_from_the_hello(self):
+        row = self._row_after_hello(history="weak",
+                                    history_detail="/bin/zsh takes no --rcfile")
+        self.assertEqual(row["history"], "weak")
+        self.assertIn("zsh", row["history_detail"])
+
+    def test_the_row_carries_a_guard_that_holds_history_off(self):
+        row = self._row_after_hello(history="off")
+        self.assertEqual(row["history"], "off")
+        self.assertEqual(row["history_detail"], "")
+
+    def test_a_history_guard_this_server_does_not_know_reads_as_weak(self):
+        """A HELLO is written by whatever is at the other end, and the
+        safe reading of an unknown word is the weaker one: claiming
+        history is off is the only answer that can mislead."""
+        for sent in ("", "OFF", "off ", "weak", 1, True, ["off"], None, {}):
+            row = self._row_after_hello(history=sent)
+            self.assertEqual(row["history"], "weak", repr(sent))
+
+    def test_an_endpoint_from_an_older_build_reports_no_guard(self):
+        row = self._row_after_hello()  # no history keyword at all
+        self.assertEqual(row["history"], "weak")
+        self.assertEqual(row["history_detail"], "")
+
+    def test_a_reason_is_not_carried_beside_a_guard_that_says_off(self):
+        """The pair is what a panel renders, and "history is off" beside
+        a reason why it is not is a sentence that cannot be rendered
+        truthfully. The word is validated, so a reason arriving with it
+        is from something this server does not know the shape of."""
+        row = self._row_after_hello(history="off",
+                                    history_detail="/bin/zsh takes no --rcfile")
+        self.assertEqual((row["history"], row["history_detail"]), ("off", ""))
+
+    def test_a_disconnected_row_reports_no_guard_at_all(self):
+        """As with `features`: the guard is the endpoint's answer about
+        its own host, and a row keeps its port after the endpoint has
+        gone. The last answer shown beside a row nothing is behind would
+        be a claim about a host this server is no longer talking to --
+        and `chsh` on it is exactly why that claim expires."""
+        server = self.start_server()
+        peer = self.command_peer(server, "build-alpha", history="off")
+        self.assertEqual(self.row(server, "build-alpha")["history"], "off")
+
+        peer.close()
+        self.wait_for(
+            lambda: self.row(server, "build-alpha")["state"] == "disconnected")
+        row = self.row(server, "build-alpha")
+        self.assertEqual((row["history"], row["history_detail"]), ("", ""))
 
     def test_the_same_identity_gets_the_same_port_after_a_server_restart(self):
         first = self.start_server()

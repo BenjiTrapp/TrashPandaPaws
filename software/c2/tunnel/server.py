@@ -359,6 +359,19 @@ class _CommandChannel(object):
         # session there would have. `None` from a build that does not
         # report it: the panel says so rather than assuming root.
         self.user = None            # type: Optional[str]
+        # What a session on that endpoint does about the operator's own
+        # command history, as its HELLO reported it: `"off"` where the
+        # generated rcfile holds it off for good, `"weak"` where the
+        # session can only set `HISTFILE` and the host's rc files run
+        # after that and may undo it. `history_detail` is why, for the
+        # weaker one, and `""` beside `"off"`.
+        #
+        # The weaker guard is the default, and `_history` is where an
+        # unknown word and a build too old to send one both land on it:
+        # "history is off" is the only answer that can mislead an operator
+        # into typing something they would not have typed.
+        self.history = "weak"       # type: str
+        self.history_detail = ""    # type: str
         # Which AES backend the *endpoint* has, as its HELLO reported it.
         # Not this process's: `crypto_path()` answers for the server, and
         # the two halves are different hosts with different libcrypto.
@@ -627,6 +640,18 @@ class TunnelServer(object):
                 "hostname": channel.hostname if channel is not None else None,
                 "os": channel.os_name if channel is not None else None,
                 "user": channel.user if channel is not None else None,
+                # What a session on that endpoint does about the
+                # operator's command history, and why where that is the
+                # weaker answer. Both empty for a disconnected row: the
+                # guard is the endpoint's own answer about its own host,
+                # carried by its HELLO, and nothing on this side can know
+                # it for an endpoint that is not here. Empty is the
+                # panel's signal to claim neither, which is not the same
+                # as the weaker guard -- that one is a measured fact about
+                # a host that answered.
+                "history": channel.history if channel is not None else "",
+                "history_detail": (channel.history_detail
+                                   if channel is not None else ""),
                 "peer": channel.peer if channel is not None else None,
                 "sessions": len(mine),
                 "bytes_in": before[0] + sum(s.sock.bytes_in for s in counted),
@@ -886,6 +911,8 @@ class TunnelServer(object):
         channel.hostname = _text(body.get("hostname"))
         channel.os_name = _text(body.get("os"))
         channel.user = _text(body.get("user"))
+        channel.history, channel.history_detail = _history(
+            body.get("history"), body.get("history_detail"))
         channel.implant_id = _text(body.get("implant_id"))
         channel.crypto = _text(body.get("crypto"))
         channel.features = _features(body.get("features"))
@@ -1465,6 +1492,26 @@ def _features(value) -> Tuple[str, ...]:
     if not isinstance(value, list):
         return ()
     return tuple(item for item in value if isinstance(item, str))
+
+
+def _history(value, detail) -> Tuple[str, str]:
+    """A `HELLO`'s history guard and its reason: `("off", "")` or `("weak", why)`.
+
+    Two words and no third. `"off"` says that a session on that endpoint
+    cannot write the operator's commands to a history file, and an
+    operator reads it beside the row and types accordingly -- so it is the
+    one answer here that can mislead, and only that exact word earns it.
+    Everything else is the weaker guard: a build from before this field,
+    a word a later build invents, a number, and whatever else is at the
+    other end of a tunnel, all read alike.
+
+    The reason is carried only beside the weaker guard. "History is off"
+    printed next to a reason why it is not is a pair no panel can render
+    truthfully, and this is the one place the two are made to agree.
+    """
+    if _text(value) == "off":
+        return "off", ""
+    return "weak", _text(detail) or ""
 
 
 def _token_bytes(value, kind: str) -> bytes:

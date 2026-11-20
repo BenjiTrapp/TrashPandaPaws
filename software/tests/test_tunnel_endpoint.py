@@ -1750,6 +1750,62 @@ class TestTheLoginShell(_ShellChoice, unittest.TestCase):
                              case)
             self.assertEqual(lookup.call_count, 1, case)
 
+    def test_a_guard_that_no_longer_matches_the_reported_one_is_refused(self):
+        """The half of the guard that can go stale, caught at the session.
+
+        `/dev/fd` is the host's and does not move. The login shell is the
+        user's: `chsh`, or a bash removed, takes effect on the next
+        session of an endpoint that has been connected for months, and
+        the panel would still be showing what the HELLO said. So the
+        invocation is told what was reported and builds nothing when the
+        session it would build disagrees -- in either direction, because
+        "reported weak and this one is off" is a view that is just as
+        untrue of the session in front of the operator, and one
+        comparison that refuses both ways cannot be got subtly wrong.
+
+        The pair is compared and not the word. The last two refusals are
+        weak both times and differ in the reason, which is printed beside
+        the word: a panel that says `/bin/zsh is not bash` over a session
+        that is bash without a `/dev/fd` is wrong about the part an
+        operator acts on.
+
+        `None` is a caller that has reported nothing: there is nothing to
+        contradict, and every other test here passes two arguments.
+        """
+        cases = (  # (shell then, /dev/fd then, shell now, /dev/fd now)
+            ("/bin/bash", True, "/bin/bash", True, False),
+            ("/bin/zsh", True, "/bin/zsh", True, False),
+            ("/bin/bash", False, "/bin/bash", False, False),
+            ("/bin/bash", True, "/bin/zsh", True, True),
+            ("/bin/zsh", True, "/bin/bash", True, True),
+            ("/bin/bash", False, "/bin/zsh", True, True),
+            ("/bin/zsh", True, "/bin/zsh", False, False),
+            ("/bin/bash", True, "/bin/bash", False, True),
+            ("/bin/zsh", True, "/usr/local/bin/zsh", True, True),
+        )
+        for then, fd_then, now, fd_now, refuses in cases:
+            with self._passwd(then), self._executable({then}), \
+                    self._dev_fd(fd_then):
+                reported = beacon_mod._history_guard()
+            held = ()
+            with self._passwd(now), self._executable({now}), \
+                    self._dev_fd(fd_now):
+                try:
+                    _, _, held = beacon_mod._shell_invocation(80, 24,
+                                                              reported)
+                    refused = False
+                except beacon_mod._HistoryGuardChanged:
+                    refused = True
+            for fd in held:
+                os.close(fd)
+            self.assertEqual(refused, refuses,
+                             (then, fd_then, now, fd_now, reported))
+
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
+                self._dev_fd(True):
+            _, _, held = beacon_mod._shell_invocation(80, 24, None)
+        self.assertEqual(held, ())
+
     def test_a_zsh_session_blames_the_shell_and_not_the_host(self):
         """The operator can tell a login zsh apart from an ancient host
         only if the reason says which it was."""
@@ -1791,12 +1847,25 @@ class TestTheLoginShell(_ShellChoice, unittest.TestCase):
 
     def test_a_scan_for_the_environment_is_not_fooled_by_a_name(self):
         """The scan above has been tripped three times by text that was
-        not a reading. It must see through a local called `environment`
-        and still catch both ways of reading the variable."""
+        not a reading. It must see through a local called `environment`,
+        catch both ways of reading the variable, and catch a reading whose
+        name never appears as an attribute: a bare name and an import
+        under another name are how one hides from a scan that walks only
+        attributes, and both branches that see them were dead here --
+        every test passed with either deleted."""
+        from os import environ
+
         def innocent():
             """Says os.environ and getenv in prose."""
             environment = 1  # os.environ
             return environment
+
+        def contains_the_letters():
+            """Every kind of identifier the scan collects, each one
+            *containing* a name it is looking for and none of them equal
+            to one: a bare name, an attribute, and an import."""
+            from somewhere import getenv_all
+            return getenv_all(thing.environ_of(environment))
 
         def reads_environ():
             return os.environ.get("SHELL")
@@ -1804,16 +1873,82 @@ class TestTheLoginShell(_ShellChoice, unittest.TestCase):
         def reads_getenv():
             return os.getenv("SHELL")
 
+        def reads_a_bare_environ():
+            """What `from os import environ` at the top of a module and a
+            read down here looks like: no attribute is touched."""
+            return dict(environ)
+
+        def reads_getenv_under_another_name():
+            """The name is in the import and nowhere else."""
+            from os import getenv as ask
+            return ask("SHELL")
+
         self.assertFalse({"environ", "getenv"}
                          & self._names_used_by(innocent))
+        # By equality and not by substring. A set cannot be asked "does
+        # any member contain this", so the question is put the other way:
+        # the identifiers come back whole and the two readings are not in
+        # them. Each of the three node kinds has to pass through that
+        # test, so a scan that cut an identifier down to a name it knows
+        # fails in whichever branch does it.
+        found = self._names_used_by(contains_the_letters)
+        self.assertLessEqual({"getenv_all", "environ_of", "environment"},
+                             found)
+        self.assertFalse({"environ", "getenv"} & found, found)
         self.assertIn("environ", self._names_used_by(reads_environ))
         self.assertIn("getenv", self._names_used_by(reads_getenv))
+        self.assertIn("environ", self._names_used_by(reads_a_bare_environ))
+        self.assertIn("getenv",
+                      self._names_used_by(reads_getenv_under_another_name))
 
     def test_a_passwd_lookup_that_raises_falls_back_rather_than_throwing(self):
         with mock.patch.object(pwd, "getpwuid",
                                side_effect=KeyError("no such uid")), \
                 self._executable({"/bin/bash"}):
             self.assertEqual(beacon_mod._shell_program(), "/bin/bash")
+
+
+class TestTheHelloCarriesTheHistoryGuard(_ShellChoice,
+                                        TunnelEndpointTestCase):
+    """What a HELLO says about command history on this host.
+
+    Modelled on `TestRegistration.test_hello_advertises_the_shell_feature`:
+    port 1234 is never dialled, because the body is what is under test and
+    not the connection.
+
+    Said once, at connect, because what reads it is a panel looking at an
+    endpoint row rather than at a session. The half of the answer that can
+    go stale between the HELLO and a session -- the login shell -- is
+    caught where the session is built; see `TestARefusedShellSession`.
+    """
+
+    def _body(self):
+        endpoint = TunnelEndpoint(self.config_for(1234))
+        self.addCleanup(endpoint.stop)
+        return endpoint._hello()
+
+    def test_hello_reports_the_history_guard_a_session_here_would_get(self):
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(True):
+            body = self._body()
+        self.assertEqual(body["history"], "off")
+        self.assertEqual(body["history_detail"], "")
+
+    def test_hello_reports_the_weaker_guard_and_what_caused_it(self):
+        """Both branches, because the "off" case on its own is passed by a
+        body that says "off" whatever the host is."""
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
+                self._dev_fd(True):
+            body = self._body()
+        self.assertEqual(body["history"], "weak")
+        self.assertIn("zsh", body["history_detail"])
+
+    def test_a_host_without_dev_fd_reports_the_weaker_guard_too(self):
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(False):
+            body = self._body()
+        self.assertEqual(body["history"], "weak")
+        self.assertIn(beacon_mod._DEV_FD, body["history_detail"])
 
 
 @unittest.skipUnless(_HAS_PTY, _NO_PTY)
@@ -1853,6 +1988,98 @@ class TestARefusedShellSession(_ShellChoice, TunnelEndpointTestCase):
                                   refusals.append(reason)):
             endpoint._serve_shell(None, None, 80, 24)
         return endpoint, refusals, masters
+
+    def _serve_after_the_login_shell_changed(self, at_hello, at_session):
+        """A HELLO on one login shell, and then a session on another.
+
+        The HELLO goes through `_hello`, not by writing whatever it
+        remembers: what has to be checked against is what was *reported*,
+        and a test that set the memory by hand would hold no claim about
+        that. Returns the guard the HELLO carried as well, so each test
+        can say which direction it drove.
+        """
+        refusals = []
+        masters = []
+        pty_mod = beacon_mod._shell_modules()[0]
+        real_openpty = pty_mod.openpty
+
+        def openpty():
+            master, slave = real_openpty()
+            masters.extend((master, slave))
+            return master, slave
+
+        endpoint = TunnelEndpoint(self.config_for(1234))
+        self.addCleanup(endpoint.stop)
+        with self._passwd(at_hello), self._executable({at_hello}), \
+                self._dev_fd(True):
+            reported = endpoint._hello()["history"]
+        with self._passwd(at_session), self._executable({at_session}), \
+                self._dev_fd(True), \
+                mock.patch.object(pty_mod, "openpty", openpty), \
+                mock.patch.object(TunnelEndpoint, "_refuse_shell",
+                                  lambda self, sock, noise, reason:
+                                  refusals.append(reason)):
+            endpoint._serve_shell(None, None, 80, 24)
+        return endpoint, reported, refusals, masters
+
+    def test_the_operator_is_told_the_login_shell_changed_under_them(self):
+        """`chsh` between the HELLO and the session, which is the whole
+        reason the reported guard is checked again here. The sentence has
+        to name the shell, say that it changed since the tunnel connected,
+        and say that reconnecting reports the new one -- the operator is
+        looking at a panel that is now out of date and nothing else will
+        tell them."""
+        _, reported, refusals, _ = self._serve_after_the_login_shell_changed(
+            "/bin/bash", "/bin/zsh")
+        self.assertEqual(reported, "off")
+        self.assertEqual(len(refusals), 1)
+        self.assertRegex(refusals[0], r"(?i)login shell")
+        self.assertRegex(refusals[0], r"(?i)histor")
+        self.assertRegex(refusals[0], r"(?i)reconnect")
+        self.assertRegex(refusals[0], r"(?i)since the tunnel connected")
+        self.assertIn("'off'", refusals[0])
+        self.assertIn("'weak' (/bin/zsh is not bash", refusals[0])
+        self.assertNotRegex(refusals[0], r"Traceback|OSError\(")
+
+    def test_a_guard_that_changed_the_other_way_is_refused_as_well(self):
+        """Reported `weak`, and this session would hold history off. The
+        view is no more true of the session than in the other direction,
+        and one comparison that refuses both ways is the rule that cannot
+        be got subtly wrong."""
+        _, reported, refusals, _ = self._serve_after_the_login_shell_changed(
+            "/bin/zsh", "/bin/bash")
+        self.assertEqual(reported, "weak")
+        self.assertEqual(len(refusals), 1)
+        self.assertRegex(refusals[0], r"(?i)login shell")
+
+    def test_a_login_shell_that_changed_between_two_weak_ones_is_refused(self):
+        """The word is `weak` before and after, and the reason is what
+        changed: the interface would go on naming a shell that is no
+        longer the one a session gets. The sentence has to show both
+        reasons, because that is the difference the operator is owed."""
+        _, reported, refusals, _ = self._serve_after_the_login_shell_changed(
+            "/bin/zsh", "/usr/local/bin/zsh")
+        self.assertEqual(reported, "weak")
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("(/bin/zsh is not bash", refusals[0])
+        self.assertIn("(/usr/local/bin/zsh is not bash", refusals[0])
+
+    def test_a_session_refused_for_a_changed_shell_leaves_nothing_taken(self):
+        """As for the pipe: no slot held and no descriptor open. A
+        refusal is the cheap path and must not be the one that leaks.
+
+        That a guard which still *matches* gets its session is held by
+        `TestAShellSession`, which runs a real HELLO and a real shell
+        through the same endpoint.
+        """
+        endpoint, _, refusals, masters = \
+            self._serve_after_the_login_shell_changed("/bin/bash", "/bin/zsh")
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(endpoint._shells, 0)
+        self.assertEqual(len(masters), 2)
+        for fd in masters:
+            with self.assertRaises(OSError, msg="descriptor %d" % fd):
+                os.fstat(fd)
 
     def test_the_operator_is_told_why_the_session_was_refused(self):
         """A stream that simply goes quiet is the one failure worse than
@@ -1949,23 +2176,51 @@ class TestAShellSession(TunnelEndpointTestCase):
         setattr(beacon_mod, name, value)
         self.addCleanup(setattr, beacon_mod, name, original)
 
-    def ask_for_a_shell(self, cols=None, rows=None):
-        """One OPEN_SHELL, and the stream the endpoint claims it with."""
+    def ask_for_a_shell(self, cols=None, rows=None, server=None,
+                        channel=None):
+        """One OPEN_SHELL, and the stream the endpoint claims it with.
+
+        `server` and `channel` name a second endpoint's pair where a test
+        has connected one; `setUp`'s is the default.
+        """
+        server = server if server is not None else self.server
+        channel = channel if channel is not None else self.channel
         token = os.urandom(16).hex()
-        wanted = len(self.server.shells) + 1
-        body = {"port": self.server.port, "token": token}
+        wanted = len(server.shells) + 1
+        body = {"port": server.port, "token": token}
         if cols is not None:
             body["cols"] = cols
         if rows is not None:
             body["rows"] = rows
-        self.channel.send_message(MSG_OPEN_SHELL, body)
-        self.wait_for(lambda: len(self.server.shells) >= wanted,
+        channel.send_message(MSG_OPEN_SHELL, body)
+        self.wait_for(lambda: len(server.shells) >= wanted,
                       what="the endpoint dialling back for a shell session")
-        claim, stream = self.server.shells[wanted - 1]
+        claim, stream = server.shells[wanted - 1]
         self.assertEqual(claim, {"token": token},
                          "the endpoint claimed the session with the wrong "
                          "body")
         return stream
+
+    def an_endpoint_that_connected_under_this_tests_patches(self):
+        """A second server and endpoint, dialled with the patches in force.
+
+        `setUp` connects one before a test can change the host, and the
+        HELLO carries the history guard of the host as it was then. A
+        session whose guard has changed since is refused on purpose -- see
+        `_HistoryGuardChanged` -- so a test that strips bash after `setUp`
+        would be describing a host that lost bash mid-tunnel. Where what
+        it means is a host that never had one, it connects here instead.
+
+        Returns `(server, channel)` for `ask_for_a_shell`.
+        """
+        server = _FakeTunnelServer(self.store)
+        self.addCleanup(lambda: self.assertEqual(server.errors, []))
+        self.addCleanup(server.close)
+        self.start_endpoint(self.config_for(server.port,
+                                            identity="build-beta"))
+        self.wait_for(lambda: server.channel is not None,
+                      what="the second endpoint's command channel")
+        return server, server.channel
 
     def expect(self, stream, needle, timeout=20.0):
         """Read `stream` until `needle` arrives, or fail saying what did."""
@@ -2387,8 +2642,15 @@ class TestAShellSession(TunnelEndpointTestCase):
         # wanted here -- a host stripped to `/bin/sh` is a host unlikely
         # to carry util-linux -- and whoever maintains the setsid path
         # should know that this test does not exercise it.
+        #
+        # The endpoint is connected *after* the patch, because its HELLO
+        # reports which history guard a session here gets and a session
+        # whose guard has changed since is refused. A host that never had
+        # bash is what this test means; a host that lost it mid-tunnel is
+        # `TestARefusedShellSession`'s business.
         self.patched("_shell_executable", lambda path: False)
-        stream = self.ask_for_a_shell()
+        server, channel = self.an_endpoint_that_connected_under_this_tests_patches()
+        stream = self.ask_for_a_shell(server=server, channel=channel)
 
         data = self.run_in_the_shell(
             stream, b'echo "S""=[$0]" "H""=[$HISTFILE]"\n', b"S=[")

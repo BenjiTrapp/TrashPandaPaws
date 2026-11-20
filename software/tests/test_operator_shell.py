@@ -978,6 +978,13 @@ class _RouteCase(unittest.TestCase):
                 "shell_port": self.dead_port(),
                 "shell_password": self.SHELL_PASSWORD,
                 "shell_recording": True,
+                # What a session on that endpoint does about command
+                # history, as its HELLO reported it. The relay never
+                # leaves the pair unset for a connected endpoint: an
+                # unknown word, and an endpoint too old to send one, both
+                # read as "weak" there.
+                "history": "off",
+                "history_detail": "",
                 "shell": {"sessions": sessions, "max_sessions": 4},
                 "socks": {"sessions": socks_sessions, "max_sessions": 256},
             }],
@@ -1010,6 +1017,8 @@ class _RouteCase(unittest.TestCase):
             "shell_port": self.dead_port(),
             "shell_password": self.SHELL_PASSWORD,
             "shell_recording": True,
+            "history": "off",
+            "history_detail": "",
             "shell": {"sessions": 0, "max_sessions": 4},
             "socks": {"sessions": socks_sessions, "max_sessions": 256},
         }]
@@ -1037,6 +1046,45 @@ class _RouteCase(unittest.TestCase):
     def post(self, path, payload=None, **kw):
         return self.client(**kw).post(self.url(path), json=payload or {},
                                       headers=self.auth)
+
+    # ── state answers, for the fields that are read off the row ──
+
+    def _state_for(self, supervisor):
+        """The state answer for that supervisor, with a target designated.
+
+        The target matters: `/state` answers early for a view that has
+        been pointed at nothing, so without one this would measure that
+        early answer instead of the field it was asked about -- the
+        mistake `test_the_strip_gets_a_host_to_show` records.
+        """
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        return self.get("/api/opshell/state", supervisor=supervisor).get_json()
+
+    def _state_with_row(self, **fields):
+        """The state answer over `connected()`, whose row carries `fields`.
+
+        The fixture's own row, updated, rather than a second row written
+        here: a row invented in a test is the typo-against-a-typo shape
+        that `TestTheFixturesDoNotInventFieldNames` exists to stop.
+        """
+        supervisor = self.connected()
+        supervisor.status()["endpoints"][0].update(fields)
+        return self._state_for(supervisor)
+
+    def _state_without_row(self):
+        """The state answer for a configured relay that has no row yet.
+
+        `configured_but_stopped()` reports a shell port range and no
+        endpoints, which is every moment between the operator's click and
+        the endpoint's HELLO.
+        """
+        return self._state_for(self.configured_but_stopped())
+
+    def _blind_state(self):
+        """The early answer, with no tunnel supervisor to ask at all."""
+        return self._state_for(None)
+
 
 
 class TestTheRoutesAreOperatorOnly(_RouteCase):
@@ -1111,6 +1159,43 @@ class TestTheStateTellsTheTruth(_RouteCase):
         self.post(self.url("/api/opshell/open"), {"agent": self.AGENT})
         state = self.get(self.url("/api/opshell/state")).get_json()
         self.assertIn("no tunnel block", state["reason"])
+
+    def test_the_state_answer_carries_the_history_guard_the_row_has(self):
+        state = self._state_with_row(
+            history="weak", history_detail="/bin/zsh takes no --rcfile")
+        self.assertEqual(state["history"], "weak")
+        self.assertIn("zsh", state["history_detail"])
+
+    def test_a_guard_that_holds_history_off_reaches_the_answer_too(self):
+        state = self._state_with_row(history="off", history_detail="")
+        self.assertEqual(state["history"], "off")
+        self.assertEqual(state["history_detail"], "")
+
+    def test_a_channel_with_no_row_is_told_nothing_about_history(self):
+        """`user` and `root` are populated only inside `if row is not
+        None`, and so is this. An empty guard is the view's signal to
+        claim neither: nothing here has measured the host, and "weak"
+        would be a statement about a session that does not exist.
+        """
+        self.assertEqual(self._state_without_row()["history"], "")
+        self.assertEqual(self._state_without_row()["history_detail"], "")
+        self.assertEqual(self._blind_state()["history"], "")
+        self.assertEqual(self._blind_state()["history_detail"], "")
+
+    def test_a_relay_too_old_to_report_a_guard_is_told_nothing_either(self):
+        """A row from a tunnel server built before this field: the
+        endpoint's own answer cannot have reached it, and "" is the only
+        reading of that. The relay is where an unknown word becomes
+        `weak`, and that is a different question from a relay that says
+        nothing at all."""
+        supervisor = self.connected()
+        row = supervisor.status()["endpoints"][0]
+        row.pop("history", None)
+        row.pop("history_detail", None)
+        state = self._state_for(supervisor)
+        self.assertEqual(state["history"], "")
+        self.assertEqual(state["history_detail"], "")
+
 
 
 class TestOpeningTheChannel(_RouteCase):
@@ -2220,6 +2305,7 @@ class TestTheFixturesDoNotInventFieldNames(_RouteCase):
         row = self.connected().status()["endpoints"][0]
         for field in ("implant_id", "state", "user", "hostname",
                       "shell_port", "shell_password", "shell_recording",
+                      "history", "history_detail",
                       "shell", "socks"):
             self.assertIn(field, row, "the fixture omits %r" % field)
             self.assertIn('"%s"' % field, upstream,
@@ -2869,6 +2955,8 @@ class TestTheSweepIsWiredToTheCheckIn(_RouteCase):
             "shell_port": self.dead_port(),
             "shell_password": self.SHELL_PASSWORD,
             "shell_recording": True,
+            "history": "off",
+            "history_detail": "",
             "shell": {"sessions": 0, "max_sessions": 4},
             "socks": {"sessions": 0, "max_sessions": 256},
         }]

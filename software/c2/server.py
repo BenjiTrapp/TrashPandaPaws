@@ -1751,6 +1751,15 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             "host": "",
             "user": "",
             "root": False,
+            # What a session on that host does about the operator's own
+            # command history, as the endpoint reported it when it
+            # connected: "off", "weak", or "" for a view that has not
+            # been told. Empty is not the weaker guard: "weak" is a
+            # measured fact about a host that answered, and "" is this
+            # view having nothing to say, which is what the page shows
+            # when there is no row to read.
+            "history": "",
+            "history_detail": "",
             "recording": False,
             "transcript_dir": None,
             "channel": "unknown" if _opshell["record_error"] else "closed",
@@ -1891,6 +1900,13 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             out["host"] = row.get("hostname") or ""
             out["user"] = row.get("user") or ""
             out["root"] = row.get("user") == "root"
+            # Beside `user` and `root`, and inside this branch for the
+            # same reason: it is the endpoint's own answer about its own
+            # host, and a row is the only thing here that carries one. A
+            # relay built before the field says nothing, and `or ""` is
+            # that -- never a guard this view made up.
+            out["history"] = row.get("history") or ""
+            out["history_detail"] = row.get("history_detail") or ""
             out["recording"] = bool(row.get("shell_recording"))
             out["channel"] = "open"
         elif _opshell_agent_reports_tunnel(target) and \
