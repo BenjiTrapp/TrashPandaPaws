@@ -6565,18 +6565,30 @@ class Beacon:
     def _gsocket_start(self) -> bool:
         """Bring the carrier up if it is not, and say whether it is now.
 
-        Called from one place: where `_beacon_loop` concludes that no
-        upstream leg delivered. That is the latch, and it is also the
-        whole restart loop -- a cycle whose carrier died is a cycle where
-        nothing delivered, so the same condition brings it back. There is
-        deliberately no timer and no watcher thread: a restart in two
-        places is a child that reappears after something stopped it, which
-        is what `carrier.py` and `supervisor.py` each say about
-        themselves.
+        **The one place that spawns the child, reached from two callers.**
+        `_beacon_loop` calls it where it concludes that no upstream leg
+        delivered: that is the latch, and it is also the whole restart
+        loop, since a cycle whose carrier died is a cycle where nothing
+        delivered and the same condition brings it back. `_egress_gsocket`
+        calls it for `egress gsocket`, which is an operator asking for
+        that same start now instead of at the end of the next failed
+        cycle. Both arrive here, so there is still exactly one place in
+        this process that execs a `gs-netcat`, one restart delay and one
+        attempt ceiling.
 
-        Never raises. It runs on the beacon thread between a failed cycle
-        and the rescue, and an exception here would cost the rescue that
-        is about to carry the reason.
+        The invariant is about the restart loop and not about the number
+        of callers, which is why a second caller costs nothing where a
+        timer or a watcher thread would cost something: either of those
+        would be a *second* restart loop, and a restart loop in two places
+        is a child that reappears after something stopped it -- which is
+        what `carrier.py` and `supervisor.py` each say about themselves.
+        So there is deliberately no timer and no watcher thread, and
+        anything that wants the carrier up asks here rather than spawning
+        one of its own.
+
+        Never raises. Both callers run on the beacon thread, and the
+        latch's call sits between a failed cycle and the rescue, where an
+        exception would cost the rescue that is about to carry the reason.
         """
         if not self.gsocket_enabled:
             return False
