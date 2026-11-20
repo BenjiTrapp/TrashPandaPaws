@@ -223,6 +223,11 @@ def main(argv=None):
     parser.add_argument("--pair-timeout", type=float, default=90.0,
                         help="seconds to wait for the relay to pair the two "
                              "ends (--real only; default 90)")
+    parser.add_argument("--serve", action="store_true",
+                        help="after the checks, keep the team server up and "
+                             "print its operator URL, so the panel can be "
+                             "used or photographed with a live carrier and a "
+                             "registered agent behind it")
     args = parser.parse_args(argv)
     real = pathlib.Path(args.real).resolve() if args.real else None
 
@@ -492,6 +497,21 @@ def main(argv=None):
         except ValueError as exc:
             check("beacon-gen refuses an enabled gsocket leg", True,
                   str(exc)[:66])
+
+        if args.serve:
+            print("\n%sServing. The panel has a live carrier and a registered "
+                  "agent behind it.%s" % (_BOLD, _OFF))
+            print("  operator interface : http://127.0.0.1:%d/" % op_port)
+            print("  operator token     : operator-token")
+            print("  agent socket       : 127.0.0.1:%d  (cover replies only)"
+                  % agent_port)
+            print("  the carrier's row  : the 📡 button in the header")
+            print("\n  Ctrl-C to stop. Everything is torn down on the way out.")
+            try:
+                while True:
+                    time.sleep(3600)
+            except KeyboardInterrupt:
+                print("\n  stopping")
 
     finally:
         for one in beacons:
