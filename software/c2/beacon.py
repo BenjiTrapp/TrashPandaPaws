@@ -3183,6 +3183,13 @@ _SHELL_SH = "/bin/sh"
 _SHELL_ZSH = "/bin/zsh"
 _DEV_FD = "/dev/fd"
 
+# The names, not the paths, of the login shells a session will run: a
+# passwd entry says `/usr/local/bin/bash` as readily as `/bin/bash`
+# (Homebrew, Arch, NixOS, a usrmerge `chsh`), and it is the program that
+# is wanted, wherever the host keeps it. Derived from the default paths
+# so that the two cannot name different shells.
+_LOGIN_PROGRAMS = (os.path.basename(_SHELL_BASH), os.path.basename(_SHELL_ZSH))
+
 # Where `setsid(1)` is, and why the shell is started through it.
 #
 # A terminal is only half a terminal until it is some session's
@@ -3292,28 +3299,38 @@ def _login_shell() -> str:
     The passwd entry and not `$SHELL`: under the shipped
     `services/raccoon-beacon.service` the environment is the service
     manager's, so `$SHELL` there is nobody's choice, and a test pins that
-    this function never reads it. The unit runs as
-    root, which makes "the login shell" root's -- on most Linux hosts
-    `/bin/bash`, so the behaviour is unchanged there. What this helps is
-    the operator's own machine, which is the device the feature is for:
-    their prompt, colours and completion live in the rc files of the
-    shell they chose, and a different shell never reads them.
+    this function never reads it. The unit runs as root, which makes "the
+    login shell" root's -- on most Linux hosts `/bin/bash`, so the
+    behaviour is unchanged there. What this helps is the operator's own
+    machine, which is the device the feature is for: their prompt,
+    colours and completion live in the rc files of the shell they chose,
+    and a different shell never reads them.
 
-    Only bash and zsh are answered, by basename, because those are the
-    two whose flags are known to work here; fish and tcsh take neither
-    `--rcfile` nor bash's `-i` semantics, and an untested flag costs a
-    session that dies on the spot. The effective uid, as in
-    `_process_user`, because that is the one a session would run with.
-    `""` on any failure, a shell that is not there, or one not driven:
-    the caller has a preference of its own, and a lookup that fails must
-    cost the choice and never the whole connection.
+    Only bash and zsh are answered, by basename. bash is the shell the
+    rcfile construction is written and tested for. zsh is run as plain
+    `zsh -i`, which is what it was seen to do in one unpinned run of this
+    file on macOS; no test drives a zsh session. fish and tcsh take
+    neither `--rcfile` nor bash's `-i` semantics, and an untested flag
+    costs a session that dies on the spot.
+
+    The entry must be an absolute path to a regular file that can be
+    executed. `os.access` says yes for a directory, and for a relative
+    name it resolves against this process's working directory while
+    `Popen` searches `PATH`, so either would be a probe about something
+    other than what runs, and a session that exits instantly. The
+    effective uid, as in `_process_user`, because that is the one a
+    session would run with. `""` on any failure, a shell that is not
+    there, or one not driven: the caller has a preference of its own, and
+    a lookup that fails must cost the choice and never the whole
+    connection.
     """
     try:
         if platform.system() == "Windows":
             return ""
         import pwd
         shell = pwd.getpwuid(os.geteuid()).pw_shell
-        if (shell and os.path.basename(shell) in ("bash", "zsh")
+        if (os.path.isabs(shell) and os.path.isfile(shell)
+                and os.path.basename(shell) in _LOGIN_PROGRAMS
                 and _shell_executable(shell)):
             return shell
         return ""
@@ -3406,7 +3423,7 @@ def _shell_invocation(cols: int, rows: int) -> Tuple[list, dict, tuple]:
     env["LINES"] = str(rows)
     rc_fd = -1
     weaker = ""
-    if program != _SHELL_BASH:
+    if os.path.basename(program) != os.path.basename(_SHELL_BASH):
         weaker = "%s is not bash, and only bash takes --rcfile" % program
     elif not os.path.isdir(_DEV_FD):
         weaker = "this host has no %s to hand a pipe to bash on" % _DEV_FD

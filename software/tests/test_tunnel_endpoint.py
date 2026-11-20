@@ -1518,9 +1518,23 @@ class TestTheLoginShell(unittest.TestCase):
 
     @contextlib.contextmanager
     def _executable(self, paths):
-        """Only the paths given are executable, whatever this host has."""
+        """Only the paths given are executable files, whatever this host has.
+
+        The probe and `os.path.isfile` both, because the chooser asks
+        both and a path like `/usr/local/bin/bash` is not on every host.
+        """
         with mock.patch.object(beacon_mod, "_shell_executable",
-                               lambda path: path in paths):
+                               lambda path: path in paths), \
+                mock.patch.object(os.path, "isfile",
+                                  lambda path: path in paths):
+            yield
+
+    @contextlib.contextmanager
+    def _passwd_of(self, lookup):
+        """`pwd.getpwuid` is `lookup`, and the two uids are told apart."""
+        with mock.patch.object(pwd, "getpwuid", side_effect=lookup), \
+                mock.patch.object(os, "geteuid", return_value=4242), \
+                mock.patch.object(os, "getuid", return_value=1):
             yield
 
     def _code_of(self, function):
@@ -1556,6 +1570,92 @@ class TestTheLoginShell(unittest.TestCase):
         with self._passwd("/usr/bin/fish"), \
                 self._executable({"/usr/bin/fish", "/bin/bash"}):
             self.assertEqual(beacon_mod._shell_program(), "/bin/bash")
+
+    def test_a_bash_or_zsh_wherever_the_host_keeps_it_is_the_login_shell(self):
+        for shell in ("/usr/local/bin/bash", "/usr/bin/bash", "/bin/bash",
+                      "/usr/bin/zsh", "/opt/homebrew/bin/zsh"):
+            with self._passwd(shell), self._executable({shell, "/bin/sh"}):
+                self.assertEqual(beacon_mod._shell_program(), shell, shell)
+
+    def test_only_bash_and_zsh_are_ever_the_login_shell(self):
+        for shell in ("/sbin/nologin", "/usr/bin/false", "/bin/sh",
+                      "/bin/ksh", "/bin/dash", "/bin/tcsh", "/usr/bin/fish"):
+            with self._passwd(shell), \
+                    self._executable({shell, "/bin/bash", "/bin/sh"}):
+                self.assertEqual(beacon_mod._shell_program(), "/bin/bash",
+                                 shell)
+                self.assertEqual(beacon_mod._login_shell(), "", shell)
+
+    def test_the_environments_shell_is_not_a_fallback_either(self):
+        """An empty passwd answer does not hand the choice to `$SHELL`."""
+        with self._passwd(""), \
+                self._executable({"/bin/zsh", "/bin/bash"}), \
+                mock.patch.dict(os.environ, {"SHELL": "/bin/zsh"}):
+            self.assertEqual(beacon_mod._shell_program(), "/bin/bash")
+
+    def test_a_directory_is_not_a_shell(self):
+        """`os.access(X_OK)` is true of a directory, so the probe alone
+        would accept it and the session would die at exec."""
+        for name in ("bash", "zsh"):
+            directory = os.path.join(tempfile.mkdtemp(), name)
+            os.mkdir(directory)
+            self.addCleanup(shutil.rmtree, os.path.dirname(directory),
+                            True)
+            self.assertTrue(os.access(directory, os.X_OK))
+            with self._passwd(directory):
+                self.assertEqual(beacon_mod._login_shell(), "", directory)
+
+    def test_a_relative_name_is_not_a_shell(self):
+        """`os.access` resolves it against the working directory and
+        `Popen` against `PATH`: the probe could be about another file."""
+        for shell in ("bash", "zsh", "./bash", "bin/zsh"):
+            with self._passwd(shell), self._executable({shell, "/bin/sh"}):
+                self.assertEqual(beacon_mod._login_shell(), "", shell)
+
+    def test_a_malformed_passwd_entry_falls_back_rather_than_throwing(self):
+        def unreadable(uid):
+            raise OSError("passwd unreadable")
+
+        def without_a_shell(uid):
+            return mock.Mock(spec=[])
+
+        for lookup in (unreadable, without_a_shell):
+            with self._passwd_of(lookup), self._executable({"/bin/bash"}):
+                self.assertEqual(beacon_mod._shell_program(), "/bin/bash",
+                                 lookup.__name__)
+
+    def test_it_is_the_effective_uid_whose_entry_is_asked(self):
+        entry = mock.Mock(pw_shell="/bin/zsh")
+
+        def lookup(uid):
+            if uid != 4242:
+                raise KeyError(uid)
+            return entry
+
+        with self._passwd_of(lookup), \
+                self._executable({"/bin/zsh", "/bin/bash"}):
+            self.assertEqual(beacon_mod._shell_program(), "/bin/zsh")
+
+    @unittest.skipUnless(os.path.isdir("/dev/fd"), "no /dev/fd to hand bash")
+    def test_a_bash_that_is_not_in_bin_still_gets_the_generated_rcfile(self):
+        """Comparing the path with `/bin/bash` said "not bash" of
+        `/usr/local/bin/bash`, and the session lost the rcfile: no
+        completion, and history on."""
+        shell = "/usr/local/bin/bash"
+        with self._passwd(shell), self._executable({shell}):
+            argv, env, held = beacon_mod._shell_invocation(80, 24)
+        for fd in held:
+            os.close(fd)
+        self.assertEqual(argv[:2], [shell, "--rcfile"])
+        self.assertEqual(argv[3:], ["-i"])
+        self.assertEqual(len(held), 1)
+        self.assertNotEqual(env.get("HISTFILE"), os.devnull)
+
+    def test_a_shell_that_is_not_bash_takes_the_weaker_path(self):
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}):
+            argv, env, held = beacon_mod._shell_invocation(80, 24)
+        self.assertEqual(argv, ["/bin/zsh", "-i"])
+        self.assertEqual((env["HISTFILE"], held), (os.devnull, ()))
 
     def test_the_environments_shell_variable_is_never_consulted(self):
         with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
@@ -1715,6 +1815,10 @@ class TestAShellSession(TunnelEndpointTestCase):
 
     @unittest.skipUnless(_HAS_PTY, _NO_PTY)
     def test_the_prompt_starts_in_the_root_directory(self):
+        # What is pinned is that `_SHELL_CWD` is handed to `Popen`, and it
+        # holds for bash. A login shell's own startup file may `cd`
+        # elsewhere, which is the user's configuration winning and not a
+        # fault here -- see the pin in `setUp`.
         stream = self.ask_for_a_shell()
 
         data = self.run_in_the_shell(stream, b"pwd\n", b"/\r\n")
@@ -2088,6 +2192,8 @@ class TestAShellSession(TunnelEndpointTestCase):
         self.assertEqual(argv[:2], [wrapper, "-c"],
                          "the shell was not spawned through the wrapper "
                          "asking for a controlling terminal: %r" % (argv,))
+        # Bash or `/bin/sh` only because `setUp` pins the login shell off;
+        # with the host's own choice this would be whatever that is.
         self.assertIn(argv[2], ("/bin/bash", "/bin/sh"))
         self.assertIn("-i", argv[3:])
 
