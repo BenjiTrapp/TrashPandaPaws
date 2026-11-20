@@ -62,6 +62,7 @@ its working directory, its `$$`, and whether that pid is still in the
 process table afterwards.
 """
 
+import ast
 import base64
 import contextlib
 import errno
@@ -74,6 +75,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import traceback
@@ -1521,6 +1523,20 @@ class TestTheLoginShell(unittest.TestCase):
                                lambda path: path in paths):
             yield
 
+    def _code_of(self, function):
+        """`function`'s code as the parser sees it: no docstring, no comments.
+
+        The guard is about what the function does. Its prose is free to
+        name `$SHELL` -- saying why it is not read is the docstring's job.
+        """
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        body = tree.body[0].body
+        if (isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            del body[0]
+        return ast.dump(tree)
+
     def test_the_login_shell_of_the_effective_user_is_what_runs(self):
         """`$SHELL` under the shipped service unit is the service
         manager's environment, not a user's choice, so the passwd entry
@@ -1545,7 +1561,7 @@ class TestTheLoginShell(unittest.TestCase):
         with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
                 mock.patch.dict(os.environ, {"SHELL": "/bin/ksh"}):
             self.assertEqual(beacon_mod._shell_program(), "/bin/zsh")
-        self.assertNotIn("SHELL", inspect.getsource(beacon_mod._login_shell))
+        self.assertNotIn("SHELL", self._code_of(beacon_mod._login_shell))
 
     def test_a_passwd_lookup_that_raises_falls_back_rather_than_throwing(self):
         with mock.patch.object(pwd, "getpwuid",

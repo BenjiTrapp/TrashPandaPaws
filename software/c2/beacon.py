@@ -3289,10 +3289,10 @@ def _shell_executable(path: str) -> bool:
 def _login_shell() -> str:
     """The effective user's login shell if it is one this can drive, else "".
 
-    The passwd entry and not the environment's shell variable: under the
-    shipped `services/raccoon-beacon.service` the environment is the
-    service manager's, so that variable is nobody's choice there, and a
-    test pins that this function never reads it. The unit runs as
+    The passwd entry and not `$SHELL`: under the shipped
+    `services/raccoon-beacon.service` the environment is the service
+    manager's, so `$SHELL` there is nobody's choice, and a test pins that
+    this function never reads it. The unit runs as
     root, which makes "the login shell" root's -- on most Linux hosts
     `/bin/bash`, so the behaviour is unchanged there. What this helps is
     the operator's own machine, which is the device the feature is for:
