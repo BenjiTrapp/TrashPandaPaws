@@ -2307,7 +2307,11 @@ def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True,
     fail, so a key that was sometimes absent would only make every later
     reader write `.get("egress_decider") or {}` and get the default wrong
     once. It is read from `c2` and not from `c2.fallback`, because the
-    fallback block is the five legs and a policy is not a leg.
+    fallback block is the five legs and a policy is not a leg -- and a
+    policy found *inside* `c2.fallback` is left unread and said out loud,
+    because it is the one unusable policy `read_egress_policy` never sees
+    and would otherwise be the only misconfiguration here with no line to
+    its name.
 
     **A tunnel this host cannot run does not cost it its beacon, and does
     not lose its reason either.** That loader refuses a block it cannot
@@ -2337,6 +2341,34 @@ def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True,
     }
     for transport in _FALLBACK_TRANSPORTS:
         block[transport] = fallback.get(transport, {})
+    # A policy nested one level too deep is the one misconfiguration this
+    # reader cannot see: `read_egress_policy` is never handed it, so the
+    # decider is off while the file shows a complete, plausible block. It
+    # is a likely mistake, too -- the decider is *about* fallback
+    # behaviour and `c2.fallback` sits immediately beside it -- and the
+    # same error one key wide, `budgte: 3`, is refused by name a few
+    # functions above. So this one says so as well. **What is read does
+    # not change**: a block in the wrong place stays unread, because
+    # taking it from either place would make the file's own structure
+    # meaningless. It only stops being silent.
+    #
+    # `isinstance` and not a bare `in`, because `c2_cfg.get("fallback") or
+    # {}` leaves a scalar a scalar and `in` on a string is a substring
+    # test -- which would answer "yes" to `fallback: egress_decider` and
+    # log about a block nobody wrote. The loop above happens to fail
+    # first on such a value today; the guard is what keeps this line
+    # right if it ever stops doing so.
+    #
+    # The second half of the line is the state that actually results,
+    # because a warning claiming "the decider is off" on a host with a
+    # perfectly good `c2.egress_decider` beside the stray one would be a
+    # false statement on the one channel the operator has.
+    if isinstance(fallback, dict) and "egress_decider" in fallback:
+        logger.warning(
+            "c2.fallback.egress_decider is not read: the policy belongs at "
+            "c2.egress_decider, beside c2.fallback and not inside it. %s",
+            "The block at c2.egress_decider is the one that was read"
+            if "egress_decider" in c2_cfg else "The decider is off")
     # Not a transport, so not in the loop above. A policy that cannot be
     # used reads as off with its reason logged, and never raises: the
     # beacon is the access, and a refusal that stopped it would have cost

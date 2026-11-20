@@ -604,11 +604,16 @@ class TestWhereThePolicyLands(PolicyCase):
     def test_the_decider_is_read_from_c2_and_not_from_c2_fallback(self):
         # `c2.fallback` is the five legs, and the loop over them ignores
         # anything else under it. A policy written there is therefore not
-        # read, and the decider is off -- which is the safe reading, since
-        # a reader that took the block from either place would make the
-        # file's own structure meaningless. The cost is honest and stated
-        # here: a block in the wrong place is silent, so the operator
-        # guide's example has to be the one an operator copies.
+        # read, and that reading must not change: taking the block from
+        # either place would make the file's own structure meaningless.
+        #
+        # But it is said out loud. This is the one unusable policy
+        # `read_egress_policy` never sees -- the operator reads a
+        # complete, plausible block in the file and the decider is off --
+        # and a typo one key wide, `budgte: 3`, is refused by name, so a
+        # whole policy one level too deep cannot be the quiet one. It is
+        # also the likely mistake: the decider is *about* fallback
+        # behaviour and `c2.fallback` sits immediately beside it.
         logged = self.warnings()
         built = beacon_mod.beacon_config_from_fallback(
             {"fallback": {"enabled": True,
@@ -616,8 +621,40 @@ class TestWhereThePolicyLands(PolicyCase):
                                              "rules": [A_GOOD_RULE]}}},
             env={})
 
-        self.assertEqual(logged.messages, [])
+        self.assertEqual(len(logged.records), 1, logged.messages)
+        message = logged.messages[0]
+        # Where it was found and where it belongs, because the operator
+        # fixing it is reading this and not the file.
+        self.assertIn("c2.fallback.egress_decider", message)
+        self.assertIn("c2.egress_decider", message)
+        self.assertIn("The decider is off", message)
+        # And the reading is unchanged: the misplaced block is not used.
         self.assertEqual(built["c2"]["egress_decider"], DISABLED)
+
+    def test_a_stray_fallback_block_does_not_claim_the_decider_is_off(self):
+        # With a good policy at `c2.egress_decider` as well, the stray one
+        # is still named -- a leftover nobody is told about is how the
+        # file drifts from what runs -- but the line must not say the
+        # decider is off, because it is not. A false sentence on the one
+        # channel the operator has is the failure this whole reader is
+        # about.
+        logged = self.warnings()
+        built = beacon_mod.beacon_config_from_fallback(
+            {"fallback": {"enabled": True,
+                          "egress_decider": {"enabled": True,
+                                             "rules": [A_GOOD_RULE]}},
+             "egress_decider": {"enabled": True, "budget": 2,
+                                "rules": [A_GOOD_RULE]}},
+            env={})
+
+        self.assertEqual(len(logged.records), 1, logged.messages)
+        message = logged.messages[0]
+        self.assertIn("c2.fallback.egress_decider", message)
+        self.assertNotIn("The decider is off", message)
+        # The policy in force is the one at the top level, read in full.
+        self.assertEqual(built["c2"]["egress_decider"],
+                         {"enabled": True, "budget": 2,
+                          "rules": [A_GOOD_RULE]})
 
 
 class TestTheBeaconsCopyOfTheVocabulary(PolicyCase):
