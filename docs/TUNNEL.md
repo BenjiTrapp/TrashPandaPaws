@@ -482,23 +482,29 @@ panel still shows the password, deliberately, because `raccoon_shell.py`
 needs an operator to read it.
 
 **It is a window and not a modal: `_` parks it, `✕` ends it.** The card
-takes the content column, with the agent list still beside it and still
-clickable, and its header carries those two controls. `✕` ends the session
-and queues the channel's shutdown, so the strip reads **closing** until the
-agent confirms. `_` hides the card and leaves a small entry under the
-agent list in its place: the session keeps running, output keeps arriving,
-and a click on that entry brings the card back with everything that arrived
-while it was away. `exit`, Ctrl-D, a stream the team server cannot hold and
-a refused one all still end a session — but of the two buttons on the card,
-only `✕` ends anything.
+takes the content column, with the agent list still visible beside it — an
+agent going offline is visible while you work, which matters because a
+channel that drops is your own way in — and its header carries those two
+controls. Visible is not the same as usable, though: the console an agent
+click draws is behind the card, so the row highlights and nothing else
+appears, and after the `✕` that console comes back scrolled to the top and
+unfocused. Park the card with `_` to read a device beside a shell rather
+than clicking through it. `✕` ends the session and queues the channel's
+shutdown, so the strip reads **closing** until the agent confirms. `_`
+hides the card and leaves a small entry under the agent list in its place:
+the session keeps running, output keeps arriving, and a click on that entry
+brings the card back with everything that arrived while it was away.
+`exit`, Ctrl-D, a stream the team server cannot hold and a refused one all
+still end a session — but of the two buttons on the card, only `✕` ends
+anything.
 
 **A parked session is not a free one.** Nothing is paused. The stream is
 still open, so for as long as the card is parked the session holds a worker
 thread on the team server, the connection to the shell port, a
 **pseudo-terminal** on the device and one of that port's **four** session
 slots — the endpoint refuses a fifth. An hour of work parked is an hour of
-all four, by design rather than by accident. Park it to work beside it, and
-end it when you are finished with it.
+all four, by design rather than by accident. So park it while you are
+coming back to it, and end it when you are not.
 
 **A reload gives you a new shell, and the page says so.** The card survives
 a page load: the session id is kept in that tab, and on the next load the
@@ -509,10 +515,10 @@ with it, the pseudo-terminal on the device died; measured across one
 reload, the shell's process id went from 75 to 78, the working directory
 was back at `/` from the `/etc` it had been left in, and a variable that
 had been set was gone. Your directory, your variables and your running
-processes do not come back. The channel, the claim and the port do, so what
-a reload costs is the session and not the tunnel — and the terminal says
-this in its opening lines rather than leaving you to type into a prompt
-that looks like the one you left.
+processes are gone with it; the channel, the claim and the port are not, so
+what a reload costs is the session and not the tunnel — and the terminal
+says this in its opening lines rather than leaving you to type into a
+prompt that looks like the one you left.
 
 **A closed tab no longer ends the session at once: it costs up to 240
 seconds plus one check-in.** Nothing is posted when the page goes away, and

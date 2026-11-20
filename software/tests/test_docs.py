@@ -926,6 +926,8 @@ class TestTheListenersGuide(_DocCase):
 
 
 TUNNEL_DOC = REPO / "docs" / "TUNNEL.md"
+DESIGN_DOC = (REPO / "docs" / "superpowers" / "specs"
+              / "2026-11-19-operator-shell-window-design.md")
 
 
 class TestTheTunnelPageDocumentsTheShellSession(unittest.TestCase):
@@ -1145,7 +1147,7 @@ class TestTheOperatorShellIsDocumentedAsAWindow(unittest.TestCase):
         "variable" each appear elsewhere on this page, so a
         document-wide search for them proves nothing about this sentence.
         """
-        text = (REPO / "docs" / "TUNNEL.md").read_text()
+        text = TUNNEL_DOC.read_text()
         said = [" ".join(p.split()) for p in text.split("\n\n")
                 if re.search(r"(?i)a new shell", " ".join(p.split()))]
         self.assertTrue(said, "the page does not say anywhere that what a "
@@ -1165,14 +1167,23 @@ class TestTheOperatorShellIsDocumentedAsAWindow(unittest.TestCase):
         shell port, a pty on the device and one of that port's four
         session slots (`beacon.py:_SHELL_MAX_SESSIONS`,
         `tunnel/shell.py:DEFAULT_MAX_SESSIONS`, both 4), for as long as it
-        is parked. Scoped to the paragraphs that mention parking, for the
-        reason above: every one of these words appears elsewhere.
+        is parked.
+
+        Scoped to the paragraph that makes the claim, and not to every
+        paragraph containing "parked": the first version took the latter,
+        which swept in the reload paragraph ("open or parked") and got
+        `connection` and `pseudo-terminal` from there for free. Measured by
+        the review: with that scope, cutting the cost list down to the
+        thread and the four slots left this green, so two of the four costs
+        were held by nothing.
         """
-        text = (REPO / "docs" / "TUNNEL.md").read_text()
+        text = TUNNEL_DOC.read_text()
         held = [" ".join(p.split()) for p in text.split("\n\n")
-                if "parked" in p.lower()]
-        self.assertTrue(held, "the page never mentions a parked session")
-        flat = " ".join(held).lower()
+                if re.search(r"(?i)parked session is not a free one",
+                             " ".join(p.split()))]
+        self.assertEqual(len(held), 1, "the page has no one paragraph that "
+                         "prices a parked session")
+        flat = held[0].lower()
         for cost, what in (("thread", "the worker thread the stream holds"),
                            ("connection", "the connection to the shell port"),
                            ("pseudo-terminal", "the pty on the device"),
@@ -1202,6 +1213,108 @@ class TestTheOperatorShellIsDocumentedAsAWindow(unittest.TestCase):
                                           "shell")):
             self.assertIn(claim, flat,
                           "the capability row does not say %s" % what)
+
+    def _window_prose(self):
+        """The three passages that describe the window, and nothing else.
+
+        Scoped, because the patterns in the test below are unambiguous
+        only here: "come back" is a true statement about the generator's
+        response further up `docs/TUNNEL.md`, and "it is restored" is a
+        true statement about the card in the tour's own paragraph. A
+        page-wide `assertNotRegex` for either would be a test about the
+        rest of the page.
+        """
+        section = TUNNEL_DOC.read_text().split(
+            "\n## Opening one from the interface", 1)
+        self.assertEqual(len(section), 2, "docs/TUNNEL.md no longer has the "
+                         "section that describes the window")
+        found = [("docs/TUNNEL.md", section[1].split("\n## ", 1)[0])]
+        for doc, lead in ((DEMO_DOC, "The **Operator Shell** panel"),
+                          (README, "| Operator Shell |")):
+            lines = [line for line in doc.read_text().splitlines()
+                     if line.startswith(lead)]
+            self.assertEqual(len(lines), 1, "%s has no single passage "
+                             "starting %r" % (doc.name, lead))
+            found.append((doc.name, lines[0]))
+        return [(name, " ".join(text.split())) for name, text in found]
+
+    def test_no_page_reverses_the_claims_these_tests_pin(self):
+        """Softening is caught above; a reversal was not.
+
+        Measured by the review against four of the nine assertions in this
+        class: "`_` cannot minimise it: the card is hidden and the shell is
+        torn down", "your directory, your variables and your running
+        processes all come back", "are restored for you", and "the shell is
+        killed ... attaches the same shell, never a new shell" each left
+        the file green. Every assertion above asks whether a subject is
+        mentioned, and none of them asks what is said about it -- so a page
+        that stated the opposite of the measurement would pass. These ask
+        the other question, on all three passages.
+
+        The pairs are subject-then-verb inside one sentence rather than two
+        separate searches, because "the card survives a page load" and
+        "until it is restored" are both true and both sit next to these.
+        """
+        for name, flat in self._window_prose():
+            for lie, what in (
+                    (r"(?i)(director|variable|process)\w*[^.;]{0,70}"
+                     r"(come back|restored|survive)",
+                     "that the shell's own directory, variables or "
+                     "processes survive a reload -- the pid went 75 to 78"),
+                    (r"(?i)the same shell",
+                     "that a reattach gets the same shell"),
+                    (r"(?i)never a new shell",
+                     "that a reattach is never a new shell"),
+                    (r"(?i)cannot minimis",
+                     "that the card cannot be parked"),
+                    (r"(?i)minimis\w*[^.;]{0,70}"
+                     r"(torn down|tears? down|killed|ends the session)",
+                     "that `_` ends the session, which is what `\u2715` is "
+                     "for")):
+                self.assertNotRegex(flat, lie, "%s claims %s" % (name, what))
+            # And the positive half of the same claim, so the passage has to
+            # say what `_` does and not merely avoid saying the opposite.
+            self.assertRegex(flat, r"(?i)keeps running|still running",
+                             "%s does not say the shell keeps running while "
+                             "the card is parked" % name)
+
+    def test_the_design_records_the_six_things_this_cannot_do(self):
+        """The six known limitations, which nothing else holds.
+
+        A design is not usually tested here. These six are the only
+        written record of what the feature deliberately cannot do -- each
+        one ruled during execution, against a change the plan forbade --
+        and the three operator claims above are now pinned while these
+        were held by nothing, so they could rot or be dropped silently.
+        Subjects, not sentences: the reasoning is free to be rewritten,
+        the six subjects are not.
+        """
+        section = DESIGN_DOC.read_text().split(
+            "\n## Known limitations, as built\n", 1)
+        self.assertEqual(len(section), 2, "the design no longer records what "
+                         "this feature cannot do")
+        body = section[1].split("\n## ", 1)[0].split("\n---", 1)[0]
+        entries = re.findall(r"^\d+\. \*\*", body, re.M)
+        self.assertEqual(len(entries), 6, "the section has %d entries; six "
+                         "limitations were ruled" % len(entries))
+        flat = " ".join(body.split()).lower()
+        for subject, what in (
+                ("count, not an identity",
+                 "that the resume checks how many sessions the claim has, "
+                 "not whether this id is one of them"),
+                ("duplicated tab", "that Duplicate Tab clones the id and "
+                                   "both tabs resume it"),
+                ("content column is hidden",
+                 "that an agent clicked while the card is open renders "
+                 "into a hidden node"),
+                ("fixed for the life of the connection",
+                 "that nothing resizes a terminal after it is attached"),
+                ("while parked is written to the terminal",
+                 "that a refusal reaches the terminal and not the parked "
+                 "entry"),
+                ("not a free one", "what a parked session holds")):
+            self.assertIn(subject, flat,
+                          "the section does not record %s" % what)
 
 
 class TestTheGuiTourKeepsUpWithTheHeader(unittest.TestCase):

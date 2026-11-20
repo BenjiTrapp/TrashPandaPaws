@@ -3325,6 +3325,29 @@ class TestTheGlyphAndTheView(_GuiCase):
         self.assertIn('method:"POST"', flush)
         self.assertNotRegex(SERVER_SRC, r"/api/opshell/keys\?")
 
+    def test_the_font_fallback_is_the_stack_the_stylesheet_declares(self):
+        """`opshellFont`'s literal and `:root{--mono}` are one stack.
+
+        The fallback is for a stylesheet that did not load, so it has to
+        be the same list of families the stylesheet would have given --
+        otherwise a terminal that fell back would be measured and drawn in
+        a font the rest of the page never uses. Nothing tied the two: the
+        node test's third case (`cssVars = {}`) asserted only that the
+        answer names *some* real family, so changing `--mono` in the
+        stylesheet and leaving the literal alone kept all 310 tests green.
+
+        Read from the source rather than run, so it holds where node is
+        not installed, and the string concatenation the line wrap needs is
+        folded away first.
+        """
+        mono = re.search(r"^\s*--mono:(.*?);\s*$", STYLE_BLOCK, re.M)
+        self.assertIsNotNone(mono, "the page no longer defines --mono")
+        source = re.sub(r'"\s*\+\s*"', "", self.js_function("opshellFont"))
+        self.assertIn(mono.group(1).strip(), source,
+                      "opshellFont's fallback stack is not the one "
+                      "`:root{--mono}` declares, so a terminal that fell "
+                      "back would use a font the page does not")
+
 
 class TestTheViewDoesNotOverclaim(_GuiCase):
     def test_the_word_closed_is_never_rendered_from_the_closing_state(self):

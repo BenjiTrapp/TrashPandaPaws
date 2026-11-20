@@ -65,8 +65,8 @@ deliberately — the way a window behaves.
 ## Goals
 
 - A reload or a navigation no longer ends the session.
-- The shell is a **sticky card** over the main area, with the agent list
-  still visible beside it.
+- The shell is a **card in the content column**, with the agent list still
+  visible beside it.
 - `_` minimises it and the shell **keeps running**; `✕` ends the session.
 - Minimised, it parks as a card under the agent list with the `>_` glyph
   and a red border; a click brings it back.
@@ -393,9 +393,11 @@ change the plan or the task forbade, and the view fails safe in all six.
    tab's `sessionStorage` is one of them — so an id written by a different
    team server on the same origin, a port change on localhost, can be
    adopted until the stream request refuses it. Bounded: an unknown id
-   gets 400, the view says so and forgets it, and the close answers "not
-   the last session", so nothing is stopped. Closing it properly needs a
-   per-session field on the state body, which the plan forbade.
+   gets 400, the view says so and forgets it, and the close is refused with
+   its own reason — `another view is holding this channel, so it stays up;
+   this session is closed` (`opshell.py:558`) — so nothing is stopped.
+   Closing it properly needs a per-session field on the state body, which
+   the plan forbade.
 2. **A duplicated tab duplicates the claim.** `sessionStorage` is cloned
    into a tab opened with Duplicate Tab, so both tabs resume the same id;
    the second stream takes the bridge and the first tab's close then stops
