@@ -200,7 +200,9 @@ def test_it_does_not_act_while_rescue_tasking_arrived_in_this_window(self):
     # _maybe_rescue returned something: the server is reachable and deciding
 def test_it_acts_when_the_rescue_could_not_even_be_sent(self):
     # dns disabled or never answered: nothing can leave, which is the case
-    # this exists for, and beacon.py's own comment says so
+    # this exists for, and beacon.py's own comment says so. Still the
+    # *second* stuck cycle: a cycle must have passed without an answer,
+    # and a cycle on which the rescue could not be sent is such a cycle.
 def test_one_attempt_per_cycle_and_never_a_sweep(self):
 def test_the_budget_is_spent_and_then_it_is_silent(self):
 def test_an_upstream_leg_delivering_closes_the_window(self):
