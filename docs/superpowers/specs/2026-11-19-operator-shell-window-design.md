@@ -420,19 +420,24 @@ change the plan or the task forbade, and the view fails safe in all six.
    terminal, and a session that attached while the card was hidden keeps
    the fallback 120×40. The view says that once, in the terminal, rather
    than leaving the operator to wonder.
-5. **A refusal that arrives while parked is written to the terminal**, not
-   to the parked entry, so the parked entry says the session ended and the
-   server's reason is in the terminal's buffer behind the hidden card. The
-   final review found the version of this claim that said the reason was
-   "visible only after a restore" to be false as built: the poll's next
-   tick replaced the card's body within two seconds and took the
-   terminal's DOM node with it, so a restore showed the closed render and
-   the reason was gone. The poll now disposes the terminal before it
-   replaces the body, which is what makes `opshellEndSession`'s own panel
-   fallback reachable — the reason is written into the card as well, so
-   what a restore shows is the reason and not a terminal that no longer
-   exists. What remains is the ordering: it is in the card, not in the
-   sidebar entry, so it is read after a restore and not before one.
+5. **A refusal that arrives while parked is read after a restore**, not in
+   the sidebar entry: the entry says `session ended · 92s`, and the
+   sentence itself is in the card. This paragraph has overstated the case
+   twice, both found by the final review. It first said the reason was
+   "visible only after a restore; recoverable, not lost", when the poll's
+   next tick replaced the card's body and took the terminal's node with
+   it, so a restore showed the closed render; and the correction to that
+   still said the reason was written into the card, when on a parked card
+   `opshellEndSession` runs with `opshellTerm` still set — the tick that
+   disposes it has not come yet — so `opshellSay` put the sentence in the
+   terminal, the panel fallback was skipped as `!opshellTerm` was false,
+   and two seconds later the reason was nowhere at all. It now rides on
+   `opshellLast` beside the duration, which is page state and survives a
+   tick, and `opshellRender` states it where it states the duration: once,
+   only when the end had a reason, and not when the strip has already said
+   the same sentence. What remains is the ordering — the parked entry is
+   one line in a 260 px column and does not carry it, so it is read on the
+   restore.
 6. **A parked session is not a free one**: a worker thread, a bridge, a pty
    on the device and one of the shell port's four session slots, held for
    as long as it is parked. It belongs where an operator reads it, so it is

@@ -1309,9 +1309,12 @@ class TestTheOperatorShellIsDocumentedAsAWindow(unittest.TestCase):
                  "into a hidden node"),
                 ("fixed for the life of the connection",
                  "that nothing resizes a terminal after it is attached"),
-                ("while parked is written to the terminal",
-                 "that a refusal reaches the terminal and not the parked "
-                 "entry"),
+                ("while parked is read after a restore",
+                 "that a refusal is read on the restore and not in the "
+                 "parked entry -- the subject changed with the merge "
+                 "blocker: the sentence used to be written only into a "
+                 "terminal the next poll tick disposed, and now rides on "
+                 "`opshellLast` into the card"),
                 ("not a free one", "what a parked session holds")):
             self.assertIn(subject, flat,
                           "the section does not record %s" % what)

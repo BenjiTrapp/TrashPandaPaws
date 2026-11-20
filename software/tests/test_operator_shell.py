@@ -3713,7 +3713,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """Ninety-nine tests hide behind `skipUnless(node)`.
+        """A hundred and three tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3721,7 +3721,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of ninety-nine quiet skips.
+        One loud failure instead of a hundred and three quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3761,9 +3761,13 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # session, an answer that is not a state, a duration that cannot
         # outlive its device, a claim the resume may not overwrite, and the
         # sentence saying why a card did not come back) and a parked panel
-        # with no session brought the seventh --
+        # with no session brought the seventh -- and 101 against 103 once the
+        # merge blocker brought four: why a parked session ended surviving
+        # the tick that ends it, an ordinary exit explaining nothing and
+        # not being inherited, that sentence stated once, and a card that
+        # came back not being told its shell is gone --
         self.assertGreaterEqual(
-            len(names), 97,
+            len(names), 101,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -6436,21 +6440,29 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "await opshellPoll();\n"
             "const afterPoll = [built[0].disposed === true,"
             " opshellTerm === null];\n"
+            "const wroteBefore = built[0].lines.length;\n"
             "opshellSession = 'sid-2';\n"
             "nextReply = {ok:true, status:200, stream: fakeStream(['ho'])};\n"
             "await opshellAttach({state:'live', host:'parrot',"
             " geometry:[80,24]});\n"
             "console.log(JSON.stringify({afterFirst, afterPoll,"
-            " built: built.length, same: built[1] === built[0],"
+            " built: built.length,"
+            " quiet: built[0].lines.length === wroteBefore,"
+            " wrote: built[1].lines.length > 0,"
             " current: opshellTerm === built[1]}));")
         # The session ended with the stream and the terminal was still
         # there: that is the state the poll has to clean up.
         self.assertEqual(got["afterFirst"], [1, False, True])
         self.assertEqual(got["afterPoll"], [True, True])
-        # A second attach builds its own, and the first is not reused.
+        # A second attach builds its own, and writes into that one: the
+        # count alone could not fail, because the harness's fake terminal
+        # is a fresh object per call, so what is asserted is where the
+        # output went.
         self.assertEqual(got["built"], 2)
-        self.assertFalse(got["same"], "the second session inherited the "
-                                      "first session's terminal")
+        self.assertTrue(got["quiet"], "the second session wrote into the "
+                                      "first session's disposed terminal")
+        self.assertTrue(got["wrote"], "the second session's terminal got "
+                                      "nothing")
         self.assertTrue(got["current"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
@@ -6625,6 +6637,160 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # And a remnant is neither.
         self.assertNotRegex(got["ended"], r"(?i)restore the")
         self.assertNotIn("opshell-cursor", got["ended"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_why_a_parked_session_ended_survives_the_tick_that_ends_it(self):
+        """The merge blocker, and the ruling that fixed it.
+
+        On a parked card `opshellEndSession` runs with `opshellTerm` still
+        set -- the poll disposes on its *next* tick -- so `opshellSay` put
+        the server's reason into the terminal and the panel fallback
+        (`!opshellTerm`) was skipped. Two seconds later that tick disposed
+        the terminal and replaced the body, and the reason was nowhere:
+        measured, `body: ""`, then `disposed: true` with the live render in
+        its place, while the dock said only `session ended`.
+
+        So the reason rides on `opshellLast`, beside the duration, which
+        is the one thing that crosses a tick.
+        """
+        got = self._node(
+            "opshellSession = 'sid'; opshellStarted = Date.now() - 92000;\n"
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['sidebar'] = el('sidebar');\n"
+            "els['main'].appendChild(els['content']);\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot'}},"
+            " {ok:true, status:200, body:{reason:'another view is holding "
+            "this channel, so it stays up'}},"
+            " {ok:true, status:200, body:{state:'idle', channel:'closed',"
+            " host:'parrot'}}];\n"
+            "await showOperatorShell();\n"
+            "opshellMinimise();\n"
+            "const term = fakeTerm(); opshellTerm = term;\n"
+            "await opshellEndSession();\n"
+            "const atEnd = [term.lines.join(' ').includes('another view'),"
+            " els['opshell-body'].innerHTML.includes('another view'),"
+            " term.disposed === true];\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({atEnd,"
+            " last: opshellLast,"
+            " disposed: term.disposed === true,"
+            " body: els['opshell-body'].innerHTML,"
+            " dock: els['sidebar'].children[0].innerHTML}));")
+        # At the end itself: the terminal has it, the panel does not, and
+        # the terminal is still alive -- the state the next tick destroys.
+        self.assertEqual(got["atEnd"], [True, False, False])
+        # It is in the page's own state, with the duration.
+        self.assertEqual(got["last"]["duration"], 92)
+        self.assertRegex(got["last"]["why"], r"(?i)another view is holding")
+        # And the tick that disposes the terminal draws it into the card,
+        # so the restore has both.
+        self.assertTrue(got["disposed"])
+        self.assertRegex(got["body"], r"(?i)another view is holding")
+        self.assertIn("92", got["body"])
+        # The dock is unchanged: one line in a 260px column says the
+        # session ended, and the sentence is read on the restore.
+        self.assertRegex(got["dock"], r"(?i)session ended")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_an_ordinary_exit_explains_nothing_and_is_not_inherited(self):
+        # Two of the three conditions on that ruling, in the sequence that
+        # breaks them: a session that ended with nothing to explain must
+        # not have something said about it -- a render that always finds
+        # something to say is the inversion this branch has shipped once
+        # already -- and the next session's end must not inherit the last
+        # one's sentence.
+        got = self._node(
+            "opshellSession = 'sid-1'; opshellStarted = Date.now() - 92000;\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['opshell-agent'] = el('opshell-agent');\n"
+            "replies = [{ok:true, status:200, body:{reason:'another view is "
+            "holding this channel'}},"
+            " {ok:true, status:200, body:{session:'sid-2'}},"
+            " {ok:true, status:200, body:{}},"
+            " {ok:true, status:200, body:{state:'idle', channel:'closed'}}];\n"
+            "await opshellEndSession();\n"
+            "const first = opshellLast;\n"
+            "await opshellOpen();\n"
+            "const cleared = opshellLast;\n"
+            "opshellStarted = Date.now() - 5000;\n"
+            "await opshellEndSession();\n"
+            "const second = opshellLast;\n"
+            "await opshellPoll();\n"
+            "const body = els['opshell-body'].innerHTML;\n"
+            "console.log(JSON.stringify({first, cleared,"
+            " keys: Object.keys(second), second,"
+            " body, paras: (body.match(/loot-empty/g)||[]).length}));")
+        self.assertRegex(got["first"]["why"], r"(?i)another view")
+        # Whatever clears `opshellLast` clears the sentence with it,
+        # because the sentence lives inside it.
+        self.assertIsNone(got["cleared"])
+        self.assertEqual(got["keys"], ["duration"],
+                         "the next session's end inherited a sentence")
+        self.assertEqual(got["second"]["duration"], 5)
+        self.assertNotRegex(got["body"], r"(?i)another view")
+        self.assertIn("5s", got["body"])
+        # One dim paragraph in that render, the picker's own: an
+        # unconditional sentence would be a second, empty one.
+        self.assertEqual(got["paras"], 1,
+                         "a session with nothing to explain got a "
+                         "paragraph anyway")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_reason_a_session_ended_is_stated_once(self):
+        # The third condition: the strip already prints `state.reason`
+        # whenever the server sends one, and the server's reason for a
+        # channel that would not stop is the same sentence the close came
+        # back with. Said twice, two paragraphs apart, it reads as two
+        # facts.
+        got = self._node(
+            "const same = opshellRender({state:'closed', duration:92,"
+            " why:'another view is holding this channel',"
+            " reason:'another view is holding this channel'});\n"
+            "const differs = opshellRender({state:'closed', duration:92,"
+            " why:'another view is holding this channel',"
+            " reason:'the device has not called home for two hours'});\n"
+            "console.log(JSON.stringify({"
+            " sameCount: (same.match(/another view/g)||[]).length,"
+            " differsCount: (differs.match(/another view/g)||[]).length,"
+            " kept: differs.includes('called home')}));")
+        self.assertEqual(got["sameCount"], 1,
+                         "the same sentence was printed twice")
+        # And a different one from the server is not swallowed by it.
+        self.assertEqual(got["differsCount"], 1)
+        self.assertTrue(got["kept"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_card_that_came_back_is_not_told_its_shell_is_gone(self):
+        # `showOperatorShell` returns early when a card already exists, so
+        # a `_gone` written while the panel was open is read by nobody and
+        # stays. Then a session is started, parked, and the page reloaded:
+        # the resume succeeds, and the note was appended above a live,
+        # restored terminal. The resume clears it where it adopts: a page
+        # putting a card back owes no explanation.
+        got = self._node(
+            "sessionStorage.setItem(opshellStore, 'kept');\n"
+            "sessionStorage.setItem(opshellStore + '_gone',"
+            " 'The shell this tab had open is gone: the team server does "
+            "not report that session as live.');\n"
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['sidebar'] = el('sidebar');\n"
+            "els['main'].appendChild(els['content']);\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot', sessions:1}},"
+            " {ok:true, status:200, body:{state:'live', channel:'open',"
+            " host:'parrot'}}];\n"
+            "const resumed = await opshellResume();\n"
+            "const card = document.getElementById('opshell-card');\n"
+            "console.log(JSON.stringify({resumed,"
+            " parts: card.children.length,"
+            " html: card.children.map(c => c.innerHTML).join(' '),"
+            " gone: sessionStorage.getItem(opshellStore + '_gone')}));")
+        self.assertTrue(got["resumed"])
+        self.assertEqual(got["parts"], 2,
+                         "the note was drawn over a card that came back")
+        self.assertNotRegex(got["html"], r"(?i)is gone")
+        self.assertIsNone(got["gone"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_non_ascii_keystrokes_survive_the_encoding(self):

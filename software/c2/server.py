@@ -8637,6 +8637,11 @@ async function opshellResume(){
     return false;
   }
   opshellSession = session;
+  // Nothing to explain: this page is putting a card back. A `_gone` left
+  // from an earlier reload -- written while the panel was already open, so
+  // `showOperatorShell` returned early and nothing read it -- would
+  // otherwise be appended above a restored, live terminal.
+  sessionStorage.removeItem(opshellStore + "_gone");
   opshellFresh = true;
   // Before the card is drawn: `opshellRender` chooses the terminal over
   // the Attach button by whether this page holds a session, and the poll
@@ -8960,6 +8965,19 @@ async function opshellEndSession(){
   const why = (answer && (answer.error || answer.reason)) || "";
   if(why){
     opshellSay(why);
+    // And beside the duration, because the terminal cannot hold it. On a
+    // parked card this runs with `opshellTerm` still set -- the poll
+    // disposes on its *next* tick -- so `opshellSay` wrote the sentence
+    // into the terminal, the panel fallback below was skipped as
+    // `!opshellTerm` was false, and two seconds later that tick disposed
+    // the terminal and replaced the body: measured, the reason was
+    // nowhere and the parked entry said only `session ended`.
+    // `opshellLast` is the one thing that crosses a tick, which is why the
+    // duration already rides on it, so the reason rides with it and
+    // `opshellRender` states it where it states the duration. Under its
+    // own key, not `reason`: the state's own `reason` is the server's
+    // view of now and must not be overwritten by the merge in the poll.
+    if(opshellLast) opshellLast.why = why;
   } else if(r.ok){
     opshellSay("the channel's shutdown is queued for the next check-in");
   }
@@ -9242,6 +9260,17 @@ function opshellRender(state){
     if(state.duration !== null && state.duration !== undefined){
       left += '<p>The session lasted <b>' + esc(state.duration)
         + 's</b>.</p>';
+    }
+    // Why it ended, when the end had one to give. A refused close comes
+    // back with the server's own sentence and `opshellEndSession` parks it
+    // on `opshellLast`, which the poll folds in here: on a card that was
+    // parked, this is the only place that sentence survives, because the
+    // terminal it was written into is disposed by the same tick that draws
+    // this. Only when there is one -- an ordinary `exit` has nothing to
+    // explain -- and not when the strip above has already said it, which
+    // happens when the server's `reason` is the same sentence.
+    if(state.why && state.why !== state.reason){
+      left += '<p class="loot-empty">' + esc(state.why) + '</p>';
     }
     if(state.recording && state.transcript_dir){
       left += '<p class="loot-empty">Its transcript is in <code>'
