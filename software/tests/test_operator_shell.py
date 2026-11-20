@@ -3320,7 +3320,7 @@ function makeNode(id, box){
   const classes = new Set();
   let html = '';
   const node = {
-    id, value: '', style: {}, children: [], parent: null,
+    id, value: '', style: {}, children: [], parentNode: null,
     // Not a browser property: a hook so a test can see every write.
     htmlWrites: [],
     box: box || {width: 0, height: 0},
@@ -3334,6 +3334,10 @@ function makeNode(id, box){
         return on;
       },
     },
+    // A browser element has `parentNode` and `parentElement` and no
+    // `parent`: a harness that offered `.parent` would pass page code that
+    // is `undefined` in Safari. There is deliberately no such field here.
+    get parentElement(){ return node.parentNode; },
     get innerHTML(){ return html; },
     // Assigning replaces the children, whatever the value: the page
     // rebuilds `#agent-list` this way every three seconds, and a card
@@ -3341,13 +3345,13 @@ function makeNode(id, box){
     set innerHTML(v){
       html = String(v);
       node.htmlWrites.push(html);
-      node.children.forEach(c => { c.parent = null; forget(c); });
+      node.children.forEach(c => { c.parentNode = null; forget(c); });
       node.children = [];
     },
     appendChild(child){
-      if(child.parent) child.parent.children.splice(
-        child.parent.children.indexOf(child), 1);
-      child.parent = node;
+      if(child.parentNode) child.parentNode.children.splice(
+        child.parentNode.children.indexOf(child), 1);
+      child.parentNode = node;
       node.children.push(child);
       adopt(child);
       return child;
@@ -3355,17 +3359,18 @@ function makeNode(id, box){
     remove(){
       removed.push(node.id);
       forget(node);
-      if(node.parent){
-        node.parent.children.splice(node.parent.children.indexOf(node), 1);
-        node.parent = null;
+      if(node.parentNode){
+        node.parentNode.children.splice(
+          node.parentNode.children.indexOf(node), 1);
+        node.parentNode = null;
       }
     },
     // A node that is not in the page, or is hidden by itself or by any
     // ancestor, measures nothing -- as in Safari. A registered node counts
-    // as in the page: `els` nodes have no parent, and `.content` is one.
+    // as in the page: `els` nodes have no parent node, and `.content` is one.
     getBoundingClientRect(){
-      let shown = !!node.parent || els[node.id] === node;
-      for(let n = node; n; n = n.parent){
+      let shown = !!node.parentNode || els[node.id] === node;
+      for(let n = node; n; n = n.parentNode){
         if(n.style.display === 'none') shown = false;
       }
       const b = shown ? node.box : {width: 0, height: 0};
@@ -3642,12 +3647,14 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "const ret = a.appendChild(mover);\n"
             "b.appendChild(mover);\n"
             "const reparented = [a.children.length, b.children.length,"
-            " mover.parent === b, ret === mover];\n"
+            " mover.parentNode === b, mover.parentElement === b,"
+            " ret === mover, 'parent' in mover];\n"
             # remove() takes a node out of its parent and records it
             "const gone = el('gone'); a.appendChild(gone);\n"
             "const before = a.children.length; gone.remove();\n"
             "const afterRemove = [before, a.children.length,"
-            " gone.parent === null, removed.includes('gone')];\n"
+            " gone.parentNode === null, gone.parentElement === null,"
+            " removed.includes('gone')];\n"
             "document.body.appendChild(other);\n"
             "const registered = Object.keys(els).sort();\n"
             # node identity
@@ -3686,8 +3693,9 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(got["writes"], ["one", "two"])
         self.assertEqual(got["html"], "two")
         self.assertEqual(got["coerced"], ["42", "string"])
-        self.assertEqual(got["reparented"], [0, 1, True, True])
-        self.assertEqual(got["afterRemove"], [1, 0, True, True])
+        # A browser node has `parentNode` and `parentElement`, never `parent`.
+        self.assertEqual(got["reparented"], [0, 1, True, True, True, False])
+        self.assertEqual(got["afterRemove"], [1, 0, True, True, True])
         # createElement makes nodes that belong to nobody's registry, and a
         # removed node has left it.
         self.assertEqual(got["registered"], ["a", "b"])
@@ -3708,7 +3716,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         Task 5 minimises a card by hiding it and Task 6 measures: a hidden
         probe that answered its box here and nothing in Safari would size
         the terminal to nothing on restore. So a node measures nothing
-        unless it is in the page (it has a parent, or it is a registered
+        unless it is in the page (it has a parent node, or it is a registered
         node) and neither it nor any ancestor is `display: none`. Also here:
         `fakeBox` is spent by the next `createElement` and by nothing else,
         an id appended into the page can be found and one removed cannot,
@@ -3778,13 +3786,15 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "list.appendChild(inner); side.appendChild(list);\n"
             "side.appendChild(parked);\n"
             "list.innerHTML = '';\n"
-            "const emptied = [list.children.length, inner.parent === null,"
+            "const emptied = [list.children.length, inner.parentNode === null,"
+            " inner.parentElement === null,"
             " document.getElementById('inner') === null,"
-            " parked.parent === side, side.children.length,"
+            " parked.parentNode === side, parked.parentElement === side,"
+            " side.children.length,"
             " document.getElementById('parked') === parked];\n"
             "const again = document.createElement('div'); list.appendChild(again);\n"
             "list.innerHTML = '<p>x</p>';\n"
-            "const refilled = [list.children.length, again.parent === null];\n"
+            "const refilled = [list.children.length, again.parentNode === null];\n"
             "console.log(JSON.stringify({spent, viaBox, registeredRoot, fields,"
             " unattached, attached, hiddenSelf, shown, afterRemove,"
             " visible, topHidden, midHidden, restored,"
@@ -3808,7 +3818,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertTrue(got["found"])
         self.assertIsNone(got["afterCardRemove"])
         self.assertTrue(got["twinKept"])
-        self.assertEqual(got["emptied"], [0, True, True, True, 2, True])
+        self.assertEqual(got["emptied"],
+                         [0, True, True, True, True, True, 2, True])
         self.assertEqual(got["refilled"], [0, True])
         self.assertIn("opshell-card", got["removed"])
 
