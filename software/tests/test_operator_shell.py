@@ -3053,16 +3053,46 @@ class TestTheGlyphAndTheView(_GuiCase):
         `opshell.LAPSE_GRACE` seconds of silence and the next check-in
         retires the claim.
         """
+        # Both quote styles, and whitespace after the paren: this file
+        # mixes `"` and `'` freely, so a pattern that names one of them
+        # bans the spelling I happened to write and permits the other.
         self.assertNotRegex(
-            SERVER_SRC, r'addEventListener\("(pagehide|beforeunload|unload)"',
+            SERVER_SRC,
+            r"""addEventListener\(\s*['"](pagehide|beforeunload|unload)['"]""",
             "a page-transition handler is back; it cannot tell a reload "
             "from a closed tab")
+        # And the property form, which `addEventListener` says nothing
+        # about: `window.onpagehide = ...` is the same listener by another
+        # door.
+        self.assertNotRegex(
+            SERVER_SRC, r"\bon(pagehide|beforeunload|unload)\s*=",
+            "a page-transition handler is back as an `on...` property; it "
+            "cannot tell a reload from a closed tab either")
 
     def test_the_close_survives_a_page_that_is_going_away(self):
-        # `opshellEndSession` runs from the ✕ and from `exit`; both can
-        # coincide with a page being torn down, and a close that is
-        # cancelled with the page leaves the claim held until the lapse.
+        # `opshellEndSession` runs from the ✕, from the End button and from
+        # `exit`. Nothing runs on page teardown any more, so what is left
+        # for `keepalive` is the race: one of those closes already in
+        # flight when the page goes away under it. That race has not been
+        # measured -- the flag costs nothing, and a close cancelled with
+        # the page leaves the claim held until the lapse.
         self.assertIn("keepalive:true", self.js_function("opshellEndSession"))
+
+    def test_the_page_resumes_a_shell_at_startup(self):
+        # Inside the `storedToken()` branch, so a page behind the token
+        # gate asks nothing.
+        at = SERVER_SRC.index("setInterval(refreshAgents, 3000)")
+        gate = SERVER_SRC[at - 200:at + 400]
+        self.assertIn("opshellResume()", gate)
+
+    def test_a_resumed_session_draws_the_card_it_attaches_into(self):
+        # Read rather than run: the harness's `document` cannot grow a
+        # card, so every behavioural resume test supplies the terminal host
+        # by hand and a resume that drew no card would pass all of them --
+        # while the operator got an invisible session whose claim nothing
+        # was heartbeating, stopped by the lapse four minutes later.
+        self.assertIn("showOperatorShell()",
+                      self.js_function("opshellResume"))
 
     def test_the_view_dials_nothing_until_the_operator_asks(self):
         # The goal: nothing happens on open, on hover, or on page load. The
@@ -3378,7 +3408,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # test deleted while the total *rose* from 231 to 246. So the floor
         # sits close to the real count --
         self.assertGreaterEqual(
-            len(names), 35,
+            len(names), 48,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -3423,7 +3453,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "esc", "opshellEndSession", "opshellTeardown", "opshellPicker",
             "opshellRender", "opshellOpen", "opshellB64",
             "opshellSay", "opshellDropRest", "opshellFlushKeys",
-            "opshellEndAfterAttach",
+            "opshellEndAfterAttach", "opshellRemember", "opshellRecall",
+            "opshellResume", "showOperatorShell",
             "opshellPoll", "opshellAttach")]) + "\n"
         # The one module constant the keystroke path reads.
         const = re.search(r"^const OPSHELL_KEYS_CEILING = .*$",
@@ -3488,6 +3519,139 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "console.log(JSON.stringify({posted, removed}));")
         self.assertEqual(got["posted"], [])
         self.assertEqual(got["removed"], ["y"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_remembered_session_is_resumed_on_load(self):
+        got = self._node(
+            "sessionStorage.setItem(opshellStore, 'kept-1');\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot', sessions:1}}];\n"
+            "await opshellResume();\n"
+            "console.log(JSON.stringify({session: opshellSession,"
+            " urls: posted.map(p => p.url)}));")
+        self.assertEqual(got["session"], "kept-1")
+        self.assertTrue(got["urls"][0].startswith("/api/opshell/state"),
+                        got["urls"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_session_that_is_gone_is_forgotten_rather_than_drawn(self):
+        """Review Focus 2.
+
+        The tab was shut for longer than the lapse, so the claim was
+        retired and the channel stopped. A card drawn from the remembered
+        id would look live over nothing.
+        """
+        got = self._node(
+            "sessionStorage.setItem(opshellStore, 'stale-1');\n"
+            "replies = [{ok:true, status:200, body:{state:'idle',"
+            " channel:'closed', sessions:0}}];\n"
+            "await opshellResume();\n"
+            "console.log(JSON.stringify({session: opshellSession,"
+            " remembered: sessionStorage.getItem(opshellStore),"
+            " bodies: Object.keys(els)}));")
+        self.assertIsNone(got["session"])
+        self.assertIsNone(got["remembered"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_session_this_server_does_not_know_is_not_adopted(self):
+        """Review Focus 5.
+
+        Two team servers on one origin -- a port change on localhost is
+        the common case -- leave each other's ids in the same
+        `sessionStorage`. An id the server answers `sessions: 0` for is
+        not this server's.
+        """
+        got = self._node(
+            "sessionStorage.setItem(opshellStore, 'other-servers-id');\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot', sessions:0}}];\n"
+            "await opshellResume();\n"
+            "console.log(JSON.stringify({session: opshellSession,"
+            " remembered: sessionStorage.getItem(opshellStore)}));")
+        self.assertIsNone(got["session"])
+        self.assertIsNone(got["remembered"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_resumed_session_says_it_is_a_new_shell(self):
+        got = self._node(
+            "sessionStorage.setItem(opshellStore, 'kept');\n"
+            "els['opshell-term'] = el('opshell-term');\n"
+            "const term = fakeTerm();\n"
+            "globalThis.Terminal = function(){ return term; };\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot', sessions:1}},"
+            " {ok:true, status:200, stream: fakeStream(['x'])}];\n"
+            "await opshellResume();\n"
+            "console.log(JSON.stringify({said: term.lines.join(' ')}));")
+        self.assertRegex(got["said"], r"(?i)new shell")
+        self.assertRegex(got["said"], r"(?i)previous|earlier|gone")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_resume_does_not_put_two_terminals_on_one_session(self):
+        # The card's own poll attaches when it finds the terminal host, and
+        # the resume attaches the session it just verified, so both can
+        # reach for the same one. Two streams on one session is a handover
+        # on the server: the first bridge is dropped, and the terminal the
+        # operator is typing into goes quiet with no line to say why.
+        got = self._node(
+            "sessionStorage.setItem(opshellStore, 'kept-3');\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['opshell-term'] = el('opshell-term');\n"
+            "globalThis.Terminal = function(){ return fakeTerm(); };\n"
+            "const live = {state:'live', channel:'open', host:'parrot',"
+            " sessions:1, geometry:[80,24]};\n"
+            "replies = [{ok:true, status:200, body:live},"
+            " {ok:true, status:200, body:live},"
+            " {ok:true, status:200, stream: fakeStream(['x'])},"
+            " {ok:true, status:200, body:{}}];\n"
+            "await opshellResume();\n"
+            "console.log(JSON.stringify({streams: posted.filter(p =>"
+            " p.url.indexOf('/api/opshell/stream') === 0).length}));")
+        self.assertEqual(got["streams"], 1,
+                         "%d streams were opened on one session; the second "
+                         "takes the bridge over from the first"
+                         % got["streams"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_session_is_remembered_when_it_opens_and_forgotten_when_it_ends(self):
+        # Nothing above writes the id: every resume test puts it in
+        # `sessionStorage` by hand, so a page that remembers nothing passes
+        # all of them while a reload restores nothing at all. Both ends in
+        # one test, because remembering without forgetting is the worse
+        # half -- a card drawn on the next load over a session that was
+        # handed back.
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "replies = [{ok:true, status:200, body:{session:'s9'}},"
+            " {ok:true, status:200, body:{}}];\n"
+            "await opshellOpen();\n"
+            "const afterOpen = sessionStorage.getItem(opshellStore);\n"
+            "await opshellEndSession();\n"
+            "console.log(JSON.stringify({afterOpen,"
+            " afterEnd: sessionStorage.getItem(opshellStore)}));")
+        self.assertEqual(got["afterOpen"], "s9")
+        self.assertIsNone(got["afterEnd"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_session_is_not_given_up_on_a_server_that_did_not_answer(self):
+        # An id is surrendered on the server's word, not on a blip: a
+        # request that never arrived says nothing about the session, and
+        # forgetting the id there turns one unlucky reload into a channel
+        # this page can no longer put back by itself.
+        #
+        # It also proves the resume cannot reject. Startup calls it bare,
+        # so a rejection is an unhandled one -- and node exits non-zero on
+        # it, which `_node` reads as a failure.
+        got = self._node(
+            "sessionStorage.setItem(opshellStore, 'kept-2');\n"
+            "replies = [{throw:'Failed to fetch'}];\n"
+            "await opshellResume();\n"
+            "console.log(JSON.stringify({session: opshellSession,"
+            " remembered: sessionStorage.getItem(opshellStore),"
+            " urls: posted.map(p => p.url)}));")
+        self.assertIsNone(got["session"])
+        self.assertEqual(got["remembered"], "kept-2")
+        self.assertEqual(len(got["urls"]), 1)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_refusal_from_open_is_shown_and_not_swallowed(self):

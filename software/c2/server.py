@@ -8422,6 +8422,81 @@ let opshellKeys = "";
 let opshellFlushing = false;
 let opshellTrouble = "";
 let opshellNoted = "";
+// Where this tab remembers the session it is holding, so a reload can put
+// the card back instead of leaving a live root shell on the device with
+// nothing on screen. `sessionStorage` and not `localStorage`: it is per
+// tab and it dies with the tab, which is the lifetime of a claim this page
+// holds. Anything else the card has to remember across a reload belongs
+// beside it under this key's own prefix, and is cleared with it in
+// `opshellRemember`.
+let opshellStore = "raccoon_opshell_session";
+// Set by `opshellResume`, read once by `opshellAttach`. A resumed card is
+// a **new** shell: the bridge's TCP connection is the shell, so the stream
+// going away with the old page killed the pty. Measured across a reload:
+// pid 75 to 78, the working directory back to / from /etc, and a variable
+// that had been set gone. A terminal that comes back looking like the one
+// that was there is the lie this whole feature exists to remove.
+let opshellFresh = false;
+
+function opshellRemember(session){
+  // One place, called wherever `opshellSession` is assigned, so what is
+  // remembered cannot drift from what this page holds -- a remembered id
+  // for a session that was handed back is a card drawn over nothing on the
+  // next load.
+  if(session) sessionStorage.setItem(opshellStore, session);
+  else sessionStorage.removeItem(opshellStore);
+}
+
+function opshellRecall(){
+  return sessionStorage.getItem(opshellStore) || "";
+}
+
+async function opshellResume(){
+  // Called once from startup. A reload is not a decision to stop working:
+  // the claim is still held, the channel is still up on the device, and
+  // without this the page comes back with an empty screen over both.
+  const session = opshellRecall();
+  if(!session) return false;
+  // Raw `fetch` with `H()`, the shape `opshellOpen` already uses, and not
+  // `api()`: `api()` throws on a 401, this is called bare, and a rejection
+  // here would be an unhandled one in the middle of startup. The token
+  // gate is `refreshAgents`' business, just above in the same block.
+  let r, state;
+  try {
+    r = await fetch("/api/opshell/state?session="
+      + encodeURIComponent(session), {headers: H()});
+    state = await r.json();
+  } catch(e) {
+    // Nothing is given up on a request that never arrived. A blip says
+    // nothing about the session, and forgetting the id here would turn one
+    // unlucky reload into a channel this page can no longer put back by
+    // itself -- the operator would have to open the panel and press Attach.
+    return false;
+  }
+  // Nor on an answer that is not about the session: a 401 is the token,
+  // a 5xx is the server, and neither of them is news that the shell ended.
+  // The id is surrendered below, on the server's word and nothing else.
+  if(!r.ok || !state) return false;
+  // `sessions` and not just `state`, because a live channel is not proof
+  // that *this* id is on it: two team servers on one origin -- a port
+  // change on localhost -- write into the same `sessionStorage`, and an id
+  // the server counts zero sessions for is somebody else's.
+  if(state.state !== "live" || !(state.sessions > 0)){
+    opshellRemember("");
+    return false;
+  }
+  opshellSession = session;
+  opshellFresh = true;
+  // Before the card is drawn: `opshellRender` chooses the terminal over
+  // the Attach button by whether this page holds a session, and the poll
+  // inside the card puts the id in its own query string.
+  await showOperatorShell();
+  // That poll attaches by itself when it finds the terminal host, and it
+  // sets `opshellAttached` before its first await -- so this is the other
+  // order, not a second terminal on the same session.
+  if(!opshellAttached) await opshellAttach(state);
+  return true;
+}
 
 async function showOperatorShell(){
   // Dials nothing. The channel is raised only when the operator presses
@@ -8453,6 +8528,9 @@ async function opshellEndSession(){
   const session = opshellSession;
   opshellSession = null;
   opshellAttached = false;
+  // And it is forgotten, so a reload after this draws the picker rather
+  // than a card over a session that was handed back.
+  opshellRemember("");
   // Whatever was typed and not yet delivered dies with the session.
   // Measured: "more" left over from a session that dropped, prepended to
   // the next session's "ls", went out as "morels" -- injected input into a
@@ -8465,6 +8543,10 @@ async function opshellEndSession(){
   // panel announces "answering again" for trouble it never saw.
   opshellTrouble = "";
   opshellNoted = "";
+  // Including the resume's own note, which is read once: a flag left
+  // standing because the terminal never opened would announce a new shell
+  // to a session that has nothing before it.
+  opshellFresh = false;
   if(opshellAbort){
     // The stream outlived the view otherwise: the bridge, the pty, one of
     // the shell port's slots, the transcript and a worker thread all
@@ -8487,8 +8569,12 @@ async function opshellEndSession(){
   // defect this whole view exists to avoid.
   let r, answer = null;
   try {
-    // keepalive, so the same call survives the tab being closed. Not
-    // `api()`: this must go out even while the page is being torn down.
+    // keepalive, so a close this page has already started still goes out
+    // when the page goes away under it -- the ✕, the End button or `exit`
+    // landing as the operator navigates. Nothing runs on page teardown any
+    // more, so that race is all this flag is for; it has not been measured,
+    // it costs nothing, and a close cancelled with the page leaves the
+    // claim held until the lapse. Not `api()`, which cannot carry it.
     r = await fetch("/api/opshell/close", {method:"POST", headers:H(),
       body: JSON.stringify({session}), keepalive:true});
     answer = await r.json();
@@ -8744,6 +8830,7 @@ async function opshellOpen(ev){
       return false;
     }
     opshellSession = answer.session;
+    opshellRemember(answer.session);
     opshellLast = null;
     // Nothing typed before this session existed belongs inside it.
     opshellKeys = "";
@@ -8912,6 +8999,18 @@ async function opshellAttach(state){
   opshellTerm.writeln("\x1b[2m-- live on " + (state.host || state.target || "?")
     + " \u00b7 history is off in this session \u00b7 " + cols + "x" + rows
     + ", fixed for this session --\x1b[0m");
+  if(opshellFresh){
+    // Said once, beside the line above, on a session the page picked back
+    // up after a reload. The shell is not the one that was there: the
+    // bridge's connection *is* the shell, so closing the stream killed the
+    // pty -- measured, pid 75 to 78, /etc back to /, a set variable gone.
+    // Reconnecting silently would leave the operator reading a prompt and
+    // believing their work was still behind it.
+    opshellFresh = false;
+    opshellTerm.writeln("\x1b[2m-- a new shell. The previous session ended "
+      + "with the page that held it: its directory, variables and "
+      + "processes are gone --\x1b[0m");
+  }
   opshellTerm.onData(d => { opshellKeys += d; opshellFlushKeys(); });
   // fetch and a ReadableStream, not EventSource: this socket
   // authenticates by Authorization header only and a token in a URL is
@@ -10933,6 +11032,8 @@ if(storedToken()){
   setInterval(checkTaskResults, 2500);
   refreshAgents();
   refreshRescues();
+  // A shell the operator had open before a reload goes back on screen.
+  opshellResume();
   toast("info","Server Online","Listening for beacon connections<br>Beacon traffic accepted on any POST path",6000);
 } else {
   askForToken(false);
