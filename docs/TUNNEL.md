@@ -464,11 +464,16 @@ back.
 
 **The terminal's size is fixed when the session opens.** The wire sends the
 geometry once, on the password line, and cannot renegotiate it — the same
-limitation `tools/raccoon_shell.py` already documents. So the strip states
-the geometry that was actually sent, and resizing the browser window does
-not resize the pty. A terminal that redrew itself to a new size while the
-far end kept the old one would be a quiet lie about what the shell thinks
-it has.
+limitation `tools/raccoon_shell.py` already documents. The pair is measured
+from the room the card actually has at that moment, so the terminal comes
+up the shape of the column instead of the port's 120×40 default. The rest
+follows from the wire: the strip states the geometry that was actually
+sent, resizing the browser window afterwards does not resize the pty, and a
+session that attached while the card was hidden keeps the 120×40 fallback
+for its whole life — the terminal says so on a line of its own, because a
+small terminal in a wide box is otherwise unexplainable. A terminal that
+redrew itself to a new size while the far end kept the old one would be a
+quiet lie about what the shell thinks it has.
 
 **The password never reaches the browser.** The team server holds the TCP
 connection to the shell port itself and puts the password on it; the
@@ -476,25 +481,66 @@ browser authenticates with the operator token it already has. The tunnel
 panel still shows the password, deliberately, because `raccoon_shell.py`
 needs an operator to read it.
 
-**Leaving the view ends the session, by every route out of it.** Closing
-the panel, clicking outside it, typing `exit`, and closing the browser tab
-all post the same close, which is what queues the channel's shutdown — the
-tab's case with `keepalive`, so the request survives the page going away.
+**It is a window and not a modal: `_` parks it, `✕` ends it.** The card
+takes the content column, with the agent list still beside it and still
+clickable, and its header carries those two controls. `✕` ends the session
+and queues the channel's shutdown, so the strip reads **closing** until the
+agent confirms. `_` hides the card and leaves a small entry under the
+agent list in its place: the session keeps running, output keeps arriving,
+and a click on that entry brings the card back with everything that arrived
+while it was away. `exit`, Ctrl-D, a stream the team server cannot hold and
+a refused one all still end a session — but of the two buttons on the card,
+only `✕` ends anything.
 
-**And a browser that is killed outright still does not leave the channel
-up.** It posts nothing, so the claim it held goes silent instead; four
-minutes of silence is enough for the implant's own next check-in to retire
-it and carry the shutdown. Four minutes, and the same four everywhere —
-every driver that can notice a silent claim uses one margin. An earlier
-version gave this one a wider margin than the view's own poll, and the
-narrower one then retired a backgrounded tab when a second panel was open.
-Four minutes is four times the slowest poll a live browser makes: a hidden
-tab is throttled to about one a minute. At the shipped three-hundred-second interval the
-width disappears inside the wait for the next check-in, because a shutdown
-can only ride one; on a fast beacon it does not, and costs about four extra
-minutes of channel. That is the price of not retiring a live session, and
-it is a price rather than a free lunch. So the cost of a killed browser is bounded by
-that margin plus one interval, and no operator action is needed.
+**A parked session is not a free one.** Nothing is paused. The stream is
+still open, so for as long as the card is parked the session holds a worker
+thread on the team server, the connection to the shell port, a
+**pseudo-terminal** on the device and one of that port's **four** session
+slots — the endpoint refuses a fifth. An hour of work parked is an hour of
+all four, by design rather than by accident. Park it to work beside it, and
+end it when you are finished with it.
+
+**A reload gives you a new shell, and the page says so.** The card survives
+a page load: the session id is kept in that tab, and on the next load the
+card comes back the way you left it — open or parked — and attaches. What
+it attaches to is a **fresh shell**. The team server's connection to the
+shell port *is* the shell, so when the page went away and took the stream
+with it, the pseudo-terminal on the device died; measured across one
+reload, the shell's process id went from 75 to 78, the working directory
+was back at `/` from the `/etc` it had been left in, and a variable that
+had been set was gone. Your directory, your variables and your running
+processes do not come back. The channel, the claim and the port do, so what
+a reload costs is the session and not the tunnel — and the terminal says
+this in its opening lines rather than leaving you to type into a prompt
+that looks like the one you left.
+
+**A closed tab no longer ends the session at once: it costs up to 240
+seconds plus one check-in.** Nothing is posted when the page goes away, and
+nothing can be — no browser signal tells a reload from a closed tab, and
+acting on the one that exists is what used to kill a healthy session on
+every reload. So a closed tab, like a browser killed outright, leaves the
+claim to go silent, and the claim's own margin retires it: **240 seconds**
+of silence, after which the implant's next check-in notices and carries the
+shutdown. One check-in and not two, because the sweep runs on the way into
+a check-in rather than after it.
+
+Four minutes is four times the slowest poll a live browser makes — a hidden
+tab is throttled to about one a minute — and it is the same margin
+everywhere, because every driver that can notice a silent claim uses one.
+An earlier version gave this one a wider margin than the view's own poll,
+and the narrower one then retired a backgrounded tab when a second panel
+was open. At the shipped three-hundred-second interval the margin
+disappears inside the wait for the next check-in, because a shutdown can
+only ride one; on a fast beacon it does not, and costs about four extra
+minutes of channel.
+
+**That loosening is the price of a shell that survives a reload, and it is
+a price.** It buys most of itself back, because an operator who reloads and
+walks away finds the card parked on their next look rather than a session
+that died under them. But the old guard was the faster of the two, and what
+is left is the slower. If you want the channel down now, press `✕`; nothing
+else on the page is quicker, and nothing at all is needed from you for the
+lapse to do it slowly.
 
 The one case left is narrow: **the implant stops checking in as well.**
 Then the channel stands — but so would any shutdown, because a task can

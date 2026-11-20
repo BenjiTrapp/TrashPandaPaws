@@ -2,8 +2,14 @@
 
 **Date:** 2026-11-19
 **Branch:** `feat/operator-shell` (PR #9), on top of the merge with `main`
-**Status:** design, awaiting approval. Builder-checked once; the
-corrections that check produced are folded in and marked.
+**Status:** implemented, Tasks 1–6, commits `0e05888..9fe7b93`. Part two
+below was **not** built and is still a proposal. Builder-checked once
+before the work began, and the corrections that check produced are folded
+in and marked; the corrections the *implementation* produced are folded in
+the same way, beside the statement each replaces, and what it could not do
+is *Known limitations, as built* near the end. **Why now** describes the
+code as it stood before the change, and its line references are that
+code's — the `pagehide` listener it cites no longer exists.
 
 ## Why now
 
@@ -75,7 +81,7 @@ deliberately — the way a window behaves.
 - **Dragging and free resizing.** Not asked for, and a resizable card would
   make the terminal's size a fiction: the wire sends the geometry once and
   cannot renegotiate it (`tools/raccoon_shell.py:38`). The card fills the
-  main area and the geometry is measured once, when the session opens.
+  content column and the geometry is measured once, when the session opens.
 - **A shell that survives a reload.** Chosen against: it would mean the
   server keeps the bridge — and therefore a live pty on the device — with
   nobody watching, plus a ring buffer for the output in between. New server
@@ -88,14 +94,15 @@ The feature's standing anti-goal holds: **a channel left open on the device
 while the operator believes it closed.** This change moves one of its
 guards, so it is stated plainly:
 
-- Today a closed tab ends the session **immediately**, via `pagehide`.
-- After this change, a closed tab ends it through the **lapse**: the claim
+- Before this change, a closed tab ended the session **immediately**, via
+  `pagehide`.
+- Since it, a closed tab ends the session through the **lapse**: the claim
   goes silent and the next check-in retires it, bounded by
   `opshell.LAPSE_GRACE` (240 s, `opshell.py:111`) plus one interval.
 
 The bound is one interval and not two for a reason the builder check
 established: `opshell_sweep()` runs **before** `_handle_beacon`
-(`server.py:3695` vs `:3706`), so the check-in that notices the lapse is
+(`server.py:3696` vs `:3705`), so the check-in that notices the lapse is
 the same one that carries the stop.
 
 That is a real loosening, approved with the trade on the table. It is
@@ -133,16 +140,18 @@ so rather than sitting there as if it were working.
   (`:4278`) holding `.sidebar` (260 px, flex column, `:4281`) whose
   `.agent-list` is `flex:1` (`:4289`), and `.content` (`:4306`).
 - **`refreshAgents` rebuilds `#agent-list.innerHTML` every 3 s**
-  (`:5385`). Appending the minimised card to `.sidebar` *after* the list is
+  (`:5453`). Appending the minimised card to `.sidebar` *after* the list is
   the only placement that survives, which is also where the operator
   pointed. This needs a comment in the code, or the next person tidies it
   into the list and it vanishes within three seconds.
 - **`renderAgentView` overwrites `#content.innerHTML` on every agent
-  click** (`:5455`), and the design wants the agent list visible and
+  click** (`:5522`), and the design wants the agent list visible and
   therefore clickable.
-- Seven behavioural properties of this view are named individually in
+- Behavioural properties of this view are named individually in
   `test_the_count_of_behavioural_tests_has_not_quietly_dropped` and may not
-  lose their tests. Its floor is 35 against 43 present.
+  lose their tests. Seven were named when this was written, with a floor of
+  35 against 43 present; the work took that to **eleven named** and a floor
+  of **90 against 92**.
 
 ## Approaches considered
 
@@ -163,12 +172,21 @@ dimmed fleet is not a place to spend an hour, which is what it is for.
 
 ### The card, open
 
-A **layer over `.content`**, not a replacement of its children — see the
-decisions below. A header row with the `>_` glyph, the device's name, and
-`_` and `✕` at the right; under it the strip that already exists (host,
-user, a `root` marker only when the endpoint reported one, the geometry
-that was sent, recording, channel state); then the terminal, filling the
-rest; then the existing line about how the session ends, verbatim.
+A **flex sibling of `.content` inside `.main`, with `.content` hidden**
+while the card is there. That replaced "a layer over `.content`" during
+execution and keeps its reason: `.main` is a row spanning the 260 px agent
+list as well, so a layer with `inset:0` over it would cover the list this
+layout exists to keep clickable, and two `flex:1` siblings would split the
+column in half. A hidden `#content` keeps its children untouched, which is
+the point of the decision below. A header row with the `>_` glyph, the
+device's name (`Operator Shell` until the first `/state` answer names the
+host), and `_` and `✕` at the right; under it the strip that already exists
+(host, user, a `root` marker only when the endpoint reported one, the
+geometry that was sent, recording, channel state); then the terminal,
+filling the rest; then the existing line about how the session ends,
+verbatim. The terminal's own opening lines carry what only it can say: the
+host, that history is off, the pair that was sent — and, when the
+measurement fell back, that this session is not fitted to the card and why.
 
 The agent list stays visible to its left, so an agent going offline is
 visible while working — which matters here, because a channel that drops is
@@ -185,7 +203,10 @@ Appended to `.sidebar` after `.agent-list`, so it sits at the bottom:
   differentiation a parked shell reads as another selected agent.
 - the device's name and the channel's state in the sidebar's small type
 - a `<button>`, not a div with an `onclick`: the header glyph was already
-  corrected from stray text to a button once (`ca65f70`)
+  corrected from stray text to a button once (`ca65f70`). As built it is a
+  row of two real buttons, because a button cannot nest one: the restore
+  takes the whole row, and the `✕` that dismisses a remnant is its own
+  button beside it
 
 While minimised the poll keeps running, so the claim keeps beating, the
 stream stays attached, and output keeps arriving in the terminal's buffer.
@@ -196,17 +217,19 @@ Restoring shows what arrived.
 It says `session ended` with the duration, drops the live border, and
 carries the `✕` that dismisses it. This is the second anti-goal. The
 duration comes from `opshellLast`, which `opshellEndSession` stashes
-(`:8476`) and the poll folds over an `idle` answer (`:8585`) — so the poll
+(`:8861`) and the poll folds over an `idle` answer (`:9025`) — so the poll
 must still be running when the session ends while minimised, and the
 dismiss path must not clear `opshellLast` before the duration has been
-shown (`opshellTeardown` clears it, `:8522`).
+shown (`opshellTeardown` clears it, `:8924`).
 
 ### After a reload
 
 The session id is kept in the tab's `sessionStorage`. On load, if the
-server says `live` and that id is still held, the card comes back as it was
-— open or minimised — and attaches. The terminal's first line says, in the
-same dim style as its other notes, that this is a new shell and the
+server says `live` and reports at least one session for the claim, the card
+comes back as it was — open or minimised — and attaches. *At least one*,
+and not *this one*: the state body carries a count, which is the first of
+the known limitations below. The terminal says, among its opening lines and
+in the same dim style as its other notes, that this is a new shell and the
 previous one is gone.
 
 ## Decided here, by me, and marked as such
@@ -216,18 +239,30 @@ previous one is gone.
   click, and the design wants that list clickable; without the layer one
   click detaches the xterm host under a live stream — the same defect class
   as `test_a_failed_poll_does_not_destroy_a_live_terminal`, reached by a
-  click instead of a blip.
+  click instead of a blip. **As built it is a flex sibling with `.content`
+  hidden rather than a layer over it** — ruled before Task 4, for the
+  reason in *The card, open* above. The decision is unchanged, because what
+  it was about is the children: a hidden column keeps them, and still shows
+  the last-clicked agent when the card goes away.
 - **Minimising hides the card in place; it does not take it apart.**
-  `opshellPoll` returns when `#opshell-body` is missing (`:8528`), and that
+  `opshellPoll` returns when `#opshell-body` is missing (`:8968`), and that
   poll *is* the claim's heartbeat. Taking the card apart would let the
   240 s lapse fire under a parked session — precisely the failure the
   branch's most-defended test exists to prevent.
-- **The geometry is measured with a probe element** — one off-screen span
-  in `var(--mono)` at 12 px, measured with `getBoundingClientRect`, divided
-  into the card's inner box, floored at 20×5 and capped at
-  `SHELL_GEOMETRY_MAX`. Not "xterm's own measurement before `open()`",
-  which my first draft offered and which does not exist in this build (no
-  fit addon, by design).
+- **The geometry is measured with a probe element**, divided into the
+  card's inner box, floored at 20×5 and capped at `SHELL_GEOMETRY_MAX`
+  (1000). Not "xterm's own measurement before `open()`", which my first
+  draft offered and which does not exist in this build (no fit addon, by
+  design). **Two rounds changed what the probe is**, and the result is what
+  landed: it is an `inline-block` holding a 32-character run whose rect
+  width is divided by 32 — the vendored library's own
+  `.xterm-char-measure-element`, declaration for declaration, so the probe
+  and the thing it sizes agree by construction rather than by measurement
+  on whichever fonts anyone could test. And its font is the **resolved**
+  `--mono` stack, not the custom property: the library prefers an
+  `OffscreenCanvas` strategy whose `ctx.font` cannot resolve one and
+  silently measures 10 px sans-serif instead, so the stack is read once
+  from the computed style and handed to both the terminal and the probe.
 - **The strip shows no geometry until the stream is up.** `state.geometry`
   is `None` before a bridge exists and is pinned that way
   (`test_with_no_session_live_there_is_no_geometry_to_report`). Showing the
@@ -255,13 +290,24 @@ previous one is gone.
   honest; the second avoids a stream request that cannot succeed.
 - Where the minimised flag lives: page state, as a module-level
   `let opshellMinimised = …` — it must be a single-line `let opshell… = …`
-  or the harness's `decls` regex (`test_operator_shell.py:3408`) will not
+  or the harness's `decls` regex (`test_operator_shell.py:3776`) will not
   lift it, and the server must not learn what "minimised" means.
+
+**As built**, all three: the border is `--red-dim`, told apart from a
+selected agent by spanning the sidebar edge to edge with no radius, by the
+glyph, by its monospace and by having no status dot; the resume asks
+`/state` first and draws the card only on a `live` answer, so no stream
+request goes out that cannot succeed; and the flag is
+`let opshellMinimised = false` beside a `sessionStorage` key under the
+session id's own prefix, which is what lets a reload come back parked
+rather than open over the work. The server still does not know the word.
 
 ## What will bite the implementer
 
 From the builder check, kept because each one is a collision rather than a
-preference:
+preference — and kept in its pre-implementation voice, as the list the
+tasks were actually dispatched against, so its counts and line numbers are
+the ones that were true then:
 
 - **`test_a_closed_tab_ends_the_session_too` (`:3043`) pins the behaviour
   being removed.** It asserts the `pagehide` listener exists and calls
@@ -315,6 +361,13 @@ preference:
   bound becomes 240 s plus one interval, and the parked-session cost
   belongs there.
 
+**Done in Task 7**, and the three pages are held by
+`TestTheOperatorShellIsDocumentedAsAWindow` in `test_docs.py`: what a
+closed tab costs, that a reattach is a new shell and what that loses, and
+the four things a parked session holds. The three rules survived — all
+three are still true — and the lifetime paragraph was replaced rather than
+softened.
+
 ## How this will be verified
 
 - The measured defect, as a test: a reload does not end the session.
@@ -325,9 +378,49 @@ preference:
 - A restored card after a reload attaches and announces a new shell.
 - An agent click does not detach a live terminal.
 - The geometry the strip states is the geometry that was sent.
-- The seven named properties keep their tests; the removal of the
-  `pagehide` guard is defended by the inverted test.
+- The named properties keep their tests; the removal of the `pagehide`
+  guard is defended by the inverted test.
 - The full suite, on this branch, on top of the merge with `main`.
+
+## Known limitations, as built
+
+Six, each ruled during execution and each recorded in the ledger with its
+reasoning. None is a defect left lying: every one was weighed against a
+change the plan or the task forbade, and the view fails safe in all six.
+
+1. **The resume checks a count, not an identity.** `/api/opshell/state`
+   reports how many sessions the claim has, not whether the id in this
+   tab's `sessionStorage` is one of them — so an id written by a different
+   team server on the same origin, a port change on localhost, can be
+   adopted until the stream request refuses it. Bounded: an unknown id
+   gets 400, the view says so and forgets it, and the close answers "not
+   the last session", so nothing is stopped. Closing it properly needs a
+   per-session field on the state body, which the plan forbade.
+2. **A duplicated tab duplicates the claim.** `sessionStorage` is cloned
+   into a tab opened with Duplicate Tab, so both tabs resume the same id;
+   the second stream takes the bridge and the first tab's close then stops
+   the channel. Fails safe — both terminals print that the session ended.
+3. **While the card is open the content column is hidden**, so a device
+   clicked in the list renders into a hidden node: its scroll and focus
+   calls are no-ops and its history poll runs at 2 s against an invisible
+   view, and after the `✕` the device console reappears scrolled to the top
+   and unfocused. That is the price of hiding the column rather than
+   emptying it, and the answer for working beside a shell is `_`, not a
+   device click.
+4. **The size is fixed for the life of the connection.** There is no route
+   that resizes — the pair rides the password line and the wire has no
+   resize message — so a window resized afterwards does not change the
+   terminal, and a session that attached while the card was hidden keeps
+   the fallback 120×40. The view says that once, in the terminal, rather
+   than leaving the operator to wonder.
+5. **A refusal that arrives while parked is written to the terminal**, not
+   to the parked entry, so the entry says the session ended and the
+   server's reason is visible only after a restore. Recoverable, not lost.
+6. **A parked session is not a free one**: a worker thread, a bridge, a pty
+   on the device and one of the shell port's four session slots, held for
+   as long as it is parked. It belongs where an operator reads it, so it is
+   in `docs/TUNNEL.md` as well as here — the alternative is a surprised
+   reading of the logs.
 
 ---
 
