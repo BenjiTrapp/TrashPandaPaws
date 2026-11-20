@@ -706,16 +706,18 @@ Ten actions are refused outright and cannot be approved, by you or by the
 expected-value check. Eight are irreversible and, from a drop-box, not
 correctable. The other two are the operator's call rather than the agent's:
 `tunnel_control` opens or closes a route into the target network, and
-`egress_control` moves the path the implant talks over. The implant grew
-that verb for the operator, and so that an implant the team server cannot
-reach can choose for itself; a model changing the egress of a beacon that
-is still answering would be spending the channel it is talking over.
+`egress_control` covers the implant's own egress verb — the proxy it posts
+through, its relay leg, and the discovery that goes looking for another
+proxy. The implant grew that verb for the operator, and so that an implant
+the team server cannot reach can choose for itself; a model changing the
+egress of a beacon that is still answering would be spending the channel it
+is talking over.
 
 | Key | Why |
 |---|---|
 | `beacon_control` | beacon lifecycle control is irreversible without an operator |
 | `tunnel_control` | opens or closes a SOCKS route into the target network, which is the operator's call and not the agent's |
-| `egress_control` | moves the path the implant's traffic leaves the host by, and a path that carries nothing is a beacon out of reach |
+| `egress_control` | selects the proxy the implant posts through, brings its relay leg up, or re-probes the host for one; none of them is the agent's call |
 | `sleep_too_long` | a sleep this long takes the beacon out of reach for hours |
 | `dropbox_lifeline` | touches the bridge, NAC bypass, cover identity or tunnel |
 | `power_off` | reboot or shutdown of the host carrying the beacon |

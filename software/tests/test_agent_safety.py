@@ -1678,10 +1678,43 @@ class TestTheEgressVerbIsNotForTheCampaignModel(unittest.TestCase):
         # of `Unknown command: egress` back from the implant.
         self.assertIn("egress", beacon_exec.BEACON_VERBS)
 
+    # The three sub-verbs the one row gates, each with the words that
+    # would account for it. The row's reason is read by the operator (the
+    # doc table, the GUI's tier-1 list), by the orchestrator (the prompt
+    # is generated from `RISK_TABLE`) and by the executor (it comes back
+    # as `blocked_reason`), so a sentence true of only one arm misinforms
+    # all three. Synonyms rather than the sentence itself, because a
+    # reason nobody may reword is its own trap.
+    #
+    # What this can hold is that every arm is *named*. Whether the clause
+    # beside a name is true of it stays a reader's judgement -- but an
+    # enumerated reason is one a reader can judge arm by arm, where a
+    # summary is one sentence for three different hazards.
+    ARMS = (
+        ("egress proxy", ("proxy",)),
+        ("egress gsocket", ("relay", "carrier", "gsocket", "leg")),
+        ("egress rediscover", ("probe", "discover", "look", "survey")),
+    )
+
     def test_egress_is_refused_for_a_reason_that_is_true_of_it(self):
         row = self._c("egress proxy 2")
         self.assertEqual(row.action_key, "egress_control")
         self.assertEqual(row.tier, safety.TIER_HARD)
+        # The positive half, which this test's name promises and its first
+        # version did not check: the reason has to account for every
+        # sub-verb the row refuses. That version shipped "moves the path
+        # the implant's traffic leaves the host by, and a path that
+        # carries nothing is a beacon out of reach" -- true of `egress
+        # proxy`, false of `rediscover`, which selects nothing, and false
+        # of `gsocket`, which adds a leg and cannot strand anything. It
+        # passed both negative checks below, which is why they were not
+        # enough on their own.
+        reason = row.reason.lower()
+        for arm, words in self.ARMS:
+            self.assertTrue(
+                any(word in reason for word in words),
+                "`%s` is gated by this row and the reason names none of "
+                "%s: %r" % (arm, list(words), row.reason))
         # Borrowing a neighbour's sentence is what `tunnel_control` was
         # split out of `beacon_control` to stop. Neither neighbour's is
         # true here: picking a proxy is not beacon lifecycle control, and
@@ -1689,7 +1722,7 @@ class TestTheEgressVerbIsNotForTheCampaignModel(unittest.TestCase):
         for other in ("beacon_control", "tunnel_control"):
             self.assertNotEqual(row.reason, safety.RISK_TABLE[other].reason)
         self.assertNotIn("irreversible", row.reason)
-        self.assertNotIn("socks", row.reason.lower())
+        self.assertNotIn("socks", reason)
 
 
 if __name__ == "__main__":

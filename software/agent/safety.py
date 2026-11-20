@@ -363,15 +363,27 @@ RISK_TABLE = {
     # prompt before anyone decided the model should have it. Neither
     # neighbour's sentence is true of it: it is not beacon lifecycle
     # control, and it is not a SOCKS route. What it is: the one verb that
-    # moves the path the implant's traffic takes out of the host. The
-    # verbs are for the operator, and for a stranded implant choosing for
-    # itself when the team server cannot be reached; a model that picked
-    # a proxy on a beacon that was still answering would be spending the
-    # channel it is talking over.
+    # acts on how this implant gets out -- it selects a proxy, raises the
+    # relay leg, or goes looking for another proxy. The verbs are for the
+    # operator, and for a stranded implant choosing for itself when the
+    # team server cannot be reached; a model that picked a proxy on a
+    # beacon that was still answering would be spending the channel it is
+    # talking over.
+    #
+    # The reason names the three rather than summarising them, because one
+    # tier over three hazards is the defect the `tunnel_control` split
+    # exists to prevent and this row walked straight into it. The first
+    # draft read "moves the path the implant's traffic leaves the host by,
+    # and a path that carries nothing is a beacon out of reach": true of
+    # `egress proxy`, false of `rediscover`, which selects nothing, and
+    # false of `gsocket`, which adds a leg and cannot strand anything. The
+    # neighbour shows the shape -- it covers both of its own arms by
+    # naming both, "opens or closes a SOCKS route".
     "egress_control": _row(
         TIER_HARD, "egress_control", "lifecycle",
-        "moves the path the implant's traffic leaves the host by, and a "
-        "path that carries nothing is a beacon out of reach"),
+        "selects the proxy the implant posts through, brings its relay "
+        "leg up, or re-probes the host for one; none of them is the "
+        "agent's call"),
     "sleep_too_long": _row(
         TIER_HARD, "sleep_too_long", "lifecycle",
         "a sleep this long takes the beacon out of reach for hours"),
