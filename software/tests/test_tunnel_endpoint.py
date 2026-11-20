@@ -1541,7 +1541,9 @@ class TestTheLoginShell(unittest.TestCase):
         """`function`'s code as the parser sees it: no docstring, no comments.
 
         The guard is about what the function does. Its prose is free to
-        name `$SHELL` -- saying why it is not read is the docstring's job.
+        name `$SHELL` -- saying why it is not read is the docstring's job
+        -- and so is any name it likes, so the scan looks for the reading
+        of the environment and not for a word.
         """
         tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
         body = tree.body[0].body
@@ -1657,11 +1659,20 @@ class TestTheLoginShell(unittest.TestCase):
         self.assertEqual(argv, ["/bin/zsh", "-i"])
         self.assertEqual((env["HISTFILE"], held), (os.devnull, ()))
 
+    # A guard that reads source is only worth what it reads. Mutating
+    # `beacon.py` and re-running can silently run the *old* code: a `.pyc`
+    # is trusted when the source's size and mtime-second match, and a
+    # mutation that changes one character straight after another that did
+    # the same matches. That happened here: a mutation looked caught by
+    # the wrong test because it had not run at all. Between mutations,
+    # delete `software/c2/__pycache__/beacon*` and run with `-B`.
     def test_the_environments_shell_variable_is_never_consulted(self):
         with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
                 mock.patch.dict(os.environ, {"SHELL": "/bin/ksh"}):
             self.assertEqual(beacon_mod._shell_program(), "/bin/zsh")
-        self.assertNotIn("SHELL", self._code_of(beacon_mod._login_shell))
+        code = self._code_of(beacon_mod._login_shell)
+        for reading in ("environ", "getenv"):
+            self.assertNotIn(reading, code)
 
     def test_a_passwd_lookup_that_raises_falls_back_rather_than_throwing(self):
         with mock.patch.object(pwd, "getpwuid",

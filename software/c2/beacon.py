@@ -3188,7 +3188,7 @@ _DEV_FD = "/dev/fd"
 # (Homebrew, Arch, NixOS, a usrmerge `chsh`), and it is the program that
 # is wanted, wherever the host keeps it. Derived from the default paths
 # so that the two cannot name different shells.
-_LOGIN_PROGRAMS = (os.path.basename(_SHELL_BASH), os.path.basename(_SHELL_ZSH))
+_LOGIN_SHELLS = (os.path.basename(_SHELL_BASH), os.path.basename(_SHELL_ZSH))
 
 # Where `setsid(1)` is, and why the shell is started through it.
 #
@@ -3330,7 +3330,7 @@ def _login_shell() -> str:
         import pwd
         shell = pwd.getpwuid(os.geteuid()).pw_shell
         if (os.path.isabs(shell) and os.path.isfile(shell)
-                and os.path.basename(shell) in _LOGIN_PROGRAMS
+                and os.path.basename(shell) in _LOGIN_SHELLS
                 and _shell_executable(shell)):
             return shell
         return ""
