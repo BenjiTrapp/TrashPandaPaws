@@ -3415,6 +3415,15 @@ function reply(){
   return nextReply;
 }
 
+// What a browser does with a custom property: the page's stylesheet defines
+// `--mono`, and `getComputedStyle(...).getPropertyValue` answers it, or an
+// empty string when it is not defined. `_node` fills `cssVars` from the
+// page's own `:root`, so no test restates the stack.
+let cssVars = {};
+function getComputedStyle(){
+  return {getPropertyValue: name => cssVars[name] || ''};
+}
+
 class AbortError extends Error {
   constructor(){ super('The operation was aborted'); this.name = 'AbortError'; }
 }
@@ -3704,8 +3713,10 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # it had, and told a probe failure from a hidden card -- and 89
         # against 91 once the pair was pinned to the probe's own box by
         # division rounded down, and the probe to the terminal's own font --
+        # and 90 against 92 once that font was resolved for both, because
+        # the canvas strategy cannot read `var(--mono)` --
         self.assertGreaterEqual(
-            len(names), 89,
+            len(names), 90,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -3773,12 +3784,15 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "opshellResume", "showOperatorShell", "opshellChrome",
             "opshellClose", "opshellMinimise", "opshellRestore",
             "opshellParked", "opshellRetitle", "opshellPoll",
-            "opshellAttach", "opshellMeasure")]) + "\n"
+            "opshellAttach", "opshellMeasure", "opshellFont")]) + "\n"
         # The one module constant the keystroke path reads.
         const = re.search(r"^const OPSHELL_KEYS_CEILING = .*$",
                           SERVER_SRC, re.M)
         self.assertIsNotNone(const, "the request ceiling is gone")
         src = const.group(0) + "\n" + src
+        mono = re.search(r"^\s*--mono:(.*?);\s*$", STYLE_BLOCK, re.M)
+        self.assertIsNotNone(mono, "the page no longer defines --mono")
+        src = "cssVars['--mono'] = %s;\n" % json.dumps(mono.group(1)) + src
         out = subprocess.run(
             ["node", "--input-type=module", "-e", env + src + script],
             capture_output=True, text=True, timeout=30)
@@ -6097,6 +6111,11 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         notes = [l for l in hidden if "not fitted" in l]
         self.assertEqual(len(notes), 1, hidden)
         self.assertIn("keeps that size", notes[0])
+        # "that size" refers to the strip line above, so the strip is where
+        # the size is pinned: the note does not carry it any more.
+        strip = [l for l in hidden if "live on" in l]
+        self.assertEqual(len(strip), 1, hidden)
+        self.assertIn("120x40", strip[0])
         shown = self._attach_lines("", (256, 16))
         self.assertEqual([l for l in shown if "not fitted" in l], [], shown)
 
@@ -6174,6 +6193,45 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(got["text"], "W" * 32)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_terminal_is_given_a_resolved_font_and_the_probe_the_same_one(self):
+        """The vendored xterm prefers an OffscreenCanvas strategy and sets
+        `ctx.font = "12px " + fontFamily`; a canvas cannot resolve
+        `var(--mono)`, so the assignment is ignored and the terminal's own
+        cell is measured in a default sans-serif while the probe measures
+        the right one. Both get the resolved list, and an empty answer from
+        the stylesheet is the literal stack and not an empty name."""
+        script = (
+            "%s\n"
+            "const made_nodes = [];\n"
+            "const _ce = document.createElement;\n"
+            "document.createElement = () => {"
+            " const n = _ce(); made_nodes.push(n); return n; };\n"
+            "els['opshell-term'] = el('opshell-term');\n"
+            "els['opshell-term'].box = {width: 1000, height: 500};\n"
+            "globalThis.Terminal = function(o){ globalThis.made = o;"
+            " return fakeTerm(); };\n"
+            "opshellSession = 'sid';\n"
+            "fakeBox(256, 16);\n"
+            "nextReply = {ok:true, status:200, stream: fakeStream(['x'])};\n"
+            "await opshellAttach({state:'live', host:'parrot'});\n"
+            "console.log(JSON.stringify({probe: made_nodes[0].style"
+            ".fontFamily, term: made.fontFamily}));")
+        stack = re.search(r"^\s*--mono:(.*?);\s*$", STYLE_BLOCK, re.M).group(1)
+        for setup, want in (
+                ("", stack),
+                ("cssVars['--mono'] = '  \\'Test Mono\\', monospace  ';",
+                 "'Test Mono', monospace"),
+                ("cssVars = {};", None)):
+            got = self._node(script % setup)
+            self.assertEqual(got["probe"], got["term"],
+                             "the probe and the terminal measure different fonts")
+            self.assertNotIn("var(", got["term"],
+                             "a canvas cannot resolve a custom property")
+            self.assertIn("monospace", got["term"], "no real family named")
+            if want is not None:
+                self.assertEqual(got["term"], want)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_terminal_host_has_a_box_to_be_measured_in(self):
         """Not in the brief, found by reading the markup: `#opshell-term` is
         an empty block when the page measures it, so as a plain `div` it is
@@ -6197,7 +6255,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         wrapper = html.index('class="opshell-live"')
         self.assertLess(wrapper, html.index('id="opshell-term"'),
                         "the host is outside the box that gives it a height")
-        flat = lambda name: "".join(
+        flat = lambda name: ";".join(
             self.css_rules(name)).replace(" ", "").replace("\n", "")
         live, host, body = (flat("opshell-live"), flat("opshell-term"),
                             flat("opshell-body"))

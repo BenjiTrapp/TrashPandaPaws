@@ -9377,8 +9377,24 @@ async function opshellFlushKeys(){
 // says that size, which is what it is. The floor is on this side because
 // the server clamps 0 to 1 and the operator would get a one-column terminal
 // with no explanation.
-function opshellMeasure(host){
+// The font stack as a list of names, for the terminal and for the probe alike.
+// Not `var(--mono)`: the vendored xterm prefers an OffscreenCanvas strategy
+// that measures with `ctx.font = "12px " + fontFamily`, and a canvas cannot
+// resolve a custom property, so the assignment is ignored and the cell is
+// measured in the canvas's default 10px sans-serif. Resolved here once and
+// handed to both, the two agree whichever strategy the library picks. An
+// empty answer -- a stylesheet that failed to load -- is the literal stack,
+// not an empty font name.
+function opshellFont(){
+  const stack = (getComputedStyle(document.body).getPropertyValue("--mono")
+                 || "").trim();
+  return stack || "'Cascadia Code','Fira Code','JetBrains Mono',"
+    + "'Courier New',monospace";
+}
+
+function opshellMeasure(host, font){
   const fallback = [120, 40];
+  font = font || opshellFont();
   opshellUnfitted = "";
   const room = host.getBoundingClientRect();
   if(!(room.width > 0) || !(room.height > 0)){
@@ -9392,7 +9408,8 @@ function opshellMeasure(host){
   // run of 32 characters whose width is divided back down, so a fractional
   // advance is not rounded away on one glyph. It has to be in the page to
   // have a size, so it is appended, read and taken out again. Family and
-  // size are the Terminal's own, below; a test holds the two together.
+  // size are the Terminal's own, in `opshellAttach`; a test holds them
+  // together.
   const RUN = 32;
   const probe = document.createElement("span");
   probe.style.display = "inline-block";
@@ -9401,7 +9418,7 @@ function opshellMeasure(host){
   probe.style.visibility = "hidden";
   probe.style.whiteSpace = "pre";
   probe.style.lineHeight = "normal";
-  probe.style.fontFamily = "var(--mono)";
+  probe.style.fontFamily = font;
   probe.style.fontSize = "12px";
   probe.textContent = "W".repeat(RUN);
   document.body.appendChild(probe);
@@ -9425,9 +9442,10 @@ async function opshellAttach(state){
   if(!host || typeof Terminal === "undefined") return;
   opshellAttached = true;
   opshellStarted = Date.now();
-  const [cols, rows] = opshellMeasure(host);
+  const font = opshellFont();
+  const [cols, rows] = opshellMeasure(host, font);
   opshellTerm = new Terminal({cols, rows, cursorBlink:true,
-                              fontFamily:"var(--mono)", fontSize:12});
+                              fontFamily:font, fontSize:12});
   opshellTerm.open(host);
   // Claims only what the code does: the session's rc files run, then
   // `unset HISTFILE` and `set +o history` (beacon.py:3228).
