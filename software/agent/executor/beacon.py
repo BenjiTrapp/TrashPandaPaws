@@ -36,15 +36,25 @@ def _liveness(c2, beacon_id):
 # with no hint that `shell arp -a` is the form that works. A test compares
 # this set against that dispatch table, so a verb added there and not here
 # fails rather than silently going unoffered.
+#
+# Presence here is not permission. `tunnel` and `egress` are listed because
+# the beacon dispatches them and this list states the language rather than
+# the licence; `safety.classify` refuses both at tier 1. Stating them is
+# still the kinder half: a refusal carries its reason back as
+# blocked_reason, which the model can comply with, where an unoffered verb
+# comes back as "Unknown command" from the implant and reads as a bug.
 BEACON_VERBS = (
     "shell", "ls", "lsjson", "cat", "pwd", "cd", "cp", "mv", "rm", "mkdir",
     "chmod", "write", "upload", "download", "loot", "exfil", "netscan",
     "arptable", "proxyinfo", "avenum", "smbloot", "persist", "unpersist",
-    "tunnel", "sleep", "reconfig", "kill",
+    "tunnel", "sleep", "reconfig", "egress", "kill",
 )
 
 # Only where the name does not say it. Kept short on purpose: this goes into
-# every executor prompt.
+# every executor prompt. Nothing for `egress`, although its name says least
+# of all: `safety.classify` refuses the verb, so a hint would spend prompt
+# lines teaching a grammar the model may not write. The name plus a refusal
+# that carries its reason is the whole of what it needs about that one.
 VERB_HINTS = {
     "shell": "run any other program: shell <command>",
     "lsjson": "like ls, machine-readable",

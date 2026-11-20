@@ -12,6 +12,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from software.agent import safety
+# The verb list the executor prompt is written from. Imported here because
+# this file's subject is the gate on it: a verb the implant dispatches is
+# a verb the model is told about, and the refusal is the other half.
+from software.agent.executor import beacon as beacon_exec
 
 
 def _classify(cmd, **kw):
@@ -1621,6 +1625,72 @@ class TestXargsFlagsDoNotHideTheProgram(unittest.TestCase):
     def test_an_attached_replacement_string_is_not_a_program(self):
         # `-I{}` carries its value, so nothing after it may be skipped.
         self.assertTrue(safety.is_scan("xargs -I{} nmap -p- 10.0.1.5"))
+
+
+class TestTheEgressVerbIsNotForTheCampaignModel(unittest.TestCase):
+    """`egress` reached the agent's vocabulary the way `tunnel` did.
+
+    The implant's dispatch table and `executor/beacon.py`'s copy of it are
+    compared for equality by `test_agent_prompts`, so a verb added to the
+    beacon is a verb the executor prompt states whether anyone decided it
+    should be. `safety.classify` is then the only thing between the model
+    and it, which is why the refusal is here and not in the prompt.
+
+    What the verb does: it picks the proxy the implant posts through, or
+    brings its relay leg up. That is the hazard `reconfig` is refused for
+    -- it can move the callback -- and the verbs exist for the operator
+    and for the implant deciding about itself when nobody can be reached.
+    The model keeps `try_egress` for a stuck beacon and is refused these.
+
+    One path this does not bind, stated so that nobody reads the refusal
+    as covering more than it does: `agent/tools/egress.py`'s `try_egress`
+    queues through the C2 directly and never calls classify. That
+    asymmetry predates these verbs and is recorded in the design.
+
+    And one shape where the refusal is not the reason the model reads: in
+    the router the scope check answers before the tier-1 verdict, so
+    `egress proxy 2` comes back refused for the bare `2` it cannot verify
+    as a target. Refused either way with nothing queued, which is what
+    fail-closed means here; every other spelling carries this row's reason.
+    """
+
+    def _c(self, cmd):
+        return _classify(cmd)
+
+    def test_egress_is_hard_refused_for_the_campaign_model(self):
+        # reconfig is hard "because it can move the callback"; egress proxy
+        # moves the implant's egress path, which is the same hazard.
+        #
+        # Every sub-verb and the bare verb, plus the spellings that reduce
+        # to one: classify reads the first token of the *effective*
+        # command, so neither `shell` nor a privilege prefix may carry one
+        # past the check.
+        for cmd in ("egress proxy 2", "egress proxy http://10.0.1.9:3128",
+                    "egress rediscover", "egress gsocket", "egress",
+                    "EGRESS gsocket", "sudo egress gsocket",
+                    "shell egress proxy 2"):
+            self.assertEqual(self._c(cmd).tier, safety.TIER_HARD, cmd)
+
+    def test_the_executor_knows_the_verb_exists(self):
+        # The set-equality test is the forcing function, not the goal. The
+        # goal is that the word is in the language the executor prompt
+        # states, so the model reads a refusal it can comply with instead
+        # of `Unknown command: egress` back from the implant.
+        self.assertIn("egress", beacon_exec.BEACON_VERBS)
+
+    def test_egress_is_refused_for_a_reason_that_is_true_of_it(self):
+        row = self._c("egress proxy 2")
+        self.assertEqual(row.action_key, "egress_control")
+        self.assertEqual(row.tier, safety.TIER_HARD)
+        # Borrowing a neighbour's sentence is what `tunnel_control` was
+        # split out of `beacon_control` to stop. Neither neighbour's is
+        # true here: picking a proxy is not beacon lifecycle control, and
+        # it is not a SOCKS route into the target network.
+        for other in ("beacon_control", "tunnel_control"):
+            self.assertNotEqual(row.reason, safety.RISK_TABLE[other].reason)
+        self.assertNotIn("irreversible", row.reason)
+        self.assertNotIn("socks", row.reason.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
