@@ -183,10 +183,14 @@ gs-netcat -g
 
 Do not type a secret you chose yourself: this is a credential on a relay
 network anybody may join, and a guessed one is a dialable path to the beacon
-socket. The store's floor is **21 characters**, which is exactly what
-`gs-netcat -g` emits — gsocket truncates its own base58 output to 21
-(`lib/gsocket-util.c:153-170`) — so a minted secret clears it and a
-hand-written one has to be at least as long. Twenty-one base58 characters is
+socket. The store's floor is **21 characters**, one below what `gs-netcat -g`
+actually mints. Upstream truncates its base58 output with `b58[22] = '\0'`
+(`lib/gsocket-util.c:153-170`) under a comment that says "21 characters",
+but that terminator is at index 22, so the string is 22 characters long —
+measured, three runs of the v1.4.43 build, and `tools/gsocket_rig.py --real`
+re-measures it. The floor sits below both numbers on purpose, so a minted
+secret clears it whichever one a future release honours, and a hand-written
+one still has to be at least that long. Twenty-one base58 characters is
 about 123 bits, and every guess costs an attacker a fresh TCP connection to
 the relay network; the floor is there for the secret somebody writes by hand,
 which is the only one that was ever going to be weak.
@@ -382,15 +386,26 @@ The cycle after that is the one that gets out. That is the warm-up, and it is
 
 **The implant's local forward binds every interface.** This repository
 recorded that as an open question for most of this feature's life. It is
-settled, from upstream source at **v1.4.43** — read rather than run, because
-running `gs-netcat` to find out means dialling a third-party relay network
-from the operator's own machine, which has OPSEC meaning of its own:
+settled twice over — first from upstream source at **v1.4.43**, then by
+observation:
 
 | Upstream | What it says |
 |---|---|
 | `tools/4_gs-netcat.c:1499` | `case 'p': gopt.port = htons(atoi(optarg)); gopt.is_multi_peer = 1;` |
 | `tools/4_gs-netcat.c:1573-1585` | the **client** branch — `if (!(gopt.flags & GSC_FL_IS_SERVER))` — calls `fd_net_listen(gopt.listen_fd, &gopt.port, SOCK_STREAM)` when `is_multi_peer` is set |
 | `tools/utils.c:1238-1259` | `fd_net_listen()` sets `addr.sin_addr.s_addr = htonl(INADDR_ANY)` whenever `*port != 0`, and binds `inet_addr("127.0.0.1")` **only** when the port is 0 |
+
+And then measured, because reading is not the same as knowing: a real
+`gs-netcat -k <file> -w -p 26550` on the v1.4.43 build, with
+`lsof -nP -iTCP:26550 -sTCP:LISTEN`, reports
+
+```
+gs-netcat  70668  TCP *:26550 (LISTEN)
+```
+
+`*:26550`, not `127.0.0.1:26550`. `tools/gsocket_rig.py --real` makes that
+check part of its run, so the answer cannot quietly drift with an upstream
+release.
 
 So the implant's own argv — `gs-netcat -k <file> -w -p <port>` — binds
 `0.0.0.0:<local_port>`, and there is **no bind-address flag** anywhere in
@@ -637,6 +652,28 @@ python3 tools/listener_docker_rig.py smb # listener in a container
 Each registers, queues a task, and waits for the result — except for DNS,
 where the cycle stops at "the beacon decrypted the tasking", because
 there is no result to wait for.
+
+The gsocket leg has its own, because its interesting hop is not a socket on
+this host:
+
+```sh
+python3 tools/gsocket_rig.py                        # offline, nothing leaves
+python3 tools/gsocket_rig.py --real /path/gs-netcat # through the real GSRN
+```
+
+Both modes stand up the real team server on its two real sockets, place the
+implant's secret by hand the way this document tells an operator to, switch
+the other four legs off, queue a task through the real operator route, and
+wait for the result. The difference is one hop: the default stands the
+carrier in with a local forward, and `--real` has two actual `gs-netcat`
+processes pair through the relay network. **`--real` sends traffic to
+third-party infrastructure from whatever machine runs it**, which is why it
+is never the default and never runs in CI.
+
+`--real` also re-measures the two facts this feature took from reading
+upstream's C: what the forward binds, and how many characters
+`gs-netcat -g` mints. Both were wrong in a first draft of this
+documentation, in opposite directions.
 
 For something to click around in:
 

@@ -262,12 +262,17 @@ class GsocketCarrier:
     #                                  only when the port is 0
     #
     # So the implant's own shape, `gs-netcat -k <file> -w -p <port>`, binds
-    # `0.0.0.0:<local_port>`. It was read rather than run: running it means
-    # dialling the Global Socket Relay Network from the operator's own
-    # machine, which has OPSEC meaning for this project, and the source
-    # answers the question exactly. (`ss -ltnp` on Linux or
-    # `lsof -nP -iTCP -sTCP:LISTEN` on macOS is still how somebody would
-    # confirm it on a real implant.)
+    # `0.0.0.0:<local_port>`. Read first, then confirmed by running it: a
+    # real `gs-netcat -k <file> -w -p 26550` on the v1.4.43 build reports
+    # `TCP *:26550 (LISTEN)` under `lsof -nP -iTCP:26550 -sTCP:LISTEN`.
+    # That run dialled the Global Socket Relay Network from an operator's
+    # own machine, which has OPSEC meaning for this project and is why it
+    # was the operator's call to make rather than a step in a test;
+    # `tools/gsocket_rig.py --real` is where it lives now, so the answer
+    # cannot drift with an upstream release unnoticed. On a real implant
+    # the check is `ss -ltnp` (Linux), and it is still worth running there
+    # -- not for the bind, which is settled, but because the firewall rule
+    # below is what has to hold, and that rule has never been exercised.
     #
     # What follows from it: the implant's whole segment can reach the team
     # server's beacon socket through that forward -- bounded by the

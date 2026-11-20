@@ -51,15 +51,21 @@ is no floor at all -- the one secret anybody hand-writes is the one that
 matters. The same check runs when the file is read, so hand-editing the
 store is not the way around it.
 
-The number is 21, which is what `gs-netcat -g` emits: upstream
-`lib/gsocket-util.c:153-170` truncates its base58 encoding with
-`b58[22] = '\0';` ("shorten secret to 21 characters"), and that generator
-is what the operator guide tells an operator to run. A floor above it
-would refuse every secret minted the documented way. It is still a floor
-worth having: 21 base58 characters is about 123 bits, and every guess
-against it costs the guesser a fresh TCP connection to the relay network,
-so the length is not the thing that will fail -- a secret somebody chose
-by hand is, which is what the floor catches.
+The number is 21, which is one below what `gs-netcat -g` actually emits.
+Upstream `lib/gsocket-util.c:153-170` truncates its base58 encoding with
+`b58[22] = '\0';` under the comment "shorten secret to 21 characters" --
+but that terminator sits at index 22, so the string is indices 0..21 and
+the generator emits **22**. Measured, not read: three runs of the v1.4.43
+macOS build gave 22 characters each. The comment in upstream's own source
+contradicts its own code, and this file deliberately trusts neither
+number alone: the floor sits below both, so it keeps working whichever
+one a future release honours. A floor above either would refuse the
+secret minted the documented way, which is the failure this number
+replaced. It is still a floor worth having: 21 base58 characters is about
+123 bits, and every guess against it costs the guesser a fresh TCP
+connection to the relay network, so the length is not the thing that will
+fail -- a secret somebody chose by hand is, which is what the floor
+catches.
 
 Whitespace and control characters are
 refused for a different reason: `secret_file_for` writes the secret and
@@ -126,13 +132,19 @@ from typing import Any, Dict, List, Optional, Tuple
 # `register_implant`, which refuses anything shorter, and `generate`
 # reads this rather than repeating the number.
 #
-# **21, because that is what `gs-netcat -g` emits** -- the generator the
-# operator guide tells an operator to use, and the only credential path
-# this feature has. Upstream `lib/gsocket-util.c:153-170` base58-encodes
-# its random bytes and then writes `b58[22] = '\0';` with the comment
-# "shorten secret to 21 characters". A floor of 24 refused every secret
-# minted the documented way, which left the guide's two commands unable
-# both to succeed and its fallback the one the guide forbids.
+# **21, which is one below what `gs-netcat -g` emits** -- the generator
+# the operator guide tells an operator to use, and the only credential
+# path this feature has. Upstream `lib/gsocket-util.c:153-170`
+# base58-encodes its random bytes and then writes `b58[22] = '\0';` with
+# the comment "shorten secret to 21 characters". That terminator is at
+# index 22, so the string is indices 0..21: the code emits **22** and its
+# own comment says 21. Measured on the v1.4.43 macOS build, three runs,
+# 22 characters each (`tools/gsocket_rig.py --real` re-measures it).
+#
+# The floor sits below both numbers on purpose, so it survives whichever
+# one a future release decides to honour. A floor of 24 refused every
+# secret minted the documented way, which left the guide's two commands
+# unable both to succeed and its fallback the one the guide forbids.
 #
 # The floor is still a real floor. 21 characters of base58 is about 123
 # bits (21 * log2(58)), and this alphabet is 57 characters, so a
