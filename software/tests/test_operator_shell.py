@@ -3381,7 +3381,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """Twenty-eight tests hide behind `skipUnless(node)`.
+        """Fifty tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3389,7 +3389,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of twenty-eight quiet skips.
+        One loud failure instead of fifty quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3406,7 +3406,8 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # is what happened twice: five tests deleted at once while the
         # total still looked plausible, and later a single named safety
         # test deleted while the total *rose* from 231 to 246. So the floor
-        # sits close to the real count --
+        # sits close to the real count -- 48 against 50 when it was set,
+        # carried with the controller's nod --
         self.assertGreaterEqual(
             len(names), 48,
             "only %d behavioural view tests remain; a named safety test was "
@@ -3530,8 +3531,14 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "console.log(JSON.stringify({session: opshellSession,"
             " urls: posted.map(p => p.url)}));")
         self.assertEqual(got["session"], "kept-1")
-        self.assertTrue(got["urls"][0].startswith("/api/opshell/state"),
-                        got["urls"])
+        # The id rides in the query string, and `startswith` could not see
+        # that: `encodeURIComponent("")` left `?session=` and passed. The
+        # server reads that arg to beat *this* claim and to report the
+        # geometry of *this* bridge, so without it the claim is not
+        # heartbeat by the request that resumed it and the card reports
+        # another tab's pty size.
+        self.assertIn("/api/opshell/state?session=kept-1", got["urls"][0],
+                      got["urls"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_session_that_is_gone_is_forgotten_rather_than_drawn(self):
@@ -3551,6 +3558,26 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " bodies: Object.keys(els)}));")
         self.assertIsNone(got["session"])
         self.assertIsNone(got["remembered"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_channel_that_is_not_up_yet_is_not_resumed_either(self):
+        # The other half of the same guard, and it was unpinned: cut to
+        # `if(!(state.sessions > 0))` the suite stayed green, and then a
+        # `waiting` or `closing` answer that happens to carry another tab's
+        # session count adopts the id and draws a terminal for a channel
+        # that is not up -- `/stream` would refuse it, which is the card
+        # looking live over nothing that Review Focus 2 is about.
+        for state in ("waiting", "closing"):
+            got = self._node(
+                "sessionStorage.setItem(opshellStore, 'early-1');\n"
+                "replies = [{ok:true, status:200, body:{state:'%s',"
+                " channel:'closed', sessions:1}}];\n"
+                "await opshellResume();\n"
+                "console.log(JSON.stringify({session: opshellSession,"
+                " remembered: sessionStorage.getItem(opshellStore)}));"
+                % state)
+            self.assertIsNone(got["session"], state)
+            self.assertIsNone(got["remembered"], state)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_session_this_server_does_not_know_is_not_adopted(self):
@@ -3634,24 +3661,39 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_session_is_not_given_up_on_a_server_that_did_not_answer(self):
-        # An id is surrendered on the server's word, not on a blip: a
-        # request that never arrived says nothing about the session, and
-        # forgetting the id there turns one unlucky reload into a channel
-        # this page can no longer put back by itself.
+        # An id is surrendered on the server's word about the session, and
+        # on nothing else. Both halves, because the first version of this
+        # test drove only the throw: `if(!r.ok || !state){ opshellRemember(
+        # ""); return false; }` was green across the whole suite, and that
+        # is the 401 -- the case this narrowing was argued from. The token
+        # gate prompts, the operator types the token, and the id has
+        # already been thrown away by a resume that ran before either.
         #
-        # It also proves the resume cannot reject. Startup calls it bare,
-        # so a rejection is an unhandled one -- and node exits non-zero on
-        # it, which `_node` reads as a failure.
-        got = self._node(
-            "sessionStorage.setItem(opshellStore, 'kept-2');\n"
-            "replies = [{throw:'Failed to fetch'}];\n"
-            "await opshellResume();\n"
-            "console.log(JSON.stringify({session: opshellSession,"
-            " remembered: sessionStorage.getItem(opshellStore),"
-            " urls: posted.map(p => p.url)}));")
-        self.assertIsNone(got["session"])
-        self.assertEqual(got["remembered"], "kept-2")
-        self.assertEqual(len(got["urls"]), 1)
+        # A request that never arrived is the other half: it says nothing
+        # about the session, and forgetting there turns one unlucky reload
+        # into a channel this page can no longer put back by itself.
+        #
+        # The throw case also shows that the resume's fetch path cannot
+        # reject -- startup calls it bare, so a rejection is an unhandled
+        # one and node exits non-zero, which `_node` reads as a failure.
+        # Only that path: `showOperatorShell` and `opshellAttach` are
+        # reached on the live path and are not covered here.
+        for reply, why in (("{throw:'Failed to fetch'}", "a dropped request"),
+                           ("{ok:false, status:401, body:{}}", "a 401"),
+                           ("{ok:false, status:502, body:{}}", "a 502")):
+            got = self._node(
+                "sessionStorage.setItem(opshellStore, 'kept-2');\n"
+                "replies = [%s];\n"
+                "await opshellResume();\n"
+                "console.log(JSON.stringify({session: opshellSession,"
+                " remembered: sessionStorage.getItem(opshellStore),"
+                " urls: posted.map(p => p.url)}));" % reply)
+            self.assertIsNone(got["session"], why)
+            self.assertEqual(got["remembered"], "kept-2",
+                             "%s cost the operator the remembered session"
+                             % why)
+            # One request, not a retry loop inside startup.
+            self.assertEqual(len(got["urls"]), 1, why)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_refusal_from_open_is_shown_and_not_swallowed(self):
@@ -4089,6 +4131,14 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " session: opshellSession,"
             " closed: posted.filter(p => p.url.endsWith('close')).length}));")
         self.assertRegex(got["said"], r"session ended")
+        # And this session, which nothing resumed, is not told it replaced
+        # one. `if(opshellFresh)` reduced to `if(true)` was green across
+        # the whole suite: every freshly opened shell then announced "the
+        # previous session ended with the page that held it", which in a
+        # fresh tab is false. An invented predecessor is the same class of
+        # defect as silence about a real one -- this is the direction of
+        # the lie that no other test was watching.
+        self.assertNotRegex(got["said"], r"(?i)new shell")
         self.assertIsNone(got["session"])
         self.assertEqual(got["closed"], 1,
                          "a finished stream did not end the session")

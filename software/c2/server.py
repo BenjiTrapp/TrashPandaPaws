@@ -8439,10 +8439,14 @@ let opshellStore = "raccoon_opshell_session";
 let opshellFresh = false;
 
 function opshellRemember(session){
-  // One place, called wherever `opshellSession` is assigned, so what is
-  // remembered cannot drift from what this page holds -- a remembered id
-  // for a session that was handed back is a card drawn over nothing on the
-  // next load.
+  // Three call sites, and they are the three places a session starts or
+  // stops being this page's: `opshellOpen` when one is adopted,
+  // `opshellResume` when the server disowns the one that was remembered,
+  // and `opshellEndSession` when one ends. Not every assignment of
+  // `opshellSession` -- the hand-back branch in `opshellOpen` sets the
+  // field only so the close has an id to post, and remembering an id this
+  // page is giving straight back would draw a card over it on the next
+  // load.
   if(session) sessionStorage.setItem(opshellStore, session);
   else sessionStorage.removeItem(opshellStore);
 }
