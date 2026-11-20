@@ -3699,9 +3699,11 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # node, left for the class that reads the source -- and 85 against
         # 87 once the measured geometry brought seven: its ratio, its floor,
         # its cap, the hidden card's fallback, the probe's removal, the
-        # pair that is sent and the host's box --
+        # pair that is sent and the host's box -- and 87 against 89 once the
+        # attach said when it had not fitted the card, and said nothing when
+        # it had, and told a probe failure from a hidden card --
         self.assertGreaterEqual(
-            len(names), 85,
+            len(names), 87,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -6054,6 +6056,51 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertIn("cols=%d&rows=%d" % (cols, rows), got["url"])
         self.assertNotEqual([cols, rows], [120, 40],
                             "the measurement never replaced the old default")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_terminal_that_was_not_fitted_says_so_once_and_a_fitted_one_does_not(self):
+        """The size is fixed for the life of the connection, so an operator
+        who restores a card that was hidden at the attach sees a small
+        terminal in a wide box with no way to resize it and no way to know
+        why. Driven through `opshellAttach`, both ways: a note that always
+        fires is the same defect as one that never does."""
+        script = (
+            "const card = el('opshell-card');\n"
+            "const host = el('opshell-term');\n"
+            "card.appendChild(host);\n"
+            "host.box = {width: 1600, height: 800};\n"
+            "card.style.display = '%s';\n"
+            "globalThis.Terminal = function(o){ globalThis.t = fakeTerm();"
+            " return t; };\n"
+            "opshellSession = 'sid';\n"
+            "fakeBox(8, 16);\n"
+            "nextReply = {ok:true, status:200, stream: fakeStream(['x'])};\n"
+            "await opshellAttach({state:'live', host:'parrot'});\n"
+            "console.log(JSON.stringify({lines: t.lines}));")
+        hidden = self._node(script % "none")["lines"]
+        notes = [l for l in hidden if "not fitted" in l]
+        self.assertEqual(len(notes), 1, hidden)
+        self.assertIn("not visible", notes[0])
+        self.assertIn("120x40", notes[0])
+        self.assertIn("keeps", notes[0])
+        shown = self._node(script % "")["lines"]
+        self.assertEqual([l for l in shown if "not fitted" in l], [], shown)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_probe_that_measures_nothing_is_not_blamed_on_the_card(self):
+        got = self._node(
+            "const host = el('opshell-term');\n"
+            "host.box = {width: 1600, height: 800};\n"
+            "globalThis.Terminal = function(o){ globalThis.t = fakeTerm();"
+            " return t; };\n"
+            "opshellSession = 'sid';\n"
+            "nextReply = {ok:true, status:200, stream: fakeStream(['x'])};\n"
+            "await opshellAttach({state:'live', host:'parrot'});\n"
+            "console.log(JSON.stringify({lines: t.lines}));")
+        notes = [l for l in got["lines"] if "not fitted" in l]
+        self.assertEqual(len(notes), 1, got["lines"])
+        self.assertNotIn("not visible", notes[0],
+                         "a visible card was said to be hidden")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_terminal_host_has_a_box_to_be_measured_in(self):

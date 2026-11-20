@@ -8482,6 +8482,11 @@ let opshellKeys = "";
 let opshellFlushing = false;
 let opshellTrouble = "";
 let opshellNoted = "";
+// Why the last measurement fell back to the default, or "" when it fitted.
+// Set by `opshellMeasure`, read once by `opshellAttach` to say so in the
+// terminal: the size is fixed for the connection, so an operator who finds a
+// small terminal in a wide box has no other way to learn why.
+let opshellUnfitted = "";
 // Whether the card is parked in the sidebar rather than shown. Hidden and
 // not taken down: see `opshellMinimise`.
 let opshellMinimised = false;
@@ -9366,8 +9371,12 @@ async function opshellFlushKeys(){
 // with no explanation.
 function opshellMeasure(host){
   const fallback = [120, 40];
+  opshellUnfitted = "";
   const room = host.getBoundingClientRect();
-  if(!(room.width > 0) || !(room.height > 0)) return fallback;
+  if(!(room.width > 0) || !(room.height > 0)){
+    opshellUnfitted = "it was not visible when this session attached";
+    return fallback;
+  }
   // One character of the terminal's own font. It has to be in the page to
   // have a size, so it is appended, read and taken out again.
   const probe = document.createElement("span");
@@ -9382,7 +9391,10 @@ function opshellMeasure(host){
   document.body.appendChild(probe);
   let cell;
   try { cell = probe.getBoundingClientRect(); } finally { probe.remove(); }
-  if(!(cell.width > 0) || !(cell.height > 0)) return fallback;
+  if(!(cell.width > 0) || !(cell.height > 0)){
+    opshellUnfitted = "the page could not measure a character of its font";
+    return fallback;
+  }
   const fit = (room, one, floor) =>
     Math.min(1000, Math.max(floor, Math.floor(room / one)));
   return [fit(room.width, cell.width, 20), fit(room.height, cell.height, 5)];
@@ -9402,6 +9414,12 @@ async function opshellAttach(state){
   opshellTerm.writeln("\x1b[2m-- live on " + (state.host || state.target || "?")
     + " \u00b7 history is off in this session \u00b7 " + cols + "x" + rows
     + ", fixed for this session --\x1b[0m");
+  if(opshellUnfitted){
+    // Said once, here, because this is the only moment the size is chosen.
+    opshellTerm.writeln("\x1b[2m-- not fitted to the card: " + opshellUnfitted
+      + ", so this session keeps " + cols + "x" + rows + ". A session "
+      + "opened while the card is visible is fitted to it --\x1b[0m");
+  }
   if(opshellFresh){
     // Said once, beside the line above, on a session the page picked back
     // up after a reload. The shell is not the one that was there: the
