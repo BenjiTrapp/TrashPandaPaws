@@ -8485,6 +8485,17 @@ let opshellMinimised = false;
 // not cleared when a session ends, for that reason: what it is, always, is
 // the last thing this view was told.
 let opshellSeen = null;
+// The markup this page last wrote into the dock, and what the poll decides
+// against. Not `dock.innerHTML`: a browser's getter re-serializes the DOM,
+// so a remnant's `&#10005;` reads back as `✕` and an `&#39;` in a hostname
+// reads back as `'` -- measured in a browser at offsets 474 and 293 -- and
+// a guard comparing the two would find them different on every single
+// tick, rewriting the dock every two seconds and destroying the buttons in
+// it, which is the defect the guard exists to prevent. Nothing else in the
+// page writes the dock, so this is the node's content. Every write to the
+// dock sets it, and both places the dock is removed clear it, or the next
+// tick skips a change or draws nothing into a fresh tray.
+let opshellDockHtml = "";
 // Where this tab remembers the session it is holding, so a reload can put
 // the card back instead of leaving a live root shell on the device with
 // nothing on screen. `sessionStorage` and not `localStorage`: it is per
@@ -8701,8 +8712,11 @@ function opshellMinimise(ev){
   dock.id = "opshell-dock";
   dock.classList.add("opshell-dock");
   // Drawn from the last state the poll read, so the label is right from
-  // the moment it appears; the poll rewrites it every two seconds.
-  dock.innerHTML = opshellParked(opshellSeen);
+  // the moment it appears; the poll rewrites it when it changes. The write
+  // is unconditional here, whatever the remembered markup says, because
+  // this tray is new and empty.
+  opshellDockHtml = opshellParked(opshellSeen);
+  dock.innerHTML = opshellDockHtml;
   sidebar.appendChild(dock);
 }
 
@@ -8714,6 +8728,7 @@ function opshellRestore(ev){
   sessionStorage.removeItem(opshellStore + "_min");
   const dock = document.getElementById("opshell-dock");
   if(dock) dock.remove();
+  opshellDockHtml = "";
   // A restore with no card to show hides nothing. Hiding `#content` with
   // nothing over it is the blank column by the other door.
   if(!card) return;
@@ -8831,7 +8846,12 @@ async function opshellEndSession(){
   // request below, for the same reason the cross takes the card down
   // before its own: the screen is not left wrong behind a round trip.
   const parked = document.getElementById("opshell-dock");
-  if(parked) parked.innerHTML = opshellParked(opshellSeen);
+  if(parked){
+    // Remembered as well as written, or the poll's next tick compares its
+    // label with a string this never replaced and skips a real change.
+    opshellDockHtml = opshellParked(opshellSeen);
+    parked.innerHTML = opshellDockHtml;
+  }
   // The answer is read, not merely awaited. The first version discarded
   // it, so every one of the three ways a stop can be refused was silent:
   // a rejected request, a `reason` from `may_stop` ("live socks sessions
@@ -8887,6 +8907,7 @@ function opshellTeardown(card){
   opshellMinimised = false;
   const dock = document.getElementById("opshell-dock");
   if(dock) dock.remove();
+  opshellDockHtml = "";
   // And the last state read, for the same reason the line above drops the
   // duration: the view is going away, so what it was told goes with it.
   // Without this, reopening the panel and pressing `_` before its first
@@ -8996,10 +9017,19 @@ async function opshellPoll(){
   // to `<body>` every two seconds and a keyboard-only operator cannot
   // reliably reach the button and press Enter -- and the label's selection
   // and the cursor's animation restart with it.
+  //
+  // Against the markup this page last wrote and not against
+  // `dock.innerHTML`, which in a browser is the DOM read back: a remnant's
+  // `&#10005;` returns as `✕`, so comparing with the node would have found
+  // a difference on every tick and rewritten exactly the label that has
+  // two buttons in it.
   const dock = document.getElementById("opshell-dock");
   if(dock){
     const next = opshellParked(state);
-    if(dock.innerHTML !== next) dock.innerHTML = next;
+    if(next !== opshellDockHtml){
+      opshellDockHtml = next;
+      dock.innerHTML = next;
+    }
   }
   if(!opshellAttached){
     body.innerHTML = opshellRender(state);

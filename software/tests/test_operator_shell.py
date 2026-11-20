@@ -3663,7 +3663,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """Seventy-nine tests hide behind `skipUnless(node)`.
+        """Eighty tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3671,7 +3671,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of seventy-nine quiet skips.
+        One loud failure instead of eighty quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3693,12 +3693,12 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # harness's DOM brought three tests of its own, and 57 against 59
         # once the card, its double-press guard and its missing-mount guard
         # brought five more, and 59 against 61 once the card's restore and
-        # its title brought two, and 77 against 79 once minimise, the park,
-        # the restore, the remnant's own cross and a review's five
-        # bypasses brought eighteen -- one of which, a grep that ran no
+        # its title brought two, and 78 against 80 once minimise, the park,
+        # the restore, the remnant's own cross and two reviews' six
+        # bypasses brought nineteen -- one of which, a grep that ran no
         # node, left for the class that reads the source --
         self.assertGreaterEqual(
-            len(names), 77,
+            len(names), 78,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -5637,9 +5637,14 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # hidden, and `exit` lands between two ticks: waiting for the next
         # poll leaves "channel open" standing over a shell that is gone,
         # for up to two seconds, and the ✕ that dismisses the remnant
-        # arrives that late too. No timer is run here, and the queue holds
-        # exactly the poll and the close, so a poll sneaking in would be an
-        # error rather than a free pass.
+        # arrives that late too. No timer is run here, so every request is
+        # one this test asked for.
+        #
+        # The tick after that end is driven as well, because this write
+        # has to leave the poll's memory of the label in step: a remnant
+        # the poll believes it has not written yet is a remnant rewritten
+        # on the next tick, with the two buttons in it destroyed -- the
+        # defect the poll's guard exists to prevent, by another door.
         got = self._node(
             "opshellSession = 'sid';\n"
             "opshellStarted = Date.now() - 92000;\n"
@@ -5648,13 +5653,22 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "els['main'].appendChild(els['content']);\n"
             "replies = [{ok:true, status:200, body:{state:'live',"
             " channel:'open', host:'parrot'}},"
-            " {ok:true, status:200, body:{}}];\n"
+            " {ok:true, status:200, body:{}},"
+            " {ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot'}}];\n"
             "await showOperatorShell();\n"
             "opshellMinimise();\n"
             "const parked = els['sidebar'].children[0];\n"
             "const before = parked.innerHTML;\n"
             "await opshellEndSession();\n"
-            "console.log(JSON.stringify({before, after: parked.innerHTML,"
+            "const after = parked.innerHTML;\n"
+            "const mark = document.createElement('b');\n"
+            "parked.appendChild(mark);\n"
+            "const writes = parked.htmlWrites.length;\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({before, after,"
+            " writes, later: parked.htmlWrites.length,"
+            " kept: mark.parentNode !== null,"
             " urls: posted.map(p => p.url.split('?')[0])}));")
         self.assertRegex(got["before"], r"(?i)channel open")
         self.assertRegex(got["after"], r"(?i)session ended")
@@ -5667,8 +5681,14 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # queues.
         self.assertNotIn("opshellClose(", got["before"])
         self.assertIn("opshellClose(", got["after"])
-        self.assertEqual(got["urls"],
-                         ["/api/opshell/state", "/api/opshell/close"])
+        # The tick after the end says the same thing, so it writes
+        # nothing and the remnant's buttons stay where they were.
+        self.assertEqual(got["later"], got["writes"],
+                         "the tick after the end rewrote the remnant")
+        self.assertTrue(got["kept"])
+        self.assertEqual(got["urls"], ["/api/opshell/state",
+                                       "/api/opshell/close",
+                                       "/api/opshell/state"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_parked_cross_dismisses_what_the_session_left(self):
@@ -5802,6 +5822,69 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # operator cannot reliably Tab to Restore and press Enter. What
         # the harness can show is the write itself, through what a write
         # destroys and through the count of writes.
+        #
+        # The park here follows a poll, so the tick after it says exactly
+        # what the park said: that pins the park's own write into the
+        # poll's memory of the label as well as the guard that reads it,
+        # because a park the poll believes it has not seen is a dock
+        # rewritten on the very next tick.
+        got = self._node(
+            "opshellSession = 'sid';\n"
+            "els['opshell-card'] = el('opshell-card');\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['sidebar'] = el('sidebar'); els['content'] = el('content');\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot'}},"
+            " {ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot'}},"
+            " {ok:true, status:200, body:{state:'live',"
+            " channel:'closed', host:'parrot'}}];\n"
+            "await opshellPoll();\n"
+            "opshellMinimise();\n"
+            "const dock = els['sidebar'].children[0];\n"
+            "const parkWrites = dock.htmlWrites.length;\n"
+            "const mark = document.createElement('b');\n"
+            "dock.appendChild(mark);\n"
+            "await opshellPoll();\n"
+            "const quiet = [dock.htmlWrites.length, mark.parentNode !== null];\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({parkWrites, quiet,"
+            " writes: dock.htmlWrites.length,"
+            " kept: mark.parentNode !== null, html: dock.innerHTML}));")
+        # The park writes the tray once, whatever was remembered before.
+        self.assertEqual(got["parkWrites"], 1)
+        # The tick after it says the same thing, so it writes nothing and
+        # leaves what is in the tray alone.
+        self.assertEqual(got["quiet"], [1, True],
+                         "a tick that changed nothing rewrote the dock, "
+                         "and took the buttons in it with it")
+        # And the tick that does change it writes, or the label would be
+        # the lie the refresh exists to prevent.
+        self.assertEqual(got["writes"], 2)
+        self.assertFalse(got["kept"])
+        self.assertRegex(got["html"], r"(?i)channel closed")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_parked_label_is_compared_with_the_markup_it_wrote(self):
+        """A browser's `innerHTML` getter re-serializes the DOM.
+
+        A remnant's `&#10005;` reads back as `✕`, and an `&#39;` from a
+        hostname reads back as `'` because `esc()`'s output lands in a
+        text node -- measured in a browser at offsets 474 and 293. So a
+        guard that compares the node's `innerHTML` with the markup it is
+        about to write finds them different on every tick, and rewrites
+        the dock every two seconds: the defect the guard exists to
+        prevent, on the one path that has two focusable controls rather
+        than one. `opshellRetitle`'s sibling guard is safe because
+        `textContent` has no serializer.
+
+        This harness cannot show that -- its getter returns the string
+        that was written, verbatim -- but it can show the semantics that
+        replaces it. The dock is judged by what this page last wrote into
+        it, and nothing else in the page writes the dock, so something
+        else appearing in the node is not a change this label has to
+        answer for.
+        """
         got = self._node(
             "opshellSession = 'sid';\n"
             "els['opshell-card'] = el('opshell-card');\n"
@@ -5812,27 +5895,21 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "replies = [{ok:true, status:200, body:{state:'live',"
             " channel:'open', host:'parrot'}},"
             " {ok:true, status:200, body:{state:'live',"
-            " channel:'open', host:'parrot'}},"
-            " {ok:true, status:200, body:{state:'live',"
-            " channel:'closed', host:'parrot'}}];\n"
+            " channel:'open', host:'parrot'}}];\n"
             "await opshellPoll();\n"
-            "const mark = document.createElement('b');\n"
-            "dock.appendChild(mark);\n"
+            "const mine = dock.htmlWrites.length;\n"
+            "dock.innerHTML = 'what a browser reads back';\n"
             "await opshellPoll();\n"
-            "const quiet = [dock.htmlWrites.length, mark.parentNode !== null];\n"
-            "await opshellPoll();\n"
-            "console.log(JSON.stringify({quiet,"
-            " writes: dock.htmlWrites.length,"
-            " kept: mark.parentNode !== null}));")
-        # Two writes: the park's own, and the first poll's label. The
-        # second poll said the same thing and wrote nothing.
-        self.assertEqual(got["quiet"], [2, True],
-                         "a tick that changed nothing rewrote the dock, "
-                         "and took the buttons in it with it")
-        # And the tick that does change it writes, or the label would be
-        # the lie the refresh exists to prevent.
-        self.assertEqual(got["writes"], 3)
-        self.assertFalse(got["kept"])
+            "console.log(JSON.stringify({mine,"
+            " writes: dock.htmlWrites.length, html: dock.innerHTML}));")
+        # The park's own write, and the first poll's label.
+        self.assertEqual(got["mine"], 2)
+        # The write below is the third, and the tick after it adds none:
+        # what changed is the node, not the markup this page wrote.
+        self.assertEqual(got["writes"], 3,
+                         "the poll judged the dock by what the node reads "
+                         "back, so a remnant is rewritten on every tick")
+        self.assertEqual(got["html"], "what a browser reads back")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_hostname_cannot_write_markup_into_the_parked_card(self):
@@ -5849,8 +5926,13 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " host:'<img src=x>\\\" onmouseover=1 \\''})}));")
         self.assertNotIn("<img", got["html"])
         self.assertIn("&lt;img", got["html"])
-        # The quote that would end the title attribute, and the one that
-        # would end a single-quoted one.
+        # `<` is the one that matters in the position the host lands in --
+        # text, inside a span; the `title` beside it is a literal string
+        # and the host never reaches an attribute. The two quotes are
+        # checked because they are what tells `esc()` apart from a
+        # hand-rolled `<`-only replacement: all five of its substitutions
+        # ran on this value, so moving the host into an attribute later
+        # cannot open a hole that was never closed.
         self.assertIn("&quot;", got["html"])
         self.assertIn("&#39;", got["html"])
 
