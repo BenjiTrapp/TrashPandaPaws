@@ -4668,6 +4668,26 @@ header .info{font-size:11px;color:var(--text2)}
   .opshell-cursor{animation:none}
 }
 
+/* The Operator Shell's card.
+   A flex sibling of .content inside .main, and .content is hidden while it
+   is there: .main is a row holding the 260px agent list beside .content, so
+   a layer positioned over .main would cover the list this layout keeps
+   clickable, and two flex:1 siblings would split the column in half. */
+.opshell-card{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+.opshell-chrome{
+  display:flex;align-items:center;gap:10px;flex:none;
+  padding:8px 16px;background:var(--surface);border-bottom:1px solid var(--border);
+  font-family:var(--mono);font-size:12px;color:var(--text);
+}
+.opshell-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.opshell-ctl{
+  background:none;border:none;cursor:pointer;font-family:var(--mono);
+  font-size:18px;line-height:1;color:var(--text2);padding:4px 8px;
+  border-radius:3px;transition:color 0.15s,background 0.15s;
+}
+.opshell-ctl:hover{color:var(--text);background:rgba(255,26,26,0.12)}
+#opshell-body{flex:1;min-height:0;overflow:auto;padding:12px 16px}
+
 /* Notification bell */
 .bell-wrap{position:relative;margin-left:8px}
 .bell-btn{
@@ -8502,29 +8522,66 @@ async function opshellResume(){
   return true;
 }
 
+function opshellChrome(name){
+  // The card's own header. Both controls call their handler directly with
+  // the event. The cross goes to `opshellClose`, which also takes the card
+  // down, and not to the bare session ender; the underscore goes to
+  // `opshellMinimise`, which keeps the session.
+  return '<span class="opshell-glyph">&gt;<span class="opshell-cursor">_'
+    + '</span></span><span class="opshell-title">' + esc(name) + '</span>'
+    + '<button class="opshell-ctl" title="Minimise" '
+    + 'onclick="opshellMinimise(event)">_</button>'
+    + '<button class="opshell-ctl" title="Close and end the session" '
+    + 'onclick="opshellClose(event)">&#10005;</button>';
+}
+
 async function showOperatorShell(){
   // Dials nothing. The channel is raised only when the operator presses
   // the button in the view below, which says so.
-  const overlay = document.createElement("div");
-  overlay.className = "loot-overlay";
-  overlay.onclick = e => { if(e.target===overlay) opshellTeardown(overlay); };
-  const panel = document.createElement("div");
-  panel.className = "loot-panel panel-wide";
-  overlay.appendChild(panel);
-  document.body.appendChild(overlay);
-  panel.innerHTML = '<h2><span class="opshell-glyph">&gt;'
-    + '<span class="opshell-cursor">_</span></span> Operator Shell</h2>'
-    + '<button class="loot-close" onclick="opshellTeardown('
-    + 'this.closest(\'.loot-overlay\'))">&#10005;</button>'
-    + '<div id="opshell-body" class="loot-loading">Loading...</div>';
+  //
+  // The header button is reachable while the card is up, since the card is
+  // no longer a modal: a second press must not draw a second `#opshell-body`.
+  if(document.getElementById("opshell-card")) return;
+  const main = document.querySelector(".main");
+  const card = document.createElement("div");
+  card.id = "opshell-card";
+  card.classList.add("opshell-card");
+  const chrome = document.createElement("div");
+  chrome.classList.add("opshell-chrome");
+  chrome.innerHTML = opshellChrome("Operator Shell");
+  // Its own element with its `id` set before it is appended, and not a
+  // child born inside some parent's `innerHTML`: the render fills this one
+  // node and the poll finds it by id.
+  const body = document.createElement("div");
+  body.id = "opshell-body";
+  body.classList.add("loot-loading");
+  body.innerHTML = "Loading...";
+  card.appendChild(chrome);
+  card.appendChild(body);
+  main.appendChild(card);
+  // Hidden and not emptied: `renderAgentView` rewrites its children on
+  // every agent click, and they are what comes back when the card goes.
+  document.querySelector("#content").style.display = "none";
   await opshellPoll();
 }
 
+async function opshellClose(ev){
+  // The cross, and the only path it uses. The session ends with the card
+  // gone from the page first, so the column is not left hidden behind a
+  // request that takes a moment.
+  const card = document.getElementById("opshell-card");
+  const ended = opshellTeardown(card);
+  document.querySelector("#content").style.display = "";
+  return ended;
+}
+
 async function opshellEndSession(){
-  // One releaser on this side, as there is one on the server's: the ✕, a
-  // click outside the panel, `exit`, and the End button all arrive here. A
-  // closed tab does not: it is indistinguishable from a reload, and the
-  // lapse retires that claim. The previous version had none -- teardown cleared a timer
+  // One releaser on this side, as there is one on the server's: the ✕
+  // (through `opshellClose`), `exit`, and the End button all arrive here. The
+  // card is a flex sibling and not a modal, so there is no click outside it
+  // to release anything. A closed tab does not arrive: it is
+  // indistinguishable from a reload, and the lapse retires that claim. The
+  // previous version had none -- teardown cleared a timer
   // and returned, so the channel stayed up on the device while the panel's
   // own text promised that closing it queued the shutdown, and teardown's
   // own comment claimed the lapse would do it. The lapse could not: it ran
@@ -8603,7 +8660,7 @@ async function opshellEndSession(){
   return true;
 }
 
-function opshellTeardown(overlay){
+function opshellTeardown(card){
   // The view goes away and so does the session. Closing the panel is one
   // of the two ways the design says a session ends.
   if(opshellTimer){ clearTimeout(opshellTimer); opshellTimer = null; }
@@ -8611,7 +8668,7 @@ function opshellTeardown(overlay){
   // Otherwise reopening the panel an hour later still says "the session
   // lasted 92s" above the picker.
   opshellLast = null;
-  if(overlay) overlay.remove();
+  if(card) card.remove();
   return opshellEndSession();
 }
 

@@ -3094,6 +3094,28 @@ class TestTheGlyphAndTheView(_GuiCase):
         self.assertIn("showOperatorShell()",
                       self.js_function("opshellResume"))
 
+    def test_the_chrome_carries_both_window_controls(self):
+        chrome = self.js_function("opshellChrome")
+        self.assertIn("opshellMinimise(", chrome)
+        self.assertIn("opshellClose(", chrome)
+        # Not the inert handler, and not from the render: the render is
+        # asserted elsewhere to be free of it.
+        self.assertNotIn("opshellEndSession()", chrome)
+
+    def test_the_card_takes_the_content_column_and_not_the_whole_row(self):
+        # Ruled during execution, against the markup rather than the plan:
+        # `.main` is a flex row holding the 260px sidebar beside
+        # `.content`, so an `inset:0` layer inside it would cover the agent
+        # list this layout exists to keep visible.
+        rules = [l.strip() for l in SERVER_SRC.splitlines()
+                 if l.strip().startswith(".opshell-card{")]
+        self.assertEqual(len(rules), 1,
+                         "expected exactly one .opshell-card rule, got %d"
+                         % len(rules))
+        self.assertIn("flex:1", rules[0])
+        self.assertNotIn("position:absolute", rules[0])
+        self.assertNotIn("inset:0", rules[0])
+
     def test_the_view_dials_nothing_until_the_operator_asks(self):
         # The goal: nothing happens on open, on hover, or on page load. The
         # channel is raised only when the operator presses the button in
@@ -3551,8 +3573,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "opshellRender", "opshellOpen", "opshellB64",
             "opshellSay", "opshellDropRest", "opshellFlushKeys",
             "opshellEndAfterAttach", "opshellRemember", "opshellRecall",
-            "opshellResume", "showOperatorShell",
-            "opshellPoll", "opshellAttach")]) + "\n"
+            "opshellResume", "showOperatorShell", "opshellChrome",
+            "opshellClose", "opshellPoll", "opshellAttach")]) + "\n"
         # The one module constant the keystroke path reads.
         const = re.search(r"^const OPSHELL_KEYS_CEILING = .*$",
                           SERVER_SRC, re.M)
@@ -3878,6 +3900,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_remembered_session_is_resumed_on_load(self):
         got = self._node(
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['main'].appendChild(els['content']);\n"
             "sessionStorage.setItem(opshellStore, 'kept-1');\n"
             "replies = [{ok:true, status:200, body:{state:'live',"
             " channel:'open', host:'parrot', sessions:1}}];\n"
@@ -3956,12 +3980,19 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
     def test_a_resumed_session_says_it_is_a_new_shell(self):
         got = self._node(
             "sessionStorage.setItem(opshellStore, 'kept');\n"
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['main'].appendChild(els['content']);\n"
             "els['opshell-term'] = el('opshell-term');\n"
             "const term = fakeTerm();\n"
             "globalThis.Terminal = function(){ return term; };\n"
-            "replies = [{ok:true, status:200, body:{state:'live',"
-            " channel:'open', host:'parrot', sessions:1}},"
-            " {ok:true, status:200, stream: fakeStream(['x'])}];\n"
+            # The card is drawn for real now, so its poll runs and takes a
+            # reply of its own, as it does in the two-terminals test below.
+            "const live = {state:'live', channel:'open', host:'parrot',"
+            " sessions:1, geometry:[80,24]};\n"
+            "replies = [{ok:true, status:200, body:live},"
+            " {ok:true, status:200, body:live},"
+            " {ok:true, status:200, stream: fakeStream(['x'])},"
+            " {ok:true, status:200, body:{}}];\n"
             "await opshellResume();\n"
             "console.log(JSON.stringify({said: term.lines.join(' ')}));")
         self.assertRegex(got["said"], r"(?i)new shell")
@@ -3976,7 +4007,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # operator is typing into goes quiet with no line to say why.
         got = self._node(
             "sessionStorage.setItem(opshellStore, 'kept-3');\n"
-            "els['opshell-body'] = el('opshell-body');\n"
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['main'].appendChild(els['content']);\n"
             "els['opshell-term'] = el('opshell-term');\n"
             "globalThis.Terminal = function(){ return fakeTerm(); };\n"
             "const live = {state:'live', channel:'open', host:'parrot',"
@@ -4956,6 +4988,86 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # keystrokes: the point of coalescing.
         self.assertEqual("".join(got["text"]), "abc")
         self.assertLess(len(got["text"]), 3)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_card_sits_in_the_content_column_and_not_inside_content(self):
+        # `renderAgentView` writes `#content.innerHTML` on every agent
+        # click, and this design wants the agent list clickable. A card
+        # that lived inside `.content` would lose its terminal to a click.
+        got = self._node(
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['main'].appendChild(els['content']);\n"
+            "els['content'].innerHTML = '<div class=\"empty\"></div>';\n"
+            "await showOperatorShell();\n"
+            "const card = els['main'].children[els['main'].children.length-1];\n"
+            "console.log(JSON.stringify({content: els['content'].innerHTML,"
+            " bodyExists: !!document.getElementById('opshell-body'),"
+            " hidden: els['content'].style.display,"
+            " inMain: els['main'].children.length,"
+            " isCard: card.classList.contains('opshell-card'),"
+            " bodyInCard: !!document.getElementById('opshell-body') &&"
+            " document.getElementById('opshell-body').parentNode !== null}));")
+        self.assertIn("empty", got["content"])
+        self.assertTrue(got["bodyExists"])
+        self.assertEqual(got["hidden"], "none",
+                         "two flex:1 siblings would split the column")
+        self.assertEqual(got["inMain"], 2)
+        self.assertTrue(got["isCard"])
+        self.assertTrue(got["bodyInCard"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_cross_ends_the_session_and_takes_the_card_down(self):
+        got = self._node(
+            "opshellSession = 'sid'; els['opshell-card'] = el('opshell-card');\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['content'] = el('content');\n"
+            "els['content'].style.display = 'none';\n"
+            "nextReply = {ok:true, status:200, body:{state:'closing'}};\n"
+            "await opshellClose();\n"
+            "console.log(JSON.stringify({urls: posted.map(p => p.url),"
+            " session: opshellSession, removed,"
+            " shown: els['content'].style.display}));")
+        self.assertEqual(got["urls"], ["/api/opshell/close"])
+        self.assertIsNone(got["session"])
+        self.assertIn("opshell-card", got["removed"])
+        self.assertEqual(got["shown"], "",
+                         "the content column stayed hidden with no card "
+                         "over it")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_an_agent_click_does_not_detach_a_live_terminal(self):
+        # The condition the layer exists for, driven rather than reasoned
+        # about: `renderAgentView` writes `#content.innerHTML`, and the
+        # card is a sibling, so the terminal's host must survive.
+        got = self._node(
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['main'].appendChild(els['content']);\n"
+            "await showOperatorShell();\n"
+            "opshellTerm = fakeTerm();\n"
+            "els['content'].innerHTML = '<div class=\"pcard\">agent</div>';\n"
+            "console.log(JSON.stringify({"
+            " host: !!document.getElementById('opshell-term') ||"
+            " !!document.getElementById('opshell-body'),"
+            " content: els['content'].innerHTML}));")
+        self.assertTrue(got["host"],
+                        "an agent click took the card's body with it")
+        self.assertIn("pcard", got["content"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_button_pressed_twice_does_not_draw_a_second_terminal(self):
+        # Not modal any more: the header button stays reachable while the
+        # card is up, and two cards would be two `#opshell-body`, the second
+        # unreachable by id and both polling the one session.
+        got = self._node(
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['main'].appendChild(els['content']);\n"
+            "await showOperatorShell();\n"
+            "await showOperatorShell();\n"
+            "console.log(JSON.stringify({inMain: els['main'].children.length,"
+            " cards: els['main'].children.filter(c =>"
+            " c.classList.contains('opshell-card')).length}));")
+        self.assertEqual(got["cards"], 1)
+        self.assertEqual(got["inMain"], 2)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_non_ascii_keystrokes_survive_the_encoding(self):
