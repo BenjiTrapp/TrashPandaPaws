@@ -35,11 +35,17 @@ from software.c2.dns_rescue import TRANSPORTS
 # and checks every value here against it.
 #
 # The honest limit, stated here because it shapes what this tool can do:
-# **the implant has no command that changes its proxy or its transport.**
-# Those are fixed when it is generated. What can be changed at runtime is
-# the traffic profile and the timing -- which still covers a real class of
-# cause, since a blocked URI pattern or an alerting cadence is a plausible
-# reason for a leg to fail. Anything else needs a new beacon-side verb.
+# **nothing this tool queues changes the implant's proxy or its
+# transport.** The implant now has `egress proxy`, `egress rediscover`
+# and `egress gsocket` for exactly that, but they are deliberately not in
+# the map below and are hard-refused to this model (`safety.py`'s
+# `_EGRESS_VERBS`, the `egress_control` risk row): widening this tool is a
+# separate decision about what a model may do to a live implant, and they
+# exist for the operator and for the implant's own decider. So what this
+# tool can change at runtime is the traffic profile and the timing --
+# which still covers a real class of cause, since a blocked URI pattern or
+# an alerting cadence is a plausible reason for a leg to fail. Anything
+# else is a verb this tool does not reach for.
 ATTEMPT_VERBS = {
     "profile": "reconfig",
     "sleep": "sleep",
@@ -200,10 +206,10 @@ def entries():
                 "try_egress",
                 "Queue ONE next attempt for a stuck beacon, chosen from its "
                 "diagnosis. One per call, deliberately: a sweep of "
-                "candidates is far louder than the problem it solves. The "
-                "implant cannot change its proxy or its transport at "
-                "runtime -- what you can change is its traffic profile and "
-                "its timing.",
+                "candidates is far louder than the problem it solves. This "
+                "tool cannot change a beacon's proxy or its transport -- "
+                "what you can change through it is the traffic profile and "
+                "the timing.",
                 {"type": "object",
                  "properties": {
                      "beacon_id": {"type": "string",

@@ -8901,10 +8901,12 @@ class Beacon:
     # Three sub-verbs under one tasking key, and with them the thing an
     # implant could not do at all until now: change how it talks. The
     # orchestrator's own tool states the limit this closes --
-    # `software/agent/tools/egress.py` says "the implant has no command
-    # that changes its proxy or its transport" -- so a team server looking
-    # at a stuck beacon's rescue record had a diagnosis and two possible
-    # answers, both about timing.
+    # `software/agent/tools/egress.py` says nothing it queues "changes the
+    # implant's proxy or its transport", and that is still true of that
+    # tool -- so a team server looking at a stuck beacon's rescue record
+    # had a diagnosis and two possible answers, both about timing. These
+    # three are the proxy and transport answers it lacked, reached by the
+    # operator and the implant's own decider rather than by that tool.
     #
     #   egress rediscover         run ProxyDiscovery again, report the list
     #   egress proxy <index|url>  make one of those candidates the active one
@@ -9024,7 +9026,7 @@ class Beacon:
                     "proxy on this host" % target)
 
         chosen = None
-        if target.isdigit():
+        if target.isdecimal():
             index = int(target)
             if not 1 <= index <= len(candidates):
                 return ("[error] There is no discovered proxy %s: the list "
@@ -9114,7 +9116,9 @@ class Beacon:
         proc = self._gsocket_proc
         pid = proc.pid if proc is not None else 0
         if already:
-            return ("Carrier already up: pid %d, forward on 127.0.0.1:%d"
+            return ("Carrier already up: pid %d, forward on 127.0.0.1:%d. "
+                    "Not a test of the leg: the next check-in through the "
+                    "forward is"
                     % (pid, self.gsocket_local_port))
         return ("Carrier started: pid %d, forward on 127.0.0.1:%d. Not a "
                 "test of the leg: the next check-in through the forward is"

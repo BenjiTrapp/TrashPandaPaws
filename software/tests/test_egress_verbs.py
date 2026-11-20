@@ -3,9 +3,10 @@
 
 The beacon dispatched twenty-six verbs and, until these three, offered an
 operator almost nothing to decide between when an implant cannot reach the
-team server: `software/agent/tools/egress.py` states the limit in its own
-comment -- "the implant has no command that changes its proxy or its
-transport". Three sub-verbs under one `egress` key change that:
+team server: `software/agent/tools/egress.py` queues nothing that changes
+the implant's proxy or its transport -- its attempts are about timing and
+traffic profile. Three sub-verbs under one `egress` key, for the operator
+and the implant's own decider rather than for that tool, change that:
 
     egress rediscover           re-run proxy discovery, report the list
     egress proxy <index|url>    make a discovered proxy the active one
@@ -336,6 +337,27 @@ class TestSelectingADiscoveredProxy(EgressCase):
         self.assertIsNone(beacon._proxy._active_proxy)
         self.assertIsNone(beacon._proxy_session)
 
+    def test_a_numeric_looking_argument_int_rejects_is_refused_naming_it(self):
+        # `isdigit()` was the wrong predicate here. It returns True for
+        # superscripts and other numeric characters that `int()` then
+        # refuses with a ValueError, so such an argument reached `int()`
+        # inside the dispatch and came back as a bare `[exception: ...]`
+        # -- not a refusal, and not one naming the value, which this
+        # verb's whole contract is. `isdecimal()` is the predicate that
+        # matches `int()`: a superscript two is not a decimal, so it falls
+        # through to the URL branch and is refused with the value in the
+        # reason, the same as any other string the discovery did not find.
+        url = "http://127.0.0.1:%d" % _free_port()
+        beacon = self.discovered(url)
+
+        output = beacon._exec_egress("proxy \u00b2")
+
+        self.assertIn("[error]", output)
+        self.assertNotIn("exception", output.lower())
+        self.assertIn("\u00b2", output)
+        self.assertIsNone(beacon._proxy._active_proxy)
+        self.assertIsNone(beacon._proxy_session)
+
     def test_proxy_with_no_argument_is_refused_with_the_list_to_read(self):
         # Refused before any discovery runs, so the message has to point
         # at the verb that prints the numbering rather than at a list it
@@ -506,12 +528,20 @@ class TestTheCarrierVerb(EgressCase):
                         "the carrier's forward never accepted")
         self.assertIn(str(self.forward_port), output)
 
+        # The caveat is the contract, and both starts carry it: a
+        # selection or a start is not a test of the leg, and an operator
+        # reading the answer has to be told so. The first start said it;
+        # the "already up" branch used to drop it, so a re-run read as a
+        # subtly different promise than the first.
+        self.assertIn("Not a test of the leg", output)
+
         # Idempotent, as the latch's own caller relies on: asked twice,
         # one child.
         again = beacon._exec_egress("gsocket")
         self.assertNotIn("[error]", again)
         self.assertEqual(beacon._gsocket_proc.pid, pid)
         self.assertEqual(beacon._gsocket_starts, 1)
+        self.assertIn("Not a test of the leg", again)
 
     def test_gsocket_on_a_build_without_the_leg_reports_that_and_changes_nothing(self):
         # No gsocket block at all, which is every build generated before
