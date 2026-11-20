@@ -8513,12 +8513,18 @@ function opshellRemember(session){
   if(session) sessionStorage.setItem(opshellStore, session);
   else sessionStorage.removeItem(opshellStore);
   // The minimised flag is the "beside it" key the comment above promises
-  // to clear, and it is cleared on both branches: a session that starts or
-  // ends is a card that is open or gone, never a parked one. Left standing
-  // after an end, it would bring the next reload back parked onto nothing;
-  // left standing after a disowned id, it would park the next session the
-  // operator opened with the card in front of them.
-  sessionStorage.removeItem(opshellStore + "_min");
+  // to clear, and it is cleared whenever an id stops being this page's: a
+  // session that ended, or one the server disowned, leaves nothing to
+  // park, and a flag left standing would bring the next reload back parked
+  // onto it. A session that *starts* clears it too, because a new shell is
+  // opened with the card in front of the operator -- unless they parked
+  // the card while the open was still in flight, which the await straddles
+  // and which is the one way a park and a new id coexist. Measured: press
+  // Open, press `_`, and without this the flag was gone by the time the
+  // open landed, so a reload came back open over the operator's work.
+  if(!session || !opshellMinimised){
+    sessionStorage.removeItem(opshellStore + "_min");
+  }
 }
 
 function opshellRecall(){
@@ -8657,6 +8663,12 @@ function opshellMinimise(ev){
   // parked and waiting, with the stream and everything in the terminal's
   // buffer gone with it. `ev` is unused, as in `opshellClose`: the
   // parameter is the `onclick="opshellMinimise(event)"` shape.
+  //
+  // One park at a time, the standard `showOperatorShell` holds itself to:
+  // two docks would be two "Restore the shell" buttons, and a restore
+  // removes only the one it finds by id -- so the operator would get the
+  // shell back with a button beside the list still offering it.
+  if(opshellMinimised) return;
   const card = document.getElementById("opshell-card");
   // The sidebar, after `.agent-list` and never inside it: `refreshAgents`
   // assigns `#agent-list.innerHTML` every three seconds, which takes every
@@ -8875,6 +8887,15 @@ function opshellTeardown(card){
   opshellMinimised = false;
   const dock = document.getElementById("opshell-dock");
   if(dock) dock.remove();
+  // And the last state read, for the same reason the line above drops the
+  // duration: the view is going away, so what it was told goes with it.
+  // Without this, reopening the panel and pressing `_` before its first
+  // poll has answered -- or during an outage, which the poll's catch rides
+  // out without touching this -- draws a dock naming the device of the
+  // session that is over, which is a claim that a shell is live there.
+  // After the dock has gone, so the redraw in `opshellEndSession` still
+  // has the host it names when a session ends under a parked card.
+  opshellSeen = null;
   if(card) card.remove();
   // Where the card comes down and not in the caller: a card gone with
   // `#content` still hidden is a blank column that agent clicks keep
@@ -8968,8 +8989,18 @@ async function opshellPoll(){
   // operator can see of a parked session, so it is redrawn here with
   // everything this tick learned -- a channel that dropped, a session that
   // ended -- rather than written once at the minimise and left to rot.
+  //
+  // And only when it changed, as the title eleven lines above, for a worse
+  // reason: this node holds the restore button and, on a remnant, the ✕.
+  // Assigning `innerHTML` destroys and recreates them, so focus goes back
+  // to `<body>` every two seconds and a keyboard-only operator cannot
+  // reliably reach the button and press Enter -- and the label's selection
+  // and the cursor's animation restart with it.
   const dock = document.getElementById("opshell-dock");
-  if(dock) dock.innerHTML = opshellParked(state);
+  if(dock){
+    const next = opshellParked(state);
+    if(dock.innerHTML !== next) dock.innerHTML = next;
+  }
   if(!opshellAttached){
     body.innerHTML = opshellRender(state);
   } else {
