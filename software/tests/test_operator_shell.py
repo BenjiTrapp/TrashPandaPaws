@@ -3101,20 +3101,36 @@ class TestTheGlyphAndTheView(_GuiCase):
         # Not the inert handler, and not from the render: the render is
         # asserted elsewhere to be free of it.
         self.assertNotIn("opshellEndSession()", chrome)
+        # `opshellRetitle` finds the title by this class.
+        self.assertIn("opshell-title", chrome)
 
     def test_the_card_takes_the_content_column_and_not_the_whole_row(self):
         # Ruled during execution, against the markup rather than the plan:
         # `.main` is a flex row holding the 260px sidebar beside
-        # `.content`, so an `inset:0` layer inside it would cover the agent
-        # list this layout exists to keep visible.
-        rules = [l.strip() for l in SERVER_SRC.splitlines()
-                 if l.strip().startswith(".opshell-card{")]
-        self.assertEqual(len(rules), 1,
+        # `.content`, so a positioned layer over it would cover the agent
+        # list this layout exists to keep visible. Every rule whose
+        # selector is the card itself is read, by class or by id, and none
+        # may position it, inset it or give it a z-index: a rule by id
+        # beats the class rule, and `position:fixed` with four edges is the
+        # same layer by another spelling.
+        rules = re.findall(r"(?m)^\s*([^{}\n]+)\{([^}]*)\}", SERVER_SRC)
+        card = [(sel.strip(), body) for sel, body in rules
+                if any(re.match(r"[.#]opshell-card(?![\w-])(?![ >+~])",
+                                part.strip())
+                       and " " not in part.strip()
+                       for part in sel.split(","))]
+        by_class = [body for sel, body in card if sel == ".opshell-card"]
+        self.assertEqual(len(by_class), 1,
                          "expected exactly one .opshell-card rule, got %d"
-                         % len(rules))
-        self.assertIn("flex:1", rules[0])
-        self.assertNotIn("position:absolute", rules[0])
-        self.assertNotIn("inset:0", rules[0])
+                         % len(by_class))
+        self.assertIn("flex:1", by_class[0])
+        self.assertGreaterEqual(len(card), 1)
+        for sel, body in card:
+            for prop in ("position", "inset", "z-index"):
+                self.assertNotRegex(
+                    body, r"(?<![\w-])%s\s*:" % prop,
+                    "%s sets %s; the card is a flex sibling in the content "
+                    "column, not a layer over the page" % (sel, prop))
 
     def test_the_view_dials_nothing_until_the_operator_asks(self):
         # The goal: nothing happens on open, on hover, or on page load. The
@@ -3501,7 +3517,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """Fifty-four tests hide behind `skipUnless(node)`.
+        """Sixty-one tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3509,7 +3525,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of fifty-four quiet skips.
+        One loud failure instead of sixty-one quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3530,9 +3546,10 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # carried with the controller's nod, 52 against 54 once the
         # harness's DOM brought three tests of its own, and 57 against 59
         # once the card, its double-press guard and its missing-mount guard
-        # brought five more --
+        # brought five more, and 59 against 61 once the card's restore and
+        # its title brought two --
         self.assertGreaterEqual(
-            len(names), 57,
+            len(names), 59,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -3579,7 +3596,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "opshellSay", "opshellDropRest", "opshellFlushKeys",
             "opshellEndAfterAttach", "opshellRemember", "opshellRecall",
             "opshellResume", "showOperatorShell", "opshellChrome",
-            "opshellClose", "opshellPoll", "opshellAttach")]) + "\n"
+            "opshellClose", "opshellRetitle", "opshellPoll",
+            "opshellAttach")]) + "\n"
         # The one module constant the keystroke path reads.
         const = re.search(r"^const OPSHELL_KEYS_CEILING = .*$",
                           SERVER_SRC, re.M)
@@ -5036,7 +5054,14 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " inMain: els['main'].children.length,"
             " isCard: card.classList.contains('opshell-card'),"
             " bodyInCard: !!document.getElementById('opshell-body') &&"
-            " document.getElementById('opshell-body').parentNode !== null}));")
+            " document.getElementById('opshell-body').parentNode !== null,"
+            " chrome: card.children[0] && card.children[0].innerHTML}));")
+        # The controls are in the card, not just in the function that
+        # makes them: a card with its chrome unwritten or unappended has
+        # no way to close or minimise, and the grep of `opshellChrome`
+        # cannot see that.
+        self.assertIn("opshellClose(", got["chrome"] or "")
+        self.assertIn("opshellMinimise(", got["chrome"] or "")
         self.assertIn("empty", got["content"])
         self.assertTrue(got["bodyExists"])
         self.assertEqual(got["hidden"], "none",
@@ -5098,6 +5123,47 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " c.classList.contains('opshell-card')).length}));")
         self.assertEqual(got["cards"], 1)
         self.assertEqual(got["inMain"], 2)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_taking_the_card_down_gives_the_column_back_wherever_it_is_called_from(self):
+        # The invariant is "no card, so a visible column", and it lives where
+        # the card comes down. Driven through `opshellTeardown` itself and
+        # not through the cross, so a restore that sits only in the caller
+        # does not pass.
+        got = self._node(
+            "els['content'] = el('content');\n"
+            "els['main'] = el('main'); els['main'].appendChild(els['content']);\n"
+            "await showOperatorShell();\n"
+            "const hidden = els['content'].style.display;\n"
+            "await opshellTeardown(document.getElementById('opshell-card'));\n"
+            "console.log(JSON.stringify({hidden,"
+            " shown: els['content'].style.display,"
+            " card: document.getElementById('opshell-card')}));")
+        self.assertEqual(got["hidden"], "none")
+        self.assertEqual(got["shown"], "")
+        self.assertIsNone(got["card"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_card_names_the_device_once_the_state_does(self):
+        # The header row's job is to say which device this is. Until the
+        # state names one it says what the card is; the buttons beside the
+        # title are not touched. The harness does not parse markup, so the
+        # title is registered by hand, as `#opshell-body` could not be.
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['opshell-title'] = el('opshell-title');\n"
+            "els['opshell-title'].classList.add('opshell-title');\n"
+            "els['opshell-title'].textContent = 'Operator Shell';\n"
+            "replies = [{ok:true, status:200, body:{state:'live',"
+            " channel:'open', host:'parrot', sessions:0}},"
+            " {ok:true, status:200, body:{state:'idle', channel:'closed'}}];\n"
+            "await opshellPoll();\n"
+            "const named = els['opshell-title'].textContent;\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({named,"
+            " after: els['opshell-title'].textContent}));")
+        self.assertEqual(got["named"], "parrot")
+        self.assertEqual(got["after"], "Operator Shell")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_page_without_its_mount_point_gets_no_card_and_no_throw(self):

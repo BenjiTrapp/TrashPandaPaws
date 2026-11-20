@@ -8576,14 +8576,12 @@ async function showOperatorShell(){
 }
 
 async function opshellClose(ev){
-  // The cross, and the only path it uses. The session ends with the card
-  // gone from the page first, so the column is not left hidden behind a
-  // request that takes a moment.
-  const card = document.getElementById("opshell-card");
-  const ended = opshellTeardown(card);
-  const content = document.querySelector("#content");
-  if(content) content.style.display = "";
-  return ended;
+  // The cross, and the only path it uses. `ev` is deliberately unused: the
+  // parameter is the `onclick="opshellClose(event)"` shape and is kept so
+  // the call site and the signature agree. Teardown takes the card down and
+  // gives the column back before its request goes out, so the column is
+  // not left hidden behind a request that takes a moment.
+  return opshellTeardown(document.getElementById("opshell-card"));
 }
 
 async function opshellEndSession(){
@@ -8680,7 +8678,20 @@ function opshellTeardown(card){
   // lasted 92s" above the picker.
   opshellLast = null;
   if(card) card.remove();
+  // Where the card comes down and not in the caller: a card gone with
+  // `#content` still hidden is a blank column that agent clicks keep
+  // writing into.
+  const content = document.querySelector("#content");
+  if(content) content.style.display = "";
   return opshellEndSession();
+}
+
+function opshellRetitle(state){
+  // The card's header names the device once the view's own state does, and
+  // says what the card is until then. Only the title is written: the
+  // buttons beside it are not rebuilt.
+  const title = document.querySelector(".opshell-title");
+  if(title) title.textContent = (state && state.host) || "Operator Shell";
 }
 
 async function opshellPoll(){
@@ -8735,6 +8746,7 @@ async function opshellPoll(){
     opshellTimer = setTimeout(opshellPoll, 2000);
     return;
   }
+  opshellRetitle(state);
   if(opshellTrouble){
     // Recovery is worth one line, or the operator is left reading the
     // last complaint with no sign it ended.
