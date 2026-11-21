@@ -2341,6 +2341,23 @@ def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True,
     refusal that lived only there would be a refusal nobody saw.
     """
     fallback = c2_cfg.get("fallback") or {}
+    if not isinstance(fallback, dict):
+        # `fallback: true` instead of a block, which reads like a switch
+        # and is the shape the block's own `enabled` key invites. The
+        # loop below used to reach `.get` on it and raise AttributeError
+        # before anything validated it -- and this function is the one
+        # place a `c2` block becomes a beacon config, so raising here
+        # costs the access on a host nobody can reach. The five
+        # transports' own posture therefore applies to the block that
+        # holds them: unusable reads as absent, said once, with the
+        # value in it.
+        logger.warning(
+            "c2.fallback is %r, which is not a mapping of the five "
+            "transports, so none of them was read and the beacon has no "
+            "leg configured from this file. The transports belong under "
+            "it as a block, as configs/raccoon.yaml ships them.",
+            fallback)
+        fallback = {}
     block = {
         "beacon_interval_seconds": c2_cfg.get("beacon_interval_seconds", 300),
         "jitter_percent": c2_cfg.get("jitter_percent", 20),
