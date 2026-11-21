@@ -9105,16 +9105,17 @@ async function opshellPoll(){
     // good: the claim then lapsed and a session the operator was sitting
     // in was stopped on the device. The whole grace argument assumes this
     // poll keeps running.
-    const why = esc(String((e && e.message) || e));
+    const said = String((e && e.message) || e);
+    const why = esc(said);
     if(opshellAttached){
       // Never over an attached terminal: replacing the body took the
       // terminal's own node with it, and the stream then wrote into a
       // detached element. And once, not every two seconds: a sustained
       // outage wrote thirty lines in a minute and scrolled the operator's
       // own work off the screen exactly when they needed to read it.
-      if(opshellTrouble !== why){
-        opshellTrouble = why;
-        opshellSay("the view lost contact with the team server (" + why
+      if(opshellTrouble !== said){
+        opshellTrouble = said;
+        opshellSay("the view lost contact with the team server (" + said
                    + "). The session is unaffected until it lapses.");
       }
     } else {
@@ -9388,11 +9389,26 @@ function opshellDropRest(text){
     : ""));
 }
 
+function opshellPlain(text){
+  // Text that came from the machine, the server or an exception, made safe
+  // to write into a terminal. A terminal is not markup: `esc()` would print
+  // `&amp;` and still let an escape sequence through, so what goes is every
+  // C0 control, DEL and C1 control -- the characters a terminal acts on --
+  // each run becoming one space. Every writer into the terminal that can
+  // carry such text goes through this; the page's own literals do not.
+  return String(text == null ? "" : text)
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").trim();
+}
+
 function opshellSay(text){
   // Out of band, in the terminal, where the operator is looking. The dim
   // sequence is what this view already uses for its own notes, so it
-  // cannot be mistaken for something the shell printed.
-  if(opshellTerm) opshellTerm.writeln("\r\n\x1b[2m-- " + text + " --\x1b[0m");
+  // cannot be mistaken for something the shell printed. This is the one
+  // door for every note, and its callers pass server messages, exception
+  // text and the machine's own `reason`, so the text is made plain here and
+  // not at each of those call sites.
+  if(opshellTerm) opshellTerm.writeln("\r\n\x1b[2m-- " + opshellPlain(text)
+    + " --\x1b[0m");
 }
 
 function opshellB64(text){
@@ -9590,21 +9606,20 @@ async function opshellAttach(state){
   // is held by a generated startup file, "weak" is the fallback the user's
   // own configuration runs after, and anything else -- no row for this
   // channel, or a relay too old to carry the field -- is not mentioned.
-  // The reason is text the machine wrote and this is a terminal, not
-  // markup, so what has to go is control characters: HTML escaping would
-  // print `&amp;` and still let an escape sequence through.
+  // The reason, the host and the target are text the machine reported and
+  // this is a terminal, not markup, so they go through `opshellPlain`.
   const guard = state.history === "off" ? "history is off in this session"
     : state.history === "weak"
       ? "history is not guaranteed off in this session"
       : "";
   const why = state.history === "weak"
-    ? String(state.history_detail == null ? "" : state.history_detail)
-        .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").trim()
+    ? opshellPlain(state.history_detail)
     : "";
   const guardLine = !why ? guard : guard + " (" + why + "): this shell could "
     + "not be given a startup file, so your own configuration runs after "
     + "and may undo it";
-  opshellTerm.writeln("\x1b[2m-- live on " + (state.host || state.target || "?")
+  opshellTerm.writeln("\x1b[2m-- live on "
+    + (opshellPlain(state.host) || opshellPlain(state.target) || "?")
     + (guardLine ? " \u00b7 " + guardLine : "") + " \u00b7 " + cols + "x" + rows
     + ", fixed for this session --\x1b[0m");
   if(opshellUnfitted){
@@ -9637,7 +9652,7 @@ async function opshellAttach(state){
   } catch(e) {
     if(opshellTerm){
       opshellTerm.writeln("\r\n\x1b[2m-- the stream failed ("
-        + ((e && e.message) || e) + ") --\x1b[0m");
+        + opshellPlain((e && e.message) || e) + ") --\x1b[0m");
     }
     await opshellEndSession();
     return;

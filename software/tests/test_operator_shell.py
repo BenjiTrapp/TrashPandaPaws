@@ -3817,7 +3817,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """A hundred and seven tests hide behind `skipUnless(node)`.
+        """A hundred and seventeen tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3825,7 +3825,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of a hundred and seven quiet skips.
+        One loud failure instead of a hundred and seventeen quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3874,14 +3874,26 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # given, which brought four: nothing said when it was told
         # nothing, "not guaranteed" with its reason beside "off", the same
         # sentence whole with no reason, and a reason that may not carry a
-        # control sequence into the terminal --
+        # control sequence into the terminal -- and 115 against 117 once
+        # every other writer of text from the machine or a server into that
+        # terminal was locked one by one, which brought ten: the helper
+        # itself, the host and the target, the stream's failure, the
+        # shutdown that failed and the reason it was refused for, the poll
+        # that failed and the state's own note, the key request that failed
+        # and the one that was refused, and the shell's own bytes reaching
+        # the terminal untouched --
         self.assertGreaterEqual(
-            len(names), 105,
+            len(names), 115,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
         # named one by one, because a count cannot defend a property.
         for must in ("test_what_is_typed_during_a_failing_batch_dies_with_it",
+                     # A first line that says history is off when the page
+                     # was told nothing is the claim that would mislead the
+                     # person it is addressed to, and no other test keeps
+                     # the default from being "off".
+                     "test_the_first_line_claims_nothing_when_it_was_told_nothing",
                      "test_the_same_holds_when_the_request_is_rejected_outright",
                      "test_a_write_that_may_have_landed_is_not_called_nothing",
                      "test_closing_the_view_closes_the_session",
@@ -3939,7 +3951,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         src = "\n".join(decls + [self.js_function(n) for n in (
             "esc", "opshellEndSession", "opshellTeardown", "opshellPicker",
             "opshellRender", "opshellOpen", "opshellB64",
-            "opshellSay", "opshellDropRest", "opshellFlushKeys",
+            "opshellPlain", "opshellSay", "opshellDropRest",
+            "opshellFlushKeys",
             "opshellEndAfterAttach", "opshellRemember", "opshellRecall",
             "opshellResume", "showOperatorShell", "opshellChrome",
             "opshellClose", "opshellMinimise", "opshellRestore",
@@ -4997,6 +5010,164 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertNotIn("\r", first)
         self.assertIn("not guaranteed off", first)
         self.assertIn("end", first)
+
+    # --- Every door into the terminal, locked one at a time ---------------
+    #
+    # `history_detail` was the first writer of machine-derived text into the
+    # terminal to be made plain, and the first line, the notes and the
+    # stream-failure lines carry text from the same places. Each is driven
+    # here with a hostile string and what reached the terminal is read back:
+    # the helper's own test cannot say that a writer calls it.
+    _HOSTILE = "ok\x1b[2J\x1b[H\rfake\x07\x9b31m\x7f & <end>"
+
+    def _assert_nothing_drives_the_terminal(self, lines, where):
+        """Every note the hostile string reached carries no control byte of
+        its own, only the page's dim and reset, and is still readable: not
+        blanked, and not HTML-escaped -- this is a terminal, not markup."""
+        hit = [l for l in lines if "ok" in l and "end" in l]
+        self.assertTrue(hit, "%s: the text never reached the terminal: %r"
+                        % (where, lines))
+        for line in hit:
+            bare = re.sub(r"^\r\n", "", line)
+            bare = bare.replace("\x1b[2m", "").replace("\x1b[0m", "")
+            self.assertNotRegex(bare, r"[\x00-\x1f\x7f-\x9f]",
+                                "%s wrote a control byte: %r" % (where, line))
+            self.assertIn("ok", bare)
+            self.assertIn("& <end>", bare, "%s changed the text: %r"
+                          % (where, line))
+            self.assertNotIn("&amp;", bare)
+            self.assertEqual(
+                re.findall(r"\x1b", line),
+                ["\x1b"] * (line.count("\x1b[2m") + line.count("\x1b[0m")),
+                "%s let an escape sequence through: %r" % (where, line))
+
+    def _lines(self, script):
+        got = self._node(script + "\nconsole.log(JSON.stringify("
+                         "{lines: opshellTerm ? opshellTerm.lines : []}));")
+        return got["lines"]
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_helper_removes_what_a_terminal_acts_on_and_nothing_else(self):
+        got = self._node(
+            "const cases = ['a\\x1b[2Jb', 'a\\rb', 'a\\nb', 'a\\x07b',"
+            " 'a\\x7fb', 'a\\x9bb', 'a\\x00b', '  x  '];\n"
+            "console.log(JSON.stringify({\n"
+            " out: cases.map(opshellPlain),\n"
+            " kept: opshellPlain('caf\\u00e9 \\u65e5\\u672c \\u2713 & <b>'),\n"
+            " nothing: [opshellPlain(null), opshellPlain(undefined),"
+            " opshellPlain(''), opshellPlain(7)]}));")
+        self.assertEqual(got["out"], ["a [2Jb", "a b", "a b", "a b", "a b",
+                                      "a b", "a b", "x"])
+        self.assertEqual(got["kept"], "caf\u00e9 \u65e5\u672c \u2713 & <b>")
+        self.assertEqual(got["nothing"], ["", "", "", "7"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_host_and_the_target_cannot_drive_the_terminal(self):
+        for field, extra in (("host", {}), ("target", {"host": ""})):
+            fields = dict(extra)
+            fields[field] = self._HOSTILE
+            first, _ = self._first_line(fields)
+            self._assert_nothing_drives_the_terminal(
+                [first], "the first line's %s" % field)
+            self.assertIn("live on ok", first)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_stream_failure_cannot_drive_the_terminal(self):
+        lines = self._lines(
+            "els['opshell-term'] = el('opshell-term');\n"
+            "globalThis.Terminal = function(){ return fakeTerm(); };\n"
+            "opshellSession = 'sid';\n"
+            "nextReply = {throw:%s};\n"
+            "await opshellAttach({state:'live', geometry:[80,24],"
+            " host:'parrot'});" % json.dumps(self._HOSTILE))
+        self.assertTrue([l for l in lines if "the stream failed" in l])
+        self._assert_nothing_drives_the_terminal(lines, "the stream failure")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_what_the_shell_prints_still_reaches_the_terminal_untouched(self):
+        """The one writer that is not made plain: the shell's own bytes. A
+        terminal exists to act on them, and stripping them would be a shell
+        that cannot show colour or move its cursor."""
+        got = self._node(
+            "els['opshell-term'] = el('opshell-term');\n"
+            "const term = fakeTerm();\n"
+            "globalThis.Terminal = function(){ return term; };\n"
+            "opshellSession = 'sid';\n"
+            "nextReply = {ok:true, status:200, stream:"
+            " fakeStream(['\\x1b[31mred\\x1b[0m\\r\\n'])};\n"
+            "await opshellAttach({state:'live', geometry:[80,24],"
+            " host:'parrot'});\n"
+            "console.log(JSON.stringify({lines: term.lines}));")
+        self.assertIn("\x1b[31mred\x1b[0m\r\n", got["lines"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_refused_shutdown_cannot_drive_the_terminal(self):
+        # The request itself fails: the message is the exception's.
+        lines = self._lines(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "nextReply = {throw:%s};\n"
+            "await opshellEndSession();" % json.dumps(self._HOSTILE))
+        self._assert_nothing_drives_the_terminal(lines, "the failed shutdown")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_servers_reason_for_a_refused_shutdown_cannot_drive_the_terminal(self):
+        for key in ("reason", "error"):
+            lines = self._lines(
+                "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+                "nextReply = {ok:true, status:200, body:{%s:%s}};\n"
+                "await opshellEndSession();"
+                % (key, json.dumps(self._HOSTILE)))
+            self._assert_nothing_drives_the_terminal(
+                lines, "the server's %s" % key)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_poll_failure_cannot_drive_the_terminal(self):
+        # An HTML error page from a proxy makes the JSON parse fail with
+        # text from the far side in it, so this message is not the page's.
+        lines = self._lines(
+            "opshellAttached = true; opshellSession = 'sid';\n"
+            "opshellTerm = fakeTerm();\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "nextReply = {throw:%s};\n"
+            "await opshellPoll();" % json.dumps(self._HOSTILE))
+        self.assertTrue([l for l in lines if "lost contact" in l])
+        self._assert_nothing_drives_the_terminal(lines, "the poll failure")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_what_the_state_says_cannot_drive_the_terminal(self):
+        for body in ("state:'live', channel:'unknown', reason:%s",
+                     "state:'closing', channel:%s"):
+            lines = self._lines(
+                "opshellAttached = true; opshellSession = 'sid';\n"
+                "opshellTerm = fakeTerm();\n"
+                "els['opshell-body'] = el('opshell-body');\n"
+                "nextReply = {ok:true, status:200, body:{host:'parrot',"
+                " %s}};\n"
+                "await opshellPoll();" % (body % json.dumps(self._HOSTILE)))
+            self._assert_nothing_drives_the_terminal(
+                lines, "the state's note (%s)" % body.split(",")[1].strip())
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_failed_key_request_cannot_drive_the_terminal(self):
+        lines = self._lines(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "opshellKeys = 'ls\\r';\n"
+            "nextReply = {throw:%s};\n"
+            "await opshellFlushKeys();" % json.dumps(self._HOSTILE))
+        self.assertTrue([l for l in lines if "may or may not" in l])
+        self._assert_nothing_drives_the_terminal(lines, "the key failure")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_refused_key_request_cannot_drive_the_terminal(self):
+        # Every field the route sends, because the page joins all three.
+        lines = self._lines(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "opshellKeys = 'ls\\r';\n"
+            "nextReply = {ok:false, status:409, body:{error:%(h)s,"
+            " refused:%(h)s, detail:%(h)s}};\n"
+            "await opshellFlushKeys();" % {"h": json.dumps(self._HOSTILE)})
+        self.assertTrue([l for l in lines if "not delivered" in l])
+        self._assert_nothing_drives_the_terminal(lines, "the key refusal")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_far_end_that_hangs_up_ends_the_session(self):
