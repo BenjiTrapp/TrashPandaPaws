@@ -393,10 +393,11 @@ softened.
 
 ## Known limitations, as built
 
-Seven, each ruled during execution and each recorded in the ledger with its
+Eight, each ruled during execution and each recorded in the ledger with its
 reasoning. None is a defect left lying: every one was weighed against a
 change the plan or the task forbade, and the view fails safe in the first
-six. The seventh is a trust boundary and not a failure mode.
+six. The seventh is a trust boundary and not a failure mode. The eighth is
+the one window in which the first line can be out of date.
 
 1. **The resume checks a count, not an identity.** `/api/opshell/state`
    reports how many sessions the claim has, not whether the id in this
@@ -455,6 +456,15 @@ six. The seventh is a trust boundary and not a failure mode.
    is, the endpoint reports"), and saying so here keeps the view's claim
    honest about whose claim it is: the first line is the endpoint's word,
    passed on, and not something the interface checked.
+8. **The page attaches with state up to one poll old.** The first line's
+   history word comes from the last `/api/opshell/state` the page read,
+   up to two seconds before the attach. If the service reconnects with a
+   new answer inside that window, the machine compares against its *new*
+   report and runs the session, while the page prints the *old* word.
+   Rare: it needs a reconnect, with a changed login shell or `/dev/fd`,
+   inside one poll. Closing it would mean the attach carrying the word the
+   page is about to print -- widening the protocol, which the plan chose
+   against.
 
 ---
 

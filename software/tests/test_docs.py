@@ -11,6 +11,11 @@ So this does for the documentation what test_c2_agent_gui does for the GUI's
 JavaScript tables: compares them to the source of truth, and fails when they
 drift. It asserts that every key and every number is *present*, not that the
 surrounding sentences are unchanged -- the prose is free, the facts are not.
+
+Expect a correct rewording to fail some of these: the operator-shell tests pin
+which way each claim points, and a review measured that nine of ten
+reversals fail a test and so do six correct rewordings. Every failure names
+the property it holds; if the new prose still holds it, move the pin.
 """
 
 import argparse
@@ -1288,18 +1293,19 @@ class TestTheOperatorShellIsDocumentedAsAWindow(unittest.TestCase):
                              "%s does not say the shell keeps running while "
                              "the card is parked" % name)
 
-    def test_the_design_records_the_seven_things_this_cannot_do(self):
-        """The seven known limitations, which nothing else holds.
+    def test_the_design_records_the_eight_things_this_cannot_do(self):
+        """The eight known limitations, which nothing else holds.
 
-        A design is not usually tested here. These seven are the only
+        A design is not usually tested here. These eight are the only
         written record of what the feature deliberately cannot do -- each
         one ruled during execution, against a change the plan forbade --
         and the three operator claims above are now pinned while these
         were held by nothing, so they could rot or be dropped silently.
         Subjects, not sentences: the reasoning is free to be rewritten,
-        the seven subjects are not. The seventh arrived with the login
+        the eight subjects are not. The seventh arrived with the login
         shell: what the view says about history is what the endpoint said
-        about itself.
+        about itself. The eighth is the one window in which the page can
+        print the old answer over a session that runs on the new one.
         """
         section = DESIGN_DOC.read_text().split(
             "\n## Known limitations, as built\n", 1)
@@ -1307,7 +1313,7 @@ class TestTheOperatorShellIsDocumentedAsAWindow(unittest.TestCase):
                          "this feature cannot do")
         body = section[1].split("\n## ", 1)[0].split("\n---", 1)[0]
         entries = re.findall(r"^\d+\. \*\*", body, re.M)
-        self.assertEqual(len(entries), 7, "the section has %d entries; seven "
+        self.assertEqual(len(entries), 8, "the section has %d entries; eight "
                          "limitations were ruled" % len(entries))
         flat = " ".join(body.split()).lower()
         for subject, what in (
@@ -1330,7 +1336,11 @@ class TestTheOperatorShellIsDocumentedAsAWindow(unittest.TestCase):
                 ("not a free one", "what a parked session holds"),
                 ("what the endpoint reported about itself",
                  "that the history guard is the endpoint's own claim, which "
-                 "the team server cannot verify")):
+                 "the team server cannot verify"),
+                ("up to one poll old",
+                 "that the page attaches with state up to one poll old, so "
+                 "a reconnect inside that window runs a session on the new "
+                 "answer under the old word")):
             self.assertIn(subject, flat,
                           "the section does not record %s" % what)
 
@@ -1739,6 +1749,66 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
                          "refusal")
         self.assertRegex(flat, r"(?i)worst trade on this branch",
                          "the section lost its conclusion")
+
+    def test_the_eighth_limitation_says_which_answer_the_session_runs_on(
+            self):
+        """The direction is the point: the machine compares against its
+        *new* report and runs the session, and the page prints the *old*
+        word. Reversed, it would read as a window that fails safe."""
+        body = self.design_section("## Known limitations, as built") \
+            .split("\n---", 1)[0]
+        entries = re.split(r"\n(?=\d+\. \*\*)", body)
+        eighth = [self.flat(e) for e in entries if e.startswith("8. **")]
+        self.assertEqual(len(eighth), 1, "no eighth entry")
+        for pattern, what in (
+                (r"(?i)up to one poll old", "how old the page's state is"),
+                (r"(?i)reconnects? with a new answer inside that window",
+                 "what has to happen inside the window"),
+                (r"(?i)compares? (?:it )?against its \*?new\*? report and "
+                 r"runs the session",
+                 "that the machine runs the session on the new answer"),
+                (r"(?i)page prints the \*?old\*? word",
+                 "that the page shows the old one"),
+                (r"(?i)\brare\b", "how likely it is")):
+            self.assertRegex(eighth[0], pattern, "the eighth entry does not "
+                             "say " + what)
+        self.assertNotRegex(eighth[0], r"(?i)\b(?:is|are) (?:refused|declined)"
+                            r"|fails safe",
+                            "the eighth entry says the window is refused")
+        intro = self.flat(body.split("\n1. **", 1)[0])
+        self.assertRegex(intro, r"^Eight,", "the section's count is not eight")
+
+    def test_on_macos_with_zsh_history_is_recorded_and_the_page_says_so(self):
+        """Measured on the machine this was built for: `/etc/zshrc` sets
+        `HISTFILE` unconditionally, after the environment, so a zsh session
+        there writes every command to the history file. The paragraph may
+        not describe that as a possibility, nor as the user's own doing."""
+        section = self.tunnel_section(
+            "### Which shell a session runs, and what it costs for history",
+            "\n### ")
+        said = self.flat(self.one_block(section, r"(?i)not guaranteed off",
+                                        "what the two history guards are"))
+        self.assertNotRegex(said, r"(?i)does not mean on|theirs to know",
+                            "the paragraph still says the weak guard is not "
+                            "the same as history being on")
+        macos = [x for x in re.split(r"(?<=[.;:])\s", said)
+                 if re.search(r"/etc/zshrc", x)]
+        self.assertTrue(macos, "the paragraph does not name /etc/zshrc")
+        joined = " ".join(macos)
+        self.assertRegex(said, r"(?i)On macOS with zsh it \*{0,2}is\*{0,2}:",
+                         "the paragraph does not say that on macOS with zsh "
+                         "history is on")
+        self.assertRegex(joined, r"`/etc/zshrc` sets `HISTFILE` itself")
+        self.assertRegex(joined, r"(?i)every command[^.]*\bis written\b",
+                         "the paragraph does not say every command is "
+                         "written")
+        self.assertNotRegex(joined, r"(?i)\b(?:may|might|could|maybe|possibly"
+                                    r"|perhaps)\b|\bnot written\b",
+                            "the macOS sentence hedges what was measured")
+        self.assertRegex(said, r"(?i)measured", "the paragraph does not say "
+                         "this was measured")
+        self.assertRegex(said, r"may well be recorded",
+                         "the paragraph does not give the first line's words")
 
     def test_the_seventh_limitation_says_whose_claim_the_guard_is(self):
         body = self.design_section("## Known limitations, as built") \

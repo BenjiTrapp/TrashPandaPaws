@@ -3974,7 +3974,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         src = "\n".join(decls + [self.js_function(n) for n in (
             "esc", "opshellEndSession", "opshellTeardown", "opshellPicker",
             "opshellRender", "opshellOpen", "opshellB64",
-            "opshellPlain", "opshellSay", "opshellDropRest",
+            "opshellClean", "opshellPlain", "opshellSay", "opshellDropRest",
             "opshellFlushKeys",
             "opshellEndAfterAttach", "opshellRemember", "opshellRecall",
             "opshellResume", "showOperatorShell", "opshellChrome",
@@ -4998,11 +4998,34 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # the reason in parentheses straight after the guard, a colon, then
         # the page's explanation, which names what runs after what.
         self.assertIn("not guaranteed off in this session "
-                      "(/bin/zsh takes no --rcfile): history is held off "
-                      "only by an environment variable here, which your own "
-                      "startup files run after and may undo",
+                      "(/bin/zsh takes no --rcfile): " + self._RECORDED,
                       lines["weak"])
         self.assertNotEqual(lines["off"], lines["weak"])
+
+    # What the weak guard costs, as measured on the Mac this was built for:
+    # `/etc/zshrc` sets `HISTFILE` unconditionally, after the environment,
+    # so there it is not "maybe" -- every command is written to the file.
+    _RECORDED = ("it may well be recorded: the host's startup files run "
+                 "after our HISTFILE, and on macOS /etc/zshrc sets its own")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_weak_guard_says_history_may_well_be_recorded_and_why(self):
+        """A direction, not a set of words: the line may not say history is
+        held off by anything, nor that undoing it is the user's doing and a
+        possibility, and it has to name the system file that does it."""
+        first, _ = self._first_line(
+            {"history": "weak", "history_detail": "/bin/zsh cannot be given "
+                                                  "a startup file of ours"})
+        explained = first.split("): ", 1)[1].split(" \u00b7 ", 1)[0]
+        self.assertEqual(explained, self._RECORDED)
+        self.assertRegex(explained, r"(?i)\bmay well be recorded\b")
+        self.assertRegex(explained, r"run after our HISTFILE")
+        self.assertRegex(explained, r"macOS /etc/zshrc sets its own")
+        self.assertNotRegex(explained, r"(?i)held off|may undo|your own|"
+                                       r"not recorded|is off")
+        # Short enough to read on one line of a card at 120 columns, the
+        # size a card falls back to, and not much wider than 80.
+        self.assertLessEqual(len(explained), 110, len(explained))
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_weak_guard_with_no_reason_reads_whole_on_its_own(self):
@@ -5172,8 +5195,85 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
              "history_detail": "r" * 5000})
         self.assertLess(len(first), 800, len(first))
         self.assertIn("\u2026", first)
-        self.assertIn("may undo", first)
+        self.assertIn("may well be recorded", first)
         self.assertRegex(first, r"[0-9]+x[0-9]+, fixed for this session")
+
+    # The cap belongs to what a note carries, not to the note: the page's
+    # own sentences are longer than 200 characters, and the last of them is
+    # the one that matters. Measured before this: the 502 note, 271
+    # characters, ended "Anything typed since has been...".
+    _DROPPED = ("Anything typed since has been dropped too, so no part of a "
+                "command can arrive without the rest of it. --\x1b[0m")
+
+    def _note_after(self, reply, keys="ls"):
+        """The last note a failed batch wrote, with one more key typed while
+        it was in flight."""
+        return self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "holdFetch = 6;\n"
+            "opshellKeys = %s;\n"
+            "nextReply = %s;\n"
+            "const flushing = opshellFlushKeys();\n"
+            "opshellKeys += '\\r';\n"
+            "await flushing;\n"
+            "console.log(JSON.stringify({last: opshellTerm.lines"
+            "[opshellTerm.lines.length - 1]}));"
+            % (json.dumps(keys), reply))["last"]
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_502_note_arrives_whole_with_its_last_sentence(self):
+        last = self._note_after(
+            "{ok:false, status:502, body:{error:'the bridge could not write "
+            "to the shell', detail:'sendall timed out'}}")
+        self.assertGreater(len(last), 200, "the case under test is a note "
+                           "longer than the old cap")
+        self.assertTrue(last.endswith(self._DROPPED), last)
+        self.assertNotIn("\u2026", last)
+        self.assertIn("the bridge could not write to the shell -- sendall "
+                      "timed out", last)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_what_a_note_carries_is_still_cut_and_the_note_is_not(self):
+        """The server's reason and the exception text are the untrusted
+        parts, and a long one is cut where it is interpolated -- so it
+        cannot push the sentence after it off the line either."""
+        for reply in ("{ok:false, status:502, body:{error:%s}}"
+                      % json.dumps("e" * 5000),
+                      "{throw:%s}" % json.dumps("e" * 5000)):
+            last = self._note_after(reply)
+            self.assertTrue(last.endswith(self._DROPPED), (reply[:30], last))
+            self.assertIn("e" * 199 + "\u2026", last)
+            self.assertNotIn("e" * 200, last)
+            self.assertLess(len(last), 600, len(last))
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_fetch_failure_and_the_paste_notes_arrive_whole(self):
+        failed = self._note_after("{throw:'socket hang up'}")
+        self.assertIn("(socket hang up). Nothing was sent again -- check the "
+                      "session before retyping. " + self._DROPPED, failed)
+        self.assertNotIn("\u2026", failed)
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "opshellKeys = 'x'.repeat(%d);\n"
+            "await opshellFlushKeys();\n"
+            "console.log(JSON.stringify({last: opshellTerm.lines"
+            "[opshellTerm.lines.length - 1]}));" % (256 * 1024))
+        self.assertTrue(got["last"].endswith(
+            "Nothing was sent. Send it in smaller pieces, or put the file on "
+            "the host another way. --\x1b[0m"), got["last"])
+        self.assertNotIn("\u2026", got["last"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_every_note_is_still_made_plain_without_the_cap(self):
+        got = self._node(
+            "opshellTerm = fakeTerm();\n"
+            "opshellSay(%s + 'z'.repeat(400));\n"
+            "console.log(JSON.stringify({last: opshellTerm.lines[0],"
+            " clean: opshellClean('a\\x1b\\x07b ' + 'y'.repeat(300))}));"
+            % json.dumps(self._HOSTILE))
+        self._assert_nothing_drives_the_terminal([got["last"]], "a long note")
+        self.assertIn("z" * 400, got["last"])
+        self.assertEqual(got["clean"], "a b " + "y" * 300)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_what_the_shell_prints_still_reaches_the_terminal_untouched(self):

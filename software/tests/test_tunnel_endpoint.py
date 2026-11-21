@@ -1765,7 +1765,7 @@ class TestTheLoginShell(_ShellChoice, unittest.TestCase):
 
         The pair is compared and not the word. The last two refusals are
         weak both times and differ in the reason, which is printed beside
-        the word: a panel that says `/bin/zsh is not bash` over a session
+        the word: a panel that blames `/bin/zsh` over a session
         that is bash without a `/dev/fd` is wrong about the part an
         operator acts on.
 
@@ -1814,6 +1814,10 @@ class TestTheLoginShell(_ShellChoice, unittest.TestCase):
             _, detail = beacon_mod._history_guard()
         self.assertIn("zsh", detail)
         self.assertNotIn(beacon_mod._DEV_FD, detail)
+        # Read by an operator on the page's first line, so it says what
+        # cannot be done and not which flag is missing.
+        self.assertEqual(detail, "/bin/zsh cannot be given a startup file "
+                                 "of ours")
 
     def test_a_host_without_dev_fd_blames_the_host_and_not_the_shell(self):
         with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
@@ -1821,6 +1825,7 @@ class TestTheLoginShell(_ShellChoice, unittest.TestCase):
             _, detail = beacon_mod._history_guard()
         self.assertIn(beacon_mod._DEV_FD, detail)
         self.assertNotIn("is not bash", detail)
+        self.assertNotIn("startup file of ours", detail)
 
     # A guard that reads source is only worth what it reads. Mutating
     # `beacon.py` and re-running can silently run the *old* code: a `.pyc`
@@ -2036,9 +2041,23 @@ class TestARefusedShellSession(_ShellChoice, TunnelEndpointTestCase):
         self.assertRegex(refusals[0], r"(?i)histor")
         self.assertRegex(refusals[0], r"(?i)reconnect")
         self.assertRegex(refusals[0], r"(?i)since the tunnel connected")
-        self.assertIn("'off'", refusals[0])
-        self.assertIn("'weak' (/bin/zsh is not bash", refusals[0])
+        self.assertIn("told history is off", refusals[0])
+        self.assertIn("history not guaranteed off (/bin/zsh cannot be given "
+                      "a startup file of ours)", refusals[0])
         self.assertNotRegex(refusals[0], r"Traceback|OSError\(")
+        self._assert_speaks_as_the_page(refusals[0])
+
+    def _assert_speaks_as_the_page(self, refusal):
+        """The page's words, not the code's: no `%r` quoting, no `weak`,
+        which the page never shows a person, and how to reconnect from the
+        interface -- with the one case where that does nothing."""
+        self.assertNotIn("'", refusal.replace("host's", "")
+                         .replace("doesn't", ""))
+        self.assertNotRegex(refusal, r"\bweak\b")
+        self.assertIn("\u2715", refusal)
+        self.assertIn("Open a shell", refusal)
+        self.assertRegex(refusal, r"(?i)not reconnect while another view "
+                                  r"holds the channel")
 
     def test_a_guard_that_changed_the_other_way_is_refused_as_well(self):
         """Reported `weak`, and this session would hold history off. The
@@ -2049,8 +2068,10 @@ class TestARefusedShellSession(_ShellChoice, TunnelEndpointTestCase):
             "/bin/zsh", "/bin/bash")
         self.assertEqual(reported, "weak")
         self.assertEqual(len(refusals), 1)
-        self.assertIn("'weak' (/bin/zsh is not bash", refusals[0])
-        self.assertIn("'off'", refusals[0])
+        self.assertIn("told history is not guaranteed off (/bin/zsh cannot "
+                      "be given a startup file of ours)", refusals[0])
+        self.assertIn("would have history off", refusals[0])
+        self._assert_speaks_as_the_page(refusals[0])
 
     def test_a_login_shell_that_changed_between_two_weak_ones_is_refused(self):
         """The word is `weak` before and after, and the reason is what
@@ -2061,8 +2082,9 @@ class TestARefusedShellSession(_ShellChoice, TunnelEndpointTestCase):
             "/bin/zsh", "/usr/local/bin/zsh")
         self.assertEqual(reported, "weak")
         self.assertEqual(len(refusals), 1)
-        self.assertIn("(/bin/zsh is not bash", refusals[0])
-        self.assertIn("(/usr/local/bin/zsh is not bash", refusals[0])
+        self.assertIn("(/bin/zsh cannot be given", refusals[0])
+        self.assertIn("(/usr/local/bin/zsh cannot be given", refusals[0])
+        self._assert_speaks_as_the_page(refusals[0])
 
     def test_the_refusal_claims_no_cause_it_has_not_established(self):
         """Only `/dev/fd` went, and the shell is the same bash. The pair
@@ -2083,9 +2105,10 @@ class TestARefusedShellSession(_ShellChoice, TunnelEndpointTestCase):
             endpoint._serve_shell(None, None, 80, 24)
         self.assertEqual(len(refusals), 1)
         self.assertNotRegex(refusals[0], r"(?i)login shell")
-        self.assertNotRegex(refusals[0], r"is not bash")
+        self.assertNotRegex(refusals[0], r"is not bash|startup file of ours")
         self.assertIn(beacon_mod._DEV_FD, refusals[0])
         self.assertRegex(refusals[0], r"(?i)reconnect")
+        self._assert_speaks_as_the_page(refusals[0])
 
     def test_reconnecting_after_a_refusal_reports_the_new_shell(self):
         """The refusal promises it: reconnect, and the tunnel reports what

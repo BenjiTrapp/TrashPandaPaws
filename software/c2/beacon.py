@@ -3476,7 +3476,10 @@ def _guard_of(program: str) -> Tuple[str, str]:
     here would call that "not bash" and withhold the rcfile from it.
     """
     if os.path.basename(program) != os.path.basename(_SHELL_BASH):
-        return "weak", "%s is not bash, and only bash takes --rcfile" % program
+        # An operator reads this on the page's first line, so it says what
+        # cannot be done and not which flag is missing: only bash takes
+        # `--rcfile`.
+        return "weak", "%s cannot be given a startup file of ours" % program
     if not os.path.isdir(_DEV_FD):
         return "weak", ("this host has no %s to hand a pipe to bash on"
                         % _DEV_FD)
@@ -4555,6 +4558,9 @@ class TunnelEndpoint(object):
                 # served: a panel is showing the reported answer to an
                 # operator, and a session that quietly contradicts it is
                 # the whole reason that answer is reported at all.
+                # In the page's words: `weak` is the code's, and the
+                # operator has only ever been shown "not guaranteed off".
+                said = {"off": "off", "weak": "not guaranteed off"}
                 was, why_was = exc.reported
                 now, why_now = exc.now
                 self._refuse_shell(
@@ -4562,11 +4568,16 @@ class TunnelEndpoint(object):
                     "no session was started, because what a session here "
                     "would do about command history has changed since the "
                     "tunnel connected, and what the interface shows about "
-                    "it is out of date. It was told history is %r%s; a "
-                    "session now would have it %r%s. Reconnect the tunnel "
-                    "and it will report what the host does now."
-                    % (was, " (%s)" % why_was if why_was else "",
-                       now, " (%s)" % why_now if why_now else ""))
+                    "it is out of date. It was told history is %s%s; a "
+                    "session now would have history %s%s. Reconnect the "
+                    "tunnel and it will report what the host does now: in "
+                    "the Operator Shell that is \u2715, then Open a shell, "
+                    "which does not reconnect while another view holds the "
+                    "channel."
+                    % (said.get(was, was),
+                       " (%s)" % why_was if why_was else "",
+                       said.get(now, now),
+                       " (%s)" % why_now if why_now else ""))
                 return
             except _HistoryPipeError as exc:
                 # Only this one: see `_shell_invocation`. Any other

@@ -398,14 +398,15 @@ the first line reads `history is off in this session`. A bash login shell
 gets that file too, which is the stronger guard and not the weaker one. Where
 the shell is not bash (only bash takes `--rcfile`, and zsh takes none) or
 the host has no `/dev/fd` to hand a pipe on, the session can only set
-`HISTFILE=/dev/null` in its environment, and the user's own startup files
-run after that and may set it again. The first line then reads `history is
-not guaranteed off in this session`, with the endpoint's reason beside it.
-Not guaranteed off does not mean on: history is held off only by a setting
-the user's own files can undo, and whether they do is theirs to know. The
-word is what the endpoint reported about itself, as the user is: the team
-server cannot verify it, and a modified endpoint could say `off` and not
-do it.
+`HISTFILE=/dev/null` in its environment, and the host's startup files run
+after that and may set it again. The first line then reads `history is not
+guaranteed off in this session`, with the endpoint's reason beside it, and
+says history may well be recorded. On macOS with zsh it **is**: `/etc/zshrc`
+sets `HISTFILE` itself, unconditionally, so every command typed in the
+session is written to the user's own `~/.zsh_history` (measured on the Mac
+this feature was built for, whose login shell is zsh). The word is what the
+endpoint reported about itself, as the user is: the team server cannot
+verify it, and a modified endpoint could say `off` and not do it.
 
 **A session whose history cannot be held off as reported is refused, not
 run.** The guard is reported once, when the tunnel connects. A pipe that
@@ -480,8 +481,9 @@ judge the risk. A live shell session shows, on the implant host:
   something turns it back on after the host's rc files have run. Where it
   could not (a login shell that is not bash, the `/bin/sh` fallback, or a
   host with no `/dev/fd`) the session only sets `HISTFILE=/dev/null`, the
-  user's own files can undo that, and the first line of the terminal says
-  so.
+  host's startup files can undo that, and the first line of the terminal
+  says so. On macOS with zsh they do: `/etc/zshrc` sets `HISTFILE`, and
+  the session's commands go to `~/.zsh_history`.
 
 The session is given `/` as its working directory rather than the
 install directory, so a prompt does not name where the implant lives. That
