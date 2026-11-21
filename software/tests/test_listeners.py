@@ -795,6 +795,48 @@ class TestTheUdpListener(unittest.TestCase):
 
     # ── the exchange ──
 
+    def test_registering_over_quic_adopts_the_assigned_agent_id(self):
+        # The one test in this class driven by the beacon's own leg rather
+        # than by framed datagrams, and it is here because this is where
+        # the listener that terminates that framing lives.
+        #
+        # Same gap SMB had: the QUIC rung in `_beacon_loop` promoted
+        # `_registered` without adopting the id the server assigned, so a
+        # beacon reachable only over QUIC filed its results under its
+        # implant id and never appeared in the agent's `history`. Fixed
+        # for all four upstream legs at once, so it is tested on each.
+        env = _TaskingServer(self.raw, None)
+        self.addCleanup(env.stop)
+        env.start()
+        listener = self._listener(
+            "http://127.0.0.1:%d/api/v1/beacon" % env.agent_port)
+        host, port = listener.address
+        beacon = Beacon({"c2": {
+            "beacon_interval_seconds": 2,
+            "jitter_percent": 0,
+            "encryption_key": self.b64,
+            "proxy": {"mode": "none"},
+            "https": {"enabled": False},
+            "dns": {"enabled": False, "domain": "", "resolver": "127.0.0.1"},
+            "smb": {"enabled": False},
+            "quic": {"enabled": True, "server": "%s:%d" % (host, port)},
+        }})
+
+        self.assertTrue(beacon._register_upstream(),
+                        "QUIC is an upstream leg and did not register")
+
+        # Asserted against the record the server holds for this implant
+        # rather than against "one new agent appeared": the implant id is
+        # stable per host and `agents` is module state this file shares,
+        # so a beacon that registered in an earlier test is re-registered
+        # here and no new name is assigned. What matters either way is
+        # that the id the beacon adopted names this implant's record.
+        fleet = env.agents()
+        self.assertIn(beacon._agent_id, fleet,
+                      "the adopted id names no agent in the fleet")
+        self.assertEqual(fleet[beacon._agent_id]["id"], beacon._implant_id)
+        self.assertTrue(beacon._registered)
+
     def test_a_payload_is_relayed_and_the_answer_comes_back(self):
         answer = self.crypto.wrap({"tasks": [{"cmd": "shell"}]})
         seen = []
@@ -1574,6 +1616,29 @@ class TestTheSmbListener(unittest.TestCase):
         new = set(self.env.agents()) - before
         self.assertEqual(len(new), 1, "the beacon did not register")
         self.assertEqual(answer.get("agent_id"), new.pop())
+
+    def test_registering_over_smb_adopts_the_assigned_agent_id(self):
+        # `_agent_id` used to be set in `_register_https` and nowhere
+        # else, while this leg promoted `_registered` on its own. So a
+        # beacon that registered over SMB filed everything afterwards
+        # under its *implant* id -- and `_handle_result` keys the agent's
+        # `history` by the assigned name, so its work never appeared
+        # against the agent at all. Half a registration.
+        beacon = self._beacon()
+
+        self.assertTrue(beacon._register_upstream(),
+                        "SMB is an upstream leg and did not register")
+
+        # Against the record the server holds for this implant rather
+        # than against "one new agent appeared": the implant id is stable
+        # per host and `agents` is module state this file shares, so a
+        # beacon that registered in an earlier test is re-registered here
+        # under the name it already had.
+        fleet = self.env.agents()
+        self.assertIn(beacon._agent_id, fleet,
+                      "the adopted id names no agent in the fleet")
+        self.assertEqual(fleet[beacon._agent_id]["id"], beacon._implant_id)
+        self.assertTrue(beacon._registered)
 
     def test_tasking_comes_back_over_smb(self):
         beacon = self._beacon()

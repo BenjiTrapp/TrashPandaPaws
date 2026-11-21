@@ -585,5 +585,81 @@ class TestLiveBeaconIntegration(ServerTestBase):
             beacon.stop()
 
 
+# ── Beacon generator: the gsocket leg it cannot deliver ──
+
+
+class TestBeaconGenGsocketLeg(unittest.TestCase):
+    """`/api/server/beacon-gen` and the fifth leg it has no binary for.
+
+    The gsocket leg reaches the team server through a `gs-netcat` child
+    process, so it needs that binary on disk beside the beacon. A
+    generated build is a single file of obfuscated source and carries no
+    binary at all, which makes an enabled gsocket leg undeliverable here
+    no matter what the config says. Refused at generation rather than
+    shipped dead: a channel that looks configured and delivers nothing is
+    this repository's most-repeated failure, and the operator's next move
+    after a silent one is a bug report about the leg rather than about the
+    build they asked for.
+
+    Not a `ServerTestBase` subclass: this route is driven entirely
+    through the test client, and that base also starts a live listener on
+    the module's single port -- which the second class to want it cannot
+    bind, so each one that inherits it prints a port-in-use error nobody
+    is meant to read. Nothing here needs a socket.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data_dir = Path(tempfile.mkdtemp())
+        cls.app = create_app(ServerCrypto(KEY), TEST_TOKEN, cls.data_dir)
+        cls.app.config["TESTING"] = True
+        cls.client = cls.app.test_client()
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls.data_dir, ignore_errors=True)
+
+    def post_gen(self, protocols):
+        return self.client.post(
+            "/api/server/beacon-gen",
+            json={"c2_url": "http://127.0.0.1:1/api/v1/beacon",
+                  "layers": 1, "protocols": protocols},
+            headers={"Authorization": "Bearer %s" % TEST_TOKEN},
+        )
+
+    def test_beacon_gen_refuses_an_enabled_gsocket_leg(self):
+        # A generated build is a single file with no binary beside it, so
+        # the leg could never work. Refused at generation, naming the
+        # reason, rather than emitting a build with a dead fifth leg.
+        response = self.post_gen({
+            "https": {"enabled": True,
+                      "callback_url": "http://127.0.0.1:1/api/v1/beacon"},
+            "gsocket": {"enabled": True},
+        })
+        self.assertEqual(response.status_code, 400)
+        error = response.get_json()["error"]
+        # The message has to say what to do instead, not merely that it
+        # refused: the leg is a hardware-implant feature because the
+        # image is what carries `gs-netcat`.
+        self.assertIn("gs-netcat", error)
+        self.assertIn("hardware implant", error)
+        # And no build came back alongside the refusal.
+        self.assertNotIn("oneliner_unix", response.get_json())
+
+    def test_beacon_gen_ignores_a_disabled_gsocket_leg(self):
+        # `enabled: false` is what every config in this repository
+        # carries, including the ones an operator pastes into the
+        # generator. It is not an error, and a request carrying one still
+        # gets the build it asked for.
+        response = self.post_gen({
+            "https": {"enabled": True,
+                      "callback_url": "http://127.0.0.1:1/api/v1/beacon"},
+            "gsocket": {"enabled": False},
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["oneliner_unix"])
+
+
 if __name__ == "__main__":
     unittest.main()

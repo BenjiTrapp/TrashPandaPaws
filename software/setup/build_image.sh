@@ -46,6 +46,28 @@ PARROT_IMAGE_URL="https://download.parrot.sh/parrot/iso/${PARROT_VERSION}/Parrot
 PARROT_IMAGE_FILE="parrot-arm64-${PARROT_VERSION}.img.xz"
 PARROT_IMAGE_RAW="parrot-arm64-${PARROT_VERSION}.img"
 
+# ── gs-netcat (the gsocket leg's binary) ──
+# The beacon's fifth C2 leg (c2.fallback.gsocket) execs this, and it is
+# fetched *here*, on the workstation building the image, and never on the
+# target. An implant that downloaded a binary at runtime would make a request
+# nobody configured, from the host that can least afford one -- and the digest
+# below is only worth having if the thing it measures is in the image.
+#
+# Pinned, like the ParrotOS release above, because a moving download is a
+# different image a month later. The upstream project publishes static
+# aarch64 builds, which is what the Pi needs; the digest is of
+# gs-netcat_linux-aarch64 from the v1.4.43 release page and must stay in step
+# with c2.fallback.gsocket.sha256 in configs/raccoon.yaml, which is what the
+# implant verifies against before every exec. A test holds the two together.
+#
+# Update all three lines together, and re-measure: a new version with an old
+# digest reads to an operator as a replaced binary, which is the one finding
+# here nobody should get wrong.
+GSNETCAT_VERSION="1.4.43"
+GSNETCAT_URL="https://github.com/hackerschoice/gsocket/releases/download/v${GSNETCAT_VERSION}/gs-netcat_linux-aarch64"
+GSNETCAT_FILE="gs-netcat-${GSNETCAT_VERSION}-linux-aarch64"
+GSNETCAT_SHA256="d4a7dfda2303fd0203d9bd2f29f8f2ee28dc2c42176f6a3ab37566aad1d5f117"
+
 # ── Defaults ──
 TARGET_DEVICE=""
 CUSTOM_CONFIG=""
@@ -263,6 +285,65 @@ chmod +x "${RACCOON_DIR}/software/setup/"*.sh
 # Copy requirements
 cp "${PROJECT_DIR}/software/requirements.txt" "${RACCOON_DIR}/software/"
 
+# ── gs-netcat, for the gsocket C2 leg ──
+#
+# Fetched on this workstation and verified here, then placed in the image.
+# Nothing about this happens on the target: see the pin at the top of the
+# file. The leg ships disabled, so an image without the binary is a working
+# image -- which is why a download that fails is a warning and not the end of
+# the build.
+#
+# A digest *mismatch* is fatal, and the asymmetry is deliberate. A missing
+# file is a leg that refuses to start and says so ("no such file, so there is
+# no gs-netcat to exec"). A file that does not match is either a stale pin or
+# a binary somebody else put there, and the second one would be handed the
+# secret that fronts the beacon socket. An unverifiable binary is treated as
+# a failed check, never as a passed one.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
+GSNETCAT_CACHED="${CACHE_DIR}/${GSNETCAT_FILE}"
+if [ ! -f "$GSNETCAT_CACHED" ]; then
+    log "Downloading gs-netcat ${GSNETCAT_VERSION} (aarch64)..."
+    wget -q --show-progress -O "${GSNETCAT_CACHED}.part" "$GSNETCAT_URL" \
+        && mv "${GSNETCAT_CACHED}.part" "$GSNETCAT_CACHED" \
+        || rm -f "${GSNETCAT_CACHED}.part"
+fi
+
+if [ -f "$GSNETCAT_CACHED" ]; then
+    GSNETCAT_ACTUAL=$(sha256_of "$GSNETCAT_CACHED") || GSNETCAT_ACTUAL=""
+    if [ -z "$GSNETCAT_ACTUAL" ]; then
+        err "Cannot check the sha256 of ${GSNETCAT_CACHED}: no sha256sum and"
+        err "no shasum on this machine. Install either, or delete the file"
+        err "and build without the gsocket leg."
+        exit 1
+    fi
+    if [ "$GSNETCAT_ACTUAL" != "$GSNETCAT_SHA256" ]; then
+        err "gs-netcat ${GSNETCAT_VERSION} does not match its pinned digest."
+        err "  expected: ${GSNETCAT_SHA256}"
+        err "  measured: ${GSNETCAT_ACTUAL}"
+        err "Either GSNETCAT_SHA256 in this script is stale, or that is not"
+        err "the binary that was measured. Delete ${GSNETCAT_CACHED} and"
+        err "re-download before trusting it with an implant's secret."
+        exit 1
+    fi
+    install -m 755 "$GSNETCAT_CACHED" "${RACCOON_DIR}/bin/gs-netcat"
+    log "gs-netcat ${GSNETCAT_VERSION} installed (sha256 verified)"
+else
+    warn "Could not fetch gs-netcat ${GSNETCAT_VERSION}; the image has no"
+    warn "/opt/raccoon/bin/gs-netcat. The gsocket leg ships disabled, so the"
+    warn "implant still works -- but leave c2.fallback.gsocket.enabled false"
+    warn "until the binary is in place, or that leg will report"
+    warn "\"has no gs-netcat binary\" on every cycle."
+fi
+
 log "Software injected into /opt/raccoon/"
 
 # ── Step 5: Configure first-boot ──
@@ -405,6 +486,16 @@ sysctl -p /etc/sysctl.d/99-raccoon.conf 2>/dev/null || true
 
 # Load bridge module on boot
 echo "br_netfilter" > /etc/modules-load.d/raccoon-bridge.conf
+
+# Keep the gsocket C2 leg's local forward off the wire. Its `-p` binds every
+# interface (measured in upstream source at v1.4.43) and there is no
+# bind-address flag, and an unexpected listening port is an indicator on a
+# device impersonating an IP phone. One INPUT rule, applied now and
+# reapplied at every boot by the unit this installs, whether or not the leg
+# is ever enabled.
+echo "[+] Restricting the gsocket forward to this host..."
+/opt/raccoon/software/setup/gsocket_forward_firewall.sh || \
+    echo "[!] could not apply the gsocket forward rule"
 
 # Hostname from config
 CFG=/opt/raccoon/configs/raccoon.yaml

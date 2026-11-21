@@ -121,6 +121,142 @@ c2:
       # datagrams that looks like it on a flow record, which is the point.
       enabled: false
       server: ""
+    gsocket:
+      # The fifth leg, and the only one with no address to configure: a
+      # `gs-netcat` child here and a carrier beside the team server's beacon
+      # socket both dial *out* to the Global Socket Relay Network and are
+      # introduced to each other by a shared secret. So this leg survives the
+      # case the four above share -- the callback URL, the DNS zone, the SMB
+      # host and the QUIC host blocked or burned at once -- and it needs no
+      # inbound port and no name an investigator can pivot from this disk to
+      # the operator's infrastructure.
+      #
+      # WARNING: read the GSRN section of docs/LISTENERS.md before enabling
+      # this on an engagement. The relay network is a third party, so a
+      # client's traffic crosses infrastructure nobody in this project
+      # operates, and whether that is allowed is a question for the rules of
+      # engagement rather than for a default in a file. It also hides *where*
+      # the C2 is and not *that* gsocket is in use.
+      #
+      # Hardware implant only. A build the team server generates cannot carry
+      # this leg -- it is a single file that spawns no child -- and the
+      # generator refuses an enabled one with a reason rather than producing a
+      # build whose fifth leg silently does nothing.
+      enabled: false
+      # The secret is this leg's whole address on the relay network, so it is
+      # not here: a config file is something people paste into tickets. It
+      # names a file instead, so `gs-netcat` can be handed `-k <path>` rather
+      # than `-s <secret>`, which would put the credential in a world-readable
+      # `ps` line. 0600, one secret per implant, minted with `gs-netcat -g`.
+      #
+      # Empty here, and it stays empty until somebody writes that file: this
+      # is the one step of the leg nothing in the repository automates. The
+      # build generator does not write it -- the generator is what *refuses*
+      # this leg -- and the team server's secret store only writes its own
+      # carrier's copy. So the implant's copy is created by hand (0600, the
+      # secret and no trailing newline) and named here. The GSRN section of
+      # docs/LISTENERS.md gives both commands.
+      #
+      # A bare key reads as None, which counts as absent and is allowed only
+      # while the leg is disabled -- the same rule c2.encryption_key states a
+      # screen below.
+      secret_file:
+      # Installed into the image by software/setup/build_image.sh at *build*
+      # time, from a pinned release with the digest below. Never fetched on
+      # the target: an implant that downloaded a binary at runtime would make
+      # a request nobody configured, from the host that can least afford one.
+      binary_path: "/opt/raccoon/bin/gs-netcat"
+      # gs-netcat 1.4.43, linux-aarch64, verified before every exec. Empty
+      # would mean "do not verify", the meaning c2.sliver.sha256 has; it is
+      # filled because the leg hands this binary the secret that fronts the
+      # beacon socket, so "some gs-netcat is there" is not the question worth
+      # answering. Keep it in step with GSNETCAT_SHA256 in build_image.sh.
+      sha256: "d4a7dfda2303fd0203d9bd2f29f8f2ee28dc2c42176f6a3ab37566aad1d5f117"
+      # The five settings below are written out rather than left to their
+      # defaults, because each is refused when written as a bare key: a
+      # `scheme:` with nothing after it reads as None, and None counts as
+      # "absent" only for the three path-ish settings above.
+      #
+      # The scheme the beacon builds its URL against, aimed at its own
+      # forward. http, because the team server's --ssl is off by default and
+      # every relay_url below is http://127.0.0.1:8443: the forward lands on
+      # that same socket. Confidentiality on the hop rests on the SRP/AES-256
+      # session gsocket negotiates end to end and the AES-256-GCM envelope
+      # inside it, neither of which any carrier can read.
+      scheme: "http"
+      # The port the child forwards from, which the beacon then addresses on
+      # 127.0.0.1. It binds *every* interface, not loopback: measured in
+      # gs-netcat's own source at v1.4.43, and the tool has no bind-address
+      # flag. software/setup/gsocket_forward_firewall.sh closes it to
+      # everything but this host, from both provisioning paths; the GSRN
+      # section of docs/LISTENERS.md carries the citation and the reasons.
+      # There is nothing special about 16443 beyond its not colliding with
+      # anything else this host listens on.
+      local_port: 16443
+      # Zero would restart the child as fast as gs-netcat can fail -- a busy
+      # loop on the implant's CPU and a flood of joins on the relay network,
+      # both loud in exactly the place an implant has to be quiet.
+      restart_delay_seconds: 30
+      # 0 = unlimited, the meaning c2.sliver.max_restarts has above.
+      max_restarts: 0
+      # How long a cycle will block waiting for a freshly started carrier's
+      # forward to accept. Measured from the start, and the latch starts the
+      # carrier at the end of a failed cycle -- a whole beacon interval
+      # earlier -- so on the tasking path the window has closed and the leg
+      # gets one connect attempt. The arm that really waits is the
+      # re-registration every fifth failed cycle, which starts the carrier
+      # and then tries to register over it in the same pass.
+      ready_timeout_seconds: 20
+
+  # ── Egress decider: THIS HOST DECIDING FOR ITSELF AS A CLIENT ──
+  #
+  # The client side, like c2.fallback above it. What an implant that cannot
+  # reach its team server may try on its own, in this order, when no operator
+  # and no server-side model can be reached to decide for it. The thing that
+  # normally decides -- the agent's `try_egress` -- sits on the far side of
+  # exactly the connection being established, so when the device is dropped
+  # it cannot be asked. This block is the fallback for that one case, and it
+  # is for nothing else.
+  #
+  # Read docs/EGRESS_DECIDER.md before enabling it. Every row here is an
+  # action the implant takes with nobody watching, and the gate on what a
+  # row may try is in the beacon's code and not in this file: configuration
+  # chooses from three verbs and orders them, and cannot add a fourth. In
+  # particular it may never `sleep` -- the one verb the server-side model
+  # reaches for on a stuck beacon, and the one an implant deciding for
+  # itself must not have.
+  #
+  # Drop-box only. A build the team server generates carries no decider and
+  # reads none of this; this block is read by the Pi's beacon from the file,
+  # like c2.fallback above.
+  #
+  # Ships disabled: a fresh checkout decides nothing. The rules below are a
+  # draft the operator can switch on by changing one word, and they are
+  # validated whether the block is enabled or not, so a typo surfaces now
+  # rather than on the stuck cycle it would have fired.
+  egress_decider:
+    enabled: false
+    # At most this many autonomous attempts per stuck window. The window
+    # closes -- and the budget is refilled -- when any upstream leg
+    # delivers. Three, one per verb.
+    budget: 3
+    # The first rule whose condition holds, and whose verb this build can
+    # run, is the one attempt. A `when` lists the rescue classes of named
+    # transports, the record's flags, or `any` transport carrying one of a
+    # set of classes; several keys in one `when` all have to hold.
+    rules:
+      # A proxy answered but refused us: re-run discovery for another.
+      - when: {https: [auth_required, http_status]}
+        try: rediscover
+      # Discovery has already found a proxy we are not using: select it.
+      - when: {flags: [proxy_found]}
+        try: proxy
+      # Nothing out there answered at all: bring the gsocket carrier up now
+      # rather than waiting for the latch. A first rule of `gsocket` instead
+      # would bring it up a cycle sooner, at the cost of not trying a proxy
+      # first -- see the one-cycle cost in docs/EGRESS_DECIDER.md.
+      - when: {any: [timed_out, unreachable]}
+        try: gsocket
 
   beacon_interval_seconds: 300
   jitter_percent: 20
@@ -173,6 +309,48 @@ c2:
       relay_url: "http://127.0.0.1:8443"
       settings:
         zone: "c2.example.com"
+
+  # ── gsocket carriers: THIS HOST AS A GSOCKET SERVER ──
+  #
+  # The far end of `c2.fallback.gsocket` above, and its opposite in exactly
+  # the way `c2.listeners` is the opposite of `c2.fallback`: one `gs-netcat`
+  # per implant, listening on the Global Socket Relay Network under that
+  # implant's secret and forwarding whatever arrives into this host's own
+  # beacon socket. Configuring a leg here, or a carrier up there, is the
+  # mistake the two blocks' matching key names invite -- and the symptom is a
+  # process that joins the relay network and waits for ever for a peer that
+  # is listening somewhere else.
+  #
+  # It is not a `c2.listeners` entry: a carrier opens no socket, so it has no
+  # bind host, no bind port and nothing for the panel's port column to show.
+  # It is supervised by the team server all the same, with its own row in the
+  # 📡 panel; `services/raccoon-gsocket.service` is for a host that wants one
+  # without the panel.
+  #
+  # Ships empty, and the empty list is the whole point: a carrier joins a
+  # third-party relay network, and nothing should join one because a file
+  # happened to mention it. A configured entry is validated whether it is
+  # enabled or not, and a block the validators refuse stops the team server
+  # at startup with the offending value in the message.
+  #
+  # No secret here either. `identity` is a *name*, looked up in the team
+  # server's secret store (<data dir>/gsocket/secrets.json), which writes the
+  # credential to a 0600 file and hands the carrier `-k <path>`. One secret
+  # per implant, never fleet-wide: see docs/LISTENERS.md for why a recovered
+  # implant image must not dial anything but its own carrier.
+  gsocket_carrier: []
+    # - name: implant-01
+    #   # Which implant's secret this carrier listens under, as registered
+    #   # in the secret store. Two carriers may not share one.
+    #   identity: implant-01
+    #   enabled: false
+    #   # Where to connect what arrives: this host's beacon socket. A
+    #   # destination for `gs-netcat -d`, not an address to bind -- a
+    #   # wildcard here is a bind_host copied out of c2.listeners.
+    #   beacon_host: "127.0.0.1"
+    #   beacon_port: 8443
+    #   binary_path: "/opt/raccoon/bin/gs-netcat"
+    #   sha256: "d4a7dfda2303fd0203d9bd2f29f8f2ee28dc2c42176f6a3ab37566aad1d5f117"
 
   # ── Reverse SOCKS tunnel, near end: THIS HOST AS A TUNNEL CLIENT ──
   #

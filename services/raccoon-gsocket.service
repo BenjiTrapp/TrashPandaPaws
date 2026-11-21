@@ -1,0 +1,95 @@
+[Unit]
+Description=Raccoon gsocket carrier — one gs-netcat beside the beacon socket
+# The team server's side of the beacon's fifth leg: it listens on the Global
+# Socket Relay Network under one implant's secret and forwards whatever
+# arrives into this host's own beacon socket. The 📡 panel starts and stops
+# these as child processes of the team server; this unit is for a host that
+# wants one without the panel, the way the tunnel ships both.
+#
+# There is no .socket sibling, and that is not an omission. The three
+# listener units have one because 53 and 445 are privileged ports that
+# systemd binds for them; a carrier binds nothing at all -- it dials out, and
+# `-p` here is a destination port on this machine, not an address to listen
+# on. Only the implant's side of this leg opens a local forward.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Unprivileged, and nothing in this file changes that. A carrier holds no
+# encryption key -- what travels through it is sealed in the beacon's
+# AES-256-GCM envelope, so it can neither read beacon traffic nor forge it --
+# and it opens no socket, so it needs no capability either.
+#
+# The key file named below has to be readable by this user: install it with
+# `install -o nobody -g nogroup -m 600`. Mode 0600 and not looser, because
+# every secret in it is a dialable path to the beacon socket of the implant it
+# belongs to, and the team server's own secret store refuses a key file other
+# users can read rather than quietly tightening it.
+User=nobody
+Group=nogroup
+WorkingDirectory=/opt/raccoon
+
+# The secret never reaches this command line. `gs-netcat` accepts
+# `-s <secret>` and its own documentation warns against it, because
+# /proc/<pid>/cmdline is world-readable and so is a unit file; `-k <path>`
+# reads it from a 0600 file instead. The path is not written here either: a
+# key file's name carries the identity of the implant it belongs to, and this
+# file is readable by everyone on the host.
+#
+# No `-` before the path, unlike the DNS listener's token file: that listener
+# refuses to start without its token and says why, while `gs-netcat` is a
+# third-party binary that would be handed an empty `-k` and say nothing
+# useful. A missing credential should stop the unit, not produce a carrier
+# nobody can diagnose.
+EnvironmentFile=/etc/raccoon/gsocket.env
+
+# `-l` listens on the relay network under that secret; `-d`/`-p` say where to
+# connect what arrives. 127.0.0.1:8443 is the team server's beacon socket --
+# `--port`'s default, and the socket every shipped relay_url addresses. A
+# deployment that moved it wants a drop-in overriding this line, not an edit
+# here.
+#
+# The binary is the one software/setup/build_image.sh installs from a pinned
+# release with a recorded digest. A team server installed some other way
+# needs its own copy at this path.
+ExecStart=/opt/raccoon/bin/gs-netcat -k ${RACCOON_GSOCKET_SECRET_FILE} \
+    -l -d 127.0.0.1 -p 8443
+Restart=always
+# 30 seconds, the default c2.fallback.gsocket.restart_delay_seconds uses on
+# the implant's side, and for the same reason: restarting as fast as
+# gs-netcat can fail is a busy loop here and a flood of joins on a relay
+# network operated by somebody else.
+RestartSec=30
+
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/raccoon
+# It relays bytes between a third-party relay network and the beacon socket,
+# so it gets the same small surface the listeners get.
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+# MemoryDenyWriteExecute is deliberately absent. gs-netcat is a third-party
+# static binary that was never run on the machine this unit was written on,
+# and a mapping it needs that this would refuse produces a carrier that exits
+# at start with nothing but a code. Nothing else in this sandbox depends on
+# it; add it once somebody has watched a carrier come up with it on.
+
+# stdout goes nowhere: gs-netcat is a pipe tool, so anything it writes there
+# is traffic rather than a log line, and the journal is not where beacon
+# ciphertext belongs. Its refusals arrive on stderr, which is kept -- a
+# carrier that cannot read its key file is the failure this unit most needs to
+# be able to explain.
+StandardInput=null
+StandardOutput=null
+StandardError=journal
+SyslogIdentifier=raccoon-gsocket
+
+[Install]
+WantedBy=multi-user.target

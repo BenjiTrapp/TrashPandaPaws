@@ -355,6 +355,35 @@ RISK_TABLE = {
         TIER_HARD, "tunnel_control", "lifecycle",
         "opens or closes a SOCKS route into the target network, which is "
         "the operator's call and not the agent's"),
+    # Its own row for the same reason `tunnel_control` has one, and it
+    # arrived the same way: the implant grew an `egress` verb -- `egress
+    # proxy <index|url>`, `egress rediscover`, `egress gsocket` -- and the
+    # set-equality test between the beacon's dispatch table and
+    # `executor/beacon.py`'s copy of it put the word in the executor's
+    # prompt before anyone decided the model should have it. Neither
+    # neighbour's sentence is true of it: it is not beacon lifecycle
+    # control, and it is not a SOCKS route. What it is: the one verb that
+    # acts on how this implant gets out -- it selects a proxy, raises the
+    # relay leg, or goes looking for another proxy. The verbs are for the
+    # operator, and for a stranded implant choosing for itself when the
+    # team server cannot be reached; a model that picked a proxy on a
+    # beacon that was still answering would be spending the channel it is
+    # talking over.
+    #
+    # The reason names the three rather than summarising them, because one
+    # tier over three hazards is the defect the `tunnel_control` split
+    # exists to prevent and this row walked straight into it. The first
+    # draft read "moves the path the implant's traffic leaves the host by,
+    # and a path that carries nothing is a beacon out of reach": true of
+    # `egress proxy`, false of `rediscover`, which selects nothing, and
+    # false of `gsocket`, which adds a leg and cannot strand anything. The
+    # neighbour shows the shape -- it covers both of its own arms by
+    # naming both, "opens or closes a SOCKS route".
+    "egress_control": _row(
+        TIER_HARD, "egress_control", "lifecycle",
+        "selects the proxy the implant posts through, brings its relay "
+        "leg up, or re-probes the host for one; none of them is the "
+        "agent's call"),
     "sleep_too_long": _row(
         TIER_HARD, "sleep_too_long", "lifecycle",
         "a sleep this long takes the beacon out of reach for hours"),
@@ -913,11 +942,30 @@ _MALFORMED = _row(TIER_HARD, "malformed", "input",
 # one this fails closed. Unlike the three here it is reversible, which is
 # why it does not borrow their reason. The verb stays in `VERB_HINTS` and
 # is still described to the model, exactly as `kill`, `unpersist` and
-# `reconfig` are.
+# `reconfig` are. `egress` is the second verb of that shape, refused the
+# same way under a row of its own; see `_EGRESS_VERBS` below.
 _BEACON_HARD_VERBS = ("kill", "unpersist", "reconfig")
 
 # Refused like the three above and for its own stated reason.
 _TUNNEL_VERBS = ("tunnel",)
+
+# The same story one verb later. `egress proxy`, `egress rediscover` and
+# `egress gsocket` went into the implant for the operator and for a
+# stranded implant deciding about itself, and the same set-equality test
+# carried the word into the executor's prompt; this is the half that makes
+# that safe. Refused under `egress_control` and not with the three above,
+# because "irreversible without an operator" is not what is wrong with a
+# model choosing this implant's proxy, and not with `tunnel` either: that
+# verb opens a route *into* the network, this one changes the way out of
+# it, and two refusals a reader cannot tell apart are one refusal.
+#
+# The whole verb, including the sub-verb that only re-runs discovery. The
+# gate reads a first token, so per-sub-verb would be new machinery for a
+# verb the model has no use for -- and `egress rediscover` is not free
+# either: it probes the host's network again from a beacon whose channel
+# is the thing in question.
+_EGRESS_VERBS = ("egress",)
+
 _SLEEP_LIMIT_SECONDS = 3600
 
 # The two halves of _RULES are consulted at different points in classify, so
@@ -1047,6 +1095,8 @@ def classify(command, target_kind, is_uplink_iface, phase5_enabled):
         return RISK_TABLE["beacon_control"]
     if first_token in _TUNNEL_VERBS:
         return RISK_TABLE["tunnel_control"]
+    if first_token in _EGRESS_VERBS:
+        return RISK_TABLE["egress_control"]
     if first_token == "sleep":
         return _classify_sleep(effective[0])
 

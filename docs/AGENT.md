@@ -702,15 +702,22 @@ recorded it:      yes, as a finding
 
 ### Never permitted, in any mode
 
-Nine actions are refused outright and cannot be approved, by you or by the
+Ten actions are refused outright and cannot be approved, by you or by the
 expected-value check. Eight are irreversible and, from a drop-box, not
-correctable; the ninth, `tunnel_control`, is reversible and refused
-because it is the operator's call:
+correctable. The other two are the operator's call rather than the agent's:
+`tunnel_control` opens or closes a route into the target network, and
+`egress_control` covers the implant's own egress verb — the proxy it posts
+through, its relay leg, and the discovery that goes looking for another
+proxy. The implant grew that verb for the operator, and so that an implant
+the team server cannot reach can choose for itself; a model changing the
+egress of a beacon that is still answering would be spending the channel it
+is talking over.
 
 | Key | Why |
 |---|---|
 | `beacon_control` | beacon lifecycle control is irreversible without an operator |
 | `tunnel_control` | opens or closes a SOCKS route into the target network, which is the operator's call and not the agent's |
+| `egress_control` | selects the proxy the implant posts through, brings its relay leg up, or re-probes the host for one; none of them is the agent's call |
 | `sleep_too_long` | a sleep this long takes the beacon out of reach for hours |
 | `dropbox_lifeline` | touches the bridge, NAC bypass, cover identity or tunnel |
 | `power_off` | reboot or shutdown of the host carrying the beacon |
@@ -990,6 +997,106 @@ have to be distinguishable.
   re-reaches the action — with `pause` still configured it suspends again,
   so switch the behaviour to `decide` or `skip` before resuming, or stop the
   run. The record is complete either way.
+
+
+### The gsocket leg
+
+The beacon's fifth transport reaches the team server through a `gs-netcat`
+child and the Global Socket Relay Network
+([`docs/LISTENERS.md`](LISTENERS.md#the-fifth-transport-gsocket-over-the-gsrn)).
+These four are properties of that arrangement, not findings a review left
+open, which is why they are their own section and not filed under the
+hardening pass's severity groups below — those are that pass's, and counted
+against it. The fourth is the one that would hold a deployment, and it is now
+measured rather than assumed: the answer came out the worse way, and the
+remedy ships with the implant's provisioning.
+
+- **A generated build has four legs; the hardware implant has five.** The leg
+  needs a child process and a binary on disk, and a build the team server
+  generates is a single file that is pasted into a shell. So the generator
+  refuses an enabled `gsocket` leg with a 400 naming the reason rather than
+  producing a build whose fifth leg silently does nothing. An operator
+  comparing the two will find a transport in `configs/raccoon.yaml` that the
+  Beacon Gen form cannot offer, and that asymmetry is deliberate.
+- **The carrier is a second process, so killing it kills the leg.** Both ends
+  are a `gs-netcat` the project spawns and does not contain: kill the
+  implant's child and the forward is gone until the beacon notices on its
+  next failed cycle and starts another, no sooner than
+  `restart_delay_seconds` (30 by default) after the last start. There is no
+  watcher thread and no timer, deliberately — a restart in two places is a
+  child that reappears after an operator stopped it — but the cost is that an
+  implant whose carrier was killed is unreachable over this leg for at least
+  one beacon interval, and the panel reports the carrier, not the implant's
+  copy of it, which nothing on the team server can see.
+- **Reachability now depends on a third-party relay network.** The GSRN is
+  operated by The Hacker's Choice, not by this project: if it is down,
+  blocked, or no longer willing to carry this traffic, the leg is down with
+  it, and nothing in the repository can route around that. It is also
+  recognisable — the relay hosts are published and gsocket is well-known
+  tooling to defenders — so this leg hides where the C2 is, not that gsocket
+  is in use. Whether a client's traffic may cross a third party at all is a
+  rules-of-engagement question; the shipped configuration leaves the leg
+  disabled rather than deciding it.
+- **The implant's carrier opens a local forward, and it binds every
+  interface.** `gs-netcat -p <local_port>` on the implant is a listening
+  socket, and whatever reaches it reaches the team server's beacon socket
+  **unauthenticated at the transport level** — bounded by the AES-256-GCM
+  envelope to exactly what a compromised listener can do (drop or replay
+  messages; it can neither read them nor forge one), but a path all the same.
+  How far it reaches is **measured in upstream source at v1.4.43**, not
+  assumed: `tools/4_gs-netcat.c:1499` sets `gopt.is_multi_peer = 1` for `-p`,
+  `tools/4_gs-netcat.c:1573-1585` takes the client branch and calls
+  `fd_net_listen(gopt.listen_fd, &gopt.port, SOCK_STREAM)`, and
+  `tools/utils.c:1238-1259` binds `htonl(INADDR_ANY)` whenever `*port != 0`
+  — `127.0.0.1` only for port 0. So the implant's own argv,
+  `gs-netcat -k <file> -w -p <port>`, binds `0.0.0.0:<local_port>`: not the
+  host's local users but the whole segment has that path. **The consequence
+  that matters more here is the cover identity**, because no envelope bounds
+  it: an unexpected port answering on every interface is an indicator in its
+  own right, and it belongs to no Cisco IP phone and no HP printer, so one
+  scan of the segment finds it. `gs-netcat`
+  offers no bind-address flag, so the remedy is a host firewall rule —
+  `software/setup/gsocket_forward_firewall.sh`, run by both of the implant's
+  provisioning paths, which drops that port on everything but `lo` and
+  reapplies the rule at every boot. The same reading settled the server side
+  favourably: `-l` takes the other branch and the carrier opens no local
+  socket at all. The citation is repeated above `GsocketCarrier.argv` in
+  `software/c2/gsocket/carrier.py` and in the GSRN section of
+  [`docs/LISTENERS.md`](LISTENERS.md#what-the-implants-forward-exposes-measured).
+
+
+### The egress decider
+
+When no operator and no server-side model can be reached, a dropped implant
+can decide for itself what to try next, from `c2.egress_decider` of
+`configs/raccoon.yaml` — the operator's policy over the three
+connection-establishing verbs `egress_control` covers (select a discovered
+proxy, re-run discovery, bring the gsocket carrier up). It is off in the
+shipped file; see [`docs/EGRESS_DECIDER.md`](EGRESS_DECIDER.md). These three
+are limits of that decider, not findings a review left open, which is why they
+are their own entries and not filed under the hardening pass's groups below.
+
+- **The decider is drop-box only.** A generated build has no decider and no
+  way to be given one: it is a single file with no `raccoon.yaml` to read, and
+  `beacon_config_from_fallback` is what reads the block. The cost is honest —
+  the two proxy verbs are unavailable on exactly the corporate target host
+  where a proxy is most likely, because that is the host the generator builds
+  for. Reaching it would mean a generator request field, panel work and
+  validation, and that is not built.
+- **The decider may never `sleep`.** `sleep` is the one verb the team server's
+  model reaches for on a stuck beacon — on the server, where an operator is
+  present to be asked. The implant's own decider is refused it in code: an
+  implant that can slow its own check-ins with nobody to ask can talk itself
+  into silence. So the two deciders are not equivalent, and a policy cannot
+  add `sleep` back, because the allowed set is fixed in the beacon rather than
+  read from the file.
+- **Two rescue flags are dead, and a rule naming one is refused.** `dot1x_seen`
+  and `portal_answered` are in the rescue record's format and the team server
+  renders them, so the panel invites a rule that names them — but nothing sets
+  them in the beacon, because no 802.1X sensing and no captive-portal
+  detection exists here. A rule that could never match is refused by name when
+  the policy is read. Making them live is a separate piece of work, and the one
+  that would make this decider much smarter.
 
 
 ### Left open by the security hardening

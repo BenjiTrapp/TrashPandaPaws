@@ -142,6 +142,20 @@ if systemctl is-active --quiet ufw 2>/dev/null; then
     echo -e "${YELLOW}    UFW disabled (bridge requires unrestricted L2 forwarding)${NC}"
 fi
 
+# ── Network: keep the gsocket leg's local forward off the wire ──
+# Not a firewall policy -- the line above just removed one -- but a single
+# INPUT rule on one port. The implant's side of the gsocket C2 leg is
+# `gs-netcat -w -p <local_port>`, and that `-p` binds every interface:
+# measured in upstream source at v1.4.43 (tools/utils.c:1238-1259 binds
+# INADDR_ANY whenever the port is non-zero), and `gs-netcat` has no
+# bind-address flag. An unexpected port answering on every interface is an
+# indicator on a device impersonating an IP phone, which is the cover
+# identity this whole image exists to hold, so the rule is applied whether
+# or not the leg is ever enabled. The script explains itself at length.
+echo -e "${GREEN}[+] Restricting the gsocket forward to this host${NC}"
+"${SCRIPT_DIR}/gsocket_forward_firewall.sh" || \
+    echo -e "${YELLOW}    could not apply the rule; see the script's header${NC}"
+
 # ── Disable unnecessary ParrotOS services (reduce footprint) ──
 echo -e "${GREEN}[+] Disabling unnecessary services${NC}"
 for svc in avahi-daemon cups bluetooth ModemManager; do

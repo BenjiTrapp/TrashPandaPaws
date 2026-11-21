@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Orchestrator tools for a beacon that cannot get out.
 
-A beacon whose HTTPS, SMB and QUIC legs have all failed sends one
+A beacon whose upstream legs have all failed — HTTPS, SMB, QUIC and, on a
+hardware implant, gsocket — sends one
 encrypted diagnostic over DNS (see `software/c2/dns_rescue.py`), and the
 team server attaches it to that agent's record as `stuck`. These two tools
 are the other half: the orchestrator reads the diagnosis and queues **one**
@@ -24,6 +25,7 @@ import json
 from software.agent.c2client import C2Unauthorized, C2Unavailable
 from software.agent.llm.provider import ToolSpec
 from software.agent.tools import CORE, Entry
+from software.c2.dns_rescue import TRANSPORTS
 
 # What the model may ask for, mapped to the verb the implant actually
 # dispatches. This mapping is the whole reason this constant exists: the
@@ -33,11 +35,17 @@ from software.agent.tools import CORE, Entry
 # and checks every value here against it.
 #
 # The honest limit, stated here because it shapes what this tool can do:
-# **the implant has no command that changes its proxy or its transport.**
-# Those are fixed when it is generated. What can be changed at runtime is
-# the traffic profile and the timing -- which still covers a real class of
-# cause, since a blocked URI pattern or an alerting cadence is a plausible
-# reason for a leg to fail. Anything else needs a new beacon-side verb.
+# **nothing this tool queues changes the implant's proxy or its
+# transport.** The implant now has `egress proxy`, `egress rediscover`
+# and `egress gsocket` for exactly that, but they are deliberately not in
+# the map below and are hard-refused to this model (`safety.py`'s
+# `_EGRESS_VERBS`, the `egress_control` risk row): widening this tool is a
+# separate decision about what a model may do to a live implant, and they
+# exist for the operator and for the implant's own decider. So what this
+# tool can change at runtime is the traffic profile and the timing --
+# which still covers a real class of cause, since a blocked URI pattern or
+# an alerting cadence is a plausible reason for a leg to fail. Anything
+# else is a verb this tool does not reach for.
 ATTEMPT_VERBS = {
     "profile": "reconfig",
     "sleep": "sleep",
@@ -61,8 +69,15 @@ def _leg_report(record):
         # queued attempt will never reach it either.
         "dns_answered": bool(record.get("dns_answered")),
         "reported_at": record.get("at", ""),
-        "legs": {leg: record.get(leg) for leg in
-                 ("https", "dns", "smb", "quic")},
+        # Read off `dns_rescue.TRANSPORTS` rather than written out here.
+        # This dict was `("https", "dns", "smb", "quic")` for the whole of
+        # the gsocket leg's life, so a beacon stuck with `binary_missing`
+        # or `carrier_failed` handed the campaign model four keys and no
+        # mention of the leg that failed -- the class survived only inside
+        # `summary`. `beacon.py`'s own comment on the config mapping names
+        # the shape: two copies of one mapping, both missing the same
+        # half, is how that survives a year.
+        "legs": {leg: record.get(leg) for leg in TRANSPORTS},
     }
 
 
@@ -191,10 +206,10 @@ def entries():
                 "try_egress",
                 "Queue ONE next attempt for a stuck beacon, chosen from its "
                 "diagnosis. One per call, deliberately: a sweep of "
-                "candidates is far louder than the problem it solves. The "
-                "implant cannot change its proxy or its transport at "
-                "runtime -- what you can change is its traffic profile and "
-                "its timing.",
+                "candidates is far louder than the problem it solves. This "
+                "tool cannot change a beacon's proxy or its transport -- "
+                "what you can change through it is the traffic profile and "
+                "the timing.",
                 {"type": "object",
                  "properties": {
                      "beacon_id": {"type": "string",

@@ -64,10 +64,16 @@ def _a_ciphertext() -> str:
 
 
 class TestTheRecord(unittest.TestCase):
-    def test_the_record_is_sixteen_bytes(self):
-        # Two bytes for the code, because 407 does not fit in one.
-        self.assertEqual(len(_a_record()), 16)
-        self.assertEqual(dns_rescue.RECORD_BYTES, 16)
+    def test_the_record_is_nineteen_bytes(self):
+        # Five transports at three bytes each, plus version, fingerprint
+        # and flags. Two bytes for the code, because 407 does not fit in
+        # one.
+        self.assertEqual(len(_a_record()), 19)
+        self.assertEqual(dns_rescue.RECORD_BYTES, 19)
+
+    def test_gsocket_is_the_fifth_and_last_transport(self):
+        self.assertEqual(dns_rescue.TRANSPORTS,
+                         ("https", "dns", "smb", "quic", "gsocket"))
 
     def test_pack_and_unpack_round_trip(self):
         got = dns_rescue.unpack(_a_record())
@@ -92,6 +98,37 @@ class TestTheRecord(unittest.TestCase):
             with self.subTest(raw=bad):
                 with self.assertRaises(ValueError):
                     dns_rescue.unpack(bad)
+
+    def test_a_five_transport_record_round_trips(self):
+        packed = dns_rescue.pack(
+            {"https": (dns_rescue.CLASSES["timed_out"], 0),
+             "gsocket": (dns_rescue.CLASSES["carrier_failed"], 0)},
+            dns_rescue.FLAG_DNS_ANSWERED, 0xBEEF)
+        self.assertEqual(len(packed), 19)
+        out = dns_rescue.unpack(packed)
+        self.assertEqual(out["version"], 2)
+        self.assertEqual(out["fingerprint"], 0xBEEF)
+        self.assertEqual(out["gsocket"],
+                         (dns_rescue.CLASSES["carrier_failed"], 0))
+
+    def test_a_v1_record_from_the_field_still_reads(self):
+        # What an implant deployed before this change sends: 16 bytes,
+        # version 1, four transports.
+        v1 = struct.pack("!BHBHBHBHBHB", 1, 0xBEEF,
+                         dns_rescue.CLASSES["timed_out"], 0,
+                         dns_rescue.CLASSES["answered"], 0,
+                         dns_rescue.CLASSES["not_attempted"], 0,
+                         dns_rescue.CLASSES["not_attempted"], 0,
+                         dns_rescue.FLAG_DNS_ANSWERED)
+        out = dns_rescue.unpack(v1)
+        self.assertEqual(out["version"], 1)
+        self.assertEqual(out["https"], (dns_rescue.CLASSES["timed_out"], 0))
+        self.assertEqual(out["gsocket"],
+                         (dns_rescue.CLASSES["not_attempted"], 0))
+
+    def test_an_unknown_version_is_still_refused(self):
+        with self.assertRaises(ValueError):
+            dns_rescue.unpack(b"\x07" + b"\x00" * 18)
 
     def test_every_http_status_fits(self):
         # The field is two bytes precisely so that 407 -- a proxy demanding
@@ -138,7 +175,7 @@ class TestTheLabelArithmetic(unittest.TestCase):
     def test_the_payload_is_exactly_two_labels_of_at_most_63(self):
         one, two = dns_rescue.to_labels(_a_ciphertext())
         self.assertEqual(len(one) + len(two), dns_rescue.PAYLOAD_CHARS)
-        self.assertEqual(dns_rescue.PAYLOAD_CHARS, 96)
+        self.assertEqual(dns_rescue.PAYLOAD_CHARS, 103)
         for label in (one, two):
             with self.subTest(label=label):
                 self.assertLessEqual(len(label), 63)
@@ -160,7 +197,12 @@ class TestTheLabelArithmetic(unittest.TestCase):
     def test_the_split_is_a_halving_not_a_constant(self):
         # A hard-coded 42 would produce a third label the moment the record,
         # the key name or the separators change. Halving survives that.
-        for extra in range(0, 15, 7):
+        #
+        # The loop stops at 9 extra bytes, not 14: with the five-transport
+        # record the full chain already costs 103 of the 126 characters two
+        # labels hold, and 12 extra bytes push it to 128 -- which `to_labels`
+        # refuses by design. This drives four lengths, two of them odd.
+        for extra in range(0, 10, 3):
             cipher = _encrypt_like_the_beacon(
                 {dns_rescue.WRAPPER_KEY: base64.b64encode(_a_record() + b"\x00" * extra).decode()})
             one, two = dns_rescue.to_labels(cipher)
@@ -2216,6 +2258,29 @@ class TestTheAgentReadsTheDiagnosis(unittest.TestCase):
         self.assertEqual(len(got["stuck"]), 1)
         self.assertIn("407", got["stuck"][0]["summary"])
         self.assertEqual(got["stuck"][0]["beacon_id"], "b1")
+
+    def test_the_leg_report_names_every_transport_in_the_record(self):
+        # The dict the campaign model reads to pick its next attempt. It
+        # was written out as `("https", "dns", "smb", "quic")` for the
+        # whole of the gsocket leg's life, so a beacon stuck with
+        # `binary_missing` or `carrier_failed` handed the model four keys
+        # with no mention of the leg that had failed -- the class survived
+        # only inside the `summary` string, which nothing parses.
+        #
+        # Pinned against `dns_rescue.TRANSPORTS` rather than against a
+        # list written here, because a list written here is the second
+        # copy that made this possible. A sixth transport now fails this
+        # test until the tool reports it.
+        c2 = _StuckC2({"b1": _stuck_agent(
+            stuck=dict(_stuck_agent()["stuck"],
+                       gsocket=["carrier_failed", 0]))})
+        entry = self._tool(c2, "get_stuck_beacons")()["stuck"][0]
+        self.assertEqual(set(entry["legs"]), set(dns_rescue.TRANSPORTS),
+                         "the leg report's key set is not the record's "
+                         "transports; a leg that failed is invisible to the "
+                         "model that has to choose the next attempt")
+        self.assertEqual(entry["legs"]["gsocket"], ["carrier_failed", 0],
+                         "the gsocket diagnosis is dropped from the report")
 
     def test_a_fleet_with_nothing_stuck_is_not_an_error(self):
         # Most beacons are fine and have nothing to report.

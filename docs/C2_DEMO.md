@@ -59,6 +59,7 @@ screens, still, with the detail the captions cannot carry.
 21. [Automated Attack — watching one run](#21-automated-attack--watching-one-run)
 22. [Automated Attack — the approval gate](#22-automated-attack--the-approval-gate)
 23. [Automated Attack — the deliverable](#23-automated-attack--the-deliverable)
+24. [The gsocket carrier panel](#24-the-gsocket-carrier-panel)
 
 ---
 
@@ -1319,3 +1320,82 @@ are different results, and only the task count tells them apart.
 > tiers, risk and OpSec profiles with measured numbers, the scope rules that
 > surprise people, budgets, what is logged, and the traps worth knowing
 > before the first run.
+
+---
+
+## 24. The gsocket carrier panel
+
+The beacon's fifth transport has no address. `gsocket` reaches the team
+server through a `gs-netcat` process on each side that meets its
+counterpart on the Global Socket Relay Network — a third-party relay — and
+the two find each other by a shared secret rather than by a host and port.
+So the 📡 panel, which otherwise lists listeners by what they bind, grows a
+row of a different kind.
+
+![The gsocket carrier in the Listeners panel](screenshots/35_gsocket_carrier_panel.png)
+
+*Captured from a running team server with a live carrier and an implant
+that had registered through it, by `tools/gsocket_rig.py --serve` and
+`tools/capture_gui.py`.*
+
+### What the row says, and why it reads differently
+
+| Column | A listener | A gsocket carrier |
+|--------|-----------|-------------------|
+| **What identifies it** | bind host and port — `0.0.0.0:445` | the implant's identity — `gsocket for implant gs-pi-01` |
+| **Socket** | the one it binds | *no socket of its own* |
+| **Key** | never holds the encryption key | never holds it either |
+| **Secret** | the listener token, for DNS only | one relay secret **per implant**, from the store |
+| **Start / Stop** | the same buttons | the same buttons |
+
+One carrier serves one implant, because the secret is per-implant: a
+fleet-wide secret would mean one recovered implant image handed its finder
+a dialable path to the beacon socket for every implant on the engagement.
+So a fleet of four carriers is four rows.
+
+### What this panel cannot show you
+
+**Which leg an agent actually came in on.** The carrier forwards into the
+same beacon socket a listener relays into, so the server records
+`last_channel = "http"` for a gsocket check-in exactly as it does for SMB
+and QUIC. Only DNS gets a `VIA DNS` tag, because only DNS is answered
+somewhere else. An agent reached over the relay network therefore looks, in
+the agent list, like any other — which is a property of where the traffic
+lands rather than something this panel chose to hide.
+
+**Whether the far end is up.** The row's `running` is about *this* process:
+that our end joined the relay and is waiting. `gs-netcat -t` could ask the
+relay whether the peer is listening, and `GsocketCarrier.probe()` wraps it,
+but nothing calls it from the status path — it re-hashes the binary on
+every call, and a panel that did that on each page load would be paying a
+multi-megabyte digest for a yes.
+
+### The warm-up cycle, which is not a fault
+
+The implant's carrier is **lazy**: it does not run while another leg is
+delivering, so a healthy implant holds no connection to the relay network
+at all. It starts on the first check-in cycle that ends with nothing
+delivered, and then stays up.
+
+That means the first cycle of an outage reports the leg as failed —
+`GSOCKET: its gs-netcat did not come up` — because the latch starts the
+carrier *after* the chain has been tried. The leg registers on the cycle
+after that. Read as a fault it looks like a broken transport; it is the
+price of not holding a relay connection open on a healthy implant, and
+[`LISTENERS.md`](LISTENERS.md#the-warm-up-cycle-which-is-not-a-fault) says
+so next to the setting that governs it.
+
+### Not in the Beacon Generator
+
+Section 2's generator will refuse this leg with a 400: a generated build is
+a single file and the leg needs a `gs-netcat` binary beside it. Five
+transports are the hardware implant's; a generated build has four. The
+refusal names the hardware implant, so the message is actionable rather
+than only negative.
+
+---
+
+> **Operator guide:** [`LISTENERS.md`](LISTENERS.md#the-fifth-transport-gsocket-over-the-gsrn)
+> — what the relay network costs, why one secret per implant, how both
+> copies of that secret are placed by hand, and what the implant's forward
+> exposes.
