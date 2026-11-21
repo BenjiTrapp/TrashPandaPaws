@@ -1019,7 +1019,12 @@ class TestTheTunnelPageDocumentsTheShellSession(unittest.TestCase):
     def test_the_tunnel_page_lists_the_detection_indicators(self):
         # What the session leaves on the host, in the voice this project
         # already uses for such notes.
-        self.present("bash", "the shell child")
+        # Not the word `bash`: a zsh login shell is the shell child there,
+        # and a pin on the word held the false "a bash child" in place.
+        self.present("child of the `python3 -`", "the process the shell "
+                     "is a child of")
+        self.present("the login shell, `bash` or `zsh`, else `bash` or "
+                     "`/bin/sh`", "which shells the child can be")
         self.present("python3 -", "the process it is a child of")
         self.present("pseudo-terminal", "the pty on the host")
         self.present("second connection", "the extra connection on the "
@@ -1158,6 +1163,11 @@ class TestTheOperatorShellIsDocumentedAsAWindow(unittest.TestCase):
                            ("process", "that the processes went with it")):
             self.assertIn(lost, flat, "the page says the shell is a new one "
                           "and not %s" % what)
+        # One reload measured `/`, which is where the spawn puts a session
+        # and not where every login shell stays; the sentence says which.
+        self.assertIn("back where the spawn puts it", flat,
+                      "the reload's working directory reads as a rule and "
+                      "not as where the spawn puts it")
 
     def test_the_tunnel_page_prices_a_parked_session(self):
         """Parking is the answer the page recommends, so it costs something.
@@ -1377,7 +1387,10 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
                               "which shell is chosen and from where")
         for pattern, what in (
                 (r"(?i)login shell", "that it is the login shell"),
-                (r"\$SHELL", "that `$SHELL` is not what is read"),
+                (r"passwd entry[^.]*and not from `\$SHELL`",
+                 "that the passwd entry is what is read and `$SHELL` is "
+                 "not -- in that order, since both words appear in the "
+                 "reversal too"),
                 (r"(?i)service manager", "why `$SHELL` is nobody's choice "
                                          "under the shipped unit"),
                 (r"(?i)\broot\b", "that a shipped implant runs as root, "
@@ -1389,6 +1402,42 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
                 (r"(?i)/bin/sh", "the floor when there is no bash")):
             self.assertRegex(said, pattern, "the paragraph does not say "
                              + what)
+
+    def test_no_paragraph_still_says_the_shell_is_always_bash(self):
+        """The statements the pin on the word `bash` held in place.
+
+        The introduction said "the host's own shell, `bash` where there is
+        one", and the detection list said a live session shows "a `bash`
+        child". Both are false for a zsh login shell, and the second is
+        what an operator reads to judge their own exposure. So the page may
+        not say, of the session's shell, that it is bash, anywhere an
+        unconditional claim would be made: the two paragraphs are read, and
+        so is the one about a shipped root implant.
+        """
+        text = TUNNEL_DOC.read_text()
+        intro = self.one_block(text, r"(?i)can also serve an \*\*interactive "
+                                     r"terminal\*\*", "what the feature is")
+        self.assertNotRegex(intro, r"(?i)host's own shell, `bash`",
+                            "the introduction says the shell is bash")
+        self.assertRegex(intro, r"(?i)login shell, else `bash`")
+        listed = self.one_block(
+            self.tunnel_section("### What it leaves on the host", "\n---"),
+            r"(?i)child of the `python3 -`", "what the shell child is")
+        self.assertNotRegex(listed, r"(?i)a \*\*`bash` child",
+                            "the indicator list says the child is bash")
+        section = self.tunnel_section(
+            "### Which shell a session runs, and what it costs for history",
+            "\n### ")
+        root = self.one_block(section, r"(?i)passwd", "the shipped root case")
+        self.assertNotRegex(root, r"(?i)nothing changes there",
+                            "a root implant's prompt is red now, so "
+                            "nothing does not change; the same shell runs")
+        self.assertRegex(root, r"(?i)same shell runs there")
+        completion = self.one_block(text, r"(?i)flag completion needs one "
+                                          r"extra step", "completion")
+        self.assertNotRegex(completion, r"(?i)a session here is `bash -i`",
+                            "the completion paragraph says every session "
+                            "is bash")
 
     def test_the_session_is_given_root_but_may_not_stay_there(self):
         """Statement 3: "The session starts in `/`" is a spawn argument.
@@ -1414,6 +1463,13 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
                          "startup files may change the directory")
         self.assertRegex(paragraph, r"(?i)measured",
                          "the paragraph does not say that this was measured")
+        self.assertRegex(paragraph, r"started from `/`[^.]*found in the "
+                                    r"home directory",
+                         "the paragraph does not say what the measurement "
+                         "found: a shell started from / was in the home "
+                         "directory")
+        self.assertNotRegex(paragraph, r"(?i)left the session in `/`",
+                            "the paragraph says the session stayed in /")
         self.assertNotRegex(
             self.flat(text), r"(?i)session starts in\s*`?/`?(?![\w.])",
             "another paragraph still says the session starts in /")
@@ -1442,6 +1498,21 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
                  "that the view says which of the two applies")):
             self.assertRegex(item, pattern, "the history item does not say "
                              + what)
+        # A direction, not two words: the sentence about bash taking the
+        # rcfile may not say anything about being not guaranteed.
+        took = [x for x in re.split(r"(?<=[.;])\s", item)
+                if re.search(r"(?i)bash took", x)]
+        self.assertEqual(len(took), 1, "the item has %d sentences about "
+                         "bash taking the rcfile" % len(took))
+        self.assertRegex(took[0], r"(?i)^Where bash took the generated "
+                                  r"rcfile history is off, and none is "
+                                  r"written")
+        self.assertNotRegex(took[0], r"(?i)guaranteed|even where",
+                            "history is said to be only not guaranteed off "
+                            "where bash took the rcfile")
+        self.assertRegex(item, r"(?i)`/bin/sh`|bin/sh",
+                         "the item leaves out the /bin/sh fallback, which "
+                         "takes the weaker guard too")
         self.assertNotRegex(
             self.flat(section),
             r"(?i)`HISTFILE` is unset for the session\s*(?:\u2014|--?)\s*"
@@ -1480,18 +1551,23 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
                 (r"(?i)only bash takes `?--rcfile|zsh takes no `?--rcfile",
                  "why a non-bash shell gets the weaker one"),
                 (r"/dev/fd", "that a host without /dev/fd gets it too"),
-                (r"(?i)bash login shell\s+gets that file too[^.]*stronger",
-                 "that a bash login shell gets the stronger one"),
+                (r"(?i)bash login shell gets that file too, which is the "
+                 r"stronger guard and not the weaker",
+                 "that a bash login shell gets the stronger one, and not "
+                 "the reverse -- `[^.]*stronger` also matched the reversal"),
                 (r"(?i)after that|run after", "that the user's files run "
                                               "after the weaker guard"),
                 (r"history is off in this session",
                  "the first line's wording for the stronger guard"),
                 (r"history is not guaranteed off in this session",
                  "the first line's wording for the weaker guard"),
-                (r"(?i)cannot verify", "that the word is the endpoint's own "
-                                       "claim, as the user is")):
+                (r"(?i)the team server cannot verify it",
+                 "that the word is the endpoint's own claim, as the user "
+                 "is")):
             self.assertRegex(said, pattern, "the paragraph does not say "
                              + what)
+        self.assertNotRegex(said, r"(?i)team server (?:checks|verifies)",
+                            "the paragraph says the team server checks it")
 
     def test_the_page_says_what_the_first_line_shows_in_each_of_three_cases(
             self):
@@ -1508,19 +1584,32 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
         self.assertEqual(len(cases), 3, "the paragraph has %d cases, wanted "
                          "three: %r" % (len(cases), cases))
         old, none, unknown = cases
+        # Each bullet is pinned by the sentence that says what the line
+        # reads, and by what it may not say: `off` is the one reading that
+        # misleads, and a bullet that said the reverse kept every word
+        # these checks used to look for.
         self.assertRegex(old, r"(?i)built before")
-        self.assertRegex(old, r"(?i)not guaranteed off")
-        self.assertRegex(old, r"(?i)\bno reason\b|without (?:a|any) reason",
+        self.assertRegex(old, r"(?i)reads as `not guaranteed off` with "
+                              r"\*\*no reason\*\*",
                          "an endpoint too old to send the field must read as "
                          "the weaker word with no reason beside it")
+        for what, bullet in (("old", old), ("unknown", unknown)):
+            self.assertNotRegex(
+                bullet, r"(?i)(?:reads|treated|shown|taken|counted) as "
+                        r"`?off\b|never as `?not guaranteed|history is off",
+                "the %s case is described as reading `off`" % what)
         self.assertRegex(none, r"(?i)\bno row\b")
         self.assertRegex(none, r"(?i)relay[^.]*too old|too old[^.]*relay")
-        self.assertRegex(none, r"(?i)says nothing about history")
-        self.assertNotRegex(none, r"(?i)not guaranteed off[^.]*\bkeeps\b",
-                            "the nothing case must not be described as the "
-                            "weaker word")
+        self.assertRegex(none, r"(?i)says nothing about history\W+neither "
+                               r"word")
+        self.assertNotRegex(none, r"(?i)reads? (?:as )?`?(?:history is )?"
+                                  r"(?:not guaranteed )?off|history is "
+                                  r"(?:not guaranteed )?off",
+                            "the nothing case must not be described as "
+                            "either word")
         self.assertRegex(unknown, r"(?i)recognis")
-        self.assertRegex(unknown, r"(?i)not guaranteed off")
+        self.assertRegex(unknown, r"(?i)reads as `not guaranteed off` as "
+                                  r"well")
         self.assertRegex(unknown, r"(?i)\bkeeps\b[^.]*reason")
 
     def test_the_page_documents_the_colour_the_user_asked_for(self):
@@ -1530,6 +1619,10 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
             "\n### ")
         said = self.one_block(section, r"(?i)colou?r defaults",
                               "that bash gets colour defaults")
+        self.assertNotRegex(self.flat(section), r"(?i)only where it has none "
+                                                r"of its own",
+                            "the prompt is set regardless; only the two "
+                            "variables yield to the environment")
         for pattern, what in (
                 (r"(?i)\bbash\b", "that it is bash that gets them"),
                 (r"~/\.bashrc|\$HOME/\.bashrc", "that the user's own file "
@@ -1538,6 +1631,15 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
                  "that the user's own settings win"),
                 (r"(?i)before\W{0,3}the user's own `~/\.bashrc`",
                  "that the defaults come before the user's own file"),
+                (r"the prompt goes after the distribution's "
+                 r"`/etc/bash\.bashrc`",
+                 "that the prompt follows the system file, which sets one "
+                 "of its own"),
+                (r"each only if the environment has none",
+                 "that the two variables yield to the environment"),
+                (r"(?i)only the user's own `~/\.bashrc` overrides it",
+                 "that the prompt is set regardless and only the user's own "
+                 "file overrides it"),
                 (r"(?i)highlighting", "as-you-type highlighting"),
                 (r"(?i)install[^.]*themselves|themselves[^.]*install",
                  "that highlighting is something the user installs")):
@@ -1549,8 +1651,10 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
                     if line.startswith("| Operator Shell |")), None)
         self.assertIsNotNone(row, "the GUI feature table has no Operator "
                              "Shell row")
-        self.assertRegex(re.sub(r"[*`]", "", row), r"(?i)login shell",
-                         "the row does not say whose shell the session runs")
+        self.assertRegex(re.sub(r"[*`]", "", row),
+                         r"(?i)login shell where that is bash or zsh",
+                         "the row does not say whose shell the session runs, "
+                         "and which two it drives")
 
     def test_the_demo_tour_says_what_the_first_line_claims_about_history(self):
         line = next((l for l in DEMO_DOC.read_text().splitlines()
@@ -1560,9 +1664,17 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
         for pattern, what in (
                 (r"(?i)login shell", "whose shell it is"),
                 (r"(?i)not guaranteed off", "the weaker claim"),
-                (r"(?i)says nothing", "that the line can say nothing")):
+                (r"(?i)reason beside it, where it gave one",
+                 "that an old endpoint's weaker word has no reason"),
+                (r"(?i)nothing about history when the team server has no "
+                 r"row", "that the line is silent only when there is no row "
+                          "to read")):
             self.assertRegex(flat, pattern, "the tour's paragraph does not "
                              "say " + what)
+        self.assertNotRegex(flat, r"(?i)endpoint reported nothing",
+                            "the tour says the line is silent for an "
+                            "endpoint that reported nothing, which is the "
+                            "other case: it reads as the weaker word")
 
     def test_the_design_does_not_say_nothing_runs_for_a_login_shell(self):
         """Statement 1: a bash login shell does get the generated file."""
@@ -1573,10 +1685,13 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
                                   r"is a login shell")
         said = self.one_block(section, r"(?i)login shell",
                               "what a login shell gets")
-        self.assertRegex(said, r"(?i)bash login shell")
-        self.assertRegex(said, r"(?i)stronger|strong")
-        self.assertRegex(said, r"(?i)not bash|non-bash|that is not bash")
-        self.assertRegex(said, r"(?i)never sees|does not see|sees none")
+        self.assertRegex(said, r"(?i)bash login shell gets it too")
+        self.assertRegex(said, r"(?i)stronger history guard and not the "
+                               r"weaker")
+        self.assertRegex(said, r"(?i)only a login shell that is not bash"
+                               r"[^.]*never sees the file")
+        self.assertRegex(said, r"(?i)no `/dev/fd` runs plain `-i` and sees "
+                               r"none of it")
         self.assertRegex(flat, r"/etc/bash\.bashrc",
                          "the section does not say where the prompt sits "
                          "relative to the system file")
@@ -1593,6 +1708,10 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
         self.assertNotRegex(
             text, r"the host, that history is off, the pair",
             "part one still says the first line always claims history off")
+        self.assertRegex(text, r"off, or only not guaranteed off, or "
+                               r"nothing at all",
+                         "part one leaves out the third state, in which the "
+                         "line says nothing about history")
 
     def test_the_design_records_what_was_built_for_history(self):
         section = self.design_section(
@@ -1604,8 +1723,20 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
             "the section still describes a per-session report")
         self.assertRegex(flat, r"(?i)host capability")
         self.assertRegex(flat, r"(?i)\bHELLO\b")
-        self.assertRegex(flat, r"(?i)no upward|no per-session channel")
-        self.assertRegex(flat, r"(?i)refus")
+        self.assertRegex(flat, r"(?i)no message the page reads before its "
+                               r"first line",
+                         "the section does not say why the mechanism cannot "
+                         "be reported per session")
+        self.assertNotRegex(flat, r"(?i)there is no way to do that",
+                            "the session stream does run upward; it carries "
+                            "raw bytes only")
+        self.assertRegex(flat, r"(?i)no longer matches is \*\*refused\*\*",
+                         "the section does not say a changed guard is "
+                         "refused")
+        self.assertRegex(flat, r"(?i)pipe[^.]*\.\s+It is now a "
+                               r"\*\*refusal\*\* that names history",
+                         "the section does not say the pipe failure is a "
+                         "refusal")
         self.assertRegex(flat, r"(?i)worst trade on this branch",
                          "the section lost its conclusion")
 
@@ -1615,9 +1746,12 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
         entries = re.split(r"\n(?=\d+\. \*\*)", body)
         seventh = [self.flat(e) for e in entries if e.startswith("7. **")]
         self.assertEqual(len(seventh), 1, "no seventh entry")
+        self.assertNotRegex(seventh[0], r"(?i)team server "
+                            r"(?:checks|verifies|validates) it",
+                            "the entry says the team server checks the guard")
         for pattern, what in (
-                (r"(?i)cannot verify", "that the team server cannot verify "
-                                       "it"),
+                (r"(?i)team server cannot verify it, exactly as it cannot "
+                 r"verify `user`", "that the team server cannot verify it"),
                 (r"(?i)\buser\b", "that `user` is the same boundary"),
                 (r"(?i)modified endpoint[^.]*\boff\b",
                  "what a modified endpoint could claim"),
@@ -1665,6 +1799,14 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
                                    "which shells the file is handed to")
         self.assertNotRegex(paragraph, r"(?i)every bash")
         self.assertRegex(paragraph, r"/dev/fd")
+        # The direction, and not two words: a comment that said a bash with
+        # no /dev/fd is handed the file "all the same" mentions the path
+        # and bans nothing above.
+        self.assertRegex(paragraph, r"no `/dev/fd`[^.;]*plain[^.;]*`-i`"
+                                    r"[^.;]*never sees the file",
+                         "the comment does not say that a bash on a host "
+                         "with no /dev/fd runs plain -i and never sees "
+                         "the file")
         from software.c2 import beacon
         with patch("software.c2.beacon.os.path.isdir", return_value=True):
             self.assertEqual(beacon._guard_of("/bin/bash")[0], "off")

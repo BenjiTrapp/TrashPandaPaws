@@ -191,7 +191,8 @@ it said "closing it queues the channel's shutdown" in a card whose two
 buttons are a `✕` that closes and a `_` that does not, so it names the
 `✕` now and says what the `_` does instead. The terminal's own opening
 lines carry what only it can say: the host, what history will do in this
-session (off, or only not guaranteed off, as part two built it), the pair
+session (off, or only not guaranteed off, or nothing at all, as part two
+built it), the pair
 that was sent — and, when the measurement fell back, that this session is
 not fitted to the card and why.
 
@@ -528,11 +529,12 @@ and there is a test asserting that line claims only what the code does
 (`test_the_first_terminal_line_claims_only_what_the_code_does`).
 
 **As built, and why it is not what was first proposed.** The proposal was
-that the beacon reports which mechanism *a session* used. There is no way to
-do that: there is no upward per-session channel from a session to the view,
-and the only message that reaches the team server's row for an endpoint is
-its `HELLO`, sent once, when the tunnel connects. So the mechanism became a **host
-capability** rather than a per-session fact:
+that the beacon reports which mechanism *a session* used. That cannot be
+done in time: the session stream does run upward, but it carries raw bytes
+only, and no message the page reads before its first line says which
+mechanism a session used. The only message that reaches the team server's
+row for an endpoint is its `HELLO`, sent once, when the tunnel connects. So
+the mechanism became a **host capability** rather than a per-session fact:
 
 - the endpoint asks `_history_guard()` for the guard a session here would
   get and reports `history` (`"off"` or `"weak"`) and `history_detail` (the
@@ -583,10 +585,10 @@ with flags nobody has tested.
 
 Put in the generated rcfile ahead of the operator's own `~/.bashrc`, so
 their settings override them rather than the other way round. `CLICOLOR`
-and `LSCOLORS` go at the very top; the prompt goes **after** `/etc/bash.bashrc` and before
-`~/.bashrc`, because Debian and ParrotOS set `PS1` in the system file
-unconditionally and a prompt placed above it would be overwritten before
-anyone saw it:
+and `LSCOLORS` go at the very top; the prompt goes **after**
+`/etc/bash.bashrc` and before `~/.bashrc`, because Debian and ParrotOS set
+`PS1` in the system file unconditionally and a prompt placed above it would
+be overwritten before anyone saw it:
 
 - `CLICOLOR=1` and an `LSCOLORS` default for BSD/macOS `ls`
 - `LS_COLORS` not mentioned at all, since GNU `ls` reads it from the

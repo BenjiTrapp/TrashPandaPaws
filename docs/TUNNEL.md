@@ -252,8 +252,8 @@ The `proxychains.conf` line these two values go into is in
 
 A build with a tunnel can also serve an **interactive terminal** over it.
 An operator attaches their own terminal to a port on the team server and
-lands in a shell on the implant host — the host's own shell, `bash` where
-there is one, with its completion and its tools. Like every other session
+lands in a shell on the implant host — the endpoint user's login shell, else
+`bash`, with its completion and its tools. Like every other session
 on this tunnel it is **dialled out**: the endpoint opens a second
 connection to the same outbound port it already holds the command channel
 on, and **nothing listens on the implant** for it. There is no new port,
@@ -386,9 +386,9 @@ are not. A login shell that is neither (fish, tcsh), or one that is missing
 or cannot be executed, is not driven with flags nobody has tested: the
 session runs `bash`, and `/bin/sh` where there is no bash. On a shipped
 implant the unit runs as **root**, so the login shell is root's, usually
-`/bin/bash`, and nothing changes there. The case this helps is the
-operator's own machine, where the endpoint runs as the person who set that
-shell up.
+`/bin/bash`, and the same shell runs there as before. The case this helps
+is the operator's own machine, where the endpoint runs as the person who
+set that shell up.
 
 **History is held off in one of two ways, and the first line of the terminal
 says which.** Where the shell is bash and the host has a `/dev/fd`, the
@@ -418,19 +418,22 @@ shell was changed with `chsh` or a bash was removed since the tunnel
 connected, is declined the same way: reconnect the tunnel and it reports
 what the host does now.
 
-**Colour is the user's own, and bash gets defaults only where it has none of
-its own.** A bash session that takes the generated rcfile is given colour
+**Colour is the user's own: bash gets defaults, and its own `~/.bashrc` wins
+over them.** A bash session that takes the generated rcfile is given colour
 defaults: `CLICOLOR` and `LSCOLORS` for BSD and macOS `ls`, each only if the
 environment has none, and a prompt naming the host and the working directory
-in the interface's red, so a glance tells it from a local one. They are placed **before** the
-user's own `~/.bashrc` is read, so the operator's own settings win over them
-(the prompt goes after the distribution's `/etc/bash.bashrc`, which sets one
-unconditionally on Debian and ParrotOS, and before the user's). `LS_COLORS`
-is left alone: GNU `ls` reads it from the host's environment. A zsh login
-shell is given nothing at all, because its own configuration is the point.
-As-you-type highlighting, `zsh-syntax-highlighting` for instance, is
-something the operator installs themselves; nothing here installs anything
-on the device, and what this change does is let it apply.
+in the interface's red, so a glance tells it from a local one. The prompt is
+set whether or not the environment had one, and it replaces the
+distribution's; only the user's own `~/.bashrc` overrides it. They are placed
+**before** the user's own `~/.bashrc` is read, so the operator's own settings
+win over them (the prompt goes after the distribution's `/etc/bash.bashrc`,
+which sets one unconditionally on Debian and ParrotOS, and before the
+user's). `LS_COLORS` is left alone: GNU `ls` reads it from the host's
+environment. A zsh login shell is given nothing at all, because its own
+configuration is the point. As-you-type highlighting,
+`zsh-syntax-highlighting` for instance, is something the operator installs
+themselves; nothing here installs anything on the device, and what this
+change does is let it apply.
 
 ### Three platform facts
 
@@ -450,9 +453,9 @@ and always there. Flag completion — `ls --col` becoming `ls --color` — is
 `bash-completion`, which is a package, and on Debian and ParrotOS it
 installs itself through `/etc/profile.d/bash_completion.sh`: the direct
 source in `/etc/bash.bashrc` is commented out, and only a **login** shell
-reads `/etc/profile`. A session here is `bash -i`, so the generated rcfile
-sources that loader itself, from the first of three candidate paths it can
-read, and skips the whole thing when the loader is already defined.
+reads `/etc/profile`. A bash session here is `bash -i`, so the generated
+rcfile sources that loader itself, from the first of three candidate paths
+it can read, and skips the whole thing when the loader is already defined.
 Measured on Debian 13 with bash-completion 2.16: without this, a real
 interactive `ssh` session had flag completion and a session here did not.
 A host without the package keeps command and path completion and loses
@@ -463,7 +466,8 @@ nothing else.
 This project documents what its features leave behind so an operator can
 judge the risk. A live shell session shows, on the implant host:
 
-- a **`bash` child of the `python3 -` beacon process** — the beacon
+- a **shell process that is a child of the `python3 -` beacon process**
+  (the login shell, `bash` or `zsh`, else `bash` or `/bin/sh`) — the beacon
   already runs as `python -` with its source on stdin, and the shell is a
   child of it;
 - a **pseudo-terminal** open on the host, for as long as the session is
@@ -474,18 +478,19 @@ judge the risk. A live shell session shows, on the implant host:
 - a **history file**, only where history is **not guaranteed off**. Where
   bash took the generated rcfile history is off, and none is written unless
   something turns it back on after the host's rc files have run. Where it
-  could not (a login shell that is not bash, or a host with no `/dev/fd`) the
-  session only sets `HISTFILE=/dev/null`, the user's own files can undo that,
-  and the first line of the terminal says so.
+  could not (a login shell that is not bash, the `/bin/sh` fallback, or a
+  host with no `/dev/fd`) the session only sets `HISTFILE=/dev/null`, the
+  user's own files can undo that, and the first line of the terminal says
+  so.
 
 The session is given `/` as its working directory rather than the
 install directory, so a prompt does not name where the implant lives. That
 is what the spawn is given and not a promise about where the session is: a
 login shell's own startup files run after it and may change the directory,
-which was measured on a macOS host whose zsh left the session in the home
-directory, so a prompt there may name a path. The first three artifacts are
-real and are the cost of every session; the fourth is the cost of the ones
-that are not guaranteed.
+which was measured on a macOS host: a login shell started from `/` was found
+in the home directory, so a prompt there may name a path. The first three
+artifacts are real and are the cost of every session; the fourth is the cost
+of the ones that are not guaranteed.
 
 ---
 
@@ -602,12 +607,12 @@ it attaches to is a **fresh shell**. The team server's connection to the
 shell port *is* the shell, so when the page went away and took the stream
 with it, the pseudo-terminal on the device died; measured across one
 reload, the shell's process id went from 75 to 78, the working directory
-was back at `/` from the `/etc` it had been left in, and a variable that
-had been set was gone. Your directory, your variables and your running
-processes are gone with it; the channel, the claim and the port are not, so
-what a reload costs is the session and not the tunnel — and the terminal
-says this in its opening lines rather than leaving you to type into a
-prompt that looks like the one you left.
+was back where the spawn puts it (`/`) from the `/etc` it had been left
+in, and a variable that had been set was gone. Your directory, your
+variables and your running processes are gone with it; the channel, the
+claim and the port are not, so what a reload costs is the session and not
+the tunnel — and the terminal says this in its opening lines rather than
+leaving you to type into a prompt that looks like the one you left.
 
 **A closed tab no longer ends the session at once: it costs up to 240
 seconds plus one check-in.** Nothing is posted when the page goes away, and
