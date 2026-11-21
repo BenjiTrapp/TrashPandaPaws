@@ -2628,6 +2628,67 @@ class TestAShellSession(TunnelEndpointTestCase):
                       "guard it with a readability test like the lines "
                       "above it" % (line.strip(),))
 
+    def test_the_colour_defaults_are_set_before_the_host_is_sourced(self):
+        """Review Focus 5. Order is the whole requirement: after the
+        host's files these would overwrite the operator's own prompt."""
+        rc = beacon_mod._SHELL_RCFILE
+        self.assertLess(rc.index("CLICOLOR"), rc.index('"$HOME/.bashrc"'))
+        self.assertLess(rc.index("LSCOLORS"), rc.index('"$HOME/.bashrc"'))
+        self.assertLess(rc.index("PS1"), rc.index('"$HOME/.bashrc"'))
+
+    def test_the_defaults_do_not_touch_what_the_host_already_has(self):
+        self.assertNotIn("LS_COLORS", beacon_mod._SHELL_RCFILE)
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_the_operators_own_settings_win_over_the_colour_defaults(self):
+        # The order test above reads text; this one asks a real bash. A
+        # `.bashrc` that sets its own prompt and its own `CLICOLOR` has to
+        # be what the session ends up with.
+        self.a_home_directory(
+            bashrc='PS1="MINE> "\nCLICOLOR=0\n')
+        stream = self.ask_for_a_shell()
+
+        data = self.run_in_the_shell(
+            stream, b'echo "P""=[$PS1]" "C""=[$CLICOLOR]"\n', b"C=[")
+
+        self.assertIn(b"P=[MINE> ]", data,
+                      "the default prompt overwrote the operator's own")
+        self.assertIn(b"C=[0]", data,
+                      "the default CLICOLOR overwrote the operator's own")
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_a_host_with_no_configuration_gets_colour_and_a_red_prompt(self):
+        saved = {name: os.environ.pop(name, None)
+                 for name in ("CLICOLOR", "LSCOLORS")}
+        for name, value in saved.items():
+            if value is not None:
+                self.addCleanup(os.environ.__setitem__, name, value)
+        self.a_home_directory()
+        stream = self.ask_for_a_shell()
+
+        data = self.run_in_the_shell(
+            stream, b'echo "C""=[$CLICOLOR]" "L""=[${LSCOLORS:+set}]"\n',
+            b"L=[")
+
+        self.assertIn(b"C=[1]", data)
+        self.assertIn(b"L=[set]", data)
+        if os.path.exists("/etc/bash.bashrc"):
+            return      # that file sets its own PS1 before ours can show
+        data = self.run_in_the_shell(
+            stream, b'echo "P""=[${PS1//[^0-9;]/}]"\n', b"P=[")
+        self.assertIn(b"38;2;255;26;26", data,
+                      "the prompt is not the interface's own red")
+
+    def test_the_rcfile_still_ends_by_turning_history_off(self):
+        """The colour lines went in above the sourcing; the history lines
+        must stay below it, or the host's rc runs after them."""
+        rc = beacon_mod._SHELL_RCFILE
+        self.assertGreater(rc.index("unset HISTFILE"),
+                           rc.index('"$HOME/.bashrc"'))
+        self.assertTrue(rc.rstrip().endswith("set +o history"))
+
     @unittest.skipUnless(_HAS_PTY, _NO_PTY)
     @unittest.skipUnless(_HAS_BASH, _NO_BASH)
     def test_the_generated_rcfile_leaves_nothing_on_disk(self):

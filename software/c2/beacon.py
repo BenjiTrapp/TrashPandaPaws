@@ -3246,7 +3246,26 @@ _SETSID_PATHS = ("/usr/bin/setsid", "/bin/setsid")
 # readability before it is read -- an unguarded source would be an error
 # message in every session on a host without the package -- and the whole
 # thing skipped when `/etc/bash.bashrc` already did it.
-_SHELL_RCFILE = ('[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n'
+#
+# The colour lines come first, above every sourcing, and that order is the
+# whole of their design. Bash with no configuration is monochrome with a
+# bare prompt, which is what this rcfile exists to hand over when there is
+# no login shell of the user's own to run; but a default placed after the
+# host's files would overwrite the prompt and the colours the operator
+# set up for themselves, and their settings are meant to win over
+# anything this code chooses. Placed first, an `.bashrc` that sets `PS1`
+# simply replaces it. The prompt names the host and the working directory
+# in the interface's own red -- `--red` in the page's palette, #ff1a1a --
+# so a glance tells this session from a local one. `CLICOLOR` and
+# `LSCOLORS` are for BSD and macOS `ls`, and are only given a value when
+# the environment has none. `LS_COLORS` is deliberately not mentioned at
+# all: GNU `ls` reads it from the environment the host already has, and
+# which colours a host wants (`dircolors` and its database) is the host's
+# business, not something to guess at here.
+_SHELL_RCFILE = ('export CLICOLOR="${CLICOLOR:-1}"\n'
+                 'export LSCOLORS="${LSCOLORS:-ExFxCxDxBxegedabagacad}"\n'
+                 + r"PS1='\[\e[38;2;255;26;26m\]\h:\w\$\[\e[0m\] '" + '\n'
+                 '[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n'
                  'declare -F _completion_loader >/dev/null 2>&1 ||'
                  ' for _rc_bc in /etc/profile.d/bash_completion.sh'
                  ' /usr/share/bash-completion/bash_completion'
