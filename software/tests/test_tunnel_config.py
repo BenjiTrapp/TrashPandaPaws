@@ -547,6 +547,35 @@ class TestTheYamlPath(unittest.TestCase):
         self.assertIsNone(built["c2"].get("tunnel"))
         self.assertIsNone(tunnel_config_problem(built))
 
+    def test_a_scalar_fallback_is_not_an_error_and_names_the_value(self):
+        # `fallback: true` instead of a block is a plausible edit, because
+        # the key reads like a switch and the block it replaces has an
+        # `enabled` inside it. It used to reach `fallback.get(transport)`
+        # in the loop below and raise AttributeError before anything
+        # validated it -- and this function is the one place a `c2` block
+        # becomes a beacon config on the drop-box, so a crash here costs
+        # the access the beacon exists to keep.
+        #
+        # So the posture the five transports already have applies to the
+        # block that holds them: unusable reads as absent, the reason is
+        # logged once, and the offending value is in it. Not a raise: the
+        # caller is the start-up path, and `c2.tunnel`'s ValueError is
+        # caught two lines from here for exactly that reason.
+        with self.assertLogs(beacon_mod.logger, level="WARNING") as caught:
+            built = beacon_config_from_fallback({"fallback": True}, env={})
+
+        for transport in beacon_mod._FALLBACK_TRANSPORTS:
+            self.assertEqual(
+                built["c2"][transport], {},
+                "%s should read as absent when the block holding it is "
+                "not a mapping" % transport)
+        message = "\n".join(caught.output)
+        self.assertIn("c2.fallback", message)
+        self.assertIn("True", message,
+                      "the refusal does not name the offending value")
+        self.assertEqual(len(caught.output), 1,
+                         "one line per start, not one per transport")
+
     def test_the_psk_is_not_read_from_the_yaml(self):
         # The refusal, not the absence. A loader that read a `psk` key
         # happily would pass any test that only looked at the shipped
