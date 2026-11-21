@@ -265,6 +265,11 @@ class _TeamServer:
 class LegFixture(unittest.TestCase):
     """A beacon with a gsocket leg over a stand-in, and no orphans after."""
 
+    # How long a reading waits for the stand-in's child to record. An
+    # attribute rather than a literal so the test that pins the waiting
+    # rule can shorten it instead of sleeping for the real deadline.
+    _RECORD_WAIT_SECONDS = 30.0
+
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="raccoon-gsocket-leg-")
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
@@ -409,12 +414,30 @@ class LegFixture(unittest.TestCase):
             return handle.read()
 
     def _recorded(self, path: str) -> str:
-        deadline = time.monotonic() + 5.0
+        # Existence is not the finish line, and that is the whole point of
+        # this helper. The stand-in writes with `env > "$FILE"`, and the
+        # shell's redirection *creates and truncates* the file before `env`
+        # has produced a byte -- so a reader that stopped at
+        # `os.path.exists` could read an empty file and assert happily
+        # against "". Waiting for a size is what makes the reading honest.
+        #
+        # The deadline is generous rather than tight: the previous five
+        # seconds were measured failing on a loaded machine (a full suite
+        # beside four other processes), and the only cost of a long
+        # deadline is how long a genuine breakage takes to be reported,
+        # while the cost of a short one is a test that fails for a reason
+        # that has nothing to do with what it asserts.
+        deadline = time.monotonic() + self._RECORD_WAIT_SECONDS
         while time.monotonic() < deadline:
-            if os.path.exists(path):
-                return path
+            try:
+                if os.path.getsize(path) > 0:
+                    return path
+            except OSError:
+                pass
             time.sleep(0.05)
-        raise AssertionError("the stand-in recorded nothing at %s" % path)
+        raise AssertionError(
+            "the stand-in recorded nothing at %s within %.1fs (exists: %s)"
+            % (path, self._RECORD_WAIT_SECONDS, os.path.exists(path)))
 
     def child_pid(self, beacon: Beacon) -> int:
         proc = beacon._gsocket_proc
@@ -1091,6 +1114,55 @@ class TestRegisteringOverTheFirstUpstreamLeg(LegFixture):
                          "the fifth failed cycle was never reached")
         self.assertIn("gsocket", beacon._leg_status)
         self.assertNotIn("https", beacon._leg_status)
+
+
+class TestTheReadingsWaitForContent(LegFixture):
+    """The helper the other classes read through, tested on its own.
+
+    This file lost a full-suite run to the rule below: a reading that
+    stopped at `os.path.exists` accepted a file the shell's redirection
+    had created and `env` had not yet filled. Both failure shapes are
+    pinned here, because neither is reproducible on an idle machine and a
+    flake nobody can reproduce is a flake nobody fixes.
+    """
+
+    _RECORD_WAIT_SECONDS = 0.4
+
+    def test_a_file_that_exists_but_is_empty_is_not_a_recording(self):
+        # The exact state `env > "$FILE"` passes through on its way to
+        # writing: present, and empty. Accepting it is how a test asserts
+        # against "" and passes while proving nothing.
+        path = os.path.join(self.root, "empty.txt")
+        open(path, "w").close()
+
+        with self.assertRaises(AssertionError) as caught:
+            self._recorded(path)
+
+        message = str(caught.exception)
+        self.assertIn(path, message)
+        self.assertIn("exists: True", message,
+                      "the failure does not distinguish an empty "
+                      "recording from an absent one, which is the whole "
+                      "difference between a slow child and a broken one")
+
+    def test_content_arriving_late_is_waited_for(self):
+        # The child writes on its own time, which is the reason the
+        # helper waits at all. Deliberately after a delay longer than one
+        # poll interval, so a helper that only looked once would fail.
+        path = os.path.join(self.root, "late.txt")
+        open(path, "w").close()
+
+        def fill():
+            time.sleep(0.1)
+            with open(path, "w") as handle:
+                handle.write("SHELL=/bin/sh\n")
+
+        writer = threading.Thread(target=fill)
+        writer.start()
+        self.addCleanup(writer.join)
+
+        with open(self._recorded(path)) as handle:
+            self.assertEqual(handle.read(), "SHELL=/bin/sh\n")
 
 
 class TestTheServersWords(unittest.TestCase):
