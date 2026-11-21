@@ -4569,11 +4569,13 @@ class TunnelEndpoint(object):
                     "would do about command history has changed since the "
                     "tunnel connected, and what the interface shows about "
                     "it is out of date. It was told history is %s%s; a "
-                    "session now would have history %s%s. Reconnect the "
-                    "tunnel and it will report what the host does now: in "
-                    "the Operator Shell that is \u2715, then Open a shell, "
-                    "which does not reconnect while another view holds the "
-                    "channel."
+                    "session now would have history %s%s. The answer is "
+                    "reported again only when the tunnel itself "
+                    "reconnects: in the tunnel panel, Stop this endpoint "
+                    "and, once it shows stopped, Start it, one check-in "
+                    "each. Closing this view and opening another shell "
+                    "does not do it, because a shell rides the channel "
+                    "that is already up."
                     % (said.get(was, was),
                        " (%s)" % why_was if why_was else "",
                        said.get(now, now),

@@ -2049,15 +2049,25 @@ class TestARefusedShellSession(_ShellChoice, TunnelEndpointTestCase):
 
     def _assert_speaks_as_the_page(self, refusal):
         """The page's words, not the code's: no `%r` quoting, no `weak`,
-        which the page never shows a person, and how to reconnect from the
-        interface -- with the one case where that does nothing."""
+        which the page never shows a person, and the one way to reconnect
+        that reports the answer again. The guard is remembered in `_hello`,
+        which runs only when the command channel reconnects; a shell is a
+        message on the channel already up, so closing the view and opening
+        another changes nothing and the person would be declined in a
+        loop. Only stopping and starting the endpoint, each a task taken at
+        a check-in, builds a fresh endpoint and a fresh HELLO."""
         self.assertNotIn("'", refusal.replace("host's", "")
                          .replace("doesn't", ""))
         self.assertNotRegex(refusal, r"\bweak\b")
-        self.assertIn("\u2715", refusal)
-        self.assertIn("Open a shell", refusal)
-        self.assertRegex(refusal, r"(?i)not reconnect while another view "
-                                  r"holds the channel")
+        self.assertIn("tunnel panel", refusal)
+        self.assertRegex(refusal, r"Stop this endpoint[^.]*Start it")
+        self.assertRegex(refusal, r"(?i)check-in")
+        self.assertRegex(refusal, r"(?i)only when the tunnel itself "
+                                  r"reconnects")
+        # Named only to say it does not work, never as the advice.
+        self.assertNotIn("\u2715", refusal)
+        self.assertNotIn("Open a shell", refusal)
+        self.assertRegex(refusal, r"(?i)opening another shell does not do it")
 
     def test_a_guard_that_changed_the_other_way_is_refused_as_well(self):
         """Reported `weak`, and this session would hold history off. The

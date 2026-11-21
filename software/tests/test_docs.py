@@ -1810,6 +1810,48 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
         self.assertRegex(said, r"may well be recorded",
                          "the paragraph does not give the first line's words")
 
+    def test_the_designs_consequence_says_history_is_on_with_macos_zsh(self):
+        """The design is the document the plan argues from, so it may not
+        be the one place left saying the user's files only *may* turn
+        history back on. On macOS with zsh the system's file does, every
+        time."""
+        section = self.flat(self.design_section(
+            "## The consequence that has to be said out loud"))
+        self.assertNotRegex(section, r"(?i)own rc may switch history",
+                            "the design still says the operator's rc may "
+                            "switch history back on")
+        sentence = [x for x in re.split(r"(?<=[.])\s", section)
+                    if "/etc/zshrc" in x]
+        self.assertTrue(sentence, "the consequence does not name /etc/zshrc")
+        self.assertRegex(sentence[0], r"(?i)on macOS with zsh history is "
+                                      r"switched back on, every time")
+        self.assertNotRegex(sentence[0], r"(?i)\b(?:may|might|could)\b",
+                            "the macOS sentence hedges what was measured")
+
+    def test_a_changed_answer_is_reported_again_only_by_a_new_tunnel(self):
+        """The guard is remembered in `_hello`, which runs only when the
+        command channel reconnects. Advice to close the view and open
+        another shell would send the reader round a loop with no shell, so
+        both documents say Stop then Start in the tunnel panel, and say
+        that reopening does not do it."""
+        tunnel = self.flat(self.tunnel_section(
+            "### Which shell a session runs, and what it costs for history",
+            "\n### "))
+        design = self.flat(self.design_section(
+            "## The consequence that has to be said out loud"))
+        for name, text in (("docs/TUNNEL.md", tunnel), ("the design", design)):
+            self.assertRegex(text, r"(?i)\bStop\b[^.]*\bStart\b[^.]*"
+                                   r"tunnel panel|tunnel panel[^.]*\bStop\b"
+                                   r"[^.]*\bStart\b",
+                             "%s does not say to Stop and Start the endpoint "
+                             "in the tunnel panel" % name)
+            self.assertRegex(text, r"(?i)check-in",
+                             "%s does not say each takes a check-in" % name)
+            self.assertRegex(text, r"(?i)opening another shell (?:does not "
+                                   r"do it|sends nothing new)",
+                             "%s does not say reopening changes nothing"
+                             % name)
+
     def test_the_seventh_limitation_says_whose_claim_the_guard_is(self):
         body = self.design_section("## Known limitations, as built") \
             .split("\n---", 1)[0]
