@@ -9586,10 +9586,26 @@ async function opshellAttach(state){
   opshellTerm = new Terminal({cols, rows, cursorBlink:true,
                               fontFamily:font, fontSize:12});
   opshellTerm.open(host);
-  // Claims only what the code does: the session's rc files run, then
-  // `unset HISTFILE` and `set +o history` (beacon.py:3228).
+  // States what the machine reported about history and nothing more: "off"
+  // is held by a generated startup file, "weak" is the fallback the user's
+  // own configuration runs after, and anything else -- no row for this
+  // channel, or a relay too old to carry the field -- is not mentioned.
+  // The reason is text the machine wrote and this is a terminal, not
+  // markup, so what has to go is control characters: HTML escaping would
+  // print `&amp;` and still let an escape sequence through.
+  const guard = state.history === "off" ? "history is off in this session"
+    : state.history === "weak"
+      ? "history is not guaranteed off in this session"
+      : "";
+  const why = state.history === "weak"
+    ? String(state.history_detail == null ? "" : state.history_detail)
+        .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").trim()
+    : "";
+  const guardLine = !why ? guard : guard + " (" + why + "): this shell could "
+    + "not be given a startup file, so your own configuration runs after "
+    + "and may undo it";
   opshellTerm.writeln("\x1b[2m-- live on " + (state.host || state.target || "?")
-    + " \u00b7 history is off in this session \u00b7 " + cols + "x" + rows
+    + (guardLine ? " \u00b7 " + guardLine : "") + " \u00b7 " + cols + "x" + rows
     + ", fixed for this session --\x1b[0m");
   if(opshellUnfitted){
     // Said once, here, because this is the only moment the size is chosen.

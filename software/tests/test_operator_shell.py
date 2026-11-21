@@ -3455,10 +3455,26 @@ class TestTheViewDoesNotOverclaim(_GuiCase):
         self.assertIn("state.user", render)
         self.assertIn("state.root", render)
 
+    def test_the_first_line_states_the_history_guard_it_was_given(self):
+        # The line is written by `opshellAttach`, not by `opshellRender`
+        # (which draws the strip), so that is the function that must read
+        # the two fields the machine reported.
+        attach = self.js_function("opshellAttach")
+        self.assertIn("state.history", attach)
+        self.assertIn("state.history_detail", attach)
+
     def test_the_first_terminal_line_claims_only_what_the_code_does(self):
-        # `unset HISTFILE` and `set +o history` run after the rc files
-        # (beacon.py:3228). That is exactly what this says, and no more.
-        self.assertIn("history is off in this session", SERVER_SRC)
+        # The sentence used to be a constant, true only while the generated
+        # startup file held history off. What it says now is decided by
+        # the machine's word, and the behaviour is pinned in node by the
+        # three `..._history_...` tests of the class that runs the view.
+        # What is read here is only that the claim has one author: the
+        # attach, once, beside the weaker sentence it must never replace.
+        attach = self.js_function("opshellAttach")
+        self.assertEqual(attach.count("history is off in this session"), 1)
+        self.assertIn("history is not guaranteed off", attach)
+        self.assertEqual(SERVER_SRC.count("history is off in this session"), 1,
+                         "the constant claim is written somewhere else too")
 
     def test_there_is_no_cancel_button_for_a_queued_task(self):
         # This server has no task withdrawal, so a button that said it
@@ -3801,7 +3817,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """A hundred and three tests hide behind `skipUnless(node)`.
+        """A hundred and seven tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3809,7 +3825,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of a hundred and three quiet skips.
+        One loud failure instead of a hundred and seven quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3853,9 +3869,14 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # merge blocker brought four: why a parked session ended surviving
         # the tick that ends it, an ordinary exit explaining nothing and
         # not being inherited, that sentence stated once, and a card that
-        # came back not being told its shell is gone --
+        # came back not being told its shell is gone -- and 105 against
+        # 107 once the first terminal line stated the history guard it was
+        # given, which brought four: nothing said when it was told
+        # nothing, "not guaranteed" with its reason beside "off", the same
+        # sentence whole with no reason, and a reason that may not carry a
+        # control sequence into the terminal --
         self.assertGreaterEqual(
-            len(names), 101,
+            len(names), 105,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -4895,6 +4916,87 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " closed: posted.filter(p => p.url.endsWith('close')).length}));")
         self.assertIn("no free session slots", " ".join(got["lines"]))
         self.assertIn("root@parrot", " ".join(got["lines"]))
+
+    def _first_line(self, state_fields):
+        """What the page wrote first into the terminal for this state."""
+        got = self._node(
+            "els['opshell-term'] = el('opshell-term');\n"
+            "const term = fakeTerm();\n"
+            "globalThis.Terminal = function(){ return term; };\n"
+            "opshellSession = 'sid';\n"
+            "nextReply = {ok:true, status:200, stream: fakeStream(['x'])};\n"
+            "await opshellAttach(Object.assign({state:'live',"
+            " geometry:[80,24], host:'parrot'}, %s));\n"
+            "console.log(JSON.stringify({first: term.lines[0],"
+            " all: term.lines.join(' ')}));" % json.dumps(state_fields))
+        return got["first"], got["all"]
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_first_line_claims_nothing_when_it_was_told_nothing(self):
+        """Review Focus 3. A page that defaults to "history is off" would
+        claim it for a channel the relay has no row for."""
+        for fields in ({"history": "", "history_detail": ""},
+                       {},
+                       {"history": None, "history_detail": None},
+                       {"history": "banana", "history_detail": "x"},
+                       {"history": "", "history_detail": "stray reason"}):
+            first, _ = self._first_line(fields)
+            self.assertNotRegex(first, r"(?i)history",
+                                "said something about history for %r" % fields)
+            self.assertNotIn("stray reason", first)
+            self.assertIn("live on parrot", first)
+            self.assertRegex(first, r"[0-9]+x[0-9]+, fixed for this session")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_weak_guard_says_why_and_an_off_guard_says_it_is_off(self):
+        lines = {}
+        for guard, detail in (("off", ""),
+                              ("weak", "/bin/zsh takes no --rcfile")):
+            lines[guard], _ = self._first_line(
+                {"history": guard, "history_detail": detail})
+        self.assertRegex(lines["off"], r"(?i)history is off in this session")
+        self.assertNotRegex(lines["weak"], r"(?i)history is off")
+        self.assertRegex(lines["weak"], r"(?i)not guaranteed off")
+        self.assertIn("/bin/zsh takes no --rcfile", lines["weak"])
+        self.assertRegex(lines["weak"], r"(?i)startup file")
+        self.assertRegex(lines["weak"], r"(?i)may undo")
+        self.assertNotEqual(lines["off"], lines["weak"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_weak_guard_with_no_reason_reads_whole_on_its_own(self):
+        """A relay too old to send the field arrives as "weak" and nothing
+        else. The sentence then stands without a reason clause: no empty
+        parenthesis, no colon or "because" left hanging."""
+        for detail in ("", None, "   ", "\x1b\x07"):
+            first, _ = self._first_line(
+                {"history": "weak", "history_detail": detail})
+            self.assertIn("history is not guaranteed off in this session",
+                          first, repr(detail))
+            self.assertNotRegex(first, r"\(\s*\)", repr(detail))
+            self.assertNotRegex(first, r"(?i)because|\bwhy\b|:\s*(\u00b7|\x1b|$)",
+                                repr(detail))
+            self.assertNotRegex(first, r"(?i)history is off")
+            self.assertNotRegex(first, r"(?i)startup file",
+                                "explained a cause the page was not told")
+            self.assertNotIn("undefined", first)
+            self.assertNotIn("null", first)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_reason_is_text_from_the_machine_and_cannot_drive_the_terminal(self):
+        """`history_detail` is written by the machine, so it may not carry a
+        control sequence into the operator's terminal: an escape that
+        cleared the line would hide the one sentence that says history is
+        not held off."""
+        hostile = "ok\x1b[2J\x1b[H\rfake\x07\x9b31m end"
+        first, everything = self._first_line(
+            {"history": "weak", "history_detail": hostile})
+        # The only escapes in the line are the page's own dim and reset.
+        self.assertEqual(re.findall(r"\x1b\[[0-9;]*[A-Za-z]", first),
+                         ["\x1b[2m", "\x1b[0m"])
+        self.assertNotRegex(first, r"[\x00-\x08\x0a-\x1a\x1c-\x1f\x7f-\x9f]")
+        self.assertNotIn("\r", first)
+        self.assertIn("not guaranteed off", first)
+        self.assertIn("end", first)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_far_end_that_hangs_up_ends_the_session(self):
