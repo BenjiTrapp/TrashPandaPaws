@@ -4573,7 +4573,9 @@ class TunnelEndpoint(object):
                     "reported again only when the tunnel itself "
                     "reconnects: in the tunnel panel, Stop this endpoint "
                     "and, once it shows stopped, Start it, one check-in "
-                    "each. Closing this view and opening another shell "
+                    "each; stopping it ends every session and proxy on "
+                    "this endpoint, not just this one. Closing this view "
+                    "and opening another shell "
                     "does not do it, because a shell rides the channel "
                     "that is already up."
                     % (said.get(was, was),

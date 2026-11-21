@@ -1851,6 +1851,12 @@ class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
                                    r"do it|sends nothing new)",
                              "%s does not say reopening changes nothing"
                              % name)
+            self.assertRegex(text, r"(?i)stopping it ends every session and "
+                                   r"proxy on that endpoint, not just the "
+                                   r"declined one",
+                             "%s gives the Stop advice without saying it "
+                             "ends every session and proxy on the endpoint"
+                             % name)
 
     def test_the_seventh_limitation_says_whose_claim_the_guard_is(self):
         body = self.design_section("## Known limitations, as built") \

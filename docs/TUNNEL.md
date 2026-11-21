@@ -418,9 +418,10 @@ session whose guard no longer matches what was reported, because the login
 shell was changed with `chsh` or a bash was removed since the tunnel
 connected, is declined the same way. The answer is reported again only when
 the tunnel itself reconnects: in the tunnel panel, Stop the endpoint and,
-once it shows stopped, Start it, each taking effect at a check-in. Closing
-the Operator Shell and opening another shell does not do it, because a shell
-rides the channel that is already up.
+once it shows stopped, Start it, each taking effect at a check-in; stopping
+it ends every session and proxy on that endpoint, not just the declined
+one. Closing the Operator Shell and opening another shell does not do it,
+because a shell rides the channel that is already up.
 
 **Colour is the user's own: bash gets defaults, and its own `~/.bashrc` wins
 over them.** A bash session that takes the generated rcfile is given colour

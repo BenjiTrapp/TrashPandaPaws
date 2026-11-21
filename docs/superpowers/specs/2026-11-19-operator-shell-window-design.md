@@ -536,9 +536,9 @@ So a zsh session takes the weaker path, and **on macOS with zsh history is
 switched back on, every time**: the system's own `/etc/zshrc` sets
 `HISTFILE` itself, unconditionally, after our environment, so every command
 is written to `~/.zsh_history` (measured). That matters beyond tidiness,
-because the terminal's first line said `history is off in this session` as a constant,
-and there is a test asserting that line claims only what the code does
-(`test_the_first_terminal_line_claims_only_what_the_code_does`).
+because the terminal's first line said `history is off in this session` as
+a constant, and there is a test asserting that line claims only what the
+code does (`test_the_first_terminal_line_claims_only_what_the_code_does`).
 
 **As built, and why it is not what was first proposed.** The proposal was
 that the beacon reports which mechanism *a session* used. That cannot be
@@ -560,9 +560,10 @@ the mechanism became a **host capability** rather than a per-session fact:
   reconnect the tunnel, rather than run under a claim nobody has rechecked.
   Reconnect means the tunnel itself: the answer is remembered in `_hello`,
   which runs only when the command channel reconnects, so it takes Stop and
-  then Start on the endpoint in the tunnel panel (a check-in each). Closing
-  the view and opening another shell sends nothing new and is declined
-  again;
+  then Start on the endpoint in the tunnel panel (a check-in each), and
+  stopping it ends every session and proxy on that endpoint, not just the
+  declined one. Closing the view and opening another shell sends nothing
+  new and is declined again;
 - the one reason that is genuinely per attempt, a pipe for the generated
   file that cannot be opened for the moment, used to downgrade that session
   to the weaker guard silently. It is now a **refusal** that names history,

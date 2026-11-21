@@ -2064,6 +2064,10 @@ class TestARefusedShellSession(_ShellChoice, TunnelEndpointTestCase):
         self.assertRegex(refusal, r"(?i)check-in")
         self.assertRegex(refusal, r"(?i)only when the tunnel itself "
                                   r"reconnects")
+        # The advice costs every other session and proxy on the endpoint,
+        # and following it must not be the first the person hears of that.
+        self.assertRegex(refusal, r"(?i)stopping it ends every session and "
+                                  r"proxy on this endpoint, not just this one")
         # Named only to say it does not work, never as the advice.
         self.assertNotIn("\u2715", refusal)
         self.assertNotIn("Open a shell", refusal)
