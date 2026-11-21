@@ -2325,6 +2325,79 @@ class TestAShellSession(TunnelEndpointTestCase):
             self.addCleanup(os.environ.__setitem__, "HOME", previous)
         return home
 
+    def a_changed_environment(self, **values):
+        """Set (or, given None, remove) variables this process's children inherit.
+
+        The endpoint builds a session's environment from its own, so this
+        is how a variable the host "already has" is put under the test's
+        control. Restored afterwards.
+        """
+        for name, value in values.items():
+            previous = os.environ.get(name)
+            if previous is None:
+                self.addCleanup(os.environ.pop, name, None)
+            else:
+                self.addCleanup(os.environ.__setitem__, name, previous)
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    @staticmethod
+    def the_pages_red():
+        """`--red` as the page defines it, as the `r;g;b` an SGR code wants.
+
+        Read out of the page's own stylesheet rather than written down
+        here, so a palette change that the prompt did not follow fails.
+        """
+        path = os.path.join(os.path.dirname(beacon_mod.__file__),
+                            "server.py")
+        with open(path, encoding="utf-8") as handle:
+            found = re.search(r"--red:\s*#([0-9a-fA-F]{6})\s*;", handle.read())
+        assert found, "the page no longer defines --red"
+        value = found.group(1)
+        return ";".join(str(int(value[i:i + 2], 16)) for i in (0, 2, 4))
+
+    def assert_a_red_prompt(self, ps1):
+        """`ps1` is the interface's red around the host and directory.
+
+        Each property is one way a prompt goes wrong: no `\\h` or `\\w`
+        and it names neither; an escape outside `\\[ \\]` and bash
+        miscounts the width, so line editing wraps wrongly; no reset and
+        everything the operator types is red.
+        """
+        start = r"\[\e[38;2;%sm\]" % self.the_pages_red()
+        reset = r"\[\e[0m\]"
+        found = re.fullmatch(re.escape(start) + r"(.*)" + re.escape(reset)
+                             + r"\s*", ps1, re.DOTALL)
+        self.assertIsNotNone(
+            found, "the prompt is not the page's --red, wrapped in \\[ \\], "
+            "and reset at the end: %r" % (ps1,))
+        body = found.group(1)
+        self.assertIn("\\h", body, "the prompt does not name the host")
+        self.assertIn("\\w", body,
+                      "the prompt does not name the working directory")
+        self.assertNotIn("\\e", body,
+                         "something else is coloured inside the prompt")
+
+    def value_in_the_shell(self, stream, expansion):
+        """What `expansion` (e.g. `$PS1`) comes to inside the session, as text.
+
+        Printed between a `V<n>=[` and a `] END<n>` that cannot be in the
+        echo of the command, because each is split by a pair of quotes.
+        The stream's buffer is cumulative, so each call has a number of
+        its own and cannot be satisfied by an earlier call's output.
+        """
+        self._asked = getattr(self, "_asked", 0) + 1
+        n = b"%d" % self._asked
+        command = (b'echo "V""' + n + b'=[' + expansion + b']" "E""ND' + n
+                   + b'"\n')
+        data = self.run_in_the_shell(stream, command, b" END" + n)
+        found = re.findall(rb"V" + n + rb"=\[(.*?)\] END" + n, data,
+                           re.DOTALL)
+        self.assertEqual(len(found), 1, data)
+        return found[0].decode("utf-8", "replace")
+
     # ── the claim ──
 
     def test_an_open_shell_dials_back_and_claims_with_its_token(self):
@@ -2639,8 +2712,10 @@ class TestAShellSession(TunnelEndpointTestCase):
         rc = beacon_mod._SHELL_RCFILE
         system_file = rc.rindex("/etc/bash.bashrc")
         operators_file = rc.index('"$HOME/.bashrc"')
-        self.assertLess(rc.index("CLICOLOR"), system_file)
-        self.assertLess(rc.index("LSCOLORS"), system_file)
+        self.assertLess(rc.rindex("CLICOLOR"), system_file,
+                        "a CLICOLOR is set at or below the system file")
+        self.assertLess(rc.rindex("LSCOLORS"), system_file,
+                        "a LSCOLORS is set at or below the system file")
         self.assertGreater(rc.index("PS1"), system_file,
                            "the prompt is above /etc/bash.bashrc, which "
                            "sets its own PS1 on Debian and ParrotOS and "
@@ -2651,49 +2726,86 @@ class TestAShellSession(TunnelEndpointTestCase):
         self.assertEqual(rc.count("PS1"), 1)
 
     def test_the_defaults_do_not_touch_what_the_host_already_has(self):
-        self.assertNotIn("LS_COLORS", beacon_mod._SHELL_RCFILE)
+        rc = beacon_mod._SHELL_RCFILE.lower()
+        self.assertNotIn("ls_colors", rc)
+        self.assertNotIn("dircolors", rc,
+                         "dircolors is the host's business, and a host with "
+                         "an LS_COLORS of its own would be overwritten")
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_a_stand_in_dircolors_is_never_run_and_ls_colors_is_kept(self):
+        """Measured rather than read: a `dircolors` on the PATH that would
+        set `LS_COLORS` is put there, and the session must not run it."""
+        stubs = os.path.join(self.root, "stub-bin")
+        os.makedirs(stubs)
+        for name in ("dircolors", "gdircolors"):
+            path = os.path.join(stubs, name)
+            with open(path, "w") as handle:
+                handle.write("#!/bin/sh\n"
+                             "echo \"LS_COLORS='di=1;31'; export LS_COLORS\"\n")
+            os.chmod(path, 0o755)
+        self.a_home_directory()
+        self.a_changed_environment(
+            PATH=stubs + os.pathsep + os.environ.get("PATH", ""),
+            LS_COLORS="di=1;34")
+        stream = self.ask_for_a_shell()
+        self.assertEqual(self.value_in_the_shell(stream, b"$LS_COLORS"),
+                         "di=1;34",
+                         "the host's LS_COLORS was replaced")
+        stream.close()
+
+        self.a_changed_environment(LS_COLORS=None)
+        stream = self.ask_for_a_shell()
+        self.assertEqual(
+            self.value_in_the_shell(stream, b"${LS_COLORS-unset}"), "unset",
+            "a host with no LS_COLORS was given one")
 
     @unittest.skipUnless(_HAS_PTY, _NO_PTY)
     @unittest.skipUnless(_HAS_BASH, _NO_BASH)
     def test_the_operators_own_settings_win_over_the_colour_defaults(self):
         # The order test above reads text; this one asks a real bash. A
-        # `.bashrc` that sets its own prompt and its own `CLICOLOR` has to
-        # be what the session ends up with.
+        # `.bashrc` that sets its own prompt and its own colour variables
+        # has to be what the session ends up with.
         self.a_home_directory(
-            bashrc='PS1="MINE> "\nCLICOLOR=0\n')
+            bashrc='PS1="MINE> "\nCLICOLOR=0\nLSCOLORS=gxgxgxgxgxgxgxgxgxgxgx\n')
         stream = self.ask_for_a_shell()
 
-        data = self.run_in_the_shell(
-            stream, b'echo "P""=[$PS1]" "C""=[$CLICOLOR]"\n', b"C=[")
-
-        self.assertIn(b"P=[MINE> ]", data,
-                      "the default prompt overwrote the operator's own")
-        self.assertIn(b"C=[0]", data,
-                      "the default CLICOLOR overwrote the operator's own")
+        self.assertEqual(self.value_in_the_shell(stream, b"$PS1"), "MINE> ",
+                         "the default prompt overwrote the operator's own")
+        self.assertEqual(self.value_in_the_shell(stream, b"$CLICOLOR"), "0",
+                         "the default CLICOLOR overwrote the operator's own")
+        self.assertEqual(self.value_in_the_shell(stream, b"$LSCOLORS"),
+                         "gxgxgxgxgxgxgxgxgxgxgx",
+                         "the default LSCOLORS overwrote the operator's own")
 
     @unittest.skipUnless(_HAS_PTY, _NO_PTY)
     @unittest.skipUnless(_HAS_BASH, _NO_BASH)
     def test_a_host_with_no_configuration_gets_colour_and_a_red_prompt(self):
-        saved = {name: os.environ.pop(name, None)
-                 for name in ("CLICOLOR", "LSCOLORS")}
-        for name, value in saved.items():
-            if value is not None:
-                self.addCleanup(os.environ.__setitem__, name, value)
+        self.a_changed_environment(CLICOLOR=None, LSCOLORS=None)
         self.a_home_directory()
         stream = self.ask_for_a_shell()
 
-        data = self.run_in_the_shell(
-            stream, b'echo "C""=[$CLICOLOR]" "L""=[${LSCOLORS:+set}]"\n',
-            b"L=[")
+        self.assertEqual(self.value_in_the_shell(stream, b"$CLICOLOR"), "1")
+        self.assertRegex(self.value_in_the_shell(stream, b"$LSCOLORS"),
+                         r"^(?:[a-hA-Hx]{2}){11}$",
+                         "LSCOLORS is not eleven pairs of BSD colour letters")
+        self.assert_a_red_prompt(self.value_in_the_shell(stream, b"$PS1"))
 
-        self.assertIn(b"C=[1]", data)
-        self.assertIn(b"L=[set]", data)
-        if os.path.exists("/etc/bash.bashrc"):
-            return      # that file sets its own PS1 before ours can show
-        data = self.run_in_the_shell(
-            stream, b'echo "P""=[${PS1//[^0-9;]/}]"\n', b"P=[")
-        self.assertIn(b"38;2;255;26;26", data,
-                      "the prompt is not the interface's own red")
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_colour_variables_already_in_the_environment_are_kept(self):
+        """The defaults fill a gap; they never replace what the host has."""
+        self.a_changed_environment(CLICOLOR="0",
+                                   LSCOLORS="gxfxcxdxbxegedabagacad")
+        self.a_home_directory()
+        stream = self.ask_for_a_shell()
+
+        self.assertEqual(self.value_in_the_shell(stream, b"$CLICOLOR"), "0",
+                         "an existing CLICOLOR was overwritten")
+        self.assertEqual(self.value_in_the_shell(stream, b"$LSCOLORS"),
+                         "gxfxcxdxbxegedabagacad",
+                         "an existing LSCOLORS was overwritten")
 
     @unittest.skipUnless(_HAS_BASH, _NO_BASH)
     def test_the_prompt_survives_the_system_file_and_the_operators_wins(self):
@@ -2725,15 +2837,61 @@ class TestAShellSession(TunnelEndpointTestCase):
                 input=b'echo "P""=[$PS1]"\nexit\n', cwd=home,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 env=dict(os.environ, HOME=home), timeout=30)
-            return done.stdout.decode("utf-8", "replace")
+            found = re.findall(r"(?m)^P=\[(.*)\]$",
+                               done.stdout.decode("utf-8", "replace"))
+            self.assertEqual(len(found), 1, done.stdout)
+            return found[0]
 
         ours = prompt_with(None)
-        self.assertIn("38;2;255;26;26", ours,
-                      "the distribution's prompt survived ours")
-        self.assertNotIn("DISTRO> ", ours)
-        theirs = prompt_with('PS1="MINE> "\n')
-        self.assertIn("P=[MINE> ]", theirs,
-                      "our prompt overwrote the operator's own")
+        self.assertNotEqual(ours, "DISTRO> ",
+                            "the distribution's prompt survived ours")
+        self.assert_a_red_prompt(ours)
+        self.assertEqual(prompt_with('PS1="MINE> "\n'), "MINE> ",
+                         "our prompt overwrote the operator's own")
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_a_bash_login_shell_outside_bin_is_handed_the_rcfile_too(self):
+        """The path nothing had walked: a login shell that is a bash.
+
+        `_login_shell` accepts bash by basename, `_guard_of` calls any
+        bash "off", and `_shell_invocation` therefore hands it the
+        generated rcfile: a user whose login shell is
+        `/opt/homebrew/bin/bash` gets this file, not only the fallback.
+        `setUp` pins `_login_shell` to `""`, which is why no test went
+        down here. A symlink named `bash` in a directory of the test's own
+        stands in for a bash that is not `/bin/bash`.
+        """
+        directory = os.path.join(self.root, "opt", "bin")
+        os.makedirs(directory)
+        login = os.path.join(directory, "bash")
+        os.symlink("/bin/bash", login)
+        self.patched("_login_shell", lambda: login)
+        self.assertEqual(beacon_mod._history_guard(), ("off", ""),
+                         "a bash login shell is not given the rcfile")
+
+        # The history lines run last: a `.bashrc` that turns history on
+        # and names a file must find both undone.
+        self.a_home_directory(bashrc='HISTFILE="$HOME/.bash_history"\n'
+                                     'set -o history\n')
+        stream = self.ask_for_a_shell()
+        self.assertEqual(self.value_in_the_shell(stream, b"$BASH"), login,
+                         "the session did not run the login shell")
+        self.assertEqual(self.value_in_the_shell(stream, b"$HISTFILE"), "",
+                         "the history lines did not run last")
+        self.assertEqual(
+            self.value_in_the_shell(
+                stream, b"$(set -o | grep -c '^history.*on$')"), "0",
+            "history is on in a bash login shell")
+        # The prompt is ours, since the `.bashrc` above sets none.
+        self.assert_a_red_prompt(self.value_in_the_shell(stream, b"$PS1"))
+        stream.close()
+
+        # And the operator's own prompt still wins over it.
+        self.a_home_directory(bashrc='PS1="MINE> "\n')
+        stream = self.ask_for_a_shell()
+        self.assertEqual(self.value_in_the_shell(stream, b"$PS1"), "MINE> ",
+                         "our prompt overwrote a bash login shell's own")
 
     def test_the_rcfile_still_ends_by_turning_history_off(self):
         """The colour lines went in above the sourcing; the history lines
