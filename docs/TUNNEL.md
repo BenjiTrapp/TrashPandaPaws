@@ -373,6 +373,65 @@ to know when reading a directory of them:
   made, a symlink in its place, a write that fails — each is logged once
   and the shell runs on.
 
+### Which shell a session runs, and what it costs for history
+
+A session runs **the login shell of the user the endpoint runs as**, where
+that is bash or zsh, so their own prompt, colours and completion apply. The
+choice is read from the **passwd entry** of the effective user and not from
+`$SHELL`: under the shipped `services/raccoon-beacon.service` the
+environment is the service manager's, so `$SHELL` there is nobody's choice.
+It is started as an ordinary interactive shell and not as a login session,
+so `~/.bashrc` and `~/.zshrc` are read and `/etc/profile` and `~/.zprofile`
+are not. A login shell that is neither (fish, tcsh), or one that is missing
+or cannot be executed, is not driven with flags nobody has tested: the
+session runs `bash`, and `/bin/sh` where there is no bash. On a shipped
+implant the unit runs as **root**, so the login shell is root's, usually
+`/bin/bash`, and nothing changes there. The case this helps is the
+operator's own machine, where the endpoint runs as the person who set that
+shell up.
+
+**History is held off in one of two ways, and the first line of the terminal
+says which.** Where the shell is bash and the host has a `/dev/fd`, the
+session is started on the generated rcfile, held in a pipe: it sources the
+host's own files and **then** unsets `HISTFILE` and turns history off, and
+the first line reads `history is off in this session`. A bash login shell
+gets that file too, which is the stronger guard and not the weaker one. Where
+the shell is not bash (only bash takes `--rcfile`, and zsh takes none) or
+the host has no `/dev/fd` to hand a pipe on, the session can only set
+`HISTFILE=/dev/null` in its environment, and the user's own startup files
+run after that and may set it again. The first line then reads `history is
+not guaranteed off in this session`, with the endpoint's reason beside it.
+Not guaranteed off does not mean on: history is held off only by a setting
+the user's own files can undo, and whether they do is theirs to know. The
+word is what the endpoint reported about itself, as the user is: the team
+server cannot verify it, and a modified endpoint could say `off` and not
+do it.
+
+**A session whose history cannot be held off as reported is refused, not
+run.** The guard is reported once, when the tunnel connects. A pipe that
+cannot be opened, because the host is out of descriptors for a moment, used
+to fall back to the weaker guard without a word, and the session would then
+record what you typed while the page said it did not; now that session is
+refused, with a reason that names history, and you attach again. And a
+session whose guard no longer matches what was reported, because the login
+shell was changed with `chsh` or a bash was removed since the tunnel
+connected, is declined the same way: reconnect the tunnel and it reports
+what the host does now.
+
+**Colour is the user's own, and bash gets defaults only where it has none of
+its own.** A bash session that takes the generated rcfile is given colour
+defaults: `CLICOLOR` and `LSCOLORS` for BSD and macOS `ls`, each only if the
+environment has none, and a prompt naming the host and the working directory
+in the interface's red, so a glance tells it from a local one. They are placed **before** the
+user's own `~/.bashrc` is read, so the operator's own settings win over them
+(the prompt goes after the distribution's `/etc/bash.bashrc`, which sets one
+unconditionally on Debian and ParrotOS, and before the user's). `LS_COLORS`
+is left alone: GNU `ls` reads it from the host's environment. A zsh login
+shell is given nothing at all, because its own configuration is the point.
+As-you-type highlighting, `zsh-syntax-highlighting` for instance, is
+something the operator installs themselves; nothing here installs anything
+on the device, and what this change does is let it apply.
+
 ### Three platform facts
 
 The shell is spawned through **`setsid -c`** where that binary exists,
@@ -411,12 +470,22 @@ judge the risk. A live shell session shows, on the implant host:
   attached;
 - a **second connection on the same outbound port** the command channel
   already uses — the same shape a SOCKS relay makes, and for the same
-  reason: one port is all most egress proxies permit.
+  reason: one port is all most egress proxies permit;
+- a **history file**, only where history is **not guaranteed off**. Where
+  bash took the generated rcfile history is off, and none is written unless
+  something turns it back on after the host's rc files have run. Where it
+  could not (a login shell that is not bash, or a host with no `/dev/fd`) the
+  session only sets `HISTFILE=/dev/null`, the user's own files can undo that,
+  and the first line of the terminal says so.
 
-The session starts in `/` rather than the install directory, so a prompt
-does not name where the implant lives, and `HISTFILE` is unset for the
-session — though the host's own rc files run and can set it again. The
-three artifacts above, though, are real and are the cost of the session.
+The session is given `/` as its working directory rather than the
+install directory, so a prompt does not name where the implant lives. That
+is what the spawn is given and not a promise about where the session is: a
+login shell's own startup files run after it and may change the directory,
+which was measured on a macOS host whose zsh left the session in the home
+directory, so a prompt there may name a path. The first three artifacts are
+real and are the cost of every session; the fourth is the cost of the ones
+that are not guaranteed.
 
 ---
 
@@ -474,6 +543,21 @@ for its whole life — the terminal says so on a line of its own, because a
 small terminal in a wide box is otherwise unexplainable. A terminal that
 redrew itself to a new size while the far end kept the old one would be a
 quiet lie about what the shell thinks it has.
+
+**The first line says what history will do, and sometimes says nothing —
+three cases look alike and are not.** The word comes from the endpoint's
+`HELLO` through the team server's row for the channel, and what reaches the
+page is not uniform:
+- **An endpoint built before the field** sends none, and reads as `not
+  guaranteed off` with **no reason** beside it: the weaker word, because
+  `off` is the one claim that can mislead and only an endpoint that says it
+  earns it.
+- **No row, or a relay too old to carry it:** a channel with no row in the
+  relay, or a relay that predates the field, gives the page nothing, and the
+  first line **says nothing about history** — neither word, rather than a
+  guess.
+- **A word nobody recognises** reads as `not guaranteed off` as well, and
+  keeps whatever reason was sent.
 
 **The password never reaches the browser.** The team server holds the TCP
 connection to the shell port itself and puts the password on it; the

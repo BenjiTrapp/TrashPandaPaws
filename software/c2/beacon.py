@@ -3247,14 +3247,16 @@ _SETSID_PATHS = ("/usr/bin/setsid", "/bin/setsid")
 # message in every session on a host without the package -- and the whole
 # thing skipped when `/etc/bash.bashrc` already did it.
 #
-# This file is handed to every bash a session runs, and only to bash: the
-# user's own login shell when that is a bash -- `_guard_of` recognises it
-# by basename, so `/opt/homebrew/bin/bash` gets it as `/bin/bash` does --
-# and the fallback bash where there is no login shell of theirs to run. A
-# login shell that is not bash, zsh in practice, never sees it. For a bash
-# login shell that is the stronger history guard, not the weaker one, and
-# a prompt that says at a glance this is not a local session is as much
-# wanted there as on the fallback.
+# This file is handed to a bash that has a `/dev/fd` to read it from, and
+# only to bash: the user's own login shell when that is a bash --
+# `_guard_of` recognises it by basename, so `/opt/homebrew/bin/bash` gets
+# it as `/bin/bash` does -- and the fallback bash where there is no login
+# shell of theirs to run. A bash on a host with no `/dev/fd` is run as plain
+# `-i` with `HISTFILE=/dev/null` in its environment and never sees the
+# file, nor its colour; a login shell that is not bash, zsh in practice,
+# never sees it either. For a bash login shell this is the stronger history
+# guard, not the weaker one, and a prompt that says at a glance this is not
+# a local session is as much wanted there as on the fallback.
 #
 # The colour lines sit above the operator's own files, and that order is
 # the whole of their design. Bash with no configuration is monochrome with

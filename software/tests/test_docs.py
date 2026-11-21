@@ -1278,16 +1278,18 @@ class TestTheOperatorShellIsDocumentedAsAWindow(unittest.TestCase):
                              "%s does not say the shell keeps running while "
                              "the card is parked" % name)
 
-    def test_the_design_records_the_six_things_this_cannot_do(self):
-        """The six known limitations, which nothing else holds.
+    def test_the_design_records_the_seven_things_this_cannot_do(self):
+        """The seven known limitations, which nothing else holds.
 
-        A design is not usually tested here. These six are the only
+        A design is not usually tested here. These seven are the only
         written record of what the feature deliberately cannot do -- each
         one ruled during execution, against a change the plan forbade --
         and the three operator claims above are now pinned while these
         were held by nothing, so they could rot or be dropped silently.
         Subjects, not sentences: the reasoning is free to be rewritten,
-        the six subjects are not.
+        the seven subjects are not. The seventh arrived with the login
+        shell: what the view says about history is what the endpoint said
+        about itself.
         """
         section = DESIGN_DOC.read_text().split(
             "\n## Known limitations, as built\n", 1)
@@ -1295,7 +1297,7 @@ class TestTheOperatorShellIsDocumentedAsAWindow(unittest.TestCase):
                          "this feature cannot do")
         body = section[1].split("\n## ", 1)[0].split("\n---", 1)[0]
         entries = re.findall(r"^\d+\. \*\*", body, re.M)
-        self.assertEqual(len(entries), 6, "the section has %d entries; six "
+        self.assertEqual(len(entries), 7, "the section has %d entries; seven "
                          "limitations were ruled" % len(entries))
         flat = " ".join(body.split()).lower()
         for subject, what in (
@@ -1315,9 +1317,363 @@ class TestTheOperatorShellIsDocumentedAsAWindow(unittest.TestCase):
                  "blocker: the sentence used to be written only into a "
                  "terminal the next poll tick disposed, and now rides on "
                  "`opshellLast` into the card"),
-                ("not a free one", "what a parked session holds")):
+                ("not a free one", "what a parked session holds"),
+                ("what the endpoint reported about itself",
+                 "that the history guard is the endpoint's own claim, which "
+                 "the team server cannot verify")):
             self.assertIn(subject, flat,
                           "the section does not record %s" % what)
+
+
+class TestTheShellAccountIsTrueOfTheLoginShellWork(unittest.TestCase):
+    """What six tasks changed about the shell, said where a reader looks.
+
+    The session now runs the user's own login shell where there is one, so
+    five statements that were true of a session that was always bash became
+    false, and one thing the user asked for -- colour -- was written down
+    nowhere. Each test here takes the paragraph that makes a claim and reads
+    that paragraph, flattened, and not the page: the pages wrap, and a
+    pattern run over a whole document has twice been green over the very
+    sentence it was written to forbid, because it was answered by a
+    different paragraph.
+    """
+
+    @staticmethod
+    def flat(text):
+        return " ".join(text.split())
+
+    def blocks(self, text):
+        return [self.flat(b) for b in text.split("\n\n") if b.strip()]
+
+    def one_block(self, text, pattern, what):
+        found = [b for b in self.blocks(text) if re.search(pattern, b)]
+        self.assertEqual(len(found), 1, "%d paragraphs say %s, wanted one "
+                         "(pattern %r)" % (len(found), what, pattern))
+        return found[0]
+
+    def tunnel_section(self, heading, end="\n#"):
+        parts = TUNNEL_DOC.read_text().split("\n" + heading + "\n", 1)
+        self.assertEqual(len(parts), 2, "docs/TUNNEL.md has no %r" % heading)
+        return parts[1].split(end, 1)[0]
+
+    def design_section(self, heading):
+        parts = DESIGN_DOC.read_text().split("\n" + heading + "\n", 1)
+        self.assertEqual(len(parts), 2, "the design has no %r" % heading)
+        return parts[1].split("\n## ", 1)[0]
+
+    def test_the_tunnel_page_says_which_shell_runs_and_what_history_costs(self):
+        text = " ".join(TUNNEL_DOC.read_text().split())
+        self.assertRegex(text, r"(?i)login shell")
+        self.assertRegex(text, r"(?i)not guaranteed off")
+        self.assertNotRegex(
+            text, r"(?i)history is (always )?off (on|in) every session",
+            "the page still promises history is off for every shell")
+
+    def test_the_tunnel_page_says_why_the_passwd_entry_and_not_shell(self):
+        section = self.tunnel_section(
+            "### Which shell a session runs, and what it costs for history",
+            "\n### ")
+        said = self.one_block(section, r"(?i)passwd",
+                              "which shell is chosen and from where")
+        for pattern, what in (
+                (r"(?i)login shell", "that it is the login shell"),
+                (r"\$SHELL", "that `$SHELL` is not what is read"),
+                (r"(?i)service manager", "why `$SHELL` is nobody's choice "
+                                         "under the shipped unit"),
+                (r"(?i)\broot\b", "that a shipped implant runs as root, "
+                                  "so nothing changes there"),
+                (r"(?i)own machine", "that the operator's own machine is "
+                                     "the case this helps"),
+                (r"(?i)bash and zsh|zsh or bash|bash or zsh",
+                 "which two shells are driven"),
+                (r"(?i)/bin/sh", "the floor when there is no bash")):
+            self.assertRegex(said, pattern, "the paragraph does not say "
+                             + what)
+
+    def test_the_session_is_given_root_but_may_not_stay_there(self):
+        """Statement 3: "The session starts in `/`" is a spawn argument.
+
+        A login shell's own startup files run after the spawn and may
+        change directory -- measured, with a zsh whose startup file
+        left the session in the home directory. The page may still say
+        what the spawn is given; it may not say where the session is.
+        """
+        text = TUNNEL_DOC.read_text()
+        paragraph = self.one_block(text, r"(?i)install directory",
+                                   "where the session starts")
+        self.assertNotRegex(
+            paragraph, r"(?i)session starts in\s*`?/`?(?![\w.])",
+            "the page still says, as a rule, that the session starts in /")
+        self.assertRegex(paragraph, r"(?i)\bgiven\s+`/`",
+                         "the paragraph does not say that `/` is what the "
+                         "spawn is given")
+        self.assertRegex(paragraph,
+                         r"(?i)startup files[^.]*\b(change|move)[^.]*director"
+                         r"|startup files[^.]*\bcd\b",
+                         "the paragraph does not say a login shell's own "
+                         "startup files may change the directory")
+        self.assertRegex(paragraph, r"(?i)measured",
+                         "the paragraph does not say that this was measured")
+        self.assertNotRegex(
+            self.flat(text), r"(?i)session starts in\s*`?/`?(?![\w.])",
+            "another paragraph still says the session starts in /")
+
+    def test_the_artifact_list_separates_history_off_from_not_guaranteed(self):
+        """Statement 4: the list now makes the distinction the page makes."""
+        section = self.tunnel_section("### What it leaves on the host",
+                                      "\n---")
+        items = [self.flat(i.split("\n\n", 1)[0])
+                 for i in re.split(r"\n(?=- )", section)
+                 if i.startswith("- ")]
+        said = [i for i in items if re.search(r"(?i)history", i)]
+        self.assertEqual(len(said), 1, "the artifact list has %d items about "
+                         "history, wanted one" % len(said))
+        item = said[0]
+        for pattern, what in (
+                (r"(?i)not guaranteed off",
+                 "that history is only *not guaranteed* off in some sessions"),
+                (r"(?i)generated rcfile|rcfile",
+                 "that where bash took the rcfile there is no file"),
+                (r"(?i)HISTFILE=/dev/null",
+                 "what the weaker guard is"),
+                (r"(?i)can undo|may undo|free to",
+                 "that the user's own files can undo the weaker guard"),
+                (r"(?i)first line",
+                 "that the view says which of the two applies")):
+            self.assertRegex(item, pattern, "the history item does not say "
+                             + what)
+        self.assertNotRegex(
+            self.flat(section),
+            r"(?i)`HISTFILE` is unset for the session\s*(?:\u2014|--?)\s*"
+            r"though",
+            "the old, unconditional sentence about HISTFILE is still there")
+
+    def test_a_pipe_failure_or_a_changed_guard_refuses_the_session(self):
+        section = self.tunnel_section(
+            "### Which shell a session runs, and what it costs for history",
+            "\n### ")
+        said = self.one_block(section, r"(?i)\brefused\b",
+                              "that a session history cannot be held off for "
+                              "is refused")
+        for pattern, what in (
+                (r"(?i)pipe", "the pipe that carries the rcfile"),
+                (r"(?i)now that session is refused, with a reason that names "
+                 r"history",
+                 "that a pipe failure refuses the session and says why"),
+                (r"(?i)declined the same way",
+                 "that a changed guard is refused too"),
+                (r"(?i)record", "that falling back would record what is "
+                                "typed"),
+                (r"(?i)chsh|login shell (?:has )?changed|changed since",
+                 "that a guard that changed since connecting is refused"),
+                (r"(?i)reconnect", "what to do about a changed guard")):
+            self.assertRegex(said, pattern, "the paragraph does not say "
+                             + what)
+
+    def test_the_history_mechanisms_are_named_with_their_reasons(self):
+        section = self.tunnel_section(
+            "### Which shell a session runs, and what it costs for history",
+            "\n### ")
+        said = self.one_block(section, r"(?i)not guaranteed off",
+                              "what the two history guards are")
+        for pattern, what in (
+                (r"(?i)only bash takes `?--rcfile|zsh takes no `?--rcfile",
+                 "why a non-bash shell gets the weaker one"),
+                (r"/dev/fd", "that a host without /dev/fd gets it too"),
+                (r"(?i)bash login shell\s+gets that file too[^.]*stronger",
+                 "that a bash login shell gets the stronger one"),
+                (r"(?i)after that|run after", "that the user's files run "
+                                              "after the weaker guard"),
+                (r"history is off in this session",
+                 "the first line's wording for the stronger guard"),
+                (r"history is not guaranteed off in this session",
+                 "the first line's wording for the weaker guard"),
+                (r"(?i)cannot verify", "that the word is the endpoint's own "
+                                       "claim, as the user is")):
+            self.assertRegex(said, pattern, "the paragraph does not say "
+                             + what)
+
+    def test_the_page_says_what_the_first_line_shows_in_each_of_three_cases(
+            self):
+        """The report reaching the page is not uniform.
+
+        Each case is read off its own bullet, so that a sentence about one
+        cannot be answered by a word in another.
+        """
+        section = TUNNEL_DOC.read_text().split(
+            "\n## Opening one from the interface", 1)[1].split("\n## ", 1)[0]
+        block = self.one_block(section, r"(?i)\bno row\b",
+                               "the three cases the first line can be in")
+        cases = [c for c in re.split(r"\s-\s(?=\*\*)", block)[1:]]
+        self.assertEqual(len(cases), 3, "the paragraph has %d cases, wanted "
+                         "three: %r" % (len(cases), cases))
+        old, none, unknown = cases
+        self.assertRegex(old, r"(?i)built before")
+        self.assertRegex(old, r"(?i)not guaranteed off")
+        self.assertRegex(old, r"(?i)\bno reason\b|without (?:a|any) reason",
+                         "an endpoint too old to send the field must read as "
+                         "the weaker word with no reason beside it")
+        self.assertRegex(none, r"(?i)\bno row\b")
+        self.assertRegex(none, r"(?i)relay[^.]*too old|too old[^.]*relay")
+        self.assertRegex(none, r"(?i)says nothing about history")
+        self.assertNotRegex(none, r"(?i)not guaranteed off[^.]*\bkeeps\b",
+                            "the nothing case must not be described as the "
+                            "weaker word")
+        self.assertRegex(unknown, r"(?i)recognis")
+        self.assertRegex(unknown, r"(?i)not guaranteed off")
+        self.assertRegex(unknown, r"(?i)\bkeeps\b[^.]*reason")
+
+    def test_the_page_documents_the_colour_the_user_asked_for(self):
+        """Statement 5: colour was the request, and was written down nowhere."""
+        section = self.tunnel_section(
+            "### Which shell a session runs, and what it costs for history",
+            "\n### ")
+        said = self.one_block(section, r"(?i)colou?r defaults",
+                              "that bash gets colour defaults")
+        for pattern, what in (
+                (r"(?i)\bbash\b", "that it is bash that gets them"),
+                (r"~/\.bashrc|\$HOME/\.bashrc", "that the user's own file "
+                                                "is what is read after"),
+                (r"(?i)\bwins?\b|\bwin\b|take precedence|override",
+                 "that the user's own settings win"),
+                (r"(?i)before\W{0,3}the user's own `~/\.bashrc`",
+                 "that the defaults come before the user's own file"),
+                (r"(?i)highlighting", "as-you-type highlighting"),
+                (r"(?i)install[^.]*themselves|themselves[^.]*install",
+                 "that highlighting is something the user installs")):
+            self.assertRegex(said, pattern, "the paragraph does not say "
+                             + what)
+
+    def test_the_readme_row_names_the_login_shell(self):
+        row = next((line for line in README.read_text().splitlines()
+                    if line.startswith("| Operator Shell |")), None)
+        self.assertIsNotNone(row, "the GUI feature table has no Operator "
+                             "Shell row")
+        self.assertRegex(re.sub(r"[*`]", "", row), r"(?i)login shell",
+                         "the row does not say whose shell the session runs")
+
+    def test_the_demo_tour_says_what_the_first_line_claims_about_history(self):
+        line = next((l for l in DEMO_DOC.read_text().splitlines()
+                     if l.startswith("The **Operator Shell** panel")), None)
+        self.assertIsNotNone(line, "the tour has no Operator Shell paragraph")
+        flat = self.flat(line)
+        for pattern, what in (
+                (r"(?i)login shell", "whose shell it is"),
+                (r"(?i)not guaranteed off", "the weaker claim"),
+                (r"(?i)says nothing", "that the line can say nothing")):
+            self.assertRegex(flat, pattern, "the tour's paragraph does not "
+                             "say " + what)
+
+    def test_the_design_does_not_say_nothing_runs_for_a_login_shell(self):
+        """Statement 1: a bash login shell does get the generated file."""
+        section = self.design_section(
+            "## Colour defaults, for a bash session only")
+        flat = self.flat(section)
+        self.assertNotRegex(flat, r"(?i)nothing here runs when the session "
+                                  r"is a login shell")
+        said = self.one_block(section, r"(?i)login shell",
+                              "what a login shell gets")
+        self.assertRegex(said, r"(?i)bash login shell")
+        self.assertRegex(said, r"(?i)stronger|strong")
+        self.assertRegex(said, r"(?i)not bash|non-bash|that is not bash")
+        self.assertRegex(said, r"(?i)never sees|does not see|sees none")
+        self.assertRegex(flat, r"/etc/bash\.bashrc",
+                         "the section does not say where the prompt sits "
+                         "relative to the system file")
+
+    def test_the_design_says_part_two_was_built(self):
+        head = DESIGN_DOC.read_text().split("\n## ", 1)[0]
+        self.assertNotRegex(self.flat(head),
+                            r"(?i)was \*\*not\*\* built|still a proposal",
+                            "the status still says part two was not built")
+        self.assertRegex(self.flat(head), r"(?i)part two[^.]*\bbuilt\b")
+
+    def test_the_designs_first_line_is_not_a_constant_any_more(self):
+        text = self.flat(DESIGN_DOC.read_text())
+        self.assertNotRegex(
+            text, r"the host, that history is off, the pair",
+            "part one still says the first line always claims history off")
+
+    def test_the_design_records_what_was_built_for_history(self):
+        section = self.design_section(
+            "## The consequence that has to be said out loud")
+        flat = self.flat(section)
+        self.assertNotRegex(
+            flat, r"(?i)reports which history mechanism it used[^.]*"
+                  r"as a field on the shell session",
+            "the section still describes a per-session report")
+        self.assertRegex(flat, r"(?i)host capability")
+        self.assertRegex(flat, r"(?i)\bHELLO\b")
+        self.assertRegex(flat, r"(?i)no upward|no per-session channel")
+        self.assertRegex(flat, r"(?i)refus")
+        self.assertRegex(flat, r"(?i)worst trade on this branch",
+                         "the section lost its conclusion")
+
+    def test_the_seventh_limitation_says_whose_claim_the_guard_is(self):
+        body = self.design_section("## Known limitations, as built") \
+            .split("\n---", 1)[0]
+        entries = re.split(r"\n(?=\d+\. \*\*)", body)
+        seventh = [self.flat(e) for e in entries if e.startswith("7. **")]
+        self.assertEqual(len(seventh), 1, "no seventh entry")
+        for pattern, what in (
+                (r"(?i)cannot verify", "that the team server cannot verify "
+                                       "it"),
+                (r"(?i)\buser\b", "that `user` is the same boundary"),
+                (r"(?i)modified endpoint[^.]*\boff\b",
+                 "what a modified endpoint could claim"),
+                (r"TUNNEL\.md", "where the same boundary is already stated")):
+            self.assertRegex(seventh[0], pattern, "the seventh entry does "
+                             "not say " + what)
+
+    def test_the_design_answers_what_it_left_to_the_builder(self):
+        from software.c2 import beacon
+        # The second heading of that name is part two's; the first belongs
+        # to part one and is not under test.
+        parts = DESIGN_DOC.read_text().split("\n## Left to the builder\n")
+        self.assertEqual(len(parts), 3, "the design no longer has both "
+                         "'Left to the builder' sections")
+        flat = self.flat(parts[2].split("\n## ", 1)[0])
+        self.assertIn("history_detail", flat)
+        self.assertRegex(flat, r"`history`\s*/\s*`history_detail`")
+        default = re.search(r'LSCOLORS:-([A-Za-z]+)', beacon._SHELL_RCFILE)
+        self.assertIsNotNone(default, "the generated file has no LSCOLORS "
+                             "default to compare to")
+        self.assertIn(default.group(1), flat,
+                      "the design does not record the LSCOLORS string the "
+                      "code uses")
+        self.assertRegex(flat, r"(?i)zsh[^.]*no[^.]*(rc|startup)[^.]*variant"
+                               r"|no .?no rc.? variant")
+
+    def test_the_comment_above_the_generated_file_does_not_say_every_bash(
+            self):
+        """Statement 2, in the one place outside the documents.
+
+        A bash on a host with no `/dev/fd` runs plain `-i` and never sees
+        the file. Read off the comment itself, and then off the function
+        that decides, so the comment cannot be right by agreeing with a
+        sentence nobody checks.
+        """
+        lines = (REPO / "software" / "c2" / "beacon.py").read_text() \
+            .splitlines()
+        end = next(i for i, l in enumerate(lines)
+                   if l.startswith("_SHELL_RCFILE = ("))
+        start = end
+        while lines[start - 1].startswith("#"):
+            start -= 1
+        comment = "\n".join(l[1:] for l in lines[start:end])
+        paragraph = self.one_block(comment, r"(?i)handed to",
+                                   "which shells the file is handed to")
+        self.assertNotRegex(paragraph, r"(?i)every bash")
+        self.assertRegex(paragraph, r"/dev/fd")
+        from software.c2 import beacon
+        with patch("software.c2.beacon.os.path.isdir", return_value=True):
+            self.assertEqual(beacon._guard_of("/bin/bash")[0], "off")
+            self.assertEqual(beacon._guard_of("/opt/homebrew/bin/bash")[0],
+                             "off", "a bash login shell is handed the file")
+            self.assertEqual(beacon._guard_of("/bin/zsh")[0], "weak")
+        with patch("software.c2.beacon.os.path.isdir", return_value=False):
+            self.assertEqual(beacon._guard_of("/bin/bash")[0], "weak",
+                             "a bash with no /dev/fd is not handed the file")
 
 
 class TestTheGuiTourKeepsUpWithTheHeader(unittest.TestCase):

@@ -3,7 +3,9 @@
 **Date:** 2026-11-19
 **Branch:** `feat/operator-shell` (PR #9), on top of the merge with `main`
 **Status:** implemented, Tasks 1–6, commits `0e05888..9fe7b93`. Part two
-below was **not** built and is still a proposal. Builder-checked once
+below was built afterwards, on `feat/opshell-login-shell`, in six tasks of
+its own; the sections of it that the build changed say what was built beside
+what was proposed. Builder-checked once
 before the work began, and the corrections that check produced are folded
 in and marked; the corrections the *implementation* produced are folded in
 the same way, beside the statement each replaces, and what it could not do
@@ -188,7 +190,8 @@ to be carried over verbatim, and the final review found it could not be:
 it said "closing it queues the channel's shutdown" in a card whose two
 buttons are a `✕` that closes and a `_` that does not, so it names the
 `✕` now and says what the `_` does instead. The terminal's own opening
-lines carry what only it can say: the host, that history is off, the pair
+lines carry what only it can say: the host, what history will do in this
+session (off, or only not guaranteed off, as part two built it), the pair
 that was sent — and, when the measurement fell back, that this session is
 not fitted to the card and why.
 
@@ -389,9 +392,10 @@ softened.
 
 ## Known limitations, as built
 
-Six, each ruled during execution and each recorded in the ledger with its
+Seven, each ruled during execution and each recorded in the ledger with its
 reasoning. None is a defect left lying: every one was weighed against a
-change the plan or the task forbade, and the view fails safe in all six.
+change the plan or the task forbade, and the view fails safe in the first
+six. The seventh is a trust boundary and not a failure mode.
 
 1. **The resume checks a count, not an identity.** `/api/opshell/state`
    reports how many sessions the claim has, not whether the id in this
@@ -443,6 +447,13 @@ change the plan or the task forbade, and the view fails safe in all six.
    as long as it is parked. It belongs where an operator reads it, so it is
    in `docs/TUNNEL.md` as well as here — the alternative is a surprised
    reading of the logs.
+7. **The history guard is what the endpoint reported about itself.** The
+   team server cannot verify it, exactly as it cannot verify `user`: a
+   modified endpoint could claim `off` and not do it. That is the trust
+   boundary `docs/TUNNEL.md` already states for the user ("Which user that
+   is, the endpoint reports"), and saying so here keeps the view's claim
+   honest about whose claim it is: the first line is the endpoint's word,
+   passed on, and not something the interface checked.
 
 ---
 
@@ -512,17 +523,37 @@ files run after that and are free to set `HISTFILE` again".
 
 So a zsh session takes the weaker path, and **the operator's own rc may
 switch history back on.** That matters beyond tidiness, because the
-terminal's first line currently says `history is off in this session`, and
-there is a test asserting that line claims only what the code does
+terminal's first line said `history is off in this session` as a constant,
+and there is a test asserting that line claims only what the code does
 (`test_the_first_terminal_line_claims_only_what_the_code_does`).
 
-Therefore:
+**As built, and why it is not what was first proposed.** The proposal was
+that the beacon reports which mechanism *a session* used. There is no way to
+do that: there is no upward per-session channel from a session to the view,
+and the only message that reaches the team server's row for an endpoint is
+its `HELLO`, sent once, when the tunnel connects. So the mechanism became a **host
+capability** rather than a per-session fact:
 
-- the beacon **reports which history mechanism it used** — the rcfile or
-  the weaker environment variable — as a field on the shell session;
-- the view's first line states only that: history is off, or history is
-  *not guaranteed off* because this shell could not be given an rcfile and
-  the operator's own configuration runs;
+- the endpoint asks `_history_guard()` for the guard a session here would
+  get and reports `history` (`"off"` or `"weak"`) and `history_detail` (the
+  reason, for the weaker one) on its `HELLO`. They travel the same hops
+  `user` does, to `GET /api/opshell/state`, where they default to `""`
+  because a page that was told nothing must claim nothing;
+- half of that answer can go stale. `/dev/fd` is the host's and does not
+  change under a running service, but the login shell is the user's and does
+  (`chsh`, a bash removed). So the endpoint remembers what it reported, and a
+  session whose guard no longer matches is **refused**, with a message to
+  reconnect the tunnel, rather than run under a claim nobody has rechecked;
+- the one reason that is genuinely per attempt, a pipe for the generated
+  file that cannot be opened for the moment, used to downgrade that session
+  to the weaker guard silently. It is now a **refusal** that names history,
+  because falling back would record the operator's commands while the page
+  said it did not;
+- the view's first line states only what it was told: `history is off in
+  this session`, `history is not guaranteed off in this session` with the
+  reason beside it, or nothing about history when the row or the field is
+  absent. An endpoint too old to send the field, and a word nobody
+  recognises, both read as the weaker one, never as `off`;
 - `docs/TUNNEL.md`'s artifact list gains the same distinction, since it
   already enumerates what a session leaves on the host.
 
@@ -548,21 +579,30 @@ device this whole feature exists for.
 A shell that is not bash and not zsh takes path 2 rather than being driven
 with flags nobody has tested.
 
-## Colour defaults, for the bash fallback only
+## Colour defaults, for a bash session only
 
-Appended to the generated rcfile **before** it sources the host's rc files,
-so the operator's own settings override them rather than the other way
-round:
+Put in the generated rcfile ahead of the operator's own `~/.bashrc`, so
+their settings override them rather than the other way round. `CLICOLOR`
+and `LSCOLORS` go at the very top; the prompt goes **after** `/etc/bash.bashrc` and before
+`~/.bashrc`, because Debian and ParrotOS set `PS1` in the system file
+unconditionally and a prompt placed above it would be overwritten before
+anyone saw it:
 
 - `CLICOLOR=1` and an `LSCOLORS` default for BSD/macOS `ls`
-- `LS_COLORS` left alone where `dircolors` exists, since GNU `ls` reads it
-  from the environment the host already has
+- `LS_COLORS` not mentioned at all, since GNU `ls` reads it from the
+  environment the host already has and which colours a host wants is the
+  host's business
 - a prompt that states the host and the working directory in the
   interface's own red, so the operator can tell this session apart from a
   local one at a glance
 
-Nothing here runs when the session is a login shell: that shell's own
-configuration is the point.
+The file is handed to **any bash** a session runs that has a `/dev/fd` to
+read it from, so a **bash login shell gets it too**, and that is deliberate
+and better: it receives the stronger history guard and not the weaker one,
+and a prompt that tells the operator this is not a local session is as
+wanted there as on the fallback. Only a login shell that is not bash, zsh in
+practice, never sees the file, and its own configuration is all there is.
+A bash on a host with no `/dev/fd` runs plain `-i` and sees none of it.
 
 ## Left to the builder
 
@@ -572,6 +612,13 @@ configuration is the point.
 - Whether zsh gets a `-f`-style "no rc" variant as a third option for an
   operator who wants the old monochrome determinism. My call: no, until
   somebody asks — a switch nobody uses is a switch nobody tests.
+
+**As built**, all three. The field rides the `HELLO` row as `history` /
+`history_detail`, and not on a shell status dict, because a session has no
+way to send one (see the consequence above). The string is
+`ExFxCxDxBxegedabagacad`, with `CLICOLOR=1`, each given only where the
+environment has none. And zsh gets no "no rc" variant, which was already the
+call made here.
 
 ## Scope, and my recommendation
 
