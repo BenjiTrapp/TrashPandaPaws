@@ -59,6 +59,7 @@ the production path.
 """
 
 import base64
+import json
 import logging
 import os
 import platform
@@ -866,6 +867,61 @@ class TestTheTunnelChild(SpawnTestCase):
         # the child's environment, not on its own.
         self.assertNotIn(beacon_mod._TUNNEL_MODE_ENV, os.environ)
 
+    def env_proof_source(self, name):
+        """A child that records one environment variable and waits.
+
+        Its own source and not `_proof_source`, whose proof file is a
+        fixed list of fields; asking it for one more would change what
+        every test above reads.
+        """
+        return ("import os, time\n"
+                "with open(os.environ['RACCOON_SPAWN_PROOF'], 'w') as h:\n"
+                "    h.write(os.environ.get(%r, '<unset>'))\n"
+                "time.sleep(120)\n" % name)
+
+    def test_the_child_is_given_the_beacons_runtime_implant_id(self):
+        """The id is minted when the beacon starts, so only the beacon has it.
+
+        It is not in the generated block, which is written before any
+        beacon exists, and the child builds its endpoint from that block.
+        The environment is the one channel from parent to child that
+        carries no command line. What this guards is the link the
+        operator shell resolves its endpoint through: an endpoint that
+        announces no id matches no fleet agent, however healthy its
+        tunnel.
+        """
+        self.set_src(self.env_proof_source(beacon_mod._TUNNEL_IMPLANT_ENV))
+        path = self.proof_path()
+        self.beacon._implant_id = "0a1b2c3d4e5f6071"
+
+        self.beacon._exec_tunnel("start")
+        lines = self.wait_for_file(path)
+
+        self.assertEqual(lines, ["0a1b2c3d4e5f6071"],
+                         "the child was not told which implant raised it")
+        self.assertNotIn(beacon_mod._TUNNEL_IMPLANT_ENV, os.environ,
+                         "the beacon put its id in its own environment "
+                         "and not the child's")
+
+    def test_a_beacon_with_no_id_leaves_the_variable_unset(self):
+        # Tidiness, not correctness: the endpoint strips a blank and
+        # announces nothing either way, so an empty variable would link
+        # no differently. It would still be a key in the child's
+        # environment that says nothing, and the beacon leaves none.
+        for missing in (None, "", "  "):
+            with self.subTest(implant_id=missing):
+                self.set_src(self.env_proof_source(
+                    beacon_mod._TUNNEL_IMPLANT_ENV))
+                path = self.proof_path()
+                self.beacon._implant_id = missing
+
+                self.beacon._exec_tunnel("start")
+                lines = self.wait_for_file(path)
+
+                self.assertEqual(lines, ["<unset>"])
+                self.beacon._exec_tunnel("stop")
+                os.remove(path)
+
     def test_tunnel_stop_terminates_the_child_and_reports_it(self):
         self.set_src(_proof_source("h", "t"))
         path = self.proof_path()
@@ -1466,6 +1522,86 @@ class TestTheChildReachesTheTunnelServer(SpawnTestCase):
         self.wait_for(lambda: self.row()["state"] == "disconnected",
                       timeout=60.0,
                       what="the server noticing the child was stopped")
+
+    def test_the_endpoint_a_beacon_raised_is_linkable_to_that_beacons_agent(self):
+        """The link the operator shell resolves its endpoint through.
+
+        What this guards is the *premise* that hid a bug. Every test of
+        the operator shell is handed an endpoint row whose `implant_id`
+        was written by the fixture to equal the agent's `id`, so none of
+        them could notice that a beacon-raised endpoint announced no id
+        at all: the shell answered 409 "no shell port on this endpoint"
+        beside a shell port that was open and serving.
+
+        Nothing here is handed over. A real beacon raises a real child,
+        the child dials a real tunnel server, and the beacon registers
+        through its own `_register_https` against the server's own
+        registration handler -- with the HTTP hop between them replaced by
+        the Flask test client, the one seam. Then the server's own
+        `_opshell_endpoint_row` is asked for the agent the beacon became.
+
+        Not an end-to-end test of the operator shell: no panel, no
+        `/api/opshell/stream`, and no live beacon over a socket. It holds
+        the chain from the beacon's id to the row the stream route
+        reads; the route itself is covered where it is.
+        """
+        from software.tests.test_c2_server import (
+            KEY, TEST_TOKEN, _reset_server_state)
+
+        tunnel = _tunnel_block(
+            port=self.server.port,
+            public_key=base64.b64encode(
+                self.store.static_public()).decode("ascii"),
+            psk=base64.b64encode(self.psk).decode("ascii"),
+            identity=self.identity,
+            allow_slow_crypto=True)
+        self.beacon = Beacon(_beacon_config(tunnel))
+        block = server_mod._beacon_config_block(
+            _gen_cfg(tunnel), 300, 20,
+            base64.b64encode(os.urandom(32)).decode())
+        self.set_src(_BEACON_PY.read_text(encoding="utf-8") + "\n" + block)
+
+        _reset_server_state()
+        self.addCleanup(_reset_server_state)
+        crypto = ServerCrypto(KEY)
+        app = create_app(crypto, TEST_TOKEN, Path(self.root))
+        client = app.test_client()
+
+        def post_through_the_server(endpoint, data):
+            reply = client.post("/api/v1/%s" % endpoint,
+                                data=json.dumps(crypto.wrap(data)),
+                                content_type="application/json")
+            return crypto.unwrap(reply.get_json())
+
+        with mock.patch.object(self.beacon, "_https_post",
+                               side_effect=post_through_the_server):
+            self.assertTrue(self.beacon._register_https(),
+                            "the beacon could not register with the server")
+        agent = self.beacon._agent_id
+        self.assertIn(agent, server_mod.agents)
+
+        self.beacon._exec_tunnel("start")
+        self.wait_for(lambda: self.row()["state"] == "connected",
+                      timeout=60.0,
+                      what="the child registering as %r" % self.identity)
+
+        class _Supervisor(object):
+            def __init__(self, tunnel_server):
+                self.tunnel_server = tunnel_server
+
+            def status(self):
+                return {"endpoints": self.tunnel_server.endpoints()}
+
+        row, _state = server_mod._opshell_endpoint_row(
+            _Supervisor(self.server), agent)
+        self.assertIsNotNone(
+            row,
+            "no endpoint is linked to agent %r: the endpoint announced "
+            "implant_id %r, and the fleet knows this beacon as %r"
+            % (agent, self.row().get("implant_id"),
+               server_mod.agents[agent]["id"]))
+        self.assertEqual(row["identity"], self.identity)
+        self.assertEqual(row["implant_id"], self.beacon._implant_id)
 
 
 if __name__ == "__main__":

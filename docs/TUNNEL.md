@@ -420,6 +420,149 @@ three artifacts above, though, are real and are the cost of the session.
 
 ---
 
+## Opening one from the interface, without reading a port out of a panel
+
+Everything above is reachable with `tools/raccoon_shell.py` and a port the
+tunnel panel shows. The **Operator Shell** glyph (`>_`) in the header is
+the same session without that detour, and it exists because the detour was
+the reason nobody found the feature: you had to know a tunnel existed, type
+`tunnel start` into a command line that never advertised it, wait without
+being told how long, read a port and a password out of a card, and forward
+a port before you could attach.
+
+It is **one** terminal onto the operator's own hardware implant, and
+deliberately not a per-agent feature — lateral movement keeps the
+task-based `shell` command. Three rules shape it, and all three were
+operator decisions rather than implementation convenience:
+
+- **Nothing is dialled until you ask.** No channel is raised on opening the
+  view, on hovering, or on page load. The button that raises it says so.
+- **The channel is dropped again when the session ends**, to keep the
+  footprint on the device as small as possible. Both the raising and the
+  dropping are `tunnel start` / `tunnel stop` *tasks*, so both take effect
+  at the implant's next check-in — up to a whole interval away. The view
+  shows that wait as a **number**, not a spinner, and **never shortens the
+  beacon's interval to make it feel faster**: a beacon that knocks every
+  ten seconds is a beacon that gets noticed.
+- **The shutdown is queued only for a channel this view raised, and only
+  when the endpoint reports no live SOCKS session.** One child process on
+  the implant serves both the SOCKS port and the shell port, so an
+  unconditional stop would drop a pivot somebody raised from the tunnel
+  panel for something else. When it cannot stop, it says so and the
+  shutdown stays owed.
+
+The view may start the tunnel **server** itself, because that process runs
+on the team server and costs the implant nothing. It will not edit
+`configs/raccoon.yaml`: a missing shell port range is reported as the
+reason, not fixed behind your back.
+
+**The build has to carry a tunnel.** That is the generator's "Carry a
+tunnel" checkbox; a build without one has no `c2.tunnel` block, and
+`tunnel start` refuses by name. The view cannot add what is missing from
+the artifact, so it shows the beacon's own refusal when the answer comes
+back.
+
+**The terminal's size is fixed when the session opens.** The wire sends the
+geometry once, on the password line, and cannot renegotiate it — the same
+limitation `tools/raccoon_shell.py` already documents. The pair is measured
+from the room the card actually has at that moment, so the terminal comes
+up the shape of the column instead of the port's 120×40 default. The rest
+follows from the wire: the strip states the geometry that was actually
+sent, resizing the browser window afterwards does not resize the pty, and a
+session that attached while the card was hidden keeps the 120×40 fallback
+for its whole life — the terminal says so on a line of its own, because a
+small terminal in a wide box is otherwise unexplainable. A terminal that
+redrew itself to a new size while the far end kept the old one would be a
+quiet lie about what the shell thinks it has.
+
+**The password never reaches the browser.** The team server holds the TCP
+connection to the shell port itself and puts the password on it; the
+browser authenticates with the operator token it already has. The tunnel
+panel still shows the password, deliberately, because `raccoon_shell.py`
+needs an operator to read it.
+
+**It is a window and not a modal: `_` parks it, `✕` ends it.** The card
+takes the content column, with the agent list still visible beside it — an
+agent going offline is visible while you work, which matters because a
+channel that drops is your own way in — and its header carries those two
+controls. Visible is not the same as usable, though: the console an agent
+click draws is behind the card, so the row highlights and nothing else
+appears, and after the `✕` that console comes back scrolled to the top and
+unfocused. Park the card with `_` to read a device beside a shell rather
+than clicking through it. `✕` ends the session and queues the channel's
+shutdown, so the strip reads **closing** until the agent confirms. `_`
+hides the card and leaves a small entry under the agent list in its place:
+the session keeps running, output keeps arriving, and a click on that entry
+brings the card back with everything that arrived while it was away.
+`exit`, Ctrl-D, a stream the team server cannot hold and a refused one all
+still end a session — but of the two buttons on the card, only `✕` ends
+anything.
+
+**A parked session is not a free one.** Nothing is paused. The stream is
+still open, so for as long as the card is parked the session holds a worker
+thread on the team server, the connection to the shell port, a
+**pseudo-terminal** on the device and one of that port's **four** session
+slots — the endpoint refuses a fifth. An hour of work parked is an hour of
+all four, by design rather than by accident. So park it while you are
+coming back to it, and end it when you are not.
+
+**A reload gives you a new shell, and the page says so.** The card survives
+a page load: the session id is kept in that tab, and on the next load the
+card comes back the way you left it — open or parked — and attaches, as
+long as the team server still reports that session as live. If it does not
+— the claim lapsed while the tab was shut, another view's close took the
+channel down, or the id belonged to a team server on the same port that
+is no longer this one — the page does not open a card; the next time you
+open the panel, it says that in a line above the picker, once. What
+it attaches to is a **fresh shell**. The team server's connection to the
+shell port *is* the shell, so when the page went away and took the stream
+with it, the pseudo-terminal on the device died; measured across one
+reload, the shell's process id went from 75 to 78, the working directory
+was back at `/` from the `/etc` it had been left in, and a variable that
+had been set was gone. Your directory, your variables and your running
+processes are gone with it; the channel, the claim and the port are not, so
+what a reload costs is the session and not the tunnel — and the terminal
+says this in its opening lines rather than leaving you to type into a
+prompt that looks like the one you left.
+
+**A closed tab no longer ends the session at once: it costs up to 240
+seconds plus one check-in.** Nothing is posted when the page goes away, and
+nothing can be — no browser signal tells a reload from a closed tab, and
+acting on the one that exists is what used to kill a healthy session on
+every reload. So a closed tab, like a browser killed outright, leaves the
+claim to go silent, and the claim's own margin retires it: **240 seconds**
+of silence, after which the implant's next check-in notices and carries the
+shutdown. One check-in and not two, because the sweep runs on the way into
+a check-in rather than after it.
+
+Four minutes is four times the slowest poll a live browser makes — a hidden
+tab is throttled to about one a minute — and it is the same margin
+everywhere, because every driver that can notice a silent claim uses one.
+An earlier version gave this one a wider margin than the view's own poll,
+and the narrower one then retired a backgrounded tab when a second panel
+was open. At the shipped three-hundred-second interval the margin
+disappears inside the wait for the next check-in, because a shutdown can
+only ride one; on a fast beacon it does not, and costs about four extra
+minutes of channel.
+
+**That loosening is the price of a shell that survives a reload, and it is
+a price.** It buys most of itself back, because an operator who reloads and
+walks away finds the card parked on their next look rather than a session
+that died under them. But the old guard was the faster of the two, and what
+is left is the slower. If you want the channel down now, press `✕`; nothing
+else on the page is quicker, and nothing at all is needed from you for the
+lapse to do it slowly.
+
+The one case left is narrow: **the implant stops checking in as well.**
+Then the channel stands — but so would any shutdown, because a task can
+only be delivered to an agent that calls home. Nothing can be queued for a
+device that is not listening, and the view says so rather than guessing:
+once a device has been silent for two of its own intervals plus whatever jitter its beacon may add, the channel reads
+`unknown` with the seconds since its last word, because every claim about
+it comes from a report that old.
+
+---
+
 ## The crypto path, and the tunnel that refuses to start
 
 A tunnel endpoint **refuses to start when the host has no libcrypto**,
