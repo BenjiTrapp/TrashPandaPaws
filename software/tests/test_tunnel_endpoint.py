@@ -2629,12 +2629,26 @@ class TestAShellSession(TunnelEndpointTestCase):
                       "above it" % (line.strip(),))
 
     def test_the_colour_defaults_are_set_before_the_host_is_sourced(self):
-        """Review Focus 5. Order is the whole requirement: after the
-        host's files these would overwrite the operator's own prompt."""
+        """Review Focus 5. Order is the whole requirement, in two parts.
+
+        The two environment variables are above everything. The prompt is
+        between the distribution's file and the operator's: above the
+        first, Debian's unconditional `PS1` overwrites it and it never
+        shows; below the second, it overwrites the operator's own.
+        """
         rc = beacon_mod._SHELL_RCFILE
-        self.assertLess(rc.index("CLICOLOR"), rc.index('"$HOME/.bashrc"'))
-        self.assertLess(rc.index("LSCOLORS"), rc.index('"$HOME/.bashrc"'))
-        self.assertLess(rc.index("PS1"), rc.index('"$HOME/.bashrc"'))
+        system_file = rc.rindex("/etc/bash.bashrc")
+        operators_file = rc.index('"$HOME/.bashrc"')
+        self.assertLess(rc.index("CLICOLOR"), system_file)
+        self.assertLess(rc.index("LSCOLORS"), system_file)
+        self.assertGreater(rc.index("PS1"), system_file,
+                           "the prompt is above /etc/bash.bashrc, which "
+                           "sets its own PS1 on Debian and ParrotOS and "
+                           "would overwrite it")
+        self.assertLess(rc.index("PS1"), operators_file,
+                        "the prompt is below ~/.bashrc, so it overwrites "
+                        "the operator's own")
+        self.assertEqual(rc.count("PS1"), 1)
 
     def test_the_defaults_do_not_touch_what_the_host_already_has(self):
         self.assertNotIn("LS_COLORS", beacon_mod._SHELL_RCFILE)
@@ -2680,6 +2694,46 @@ class TestAShellSession(TunnelEndpointTestCase):
             stream, b'echo "P""=[${PS1//[^0-9;]/}]"\n', b"P=[")
         self.assertIn(b"38;2;255;26;26", data,
                       "the prompt is not the interface's own red")
+
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_the_prompt_survives_the_system_file_and_the_operators_wins(self):
+        """What a real bash does with the generated file, around a system file.
+
+        The endpoint cannot be given a stand-in `/etc/bash.bashrc`: the
+        path is fixed in the generated file and the test may not write to
+        `/etc`. So this runs a real bash on the generated text with that
+        one path swapped for a file of the test's own that sets a `PS1`,
+        as Debian's does. What it proves is the ordering behaviour of bash
+        on the file this code generates. That the real `/etc/bash.bashrc`
+        of a Debian host looks like the stand-in is reasoned, not measured
+        here.
+        """
+        import subprocess
+        rc = beacon_mod._SHELL_RCFILE
+        self.assertIn("/etc/bash.bashrc", rc)
+        system = os.path.join(self.root, "stand-in-system-bashrc")
+        with open(system, "w") as handle:
+            handle.write('PS1="DISTRO> "\n')
+        rcfile = os.path.join(self.root, "generated-rcfile")
+        with open(rcfile, "w") as handle:
+            handle.write(rc.replace("/etc/bash.bashrc", system))
+
+        def prompt_with(bashrc):
+            home = self.a_home_directory(bashrc=bashrc)
+            done = subprocess.run(
+                ["/bin/bash", "--rcfile", rcfile, "-i"],
+                input=b'echo "P""=[$PS1]"\nexit\n', cwd=home,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                env=dict(os.environ, HOME=home), timeout=30)
+            return done.stdout.decode("utf-8", "replace")
+
+        ours = prompt_with(None)
+        self.assertIn("38;2;255;26;26", ours,
+                      "the distribution's prompt survived ours")
+        self.assertNotIn("DISTRO> ", ours)
+        theirs = prompt_with('PS1="MINE> "\n')
+        self.assertIn("P=[MINE> ]", theirs,
+                      "our prompt overwrote the operator's own")
 
     def test_the_rcfile_still_ends_by_turning_history_off(self):
         """The colour lines went in above the sourcing; the history lines

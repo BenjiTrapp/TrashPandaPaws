@@ -3247,24 +3247,30 @@ _SETSID_PATHS = ("/usr/bin/setsid", "/bin/setsid")
 # message in every session on a host without the package -- and the whole
 # thing skipped when `/etc/bash.bashrc` already did it.
 #
-# The colour lines come first, above every sourcing, and that order is the
-# whole of their design. Bash with no configuration is monochrome with a
-# bare prompt, which is what this rcfile exists to hand over when there is
-# no login shell of the user's own to run; but a default placed after the
-# host's files would overwrite the prompt and the colours the operator
-# set up for themselves, and their settings are meant to win over
-# anything this code chooses. Placed first, an `.bashrc` that sets `PS1`
-# simply replaces it. The prompt names the host and the working directory
+# The colour lines sit above the operator's own files, and that order is
+# the whole of their design. Bash with no configuration is monochrome with
+# a bare prompt, which is what this rcfile exists to hand over when there
+# is no login shell of the user's own to run; but a default placed after
+# `~/.bashrc` would overwrite the prompt and the colours the operator set
+# up for themselves, and their settings are meant to win over anything
+# this code chooses. The prompt names the host and the working directory
 # in the interface's own red -- `--red` in the page's palette, #ff1a1a --
-# so a glance tells this session from a local one. `CLICOLOR` and
-# `LSCOLORS` are for BSD and macOS `ls`, and are only given a value when
-# the environment has none. `LS_COLORS` is deliberately not mentioned at
-# all: GNU `ls` reads it from the environment the host already has, and
-# which colours a host wants (`dircolors` and its database) is the host's
+# so a glance tells this session from a local one.
+#
+# The prompt goes between the two files, not above both. `/etc/bash.bashrc`
+# is the distribution's setting, not the operator's, and Debian and
+# ParrotOS set `PS1` in it unconditionally: a prompt placed above it would
+# be overwritten before anyone saw it, on the very hosts this is for.
+# After it and before `~/.bashrc`, the distribution's prompt gives way to
+# ours and the operator's own `.bashrc` still replaces ours. `CLICOLOR`
+# and `LSCOLORS` stay at the top: they are for BSD and macOS `ls`, the
+# system file does not set them, and they are only given a value when the
+# environment has none. `LS_COLORS` is deliberately not mentioned at all:
+# GNU `ls` reads it from the environment the host already has, and which
+# colours a host wants (`dircolors` and its database) is the host's
 # business, not something to guess at here.
 _SHELL_RCFILE = ('export CLICOLOR="${CLICOLOR:-1}"\n'
                  'export LSCOLORS="${LSCOLORS:-ExFxCxDxBxegedabagacad}"\n'
-                 + r"PS1='\[\e[38;2;255;26;26m\]\h:\w\$\[\e[0m\] '" + '\n'
                  '[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n'
                  'declare -F _completion_loader >/dev/null 2>&1 ||'
                  ' for _rc_bc in /etc/profile.d/bash_completion.sh'
@@ -3273,6 +3279,7 @@ _SHELL_RCFILE = ('export CLICOLOR="${CLICOLOR:-1}"\n'
                  '  [ -r "$_rc_bc" ] && { . "$_rc_bc"; break; }\n'
                  'done\n'
                  'unset _rc_bc\n'
+                 + r"PS1='\[\e[38;2;255;26;26m\]\h:\w\$\[\e[0m\] '" + '\n'
                  '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"\n'
                  'unset HISTFILE\n'
                  'set +o history\n')
