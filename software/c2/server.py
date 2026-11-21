@@ -9394,10 +9394,18 @@ function opshellPlain(text){
   // to write into a terminal. A terminal is not markup: `esc()` would print
   // `&amp;` and still let an escape sequence through, so what goes is every
   // C0 control, DEL and C1 control -- the characters a terminal acts on --
-  // each run becoming one space. Every writer into the terminal that can
-  // carry such text goes through this; the page's own literals do not.
-  return String(text == null ? "" : text)
-    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").trim();
+  // and the zero-width and bidi format characters, which act on nothing
+  // but let a text hide or reorder what stands beside it. Each run becomes
+  // one space, and what is left is cut at 200 characters, so no host or
+  // reason can push the sentence it is written into off the screen. Every
+  // writer into the terminal that can carry such text goes through this,
+  // the page's own notes included, because `opshellSay` applies it to them;
+  // only the page's fixed lines and the shell's own bytes do not.
+  const plain = String(text == null ? "" : text)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]+/g, " ")
+    .trim();
+  if(plain.length <= 200) return plain;
+  return plain.slice(0, 199).replace(/[\ud800-\udbff]$/, "").trim() + "\u2026";
 }
 
 function opshellSay(text){
@@ -9615,9 +9623,9 @@ async function opshellAttach(state){
   const why = state.history === "weak"
     ? opshellPlain(state.history_detail)
     : "";
-  const guardLine = !why ? guard : guard + " (" + why + "): this shell could "
-    + "not be given a startup file, so your own configuration runs after "
-    + "and may undo it";
+  const guardLine = !why ? guard : guard + " (" + why + "): history is held "
+    + "off only by an environment variable here, which your own startup "
+    + "files run after and may undo";
   opshellTerm.writeln("\x1b[2m-- live on "
     + (opshellPlain(state.host) || opshellPlain(state.target) || "?")
     + (guardLine ? " \u00b7 " + guardLine : "") + " \u00b7 " + cols + "x" + rows

@@ -3467,7 +3467,11 @@ class TestTheViewDoesNotOverclaim(_GuiCase):
         # The sentence used to be a constant, true only while the generated
         # startup file held history off. What it says now is decided by
         # the machine's word, and the behaviour is pinned in node by the
-        # three `..._history_...` tests of the class that runs the view.
+        # tests of the class that runs the view that drive the first line:
+        # `test_the_first_line_claims_nothing_when_it_was_told_nothing`,
+        # `test_a_weak_guard_says_why_and_an_off_guard_says_it_is_off`,
+        # `test_a_weak_guard_with_no_reason_reads_whole_on_its_own` and the
+        # ones that hand the reason, the host and the target a hostile text.
         # What is read here is only that the claim has one author: the
         # attach, once, beside the weaker sentence it must never replace.
         attach = self.js_function("opshellAttach")
@@ -3817,7 +3821,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """A hundred and seventeen tests hide behind `skipUnless(node)`.
+        """A hundred and eighteen tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3825,7 +3829,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of a hundred and seventeen quiet skips.
+        One loud failure instead of a hundred and nineteen quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3881,9 +3885,12 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # shutdown that failed and the reason it was refused for, the poll
         # that failed and the state's own note, the key request that failed
         # and the one that was refused, and the shell's own bytes reaching
-        # the terminal untouched --
+        # the terminal untouched -- and 117 against 119 once the review of
+        # that brought two: where the helper cuts what is left, and that a
+        # host or a reason of any length leaves the sentence it is written
+        # into on the line --
         self.assertGreaterEqual(
-            len(names), 115,
+            len(names), 117,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -3894,6 +3901,22 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
                      # person it is addressed to, and no other test keeps
                      # the default from being "off".
                      "test_the_first_line_claims_nothing_when_it_was_told_nothing",
+                     # The same sentence without its reason: a relay too old
+                     # to send one must still read whole, with no empty
+                     # parenthesis and no cause the page was not told.
+                     "test_a_weak_guard_with_no_reason_reads_whole_on_its_own",
+                     # The filter's own definition. Every writer's test
+                     # asserts that it *calls* the helper; only this one
+                     # says what the helper removes, and that it keeps the
+                     # rest, so a class that narrows or widens is caught
+                     # here and nowhere else.
+                     "test_the_helper_removes_what_a_terminal_acts_on_and_nothing_else",
+                     # The other direction: filtering too much. The shell's
+                     # own bytes carry its colour, and removing colour is
+                     # what this whole feature exists to prevent. The
+                     # numeric floor cannot stand in for these three:
+                     # deleting any two leaves the total at its floor.
+                     "test_what_the_shell_prints_still_reaches_the_terminal_untouched",
                      "test_the_same_holds_when_the_request_is_rejected_outright",
                      "test_a_write_that_may_have_landed_is_not_called_nothing",
                      "test_closing_the_view_closes_the_session",
@@ -4971,8 +4994,14 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertNotRegex(lines["weak"], r"(?i)history is off")
         self.assertRegex(lines["weak"], r"(?i)not guaranteed off")
         self.assertIn("/bin/zsh takes no --rcfile", lines["weak"])
-        self.assertRegex(lines["weak"], r"(?i)startup file")
-        self.assertRegex(lines["weak"], r"(?i)may undo")
+        # How the reason is attached, and what the sentence after it says:
+        # the reason in parentheses straight after the guard, a colon, then
+        # the page's explanation, which names what runs after what.
+        self.assertIn("not guaranteed off in this session "
+                      "(/bin/zsh takes no --rcfile): history is held off "
+                      "only by an environment variable here, which your own "
+                      "startup files run after and may undo",
+                      lines["weak"])
         self.assertNotEqual(lines["off"], lines["weak"])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
@@ -5000,13 +5029,14 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         control sequence into the operator's terminal: an escape that
         cleared the line would hide the one sentence that says history is
         not held off."""
-        hostile = "ok\x1b[2J\x1b[H\rfake\x07\x9b31m end"
         first, everything = self._first_line(
-            {"history": "weak", "history_detail": hostile})
+            {"history": "weak", "history_detail": self._HOSTILE})
         # The only escapes in the line are the page's own dim and reset.
         self.assertEqual(re.findall(r"\x1b\[[0-9;]*[A-Za-z]", first),
                          ["\x1b[2m", "\x1b[0m"])
-        self.assertNotRegex(first, r"[\x00-\x08\x0a-\x1a\x1c-\x1f\x7f-\x9f]")
+        self.assertNotRegex(first, r"[\x00-\x08\x0a-\x1a\x1c-\x1f\x7f-\x9f"
+                                   r"\u200b-\u200f\u202a-\u202e\u2060-\u2069"
+                                   r"\ufeff]")
         self.assertNotIn("\r", first)
         self.assertIn("not guaranteed off", first)
         self.assertIn("end", first)
@@ -5018,7 +5048,16 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
     # stream-failure lines carry text from the same places. Each is driven
     # here with a hostile string and what reached the terminal is read back:
     # the helper's own test cannot say that a writer calls it.
-    _HOSTILE = "ok\x1b[2J\x1b[H\rfake\x07\x9b31m\x7f & <end>"
+    #
+    # One sample for all of them, so it carries a character from every part
+    # of what the helper removes: the C0 range's top (\x1f), DEL, the C1
+    # range's bottom, the two that open a string in xterm.js (\x90 device
+    # control, \x9d operating system command), the string terminator and
+    # the top (\x9c, \x9f), a run, and the invisible and direction-marking
+    # characters (zero-width space, right-to-left override, word joiner,
+    # byte-order mark).
+    _HOSTILE = ("ok\x1b[2J\x1b[H\rfake\x07\x9b31m\x7f\x80\x90\x9c\x9d\x9f"
+                "\x1f\u200b\u202e\u2060\ufeff & <end>")
 
     def _assert_nothing_drives_the_terminal(self, lines, where):
         """Every note the hostile string reached carries no control byte of
@@ -5030,8 +5069,12 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         for line in hit:
             bare = re.sub(r"^\r\n", "", line)
             bare = bare.replace("\x1b[2m", "").replace("\x1b[0m", "")
-            self.assertNotRegex(bare, r"[\x00-\x1f\x7f-\x9f]",
-                                "%s wrote a control byte: %r" % (where, line))
+            self.assertNotRegex(
+                bare,
+                "[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2069"
+                "\ufeff]",
+                "%s wrote a control or invisible character: %r"
+                % (where, line))
             self.assertIn("ok", bare)
             self.assertIn("& <end>", bare, "%s changed the text: %r"
                           % (where, line))
@@ -5048,18 +5091,55 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_helper_removes_what_a_terminal_acts_on_and_nothing_else(self):
+        # Every character is its own case, so narrowing either end of a
+        # range, or dropping the `+`, fails a case and not just a hunch.
+        removed = ["\x1b[2J", "\r", "\n", "\x07", "\x7f", "\x9b", "\x00",
+                   "\x1c", "\x1f", "\x80", "\x90", "\x98", "\x9c", "\x9d",
+                   "\x9f", "\u200b", "\u200f", "\u202a", "\u202e", "\u2060",
+                   "\u2069", "\ufeff"]
+        runs = ["a\x1b\x07b", "a\x1b\x07\x9d\u202e\ufeffb", "a\x1f\x80b"]
+        edges = "a\u00a0b\u200ac\u202fd\u205fe\u206af"
         got = self._node(
-            "const cases = ['a\\x1b[2Jb', 'a\\rb', 'a\\nb', 'a\\x07b',"
-            " 'a\\x7fb', 'a\\x9bb', 'a\\x00b', '  x  '];\n"
+            "const cases = %s;\n"
             "console.log(JSON.stringify({\n"
             " out: cases.map(opshellPlain),\n"
             " kept: opshellPlain('caf\\u00e9 \\u65e5\\u672c \\u2713 & <b>'),\n"
+            " edges: opshellPlain(%s),\n"
             " nothing: [opshellPlain(null), opshellPlain(undefined),"
-            " opshellPlain(''), opshellPlain(7)]}));")
-        self.assertEqual(got["out"], ["a [2Jb", "a b", "a b", "a b", "a b",
-                                      "a b", "a b", "x"])
+            " opshellPlain(''), opshellPlain(7)]}));"
+            % (json.dumps(["a" + c + "b" for c in removed] + runs
+                          + ["  x  "]), json.dumps(edges)))
+        self.assertEqual(
+            got["out"],
+            ["a [2Jb"] + ["a b"] * (len(removed) - 1 + len(runs)) + ["x"])
         self.assertEqual(got["kept"], "caf\u00e9 \u65e5\u672c \u2713 & <b>")
+        # Just outside the removed ranges -- a no-break space, a hair space,
+        # a narrow no-break space, a medium mathematical space and the code
+        # point after the word joiner's block -- all stay.
+        self.assertEqual(got["edges"], edges)
         self.assertEqual(got["nothing"], ["", "", "", "7"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_helper_cuts_what_is_left_at_two_hundred_characters(self):
+        got = self._node(
+            "const sur = 'x'.repeat(198) + '\\ud83d\\ude00' + 'y'.repeat(9);\n"
+            "console.log(JSON.stringify({\n"
+            " exact: opshellPlain('x'.repeat(200)),\n"
+            " over: opshellPlain('x'.repeat(201)),\n"
+            " far: opshellPlain('x'.repeat(5000)),\n"
+            " pair: opshellPlain(sur),\n"
+            " spaced: opshellPlain('x'.repeat(198) + ' \\x1b y'.repeat(9)),\n"
+            " measuredAfter: opshellPlain('\\x1b'.repeat(300) + 'x'.repeat(10))"
+            "}));")
+        self.assertEqual(got["exact"], "x" * 200)
+        self.assertEqual(got["over"], "x" * 199 + "\u2026")
+        self.assertEqual(got["far"], "x" * 199 + "\u2026")
+        # The cut may not leave half of a surrogate pair, nor a space
+        # before the ellipsis.
+        self.assertEqual(got["pair"], "x" * 198 + "\u2026")
+        self.assertEqual(got["spaced"], "x" * 198 + "\u2026")
+        # What is cut is what is left after the removal, not the raw text.
+        self.assertEqual(got["measuredAfter"], "x" * 10)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_host_and_the_target_cannot_drive_the_terminal(self):
@@ -5082,6 +5162,18 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " host:'parrot'});" % json.dumps(self._HOSTILE))
         self.assertTrue([l for l in lines if "the stream failed" in l])
         self._assert_nothing_drives_the_terminal(lines, "the stream failure")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_long_host_or_reason_cannot_push_the_sentence_off_the_line(self):
+        """Nothing upstream caps either, and the part of the line that says
+        what the history guard is, and how big the terminal is, comes last."""
+        first, _ = self._first_line(
+            {"host": "h" * 5000, "history": "weak",
+             "history_detail": "r" * 5000})
+        self.assertLess(len(first), 800, len(first))
+        self.assertIn("\u2026", first)
+        self.assertIn("may undo", first)
+        self.assertRegex(first, r"[0-9]+x[0-9]+, fixed for this session")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_what_the_shell_prints_still_reaches_the_terminal_untouched(self):
