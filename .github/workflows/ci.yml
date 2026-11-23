@@ -113,10 +113,18 @@ jobs:
       - name: Install the suite's dependencies
         run: python3 -m pip install -r software/tests/requirements.txt
 
-      # The documented invocation, unchanged: pytest is not installed and
-      # the suite is not written for it.
+      # The documented invocation, with two additions and nothing else:
+      # pytest is not installed and the suite is not written for it. `-v`
+      # because verbose is the only mode in which unittest prints a skip's
+      # *reason*, and the step below exists to name them; `tee` because that
+      # step must describe THIS run -- the one whose exit status judges the
+      # job -- rather than a second one of its own. `pipefail` so the pipe
+      # to `tee` cannot swallow a red suite.
       - name: The suite
-        run: python3 -m unittest discover -s software/tests -t .
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s software/tests -t . -v 2>&1 \
+            | tee /tmp/suite.log
 
       # On Linux the suite runs MORE than it does on a developer's Mac: the
       # shell-session tests that skip on Darwin for want of setsid(1) take
@@ -125,11 +133,28 @@ jobs:
       # dropped would hide a module that stopped importing, which has
       # happened here before -- 26 reported errors once hid 968 tests that
       # never ran.
+      #
+      # A count alone was not enough either: `OK (skipped=4)` here against
+      # `skipped=3` on a Mac was an open question for four days, because
+      # nothing printed which four. So the reasons are listed, grouped.
+      #
+      # Every summary line is printed with its line number rather than one
+      # of them being picked, because neither end of this log can be
+      # trusted: one module starts a nested `unittest` in a subprocess, and
+      # a measured run showed its `Ran 1 test ... FAILED` AFTER the real
+      # `Ran 594 tests ... OK`. Buffering decides the order, so the honest
+      # report shows every summary and says where the verdict really comes
+      # from -- the suite step's exit status, which is what fails this job.
       - name: Report what actually ran
         if: always()
         run: |
-          python3 -m unittest discover -s software/tests -t . 2>&1 \
-            | tail -3 || true
+          echo "== summaries in the log (the job's verdict is the suite"
+          echo "   step's exit status, not a line picked from here) =="
+          grep -n -E '^Ran [0-9]+ tests?|^(OK|FAILED)' /tmp/suite.log \
+            || echo "no summary line: the suite never reached one"
+          echo "== skipped, by reason =="
+          grep -oE "skipped '[^']*'" /tmp/suite.log | sort | uniq -c \
+            | sort -rn || echo "nothing was skipped"
 
   # ── The lab ──
   #
