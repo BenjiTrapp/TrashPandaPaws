@@ -3182,8 +3182,40 @@ class _GuiCase(unittest.TestCase):
         """
         return _css_rules(STYLE_BLOCK, name, selector)
 
+    def one_rule(self, name, selector):
+        """The body of the one rule spelled `selector`; fails on 0 or 2."""
+        rules = self.css_rules(name, selector)
+        self.assertEqual(len(rules), 1,
+                         "expected exactly one %s rule, got %d"
+                         % (selector, len(rules)))
+        return rules[0]
+
 
 class TestTheGlyphAndTheView(_GuiCase):
+    def test_the_card_is_framed_and_therefore_inset(self):
+        body = self.one_rule("opshell-card", ".opshell-card")
+        for prop in ("border-radius", "box-shadow", "margin"):
+            self.assertIn(prop, body,
+                          "a framed card needs %s; measured, the frame and "
+                          "the shadow are invisible without the margin"
+                          % prop)
+
+    def test_the_card_is_translucent_like_every_sibling_surface(self):
+        body = self.one_rule("opshell-card", ".opshell-card")
+        self.assertIn("var(--surface)", body)
+        self.assertNotIn("background:var(--bg)", body)
+
+    def test_no_css_newer_than_the_browser_floor_is_used_unprefixed(self):
+        # A regression fence for the Safari 14.1 floor: it passes today by
+        # design, and fails the day someone reaches for a newer feature.
+        for forbidden in (":has(", "@container", "aspect-ratio:"):
+            self.assertNotIn(forbidden, STYLE_BLOCK)
+        # Scoped to this view's rules: `.toolbar button` elsewhere in the
+        # page already uses the unprefixed property and is not this view's.
+        for sel, body in _css_blocks(STYLE_BLOCK):
+            if "opshell" in sel and "backdrop-filter" in body:
+                self.assertIn("-webkit-backdrop-filter", body, sel)
+
     def test_the_header_carries_a_terminal_glyph_that_opens_the_view(self):
         self.assertIn("showOperatorShell()", self.header_block())
 

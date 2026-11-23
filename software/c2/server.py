@@ -4798,11 +4798,19 @@ header .info{font-size:11px;color:var(--text2)}
    A flex sibling of .content inside .main, and .content is hidden while it
    is there: .main is a row holding the 260px agent list beside .content, so
    a layer positioned over .main would cover the list this layout keeps
-   clickable, and two flex:1 siblings would split the column in half. */
-.opshell-card{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+   clickable, and two flex:1 siblings would split the column in half.
+   The 8px margin is what makes the frame and the shadow visible at all; it
+   costs the terminal 2 columns and 1 row (measured at 1440x900). */
+.opshell-card{
+  flex:1;display:flex;flex-direction:column;overflow:hidden;margin:8px;
+  background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  box-shadow:0 8px 32px rgba(0,0,0,0.6);
+}
 .opshell-chrome{
   display:flex;align-items:center;gap:10px;flex:none;
-  padding:8px 16px;background:var(--surface);border-bottom:1px solid var(--border);
+  padding:8px 16px;border-radius:8px 8px 0 0;
+  background:linear-gradient(to bottom,var(--surface2),var(--surface));
+  border-bottom:1px solid var(--border);
   font-family:var(--mono);font-size:12px;color:var(--text);
 }
 .opshell-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
