@@ -4043,8 +4043,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
     def render(self, session=None, **state):
         """`opshellRender(state)`'s markup, with `opshellSession` set.
 
-        Beside `_node`, which it calls, and not on `_GuiCase`, whose other
-        subclass has no node bridge.
+        Beside `_node`, which it calls, and not on `_GuiCase`: no other
+        subclass of `_GuiCase` defines `_node`, so none of them could use it.
         """
         return self._node(
             "opshellSession = %s;\n"
@@ -4058,9 +4058,11 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # an empty `<span>`: a hole in the row.
         html = self.render(state="waiting", geometry=None, host="pi",
                            channel="closed", expected_checkin=12)
-        self.assertNotIn('class="opshell-pill"></span>', html)
-        self.assertNotIn("></span>", html)
-        self.assertEqual(html.count("opshell-pill"), 1,
+        start = html.index('<div class="opshell-strip">')
+        strip = html[start:html.index("</div>", start)]
+        self.assertNotIn('class="opshell-pill"></span>', strip)
+        self.assertNotIn("></span>", strip)
+        self.assertEqual(html.count('<span class="opshell-pill'), 1,
                          "the channel alone is a pill here")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
@@ -6969,6 +6971,39 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
                       "the body is what min-height:100% resolves against")
         self.assertIn("overflow:auto", body,
                       "a short card has nothing to scroll")
+
+    def test_the_frame_is_not_on_the_measured_host(self):
+        body = self.one_rule("opshell-term", "#opshell-term")
+        for prop in ("padding", "border:", "border-width"):
+            self.assertNotIn(prop, body,
+                             "opshellMeasure reads this element's rect for the "
+                             "cols it sends to /stream")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_frame_is_on_a_wrapper_inside_the_live_box(self):
+        html = self.render(session="mine", state="live", channel="open",
+                           host="pi", geometry=[120, 40])
+        self.assertLess(html.index('class="opshell-live"'),
+                        html.index('class="opshell-screen"'))
+        self.assertLess(html.index('class="opshell-screen"'),
+                        html.index('id="opshell-term"'))
+        self.assertIn('<div class="opshell-screen"><div id="opshell-term">'
+                      '</div></div>', html,
+                      "the measured host carries no class or style of its own")
+        screen = self.one_rule("opshell-screen", ".opshell-screen")
+        for prop in ("flex:1", "min-height:0", "display:flex", "padding",
+                     "border-radius"):
+            self.assertIn(prop, screen)
+
+    def test_a_card_too_short_still_scrolls_instead_of_clipping(self):
+        self.assertIn("min-height:72px",
+                      self.one_rule("opshell-term", "#opshell-term"))
+        self.assertIn("overflow:auto",
+                      self.one_rule("opshell-body", "#opshell-body"))
+
+    def test_the_bodys_scrollbar_is_the_houses_and_the_terminals_is_not_touched(self):
+        self.assertIn("#opshell-body::-webkit-scrollbar", STYLE_BLOCK)
+        self.assertNotIn(".xterm", STYLE_BLOCK)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_minimising_twice_parks_one_card(self):

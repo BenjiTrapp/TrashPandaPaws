@@ -4855,7 +4855,19 @@ header .info{font-size:11px;color:var(--text2)}
    with nothing to scroll. overflow is hidden because the terminal inside is
    a whole number of rows and the host is not. */
 .opshell-live{display:flex;flex-direction:column;min-height:100%}
+/* The terminal's box. On a wrapper and never on #opshell-term: opshellMeasure
+   reads the host's rect once for the cols and rows it sends to /stream, so
+   padding or a border there reports room the terminal does not have and
+   overflow:hidden clips the surplus. The wrapper passes the flex chain on:
+   flex:1 takes what the strip and the footnote leave, display:flex hands it
+   to the host's flex:1. Its 8px padding and 1px border are what the
+   measured 154x49 at 1440x900 already paid for. */
+.opshell-screen{flex:1;min-height:0;display:flex;padding:8px;border:1px solid var(--border);border-radius:6px;background:rgba(0,0,0,0.6)}
 #opshell-term{flex:1;min-height:72px;overflow:hidden}
+/* The body's scrollbar is the house's. The terminal's own stays the
+   vendored grey, because its classes are hash-pinned (static/VENDOR.md). */
+#opshell-body::-webkit-scrollbar{width:6px}
+#opshell-body::-webkit-scrollbar-thumb{background:var(--red-dim);border-radius:3px}
 
 /* The card, parked.
    The dock sits in the sidebar under .agent-list and never inside it:
@@ -9406,7 +9418,8 @@ function opshellRender(state){
         + 'them -- and a channel this view did not raise comes back with the '
         + 'reason it cannot be dropped.</p>';
     }
-    return '<div class="opshell-live">' + strip + '<div id="opshell-term"></div>'
+    return '<div class="opshell-live">' + strip
+      + '<div class="opshell-screen"><div id="opshell-term"></div></div>'
       + '<p class="loot-empty">exit, or Ctrl-D, ends the session. The '
       + '&#10005; above closes the card and queues the channel\'s '
       + 'shutdown, which takes effect at the next check-in; the _ parks '
