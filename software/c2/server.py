@@ -1853,6 +1853,15 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             "host": "",
             "user": "",
             "root": False,
+            # What a session on that host does about the operator's own
+            # command history, as the endpoint reported it when it
+            # connected: "off", "weak", or "" for a view that has not
+            # been told. Empty is not the weaker guard: "weak" is a
+            # measured fact about a host that answered, and "" is this
+            # view having nothing to say, which is what the page shows
+            # when there is no row to read.
+            "history": "",
+            "history_detail": "",
             "recording": False,
             "transcript_dir": None,
             "channel": "unknown" if _opshell["record_error"] else "closed",
@@ -1993,6 +2002,13 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             out["host"] = row.get("hostname") or ""
             out["user"] = row.get("user") or ""
             out["root"] = row.get("user") == "root"
+            # Beside `user` and `root`, and inside this branch for the
+            # same reason: it is the endpoint's own answer about its own
+            # host, and a row is the only thing here that carries one. A
+            # relay built before the field says nothing, and `or ""` is
+            # that -- never a guard this view made up.
+            out["history"] = row.get("history") or ""
+            out["history_detail"] = row.get("history_detail") or ""
             out["recording"] = bool(row.get("shell_recording"))
             out["channel"] = "open"
         elif _opshell_agent_reports_tunnel(target) and \
@@ -9084,13 +9100,14 @@ async function opshellEndSession(){
     answer = await r.json();
   } catch(e) {
     opshellSay("the shutdown could not be requested ("
-               + ((e && e.message) || e) + "). The channel may still be up; "
+               + opshellPlain((e && e.message) || e) + "). The channel may "
+               + "still be up; "
                + "it is dropped at a later check-in.");
     return true;
   }
   const why = (answer && (answer.error || answer.reason)) || "";
   if(why){
-    opshellSay(why);
+    opshellSay(opshellPlain(why));
     // And beside the duration, because the terminal cannot hold it. On a
     // parked card this runs with `opshellTerm` still set -- the poll
     // disposes on its *next* tick -- so `opshellSay` wrote the sentence
@@ -9215,17 +9232,19 @@ async function opshellPoll(){
     // good: the claim then lapsed and a session the operator was sitting
     // in was stopped on the device. The whole grace argument assumes this
     // poll keeps running.
-    const why = esc(String((e && e.message) || e));
+    const said = String((e && e.message) || e);
+    const why = esc(said);
     if(opshellAttached){
       // Never over an attached terminal: replacing the body took the
       // terminal's own node with it, and the stream then wrote into a
       // detached element. And once, not every two seconds: a sustained
       // outage wrote thirty lines in a minute and scrolled the operator's
       // own work off the screen exactly when they needed to read it.
-      if(opshellTrouble !== why){
-        opshellTrouble = why;
-        opshellSay("the view lost contact with the team server (" + why
-                   + "). The session is unaffected until it lapses.");
+      if(opshellTrouble !== said){
+        opshellTrouble = said;
+        opshellSay("the view lost contact with the team server ("
+                   + opshellPlain(said) + "). The session is unaffected "
+                   + "until it lapses.");
       }
     } else {
       body.innerHTML = '<p class="loot-empty">' + why + '</p>';
@@ -9296,7 +9315,7 @@ async function opshellPoll(){
       ? (state.reason || ("the channel is now " + state.channel)) : "";
     if(note !== opshellNoted){
       opshellNoted = note;
-      if(note) opshellSay(note);
+      if(note) opshellSay(opshellPlain(note));
     }
   }
   if(state.state === "live" && opshellSession && !opshellAttached){
@@ -9498,11 +9517,45 @@ function opshellDropRest(text){
     : ""));
 }
 
+function opshellClean(text){
+  // Text made safe to write into a terminal. A terminal is not markup:
+  // `esc()` would print `&amp;` and still let an escape sequence through,
+  // so what goes is every C0 control, DEL and C1 control -- the characters
+  // a terminal acts on -- and the zero-width and bidi format characters,
+  // which act on nothing but let a text hide or reorder what stands beside
+  // it. Each run becomes one space. Nothing is cut here: `opshellSay`
+  // applies this to whole sentences the page wrote, and the last of those
+  // is often the one that matters.
+  return String(text == null ? "" : text)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]+/g, " ")
+    .trim();
+}
+
+function opshellPlain(text){
+  // Text that came from the machine, the server or an exception: made
+  // clean, and what is left cut at 200 characters, so no host or reason
+  // can push the sentence it is written into off the screen. Applied where
+  // such a fragment is interpolated, not to the sentence around it -- cut
+  // there, the 502 note lost its warning that later keystrokes were
+  // dropped. Every writer into the terminal that can carry such text goes
+  // through `opshellClean`, and the fragment itself through this; only the
+  // page's fixed lines and the shell's own bytes go through neither.
+  const plain = opshellClean(text);
+  if(plain.length <= 200) return plain;
+  return plain.slice(0, 199).replace(/[\ud800-\udbff]$/, "").trim() + "\u2026";
+}
+
 function opshellSay(text){
   // Out of band, in the terminal, where the operator is looking. The dim
   // sequence is what this view already uses for its own notes, so it
-  // cannot be mistaken for something the shell printed.
-  if(opshellTerm) opshellTerm.writeln("\r\n\x1b[2m-- " + text + " --\x1b[0m");
+  // cannot be mistaken for something the shell printed. This is the one
+  // door for every note, and its callers pass server messages, exception
+  // text and the machine's own `reason`, so the text is made clean here and
+  // not at each of those call sites. Cut it is not: each caller cuts the
+  // fragment it interpolates with `opshellPlain`, and the page's own words
+  // around it arrive whole.
+  if(opshellTerm) opshellTerm.writeln("\r\n\x1b[2m-- " + opshellClean(text)
+    + " --\x1b[0m");
 }
 
 function opshellB64(text){
@@ -9575,7 +9628,8 @@ async function opshellFlushKeys(){
         // Honest about the one thing nobody can know here: a rejected
         // request may have reached the shell before the connection broke.
         opshellDropRest("those keystrokes may or may not have reached the "
-                        + "shell (" + ((e && e.message) || e) + "). Nothing "
+                        + "shell (" + opshellPlain((e && e.message) || e)
+                        + "). Nothing "
                         + "was sent again -- check the session before "
                         + "retyping.");
         return;
@@ -9600,7 +9654,7 @@ async function opshellFlushKeys(){
         // path was rewritten to remove.
         const attempted = r.status >= 500;
         opshellDropRest("those keystrokes were not delivered (HTTP "
-          + r.status + (said ? ": " + said : "") + "). "
+          + r.status + (said ? ": " + opshellPlain(said) : "") + "). "
           + (attempted
              ? "Some of them may already have reached the shell -- check "
                + "the session before retyping."
@@ -9696,10 +9750,27 @@ async function opshellAttach(state){
   opshellTerm = new Terminal({cols, rows, cursorBlink:true,
                               fontFamily:font, fontSize:12});
   opshellTerm.open(host);
-  // Claims only what the code does: the session's rc files run, then
-  // `unset HISTFILE` and `set +o history` (beacon.py:3228).
-  opshellTerm.writeln("\x1b[2m-- live on " + (state.host || state.target || "?")
-    + " \u00b7 history is off in this session \u00b7 " + cols + "x" + rows
+  // States what the machine reported about history and nothing more: "off"
+  // is held by a generated startup file, "weak" is the fallback the host's
+  // startup files run after -- and on macOS `/etc/zshrc` sets `HISTFILE`
+  // unconditionally, so there it is recorded, which is why the line says
+  // "may well be" and not "may" -- and anything else -- no row for this
+  // channel, or a relay too old to carry the field -- is not mentioned.
+  // The reason, the host and the target are text the machine reported and
+  // this is a terminal, not markup, so they go through `opshellPlain`.
+  const guard = state.history === "off" ? "history is off in this session"
+    : state.history === "weak"
+      ? "history is not guaranteed off in this session"
+      : "";
+  const why = state.history === "weak"
+    ? opshellPlain(state.history_detail)
+    : "";
+  const guardLine = !why ? guard : guard + " (" + why + "): it may well be "
+    + "recorded: the host's startup files run after our HISTFILE, and on "
+    + "macOS /etc/zshrc sets its own";
+  opshellTerm.writeln("\x1b[2m-- live on "
+    + (opshellPlain(state.host) || opshellPlain(state.target) || "?")
+    + (guardLine ? " \u00b7 " + guardLine : "") + " \u00b7 " + cols + "x" + rows
     + ", fixed for this session --\x1b[0m");
   if(opshellUnfitted){
     // Said once, here, because this is the only moment the size is chosen.
@@ -9731,7 +9802,7 @@ async function opshellAttach(state){
   } catch(e) {
     if(opshellTerm){
       opshellTerm.writeln("\r\n\x1b[2m-- the stream failed ("
-        + ((e && e.message) || e) + ") --\x1b[0m");
+        + opshellPlain((e && e.message) || e) + ") --\x1b[0m");
     }
     await opshellEndSession();
     return;

@@ -3645,7 +3645,15 @@ _SHELL_TERM = "xterm-256color"
 _SHELL_CWD = "/"
 _SHELL_BASH = "/bin/bash"
 _SHELL_SH = "/bin/sh"
+_SHELL_ZSH = "/bin/zsh"
 _DEV_FD = "/dev/fd"
+
+# The names, not the paths, of the login shells a session will run: a
+# passwd entry says `/usr/local/bin/bash` as readily as `/bin/bash`
+# (Homebrew, Arch, NixOS, a usrmerge `chsh`), and it is the program that
+# is wanted, wherever the host keeps it. Derived from the default paths
+# so that the two cannot name different shells.
+_LOGIN_SHELLS = (os.path.basename(_SHELL_BASH), os.path.basename(_SHELL_ZSH))
 
 # Where `setsid(1)` is, and why the shell is started through it.
 #
@@ -3703,7 +3711,42 @@ _SETSID_PATHS = ("/usr/bin/setsid", "/bin/setsid")
 # readability before it is read -- an unguarded source would be an error
 # message in every session on a host without the package -- and the whole
 # thing skipped when `/etc/bash.bashrc` already did it.
-_SHELL_RCFILE = ('[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n'
+#
+# This file is handed to a bash that has a `/dev/fd` to read it from, and
+# only to bash: the user's own login shell when that is a bash --
+# `_guard_of` recognises it by basename, so `/opt/homebrew/bin/bash` gets
+# it as `/bin/bash` does -- and the fallback bash where there is no login
+# shell of theirs to run. A bash on a host with no `/dev/fd` is run as plain
+# `-i` with `HISTFILE=/dev/null` in its environment and never sees the
+# file, nor its colour; a login shell that is not bash, zsh in practice,
+# never sees it either. For a bash login shell this is the stronger history
+# guard, not the weaker one, and a prompt that says at a glance this is not
+# a local session is as much wanted there as on the fallback.
+#
+# The colour lines sit above the operator's own files, and that order is
+# the whole of their design. Bash with no configuration is monochrome with
+# a bare prompt; but a default placed after `~/.bashrc` would overwrite
+# the prompt and the colours the operator set up for themselves, and their
+# settings are meant to win over anything this code chooses. The prompt
+# names the host and the working directory in the interface's own red --
+# `--red` in the page's palette, #ff1a1a -- so a glance tells this session
+# from a local one.
+#
+# The prompt goes between the two files, not above both. `/etc/bash.bashrc`
+# is the distribution's setting, not the operator's, and Debian and
+# ParrotOS set `PS1` in it unconditionally: a prompt placed above it would
+# be overwritten before anyone saw it, on the very hosts this is for.
+# After it and before `~/.bashrc`, the distribution's prompt gives way to
+# ours and the operator's own `.bashrc` still replaces ours. `CLICOLOR`
+# and `LSCOLORS` stay at the top: they are for BSD and macOS `ls`, the
+# system file does not set them, and they are only given a value when the
+# environment has none. `LS_COLORS` is deliberately not mentioned at all:
+# GNU `ls` reads it from the environment the host already has, and which
+# colours a host wants (`dircolors` and its database) is the host's
+# business, not something to guess at here.
+_SHELL_RCFILE = ('export CLICOLOR="${CLICOLOR:-1}"\n'
+                 'export LSCOLORS="${LSCOLORS:-ExFxCxDxBxegedabagacad}"\n'
+                 '[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n'
                  'declare -F _completion_loader >/dev/null 2>&1 ||'
                  ' for _rc_bc in /etc/profile.d/bash_completion.sh'
                  ' /usr/share/bash-completion/bash_completion'
@@ -3711,6 +3754,7 @@ _SHELL_RCFILE = ('[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n'
                  '  [ -r "$_rc_bc" ] && { . "$_rc_bc"; break; }\n'
                  'done\n'
                  'unset _rc_bc\n'
+                 + r"PS1='\[\e[38;2;255;26;26m\]\h:\w\$\[\e[0m\] '" + '\n'
                  '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"\n'
                  'unset HISTFILE\n'
                  'set +o history\n')
@@ -3750,15 +3794,67 @@ def _shell_executable(path: str) -> bool:
     return os.access(path, os.X_OK)
 
 
-def _shell_program() -> str:
-    """The shell a session runs: bash where there is one, else `/bin/sh`.
+def _login_shell() -> str:
+    """The effective user's login shell if it is one this can drive, else "".
 
-    bash because the point of the session is the host's own line editing
-    and completion, and `bash-completion` is what knows `nmap`'s flags.
-    `/bin/sh` is the floor every POSIX host has: a session without
-    completion still beats one command per check-in.
+    The passwd entry and not `$SHELL`: under the shipped
+    `services/raccoon-beacon.service` the environment is the service
+    manager's, so `$SHELL` there is nobody's choice, and a test pins that
+    this function never reads it. The unit runs as root, which makes "the
+    login shell" root's -- on most Linux hosts `/bin/bash`, so the
+    behaviour is unchanged there. What this helps is the operator's own
+    machine, which is the device the feature is for: their prompt,
+    colours and completion live in the rc files of the shell they chose,
+    and a different shell never reads them.
+
+    Only bash and zsh are answered, by basename. bash is the shell the
+    rcfile construction is written and tested for. zsh is run as plain
+    `zsh -i`, which is what it was seen to do in one unpinned run of this
+    file on macOS; no test drives a zsh session. fish and tcsh take
+    neither `--rcfile` nor bash's `-i` semantics, and an untested flag
+    costs a session that dies on the spot.
+
+    The entry must be an absolute path to a regular file that can be
+    executed. `os.access` says yes for a directory, and for a relative
+    name it resolves against this process's working directory while
+    `Popen` searches `PATH`, so either would be a probe about something
+    other than what runs, and a session that exits instantly. The
+    effective uid, as in `_process_user`, because that is the one a
+    session would run with. `""` on any failure, a shell that is not
+    there, or one not driven: the caller has a preference of its own, and
+    a lookup that fails must cost the choice and never the whole
+    connection.
     """
-    return _SHELL_BASH if _shell_executable(_SHELL_BASH) else _SHELL_SH
+    try:
+        if platform.system() == "Windows":
+            return ""
+        import pwd
+        shell = pwd.getpwuid(os.geteuid()).pw_shell
+        if (os.path.isabs(shell) and os.path.isfile(shell)
+                and os.path.basename(shell) in _LOGIN_SHELLS
+                and _shell_executable(shell)):
+            return shell
+        return ""
+    except Exception:
+        return ""
+
+
+def _shell_program() -> str:
+    """The shell a session runs: the login shell, else bash, else `/bin/sh`.
+
+    The user's own login shell first when it is bash or zsh, because the
+    point of the session is that the prompt, colours and completion are
+    theirs, and those live in the rc files of the shell they chose.
+
+    Otherwise bash where there is one, because the point of the session
+    is the host's own line editing and completion, and `bash-completion`
+    is what knows `nmap`'s flags. `/bin/sh` is the floor every POSIX host
+    has: a session without completion still beats one command per
+    check-in.
+    """
+    return (_login_shell()
+            or (_SHELL_BASH if _shell_executable(_SHELL_BASH)
+                else _SHELL_SH))
 
 
 def _setsid_program() -> str:
@@ -3798,7 +3894,89 @@ def _shell_rcfile_fd() -> int:
     return read_fd
 
 
-def _shell_invocation(cols: int, rows: int) -> Tuple[list, dict, tuple]:
+class _HistoryPipeError(OSError):
+    """The pipe that carries the generated rcfile could not be made.
+
+    What `_shell_invocation` raises, and the only thing `_serve_shell`
+    reads as "history cannot be held off for this session".
+    """
+
+
+class _HistoryGuardChanged(Exception):
+    """A session's history guard is not the one that was reported.
+
+    `_hello` reports `_history_guard()` once, when the tunnel connects,
+    because what reads it is a panel looking at an endpoint row rather
+    than at a session. Half of that answer cannot go stale -- `/dev/fd`
+    does not come and go under a running service -- and the other half
+    can: `chsh`, or a bash removed or made non-executable, takes effect on
+    the next session of an endpoint that has been connected for months.
+
+    So the guard is remembered and checked again where a session is built,
+    and this is what a disagreement raises rather than running the session
+    under a claim nobody has rechecked. `_serve_shell` turns it into a
+    refusal that shows both answers.
+
+    Not `_HistoryPipeError` and not an `OSError`: nothing here failed, and
+    that one's refusal reads an errno off the error to decide what to
+    advise. Two causes with two different things to do about them are two
+    types, so that each `except` picks exactly one of them.
+    """
+
+    def __init__(self, reported: Tuple[str, str], now: Tuple[str, str]):
+        Exception.__init__(
+            self, "reported %r when the tunnel connected and would be %r "
+                  "now" % (reported, now))
+        self.reported = reported
+        self.now = now
+
+
+def _guard_of(program: str) -> Tuple[str, str]:
+    """`_history_guard`'s answer for a shell already chosen.
+
+    Separate so that `_shell_invocation` can ask about the program it is
+    about to run and not about whatever the passwd entry says a moment
+    later. Bash is recognised by basename, as `_login_shell` recognises
+    it: the chooser accepts `/usr/local/bin/bash`, and a path comparison
+    here would call that "not bash" and withhold the rcfile from it.
+    """
+    if os.path.basename(program) != os.path.basename(_SHELL_BASH):
+        # An operator reads this on the page's first line, so it says what
+        # cannot be done and not which flag is missing: only bash takes
+        # `--rcfile`.
+        return "weak", "%s cannot be given a startup file of ours" % program
+    if not os.path.isdir(_DEV_FD):
+        return "weak", ("this host has no %s to hand a pipe to bash on"
+                        % _DEV_FD)
+    return "off", ""
+
+
+def _history_guard() -> Tuple[str, str]:
+    """How history is held off in a session here: `(guard, why)`.
+
+    `("off", "")` where the generated rcfile described at `_SHELL_RCFILE`
+    is used: the shell is bash and the host has a `/dev/fd` to hand it a
+    pipe on. Otherwise `("weak", reason)` and the session sets
+    `HISTFILE=/dev/null` in the environment, which the user's own rc files
+    run after and are free to undo.
+
+    The two reasons differ in how long they hold. `/dev/fd` is the
+    host's, and does not change under a running service. "Not bash" is
+    the login shell's, and that can: `chsh`, or a bash removed or made
+    non-executable, takes effect on the next session of a service that
+    has run for months. So an answer given once is not good for ever, and
+    a caller that reports it once has to notice when a session's guard no
+    longer matches. The reason says which it was -- the shell, or the host
+    -- because the operator can do something about one and not the other.
+    A pipe that cannot be opened is not here: that is per attempt, and it
+    refuses the session.
+    """
+    return _guard_of(_shell_program())
+
+
+def _shell_invocation(cols: int, rows: int,
+                      reported: Optional[Tuple[str, str]] = None
+                      ) -> Tuple[list, dict, tuple]:
     """What to run for a PTY session: argv, environment, descriptors.
 
     The environment is this process's own plus the terminal the session
@@ -3807,12 +3985,33 @@ def _shell_invocation(cols: int, rows: int) -> Tuple[list, dict, tuple]:
     them before it has seen a window-size change.
 
     History is held off with the generated rcfile described at
-    `_SHELL_RCFILE`. Where that construction is not available -- a host
-    with no `/dev/fd`, a host with only `/bin/sh`, which has no
-    `--rcfile`, or a pipe that could not be made -- the session falls
-    back to `HISTFILE=/dev/null` in the environment and logs that it took
-    the weaker path, because the host's own rc files run after that and
-    are free to set `HISTFILE` again.
+    `_SHELL_RCFILE`. `_history_guard` says where that is not available --
+    a shell that is not bash, or a host with no `/dev/fd` -- and there the
+    session falls back to `HISTFILE=/dev/null` in the environment and logs
+    that it took the weaker path, because the host's own rc files run
+    after that and are free to set `HISTFILE` again. Of those two,
+    `/dev/fd` is the host's and stable, and the shell is the login shell's
+    and is not: see `_history_guard`.
+
+    `reported` is the answer this endpoint has already told the server
+    about -- `_history_guard()`'s pair, carried by its HELLO. Given one, a
+    session whose answer is not it is not built at all:
+    `_HistoryGuardChanged` is raised and the caller refuses, because a
+    panel is showing the reported word and its reason to somebody. The
+    pair and not the word: a login shell that went from zsh to fish is
+    "weak" both times, and a panel that goes on saying that zsh takes no
+    `--rcfile` over a fish session says something false. The comparison is
+    here rather than at the caller so that it is about the program this
+    chose, out of this one passwd lookup; a caller asking
+    `_history_guard()` for itself would be the second lookup. `None` is a
+    caller that has reported nothing and so has nothing to contradict.
+
+    A pipe that cannot be opened is neither. It is a moment's shortage of
+    descriptors on a host that otherwise would have held history off, and
+    falling back would record the operator's commands while everything
+    they were shown said it did not. It propagates as `_HistoryPipeError`,
+    an `OSError`, and the caller refuses the session. A class of its own,
+    so that any other `OSError` from here is not taken for this one.
 
     `--rcfile` comes before `-i`: bash 3.2 stops reading long options
     after the first short one and answers `--: invalid option`, which
@@ -3826,23 +4025,19 @@ def _shell_invocation(cols: int, rows: int) -> Tuple[list, dict, tuple]:
     env["TERM"] = _SHELL_TERM
     env["COLUMNS"] = str(cols)
     env["LINES"] = str(rows)
-    rc_fd = -1
-    weaker = ""
-    if program != _SHELL_BASH:
-        weaker = "%s is not bash, and only bash takes --rcfile" % program
-    elif not os.path.isdir(_DEV_FD):
-        weaker = "this host has no %s to hand a pipe to bash on" % _DEV_FD
-    else:
-        try:
-            rc_fd = _shell_rcfile_fd()
-        except OSError as exc:
-            weaker = "the rcfile pipe could not be opened (%s)" % exc
-    if weaker:
+    guard, weaker = _guard_of(program)
+    if reported is not None and (guard, weaker) != reported:
+        raise _HistoryGuardChanged(reported, (guard, weaker))
+    if guard != "off":
         env["HISTFILE"] = os.devnull
         logger.info("tunnel: a shell session is holding history off with "
                     "HISTFILE=%s rather than a generated rcfile: %s",
                     os.devnull, weaker)
         return [program, "-i"], env, ()
+    try:
+        rc_fd = _shell_rcfile_fd()
+    except OSError as exc:
+        raise _HistoryPipeError(*exc.args) from exc
     return ([program, "--rcfile", "%s/%d" % (_DEV_FD, rc_fd), "-i"],
             env, (rc_fd,))
 
@@ -4070,6 +4265,12 @@ class TunnelEndpoint(object):
         # counts relays too, and the cap is on the ones that cost a
         # process and a PTY.
         self._shells = 0
+        # The history guard, word and reason, that the last HELLO
+        # reported, so that a session whose guard is no longer that one
+        # can be refused rather than run while a panel states the old
+        # answer. `None` until a HELLO has been built: nothing has been
+        # claimed yet, so there is nothing to contradict.
+        self._reported_history = None   # type: Optional[Tuple[str, str]]
 
     # ── lifecycle ──
 
@@ -4269,15 +4470,34 @@ class TunnelEndpoint(object):
         `features` is what this build can do besides relay, so the server
         can tell an endpoint that has a shell from one built before it
         did. A HELLO without the field is a build that predates it.
+
+        `history` and `history_detail` are what a session on this host
+        would do about the operator's command history, from
+        `_history_guard`: `"off"` and `""`, or `"weak"` and the reason.
+        Reported here, once, because what reads it is a panel looking at
+        this endpoint's row rather than at a session, and a page that
+        cannot ask states a constant instead -- which was wrong on every
+        host whose login shell is not bash. The guard is remembered as
+        well as sent: half of it can go stale while this endpoint stays
+        connected, and a session whose guard no longer matches what was
+        reported is refused rather than run under it. See
+        `_HistoryGuardChanged`.
         """
+        guard, weaker = _history_guard()
         body = {"identity": self.identity,
                 "hostname": platform.node(),
                 "os": "%s %s" % (platform.system(), platform.release()),
                 "user": _process_user(),
+                "history": guard,
+                "history_detail": weaker,
                 "crypto": self._crypto_path(),
                 "features": list(TUNNEL_FEATURES)}
         if self.implant_id:
             body["implant_id"] = self.implant_id
+        # Last, so that what is remembered is what is about to be sent and
+        # nothing after this line can make the two differ.
+        with self._lock:
+            self._reported_history = (guard, weaker)
         return body
 
     def _control_loop(self, channel: _TunnelChannel) -> None:
@@ -4793,7 +5013,59 @@ class TunnelEndpoint(object):
             # bites -- and both pumps wait in `select` instead, where the
             # end of the session is visible.
             os.set_blocking(master, False)
-            argv, env, child_fds = _shell_invocation(cols, rows)
+            with self._lock:
+                reported = self._reported_history
+            try:
+                argv, env, child_fds = _shell_invocation(cols, rows, reported)
+            except _HistoryGuardChanged as exc:
+                # The guard was reported once, at connect, and this host
+                # has since answered differently. Refused rather than
+                # served: a panel is showing the reported answer to an
+                # operator, and a session that quietly contradicts it is
+                # the whole reason that answer is reported at all.
+                # In the page's words: `weak` is the code's, and the
+                # operator has only ever been shown "not guaranteed off".
+                said = {"off": "off", "weak": "not guaranteed off"}
+                was, why_was = exc.reported
+                now, why_now = exc.now
+                self._refuse_shell(
+                    sock, noise,
+                    "no session was started, because what a session here "
+                    "would do about command history has changed since the "
+                    "tunnel connected, and what the interface shows about "
+                    "it is out of date. It was told history is %s%s; a "
+                    "session now would have history %s%s. The answer is "
+                    "reported again only when the tunnel itself "
+                    "reconnects: in the tunnel panel, Stop this endpoint "
+                    "and, once it shows stopped, Start it, one check-in "
+                    "each; stopping it ends every session and proxy on "
+                    "this endpoint, not just this one. Closing this view "
+                    "and opening another shell "
+                    "does not do it, because a shell rides the channel "
+                    "that is already up."
+                    % (said.get(was, was),
+                       " (%s)" % why_was if why_was else "",
+                       said.get(now, now),
+                       " (%s)" % why_now if why_now else ""))
+                return
+            except _HistoryPipeError as exc:
+                # Only this one: see `_shell_invocation`. Any other
+                # `OSError` from there takes the generic refusal below.
+                # This one names history, because "could not start"
+                # would leave the operator to guess what was being
+                # protected.
+                if exc.errno in (errno.EMFILE, errno.ENFILE):
+                    advice = ("The host is out of file descriptors; "
+                              "attach again once some are free.")
+                else:
+                    advice = "Attach again."
+                self._refuse_shell(
+                    sock, noise,
+                    "no session was started, because the pipe that keeps "
+                    "its command history off could not be set up (%s) "
+                    "and a session without it could record what you "
+                    "type. %s" % (exc, advice))
+                return
             program = argv[0]
             leader = _setsid_program()
             if leader:

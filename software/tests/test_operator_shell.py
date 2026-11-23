@@ -978,6 +978,13 @@ class _RouteCase(unittest.TestCase):
                 "shell_port": self.dead_port(),
                 "shell_password": self.SHELL_PASSWORD,
                 "shell_recording": True,
+                # What a session on that endpoint does about command
+                # history, as its HELLO reported it. The relay never
+                # leaves the pair unset for a connected endpoint: an
+                # unknown word, and an endpoint too old to send one, both
+                # read as "weak" there.
+                "history": "off",
+                "history_detail": "",
                 "shell": {"sessions": sessions, "max_sessions": 4},
                 "socks": {"sessions": socks_sessions, "max_sessions": 256},
             }],
@@ -1010,6 +1017,8 @@ class _RouteCase(unittest.TestCase):
             "shell_port": self.dead_port(),
             "shell_password": self.SHELL_PASSWORD,
             "shell_recording": True,
+            "history": "off",
+            "history_detail": "",
             "shell": {"sessions": 0, "max_sessions": 4},
             "socks": {"sessions": socks_sessions, "max_sessions": 256},
         }]
@@ -1037,6 +1046,45 @@ class _RouteCase(unittest.TestCase):
     def post(self, path, payload=None, **kw):
         return self.client(**kw).post(self.url(path), json=payload or {},
                                       headers=self.auth)
+
+    # ── state answers, for the fields that are read off the row ──
+
+    def _state_for(self, supervisor):
+        """The state answer for that supervisor, with a target designated.
+
+        The target matters: `/state` answers early for a view that has
+        been pointed at nothing, so without one this would measure that
+        early answer instead of the field it was asked about -- the
+        mistake `test_the_strip_gets_a_host_to_show` records.
+        """
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        return self.get("/api/opshell/state", supervisor=supervisor).get_json()
+
+    def _state_with_row(self, **fields):
+        """The state answer over `connected()`, whose row carries `fields`.
+
+        The fixture's own row, updated, rather than a second row written
+        here: a row invented in a test is the typo-against-a-typo shape
+        that `TestTheFixturesDoNotInventFieldNames` exists to stop.
+        """
+        supervisor = self.connected()
+        supervisor.status()["endpoints"][0].update(fields)
+        return self._state_for(supervisor)
+
+    def _state_without_row(self):
+        """The state answer for a configured relay that has no row yet.
+
+        `configured_but_stopped()` reports a shell port range and no
+        endpoints, which is every moment between the operator's click and
+        the endpoint's HELLO.
+        """
+        return self._state_for(self.configured_but_stopped())
+
+    def _blind_state(self):
+        """The early answer, with no tunnel supervisor to ask at all."""
+        return self._state_for(None)
+
 
 
 class TestTheRoutesAreOperatorOnly(_RouteCase):
@@ -1111,6 +1159,43 @@ class TestTheStateTellsTheTruth(_RouteCase):
         self.post(self.url("/api/opshell/open"), {"agent": self.AGENT})
         state = self.get(self.url("/api/opshell/state")).get_json()
         self.assertIn("no tunnel block", state["reason"])
+
+    def test_the_state_answer_carries_the_history_guard_the_row_has(self):
+        state = self._state_with_row(
+            history="weak", history_detail="/bin/zsh takes no --rcfile")
+        self.assertEqual(state["history"], "weak")
+        self.assertIn("zsh", state["history_detail"])
+
+    def test_a_guard_that_holds_history_off_reaches_the_answer_too(self):
+        state = self._state_with_row(history="off", history_detail="")
+        self.assertEqual(state["history"], "off")
+        self.assertEqual(state["history_detail"], "")
+
+    def test_a_channel_with_no_row_is_told_nothing_about_history(self):
+        """`user` and `root` are populated only inside `if row is not
+        None`, and so is this. An empty guard is the view's signal to
+        claim neither: nothing here has measured the host, and "weak"
+        would be a statement about a session that does not exist.
+        """
+        self.assertEqual(self._state_without_row()["history"], "")
+        self.assertEqual(self._state_without_row()["history_detail"], "")
+        self.assertEqual(self._blind_state()["history"], "")
+        self.assertEqual(self._blind_state()["history_detail"], "")
+
+    def test_a_relay_too_old_to_report_a_guard_is_told_nothing_either(self):
+        """A row from a tunnel server built before this field: the
+        endpoint's own answer cannot have reached it, and "" is the only
+        reading of that. The relay is where an unknown word becomes
+        `weak`, and that is a different question from a relay that says
+        nothing at all."""
+        supervisor = self.connected()
+        row = supervisor.status()["endpoints"][0]
+        row.pop("history", None)
+        row.pop("history_detail", None)
+        state = self._state_for(supervisor)
+        self.assertEqual(state["history"], "")
+        self.assertEqual(state["history_detail"], "")
+
 
 
 class TestOpeningTheChannel(_RouteCase):
@@ -2220,6 +2305,7 @@ class TestTheFixturesDoNotInventFieldNames(_RouteCase):
         row = self.connected().status()["endpoints"][0]
         for field in ("implant_id", "state", "user", "hostname",
                       "shell_port", "shell_password", "shell_recording",
+                      "history", "history_detail",
                       "shell", "socks"):
             self.assertIn(field, row, "the fixture omits %r" % field)
             self.assertIn('"%s"' % field, upstream,
@@ -2869,6 +2955,8 @@ class TestTheSweepIsWiredToTheCheckIn(_RouteCase):
             "shell_port": self.dead_port(),
             "shell_password": self.SHELL_PASSWORD,
             "shell_recording": True,
+            "history": "off",
+            "history_detail": "",
             "shell": {"sessions": 0, "max_sessions": 4},
             "socks": {"sessions": 0, "max_sessions": 256},
         }]
@@ -3367,10 +3455,30 @@ class TestTheViewDoesNotOverclaim(_GuiCase):
         self.assertIn("state.user", render)
         self.assertIn("state.root", render)
 
+    def test_the_first_line_states_the_history_guard_it_was_given(self):
+        # The line is written by `opshellAttach`, not by `opshellRender`
+        # (which draws the strip), so that is the function that must read
+        # the two fields the machine reported.
+        attach = self.js_function("opshellAttach")
+        self.assertIn("state.history", attach)
+        self.assertIn("state.history_detail", attach)
+
     def test_the_first_terminal_line_claims_only_what_the_code_does(self):
-        # `unset HISTFILE` and `set +o history` run after the rc files
-        # (beacon.py:3228). That is exactly what this says, and no more.
-        self.assertIn("history is off in this session", SERVER_SRC)
+        # The sentence used to be a constant, true only while the generated
+        # startup file held history off. What it says now is decided by
+        # the machine's word, and the behaviour is pinned in node by the
+        # tests of the class that runs the view that drive the first line:
+        # `test_the_first_line_claims_nothing_when_it_was_told_nothing`,
+        # `test_a_weak_guard_says_why_and_an_off_guard_says_it_is_off`,
+        # `test_a_weak_guard_with_no_reason_reads_whole_on_its_own` and the
+        # ones that hand the reason, the host and the target a hostile text.
+        # What is read here is only that the claim has one author: the
+        # attach, once, beside the weaker sentence it must never replace.
+        attach = self.js_function("opshellAttach")
+        self.assertEqual(attach.count("history is off in this session"), 1)
+        self.assertIn("history is not guaranteed off", attach)
+        self.assertEqual(SERVER_SRC.count("history is off in this session"), 1,
+                         "the constant claim is written somewhere else too")
 
     def test_there_is_no_cancel_button_for_a_queued_task(self):
         # This server has no task withdrawal, so a button that said it
@@ -3713,7 +3821,7 @@ function fakeTerm(){
 
 class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
     def test_node_is_present_or_this_fails_loudly(self):
-        """A hundred and three tests hide behind `skipUnless(node)`.
+        """A hundred and nineteen tests hide behind `skipUnless(node)`.
 
         They are the only defence the interface has -- the grep tests
         cannot see a swallowed error, a missing control or a close that
@@ -3721,7 +3829,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         success, which is the same shape as the five tests this branch
         once deleted while the suite went green.
 
-        One loud failure instead of a hundred and three quiet skips.
+        One loud failure instead of a hundred and nineteen quiet skips.
         """
         self.assertTrue(
             shutil.which("node"),
@@ -3765,14 +3873,50 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # merge blocker brought four: why a parked session ended surviving
         # the tick that ends it, an ordinary exit explaining nothing and
         # not being inherited, that sentence stated once, and a card that
-        # came back not being told its shell is gone --
+        # came back not being told its shell is gone -- and 105 against
+        # 107 once the first terminal line stated the history guard it was
+        # given, which brought four: nothing said when it was told
+        # nothing, "not guaranteed" with its reason beside "off", the same
+        # sentence whole with no reason, and a reason that may not carry a
+        # control sequence into the terminal -- and 115 against 117 once
+        # every other writer of text from the machine or a server into that
+        # terminal was locked one by one, which brought ten: the helper
+        # itself, the host and the target, the stream's failure, the
+        # shutdown that failed and the reason it was refused for, the poll
+        # that failed and the state's own note, the key request that failed
+        # and the one that was refused, and the shell's own bytes reaching
+        # the terminal untouched -- and 117 against 119 once the review of
+        # that brought two: where the helper cuts what is left, and that a
+        # host or a reason of any length leaves the sentence it is written
+        # into on the line --
         self.assertGreaterEqual(
-            len(names), 101,
+            len(names), 117,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
         # named one by one, because a count cannot defend a property.
         for must in ("test_what_is_typed_during_a_failing_batch_dies_with_it",
+                     # A first line that says history is off when the page
+                     # was told nothing is the claim that would mislead the
+                     # person it is addressed to, and no other test keeps
+                     # the default from being "off".
+                     "test_the_first_line_claims_nothing_when_it_was_told_nothing",
+                     # The same sentence without its reason: a relay too old
+                     # to send one must still read whole, with no empty
+                     # parenthesis and no cause the page was not told.
+                     "test_a_weak_guard_with_no_reason_reads_whole_on_its_own",
+                     # The filter's own definition. Every writer's test
+                     # asserts that it *calls* the helper; only this one
+                     # says what the helper removes, and that it keeps the
+                     # rest, so a class that narrows or widens is caught
+                     # here and nowhere else.
+                     "test_the_helper_removes_what_a_terminal_acts_on_and_nothing_else",
+                     # The other direction: filtering too much. The shell's
+                     # own bytes carry its colour, and removing colour is
+                     # what this whole feature exists to prevent. The
+                     # numeric floor cannot stand in for these three:
+                     # deleting any two leaves the total at its floor.
+                     "test_what_the_shell_prints_still_reaches_the_terminal_untouched",
                      "test_the_same_holds_when_the_request_is_rejected_outright",
                      "test_a_write_that_may_have_landed_is_not_called_nothing",
                      "test_closing_the_view_closes_the_session",
@@ -3830,7 +3974,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         src = "\n".join(decls + [self.js_function(n) for n in (
             "esc", "opshellEndSession", "opshellTeardown", "opshellPicker",
             "opshellRender", "opshellOpen", "opshellB64",
-            "opshellSay", "opshellDropRest", "opshellFlushKeys",
+            "opshellClean", "opshellPlain", "opshellSay", "opshellDropRest",
+            "opshellFlushKeys",
             "opshellEndAfterAttach", "opshellRemember", "opshellRecall",
             "opshellResume", "showOperatorShell", "opshellChrome",
             "opshellClose", "opshellMinimise", "opshellRestore",
@@ -4807,6 +4952,414 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " closed: posted.filter(p => p.url.endsWith('close')).length}));")
         self.assertIn("no free session slots", " ".join(got["lines"]))
         self.assertIn("root@parrot", " ".join(got["lines"]))
+
+    def _first_line(self, state_fields):
+        """What the page wrote first into the terminal for this state."""
+        got = self._node(
+            "els['opshell-term'] = el('opshell-term');\n"
+            "const term = fakeTerm();\n"
+            "globalThis.Terminal = function(){ return term; };\n"
+            "opshellSession = 'sid';\n"
+            "nextReply = {ok:true, status:200, stream: fakeStream(['x'])};\n"
+            "await opshellAttach(Object.assign({state:'live',"
+            " geometry:[80,24], host:'parrot'}, %s));\n"
+            "console.log(JSON.stringify({first: term.lines[0],"
+            " all: term.lines.join(' ')}));" % json.dumps(state_fields))
+        return got["first"], got["all"]
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_first_line_claims_nothing_when_it_was_told_nothing(self):
+        """Review Focus 3. A page that defaults to "history is off" would
+        claim it for a channel the relay has no row for."""
+        for fields in ({"history": "", "history_detail": ""},
+                       {},
+                       {"history": None, "history_detail": None},
+                       {"history": "banana", "history_detail": "x"},
+                       {"history": "", "history_detail": "stray reason"}):
+            first, _ = self._first_line(fields)
+            self.assertNotRegex(first, r"(?i)history",
+                                "said something about history for %r" % fields)
+            self.assertNotIn("stray reason", first)
+            self.assertIn("live on parrot", first)
+            self.assertRegex(first, r"[0-9]+x[0-9]+, fixed for this session")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_weak_guard_says_why_and_an_off_guard_says_it_is_off(self):
+        lines = {}
+        for guard, detail in (("off", ""),
+                              ("weak", "/bin/zsh takes no --rcfile")):
+            lines[guard], _ = self._first_line(
+                {"history": guard, "history_detail": detail})
+        self.assertRegex(lines["off"], r"(?i)history is off in this session")
+        self.assertNotRegex(lines["weak"], r"(?i)history is off")
+        self.assertRegex(lines["weak"], r"(?i)not guaranteed off")
+        self.assertIn("/bin/zsh takes no --rcfile", lines["weak"])
+        # How the reason is attached, and what the sentence after it says:
+        # the reason in parentheses straight after the guard, a colon, then
+        # the page's explanation, which names what runs after what.
+        self.assertIn("not guaranteed off in this session "
+                      "(/bin/zsh takes no --rcfile): " + self._RECORDED,
+                      lines["weak"])
+        self.assertNotEqual(lines["off"], lines["weak"])
+
+    # What the weak guard costs, as measured on the Mac this was built for:
+    # `/etc/zshrc` sets `HISTFILE` unconditionally, after the environment,
+    # so there it is not "maybe" -- every command is written to the file.
+    _RECORDED = ("it may well be recorded: the host's startup files run "
+                 "after our HISTFILE, and on macOS /etc/zshrc sets its own")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_weak_guard_says_history_may_well_be_recorded_and_why(self):
+        """A direction, not a set of words: the line may not say history is
+        held off by anything, nor that undoing it is the user's doing and a
+        possibility, and it has to name the system file that does it."""
+        first, _ = self._first_line(
+            {"history": "weak", "history_detail": "/bin/zsh cannot be given "
+                                                  "a startup file of ours"})
+        explained = first.split("): ", 1)[1].split(" \u00b7 ", 1)[0]
+        self.assertEqual(explained, self._RECORDED)
+        self.assertRegex(explained, r"(?i)\bmay well be recorded\b")
+        self.assertRegex(explained, r"run after our HISTFILE")
+        self.assertRegex(explained, r"macOS /etc/zshrc sets its own")
+        self.assertNotRegex(explained, r"(?i)held off|may undo|your own|"
+                                       r"not recorded|is off")
+        # Short enough to read on one line of a card at 120 columns, the
+        # size a card falls back to, and not much wider than 80.
+        self.assertLessEqual(len(explained), 110, len(explained))
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_weak_guard_with_no_reason_reads_whole_on_its_own(self):
+        """A relay too old to send the field arrives as "weak" and nothing
+        else. The sentence then stands without a reason clause: no empty
+        parenthesis, no colon or "because" left hanging."""
+        for detail in ("", None, "   ", "\x1b\x07"):
+            first, _ = self._first_line(
+                {"history": "weak", "history_detail": detail})
+            self.assertIn("history is not guaranteed off in this session",
+                          first, repr(detail))
+            self.assertNotRegex(first, r"\(\s*\)", repr(detail))
+            self.assertNotRegex(first, r"(?i)because|\bwhy\b|:\s*(\u00b7|\x1b|$)",
+                                repr(detail))
+            self.assertNotRegex(first, r"(?i)history is off")
+            self.assertNotRegex(first, r"(?i)startup file",
+                                "explained a cause the page was not told")
+            self.assertNotIn("undefined", first)
+            self.assertNotIn("null", first)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_reason_is_text_from_the_machine_and_cannot_drive_the_terminal(self):
+        """`history_detail` is written by the machine, so it may not carry a
+        control sequence into the operator's terminal: an escape that
+        cleared the line would hide the one sentence that says history is
+        not held off."""
+        first, everything = self._first_line(
+            {"history": "weak", "history_detail": self._HOSTILE})
+        # The only escapes in the line are the page's own dim and reset.
+        self.assertEqual(re.findall(r"\x1b\[[0-9;]*[A-Za-z]", first),
+                         ["\x1b[2m", "\x1b[0m"])
+        self.assertNotRegex(first, r"[\x00-\x08\x0a-\x1a\x1c-\x1f\x7f-\x9f"
+                                   r"\u200b-\u200f\u202a-\u202e\u2060-\u2069"
+                                   r"\ufeff]")
+        self.assertNotIn("\r", first)
+        self.assertIn("not guaranteed off", first)
+        self.assertIn("end", first)
+
+    # --- Every door into the terminal, locked one at a time ---------------
+    #
+    # `history_detail` was the first writer of machine-derived text into the
+    # terminal to be made plain, and the first line, the notes and the
+    # stream-failure lines carry text from the same places. Each is driven
+    # here with a hostile string and what reached the terminal is read back:
+    # the helper's own test cannot say that a writer calls it.
+    #
+    # One sample for all of them, so it carries a character from every part
+    # of what the helper removes: the C0 range's top (\x1f), DEL, the C1
+    # range's bottom, the two that open a string in xterm.js (\x90 device
+    # control, \x9d operating system command), the string terminator and
+    # the top (\x9c, \x9f), a run, and the invisible and direction-marking
+    # characters (zero-width space, right-to-left override, word joiner,
+    # byte-order mark).
+    _HOSTILE = ("ok\x1b[2J\x1b[H\rfake\x07\x9b31m\x7f\x80\x90\x9c\x9d\x9f"
+                "\x1f\u200b\u202e\u2060\ufeff & <end>")
+
+    def _assert_nothing_drives_the_terminal(self, lines, where):
+        """Every note the hostile string reached carries no control byte of
+        its own, only the page's dim and reset, and is still readable: not
+        blanked, and not HTML-escaped -- this is a terminal, not markup."""
+        hit = [l for l in lines if "ok" in l and "end" in l]
+        self.assertTrue(hit, "%s: the text never reached the terminal: %r"
+                        % (where, lines))
+        for line in hit:
+            bare = re.sub(r"^\r\n", "", line)
+            bare = bare.replace("\x1b[2m", "").replace("\x1b[0m", "")
+            self.assertNotRegex(
+                bare,
+                "[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u2069"
+                "\ufeff]",
+                "%s wrote a control or invisible character: %r"
+                % (where, line))
+            self.assertIn("ok", bare)
+            self.assertIn("& <end>", bare, "%s changed the text: %r"
+                          % (where, line))
+            self.assertNotIn("&amp;", bare)
+            self.assertEqual(
+                re.findall(r"\x1b", line),
+                ["\x1b"] * (line.count("\x1b[2m") + line.count("\x1b[0m")),
+                "%s let an escape sequence through: %r" % (where, line))
+
+    def _lines(self, script):
+        got = self._node(script + "\nconsole.log(JSON.stringify("
+                         "{lines: opshellTerm ? opshellTerm.lines : []}));")
+        return got["lines"]
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_helper_removes_what_a_terminal_acts_on_and_nothing_else(self):
+        # Every character is its own case, so narrowing either end of a
+        # range, or dropping the `+`, fails a case and not just a hunch.
+        removed = ["\x1b[2J", "\r", "\n", "\x07", "\x7f", "\x9b", "\x00",
+                   "\x1c", "\x1f", "\x80", "\x90", "\x98", "\x9c", "\x9d",
+                   "\x9f", "\u200b", "\u200f", "\u202a", "\u202e", "\u2060",
+                   "\u2069", "\ufeff"]
+        runs = ["a\x1b\x07b", "a\x1b\x07\x9d\u202e\ufeffb", "a\x1f\x80b"]
+        edges = "a\u00a0b\u200ac\u202fd\u205fe\u206af"
+        got = self._node(
+            "const cases = %s;\n"
+            "console.log(JSON.stringify({\n"
+            " out: cases.map(opshellPlain),\n"
+            " kept: opshellPlain('caf\\u00e9 \\u65e5\\u672c \\u2713 & <b>'),\n"
+            " edges: opshellPlain(%s),\n"
+            " nothing: [opshellPlain(null), opshellPlain(undefined),"
+            " opshellPlain(''), opshellPlain(7)]}));"
+            % (json.dumps(["a" + c + "b" for c in removed] + runs
+                          + ["  x  "]), json.dumps(edges)))
+        self.assertEqual(
+            got["out"],
+            ["a [2Jb"] + ["a b"] * (len(removed) - 1 + len(runs)) + ["x"])
+        self.assertEqual(got["kept"], "caf\u00e9 \u65e5\u672c \u2713 & <b>")
+        # Just outside the removed ranges -- a no-break space, a hair space,
+        # a narrow no-break space, a medium mathematical space and the code
+        # point after the word joiner's block -- all stay.
+        self.assertEqual(got["edges"], edges)
+        self.assertEqual(got["nothing"], ["", "", "", "7"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_helper_cuts_what_is_left_at_two_hundred_characters(self):
+        got = self._node(
+            "const sur = 'x'.repeat(198) + '\\ud83d\\ude00' + 'y'.repeat(9);\n"
+            "console.log(JSON.stringify({\n"
+            " exact: opshellPlain('x'.repeat(200)),\n"
+            " over: opshellPlain('x'.repeat(201)),\n"
+            " far: opshellPlain('x'.repeat(5000)),\n"
+            " pair: opshellPlain(sur),\n"
+            " spaced: opshellPlain('x'.repeat(198) + ' \\x1b y'.repeat(9)),\n"
+            " measuredAfter: opshellPlain('\\x1b'.repeat(300) + 'x'.repeat(10))"
+            "}));")
+        self.assertEqual(got["exact"], "x" * 200)
+        self.assertEqual(got["over"], "x" * 199 + "\u2026")
+        self.assertEqual(got["far"], "x" * 199 + "\u2026")
+        # The cut may not leave half of a surrogate pair, nor a space
+        # before the ellipsis.
+        self.assertEqual(got["pair"], "x" * 198 + "\u2026")
+        self.assertEqual(got["spaced"], "x" * 198 + "\u2026")
+        # What is cut is what is left after the removal, not the raw text.
+        self.assertEqual(got["measuredAfter"], "x" * 10)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_host_and_the_target_cannot_drive_the_terminal(self):
+        for field, extra in (("host", {}), ("target", {"host": ""})):
+            fields = dict(extra)
+            fields[field] = self._HOSTILE
+            first, _ = self._first_line(fields)
+            self._assert_nothing_drives_the_terminal(
+                [first], "the first line's %s" % field)
+            self.assertIn("live on ok", first)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_stream_failure_cannot_drive_the_terminal(self):
+        lines = self._lines(
+            "els['opshell-term'] = el('opshell-term');\n"
+            "globalThis.Terminal = function(){ return fakeTerm(); };\n"
+            "opshellSession = 'sid';\n"
+            "nextReply = {throw:%s};\n"
+            "await opshellAttach({state:'live', geometry:[80,24],"
+            " host:'parrot'});" % json.dumps(self._HOSTILE))
+        self.assertTrue([l for l in lines if "the stream failed" in l])
+        self._assert_nothing_drives_the_terminal(lines, "the stream failure")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_long_host_or_reason_cannot_push_the_sentence_off_the_line(self):
+        """Nothing upstream caps either, and the part of the line that says
+        what the history guard is, and how big the terminal is, comes last."""
+        first, _ = self._first_line(
+            {"host": "h" * 5000, "history": "weak",
+             "history_detail": "r" * 5000})
+        self.assertLess(len(first), 800, len(first))
+        self.assertIn("\u2026", first)
+        self.assertIn("may well be recorded", first)
+        self.assertRegex(first, r"[0-9]+x[0-9]+, fixed for this session")
+
+    # The cap belongs to what a note carries, not to the note: the page's
+    # own sentences are longer than 200 characters, and the last of them is
+    # the one that matters. Measured before this: the 502 note, 271
+    # characters, ended "Anything typed since has been...".
+    _DROPPED = ("Anything typed since has been dropped too, so no part of a "
+                "command can arrive without the rest of it. --\x1b[0m")
+
+    def _note_after(self, reply, keys="ls"):
+        """The last note a failed batch wrote, with one more key typed while
+        it was in flight."""
+        return self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "holdFetch = 6;\n"
+            "opshellKeys = %s;\n"
+            "nextReply = %s;\n"
+            "const flushing = opshellFlushKeys();\n"
+            "opshellKeys += '\\r';\n"
+            "await flushing;\n"
+            "console.log(JSON.stringify({last: opshellTerm.lines"
+            "[opshellTerm.lines.length - 1]}));"
+            % (json.dumps(keys), reply))["last"]
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_502_note_arrives_whole_with_its_last_sentence(self):
+        last = self._note_after(
+            "{ok:false, status:502, body:{error:'the bridge could not write "
+            "to the shell', detail:'sendall timed out'}}")
+        self.assertGreater(len(last), 200, "the case under test is a note "
+                           "longer than the old cap")
+        self.assertTrue(last.endswith(self._DROPPED), last)
+        self.assertNotIn("\u2026", last)
+        self.assertIn("the bridge could not write to the shell -- sendall "
+                      "timed out", last)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_what_a_note_carries_is_still_cut_and_the_note_is_not(self):
+        """The server's reason and the exception text are the untrusted
+        parts, and a long one is cut where it is interpolated -- so it
+        cannot push the sentence after it off the line either."""
+        for reply in ("{ok:false, status:502, body:{error:%s}}"
+                      % json.dumps("e" * 5000),
+                      "{throw:%s}" % json.dumps("e" * 5000)):
+            last = self._note_after(reply)
+            self.assertTrue(last.endswith(self._DROPPED), (reply[:30], last))
+            self.assertIn("e" * 199 + "\u2026", last)
+            self.assertNotIn("e" * 200, last)
+            self.assertLess(len(last), 600, len(last))
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_fetch_failure_and_the_paste_notes_arrive_whole(self):
+        failed = self._note_after("{throw:'socket hang up'}")
+        self.assertIn("(socket hang up). Nothing was sent again -- check the "
+                      "session before retyping. " + self._DROPPED, failed)
+        self.assertNotIn("\u2026", failed)
+        got = self._node(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "opshellKeys = 'x'.repeat(%d);\n"
+            "await opshellFlushKeys();\n"
+            "console.log(JSON.stringify({last: opshellTerm.lines"
+            "[opshellTerm.lines.length - 1]}));" % (256 * 1024))
+        self.assertTrue(got["last"].endswith(
+            "Nothing was sent. Send it in smaller pieces, or put the file on "
+            "the host another way. --\x1b[0m"), got["last"])
+        self.assertNotIn("\u2026", got["last"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_every_note_is_still_made_plain_without_the_cap(self):
+        got = self._node(
+            "opshellTerm = fakeTerm();\n"
+            "opshellSay(%s + 'z'.repeat(400));\n"
+            "console.log(JSON.stringify({last: opshellTerm.lines[0],"
+            " clean: opshellClean('a\\x1b\\x07b ' + 'y'.repeat(300))}));"
+            % json.dumps(self._HOSTILE))
+        self._assert_nothing_drives_the_terminal([got["last"]], "a long note")
+        self.assertIn("z" * 400, got["last"])
+        self.assertEqual(got["clean"], "a b " + "y" * 300)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_what_the_shell_prints_still_reaches_the_terminal_untouched(self):
+        """The one writer that is not made plain: the shell's own bytes. A
+        terminal exists to act on them, and stripping them would be a shell
+        that cannot show colour or move its cursor."""
+        got = self._node(
+            "els['opshell-term'] = el('opshell-term');\n"
+            "const term = fakeTerm();\n"
+            "globalThis.Terminal = function(){ return term; };\n"
+            "opshellSession = 'sid';\n"
+            "nextReply = {ok:true, status:200, stream:"
+            " fakeStream(['\\x1b[31mred\\x1b[0m\\r\\n'])};\n"
+            "await opshellAttach({state:'live', geometry:[80,24],"
+            " host:'parrot'});\n"
+            "console.log(JSON.stringify({lines: term.lines}));")
+        self.assertIn("\x1b[31mred\x1b[0m\r\n", got["lines"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_refused_shutdown_cannot_drive_the_terminal(self):
+        # The request itself fails: the message is the exception's.
+        lines = self._lines(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "nextReply = {throw:%s};\n"
+            "await opshellEndSession();" % json.dumps(self._HOSTILE))
+        self._assert_nothing_drives_the_terminal(lines, "the failed shutdown")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_servers_reason_for_a_refused_shutdown_cannot_drive_the_terminal(self):
+        for key in ("reason", "error"):
+            lines = self._lines(
+                "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+                "nextReply = {ok:true, status:200, body:{%s:%s}};\n"
+                "await opshellEndSession();"
+                % (key, json.dumps(self._HOSTILE)))
+            self._assert_nothing_drives_the_terminal(
+                lines, "the server's %s" % key)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_poll_failure_cannot_drive_the_terminal(self):
+        # An HTML error page from a proxy makes the JSON parse fail with
+        # text from the far side in it, so this message is not the page's.
+        lines = self._lines(
+            "opshellAttached = true; opshellSession = 'sid';\n"
+            "opshellTerm = fakeTerm();\n"
+            "els['opshell-body'] = el('opshell-body');\n"
+            "nextReply = {throw:%s};\n"
+            "await opshellPoll();" % json.dumps(self._HOSTILE))
+        self.assertTrue([l for l in lines if "lost contact" in l])
+        self._assert_nothing_drives_the_terminal(lines, "the poll failure")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_what_the_state_says_cannot_drive_the_terminal(self):
+        for body in ("state:'live', channel:'unknown', reason:%s",
+                     "state:'closing', channel:%s"):
+            lines = self._lines(
+                "opshellAttached = true; opshellSession = 'sid';\n"
+                "opshellTerm = fakeTerm();\n"
+                "els['opshell-body'] = el('opshell-body');\n"
+                "nextReply = {ok:true, status:200, body:{host:'parrot',"
+                " %s}};\n"
+                "await opshellPoll();" % (body % json.dumps(self._HOSTILE)))
+            self._assert_nothing_drives_the_terminal(
+                lines, "the state's note (%s)" % body.split(",")[1].strip())
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_failed_key_request_cannot_drive_the_terminal(self):
+        lines = self._lines(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "opshellKeys = 'ls\\r';\n"
+            "nextReply = {throw:%s};\n"
+            "await opshellFlushKeys();" % json.dumps(self._HOSTILE))
+        self.assertTrue([l for l in lines if "may or may not" in l])
+        self._assert_nothing_drives_the_terminal(lines, "the key failure")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_refused_key_request_cannot_drive_the_terminal(self):
+        # Every field the route sends, because the page joins all three.
+        lines = self._lines(
+            "opshellSession = 'sid'; opshellTerm = fakeTerm();\n"
+            "opshellKeys = 'ls\\r';\n"
+            "nextReply = {ok:false, status:409, body:{error:%(h)s,"
+            " refused:%(h)s, detail:%(h)s}};\n"
+            "await opshellFlushKeys();" % {"h": json.dumps(self._HOSTILE)})
+        self.assertTrue([l for l in lines if "not delivered" in l])
+        self._assert_nothing_drives_the_terminal(lines, "the key refusal")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_far_end_that_hangs_up_ends_the_session(self):

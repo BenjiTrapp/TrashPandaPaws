@@ -62,8 +62,11 @@ its working directory, its `$$`, and whether that pid is still in the
 process table afterwards.
 """
 
+import ast
 import base64
+import contextlib
 import errno
+import inspect
 import logging
 import os
 import re
@@ -72,6 +75,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import traceback
@@ -1496,6 +1500,740 @@ class TestWritingToATerminal(unittest.TestCase):
                          "reported success")
 
 
+class _ShellChoice(object):
+    """The stand-ins for the host that the shell choice is tested against.
+
+    Each one answers for the paths it is told about and leaves every other
+    path to the real function. A patch of `os.path` is process-wide, so
+    one that answered for everything would also lie to whatever else asks
+    while it is in force.
+    """
+
+    @contextlib.contextmanager
+    def _passwd(self, shell):
+        """The effective user's passwd entry names `shell` as login shell."""
+        entry = mock.Mock(pw_shell=shell)
+        with mock.patch.object(pwd, "getpwuid", return_value=entry):
+            yield
+
+    @contextlib.contextmanager
+    def _executable(self, paths):
+        """Only the paths given are executable files, whatever this host has.
+
+        The probe and `os.path.isfile` both, because the chooser asks
+        both and a path like `/usr/local/bin/bash` is not on every host.
+        `isfile` is the host's own for a path that is not one of these:
+        the chooser needs both answers to be yes, and the probe is no for
+        every such path.
+        """
+        real_isfile = os.path.isfile
+
+        def isfile(path):
+            return True if path in paths else real_isfile(path)
+
+        with mock.patch.object(beacon_mod, "_shell_executable",
+                               lambda path: path in paths), \
+                mock.patch.object(os.path, "isfile", isfile):
+            yield
+
+    @contextlib.contextmanager
+    def _dev_fd(self, present):
+        """The host has, or has not, a `/dev/fd` directory."""
+        real_isdir = os.path.isdir
+
+        def isdir(path):
+            return present if path == beacon_mod._DEV_FD else real_isdir(path)
+
+        with mock.patch.object(os.path, "isdir", isdir):
+            yield
+
+
+class TestTheLoginShell(_ShellChoice, unittest.TestCase):
+    """Which shell a session runs, chosen without spawning one.
+
+    Apart from `TestAShellSession`, which turns the login shell off so
+    that the choice is bash where the host has one and `/bin/sh` where it
+    does not, and its assertions do not depend on whose account runs the
+    suite: here the choice itself is under test, with the passwd entry
+    and the executable probe both stood in for.
+    """
+
+    @contextlib.contextmanager
+    def _passwd_of(self, lookup):
+        """`pwd.getpwuid` is `lookup`, and the two uids are told apart."""
+        with mock.patch.object(pwd, "getpwuid", side_effect=lookup), \
+                mock.patch.object(os, "geteuid", return_value=4242), \
+                mock.patch.object(os, "getuid", return_value=1):
+            yield
+
+    def _names_used_by(self, function):
+        """Every name `function` reads or imports, as the parser sees it.
+
+        Identifiers and not text: a docstring, a comment and a variable
+        that merely contains the letters are not the function doing
+        anything. What is collected is each `ast.Name`, each attribute
+        accessed (`os.environ` gives `environ`) and each name imported, so
+        a test can ask whether the environment is *named* and an unrelated
+        local called `environment` is not.
+        """
+        names = set()
+        for node in ast.walk(ast.parse(
+                textwrap.dedent(inspect.getsource(function)))):
+            if isinstance(node, ast.Name):
+                names.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                names.add(node.attr)
+            elif isinstance(node, ast.alias):
+                names.add(node.name.split(".")[-1])
+        return names
+
+    def test_the_login_shell_of_the_effective_user_is_what_runs(self):
+        """`$SHELL` under the shipped service unit is the service
+        manager's environment, not a user's choice, so the passwd entry
+        is what is asked."""
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}):
+            self.assertEqual(beacon_mod._shell_program(), "/bin/zsh")
+
+    def test_a_login_shell_that_is_not_there_does_not_cost_the_session(self):
+        for shell in ("/usr/bin/fish", "", "/nonexistent/zsh"):
+            with self._passwd(shell), self._executable({"/bin/bash"}):
+                self.assertEqual(beacon_mod._shell_program(), "/bin/bash",
+                                 shell)
+
+    def test_a_shell_nobody_has_driven_with_flags_is_not_driven(self):
+        """fish and tcsh take neither `--rcfile` nor bash's `-i`
+        semantics, so the preference runs rather than an untested flag."""
+        with self._passwd("/usr/bin/fish"), \
+                self._executable({"/usr/bin/fish", "/bin/bash"}):
+            self.assertEqual(beacon_mod._shell_program(), "/bin/bash")
+
+    def test_a_bash_or_zsh_wherever_the_host_keeps_it_is_the_login_shell(self):
+        for shell in ("/usr/local/bin/bash", "/usr/bin/bash", "/bin/bash",
+                      "/usr/bin/zsh", "/opt/homebrew/bin/zsh"):
+            with self._passwd(shell), self._executable({shell, "/bin/sh"}):
+                self.assertEqual(beacon_mod._shell_program(), shell, shell)
+
+    def test_only_bash_and_zsh_are_ever_the_login_shell(self):
+        for shell in ("/sbin/nologin", "/usr/bin/false", "/bin/sh",
+                      "/bin/ksh", "/bin/dash", "/bin/tcsh", "/usr/bin/fish"):
+            with self._passwd(shell), \
+                    self._executable({shell, "/bin/bash", "/bin/sh"}):
+                self.assertEqual(beacon_mod._shell_program(), "/bin/bash",
+                                 shell)
+                self.assertEqual(beacon_mod._login_shell(), "", shell)
+
+    def test_the_environments_shell_is_not_a_fallback_either(self):
+        """An empty passwd answer does not hand the choice to `$SHELL`."""
+        with self._passwd(""), \
+                self._executable({"/bin/zsh", "/bin/bash"}), \
+                mock.patch.dict(os.environ, {"SHELL": "/bin/zsh"}):
+            self.assertEqual(beacon_mod._shell_program(), "/bin/bash")
+
+    def test_a_directory_is_not_a_shell(self):
+        """`os.access(X_OK)` is true of a directory, so the probe alone
+        would accept it and the session would die at exec."""
+        for name in ("bash", "zsh"):
+            directory = os.path.join(tempfile.mkdtemp(), name)
+            os.mkdir(directory)
+            self.addCleanup(shutil.rmtree, os.path.dirname(directory),
+                            True)
+            self.assertTrue(os.access(directory, os.X_OK))
+            with self._passwd(directory):
+                self.assertEqual(beacon_mod._login_shell(), "", directory)
+
+    def test_a_relative_name_is_not_a_shell(self):
+        """`os.access` resolves it against the working directory and
+        `Popen` against `PATH`: the probe could be about another file."""
+        for shell in ("bash", "zsh", "./bash", "bin/zsh"):
+            with self._passwd(shell), self._executable({shell, "/bin/sh"}):
+                self.assertEqual(beacon_mod._login_shell(), "", shell)
+
+    def test_a_malformed_passwd_entry_falls_back_rather_than_throwing(self):
+        def unreadable(uid):
+            raise OSError("passwd unreadable")
+
+        def without_a_shell(uid):
+            return mock.Mock(spec=[])
+
+        for lookup in (unreadable, without_a_shell):
+            with self._passwd_of(lookup), self._executable({"/bin/bash"}):
+                self.assertEqual(beacon_mod._shell_program(), "/bin/bash",
+                                 lookup.__name__)
+
+    def test_it_is_the_effective_uid_whose_entry_is_asked(self):
+        entry = mock.Mock(pw_shell="/bin/zsh")
+
+        def lookup(uid):
+            if uid != 4242:
+                raise KeyError(uid)
+            return entry
+
+        with self._passwd_of(lookup), \
+                self._executable({"/bin/zsh", "/bin/bash"}):
+            self.assertEqual(beacon_mod._shell_program(), "/bin/zsh")
+
+    @unittest.skipUnless(os.path.isdir("/dev/fd"), "no /dev/fd to hand bash")
+    def test_a_bash_that_is_not_in_bin_still_gets_the_generated_rcfile(self):
+        """Comparing the path with `/bin/bash` said "not bash" of
+        `/usr/local/bin/bash`, and the session lost the rcfile: no
+        completion, and history on."""
+        shell = "/usr/local/bin/bash"
+        with self._passwd(shell), self._executable({shell}):
+            argv, env, held = beacon_mod._shell_invocation(80, 24)
+        for fd in held:
+            os.close(fd)
+        self.assertEqual(argv[:2], [shell, "--rcfile"])
+        self.assertEqual(argv[3:], ["-i"])
+        self.assertEqual(len(held), 1)
+        self.assertNotEqual(env.get("HISTFILE"), os.devnull)
+
+    def test_a_shell_that_is_not_bash_takes_the_weaker_path(self):
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}):
+            argv, env, held = beacon_mod._shell_invocation(80, 24)
+        self.assertEqual(argv, ["/bin/zsh", "-i"])
+        self.assertEqual((env["HISTFILE"], held), (os.devnull, ()))
+
+    def test_a_pipe_that_cannot_be_opened_refuses_rather_than_records(self):
+        """The downgrade this replaces was the worst trade available: a
+        session that quietly wrote the operator's commands to their own
+        history file while the view said history was off."""
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(True), \
+                mock.patch.object(beacon_mod, "_shell_rcfile_fd",
+                                  side_effect=OSError("too many files")):
+            with self.assertRaises(OSError):
+                beacon_mod._shell_invocation(80, 24)
+
+    def test_the_guard_a_host_reports_is_the_guard_a_session_gets(self):
+        """What `HELLO` carries has to be what the spawn does, or the
+        view states a fact about the wrong thing."""
+        cases = (("/bin/bash", True, "off"),
+                 ("/usr/local/bin/bash", True, "off"),
+                 ("/bin/zsh", True, "weak"),
+                 ("/bin/bash", False, "weak"))
+        for shell, has_dev_fd, expected in cases:
+            with self._passwd(shell), self._executable({shell}), \
+                    self._dev_fd(has_dev_fd):
+                guard, detail = beacon_mod._history_guard()
+                argv, env, held = beacon_mod._shell_invocation(80, 24)
+            for fd in held:
+                os.close(fd)
+            case = (shell, has_dev_fd)
+            self.assertEqual(guard, expected, case)
+            self.assertEqual("--rcfile" in argv, guard == "off",
+                             "the spawn disagreed with the report")
+            self.assertEqual(env.get("HISTFILE") == os.devnull,
+                             guard == "weak", case)
+            self.assertEqual(bool(detail), guard == "weak", case)
+
+    def test_the_invocation_acts_on_the_shell_it_chose_not_on_a_second_look(self):
+        """`_guard_of` exists so that the program and the guard come from
+        one passwd lookup. Every other test holds the entry constant, where
+        one lookup and two cannot differ; a login shell changed between
+        the two (`chsh` on a service that has run for months) is the case
+        that can."""
+        for first, second, rcfile in (("/bin/bash", "/bin/zsh", True),
+                                      ("/bin/zsh", "/bin/bash", False)):
+            lookups = [mock.Mock(pw_shell=first)] + (
+                [mock.Mock(pw_shell=second)] * 5)
+            with self._executable({"/bin/bash", "/bin/zsh"}), \
+                    self._dev_fd(True), \
+                    mock.patch.object(pwd, "getpwuid",
+                                      side_effect=lookups) as lookup:
+                argv, env, held = beacon_mod._shell_invocation(80, 24)
+            for fd in held:
+                os.close(fd)
+            case = (first, second)
+            self.assertEqual(argv[0], first, case)
+            self.assertEqual("--rcfile" in argv, rcfile, case)
+            self.assertEqual(env.get("HISTFILE") == os.devnull, not rcfile,
+                             case)
+            self.assertEqual(lookup.call_count, 1, case)
+
+    def test_a_guard_that_no_longer_matches_the_reported_one_is_refused(self):
+        """The half of the guard that can go stale, caught at the session.
+
+        `/dev/fd` is the host's and does not move. The login shell is the
+        user's: `chsh`, or a bash removed, takes effect on the next
+        session of an endpoint that has been connected for months, and
+        the panel would still be showing what the HELLO said. So the
+        invocation is told what was reported and builds nothing when the
+        session it would build disagrees -- in either direction, because
+        "reported weak and this one is off" is a view that is just as
+        untrue of the session in front of the operator, and one
+        comparison that refuses both ways cannot be got subtly wrong.
+
+        The pair is compared and not the word. The last two refusals are
+        weak both times and differ in the reason, which is printed beside
+        the word: a panel that blames `/bin/zsh` over a session
+        that is bash without a `/dev/fd` is wrong about the part an
+        operator acts on.
+
+        `None` is a caller that has reported nothing: there is nothing to
+        contradict, and every other test here passes two arguments.
+        """
+        cases = (  # (shell then, /dev/fd then, shell now, /dev/fd now)
+            ("/bin/bash", True, "/bin/bash", True, False),
+            ("/bin/zsh", True, "/bin/zsh", True, False),
+            ("/bin/bash", False, "/bin/bash", False, False),
+            ("/bin/bash", True, "/bin/zsh", True, True),
+            ("/bin/zsh", True, "/bin/bash", True, True),
+            ("/bin/bash", False, "/bin/zsh", True, True),
+            ("/bin/zsh", True, "/bin/zsh", False, False),
+            ("/bin/bash", True, "/bin/bash", False, True),
+            ("/bin/zsh", True, "/usr/local/bin/zsh", True, True),
+        )
+        for then, fd_then, now, fd_now, refuses in cases:
+            with self._passwd(then), self._executable({then}), \
+                    self._dev_fd(fd_then):
+                reported = beacon_mod._history_guard()
+            held = ()
+            with self._passwd(now), self._executable({now}), \
+                    self._dev_fd(fd_now):
+                try:
+                    _, _, held = beacon_mod._shell_invocation(80, 24,
+                                                              reported)
+                    refused = False
+                except beacon_mod._HistoryGuardChanged:
+                    refused = True
+            for fd in held:
+                os.close(fd)
+            self.assertEqual(refused, refuses,
+                             (then, fd_then, now, fd_now, reported))
+
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
+                self._dev_fd(True):
+            _, _, held = beacon_mod._shell_invocation(80, 24, None)
+        self.assertEqual(held, ())
+
+    def test_a_zsh_session_blames_the_shell_and_not_the_host(self):
+        """The operator can tell a login zsh apart from an ancient host
+        only if the reason says which it was."""
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
+                self._dev_fd(True):
+            _, detail = beacon_mod._history_guard()
+        self.assertIn("zsh", detail)
+        self.assertNotIn(beacon_mod._DEV_FD, detail)
+        # Read by an operator on the page's first line, so it says what
+        # cannot be done and not which flag is missing.
+        self.assertEqual(detail, "/bin/zsh cannot be given a startup file "
+                                 "of ours")
+
+    def test_a_host_without_dev_fd_blames_the_host_and_not_the_shell(self):
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(False):
+            _, detail = beacon_mod._history_guard()
+        self.assertIn(beacon_mod._DEV_FD, detail)
+        self.assertNotIn("is not bash", detail)
+        self.assertNotIn("startup file of ours", detail)
+
+    # A guard that reads source is only worth what it reads. Mutating
+    # `beacon.py` and re-running can silently run the *old* code: a `.pyc`
+    # is trusted when the source's size and mtime-second match, and a
+    # mutation that changes one character straight after another that did
+    # the same matches. That happened here: a mutation looked caught by
+    # the wrong test because it had not run at all. Between mutations,
+    # delete `software/c2/__pycache__/beacon*` and run with `-B`.
+    def test_the_environments_shell_variable_is_never_consulted(self):
+        """By behaviour through the invocation, and by scan of every
+        function that chooses a shell. `_shell_invocation` is not scanned:
+        it reads `os.environ` for the child's environment, which is the
+        right reading of it."""
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
+                mock.patch.dict(os.environ, {"SHELL": "/bin/ksh"}):
+            self.assertEqual(beacon_mod._shell_program(), "/bin/zsh")
+            self.assertEqual(beacon_mod._shell_invocation(80, 24)[0][0],
+                             "/bin/zsh")
+        for chooser in (beacon_mod._login_shell, beacon_mod._shell_program,
+                        beacon_mod._history_guard, beacon_mod._guard_of):
+            used = self._names_used_by(chooser)
+            for reading in ("environ", "getenv"):
+                self.assertNotIn(reading, used, chooser.__name__)
+
+    def test_a_scan_for_the_environment_is_not_fooled_by_a_name(self):
+        """The scan above has been tripped three times by text that was
+        not a reading. It must see through a local called `environment`,
+        catch both ways of reading the variable, and catch a reading whose
+        name never appears as an attribute: a bare name and an import
+        under another name are how one hides from a scan that walks only
+        attributes, and both branches that see them were dead here --
+        every test passed with either deleted."""
+        from os import environ
+
+        def innocent():
+            """Says os.environ and getenv in prose."""
+            environment = 1  # os.environ
+            return environment
+
+        def contains_the_letters():
+            """Every kind of identifier the scan collects, each one
+            *containing* a name it is looking for and none of them equal
+            to one: a bare name, an attribute, and an import."""
+            from somewhere import getenv_all
+            return getenv_all(thing.environ_of(environment))
+
+        def reads_environ():
+            return os.environ.get("SHELL")
+
+        def reads_getenv():
+            return os.getenv("SHELL")
+
+        def reads_a_bare_environ():
+            """What `from os import environ` at the top of a module and a
+            read down here looks like: no attribute is touched."""
+            return dict(environ)
+
+        def reads_getenv_under_another_name():
+            """The name is in the import and nowhere else."""
+            from os import getenv as ask
+            return ask("SHELL")
+
+        self.assertFalse({"environ", "getenv"}
+                         & self._names_used_by(innocent))
+        # By equality and not by substring. A set cannot be asked "does
+        # any member contain this", so the question is put the other way:
+        # the identifiers come back whole and the two readings are not in
+        # them. Each of the three node kinds has to pass through that
+        # test, so a scan that cut an identifier down to a name it knows
+        # fails in whichever branch does it.
+        found = self._names_used_by(contains_the_letters)
+        self.assertLessEqual({"getenv_all", "environ_of", "environment"},
+                             found)
+        self.assertFalse({"environ", "getenv"} & found, found)
+        self.assertIn("environ", self._names_used_by(reads_environ))
+        self.assertIn("getenv", self._names_used_by(reads_getenv))
+        self.assertIn("environ", self._names_used_by(reads_a_bare_environ))
+        self.assertIn("getenv",
+                      self._names_used_by(reads_getenv_under_another_name))
+
+    def test_a_passwd_lookup_that_raises_falls_back_rather_than_throwing(self):
+        with mock.patch.object(pwd, "getpwuid",
+                               side_effect=KeyError("no such uid")), \
+                self._executable({"/bin/bash"}):
+            self.assertEqual(beacon_mod._shell_program(), "/bin/bash")
+
+
+class TestTheHelloCarriesTheHistoryGuard(_ShellChoice,
+                                        TunnelEndpointTestCase):
+    """What a HELLO says about command history on this host.
+
+    Modelled on `TestRegistration.test_hello_advertises_the_shell_feature`:
+    port 1234 is never dialled, because the body is what is under test and
+    not the connection.
+
+    Said once, at connect, because what reads it is a panel looking at an
+    endpoint row rather than at a session. The half of the answer that can
+    go stale between the HELLO and a session -- the login shell -- is
+    caught where the session is built; see `TestARefusedShellSession`.
+    """
+
+    def _body(self):
+        endpoint = TunnelEndpoint(self.config_for(1234))
+        self.addCleanup(endpoint.stop)
+        return endpoint._hello()
+
+    def test_hello_reports_the_history_guard_a_session_here_would_get(self):
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(True):
+            body = self._body()
+        self.assertEqual(body["history"], "off")
+        self.assertEqual(body["history_detail"], "")
+
+    def test_hello_reports_the_weaker_guard_and_what_caused_it(self):
+        """Both branches, because the "off" case on its own is passed by a
+        body that says "off" whatever the host is."""
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
+                self._dev_fd(True):
+            body = self._body()
+        self.assertEqual(body["history"], "weak")
+        self.assertIn("zsh", body["history_detail"])
+
+    def test_a_host_without_dev_fd_reports_the_weaker_guard_too(self):
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(False):
+            body = self._body()
+        self.assertEqual(body["history"], "weak")
+        self.assertIn(beacon_mod._DEV_FD, body["history_detail"])
+
+
+@unittest.skipUnless(_HAS_PTY, _NO_PTY)
+class TestARefusedShellSession(_ShellChoice, TunnelEndpointTestCase):
+    """What `_serve_shell` does when the history guard cannot be built.
+
+    The socket and the noise session are `None`: the refusal is the only
+    thing that would touch them and it is stood in for, so a session that
+    reached for either anywhere else would fail here.
+    """
+
+    def _serve_with_a_pipe_that_fails(self, error):
+        """Run `_serve_shell` with bash chosen and its rcfile pipe failing.
+
+        Returns the reasons given for refusing, and the master descriptors
+        `openpty` handed out so the caller can see they were closed.
+        """
+        refusals = []
+        masters = []
+        pty_mod = beacon_mod._shell_modules()[0]
+        real_openpty = pty_mod.openpty
+
+        def openpty():
+            master, slave = real_openpty()
+            masters.extend((master, slave))
+            return master, slave
+
+        endpoint = TunnelEndpoint(self.config_for(1234))
+        self.addCleanup(endpoint.stop)
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(True), \
+                mock.patch.object(pty_mod, "openpty", openpty), \
+                mock.patch.object(beacon_mod, "_shell_rcfile_fd",
+                                  side_effect=error), \
+                mock.patch.object(TunnelEndpoint, "_refuse_shell",
+                                  lambda self, sock, noise, reason:
+                                  refusals.append(reason)):
+            endpoint._serve_shell(None, None, 80, 24)
+        return endpoint, refusals, masters
+
+    def _serve_after_the_login_shell_changed(self, at_hello, at_session):
+        """A HELLO on one login shell, and then a session on another.
+
+        The HELLO goes through `_hello`, not by writing whatever it
+        remembers: what has to be checked against is what was *reported*,
+        and a test that set the memory by hand would hold no claim about
+        that. Returns the guard the HELLO carried as well, so each test
+        can say which direction it drove.
+        """
+        refusals = []
+        masters = []
+        pty_mod = beacon_mod._shell_modules()[0]
+        real_openpty = pty_mod.openpty
+
+        def openpty():
+            master, slave = real_openpty()
+            masters.extend((master, slave))
+            return master, slave
+
+        endpoint = TunnelEndpoint(self.config_for(1234))
+        self.addCleanup(endpoint.stop)
+        with self._passwd(at_hello), self._executable({at_hello}), \
+                self._dev_fd(True):
+            reported = endpoint._hello()["history"]
+        with self._passwd(at_session), self._executable({at_session}), \
+                self._dev_fd(True), \
+                mock.patch.object(pty_mod, "openpty", openpty), \
+                mock.patch.object(TunnelEndpoint, "_refuse_shell",
+                                  lambda self, sock, noise, reason:
+                                  refusals.append(reason)):
+            endpoint._serve_shell(None, None, 80, 24)
+        return endpoint, reported, refusals, masters
+
+    def test_the_operator_is_told_the_login_shell_changed_under_them(self):
+        """`chsh` between the HELLO and the session, which is the whole
+        reason the reported guard is checked again here. The sentence has
+        to say that it changed since the tunnel connected, show both
+        answers, and say that reconnecting reports the new one -- the
+        operator is looking at a panel that is now out of date and nothing
+        else will tell them."""
+        _, reported, refusals, _ = self._serve_after_the_login_shell_changed(
+            "/bin/bash", "/bin/zsh")
+        self.assertEqual(reported, "off")
+        self.assertEqual(len(refusals), 1)
+        self.assertRegex(refusals[0], r"(?i)histor")
+        self.assertRegex(refusals[0], r"(?i)reconnect")
+        self.assertRegex(refusals[0], r"(?i)since the tunnel connected")
+        self.assertIn("told history is off", refusals[0])
+        self.assertIn("history not guaranteed off (/bin/zsh cannot be given "
+                      "a startup file of ours)", refusals[0])
+        self.assertNotRegex(refusals[0], r"Traceback|OSError\(")
+        self._assert_speaks_as_the_page(refusals[0])
+
+    def _assert_speaks_as_the_page(self, refusal):
+        """The page's words, not the code's: no `%r` quoting, no `weak`,
+        which the page never shows a person, and the one way to reconnect
+        that reports the answer again. The guard is remembered in `_hello`,
+        which runs only when the command channel reconnects; a shell is a
+        message on the channel already up, so closing the view and opening
+        another changes nothing and the person would be declined in a
+        loop. Only stopping and starting the endpoint, each a task taken at
+        a check-in, builds a fresh endpoint and a fresh HELLO."""
+        self.assertNotIn("'", refusal.replace("host's", "")
+                         .replace("doesn't", ""))
+        self.assertNotRegex(refusal, r"\bweak\b")
+        self.assertIn("tunnel panel", refusal)
+        self.assertRegex(refusal, r"Stop this endpoint[^.]*Start it")
+        self.assertRegex(refusal, r"(?i)check-in")
+        self.assertRegex(refusal, r"(?i)only when the tunnel itself "
+                                  r"reconnects")
+        # The advice costs every other session and proxy on the endpoint,
+        # and following it must not be the first the person hears of that.
+        self.assertRegex(refusal, r"(?i)stopping it ends every session and "
+                                  r"proxy on this endpoint, not just this one")
+        # Named only to say it does not work, never as the advice.
+        self.assertNotIn("\u2715", refusal)
+        self.assertNotIn("Open a shell", refusal)
+        self.assertRegex(refusal, r"(?i)opening another shell does not do it")
+
+    def test_a_guard_that_changed_the_other_way_is_refused_as_well(self):
+        """Reported `weak`, and this session would hold history off. The
+        view is no more true of the session than in the other direction,
+        and one comparison that refuses both ways is the rule that cannot
+        be got subtly wrong."""
+        _, reported, refusals, _ = self._serve_after_the_login_shell_changed(
+            "/bin/zsh", "/bin/bash")
+        self.assertEqual(reported, "weak")
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("told history is not guaranteed off (/bin/zsh cannot "
+                      "be given a startup file of ours)", refusals[0])
+        self.assertIn("would have history off", refusals[0])
+        self._assert_speaks_as_the_page(refusals[0])
+
+    def test_a_login_shell_that_changed_between_two_weak_ones_is_refused(self):
+        """The word is `weak` before and after, and the reason is what
+        changed: the interface would go on naming a shell that is no
+        longer the one a session gets. The sentence has to show both
+        reasons, because that is the difference the operator is owed."""
+        _, reported, refusals, _ = self._serve_after_the_login_shell_changed(
+            "/bin/zsh", "/usr/local/bin/zsh")
+        self.assertEqual(reported, "weak")
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("(/bin/zsh cannot be given", refusals[0])
+        self.assertIn("(/usr/local/bin/zsh cannot be given", refusals[0])
+        self._assert_speaks_as_the_page(refusals[0])
+
+    def test_the_refusal_claims_no_cause_it_has_not_established(self):
+        """Only `/dev/fd` went, and the shell is the same bash. The pair
+        differs, so the session is refused, but a sentence that said the
+        login shell changed would be untrue of this host. What it may say
+        is what it knows: the two answers, which carry the cause."""
+        refusals = []
+        endpoint = TunnelEndpoint(self.config_for(1234))
+        self.addCleanup(endpoint.stop)
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(True):
+            endpoint._hello()
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(False), \
+                mock.patch.object(TunnelEndpoint, "_refuse_shell",
+                                  lambda self, sock, noise, reason:
+                                  refusals.append(reason)):
+            endpoint._serve_shell(None, None, 80, 24)
+        self.assertEqual(len(refusals), 1)
+        self.assertNotRegex(refusals[0], r"(?i)login shell")
+        self.assertNotRegex(refusals[0], r"is not bash|startup file of ours")
+        self.assertIn(beacon_mod._DEV_FD, refusals[0])
+        self.assertRegex(refusals[0], r"(?i)reconnect")
+        self._assert_speaks_as_the_page(refusals[0])
+
+    def test_reconnecting_after_a_refusal_reports_the_new_shell(self):
+        """The refusal promises it: reconnect, and the tunnel reports what
+        the host does now. Held here as a sequence -- HELLO on one shell,
+        a refused session on another, the HELLO again on the new one, and
+        then a session that starts -- because an endpoint that remembered
+        only its first answer would make the refusal permanent, and every
+        other test here passes one HELLO."""
+        refusals = []
+        bridged = []
+        endpoint = TunnelEndpoint(self.config_for(1234))
+        self.addCleanup(endpoint.stop)
+
+        def session():
+            with self._passwd("/bin/bash"), \
+                    self._executable({"/bin/bash"}), self._dev_fd(True), \
+                    mock.patch.object(TunnelEndpoint, "_refuse_shell",
+                                      lambda self, sock, noise, reason:
+                                      refusals.append(reason)), \
+                    mock.patch.object(TunnelEndpoint, "_shell_bridge",
+                                      lambda self, sock, noise, master,
+                                      select_mod: bridged.append(master)):
+                endpoint._serve_shell(None, None, 80, 24)
+
+        with self._passwd("/bin/zsh"), self._executable({"/bin/zsh"}), \
+                self._dev_fd(True):
+            self.assertEqual(endpoint._hello()["history"], "weak")
+        session()
+        self.assertEqual((len(refusals), len(bridged)), (1, 0))
+
+        with self._passwd("/bin/bash"), self._executable({"/bin/bash"}), \
+                self._dev_fd(True):
+            self.assertEqual(endpoint._hello()["history"], "off")
+        session()
+        self.assertEqual((len(refusals), len(bridged)), (1, 1),
+                         "a session after the reconnect was refused: %r"
+                         % refusals)
+        self.assertEqual(endpoint._shells, 0)
+
+    def test_a_session_refused_for_a_changed_shell_leaves_nothing_taken(self):
+        """As for the pipe: no slot held and no descriptor open. A
+        refusal is the cheap path and must not be the one that leaks.
+
+        That a guard which still *matches* gets its session is held by
+        `TestAShellSession`, which runs a real HELLO and a real shell
+        through the same endpoint.
+        """
+        endpoint, _, refusals, masters = \
+            self._serve_after_the_login_shell_changed("/bin/bash", "/bin/zsh")
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(endpoint._shells, 0)
+        self.assertEqual(len(masters), 2)
+        for fd in masters:
+            with self.assertRaises(OSError, msg="descriptor %d" % fd):
+                os.fstat(fd)
+
+    def test_the_operator_is_told_why_the_session_was_refused(self):
+        """A stream that simply goes quiet is the one failure worse than
+        a wrong answer: `_refuse_shell`'s own docstring says a terminal
+        can only read a sentence."""
+        _, refusals, _ = self._serve_with_a_pipe_that_fails(
+            OSError("too many files"))
+        self.assertEqual(len(refusals), 1)
+        self.assertRegex(refusals[0], r"(?i)histor")
+        self.assertNotRegex(refusals[0], r"Traceback|OSError\(")
+
+    def test_the_refusal_claims_only_the_cause_the_error_gives(self):
+        """Out of descriptors is said of `EMFILE` and `ENFILE` and of
+        nothing else."""
+        cases = ((OSError(errno.EMFILE, "Too many open files"), True),
+                 (OSError(errno.ENFILE, "Too many open files in system"),
+                  True),
+                 (OSError(errno.ENOMEM, "Cannot allocate memory"), False),
+                 (OSError("no errno at all"), False))
+        for error, says_so in cases:
+            _, refusals, _ = self._serve_with_a_pipe_that_fails(error)
+            self.assertEqual(len(refusals), 1)
+            self.assertEqual(bool(re.search(r"file descriptors",
+                                            refusals[0])), says_so,
+                             (error, refusals[0]))
+            self.assertRegex(refusals[0], r"(?i)histor")
+
+    def test_an_oserror_that_is_not_the_pipe_is_not_called_the_pipe(self):
+        """The refusal that names history is for the pipe only; anything
+        else the invocation raises takes the generic one."""
+        refusals = []
+        endpoint = TunnelEndpoint(self.config_for(1234))
+        self.addCleanup(endpoint.stop)
+        with mock.patch.object(beacon_mod, "_shell_invocation",
+                               side_effect=OSError("something else")), \
+                mock.patch.object(TunnelEndpoint, "_refuse_shell",
+                                  lambda self, sock, noise, reason:
+                                  refusals.append(reason)):
+            endpoint._serve_shell(None, None, 80, 24)
+        self.assertEqual(len(refusals), 1)
+        self.assertNotRegex(refusals[0], r"(?i)histor")
+        self.assertEqual(endpoint._shells, 0)
+
+    def test_a_refused_session_leaves_nothing_taken(self):
+        """No slot held and no descriptor open: a host that is out of
+        descriptors is the one that cannot afford to lose more."""
+        endpoint, refusals, masters = self._serve_with_a_pipe_that_fails(
+            OSError("too many files"))
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(endpoint._shells, 0)
+        self.assertEqual(len(masters), 2)
+        for fd in masters:
+            with self.assertRaises(OSError, msg="descriptor %d" % fd):
+                os.fstat(fd)
+
+
 class TestAShellSession(TunnelEndpointTestCase):
     """`MSG_OPEN_SHELL`: a real PTY on the endpoint, dialled out like a relay.
 
@@ -1510,6 +2248,13 @@ class TestAShellSession(TunnelEndpointTestCase):
 
     def setUp(self):
         super(TestAShellSession, self).setUp()
+        # These tests talk to bash, or to `/bin/sh` where they remove it,
+        # and were written when that was the only choice. The login shell
+        # is the host's -- zsh on the machine this is developed on -- so
+        # leaving it to the host would make every assertion below depend
+        # on whose account runs the suite. The login-shell tests patch
+        # the passwd entry themselves.
+        self.patched("_login_shell", lambda: "")
         self.server = _FakeTunnelServer(self.store)
         self.addCleanup(self.assert_server_was_quiet)
         self.addCleanup(self.server.close)
@@ -1529,23 +2274,51 @@ class TestAShellSession(TunnelEndpointTestCase):
         setattr(beacon_mod, name, value)
         self.addCleanup(setattr, beacon_mod, name, original)
 
-    def ask_for_a_shell(self, cols=None, rows=None):
-        """One OPEN_SHELL, and the stream the endpoint claims it with."""
+    def ask_for_a_shell(self, cols=None, rows=None, server=None,
+                        channel=None):
+        """One OPEN_SHELL, and the stream the endpoint claims it with.
+
+        `server` and `channel` name a second endpoint's pair where a test
+        has connected one; `setUp`'s is the default.
+        """
+        server = server if server is not None else self.server
+        channel = channel if channel is not None else self.channel
         token = os.urandom(16).hex()
-        wanted = len(self.server.shells) + 1
-        body = {"port": self.server.port, "token": token}
+        wanted = len(server.shells) + 1
+        body = {"port": server.port, "token": token}
         if cols is not None:
             body["cols"] = cols
         if rows is not None:
             body["rows"] = rows
-        self.channel.send_message(MSG_OPEN_SHELL, body)
-        self.wait_for(lambda: len(self.server.shells) >= wanted,
+        channel.send_message(MSG_OPEN_SHELL, body)
+        self.wait_for(lambda: len(server.shells) >= wanted,
                       what="the endpoint dialling back for a shell session")
-        claim, stream = self.server.shells[wanted - 1]
+        claim, stream = server.shells[wanted - 1]
         self.assertEqual(claim, {"token": token},
                          "the endpoint claimed the session with the wrong "
                          "body")
         return stream
+
+    def an_endpoint_that_connected_under_this_tests_patches(self):
+        """A second server and endpoint, dialled with the patches in force.
+
+        `setUp` connects one before a test can change the host, and the
+        HELLO carries the history guard of the host as it was then. A
+        session whose guard has changed since is refused on purpose -- see
+        `_HistoryGuardChanged` -- so a test that strips bash after `setUp`
+        would be describing a host that lost bash mid-tunnel. Where what
+        it means is a host that never had one, it connects here instead.
+
+        Returns `(server, channel)` for `ask_for_a_shell`.
+        """
+        server = _FakeTunnelServer(self.store)
+        self.addCleanup(lambda: self.assertEqual(server.errors, []))
+        self.addCleanup(server.close)
+        self.start_endpoint(self.config_for(server.port,
+                                            identity="build-beta"))
+        self.wait_for(lambda: server.channel is not None,
+                      what="the second endpoint's command channel")
+        return server, server.channel
 
     def expect(self, stream, needle, timeout=20.0):
         """Read `stream` until `needle` arrives, or fail saying what did."""
@@ -1588,6 +2361,79 @@ class TestAShellSession(TunnelEndpointTestCase):
         else:
             self.addCleanup(os.environ.__setitem__, "HOME", previous)
         return home
+
+    def a_changed_environment(self, **values):
+        """Set (or, given None, remove) variables this process's children inherit.
+
+        The endpoint builds a session's environment from its own, so this
+        is how a variable the host "already has" is put under the test's
+        control. Restored afterwards.
+        """
+        for name, value in values.items():
+            previous = os.environ.get(name)
+            if previous is None:
+                self.addCleanup(os.environ.pop, name, None)
+            else:
+                self.addCleanup(os.environ.__setitem__, name, previous)
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    @staticmethod
+    def the_pages_red():
+        """`--red` as the page defines it, as the `r;g;b` an SGR code wants.
+
+        Read out of the page's own stylesheet rather than written down
+        here, so a palette change that the prompt did not follow fails.
+        """
+        path = os.path.join(os.path.dirname(beacon_mod.__file__),
+                            "server.py")
+        with open(path, encoding="utf-8") as handle:
+            found = re.search(r"--red:\s*#([0-9a-fA-F]{6})\s*;", handle.read())
+        assert found, "the page no longer defines --red"
+        value = found.group(1)
+        return ";".join(str(int(value[i:i + 2], 16)) for i in (0, 2, 4))
+
+    def assert_a_red_prompt(self, ps1):
+        """`ps1` is the interface's red around the host and directory.
+
+        Each property is one way a prompt goes wrong: no `\\h` or `\\w`
+        and it names neither; an escape outside `\\[ \\]` and bash
+        miscounts the width, so line editing wraps wrongly; no reset and
+        everything the operator types is red.
+        """
+        start = r"\[\e[38;2;%sm\]" % self.the_pages_red()
+        reset = r"\[\e[0m\]"
+        found = re.fullmatch(re.escape(start) + r"(.*)" + re.escape(reset)
+                             + r"\s*", ps1, re.DOTALL)
+        self.assertIsNotNone(
+            found, "the prompt is not the page's --red, wrapped in \\[ \\], "
+            "and reset at the end: %r" % (ps1,))
+        body = found.group(1)
+        self.assertIn("\\h", body, "the prompt does not name the host")
+        self.assertIn("\\w", body,
+                      "the prompt does not name the working directory")
+        self.assertNotIn("\\e", body,
+                         "something else is coloured inside the prompt")
+
+    def value_in_the_shell(self, stream, expansion):
+        """What `expansion` (e.g. `$PS1`) comes to inside the session, as text.
+
+        Printed between a `V<n>=[` and a `] END<n>` that cannot be in the
+        echo of the command, because each is split by a pair of quotes.
+        The stream's buffer is cumulative, so each call has a number of
+        its own and cannot be satisfied by an earlier call's output.
+        """
+        self._asked = getattr(self, "_asked", 0) + 1
+        n = b"%d" % self._asked
+        command = (b'echo "V""' + n + b'=[' + expansion + b']" "E""ND' + n
+                   + b'"\n')
+        data = self.run_in_the_shell(stream, command, b" END" + n)
+        found = re.findall(rb"V" + n + rb"=\[(.*?)\] END" + n, data,
+                           re.DOTALL)
+        self.assertEqual(len(found), 1, data)
+        return found[0].decode("utf-8", "replace")
 
     # ── the claim ──
 
@@ -1634,6 +2480,10 @@ class TestAShellSession(TunnelEndpointTestCase):
 
     @unittest.skipUnless(_HAS_PTY, _NO_PTY)
     def test_the_prompt_starts_in_the_root_directory(self):
+        # What is pinned is that `_SHELL_CWD` is handed to `Popen`, and it
+        # holds for bash. A login shell's own startup file may `cd`
+        # elsewhere, which is the user's configuration winning and not a
+        # fault here -- see the pin in `setUp`.
         stream = self.ask_for_a_shell()
 
         data = self.run_in_the_shell(stream, b"pwd\n", b"/\r\n")
@@ -1888,6 +2738,206 @@ class TestAShellSession(TunnelEndpointTestCase):
                       "guard it with a readability test like the lines "
                       "above it" % (line.strip(),))
 
+    def test_the_colour_defaults_are_set_before_the_host_is_sourced(self):
+        """Review Focus 5. Order is the whole requirement, in two parts.
+
+        The two environment variables are above everything. The prompt is
+        between the distribution's file and the operator's: above the
+        first, Debian's unconditional `PS1` overwrites it and it never
+        shows; below the second, it overwrites the operator's own.
+        """
+        rc = beacon_mod._SHELL_RCFILE
+        system_file = rc.rindex("/etc/bash.bashrc")
+        operators_file = rc.index('"$HOME/.bashrc"')
+        self.assertLess(rc.rindex("CLICOLOR"), system_file,
+                        "a CLICOLOR is set at or below the system file")
+        self.assertLess(rc.rindex("LSCOLORS"), system_file,
+                        "a LSCOLORS is set at or below the system file")
+        self.assertGreater(rc.index("PS1"), system_file,
+                           "the prompt is above /etc/bash.bashrc, which "
+                           "sets its own PS1 on Debian and ParrotOS and "
+                           "would overwrite it")
+        self.assertLess(rc.index("PS1"), operators_file,
+                        "the prompt is below ~/.bashrc, so it overwrites "
+                        "the operator's own")
+        self.assertEqual(rc.count("PS1"), 1)
+
+    def test_the_defaults_do_not_touch_what_the_host_already_has(self):
+        rc = beacon_mod._SHELL_RCFILE.lower()
+        self.assertNotIn("ls_colors", rc)
+        self.assertNotIn("dircolors", rc,
+                         "dircolors is the host's business, and a host with "
+                         "an LS_COLORS of its own would be overwritten")
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_a_stand_in_dircolors_is_never_run_and_ls_colors_is_kept(self):
+        """Measured rather than read: a `dircolors` on the PATH that would
+        set `LS_COLORS` is put there, and the session must not run it."""
+        stubs = os.path.join(self.root, "stub-bin")
+        os.makedirs(stubs)
+        for name in ("dircolors", "gdircolors"):
+            path = os.path.join(stubs, name)
+            with open(path, "w") as handle:
+                handle.write("#!/bin/sh\n"
+                             "echo \"LS_COLORS='di=1;31'; export LS_COLORS\"\n")
+            os.chmod(path, 0o755)
+        self.a_home_directory()
+        self.a_changed_environment(
+            PATH=stubs + os.pathsep + os.environ.get("PATH", ""),
+            LS_COLORS="di=1;34")
+        stream = self.ask_for_a_shell()
+        self.assertEqual(self.value_in_the_shell(stream, b"$LS_COLORS"),
+                         "di=1;34",
+                         "the host's LS_COLORS was replaced")
+        stream.close()
+
+        self.a_changed_environment(LS_COLORS=None)
+        stream = self.ask_for_a_shell()
+        self.assertEqual(
+            self.value_in_the_shell(stream, b"${LS_COLORS-unset}"), "unset",
+            "a host with no LS_COLORS was given one")
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_the_operators_own_settings_win_over_the_colour_defaults(self):
+        # The order test above reads text; this one asks a real bash. A
+        # `.bashrc` that sets its own prompt and its own colour variables
+        # has to be what the session ends up with.
+        self.a_home_directory(
+            bashrc='PS1="MINE> "\nCLICOLOR=0\nLSCOLORS=gxgxgxgxgxgxgxgxgxgxgx\n')
+        stream = self.ask_for_a_shell()
+
+        self.assertEqual(self.value_in_the_shell(stream, b"$PS1"), "MINE> ",
+                         "the default prompt overwrote the operator's own")
+        self.assertEqual(self.value_in_the_shell(stream, b"$CLICOLOR"), "0",
+                         "the default CLICOLOR overwrote the operator's own")
+        self.assertEqual(self.value_in_the_shell(stream, b"$LSCOLORS"),
+                         "gxgxgxgxgxgxgxgxgxgxgx",
+                         "the default LSCOLORS overwrote the operator's own")
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_a_host_with_no_configuration_gets_colour_and_a_red_prompt(self):
+        self.a_changed_environment(CLICOLOR=None, LSCOLORS=None)
+        self.a_home_directory()
+        stream = self.ask_for_a_shell()
+
+        self.assertEqual(self.value_in_the_shell(stream, b"$CLICOLOR"), "1")
+        self.assertRegex(self.value_in_the_shell(stream, b"$LSCOLORS"),
+                         r"^(?:[a-hA-Hx]{2}){11}$",
+                         "LSCOLORS is not eleven pairs of BSD colour letters")
+        self.assert_a_red_prompt(self.value_in_the_shell(stream, b"$PS1"))
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_colour_variables_already_in_the_environment_are_kept(self):
+        """The defaults fill a gap; they never replace what the host has."""
+        self.a_changed_environment(CLICOLOR="0",
+                                   LSCOLORS="gxfxcxdxbxegedabagacad")
+        self.a_home_directory()
+        stream = self.ask_for_a_shell()
+
+        self.assertEqual(self.value_in_the_shell(stream, b"$CLICOLOR"), "0",
+                         "an existing CLICOLOR was overwritten")
+        self.assertEqual(self.value_in_the_shell(stream, b"$LSCOLORS"),
+                         "gxfxcxdxbxegedabagacad",
+                         "an existing LSCOLORS was overwritten")
+
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_the_prompt_survives_the_system_file_and_the_operators_wins(self):
+        """What a real bash does with the generated file, around a system file.
+
+        The endpoint cannot be given a stand-in `/etc/bash.bashrc`: the
+        path is fixed in the generated file and the test may not write to
+        `/etc`. So this runs a real bash on the generated text with that
+        one path swapped for a file of the test's own that sets a `PS1`,
+        as Debian's does. What it proves is the ordering behaviour of bash
+        on the file this code generates. That the real `/etc/bash.bashrc`
+        of a Debian host looks like the stand-in is reasoned, not measured
+        here.
+        """
+        import subprocess
+        rc = beacon_mod._SHELL_RCFILE
+        self.assertIn("/etc/bash.bashrc", rc)
+        system = os.path.join(self.root, "stand-in-system-bashrc")
+        with open(system, "w") as handle:
+            handle.write('PS1="DISTRO> "\n')
+        rcfile = os.path.join(self.root, "generated-rcfile")
+        with open(rcfile, "w") as handle:
+            handle.write(rc.replace("/etc/bash.bashrc", system))
+
+        def prompt_with(bashrc):
+            home = self.a_home_directory(bashrc=bashrc)
+            done = subprocess.run(
+                ["/bin/bash", "--rcfile", rcfile, "-i"],
+                input=b'echo "P""=[$PS1]"\nexit\n', cwd=home,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                env=dict(os.environ, HOME=home), timeout=30)
+            found = re.findall(r"(?m)^P=\[(.*)\]$",
+                               done.stdout.decode("utf-8", "replace"))
+            self.assertEqual(len(found), 1, done.stdout)
+            return found[0]
+
+        ours = prompt_with(None)
+        self.assertNotEqual(ours, "DISTRO> ",
+                            "the distribution's prompt survived ours")
+        self.assert_a_red_prompt(ours)
+        self.assertEqual(prompt_with('PS1="MINE> "\n'), "MINE> ",
+                         "our prompt overwrote the operator's own")
+
+    @unittest.skipUnless(_HAS_PTY, _NO_PTY)
+    @unittest.skipUnless(_HAS_BASH, _NO_BASH)
+    def test_a_bash_login_shell_outside_bin_is_handed_the_rcfile_too(self):
+        """The path nothing had walked: a login shell that is a bash.
+
+        `_login_shell` accepts bash by basename, `_guard_of` calls any
+        bash "off", and `_shell_invocation` therefore hands it the
+        generated rcfile: a user whose login shell is
+        `/opt/homebrew/bin/bash` gets this file, not only the fallback.
+        `setUp` pins `_login_shell` to `""`, which is why no test went
+        down here. A symlink named `bash` in a directory of the test's own
+        stands in for a bash that is not `/bin/bash`.
+        """
+        directory = os.path.join(self.root, "opt", "bin")
+        os.makedirs(directory)
+        login = os.path.join(directory, "bash")
+        os.symlink("/bin/bash", login)
+        self.patched("_login_shell", lambda: login)
+        self.assertEqual(beacon_mod._history_guard(), ("off", ""),
+                         "a bash login shell is not given the rcfile")
+
+        # The history lines run last: a `.bashrc` that turns history on
+        # and names a file must find both undone.
+        self.a_home_directory(bashrc='HISTFILE="$HOME/.bash_history"\n'
+                                     'set -o history\n')
+        stream = self.ask_for_a_shell()
+        self.assertEqual(self.value_in_the_shell(stream, b"$BASH"), login,
+                         "the session did not run the login shell")
+        self.assertEqual(self.value_in_the_shell(stream, b"$HISTFILE"), "",
+                         "the history lines did not run last")
+        self.assertEqual(
+            self.value_in_the_shell(
+                stream, b"$(set -o | grep -c '^history.*on$')"), "0",
+            "history is on in a bash login shell")
+        # The prompt is ours, since the `.bashrc` above sets none.
+        self.assert_a_red_prompt(self.value_in_the_shell(stream, b"$PS1"))
+        stream.close()
+
+        # And the operator's own prompt still wins over it.
+        self.a_home_directory(bashrc='PS1="MINE> "\n')
+        stream = self.ask_for_a_shell()
+        self.assertEqual(self.value_in_the_shell(stream, b"$PS1"), "MINE> ",
+                         "our prompt overwrote a bash login shell's own")
+
+    def test_the_rcfile_still_ends_by_turning_history_off(self):
+        """The colour lines went in above the sourcing; the history lines
+        must stay below it, or the host's rc runs after them."""
+        rc = beacon_mod._SHELL_RCFILE
+        self.assertGreater(rc.index("unset HISTFILE"),
+                           rc.index('"$HOME/.bashrc"'))
+        self.assertTrue(rc.rstrip().endswith("set +o history"))
+
     @unittest.skipUnless(_HAS_PTY, _NO_PTY)
     @unittest.skipUnless(_HAS_BASH, _NO_BASH)
     def test_the_generated_rcfile_leaves_nothing_on_disk(self):
@@ -1963,8 +3013,16 @@ class TestAShellSession(TunnelEndpointTestCase):
         # wanted here -- a host stripped to `/bin/sh` is a host unlikely
         # to carry util-linux -- and whoever maintains the setsid path
         # should know that this test does not exercise it.
+        #
+        # The endpoint is connected *after* the patch, because its HELLO
+        # reports which history guard a session here gets and a session
+        # whose guard has changed since is refused. A host that never had
+        # bash is what this test means; a host that lost it mid-tunnel is
+        # `TestARefusedShellSession`'s business.
         self.patched("_shell_executable", lambda path: False)
-        stream = self.ask_for_a_shell()
+        server, channel = \
+            self.an_endpoint_that_connected_under_this_tests_patches()
+        stream = self.ask_for_a_shell(server=server, channel=channel)
 
         data = self.run_in_the_shell(
             stream, b'echo "S""=[$0]" "H""=[$HISTFILE]"\n', b"S=[")
@@ -2007,6 +3065,8 @@ class TestAShellSession(TunnelEndpointTestCase):
         self.assertEqual(argv[:2], [wrapper, "-c"],
                          "the shell was not spawned through the wrapper "
                          "asking for a controlling terminal: %r" % (argv,))
+        # Bash or `/bin/sh` only because `setUp` pins the login shell off;
+        # with the host's own choice this would be whatever that is.
         self.assertIn(argv[2], ("/bin/bash", "/bin/sh"))
         self.assertIn("-i", argv[3:])
 
