@@ -4868,6 +4868,23 @@ header .info{font-size:11px;color:var(--text2)}
    vendored grey, because its classes are hash-pinned (static/VENDOR.md). */
 #opshell-body::-webkit-scrollbar{width:6px}
 #opshell-body::-webkit-scrollbar-thumb{background:var(--red-dim);border-radius:3px}
+/* The shell's own buttons and picker. `.fd-btn` is not borrowed: it is the
+   file browser's and the Listeners panel's, it is display:flex (two of them
+   side by side stack), and its --bg2 and --bg3 are defined nowhere. */
+.opshell-btn{
+  display:inline-flex;align-items:center;gap:4px;padding:4px 10px;
+  border:1px solid var(--border);border-radius:4px;
+  background:rgba(255,255,255,0.04);color:var(--text);
+  font-family:var(--sans);font-size:11px;cursor:pointer;transition:all 0.15s;
+}
+.opshell-btn:hover{background:rgba(255,26,26,0.15);border-color:var(--red-dim);color:var(--red)}
+.opshell-btn-primary{background:rgba(255,26,26,0.12);border-color:var(--red-dim)}
+.opshell-pick{
+  padding:4px 8px;margin:0 4px;background:var(--surface2);color:var(--text);
+  border:1px solid var(--border);border-radius:4px;
+  font-family:var(--mono);font-size:11px;cursor:pointer;transition:all 0.15s;
+}
+.opshell-pick:hover,.opshell-pick:focus{border-color:var(--red-dim);outline:none}
 
 /* The card, parked.
    The dock sits in the sidebar under .agent-list and never inside it:
@@ -9368,8 +9385,8 @@ function opshellPicker(state){
   const pick = (state.candidates || []).map(a =>
     '<option value="' + esc(a) + '"' + (a === state.target ? ' selected' : '')
     + '>' + esc(a) + '</option>').join("");
-  return '<label>Device <select id="opshell-agent">' + pick + '</select></label> '
-    + '<button class="fd-btn" onclick="opshellOpen(event)">Open a shell</button>'
+  return '<label>Device <select id="opshell-agent" class="opshell-pick">' + pick + '</select></label> '
+    + '<button class="opshell-btn opshell-btn-primary" onclick="opshellOpen(event)">Open a shell</button>'
     + '<p class="loot-empty">This raises the channel on that device and '
     + 'drops it again when the session ends. Both cost one check-in.</p>';
 }
@@ -9410,8 +9427,8 @@ function opshellRender(state){
       // lapsed and stopped it without anyone asking.
       return strip
         + '<p>This channel is up, and this page is not holding it.</p>'
-        + '<button class="fd-btn" onclick="opshellOpen(event)">Attach</button> '
-        + '<button class="fd-btn" onclick="opshellEndAfterAttach(event)">'
+        + '<button class="opshell-btn opshell-btn-primary" onclick="opshellOpen(event)">Attach</button> '
+        + '<button class="opshell-btn" onclick="opshellEndAfterAttach(event)">'
         + 'End the session</button>'
         + '<p class="loot-empty">Ending it takes the channel over and then '
         + 'drops it, so the shutdown goes through the one place that decides '

@@ -6974,10 +6974,9 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
 
     def test_the_frame_is_not_on_the_measured_host(self):
         body = self.one_rule("opshell-term", "#opshell-term")
-        for prop in ("padding", "border:", "border-width"):
-            self.assertNotIn(prop, body,
-                             "opshellMeasure reads this element's rect for the "
-                             "cols it sends to /stream")
+        self.assertNotRegex(body, r"padding|border",
+                            "opshellMeasure reads this element's rect for the "
+                            "cols it sends to /stream")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_frame_is_on_a_wrapper_inside_the_live_box(self):
@@ -7003,7 +7002,36 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
 
     def test_the_bodys_scrollbar_is_the_houses_and_the_terminals_is_not_touched(self):
         self.assertIn("#opshell-body::-webkit-scrollbar", STYLE_BLOCK)
+        thumb = self.one_rule("opshell-body",
+                              "#opshell-body::-webkit-scrollbar-thumb")
+        self.assertIn("var(--red-dim)", thumb)
         self.assertNotIn(".xterm", STYLE_BLOCK)
+
+    def test_the_shells_buttons_sit_in_a_row(self):
+        body = self.one_rule("opshell-btn", ".opshell-btn")
+        self.assertIn("display:inline-flex", body)
+        self.assertNotIn("display:flex;", body)
+
+    def test_the_shell_no_longer_borrows_the_file_download_button(self):
+        for name in ("opshellPicker", "opshellRender"):
+            self.assertNotIn("fd-btn", self.js_function(name))
+
+    def test_the_listeners_panel_keeps_its_own_button_untouched(self):
+        # A fence and not an endorsement. `.fd-btn` is shared with the
+        # Listeners panel and its `var(--bg2)` and `var(--bg3)` are defined
+        # nowhere, which is a real defect there. Fixing it is separate work
+        # that needs that panel's own verification; this pins it so it
+        # cannot ship inside the Operator Shell's branch without that.
+        self.assertEqual(len(_css_rules(STYLE_BLOCK, "fd-btn", ".fd-btn")), 1)
+        self.assertIn("var(--bg2)", self.one_rule("fd-btn", ".fd-btn"))
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_picker_is_themed_and_still_readable_by_its_id(self):
+        html = self.render(state="idle", channel="closed", candidates=["pi"])
+        self.assertIn('id="opshell-agent"', html)
+        self.assertIn("opshell-pick", html)
+        self.assertIn("var(--border)", self.one_rule("opshell-pick",
+                                                    ".opshell-pick"))
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_minimising_twice_parks_one_card(self):
