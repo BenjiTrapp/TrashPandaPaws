@@ -292,3 +292,71 @@ touch the markup it rewrites, and one of the changes — the terminal's frame
   as long as no other panel's appearance changes.
 - The order of commits, and whether the body's text rule and the geometry
   hole are one commit or two.
+
+## Known limitations, as built
+
+Looked at on 2026-11-23 in headless Chrome, through `tools/demo_env.py`
+(a real C2 with one real beacon checked in, `raccoon-bandit`, and **no
+tunnel server**) and `tools/capture_gui.py`. No live device was involved,
+no hardware implant and no tunnel endpoint, so nothing below was seen
+carrying a real shell.
+
+**Seen, in the state the server really put the view in:**
+- The view as it opens with no session, at 1440×900 and at 900×500: the
+  framed card, its 8 px gutter with the wallpaper showing through it and
+  through the translucent surface, the chrome, the strip with one pill
+  (`channel closed`) and no empty hole where the geometry would be, the
+  themed picker and "Open a shell" **side by side**, and the server's own
+  reason that no tunnel server is configured.
+- That at 900×500 the idle body fits (`scrollHeight` equals
+  `clientHeight`, 378 px) and nothing is clipped.
+
+**Seen only by drawing the real `opshellRender` markup with a made-up
+state**, because the state itself needs a tunnel endpoint the demo does not
+have. These say how the markup lays out, not that the view reaches them:
+- The live box at 900×900, 900×500 and 900×300. At 300 the host stops at
+  its 72 px floor, the body overflows by 16 px and `scrollTop` moves, so a
+  short card **scrolls rather than clipping** the host. The box was empty:
+  no xterm was attached, so the terminal's own rendering inside the box was
+  not seen.
+- "Attach" and "End the session" sitting side by side, and the `root`,
+  geometry, `recording` and `channel open` pills.
+
+**Not seen at all:**
+- **The device dropdown open.** Headless Chrome draws a native `<select>`'s
+  list outside the page, so a page screenshot cannot contain it;
+  `showPicker()` with a user gesture changed no pixel in the card. The
+  closed control is themed. The open list is not styled by this change (`.opshell-pick`
+  sets nothing on `option`), so on macOS it is the system menu and
+  elsewhere it follows the control's colours — neither was looked at.
+- The waiting state's number, the closing state's word, the closed state's
+  duration, a parked card, and the terminal's text and cursor: each needs a
+  tunnel endpoint or a live channel. They are covered by the node
+  behavioural tests and by nothing a person has looked at.
+- Any scrollbar: the capture tool runs Chrome with `--hide-scrollbars`, so
+  the body's red thumb was not seen either.
+- Safari. The floor is 14.1 and only Chrome was run.
+
+**Left by decision:**
+- The terminal's own scrollbar stays the vendored grey: its classes are
+  hash-pinned (`static/VENDOR.md`), and this change styles nothing under
+  `.xterm`.
+- `.fd-btn`'s undefined `--bg2` and `--bg3` stay, fenced by a test, for the
+  file browser's own change; its only wearers are `fbShowDetail`'s detail
+  actions.
+
+**Found by looking, and covered by no test:**
+- With no session the strip reads `no device chosen` while the picker
+  beside it already shows `raccoon-bandit` selected: the picker falls back
+  to its first option when `state.target` is empty. Older than this branch,
+  and a rendered sentence, so not changed here.
+- The "Device" label is the body's 13 px sans and the picker 11 px mono, so
+  the label reads larger than the control it names; the reason above the
+  row and the note below it sit flush against it with no spacing of their
+  own.
+- When the user is root the strip says `root` twice, as the user and as the
+  pill.
+- In the live box at short heights the footnote sits directly under the
+  box's border with no margin.
+- The `_` control sits on its baseline, visibly lower than the `✕` beside
+  it.
