@@ -27,8 +27,13 @@ taste:
   and the hover's `var(--bg3)` are defined nowhere in the stylesheet, so the
   Open/Attach/End buttons have no background at all; and because `.fd-btn`
   is `display:flex`, "Attach" and "End the session" stack vertically instead
-  of sitting side by side (`server.py:4635-4646`). The class is shared with
-  the Listeners panel (`:8453`, `:8456`), which has the same two defects.
+  of sitting side by side (`server.py:4635-4646`). The class's only other
+  wearer is the file browser's detail actions, drawn by `fbShowDetail` --
+  `fbLootDir`, `fbLoadDir`, `fbDownloadFile`, the `View` button and
+  `fbUploadTo` -- which have the same two defects. (An earlier draft said
+  the Listeners panel, citing two line numbers taken from a reading before
+  other work merged. Neither was true; consumers are named by function
+  here because line numbers rot.)
 - **`#opshell-body` permanently carries `.loot-loading`** — added at
   creation and never removed (`:8853`), so the whole card body inherits the
   loot panel's *loading text* style, `color:var(--text2);font-size:13px`.
@@ -149,7 +154,8 @@ operator picked the first.
    button vocabularies live side by side.
 2. **Borrow `.pcard-head`, `.pcard-pill`, `.terminal` and
    `.log-controls select`, and fix `.fd-btn` globally.** Least new CSS, and
-   it would fix the same button defect in the Listeners panel. Rejected
+   it would fix the same button defect in the file browser's detail
+   actions. Rejected
    because it dresses the window in the panel's clothes — the very thing
    that makes it read as a panel today — and because a later change to
    `.pcard-head` for the tunnel cards would silently restyle the shell.
@@ -161,7 +167,8 @@ operator picked the first.
    blast radius in the suite than in the CSS.
 
 **`.fd-btn` is left alone.** Fixing its two undefined variables would also
-change the Listeners panel, which deserves its own verification. It is
+change the file browser's detail actions (`fbShowDetail`'s Loot, Open,
+Download, View and Upload buttons), which deserve their own verification. It is
 recorded as a separate todo, not smuggled in here.
 
 ## What it looks like

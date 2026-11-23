@@ -25,7 +25,7 @@ Copied from the spec; every task's requirements include these.
 - Safari 14.1: flexbox `gap` yes; `:has()`, container queries and unprefixed `backdrop-filter` no.
 - `--mono` stays on its own line inside `:root`, ending in `;`.
 - No wording changes to any sentence the view renders.
-- `.fd-btn` and `.loot-empty` are **not** edited: the first is shared with the Listeners panel, the second with four panels.
+- `.fd-btn` and `.loot-empty` are **not** edited: the first is shared with the file browser's detail actions (`fbShowDetail`: `fbLootDir`, `fbLoadDir`, `fbDownloadFile`, the `View` button, `fbUploadTo`), the second with four panels.
 
 ## Review Focus
 
@@ -313,7 +313,7 @@ def test_the_shell_no_longer_borrows_the_file_download_button(self):
     for name in ("opshellPicker", "opshellRender"):
         self.assertNotIn("fd-btn", self.js_function(name))
 
-def test_the_listeners_panel_keeps_its_own_button_untouched(self):
+def test_the_file_browsers_button_is_kept_untouched(self):
     self.assertEqual(len(_css_rules(STYLE_BLOCK, "fd-btn", ".fd-btn")), 1)
     self.assertIn("var(--bg2)", self.one_rule("fd-btn", ".fd-btn"))
 
@@ -325,7 +325,7 @@ def test_the_picker_is_themed_and_still_readable_by_its_id(self):
                                                 ".opshell-pick"))
 ```
 
-The third test is deliberate: it pins that this change does **not** fix `.fd-btn`'s undefined variable, because that belongs to the Listeners panel and its own verification.
+The third test is deliberate: it pins that this change does **not** fix `.fd-btn`'s undefined variable, because that belongs to the file browser's detail actions (`fbShowDetail`) and their own verification. An earlier draft of this plan, and of the test's name, said the Listeners panel, which was never a consumer.
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -415,7 +415,7 @@ Run the C2 with the demo data, open the operator GUI, open the shell view, and c
 
 - [ ] **Step 2: Write the limitations down**
 
-In the design doc, a section naming what the build could not measure: no live device, which states were seen in a browser and which only in tests, and the `.fd-btn` fix left to the Listeners panel.
+In the design doc, a section naming what the build could not measure: no live device, which states were seen in a browser and which only in tests, and the `.fd-btn` fix left to the file browser's own change.
 
 - [ ] **Step 3: Touch `docs/TUNNEL.md` only if it now says something false**
 

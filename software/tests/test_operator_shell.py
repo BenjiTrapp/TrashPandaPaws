@@ -3932,9 +3932,16 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # the terminal untouched -- and 117 against 119 once the review of
         # that brought two: where the helper cuts what is left, and that a
         # host or a reason of any length leaves the sentence it is written
-        # into on the line --
+        # into on the line -- and 137 against 138 once the window look
+        # brought fourteen: four for the strip's pills, three for the
+        # terminal's box and the short card that still scrolls, three for
+        # the body's scrollbar, its loading class and its text size, and
+        # four for the shell's own buttons and picker and the file
+        # browser's button fenced off. The floor had already slid to 117
+        # against 124 before that, five tests landing without it being
+        # raised, which is the slack this floor exists to refuse --
         self.assertGreaterEqual(
-            len(names), 117,
+            len(names), 137,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -7009,8 +7016,13 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
 
     def test_the_body_is_not_permanently_a_loading_message(self):
         src = self.js_function("showOperatorShell")
-        self.assertNotIn('classList.add("loot-loading")', src)
-        self.assertIn('<div class="loot-loading">Loading...</div>', src)
+        inner = '<div class="loot-loading">Loading...</div>'
+        self.assertIn(inner, src)
+        # Every other way of putting the class on the body itself --
+        # `classList.add`, `body.className = ...`, `setAttribute("class")`,
+        # `classList.toggle` -- names it outside that one child, so the
+        # class may appear nowhere else in the function.
+        self.assertNotIn("loot-loading", src.replace(inner, ""))
 
     def test_the_body_states_its_own_text_size(self):
         body = self.one_rule("opshell-body", "#opshell-body")
@@ -7031,9 +7043,9 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
 
     def test_the_file_browsers_button_is_kept_untouched(self):
         # A fence and not an endorsement. `.fd-btn` is worn only by the file
-        # browser's detail actions (`fbLootDir`, `fbLoadDir`,
-        # `fbDownloadFile`, the `View` button and `fbUploadTo`, in
-        # `server.py` around lines 8507-8513). Its `var(--bg2)` and
+        # browser's detail actions, which `fbShowDetail` draws: `fbLootDir`,
+        # `fbLoadDir`, `fbDownloadFile`, the `View` button and `fbUploadTo`.
+        # Named by function, because line numbers rot. Its `var(--bg2)` and
         # `var(--bg3)` are defined nowhere, which is a real defect there.
         # Fixing it is separate work that needs that panel's own
         # verification; this pins it so it cannot ship inside the Operator
