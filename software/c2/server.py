@@ -4798,11 +4798,19 @@ header .info{font-size:11px;color:var(--text2)}
    A flex sibling of .content inside .main, and .content is hidden while it
    is there: .main is a row holding the 260px agent list beside .content, so
    a layer positioned over .main would cover the list this layout keeps
-   clickable, and two flex:1 siblings would split the column in half. */
-.opshell-card{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+   clickable, and two flex:1 siblings would split the column in half.
+   The 8px margin is what makes the frame and the shadow visible at all; it
+   costs the terminal 2 columns and 1 row (measured at 1440x900). */
+.opshell-card{
+  flex:1;display:flex;flex-direction:column;overflow:hidden;margin:8px;
+  background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  box-shadow:0 8px 32px rgba(0,0,0,0.6);
+}
 .opshell-chrome{
   display:flex;align-items:center;gap:10px;flex:none;
-  padding:8px 16px;background:var(--surface);border-bottom:1px solid var(--border);
+  padding:8px 16px;border-radius:8px 8px 0 0;
+  background:linear-gradient(to bottom,var(--surface2),var(--surface));
+  border-bottom:1px solid var(--border);
   font-family:var(--mono);font-size:12px;color:var(--text);
 }
 .opshell-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -4812,7 +4820,25 @@ header .info{font-size:11px;color:var(--text2)}
   border-radius:3px;transition:color 0.15s,background 0.15s;
 }
 .opshell-ctl:hover{color:var(--text);background:rgba(255,26,26,0.12)}
-#opshell-body{flex:1;min-height:0;overflow:auto;padding:12px 16px}
+#opshell-body{flex:1;min-height:0;overflow:auto;padding:12px 16px;font-size:13px;color:var(--text)}
+/* The status strip. Its bleed to the card's edge is the body's 16px
+   padding above, so the divider runs edge to edge; change one and the
+   other. The pill is modelled on .pcard-pill and is its own rule: that
+   one belongs to the tunnel panel's cards (drawTunnel). */
+.opshell-strip{
+  display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;
+  margin:0 -16px 10px;padding:0 16px 8px;
+  border-bottom:1px solid var(--border);
+  font-family:var(--mono);font-size:11px;color:var(--text2);
+}
+.opshell-who{min-width:0;word-break:break-all;color:var(--text)}
+.opshell-pill{
+  display:inline-block;padding:1px 8px;border-radius:9px;font-size:10px;
+  border:1px solid var(--border);background:var(--surface2);color:var(--text2);
+}
+.opshell-pill-root{border-color:var(--orange);color:var(--orange)}
+.opshell-pill-rec{border-color:var(--red-dim);color:var(--red)}
+.opshell-pill-ok{border-color:var(--green-dim);color:var(--green)}
 /* The one-off note above the body, for what a reload could not put back.
    flex:none so it takes its own height and leaves the body the rest. */
 .opshell-note{flex:none;padding:10px 16px 0}
@@ -4829,7 +4855,36 @@ header .info{font-size:11px;color:var(--text2)}
    with nothing to scroll. overflow is hidden because the terminal inside is
    a whole number of rows and the host is not. */
 .opshell-live{display:flex;flex-direction:column;min-height:100%}
+/* The terminal's box. On a wrapper and never on #opshell-term: opshellMeasure
+   reads the host's rect once for the cols and rows it sends to /stream, so
+   padding or a border there reports room the terminal does not have and
+   overflow:hidden clips the surplus. The wrapper passes the flex chain on:
+   flex:1 takes what the strip and the footnote leave, display:flex hands it
+   to the host's flex:1. Its 8px padding and 1px border are what the
+   measured 154x49 at 1440x900 already paid for. */
+.opshell-screen{flex:1;min-height:0;display:flex;padding:8px;border:1px solid var(--border);border-radius:6px;background:rgba(0,0,0,0.6)}
 #opshell-term{flex:1;min-height:72px;overflow:hidden}
+/* The body's scrollbar is the house's. The terminal's own stays the
+   vendored grey, because its stylesheet is hash-pinned (static/VENDOR.md). */
+#opshell-body::-webkit-scrollbar{width:6px}
+#opshell-body::-webkit-scrollbar-thumb{background:var(--red-dim);border-radius:3px}
+/* The shell's own buttons and picker. `.fd-btn` is not borrowed: it is the
+   file browser's, it is display:flex (two of them side by
+   side stack), and its --bg2 and --bg3 are defined nowhere. */
+.opshell-btn{
+  display:inline-flex;align-items:center;gap:4px;padding:4px 10px;
+  border:1px solid var(--border);border-radius:4px;
+  background:rgba(255,255,255,0.04);color:var(--text);
+  font-family:var(--sans);font-size:11px;cursor:pointer;transition:all 0.15s;
+}
+.opshell-btn:hover{background:rgba(255,26,26,0.15);border-color:var(--red-dim);color:var(--red)}
+.opshell-btn-primary{background:rgba(255,26,26,0.12);border-color:var(--red-dim)}
+.opshell-pick{
+  padding:4px 8px;margin:0 4px;background:var(--surface2);color:var(--text);
+  border:1px solid var(--border);border-radius:4px;
+  font-family:var(--mono);font-size:11px;cursor:pointer;transition:all 0.15s;
+}
+.opshell-pick:hover,.opshell-pick:focus{border-color:var(--red-dim);outline:none}
 
 /* The card, parked.
    The dock sits in the sidebar under .agent-list and never inside it:
@@ -8850,8 +8905,7 @@ async function showOperatorShell(){
   // node and the poll finds it by id.
   const body = document.createElement("div");
   body.id = "opshell-body";
-  body.classList.add("loot-loading");
-  body.innerHTML = "Loading...";
+  body.innerHTML = '<div class="loot-loading">Loading...</div>';
   card.appendChild(chrome);
   // What the last reload could not put back, said once. `opshellResume`
   // leaves this behind when the server says the remembered session is not
@@ -9330,8 +9384,8 @@ function opshellPicker(state){
   const pick = (state.candidates || []).map(a =>
     '<option value="' + esc(a) + '"' + (a === state.target ? ' selected' : '')
     + '>' + esc(a) + '</option>').join("");
-  return '<label>Device <select id="opshell-agent">' + pick + '</select></label> '
-    + '<button class="fd-btn" onclick="opshellOpen(event)">Open a shell</button>'
+  return '<label>Device <select id="opshell-agent" class="opshell-pick">' + pick + '</select></label> '
+    + '<button class="opshell-btn opshell-btn-primary" onclick="opshellOpen(event)">Open a shell</button>'
     + '<p class="loot-empty">This raises the channel on that device and '
     + 'drops it again when the session ends. Both cost one check-in.</p>';
 }
@@ -9343,15 +9397,21 @@ function opshellRender(state){
   // Its own row, not `.pcard-kv`: that class is a label/value grid, and
   // borrowing it stacked the whole strip into one narrow column. Seen in
   // the browser, which is the only place a layout can be seen.
-  let strip = '<div style="display:flex;gap:10px;flex-wrap:wrap;'
-    + 'align-items:center;font-size:11px;color:var(--text2);'
-    + 'margin:0 0 10px">'
-    + '<span>' + esc(state.host || state.target || "no device chosen") + '</span>'
-    + (state.user ? '<span>' + esc(state.user) + '</span>' : '')
-    + (state.root ? '<span style="color:var(--orange)">root</span>' : '')
-    + '<span>' + esc(geom) + '</span>'
-    + (state.recording ? '<span style="color:var(--red)">&#9679; recording</span>' : '')
-    + '<span>channel ' + esc(chan) + '</span>'
+  // A claim with no value is not drawn at all: the geometry is null in
+  // every state before a bridge exists, and an empty element is a hole in
+  // the row. `mark` is markup written here and never text from the machine;
+  // the value is always escaped.
+  const claim = (cls, value, mark) =>
+    (value === null || value === undefined || value === "") ? ''
+      : '<span class="' + cls + '">' + (mark || '') + esc(value) + '</span>';
+  const pill = mod => 'opshell-pill' + (mod ? ' opshell-pill-' + mod : '');
+  let strip = '<div class="opshell-strip">'
+    + claim('opshell-who', state.host || state.target || "no device chosen")
+    + claim('opshell-who', state.user)
+    + (state.root ? claim(pill('root'), 'root') : '')
+    + claim(pill(), geom)
+    + (state.recording ? claim(pill('rec'), 'recording', '&#9679; ') : '')
+    + claim(pill(chan === "open" ? 'ok' : ''), 'channel ' + chan)
     + '</div>';
   if(state.reason){
     strip += '<p class="loot-empty">' + esc(state.reason) + '</p>';
@@ -9366,15 +9426,16 @@ function opshellRender(state){
       // lapsed and stopped it without anyone asking.
       return strip
         + '<p>This channel is up, and this page is not holding it.</p>'
-        + '<button class="fd-btn" onclick="opshellOpen(event)">Attach</button> '
-        + '<button class="fd-btn" onclick="opshellEndAfterAttach(event)">'
+        + '<button class="opshell-btn opshell-btn-primary" onclick="opshellOpen(event)">Attach</button> '
+        + '<button class="opshell-btn" onclick="opshellEndAfterAttach(event)">'
         + 'End the session</button>'
         + '<p class="loot-empty">Ending it takes the channel over and then '
         + 'drops it, so the shutdown goes through the one place that decides '
         + 'them -- and a channel this view did not raise comes back with the '
         + 'reason it cannot be dropped.</p>';
     }
-    return '<div class="opshell-live">' + strip + '<div id="opshell-term"></div>'
+    return '<div class="opshell-live">' + strip
+      + '<div class="opshell-screen"><div id="opshell-term"></div></div>'
       + '<p class="loot-empty">exit, or Ctrl-D, ends the session. The '
       + '&#10005; above closes the card and queues the channel\'s '
       + 'shutdown, which takes effect at the next check-in; the _ parks '

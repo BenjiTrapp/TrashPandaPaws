@@ -510,6 +510,8 @@ the reason nobody found the feature: you had to know a tunnel existed, type
 being told how long, read a port and a password out of a card, and forward
 a port before you could attach.
 
+![The Operator Shell card idle, with no session open and no tunnel server configured](screenshots/37_operator_shell_window.png)
+
 It is **one** terminal onto the operator's own hardware implant, and
 deliberately not a per-agent feature — lateral movement keeps the
 task-based `shell` command. Three rules shape it, and all three were

@@ -3182,8 +3182,43 @@ class _GuiCase(unittest.TestCase):
         """
         return _css_rules(STYLE_BLOCK, name, selector)
 
+    def one_rule(self, name, selector):
+        """The body of the one rule spelled `selector`; fails on 0 or 2."""
+        rules = self.css_rules(name, selector)
+        self.assertEqual(len(rules), 1,
+                         "expected exactly one %s rule, got %d"
+                         % (selector, len(rules)))
+        return rules[0]
+
 
 class TestTheGlyphAndTheView(_GuiCase):
+    def test_the_card_is_framed_and_therefore_inset(self):
+        body = self.one_rule("opshell-card", ".opshell-card")
+        for prop in ("border-radius", "box-shadow", "margin"):
+            self.assertIn(prop, body,
+                          "a framed card needs %s; measured, the frame and "
+                          "the shadow are invisible without the margin"
+                          % prop)
+
+    def test_the_card_is_translucent_like_every_sibling_surface(self):
+        body = self.one_rule("opshell-card", ".opshell-card")
+        self.assertIn("var(--surface)", body)
+        self.assertNotIn("background:var(--bg)", body)
+
+    def test_no_css_newer_than_the_browser_floor_is_used_unprefixed(self):
+        # A regression fence for the Safari 14.1 floor: it passes today by
+        # design, and fails the day someone reaches for a newer feature.
+        for forbidden in (":has(", "@container", "aspect-ratio:"):
+            self.assertNotIn(forbidden, STYLE_BLOCK)
+        # Scoped to this view's rules: `.toolbar button` elsewhere in the
+        # page already uses the unprefixed property and is not this view's.
+        # Comments stripped first, as `_css_rules` does: one that mentions
+        # `opshell` or holds a brace would otherwise distort the parse.
+        bare = re.sub(r"/\*.*?\*/", "", STYLE_BLOCK, flags=re.S)
+        for sel, body in _css_blocks(bare):
+            if "opshell" in sel and "backdrop-filter" in body:
+                self.assertIn("-webkit-backdrop-filter", body, sel)
+
     def test_the_header_carries_a_terminal_glyph_that_opens_the_view(self):
         self.assertIn("showOperatorShell()", self.header_block())
 
@@ -3447,6 +3482,15 @@ class TestTheViewDoesNotOverclaim(_GuiCase):
         for line in render.splitlines():
             if '"closing"' in line:
                 self.assertNotIn("Channel closed", line)
+
+    def test_the_strip_is_a_class_and_not_an_inline_style(self):
+        src = self.js_function("opshellRender")
+        self.assertIn('class="opshell-strip"', src)
+        self.assertNotIn('style="display:flex', src)
+
+    def test_a_very_long_host_does_not_push_the_controls_away(self):
+        self.assertIn("flex-wrap:wrap",
+                      self.one_rule("opshell-strip", ".opshell-strip"))
 
     def test_the_strip_states_the_user_and_does_not_assume_root(self):
         # The tunnel panel carries this scar already: it "used to state
@@ -3888,9 +3932,16 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # the terminal untouched -- and 117 against 119 once the review of
         # that brought two: where the helper cuts what is left, and that a
         # host or a reason of any length leaves the sentence it is written
-        # into on the line --
+        # into on the line -- and 138 against 138 once the window look
+        # brought fourteen: four for the strip's pills, three for the
+        # terminal's box and the short card that still scrolls, three for
+        # the body's scrollbar, its loading class and its text size, and
+        # four for the shell's own buttons and picker and the file
+        # browser's button fenced off. The floor had already slid to 117
+        # against 124 before that, five tests landing without it being
+        # raised, which is the slack this floor exists to refuse --
         self.assertGreaterEqual(
-            len(names), 117,
+            len(names), 138,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -3995,6 +4046,59 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(out.returncode, 0,
                          "node failed:\n" + out.stderr[-1500:])
         return json.loads(out.stdout.strip().splitlines()[-1])
+
+    def render(self, session=None, **state):
+        """`opshellRender(state)`'s markup, with `opshellSession` set.
+
+        Beside `_node`, which it calls, and not on `_GuiCase`: no other
+        subclass of `_GuiCase` defines `_node`, so none of them could use it.
+        """
+        return self._node(
+            "opshellSession = %s;\n"
+            "const html = opshellRender(%s);\n"
+            "console.log(JSON.stringify({html}));"
+            % (json.dumps(session), json.dumps(state)))["html"]
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_claim_with_no_value_renders_no_pill(self):
+        # Geometry is null in every state before a bridge exists, and drew
+        # an empty `<span>`: a hole in the row.
+        html = self.render(state="waiting", geometry=None, host="pi",
+                           channel="closed", expected_checkin=12)
+        start = html.index('<div class="opshell-strip">')
+        strip = html[start:html.index("</div>", start)]
+        self.assertNotIn('class="opshell-pill"></span>', strip)
+        self.assertNotIn("></span>", strip)
+        self.assertEqual(html.count('<span class="opshell-pill'), 1,
+                         "the channel alone is a pill here")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_every_claim_the_strip_made_is_still_made(self):
+        html = self.render(session="mine", state="live", host="pi",
+                           user="root", root=True, geometry=[118, 34],
+                           recording=True, channel="open")
+        for claim in ("pi", "root", "118x34", "recording", "channel open"):
+            self.assertIn(claim, html)
+        self.assertEqual(html.count("opshell-pill-root"), 1)
+        self.assertEqual(html.count("opshell-pill-rec"), 1)
+        self.assertEqual(html.count("opshell-pill-ok"), 1)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_user_is_not_called_root_when_it_is_not(self):
+        html = self.render(session="mine", state="live", host="pi",
+                           user="bob", root=False, channel="open")
+        self.assertIn("bob", html)
+        self.assertNotIn("opshell-pill-root", html)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_hostile_host_cannot_write_markup_into_a_pill(self):
+        html = self.render(session="mine", state="live", channel="open",
+                           host='<img src=x>"\'', user="<b>",
+                           geometry=["<i>", 1])
+        self.assertNotIn("<img", html)
+        self.assertNotIn("<b>", html)
+        self.assertNotIn("<i>", html)
+        self.assertIn("&lt;img", html)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_harness_dom_answers_like_a_browser(self):
@@ -6874,6 +6978,106 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
                       "the body is what min-height:100% resolves against")
         self.assertIn("overflow:auto", body,
                       "a short card has nothing to scroll")
+
+    def test_the_frame_is_not_on_the_measured_host(self):
+        body = self.one_rule("opshell-term", "#opshell-term")
+        self.assertNotRegex(body, r"padding|border",
+                            "opshellMeasure reads this element's rect for the "
+                            "cols it sends to /stream")
+        # The rule above is only the host's own. A rule that reaches it from
+        # an ancestor -- `.opshell-screen > div`, `#opshell-body *`, or
+        # `.opshell-live #opshell-term` -- puts the frame back on it just as
+        # well, and the bare markup the next test pins cannot see a rule.
+        css = re.sub(r"/\*.*?\*/", "", STYLE_BLOCK, flags=re.S)
+        above = r"(\.opshell-card|#opshell-body|\.opshell-live|\.opshell-screen)"
+        for sel, rule in _css_blocks(css):
+            for part in (p.strip() for p in sel.split(",")):
+                last = re.split(r"\s*[ >+~]\s*", part)[-1]
+                if "#opshell-term" in last:
+                    self.assertNotRegex(rule, r"padding|border",
+                                        "%s reaches the measured host" % part)
+                if re.search(above + r".*[ >+~]", part):
+                    self.assertNotRegex(
+                        last, r"^(\*|div)(:[\w-]+(\([^)]*\))?)*$",
+                        "%s reaches the measured host from above" % part)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_frame_is_on_a_wrapper_inside_the_live_box(self):
+        html = self.render(session="mine", state="live", channel="open",
+                           host="pi", geometry=[120, 40])
+        self.assertLess(html.index('class="opshell-live"'),
+                        html.index('class="opshell-screen"'))
+        self.assertLess(html.index('class="opshell-screen"'),
+                        html.index('id="opshell-term"'))
+        self.assertIn('<div class="opshell-screen"><div id="opshell-term">'
+                      '</div></div>', html,
+                      "the measured host carries no class or style of its own")
+        screen = self.one_rule("opshell-screen", ".opshell-screen")
+        for prop in ("flex:1", "min-height:0", "display:flex", "padding",
+                     "border-radius"):
+            self.assertIn(prop, screen)
+
+    def test_a_card_too_short_still_scrolls_instead_of_clipping(self):
+        self.assertIn("min-height:72px",
+                      self.one_rule("opshell-term", "#opshell-term"))
+        self.assertIn("overflow:auto",
+                      self.one_rule("opshell-body", "#opshell-body"))
+
+    def test_the_bodys_scrollbar_is_the_houses_and_the_terminals_is_not_touched(self):
+        self.assertIn("#opshell-body::-webkit-scrollbar", STYLE_BLOCK)
+        thumb = self.one_rule("opshell-body",
+                              "#opshell-body::-webkit-scrollbar-thumb")
+        self.assertIn("var(--red-dim)", thumb)
+        self.assertNotIn(".xterm", STYLE_BLOCK)
+
+    def test_the_body_is_not_permanently_a_loading_message(self):
+        src = self.js_function("showOperatorShell")
+        inner = '<div class="loot-loading">Loading...</div>'
+        self.assertIn(inner, src)
+        # Every other way of putting the class on the body itself --
+        # `classList.add`, `body.className = ...`, `setAttribute("class")`,
+        # `classList.toggle` -- names it outside that one child, so the
+        # class may appear nowhere else in the function.
+        self.assertNotIn("loot-loading", src.replace(inner, ""))
+
+    def test_the_body_states_its_own_text_size(self):
+        body = self.one_rule("opshell-body", "#opshell-body")
+        self.assertIn("font-size:13px", body)
+        self.assertIn("color:var(--text)", body)
+        for kept in ("flex:1", "min-height:0", "overflow:auto",
+                     "padding:12px 16px"):
+            self.assertIn(kept, body)
+
+    def test_the_shells_buttons_sit_in_a_row(self):
+        body = self.one_rule("opshell-btn", ".opshell-btn")
+        self.assertIn("display:inline-flex", body)
+        self.assertNotIn("display:flex;", body)
+
+    def test_the_shell_no_longer_borrows_the_file_download_button(self):
+        for name in ("opshellPicker", "opshellRender"):
+            self.assertNotIn("fd-btn", self.js_function(name))
+
+    def test_the_file_browsers_button_is_kept_untouched(self):
+        # A fence and not an endorsement. `.fd-btn` is worn only by the file
+        # browser's detail actions, which `fbShowDetail` draws: `fbLootDir`,
+        # `fbLoadDir`, `fbDownloadFile`, the `View` button and `fbUploadTo`.
+        # Named by function, because line numbers rot. Its `var(--bg2)` and
+        # `var(--bg3)` are defined nowhere, which is a real defect there.
+        # Fixing it is separate work that needs that panel's own
+        # verification; this pins it so it cannot ship inside the Operator
+        # Shell's branch without that.
+        self.assertEqual(len(_css_rules(STYLE_BLOCK, "fd-btn", ".fd-btn")), 1)
+        self.assertIn("var(--bg2)", self.one_rule("fd-btn", ".fd-btn"))
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_picker_is_themed_and_still_readable_by_its_id(self):
+        html = self.render(state="idle", channel="closed", candidates=["pi"])
+        tags = re.findall(r"<select\b[^>]*>", html)
+        self.assertEqual(len(tags), 1, html)
+        self.assertIn('id="opshell-agent"', tags[0])
+        self.assertIn("opshell-pick", tags[0])
+        self.assertIn("var(--border)", self.one_rule("opshell-pick",
+                                                    ".opshell-pick"))
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_minimising_twice_parks_one_card(self):
