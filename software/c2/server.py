@@ -4820,7 +4820,7 @@ header .info{font-size:11px;color:var(--text2)}
   border-radius:3px;transition:color 0.15s,background 0.15s;
 }
 .opshell-ctl:hover{color:var(--text);background:rgba(255,26,26,0.12)}
-#opshell-body{flex:1;min-height:0;overflow:auto;padding:12px 16px}
+#opshell-body{flex:1;min-height:0;overflow:auto;padding:12px 16px;font-size:13px;color:var(--text)}
 /* The status strip. Its bleed to the card's edge is the body's 16px
    padding above, so the divider runs edge to edge; change one and the
    other. The pill is modelled on .pcard-pill and is its own rule: that
@@ -4869,8 +4869,8 @@ header .info{font-size:11px;color:var(--text2)}
 #opshell-body::-webkit-scrollbar{width:6px}
 #opshell-body::-webkit-scrollbar-thumb{background:var(--red-dim);border-radius:3px}
 /* The shell's own buttons and picker. `.fd-btn` is not borrowed: it is the
-   file browser's and the Listeners panel's, it is display:flex (two of them
-   side by side stack), and its --bg2 and --bg3 are defined nowhere. */
+   file browser's, it is display:flex (two of them side by
+   side stack), and its --bg2 and --bg3 are defined nowhere. */
 .opshell-btn{
   display:inline-flex;align-items:center;gap:4px;padding:4px 10px;
   border:1px solid var(--border);border-radius:4px;
@@ -8905,8 +8905,7 @@ async function showOperatorShell(){
   // node and the poll finds it by id.
   const body = document.createElement("div");
   body.id = "opshell-body";
-  body.classList.add("loot-loading");
-  body.innerHTML = "Loading...";
+  body.innerHTML = '<div class="loot-loading">Loading...</div>';
   card.appendChild(chrome);
   // What the last reload could not put back, said once. `opshellResume`
   // leaves this behind when the server says the remembered session is not

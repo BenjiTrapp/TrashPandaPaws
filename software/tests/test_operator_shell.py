@@ -7007,6 +7007,19 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertIn("var(--red-dim)", thumb)
         self.assertNotIn(".xterm", STYLE_BLOCK)
 
+    def test_the_body_is_not_permanently_a_loading_message(self):
+        src = self.js_function("showOperatorShell")
+        self.assertNotIn('classList.add("loot-loading")', src)
+        self.assertIn('<div class="loot-loading">Loading...</div>', src)
+
+    def test_the_body_states_its_own_text_size(self):
+        body = self.one_rule("opshell-body", "#opshell-body")
+        self.assertIn("font-size:13px", body)
+        self.assertIn("color:var(--text)", body)
+        for kept in ("flex:1", "min-height:0", "overflow:auto",
+                     "padding:12px 16px"):
+            self.assertIn(kept, body)
+
     def test_the_shells_buttons_sit_in_a_row(self):
         body = self.one_rule("opshell-btn", ".opshell-btn")
         self.assertIn("display:inline-flex", body)
@@ -7016,20 +7029,25 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         for name in ("opshellPicker", "opshellRender"):
             self.assertNotIn("fd-btn", self.js_function(name))
 
-    def test_the_listeners_panel_keeps_its_own_button_untouched(self):
-        # A fence and not an endorsement. `.fd-btn` is shared with the
-        # Listeners panel and its `var(--bg2)` and `var(--bg3)` are defined
-        # nowhere, which is a real defect there. Fixing it is separate work
-        # that needs that panel's own verification; this pins it so it
-        # cannot ship inside the Operator Shell's branch without that.
+    def test_the_file_browsers_button_is_kept_untouched(self):
+        # A fence and not an endorsement. `.fd-btn` is worn only by the file
+        # browser's detail actions (`fbLootDir`, `fbLoadDir`,
+        # `fbDownloadFile`, the `View` button and `fbUploadTo`, in
+        # `server.py` around lines 8507-8513). Its `var(--bg2)` and
+        # `var(--bg3)` are defined nowhere, which is a real defect there.
+        # Fixing it is separate work that needs that panel's own
+        # verification; this pins it so it cannot ship inside the Operator
+        # Shell's branch without that.
         self.assertEqual(len(_css_rules(STYLE_BLOCK, "fd-btn", ".fd-btn")), 1)
         self.assertIn("var(--bg2)", self.one_rule("fd-btn", ".fd-btn"))
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_picker_is_themed_and_still_readable_by_its_id(self):
         html = self.render(state="idle", channel="closed", candidates=["pi"])
-        self.assertIn('id="opshell-agent"', html)
-        self.assertIn("opshell-pick", html)
+        tags = re.findall(r"<select\b[^>]*>", html)
+        self.assertEqual(len(tags), 1, html)
+        self.assertIn('id="opshell-agent"', tags[0])
+        self.assertIn("opshell-pick", tags[0])
         self.assertIn("var(--border)", self.one_rule("opshell-pick",
                                                     ".opshell-pick"))
 
