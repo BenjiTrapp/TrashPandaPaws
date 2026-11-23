@@ -280,6 +280,34 @@ def _wait_until(predicate, what, timeout=10.0):
     raise AssertionError("timed out waiting for %s" % what)
 
 
+def _wait_until_quiet(counter, what, quiet=0.25, timeout=10.0):
+    """Poll until `counter()` has stopped changing for `quiet` seconds.
+
+    For input a test has sent and the service may still be reading. The
+    obvious wait -- until the count *reaches* what was sent -- cannot be
+    used for UDP, because the kernel is free to drop what does not fit:
+    measured, Linux gives a datagram socket 212992 bytes by default, so
+    400 fragments of 1208 bytes do not fit and the surplus never arrives.
+    That wait would hang on exactly the run that dropped one. A count that
+    has stopped moving says the same thing without assuming delivery.
+
+    `timeout` must exceed `quiet`, or this raises before the count has
+    been given the chance to settle. Returns the count it settled on.
+    """
+    deadline = time.monotonic() + timeout
+    last = counter()
+    settled_at = time.monotonic() + quiet
+    while time.monotonic() < deadline:
+        time.sleep(0.02)
+        now = counter()
+        if now != last:
+            last = now
+            settled_at = time.monotonic() + quiet
+        elif time.monotonic() >= settled_at:
+            return last
+    raise AssertionError("timed out waiting for %s" % what)
+
+
 _PAYLOAD_FIELD_FOR_TEST = beacon_mod._PAYLOAD_FIELDS[0]
 
 
@@ -1008,6 +1036,29 @@ class TestTheUdpListener(unittest.TestCase):
                          listener.address)
         _wait_until(lambda: listener.partial_count() > 0,
                     "the listener to buffer a partial")
+
+        # The flood is still arriving here: the wait above returns as soon
+        # as one partial stands -- measured, 35 to 396 of them -- and what
+        # the socket buffer kept is still to be read. Not 399 more: Linux
+        # gives the socket 212992 bytes for a 483200-byte flood (see
+        # _wait_until_quiet), so on a common run about 92 of the 400 ever
+        # arrive and the rest never existed here.
+        #
+        # Expiring in that state leaves behind every partial created after
+        # the cutoff -- those are not stale, so they survive, and the count
+        # below is whatever slipped through that window. That is how this
+        # test failed in CI on 2026-11-22 (run 45012572152, "3 != 0"),
+        # green again on the next run of the same commit. Measured on Linux
+        # under sys.setswitchinterval(1e-6): red 1 of 15 and 2 of 30
+        # unchanged, 7 of 60 with this settle removed and nothing else
+        # changed, 0 of 60 with it.
+        #
+        # So the caps below are measured on the settled flood rather than
+        # on its first packet, and nothing is expired until the inflow has
+        # stopped. They are still not *reached* on a run that dropped most
+        # of the flood -- that is its own todo, not this fix.
+        _wait_until_quiet(listener.datagrams_seen,
+                          "the flood of datagrams to stop arriving")
 
         self.assertLessEqual(listener.partial_count(), listener.max_partials,
                              "partials grew past the cap")
