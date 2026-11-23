@@ -2,7 +2,8 @@
 
 **Date:** 2026-11-23
 **Branch:** `feat/opshell-window-look`, on `main` at `500b9cf`
-**Status:** design, approved direction, not yet planned
+**Status:** planned (`docs/superpowers/plans/2026-11-23-operator-shell-window-look.md`)
+and built in six tasks, `500b9cf..cb2f219`
 **Predecessors:** `2026-11-17-operator-shell-design.md` (part one, PR #9),
 `2026-11-19-operator-shell-window-design.md` (part two, PR #9 and #13). This
 is part three and changes **only how it is drawn**.
@@ -93,7 +94,7 @@ What would make this a failure even if it looked better:
   `expected_checkin` — and a test holds that (`:3495`).
 - `closing` rendered as `closed`. A session being torn down is not a session
   that is gone, and a test holds that too (`:3441`).
-- The terminal losing a column or a row to its own frame. See the
+- The terminal being told it has a column or row it does not have. See the
   constraint below; this is the one way a purely visual change here can
   break something real.
 - Translucency behind the terminal text. Readability of what the shell

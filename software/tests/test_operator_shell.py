@@ -3932,7 +3932,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # the terminal untouched -- and 117 against 119 once the review of
         # that brought two: where the helper cuts what is left, and that a
         # host or a reason of any length leaves the sentence it is written
-        # into on the line -- and 137 against 138 once the window look
+        # into on the line -- and 138 against 138 once the window look
         # brought fourteen: four for the strip's pills, three for the
         # terminal's box and the short card that still scrolls, three for
         # the body's scrollbar, its loading class and its text size, and
@@ -3941,7 +3941,7 @@ class TestTheViewSuiteIsNotSilentlyEmpty(unittest.TestCase):
         # against 124 before that, five tests landing without it being
         # raised, which is the slack this floor exists to refuse --
         self.assertGreaterEqual(
-            len(names), 137,
+            len(names), 138,
             "only %d behavioural view tests remain; a named safety test was "
             "once deleted while the total went up" % len(names))
         # -- and the properties that each cost this branch a Critical are
@@ -6984,6 +6984,22 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertNotRegex(body, r"padding|border",
                             "opshellMeasure reads this element's rect for the "
                             "cols it sends to /stream")
+        # The rule above is only the host's own. A rule that reaches it from
+        # an ancestor -- `.opshell-screen > div`, `#opshell-body *`, or
+        # `.opshell-live #opshell-term` -- puts the frame back on it just as
+        # well, and the bare markup the next test pins cannot see a rule.
+        css = re.sub(r"/\*.*?\*/", "", STYLE_BLOCK, flags=re.S)
+        above = r"(\.opshell-card|#opshell-body|\.opshell-live|\.opshell-screen)"
+        for sel, rule in _css_blocks(css):
+            for part in (p.strip() for p in sel.split(",")):
+                last = re.split(r"\s*[ >+~]\s*", part)[-1]
+                if "#opshell-term" in last:
+                    self.assertNotRegex(rule, r"padding|border",
+                                        "%s reaches the measured host" % part)
+                if re.search(above + r".*[ >+~]", part):
+                    self.assertNotRegex(
+                        last, r"^(\*|div)(:[\w-]+(\([^)]*\))?)*$",
+                        "%s reaches the measured host from above" % part)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_frame_is_on_a_wrapper_inside_the_live_box(self):

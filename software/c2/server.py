@@ -4824,7 +4824,7 @@ header .info{font-size:11px;color:var(--text2)}
 /* The status strip. Its bleed to the card's edge is the body's 16px
    padding above, so the divider runs edge to edge; change one and the
    other. The pill is modelled on .pcard-pill and is its own rule: that
-   one belongs to the Persistence panel. */
+   one belongs to the tunnel panel's cards (drawTunnel). */
 .opshell-strip{
   display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;
   margin:0 -16px 10px;padding:0 16px 8px;
@@ -4865,7 +4865,7 @@ header .info{font-size:11px;color:var(--text2)}
 .opshell-screen{flex:1;min-height:0;display:flex;padding:8px;border:1px solid var(--border);border-radius:6px;background:rgba(0,0,0,0.6)}
 #opshell-term{flex:1;min-height:72px;overflow:hidden}
 /* The body's scrollbar is the house's. The terminal's own stays the
-   vendored grey, because its classes are hash-pinned (static/VENDOR.md). */
+   vendored grey, because its stylesheet is hash-pinned (static/VENDOR.md). */
 #opshell-body::-webkit-scrollbar{width:6px}
 #opshell-body::-webkit-scrollbar-thumb{background:var(--red-dim);border-radius:3px}
 /* The shell's own buttons and picker. `.fd-btn` is not borrowed: it is the
