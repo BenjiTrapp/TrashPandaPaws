@@ -74,6 +74,8 @@ wrappers keep the tests below short. Add them to `_GuiCase`, beside
 
 `render` needs node, so every test using it carries the file's existing
 `@unittest.skipUnless(shutil.which("node"), "node is not installed")`.
+**`one_rule` is added in Task 1, which uses it; `render` in Task 2, its
+first caller** — a helper no test calls is a finding, not a convenience.
 
 ---
 
@@ -403,7 +405,8 @@ git commit -m "fix(opshell): the card's body is not a loading message"
 ### Task 6: Look at it, and say what is not proved
 
 **Files:**
-- Modify: `docs/TUNNEL.md` (the Operator Shell section), `docs/superpowers/specs/2026-11-23-operator-shell-window-look-design.md` (a "Known limitations, as built" section)
+- Modify: `docs/superpowers/specs/2026-11-23-operator-shell-window-look-design.md` (a "Known limitations, as built" section)
+- Modify, only under the condition below: `docs/TUNNEL.md`
 - Test: `software/tests/test_docs.py`
 
 - [ ] **Step 1: See it in a browser**
@@ -414,12 +417,16 @@ Run the C2 with the demo data, open the operator GUI, open the shell view, and c
 
 In the design doc, a section naming what the build could not measure: no live device, which states were seen in a browser and which only in tests, and the `.fd-btn` fix left to the Listeners panel.
 
-- [ ] **Step 3: Check the documentation still matches**
+- [ ] **Step 3: Touch `docs/TUNNEL.md` only if it now says something false**
+
+Read its Operator Shell section. Edit it **only** if a sentence there describes the view's appearance in a way this branch made untrue — the strip's shape, the terminal's frame, the picker. If every sentence is still true, change nothing and say so in the commit message. The pills, the gutter and the box are not facts the documentation claimed, so the expected outcome is no change.
+
+- [ ] **Step 4: Check the documentation still matches**
 
 Run: `python3 -B -m unittest software.tests.test_docs 2>&1 | tail -3`
 Expected: OK. If a doc test fails, the wording changed — which this plan forbids; revert the wording rather than the test.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add docs software/tests
