@@ -3212,7 +3212,10 @@ class TestTheGlyphAndTheView(_GuiCase):
             self.assertNotIn(forbidden, STYLE_BLOCK)
         # Scoped to this view's rules: `.toolbar button` elsewhere in the
         # page already uses the unprefixed property and is not this view's.
-        for sel, body in _css_blocks(STYLE_BLOCK):
+        # Comments stripped first, as `_css_rules` does: one that mentions
+        # `opshell` or holds a brace would otherwise distort the parse.
+        bare = re.sub(r"/\*.*?\*/", "", STYLE_BLOCK, flags=re.S)
+        for sel, body in _css_blocks(bare):
             if "opshell" in sel and "backdrop-filter" in body:
                 self.assertIn("-webkit-backdrop-filter", body, sel)
 
@@ -3479,6 +3482,15 @@ class TestTheViewDoesNotOverclaim(_GuiCase):
         for line in render.splitlines():
             if '"closing"' in line:
                 self.assertNotIn("Channel closed", line)
+
+    def test_the_strip_is_a_class_and_not_an_inline_style(self):
+        src = self.js_function("opshellRender")
+        self.assertIn('class="opshell-strip"', src)
+        self.assertNotIn('style="display:flex', src)
+
+    def test_a_very_long_host_does_not_push_the_controls_away(self):
+        self.assertIn("flex-wrap:wrap",
+                      self.one_rule("opshell-strip", ".opshell-strip"))
 
     def test_the_strip_states_the_user_and_does_not_assume_root(self):
         # The tunnel panel carries this scar already: it "used to state
@@ -4027,6 +4039,57 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(out.returncode, 0,
                          "node failed:\n" + out.stderr[-1500:])
         return json.loads(out.stdout.strip().splitlines()[-1])
+
+    def render(self, session=None, **state):
+        """`opshellRender(state)`'s markup, with `opshellSession` set.
+
+        Beside `_node`, which it calls, and not on `_GuiCase`, whose other
+        subclass has no node bridge.
+        """
+        return self._node(
+            "opshellSession = %s;\n"
+            "const html = opshellRender(%s);\n"
+            "console.log(JSON.stringify({html}));"
+            % (json.dumps(session), json.dumps(state)))["html"]
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_claim_with_no_value_renders_no_pill(self):
+        # Geometry is null in every state before a bridge exists, and drew
+        # an empty `<span>`: a hole in the row.
+        html = self.render(state="waiting", geometry=None, host="pi",
+                           channel="closed", expected_checkin=12)
+        self.assertNotIn('class="opshell-pill"></span>', html)
+        self.assertNotIn("></span>", html)
+        self.assertEqual(html.count("opshell-pill"), 1,
+                         "the channel alone is a pill here")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_every_claim_the_strip_made_is_still_made(self):
+        html = self.render(session="mine", state="live", host="pi",
+                           user="root", root=True, geometry=[118, 34],
+                           recording=True, channel="open")
+        for claim in ("pi", "root", "118x34", "recording", "channel open"):
+            self.assertIn(claim, html)
+        self.assertEqual(html.count("opshell-pill-root"), 1)
+        self.assertEqual(html.count("opshell-pill-rec"), 1)
+        self.assertEqual(html.count("opshell-pill-ok"), 1)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_user_is_not_called_root_when_it_is_not(self):
+        html = self.render(session="mine", state="live", host="pi",
+                           user="bob", root=False, channel="open")
+        self.assertIn("bob", html)
+        self.assertNotIn("opshell-pill-root", html)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_hostile_host_cannot_write_markup_into_a_pill(self):
+        html = self.render(session="mine", state="live", channel="open",
+                           host='<img src=x>"\'', user="<b>",
+                           geometry=["<i>", 1])
+        self.assertNotIn("<img", html)
+        self.assertNotIn("<b>", html)
+        self.assertNotIn("<i>", html)
+        self.assertIn("&lt;img", html)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_harness_dom_answers_like_a_browser(self):

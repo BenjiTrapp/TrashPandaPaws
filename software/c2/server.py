@@ -4821,6 +4821,24 @@ header .info{font-size:11px;color:var(--text2)}
 }
 .opshell-ctl:hover{color:var(--text);background:rgba(255,26,26,0.12)}
 #opshell-body{flex:1;min-height:0;overflow:auto;padding:12px 16px}
+/* The status strip. Its bleed to the card's edge is the body's 16px
+   padding above, so the divider runs edge to edge; change one and the
+   other. The pill is modelled on .pcard-pill and is its own rule: that
+   one belongs to the Persistence panel. */
+.opshell-strip{
+  display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;
+  margin:0 -16px 10px;padding:0 16px 8px;
+  border-bottom:1px solid var(--border);
+  font-family:var(--mono);font-size:11px;color:var(--text2);
+}
+.opshell-who{min-width:0;word-break:break-all;color:var(--text)}
+.opshell-pill{
+  display:inline-block;padding:1px 8px;border-radius:9px;font-size:10px;
+  border:1px solid var(--border);background:var(--surface2);color:var(--text2);
+}
+.opshell-pill-root{border-color:var(--orange);color:var(--orange)}
+.opshell-pill-rec{border-color:var(--red-dim);color:var(--red)}
+.opshell-pill-ok{border-color:var(--green-dim);color:var(--green)}
 /* The one-off note above the body, for what a reload could not put back.
    flex:none so it takes its own height and leaves the body the rest. */
 .opshell-note{flex:none;padding:10px 16px 0}
@@ -9351,15 +9369,21 @@ function opshellRender(state){
   // Its own row, not `.pcard-kv`: that class is a label/value grid, and
   // borrowing it stacked the whole strip into one narrow column. Seen in
   // the browser, which is the only place a layout can be seen.
-  let strip = '<div style="display:flex;gap:10px;flex-wrap:wrap;'
-    + 'align-items:center;font-size:11px;color:var(--text2);'
-    + 'margin:0 0 10px">'
-    + '<span>' + esc(state.host || state.target || "no device chosen") + '</span>'
-    + (state.user ? '<span>' + esc(state.user) + '</span>' : '')
-    + (state.root ? '<span style="color:var(--orange)">root</span>' : '')
-    + '<span>' + esc(geom) + '</span>'
-    + (state.recording ? '<span style="color:var(--red)">&#9679; recording</span>' : '')
-    + '<span>channel ' + esc(chan) + '</span>'
+  // A claim with no value is not drawn at all: the geometry is null in
+  // every state before a bridge exists, and an empty element is a hole in
+  // the row. `mark` is markup written here and never text from the machine;
+  // the value is always escaped.
+  const claim = (cls, value, mark) =>
+    (value === null || value === undefined || value === "") ? ''
+      : '<span class="' + cls + '">' + (mark || '') + esc(value) + '</span>';
+  const pill = mod => 'opshell-pill' + (mod ? ' opshell-pill-' + mod : '');
+  let strip = '<div class="opshell-strip">'
+    + claim('opshell-who', state.host || state.target || "no device chosen")
+    + claim('opshell-who', state.user)
+    + (state.root ? claim(pill('root'), 'root') : '')
+    + claim(pill(), geom)
+    + (state.recording ? claim(pill('rec'), 'recording', '&#9679; ') : '')
+    + claim(pill(chan === "open" ? 'ok' : ''), 'channel ' + chan)
     + '</div>';
   if(state.reason){
     strip += '<p class="loot-empty">' + esc(state.reason) + '</p>';
