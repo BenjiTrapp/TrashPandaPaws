@@ -343,7 +343,7 @@ Expected: OK, including the three node tests that set `els['opshell-agent'].valu
 
 - [ ] **Step 5: Mutate the row**
 
-Change `.opshell-btn`'s `display:inline-flex` to `display:flex` — the defect `.fd-btn` has — and run `test_the_shells_buttons_sit_in_a_row`: it must fail. Restore, `cmp`, run with `-B`, and report it in the commit message.
+Change `.opshell-btn`'s `display:inline-flex` to `display:flex` — what `.fd-btn` has, which stacks the shell's buttons because they sit in no flex row (the file browser's sit in `.fd-actions` and do not) — and run `test_the_shells_buttons_sit_in_a_row`: it must fail. Restore, `cmp`, run with `-B`, and report it in the commit message.
 
 - [ ] **Step 6: Commit**
 

@@ -30,7 +30,11 @@ taste:
   of sitting side by side (`server.py:4635-4646`). The class's only other
   wearer is the file browser's detail actions, drawn by `fbShowDetail` --
   `fbLootDir`, `fbLoadDir`, `fbDownloadFile`, the `View` button and
-  `fbUploadTo` -- which have the same two defects. (An earlier draft said
+  `fbUploadTo` -- which share the first defect and not the second: they
+  have no background either, but they sit inside `.fd-actions`, a wrapping
+  flex row with a 6 px gap, so as flex items they line up side by side. The
+  stacking was the shell's alone, because its buttons sat in the body with
+  no such container. (An earlier draft said
   the Listeners panel, citing two line numbers taken from a reading before
   other work merged. Neither was true; consumers are named by function
   here because line numbers rot.)
@@ -154,8 +158,8 @@ operator picked the first.
    button vocabularies live side by side.
 2. **Borrow `.pcard-head`, `.pcard-pill`, `.terminal` and
    `.log-controls select`, and fix `.fd-btn` globally.** Least new CSS, and
-   it would fix the same button defect in the file browser's detail
-   actions. Rejected
+   it would also give the file browser's detail actions the background
+   they lack. Rejected
    because it dresses the window in the panel's clothes — the very thing
    that makes it read as a panel today — and because a later change to
    `.pcard-head` for the tunnel cards would silently restyle the shell.
@@ -168,8 +172,12 @@ operator picked the first.
 
 **`.fd-btn` is left alone.** Fixing its two undefined variables would also
 change the file browser's detail actions (`fbShowDetail`'s Loot, Open,
-Download, View and Upload buttons), which deserve their own verification. It is
-recorded as a separate todo, not smuggled in here.
+Download, View and Upload buttons), which deserve their own verification;
+and defining the two variables instead would reach every other rule that
+names them, `.loot-item` among them. It is left to the file browser's own
+change, not smuggled in here. The note that it is owed lives outside this
+repository, in the project's todo list; inside it, this paragraph and the
+test `test_the_file_browsers_button_is_kept_untouched` are the record.
 
 ## What it looks like
 
