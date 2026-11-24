@@ -730,14 +730,23 @@ class CiTests(unittest.TestCase):
     def _run_scripts(self, job):
         return "\n".join(step.get("run", "") for step in self._steps(job))
 
-    def test_ci_installs_the_three_packages_the_suite_needs(self):
+    def test_ci_installs_the_packages_the_suite_needs(self):
         # Measured: without git, ffmpeg and procps the suite reports 19
         # errors and 6 failures that say nothing about the code -- the
         # requirements-floor and leak-walk tests shell out to git, the
         # figure tools encode with ffmpeg, and the supervisor and tunnel
         # spawn tests read a child's command line with ps.
+        #
+        # yara and nmap are here because the run of 2026-11-24 named them:
+        # the four tests this job silently skipped were three in
+        # test_tunnel_yara, whose own skip message says "the real claim --
+        # that the published rules do not match the artifact -- was NOT
+        # verified", and one in test_agent_safety that reads nmap's own
+        # service ordering. Measured with both installed in a container:
+        # those 231 tests run and pass, so the packages buy four real
+        # checks rather than four silent skips.
         installs = self._run_scripts("tests")
-        for package in ("git", "ffmpeg", "procps"):
+        for package in ("git", "ffmpeg", "procps", "yara", "nmap"):
             with self.subTest(package=package):
                 self.assertRegex(
                     installs, r"apt-get install[^\n]*(\\\s*\n[^\n]*)*\b%s\b"
@@ -783,6 +792,67 @@ class CiTests(unittest.TestCase):
     def test_the_lab_job_runs_the_driver(self):
         body = yaml.dump(self.doc["jobs"]["lab"])
         self.assertIn("tools/e2e_lab.py", body)
+
+    def test_the_suite_is_not_run_twice(self):
+        """Measured: it was, and it doubled every run of this job.
+
+        `The suite` ran it and `Report what actually ran` ran it again to
+        print three lines -- 544 s plus 536 s in run 45012572152, and
+        558.742 s plus 558.914 s in the run that merged #13. The report is
+        worth having; a second full suite to produce it is not, and it also
+        reports a *different* run than the one that judged the job.
+        """
+        runs = self._run_scripts("tests")
+        self.assertEqual(
+            runs.count("unittest discover"), 1,
+            "the suite is invoked %d times in the tests job; the report "
+            "step should read the first run's output, not run it again"
+            % runs.count("unittest discover"))
+
+    def test_the_report_reads_the_suites_own_output(self):
+        steps = {step.get("name", ""): step.get("run", "")
+                 for step in self._steps("tests")}
+        suite = steps.get("The suite", "")
+        report = steps.get("Report what actually ran", "")
+        self.assertIn("tee", suite,
+                      "the suite's output is not captured, so nothing else "
+                      "can report on the run that judged the job")
+        self.assertNotIn("unittest discover", report)
+        self.assertRegex(report, r"suite\.log|\$\{?SUITE",
+                         "the report step reads no captured output")
+
+    def test_the_report_names_the_skips_and_not_only_their_count(self):
+        """A count cannot say which tests went missing.
+
+        `OK (skipped=4)` on Linux against `skipped=3` on a Mac was carried
+        as an open question for four days, because nothing printed the
+        reasons. The suite prints them under `-v`, so the report lists
+        them.
+        """
+        steps = {step.get("name", ""): step.get("run", "")
+                 for step in self._steps("tests")}
+        self.assertIn("-v", steps.get("The suite", ""),
+                      "without -v the suite never prints a skip reason")
+        self.assertIn("skipped", steps.get("Report what actually ran", ""),
+                      "the report step does not name the skips")
+
+    def test_the_report_anchors_on_the_first_verdict_and_not_the_tail(self):
+        """`tail` on this suite can show a child process's verdict.
+
+        Measured: a combined run printed `Ran 1 test ... FAILED (errors=1)`
+        as its last lines while the real summary, `Ran 594 tests ... OK`,
+        sat 150 lines earlier -- one of these modules starts a nested
+        `unittest` whose output interleaves. The dangerous direction is a
+        failing parent hidden behind a child's `OK`.
+        """
+        report = {step.get("name", ""): step.get("run", "")
+                  for step in self._steps("tests")}.get(
+                      "Report what actually ran", "")
+        self.assertNotIn("tail", report,
+                         "the report takes the tail, which is where a "
+                         "nested run's verdict lands")
+        self.assertRegex(report, r"\^Ran",
+                         "the report does not anchor the verdict line")
 
     def test_ci_does_not_float_the_runner_under_a_pinned_python(self):
         """A floating image under a pinned old Python is how this broke.
