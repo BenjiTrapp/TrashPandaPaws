@@ -730,14 +730,23 @@ class CiTests(unittest.TestCase):
     def _run_scripts(self, job):
         return "\n".join(step.get("run", "") for step in self._steps(job))
 
-    def test_ci_installs_the_three_packages_the_suite_needs(self):
+    def test_ci_installs_the_packages_the_suite_needs(self):
         # Measured: without git, ffmpeg and procps the suite reports 19
         # errors and 6 failures that say nothing about the code -- the
         # requirements-floor and leak-walk tests shell out to git, the
         # figure tools encode with ffmpeg, and the supervisor and tunnel
         # spawn tests read a child's command line with ps.
+        #
+        # yara and nmap are here because the run of 2026-11-24 named them:
+        # the four tests this job silently skipped were three in
+        # test_tunnel_yara, whose own skip message says "the real claim --
+        # that the published rules do not match the artifact -- was NOT
+        # verified", and one in test_agent_safety that reads nmap's own
+        # service ordering. Measured with both installed in a container:
+        # those 231 tests run and pass, so the packages buy four real
+        # checks rather than four silent skips.
         installs = self._run_scripts("tests")
-        for package in ("git", "ffmpeg", "procps"):
+        for package in ("git", "ffmpeg", "procps", "yara", "nmap"):
             with self.subTest(package=package):
                 self.assertRegex(
                     installs, r"apt-get install[^\n]*(\\\s*\n[^\n]*)*\b%s\b"

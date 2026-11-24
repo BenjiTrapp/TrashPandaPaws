@@ -58,11 +58,11 @@ jobs:
         with:
           python-version: "3.9"
 
-      # ── Three packages, each with a measured consequence ──
+      # ── Five packages, each with a measured consequence ──
       #
-      # Without them the suite reports 19 errors and 6 failures that say
-      # nothing whatever about the code. Measured in a python:3.9-slim
-      # container before this file existed:
+      # Without the first three the suite reports 19 errors and 6 failures
+      # that say nothing whatever about the code. Measured in a
+      # python:3.9-slim container before this file existed:
       #
       #   git      the requirements-floor and leak-walk tests shell out to
       #            it; 4 errors without it
@@ -71,13 +71,28 @@ jobs:
       #   procps   `ps`, which the supervisor and tunnel-spawn tests read a
       #            child's command line with; 5 errors and 1 failure
       #
-      # Delete one and the run goes red for a reason that looks like a
-      # product fault. That is why each is named here.
+      # The last two buy back the four tests this job silently skipped
+      # until 2026-11-24, when the report below first named them:
+      #
+      #   yara     three tests in test_tunnel_yara, whose own skip message
+      #            says "the real claim -- that the published rules do not
+      #            match the artifact -- was NOT verified. Only the tier-2
+      #            marker assertion ran." So the claim this project makes
+      #            about published detection rules was never checked here
+      #   nmap     one test in test_agent_safety reads nmap's own service
+      #            ordering from nmap-services, so the narrowing is a claim
+      #            about nmap's list rather than about a number written in
+      #            the test
+      #
+      # Measured with both installed in a container: those two modules run
+      # 231 tests and pass, so this is four real checks rather than four
+      # silent skips. Delete one and the run goes red for a reason that
+      # looks like a product fault. That is why each is named here.
       - name: System packages the suite shells out to
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
-            git ffmpeg procps bash-completion util-linux
+            git ffmpeg procps bash-completion util-linux yara nmap
 
       # ── node is not optional ──
       #
@@ -104,7 +119,7 @@ jobs:
       - name: Prove the environment provides what the suite needs
         run: |
           set -eu
-          for tool in git ffmpeg ps node setsid; do
+          for tool in git ffmpeg ps node setsid yara nmap; do
             command -v "$tool" >/dev/null || { echo "missing: $tool" >&2; exit 1; }
           done
           python3 -c "import sys; assert sys.version_info[:2] == (3, 9), sys.version"
@@ -153,8 +168,9 @@ jobs:
           grep -n -E '^Ran [0-9]+ tests?|^(OK|FAILED)' /tmp/suite.log \
             || echo "no summary line: the suite never reached one"
           echo "== skipped, by reason =="
-          grep -oE "skipped '[^']*'" /tmp/suite.log | sort | uniq -c \
-            | sort -rn || echo "nothing was skipped"
+          skips=$(grep -oE "skipped '[^']*'" /tmp/suite.log \
+            | sort | uniq -c | sort -rn || true)
+          echo "${skips:-nothing was skipped}"
 
   # ── The lab ──
   #
