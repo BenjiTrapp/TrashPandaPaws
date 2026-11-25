@@ -3448,6 +3448,41 @@ class TestTheGlyphAndTheView(_GuiCase):
         self.assertIn('method:"POST"', flush)
         self.assertNotRegex(SERVER_SRC, r"/api/opshell/keys\?")
 
+    def test_the_picker_row_is_one_type_size_with_room_around_it(self):
+        """Seen in the browser on 2026-11-24: 13px label, 11px picker.
+
+        The label inherits `#opshell-body`'s 13px while `.opshell-pick` is
+        11px, so "Device" sat larger than the control it names, with
+        nothing separating that row from the sentence under it.
+        """
+        row = self.one_rule("opshell-row", ".opshell-row")
+        self.assertIn("font-size:11px", row)
+        self.assertRegex(row, r"gap|margin",
+                         "the row has no spacing of its own")
+        self.assertIn('class="opshell-row"',
+                      self.js_function("opshellPicker"))
+
+    def test_both_window_controls_sit_on_one_line(self):
+        """Seen on 2026-11-24: the `_` sat lower than the `✕`.
+
+        Two glyphs of different heights in an 18px button with
+        `line-height:1` align on their baselines, and an underscore's
+        baseline is its lowest point. Centring the glyph box levels them.
+        """
+        ctl = self.one_rule("opshell-ctl", ".opshell-ctl")
+        self.assertIn("display:inline-flex", ctl)
+        self.assertIn("align-items:center", ctl)
+
+    def test_the_footnote_does_not_sit_on_the_terminals_border(self):
+        """Seen on 2026-11-24 at 900x500: it touched the box's edge.
+
+        The box is new in part three, so this is too: the paragraph after
+        it had no margin because nothing above it had an edge before.
+        """
+        self.assertRegex(self.one_rule("opshell-screen", ".opshell-screen"),
+                         r"margin-bottom|margin:",
+                         "the terminal box leaves no room under itself")
+
     def test_the_font_fallback_is_the_stack_the_stylesheet_declares(self):
         """`opshellFont`'s literal and `:root{--mono}` are one stack.
 
@@ -4058,6 +4093,37 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "const html = opshellRender(%s);\n"
             "console.log(JSON.stringify({html}));"
             % (json.dumps(session), json.dumps(state)))["html"]
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_root_session_says_root_once(self):
+        """Seen in the browser on 2026-11-24; no test caught it.
+
+        The server sets `root` from `user == "root"` (`server.py:2004`), so
+        on a root session the orange pill repeated the word the user text
+        had just said, and the strip read `root root`. Dropping either one
+        unconditionally would lose a claim, which the design names as an
+        anti-goal, so the word is drawn once -- as the pill, because the
+        pill is the one that also says *privileged*.
+        """
+        html = self.render(session="mine", state="live", host="pi",
+                           user="root", root=True, channel="open")
+        self.assertEqual(html.count(">root<"), 1,
+                         "the strip says root %d times"
+                         % html.count(">root<"))
+        self.assertIn("opshell-pill-root", html)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_non_root_user_is_named_beside_the_root_pill(self):
+        """The other half: suppressing the pill must not suppress a user.
+
+        A session whose user is not `root` but which reports `root` -- the
+        server cannot produce it today, but the view is told both fields
+        separately -- must still show both.
+        """
+        html = self.render(session="mine", state="live", host="pi",
+                           user="derbenji", root=True, channel="open")
+        self.assertIn(">derbenji<", html)
+        self.assertEqual(html.count(">root<"), 1)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_claim_with_no_value_renders_no_pill(self):
