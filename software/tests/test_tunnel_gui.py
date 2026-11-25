@@ -1697,12 +1697,16 @@ class TestTheTunnelPanel(unittest.TestCase):
         for name, text in (("a row", self.per_row),
                            ("the shell column", self.shell_half)):
             self.assertNotIn("loot-item", text, "%s is still a loot row" % name)
-            # The old row's secondary text named variables that do not
-            # resolve; the card uses the classes and `--text2`.
-            for undefined in ("--dim", "--bg3", "--bg2"):
-                self.assertNotIn(undefined, text,
-                                 "%s names %s, which is undefined"
-                                 % (name, undefined))
+            # The old row's secondary text named these three; the card uses
+            # the classes and `--text2` instead. They were undefined when
+            # this was written, which is what made the old row's "dim" text
+            # render at full brightness; they are defined since 2026-11-25,
+            # so the reason this ban stands is now the card's vocabulary
+            # rather than their validity.
+            for banned in ("--dim", "--bg3", "--bg2"):
+                self.assertNotIn(banned, text,
+                                 "%s names %s, which the card does not use"
+                                 % (name, banned))
         # Not removed from the page: Listeners, Loot and the server block
         # above still use it.
         style = self.page[self.page.index("<style>"):self.page.index("</style>")]
@@ -2017,11 +2021,19 @@ class TestTheCardVocabulary(unittest.TestCase):
                 self._rule(selector)
 
     def test_the_card_uses_no_undefined_variable(self):
-        """Neither `--dim` nor `--bg3` (nor `--bg2`) is defined in `:root`.
+        """The card names none of `--dim`, `--bg3`, `--bg2`, and every
+        variable it does name resolves.
 
-        A declaration naming one is invalid and silently dropped, which is
-        why the old panel's "dim" text renders at full brightness. The
-        window runs from the first `.pcard` rule to the end of the last.
+        When this was written none of the three was defined in `:root`, so
+        a declaration naming one was invalid and silently dropped -- which
+        is why the old panel's "dim" text rendered at full brightness. All
+        five such names were defined on 2026-11-25, so the first half of
+        this test is no longer about validity: it keeps the card on the
+        class vocabulary it was built with. The second half is the part
+        that still guards resolution, and it guards it for every variable
+        the card reads.
+
+        The window runs from the first `.pcard` rule to the end of the last.
         """
         first = self.style.index(".pcard")
         last = self.style.rindex(".pcard")
