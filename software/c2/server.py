@@ -4818,7 +4818,21 @@ header .info{font-size:11px;color:var(--text2)}
   background:none;border:none;cursor:pointer;font-family:var(--mono);
   font-size:18px;line-height:1;color:var(--text2);padding:4px 8px;
   border-radius:3px;transition:color 0.15s,background 0.15s;
+  /* Both controls are glyph-only buttons, so they are centred boxes of one
+     size -- without that the two differed in width. */
+  display:inline-flex;align-items:center;justify-content:center;
+  min-width:26px;min-height:26px;
 }
+/* The `_` needs more than a centred box, and this is the part a test
+   cannot see: centring aligns the LINE BOX, while an underscore's ink sits
+   below the baseline and the cross's sits above it. Measured in the
+   browser on 2026-11-25 with a canvas and `actualBoundingBox*` at this
+   18px size: the underscore's ink centre is 4.56px BELOW the baseline, the
+   cross's 5.27px above it, so the glyph is lifted by their difference,
+   9.83px -- 0.546em, written as 0.55em. The first attempt centred the box
+   and changed nothing visible, which the picture showed and the test did
+   not. */
+.opshell-ctl-min{transform:translateY(-0.55em)}
 .opshell-ctl:hover{color:var(--text);background:rgba(255,26,26,0.12)}
 #opshell-body{flex:1;min-height:0;overflow:auto;padding:12px 16px;font-size:13px;color:var(--text)}
 /* The status strip. Its bleed to the card's edge is the body's 16px
@@ -4862,7 +4876,7 @@ header .info{font-size:11px;color:var(--text2)}
    flex:1 takes what the strip and the footnote leave, display:flex hands it
    to the host's flex:1. Its 8px padding and 1px border are what the
    measured 154x49 at 1440x900 already paid for. */
-.opshell-screen{flex:1;min-height:0;display:flex;padding:8px;border:1px solid var(--border);border-radius:6px;background:rgba(0,0,0,0.6)}
+.opshell-screen{flex:1;min-height:0;display:flex;padding:8px;border:1px solid var(--border);border-radius:6px;background:rgba(0,0,0,0.6);margin-bottom:8px}
 #opshell-term{flex:1;min-height:72px;overflow:hidden}
 /* The body's scrollbar is the house's. The terminal's own stays the
    vendored grey, because its stylesheet is hash-pinned (static/VENDOR.md). */
@@ -4885,6 +4899,13 @@ header .info{font-size:11px;color:var(--text2)}
   font-family:var(--mono);font-size:11px;cursor:pointer;transition:all 0.15s;
 }
 .opshell-pick:hover,.opshell-pick:focus{border-color:var(--red-dim);outline:none}
+/* The picker's own row. Its label used to inherit the body's 13px and so
+   stood larger than the 11px control it names, with nothing between that
+   row and the sentence under it -- seen in the browser on 2026-11-24. */
+.opshell-row{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  margin:0 0 8px;font-size:11px;color:var(--text2);
+}
 
 /* The card, parked.
    The dock sits in the sidebar under .agent-list and never inside it:
@@ -8864,7 +8885,7 @@ function opshellChrome(name){
   // `opshellMinimise`, which keeps the session.
   return '<span class="opshell-glyph">&gt;<span class="opshell-cursor">_'
     + '</span></span><span class="opshell-title">' + esc(name) + '</span>'
-    + '<button class="opshell-ctl" title="Minimise" '
+    + '<button class="opshell-ctl opshell-ctl-min" title="Minimise" '
     + 'onclick="opshellMinimise(event)">_</button>'
     + '<button class="opshell-ctl" title="Close and end the session" '
     + 'onclick="opshellClose(event)">&#10005;</button>';
@@ -9384,8 +9405,10 @@ function opshellPicker(state){
   const pick = (state.candidates || []).map(a =>
     '<option value="' + esc(a) + '"' + (a === state.target ? ' selected' : '')
     + '>' + esc(a) + '</option>').join("");
-  return '<label>Device <select id="opshell-agent" class="opshell-pick">' + pick + '</select></label> '
+  return '<div class="opshell-row">'
+    + '<label>Device <select id="opshell-agent" class="opshell-pick">' + pick + '</select></label>'
     + '<button class="opshell-btn opshell-btn-primary" onclick="opshellOpen(event)">Open a shell</button>'
+    + '</div>'
     + '<p class="loot-empty">This raises the channel on that device and '
     + 'drops it again when the session ends. Both cost one check-in.</p>';
 }
@@ -9407,7 +9430,14 @@ function opshellRender(state){
   const pill = mod => 'opshell-pill' + (mod ? ' opshell-pill-' + mod : '');
   let strip = '<div class="opshell-strip">'
     + claim('opshell-who', state.host || state.target || "no device chosen")
-    + claim('opshell-who', state.user)
+    // The user, unless the pill below is about to say the same word. The
+    // server sets `root` from `user == "root"` (`opshell_state`), so on a
+    // root session the two said `root root` -- seen in the browser, caught
+    // by no test. The word is kept once, as the pill, because the pill is
+    // the one that also says *privileged*; dropping either claim outright
+    // would be the loss the design names as an anti-goal.
+    + (state.root && state.user === 'root'
+        ? '' : claim('opshell-who', state.user))
     + (state.root ? claim(pill('root'), 'root') : '')
     + claim(pill(), geom)
     + (state.recording ? claim(pill('rec'), 'recording', '&#9679; ') : '')
