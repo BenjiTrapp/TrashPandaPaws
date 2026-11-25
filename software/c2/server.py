@@ -4818,12 +4818,21 @@ header .info{font-size:11px;color:var(--text2)}
   background:none;border:none;cursor:pointer;font-family:var(--mono);
   font-size:18px;line-height:1;color:var(--text2);padding:4px 8px;
   border-radius:3px;transition:color 0.15s,background 0.15s;
-  /* Centred rather than baseline-aligned: `_` and the cross are glyphs of
-     different heights, and on a shared baseline the underscore sits a
-     line below the cross -- seen in the browser on 2026-11-24. */
+  /* Both controls are glyph-only buttons, so they are centred boxes of one
+     size -- without that the two differed in width. */
   display:inline-flex;align-items:center;justify-content:center;
   min-width:26px;min-height:26px;
 }
+/* The `_` needs more than a centred box, and this is the part a test
+   cannot see: centring aligns the LINE BOX, while an underscore's ink sits
+   below the baseline and the cross's sits above it. Measured in the
+   browser on 2026-11-25 with a canvas and `actualBoundingBox*` at this
+   18px size: the underscore's ink centre is 4.56px BELOW the baseline, the
+   cross's 5.27px above it, so the glyph is lifted by their difference,
+   9.83px -- 0.546em, written as 0.55em. The first attempt centred the box
+   and changed nothing visible, which the picture showed and the test did
+   not. */
+.opshell-ctl-min{transform:translateY(-0.55em)}
 .opshell-ctl:hover{color:var(--text);background:rgba(255,26,26,0.12)}
 #opshell-body{flex:1;min-height:0;overflow:auto;padding:12px 16px;font-size:13px;color:var(--text)}
 /* The status strip. Its bleed to the card's edge is the body's 16px
@@ -8876,7 +8885,7 @@ function opshellChrome(name){
   // `opshellMinimise`, which keeps the session.
   return '<span class="opshell-glyph">&gt;<span class="opshell-cursor">_'
     + '</span></span><span class="opshell-title">' + esc(name) + '</span>'
-    + '<button class="opshell-ctl" title="Minimise" '
+    + '<button class="opshell-ctl opshell-ctl-min" title="Minimise" '
     + 'onclick="opshellMinimise(event)">_</button>'
     + '<button class="opshell-ctl" title="Close and end the session" '
     + 'onclick="opshellClose(event)">&#10005;</button>';

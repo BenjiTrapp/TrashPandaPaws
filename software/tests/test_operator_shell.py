@@ -3465,13 +3465,27 @@ class TestTheGlyphAndTheView(_GuiCase):
     def test_both_window_controls_sit_on_one_line(self):
         """Seen on 2026-11-24: the `_` sat lower than the `✕`.
 
-        Two glyphs of different heights in an 18px button with
-        `line-height:1` align on their baselines, and an underscore's
-        baseline is its lowest point. Centring the glyph box levels them.
+        Two things, and the first one alone did nothing. A centred
+        inline-flex box makes the two buttons one size, but centring aligns
+        the *line box*: measured in the browser with a canvas at this 18px
+        size, the underscore's ink centre sits 4.56px below the baseline
+        and the cross's 5.27px above it. So the glyph is lifted by their
+        difference, 9.83px = 0.546em, written as 0.55em.
+
+        This pin is the mechanism, not the effect: the suite has no layout
+        engine, so it cannot see whether the two glyphs line up. The effect
+        was measured in a browser and the numbers are in the rule's own
+        comment -- the first version of this test passed while the view was
+        still visibly wrong.
         """
         ctl = self.one_rule("opshell-ctl", ".opshell-ctl")
         self.assertIn("display:inline-flex", ctl)
         self.assertIn("align-items:center", ctl)
+        lift = self.one_rule("opshell-ctl-min", ".opshell-ctl-min")
+        self.assertRegex(lift, r"translateY\(-0\.5\d*em\)",
+                         "the minimise glyph is not lifted, so it sits "
+                         "below the cross however the box is aligned")
+        self.assertIn("opshell-ctl-min", self.js_function("opshellChrome"))
 
     def test_the_footnote_does_not_sit_on_the_terminals_border(self):
         """Seen on 2026-11-24 at 900x500: it touched the box's edge.
