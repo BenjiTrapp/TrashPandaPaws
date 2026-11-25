@@ -3497,6 +3497,39 @@ class TestTheGlyphAndTheView(_GuiCase):
                          r"margin-bottom|margin:",
                          "the terminal box leaves no room under itself")
 
+    def test_no_custom_property_is_read_without_being_defined(self):
+        """Page-wide, and it lives here beside the browser-floor fence
+        because that one is page-wide too and uses the same machinery.
+
+        A declaration that reads an undefined custom property without a
+        fallback is **invalid at computed-value time**: the property
+        silently takes its initial value, so `background:var(--bg2)` paints
+        nothing and `font-family:var(--font)` inherits. Measured on
+        2026-11-25, four were read that way -- `--bg2` (8 places), `--bg3`
+        (2), `--blue` (4 in the stylesheet plus three inline styles in the
+        script) and `--font` (1) -- which is why nine rules across six
+        panels had no background at all.
+
+        `var(--x, fallback)` is fine and is not counted: a fallback is the
+        documented way to read a property that may be absent, and this page
+        uses it deliberately for `--yellow` and `--blue-dim`.
+        """
+        root = re.search(r":root\{(.*?)\}", SERVER_SRC, re.S)
+        self.assertIsNotNone(root, "the page has no :root block")
+        defined = set(re.findall(r"(--[a-z0-9-]+)\s*:", root.group(1)))
+        page = SERVER_SRC[SERVER_SRC.index("_OPERATOR_HTML"):]
+        read_plain = re.findall(r"var\((--[a-z0-9-]+)\)", page)
+        missing = {}
+        for name in read_plain:
+            if name not in defined:
+                missing[name] = missing.get(name, 0) + 1
+        self.assertEqual(
+            missing, {},
+            "read without a fallback and never defined: %s -- each such "
+            "declaration is dropped, so the rule renders without it"
+            % ", ".join("%s (%d places)" % (n, c)
+                        for n, c in sorted(missing.items())))
+
     def test_the_font_fallback_is_the_stack_the_stylesheet_declares(self):
         """`opshellFont`'s literal and `:root{--mono}` are one stack.
 

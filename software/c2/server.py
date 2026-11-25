@@ -4365,6 +4365,23 @@ _OPERATOR_HTML = r"""<!DOCTYPE html>
   --text:#d0d4dc;--text2:#6b7080;--border:rgba(255,26,26,0.15);
   --mono:'Cascadia Code','Fira Code','JetBrains Mono','Courier New',monospace;
   --sans:system-ui,-apple-system,sans-serif;
+  /* Five names the page already read without ever defining them. A
+     declaration that reads an undefined custom property with no fallback
+     is invalid at computed-value time and silently dropped, so until
+     2026-11-25 `background:var(--bg2)` painted nothing in nine rules and
+     the panels' intro paragraphs, written as `color:var(--dim)`, rendered
+     at full brightness. Measured page-wide: 32 such reads.
+
+     Each value is taken from the page rather than invented:
+       --bg2/--bg3  the raised and hover tones `.log-controls button`
+                    already uses literally
+       --blue       what its own fallback states at `.fd-btn.up`
+       --dim        secondary text, which is what `--text2` is for
+       --font       the body's family, so the one rule reading it keeps
+                    exactly the look it had while the declaration was
+                    being dropped */
+  --bg2:rgba(255,255,255,0.04);--bg3:rgba(255,255,255,0.08);
+  --blue:#42a5f5;--dim:var(--text2);--font:var(--sans);
 }
 html,body{height:100%;overflow:hidden;font-family:var(--sans);color:var(--text);background:var(--bg)}
 body{
