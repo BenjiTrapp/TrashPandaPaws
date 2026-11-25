@@ -39,6 +39,20 @@ the beacon's dispatch:
 > are fixed when it is generated. What can be changed at runtime is the
 > traffic profile and the timing.
 
+**Superseded by this work, noted 2026-11-25.** That comment no longer exists
+in `egress.py` — this project removed it, which was the point — so the quote
+above is the state *before* the work and is kept as the reason the work
+happened, not as a description of the code. What the implant can do now:
+`_exec_egress` (`software/c2/beacon.py:9252`) dispatches `rediscover`,
+`proxy` and `gsocket`, so two of the three establish a connection and the
+premise "almost nothing to decide between" is false of the beacon today.
+
+What did *not* change, and is still true as written below: the **agent's**
+`ATTEMPT_VERBS` is still `{"profile": "reconfig", "sleep": "sleep"}`
+(`software/agent/tools/egress.py:49`). The new verbs live in the beacon and
+are reached through the gate, not through that list — which is worth knowing
+before anyone widens it on the strength of this document.
+
 `ATTEMPT_VERBS` is `{"profile": "reconfig", "sleep": "sleep"}`. A decider
 over those two would be theatre. So this work is, in order of weight:
 
