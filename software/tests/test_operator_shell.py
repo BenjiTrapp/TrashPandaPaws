@@ -7758,12 +7758,15 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "await showOperatorShell();\n"
             "const first = document.getElementById('opshell-card')"
             ".children.map(c => c.innerHTML).join(' ');\n"
+            "const firstNotes = document.getElementById('opshell-card')"
+            ".children.filter(c => c.classList.contains('opshell-note'))"
+            ".map(c => c.innerHTML);\n"
             "const cleared = sessionStorage.getItem(opshellStore + '_gone');\n"
             "await opshellTeardown(document.getElementById('opshell-card'));\n"
             "await showOperatorShell();\n"
             "const card = document.getElementById('opshell-card');\n"
             "console.log(JSON.stringify({resumed, atLoad, kept: !!kept,"
-            " first, cleared,"
+            " first, firstNotes, cleared,"
             " second: card.children.map(c => c.innerHTML).join(' '),"
             " parts: card.children.length,"
             " notes: card.children.filter(c =>"
@@ -7775,6 +7778,11 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # The next open says it, and says what the page actually knows.
         self.assertRegex(got["first"], r"(?i)gone|no longer")
         self.assertRegex(got["first"], r"(?i)team server")
+        # And as a note: the class is what places a node outside
+        # `#opshell-body`, and the text alone would pass without it.
+        self.assertEqual(len(got["firstNotes"]), 1,
+                         "the reason is shown, but not as an .opshell-note")
+        self.assertRegex(got["firstNotes"][0], r"(?i)gone|no longer")
         self.assertIsNone(got["cleared"])
         # The one after that does not.
         self.assertNotRegex(got["second"], r"(?i)gone|no longer")
