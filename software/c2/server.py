@@ -1843,7 +1843,8 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             implant = designation["id"]
             # An id that is not a usable string is an id that matches
             # nothing -- not "no id", which would make damaging the file a
-            # way past the check below.
+            # way past the check below. `opshell_remember` must write only
+            # ids this accepts.
             if isinstance(implant, str) and implant:
                 fleet = list(agents.items())
                 for name, entry in fleet:
@@ -1876,8 +1877,11 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         designation = {"agent": agent_name}
         # The id travels with the name: names are reused, the id is the
         # host's. Missing when the agent left the fleet since the open.
+        # Usable means what `opshell_target()` accepts -- a non-empty
+        # string -- and the two must agree: an id written here that the
+        # reader refuses would make the designation dead on arrival.
         implant = (agents.get(agent_name) or {}).get("id")
-        if implant:
+        if isinstance(implant, str) and implant:
             designation["id"] = implant
         tmp = opshell_target_path.with_suffix(".tmp")
         handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

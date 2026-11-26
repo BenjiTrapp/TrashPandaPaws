@@ -1427,6 +1427,29 @@ class TestADesignationFollowsTheDevice(_RouteCase):
 
     # ── what is resolved ──
 
+    def test_the_file_over_the_ordinary_fleet_is_the_device_holding_the_name(self):
+        # Row one of the table, with nothing unusual going on: the id
+        # matches the entry that holds the name, and that name is the answer.
+        self.designate(agent=self.AGENT, id=self.IMPLANT)
+        self.assertEqual(self.target(), self.AGENT)
+
+    def test_an_id_the_reader_would_refuse_is_never_written(self):
+        # The writer and the reader must agree on what a usable id is. A
+        # truthy non-string id written to the file reads back as `None`
+        # even over its own name, so the designation would be dead the
+        # moment it was made. Written by name alone it still works.
+        target = self.data_dir / "opshell-target.json"
+        for bad in (123, ["x"], {"a": 1}, True, 0, None, ""):
+            if target.exists():
+                target.unlink()
+            self.sm.agents[self.AGENT]["id"] = bad
+            answer = self.post(self.url("/api/opshell/open"),
+                               {"agent": self.AGENT})
+            self.assertEqual(answer.status_code, 200, repr(bad))
+            self.assertEqual(self.designation(), {"agent": self.AGENT},
+                             repr(bad))
+            self.assertEqual(self.target(), self.AGENT, repr(bad))
+
     def test_the_device_returning_under_a_new_name_is_found_by_its_id(self):
         self.designate(agent="the-old-name", id=self.IMPLANT)
         self.assertEqual(self.target(), self.AGENT)
