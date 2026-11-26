@@ -35,8 +35,10 @@ The previous branch's placeholder covers the case where the designated name is
 ## Intent
 
 A designation follows the device it was made for, across restarts and across
-renames. When that device is not in the fleet, the designation resolves to
-nothing rather than to whoever holds its old name.
+renames. It never resolves to a **different** device — and when its own device
+is simply gone, it still resolves to the name, so the view can keep saying
+`channel unknown` instead of claiming `closed` about a host nothing has heard
+from. The amendment below carries the exact rule; this is what it is for.
 
 ## The anchor, and what it cannot do
 
@@ -53,9 +55,10 @@ name. Two limits a reader should know:
 - On a host without `/sys/class/net/eth0` — any macOS box — the id is just
   `sha256("hostname:arch")`. **Two identically named machines of the same
   architecture collide.**
-- Renaming a host changes its id, so it registers as a new device. The
-  designation then resolves to nothing, which is the honest answer: the
-  operator pointed at a host that, by this identity scheme, no longer exists.
+- Renaming a host changes its id, so it registers as a new device. Its
+  designation then resolves to the old name while nobody holds it — which is
+  what lets the view keep saying `unknown` — and to nothing once that name is
+  handed to someone else.
 
 Neither is made worse by this change; both are properties of the existing
 identity.
@@ -115,8 +118,10 @@ Two consequences of the table that a reader should not have to derive:
 - **A damaged `id` is stricter than an absent one.** A file with no `id` keeps
   today's behaviour; a file with an unusable one is held to the safety rule.
   That is deliberate, and it is the only arrangement in which damaging the
-  file is not a way to bypass the check. Pinned by
-  `test_a_file_with_no_id_is_not_judged_by_who_holds_the_name`.
+  file is not a way to bypass the check. Both halves are pinned:
+  `test_a_file_with_no_id_is_not_judged_by_who_holds_the_name` for the lenient
+  one, and `test_an_unusable_id_with_the_name_held_by_another_device_is_nothing`
+  for the strict one.
 - **When two fleet entries share an id, the one holding the file's name
   wins.** Added during the build rather than designed here, and kept: the
   anchor's collision is acknowledged above as a limit this change does not
@@ -158,11 +163,11 @@ designation whose device was renamed.
    `agents[agent_name]["id"]`. If it is missing — the agent vanished between
    the open and the write — it writes the name alone, which is today's
    behaviour.
-2. **`opshell_target()`** resolves through the id when the file has one: the
-   fleet entry whose `id` matches, by its current name, or `None`. With no
-   `id` in the file it returns the name as it does today, so a designation
-   written before this change keeps working; the next successful open upgrades
-   the file.
+2. **`opshell_target()`** resolves through the id when the file has one, by the
+   rule and table in the amendment above: a name is returned only when it
+   cannot belong to a different device. With no `id` in the file it returns
+   the name as it does today, so a designation written before this change
+   keeps working; the next successful open upgrades the file.
 
 Nothing else. The view, the strip, the picker, the routes and the ownership
 record are untouched.
@@ -180,8 +185,11 @@ record are untouched.
 
 - A designation written for a device, the fleet rebuilt with that device under
   a **different** name, and the designation resolving to the new name.
-- The same, with the device **absent**: resolves to `None`, and the picker
-  falls into the placeholder the previous branch built.
+- The same, with the device **absent** and nobody holding its name: resolves
+  to the **name**, so `/state` keeps answering `channel unknown` with *no
+  longer in the fleet*. This is the bullet the first draft got wrong, and the
+  reason it is listed before the counter-case: the two together pin the rule
+  from both sides, and neither does it alone.
 - The counter-case that is the whole point: the designation's name handed to a
   **different** device, and the designation resolving to `None` rather than to
   that device.
