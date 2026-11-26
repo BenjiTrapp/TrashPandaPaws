@@ -1252,7 +1252,38 @@ class TestOpeningTheChannel(_RouteCase):
     def test_an_unknown_agent_is_refused_by_name(self):
         answer = self.post(self.url("/api/opshell/open"), {"agent": "no-such-raccoon"})
         self.assertEqual(answer.status_code, 404)
+        self.assertEqual(answer.get_json()["refused"], "no-such-raccoon")
         self.assertEqual(self.sm.task_queues, {})
+
+    def test_naming_nothing_is_not_reported_as_an_unknown_device(self):
+        answer = self.post(self.url("/api/opshell/open"), {})
+        self.assertEqual(answer.status_code, 400)
+        self.assertEqual(answer.get_json()["error"], "choose a device first")
+        self.assertEqual(self.sm.task_queues, {})
+
+    def test_a_remembered_designation_opens_for_a_body_that_names_nothing(self):
+        # What makes the picker's placeholder safe: it posts no `agent` key,
+        # and the fallback must survive the split. The designation is written
+        # rather than earned by opening first -- a second open would be on
+        # the adoption path and would prove this only incidentally. Writing
+        # it is this suite's own pattern, from
+        # `test_a_damaged_record_refuses_on_the_first_request_after_a_restart`.
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        answer = self.post(self.url("/api/opshell/open"), {})
+        self.assertEqual(answer.status_code, 200)
+
+    def test_an_agent_field_that_is_not_a_string_is_refused_not_a_crash(self):
+        # `.strip()` on an int answered 500. The same shape as the
+        # `c2.fallback: true` crash on the beacon.
+        for bad in (123, True, ["badger"], {"agent": "badger"}):
+            answer = self.post(self.url("/api/opshell/open"), {"agent": bad})
+            self.assertEqual(answer.status_code, 400, repr(bad))
+            self.assertEqual(self.sm.task_queues, {}, repr(bad))
+
+    def test_a_whitespace_name_names_nothing(self):
+        answer = self.post(self.url("/api/opshell/open"), {"agent": "   "})
+        self.assertEqual(answer.status_code, 400)
 
 
 class TestClosingTheChannel(_RouteCase):

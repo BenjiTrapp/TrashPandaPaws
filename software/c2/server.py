@@ -1801,6 +1801,11 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 logger.error("opshell: %s", _opshell["record_error"])
         return _opshell["claims"]
 
+    def _named(value) -> str:
+        # The request body and the hand-editable designation file can both
+        # hold a non-string; either one names nothing rather than crashing.
+        return value.strip() if isinstance(value, str) else ""
+
     def opshell_target():
         try:
             with open(opshell_target_path) as handle:
@@ -2120,10 +2125,12 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @require_auth
     def api_opshell_open():
         body = request.get_json(silent=True) or {}
-        agent_name = (body.get("agent") or opshell_target() or "").strip()
-        if not agent_name or agent_name not in agents:
+        agent_name = _named(body.get("agent")) or _named(opshell_target())
+        if not agent_name:
+            return jsonify({"error": "choose a device first"}), 400
+        if agent_name not in agents:
             return jsonify({"error": "no such agent",
-                            "refused": str(agent_name)[:64]}), 404
+                            "refused": agent_name[:64]}), 404
         claims = opshell_claims()
         if _opshell["record_error"]:
             # `opshell_claims()` first, on purpose: the error is filled in
