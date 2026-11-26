@@ -359,6 +359,25 @@ have. These say how the markup lays out, not that the view reaches them:
   beside it already shows `raccoon-bandit` selected: the picker falls back
   to its first option when `state.target` is empty. Older than this branch,
   and a rendered sentence, so not changed here.
+
+  **Overtaken by `2026-11-26-operator-shell-device-designation-design.md`,
+  noted 2026-11-26.** The note above is the state *before* that work and is
+  kept as the reason for it. It read the defect as a mismatch between two
+  words, and that was incomplete twice. The picker's option is not
+  decoration but the argument: `opshellOpen` posts `pick.value`, so a list
+  with no `selected` option makes `Open` act on the alphabetically first
+  device, one nobody chose. And the worse half was not named: when a
+  designation exists but its device has stopped checking in, the strip names
+  that device while the picker still hands back the first candidate, so
+  `Open` opened a shell on a *different* device than the one the view named.
+  The condition is therefore not "`state.target` is empty" but "no candidate
+  equals the target". `opshellPicker` now prepends
+  `<option value="">choose a device</option>` in exactly that state, and
+  `api_opshell_open` answers `400 choose a device first` when nothing is
+  named, keeping `404 no such agent` with the refused name for a name that is
+  not in the fleet. The strip was not reworded: it still reads
+  `no device chosen` with no designation, and what changed is that the
+  picker beside it now agrees.
 - The "Device" label is the body's 13 px sans and the picker 11 px mono, so
   the label reads larger than the control it names; the reason above the
   row and the note below it sit flush against it with no spacing of their
