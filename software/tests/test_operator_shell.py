@@ -4095,6 +4095,10 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
     dependency.
     """
 
+    # `candidates` is `sorted(agents)`, so this is the real order, and
+    # `badger` is what the browser hands back for an unselected list.
+    FLEET = ["badger", "clumsy-raccoon", "parrot"]
+
     def _node(self, script):
         env = _NODE_ENV
         # The module's own `let` declarations, lifted from the source
@@ -7191,6 +7195,43 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertIn("opshell-pick", tags[0])
         self.assertIn("var(--border)", self.one_rule("opshell-pick",
                                                     ".opshell-pick"))
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_fleet_with_no_designation_offers_nothing_to_open(self):
+        html = self.render(state="idle", channel="closed", candidates=self.FLEET)
+        self.assertIn('<option value="">choose a device</option>', html)
+        self.assertNotIn(" selected>", html)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_designation_that_left_the_fleet_offers_nothing_to_open(self):
+        # The half no note carried: the strip names `raccoon-bandit` while the
+        # browser would hand back `badger`, so Open took a shell on a device
+        # the view had just named a different one.
+        html = self.render(state="idle", channel="closed",
+                           candidates=self.FLEET, target="raccoon-bandit")
+        self.assertIn('<option value="">', html)
+        self.assertNotIn(" selected>", html)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_designation_in_the_fleet_is_selected_and_gets_no_placeholder(self):
+        html = self.render(state="idle", channel="closed",
+                           candidates=self.FLEET, target="parrot")
+        self.assertIn('<option value="parrot" selected>', html)
+        self.assertNotIn('<option value="">', html)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_an_empty_fleet_offers_only_the_placeholder(self):
+        html = self.render(state="idle", channel="closed", candidates=[])
+        self.assertEqual(html.count("<option"), 1, html)
+        self.assertIn('<option value="">', html)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_placeholder_is_told_by_its_empty_value_not_its_label(self):
+        # Hostnames come from the device, so a beacon can be called this.
+        html = self.render(state="idle", channel="closed",
+                           candidates=["choose a device"])
+        self.assertEqual(html.count('<option value="">'), 1, html)
+        self.assertIn('<option value="choose a device">', html)
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_minimising_twice_parks_one_card(self):

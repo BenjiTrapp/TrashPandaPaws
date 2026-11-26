@@ -9419,7 +9419,10 @@ async function opshellPoll(){
 }
 
 function opshellPicker(state){
-  const pick = (state.candidates || []).map(a =>
+  const fleet = state.candidates || [];
+  const none = fleet.some(a => a === state.target) ? "" :
+    '<option value="">choose a device</option>';
+  const pick = none + fleet.map(a =>
     '<option value="' + esc(a) + '"' + (a === state.target ? ' selected' : '')
     + '>' + esc(a) + '</option>').join("");
   return '<div class="opshell-row">'
