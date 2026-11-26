@@ -4814,6 +4814,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # nothing and the server's carefully worded reason was discarded.
         got = self._node(
             "els['opshell-body'] = el('opshell-body');\n"
+            # By hand, so not end to end: the real card is `_refusal_card`'s.
             "els['opshell-refused'] = el('opshell-refused');\n"
             "nextReply = {ok:false, status:409, body:"
             "{error:'the tunnel server would not start: port in use'}};\n"
@@ -7361,6 +7362,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         got = self._node(
             "els['opshell-body'] = el('opshell-body');\n"
             "els['opshell-agent'] = el('opshell-agent');\n"
+            # By hand, so not end to end: the real card is `_refusal_card`'s.
             "els['opshell-refused'] = el('opshell-refused');\n"
             "replies = [];\n"
             "const opened = await opshellOpen();\n"
@@ -7392,6 +7394,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # left the fleet was refused without saying which one.
         got = self._node(
             "els['opshell-body'] = el('opshell-body');\n"
+            # By hand, so not end to end: the real card is `_refusal_card`'s.
             "els['opshell-refused'] = el('opshell-refused');\n"
             "replies = [{ok:false, status:404, body:{error:'no such agent',"
             " refused:'no-such-raccoon'}}];\n"
@@ -7426,7 +7429,8 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             " body: els['opshell-body'].innerHTML,\n"
             " notes: card.children.filter(c =>"
             " c.classList.contains('opshell-note')).map(c => c.innerHTML),\n"
-            " said: card.children.map(c => c.innerHTML).join('\\n')}));"
+            " said: card.children.map(c => c.innerHTML).join('\\n'),\n"
+            " rejected: said.includes('token-rejected')}));"
             % (json.dumps(self.IDLE), script))
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
@@ -7488,6 +7492,25 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(len(got["notes"]), 1, got["said"])
         self.assertIn("no such agent: badger", got["notes"][0])
         self.assertNotIn("choose a device first", got["said"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_an_attempt_the_token_stops_still_takes_back_the_last_refusal(self):
+        # Why the clear is the first thing `opshellOpen` does and not beside
+        # `opshellLast = null`: a 401 returns before that line, so the token
+        # prompt came up under a refusal from a press that is no longer the
+        # one being answered.
+        got = self._refusal_card(
+            "els['opshell-agent'].value = '';\n"
+            "replies = [];\n"
+            "await opshellOpen();\n"
+            "els['opshell-agent'].value = 'badger';\n"
+            "replies = [{ok:false, status:401, body:{}}];\n"
+            "await opshellOpen();")
+        self.assertTrue(got["rejected"], "the second attempt never reached "
+                        "the 401 path, so this proves nothing")
+        self.assertNotIn("choose a device first", got["said"],
+                         "a refusal outlived the attempt that followed it")
+        self.assertEqual(got["notes"], [])
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_minimising_twice_parks_one_card(self):

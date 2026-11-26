@@ -129,7 +129,8 @@ A is the only one that changes the behaviour rather than the description.
    neighbour's own precedent — the close route answers `session is
    required` the same way (`:2196`).
 
-The final review added three, all in the page and none in its markup:
+Four more followed, all in the page and none in the markup `opshellRender`
+draws: the final review added 3 to 5, and using the shell found 6.
 
 3. **`opshellOpen` guards the empty pick.** When the picker exists and its
    value is empty, the page shows `choose a device first` and posts nothing.
@@ -146,9 +147,6 @@ The final review added three, all in the page and none in its markup:
    acted on it. The poll reads the list's value before the redraw and puts
    it back afterwards when it is non-empty and still a candidate. The
    markup `opshellRender` produces is unchanged.
-
-Using the shell found one more, also in the page:
-
 6. **A refusal from `Open` stays until the next attempt.** It was written
    into `#opshell-body`, which the poll rebuilds every two seconds, so
    `choose a device first` and `no such agent: <name>` were gone within one
@@ -221,6 +219,10 @@ agent`. The page now draws `refused` when the server sends it.
 - The route's two failures, each asserted on its own status and sentence,
   including that a named-but-unknown device still reports the name it
   refused.
+- A refusal from `Open`, driven through a card `showOperatorShell` drew:
+  still on the card after a poll has rebuilt the body, never written into
+  the body, one note after two refusals, and gone at the next attempt —
+  including one the token stops with a `401`.
 - Each test driven against a mutation of the line it covers, which is how
   this repo holds its tests, and with `__pycache__` cleared under
   `python3 -B` (`.superpowers` note of 2026-11-23).
