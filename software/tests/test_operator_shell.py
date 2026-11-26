@@ -1252,7 +1252,59 @@ class TestOpeningTheChannel(_RouteCase):
     def test_an_unknown_agent_is_refused_by_name(self):
         answer = self.post(self.url("/api/opshell/open"), {"agent": "no-such-raccoon"})
         self.assertEqual(answer.status_code, 404)
+        self.assertEqual(answer.get_json()["refused"], "no-such-raccoon")
         self.assertEqual(self.sm.task_queues, {})
+
+    def test_naming_nothing_is_not_reported_as_an_unknown_device(self):
+        answer = self.post(self.url("/api/opshell/open"), {})
+        self.assertEqual(answer.status_code, 400)
+        self.assertEqual(answer.get_json()["error"], "choose a device first")
+        self.assertEqual(self.sm.task_queues, {})
+
+    def test_a_remembered_designation_opens_for_a_body_that_names_nothing(self):
+        # What makes the picker's placeholder safe: it posts no `agent` key,
+        # and the fallback must survive the split. The designation is written
+        # rather than earned by opening first -- a second open would be on
+        # the adoption path and would prove this only incidentally. Writing
+        # it is this suite's own pattern, from
+        # `test_a_damaged_record_refuses_on_the_first_request_after_a_restart`.
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        answer = self.post(self.url("/api/opshell/open"), {})
+        self.assertEqual(answer.status_code, 200)
+
+    def test_a_designation_that_left_the_fleet_is_refused_by_its_name(self):
+        # The API's half of the dead-designation row: a body naming nothing
+        # falls back to the file, and a name the fleet does not hold is a
+        # `404` that says which name, not the `400` for naming nothing.
+        # The page's own guard does not reach this; any other client does.
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": "no-such-raccoon"}))
+        answer = self.post(self.url("/api/opshell/open"), {})
+        self.assertEqual(answer.status_code, 404)
+        self.assertEqual(answer.get_json()["refused"], "no-such-raccoon")
+        self.assertEqual(self.sm.task_queues, {})
+
+    def test_a_designation_file_that_names_no_string_names_nothing(self):
+        # The file is hand-editable, and a number in it reached `[:64]`.
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": 123}))
+        answer = self.post(self.url("/api/opshell/open"), {})
+        self.assertEqual(answer.status_code, 400)
+        self.assertEqual(answer.get_json()["error"], "choose a device first")
+        self.assertEqual(self.sm.task_queues, {})
+
+    def test_an_agent_field_that_is_not_a_string_is_refused_not_a_crash(self):
+        # `.strip()` on an int answered 500. The same shape as the
+        # `c2.fallback: true` crash on the beacon.
+        for bad in (123, True, ["badger"], {"agent": "badger"}):
+            answer = self.post(self.url("/api/opshell/open"), {"agent": bad})
+            self.assertEqual(answer.status_code, 400, repr(bad))
+            self.assertEqual(self.sm.task_queues, {}, repr(bad))
+
+    def test_a_whitespace_name_names_nothing(self):
+        answer = self.post(self.url("/api/opshell/open"), {"agent": "   "})
+        self.assertEqual(answer.status_code, 400)
 
 
 class TestClosingTheChannel(_RouteCase):
@@ -4095,6 +4147,10 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
     dependency.
     """
 
+    # `candidates` is `sorted(agents)`, so this is the real order, and
+    # `badger` is what the browser hands back for an unselected list.
+    FLEET = ["badger", "clumsy-raccoon", "parrot"]
+
     def _node(self, script):
         env = _NODE_ENV
         # The module's own `let` declarations, lifted from the source
@@ -4758,10 +4814,12 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # nothing and the server's carefully worded reason was discarded.
         got = self._node(
             "els['opshell-body'] = el('opshell-body');\n"
+            # By hand, so not end to end: the real card is `_refusal_card`'s.
+            "els['opshell-refused'] = el('opshell-refused');\n"
             "nextReply = {ok:false, status:409, body:"
             "{error:'the tunnel server would not start: port in use'}};\n"
             "await opshellOpen();\n"
-            "console.log(JSON.stringify({shown: els['opshell-body'].innerHTML,"
+            "console.log(JSON.stringify({shown: els['opshell-refused'].innerHTML,"
             " session: opshellSession}));")
         self.assertIn("would not start", got["shown"])
         self.assertIn("port in use", got["shown"])
@@ -6463,6 +6521,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "sessionStorage.setItem(opshellStore + '_min', '1');\n"
             "els['opshell-body'] = el('opshell-body');\n"
             "els['opshell-agent'] = el('opshell-agent');\n"
+            "els['opshell-agent'].value = 'parrot';\n"
             "nextReply = {ok:true, status:200, body:{session:'new-one'}};\n"
             "await opshellOpen();\n"
             "const stale = sessionStorage.getItem(opshellStore + '_min');\n"
@@ -7193,6 +7252,267 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
                                                     ".opshell-pick"))
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_fleet_with_no_designation_offers_nothing_to_open(self):
+        html = self.render(state="idle", channel="closed", candidates=self.FLEET)
+        self.assertIn('<option value="">choose a device</option>', html)
+        self.assertNotIn(" selected>", html)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_designation_that_left_the_fleet_offers_nothing_to_open(self):
+        # The half no note carried: the strip names `raccoon-bandit` while the
+        # browser would hand back `badger`, so Open took a shell on a device
+        # the view had just named a different one.
+        html = self.render(state="idle", channel="closed",
+                           candidates=self.FLEET, target="raccoon-bandit")
+        self.assertIn('<option value="">', html)
+        self.assertNotIn(" selected>", html)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_designation_in_the_fleet_is_selected_and_gets_no_placeholder(self):
+        html = self.render(state="idle", channel="closed",
+                           candidates=self.FLEET, target="parrot")
+        self.assertIn('<option value="parrot" selected>', html)
+        self.assertNotIn('<option value="">', html)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_an_empty_fleet_offers_only_the_placeholder(self):
+        html = self.render(state="idle", channel="closed", candidates=[])
+        self.assertEqual(html.count("<option"), 1, html)
+        self.assertIn('<option value="">', html)
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_placeholder_is_told_by_its_empty_value_not_its_label(self):
+        # Names are the server's own `raccoon-<word>` (`_assign_name`), not
+        # hostnames, so only a hand-edited `state.json` holds this one --
+        # which is why the placeholder is told by its value, not its label.
+        html = self.render(state="idle", channel="closed",
+                           candidates=["choose a device"])
+        self.assertEqual(html.count('<option value="">'), 1, html)
+        self.assertIn('<option value="choose a device">', html)
+
+    # What a browser does with a `<select>` drawn into `#opshell-body`: the
+    # write destroys the old one, and the new one holds the value the markup
+    # selects -- the `selected` option, else the first. The harness does not
+    # parse markup, so without this the list would outlive the redraw that
+    # destroys it, and a pick could not be lost however the poll was written.
+    _REDRAWN_PICKER = (
+        "const body = el('opshell-body');\n"
+        "body.appendChild(el('opshell-agent'));\n"
+        "const write = Object.getOwnPropertyDescriptor(body, 'innerHTML');\n"
+        "Object.defineProperty(body, 'innerHTML', {get: write.get,\n"
+        "  set(v){\n"
+        "    write.set.call(body, v);\n"
+        "    const list = /<select id=\"opshell-agent\"[^>]*>(.*?)<\\/select>/"
+        ".exec(v);\n"
+        "    if(!list) return;\n"
+        "    const on = /<option value=\"([^\"]*)\" selected>/.exec(list[1])\n"
+        "      || /<option value=\"([^\"]*)\"/.exec(list[1]);\n"
+        "    const node = makeNode('opshell-agent');\n"
+        "    node.value = on ? on[1] : '';\n"
+        "    body.appendChild(node);\n"
+        "  }});\n")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_poll_does_not_take_back_the_operators_pick(self):
+        # The final review's Critical. The poll redraws the idle body every
+        # two seconds, and the markup selects the designation: the operator
+        # picked `badger`, the tick put `parrot` back, and Open took a shell
+        # on `parrot`. The markup is checked too, because the fix must not
+        # reach it -- the ordinary path renders as it did.
+        idle = {"state": "idle", "channel": "closed",
+                "candidates": self.FLEET, "target": "parrot"}
+        got = self._node(
+            self._REDRAWN_PICKER
+            + "body.innerHTML = opshellRender(%s);\n"
+            "els['opshell-agent'].value = 'badger';\n"
+            "replies = [{ok:true, status:200, body:%s}];\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({value: els['opshell-agent'].value,"
+            " html: body.innerHTML, drawn: opshellRender(%s)}));"
+            % (json.dumps(idle), json.dumps(idle), json.dumps(idle)))
+        self.assertEqual(got["value"], "badger",
+                         "the poll put the designation back over the pick")
+        self.assertEqual(got["html"], got["drawn"])
+        self.assertIn('<option value="parrot" selected>', got["html"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_pick_that_left_the_fleet_is_not_put_back(self):
+        # The other half: a value that is no longer an option is one a
+        # browser would refuse anyway, and keeping it would leave the list
+        # showing nothing selected. The markup's own selection stands.
+        before = {"state": "idle", "channel": "closed",
+                  "candidates": self.FLEET, "target": "parrot"}
+        after = dict(before, candidates=["clumsy-raccoon", "parrot"])
+        got = self._node(
+            self._REDRAWN_PICKER
+            + "body.innerHTML = opshellRender(%s);\n"
+            "els['opshell-agent'].value = 'badger';\n"
+            "replies = [{ok:true, status:200, body:%s}];\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({value: els['opshell-agent'].value}));"
+            % (json.dumps(before), json.dumps(after)))
+        self.assertEqual(got["value"], "parrot")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_list_showing_its_placeholder_opens_nothing(self):
+        # Posting `{}` from the placeholder let the server fall back to
+        # whatever designation existed by then -- one another tab could
+        # have written after this view was drawn, and so a device the
+        # operator was never shown. Nothing is posted; the reason is said.
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['opshell-agent'] = el('opshell-agent');\n"
+            # By hand, so not end to end: the real card is `_refusal_card`'s.
+            "els['opshell-refused'] = el('opshell-refused');\n"
+            "replies = [];\n"
+            "const opened = await opshellOpen();\n"
+            "console.log(JSON.stringify({opened, posted,"
+            " shown: els['opshell-refused'].innerHTML}));")
+        self.assertFalse(got["opened"])
+        self.assertEqual(got["posted"], [])
+        self.assertIn("choose a device first", got["shown"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_attach_which_has_no_list_still_names_nothing_and_opens(self):
+        # The guard's boundary. Attach is drawn with no picker and relies
+        # on the server's fallback to the designation, so a view with no
+        # list at all must still post `{}`.
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "replies = [{ok:true, status:200, body:{session:'adopted'}}];\n"
+            "const opened = await opshellOpen();\n"
+            "console.log(JSON.stringify({opened, posted,"
+            " session: opshellSession}));")
+        self.assertTrue(got["opened"])
+        self.assertEqual([p["body"] for p in got["posted"]], ["{}"])
+        self.assertEqual(got["session"], "adopted")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_refused_name_is_shown_with_the_refusal(self):
+        # The route answers `no such agent` with the name in `refused`, and
+        # the page drew only the first half -- so a designation that had
+        # left the fleet was refused without saying which one.
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            # By hand, so not end to end: the real card is `_refusal_card`'s.
+            "els['opshell-refused'] = el('opshell-refused');\n"
+            "replies = [{ok:false, status:404, body:{error:'no such agent',"
+            " refused:'no-such-raccoon'}}];\n"
+            "const opened = await opshellOpen();\n"
+            "console.log(JSON.stringify({opened,"
+            " shown: els['opshell-refused'].innerHTML}));")
+        self.assertFalse(got["opened"])
+        self.assertIn("no such agent: no-such-raccoon", got["shown"])
+
+    # What the poll answers while nothing is attached: the card's ordinary
+    # resting state, and the one that redraws `#opshell-body` every tick.
+    IDLE = {"state": "idle", "channel": "closed", "candidates": ["badger"]}
+
+    def _refusal_card(self, script):
+        """A real card, `script` run in it, and what the card then says.
+
+        Drawn by `showOperatorShell` rather than assembled here, so where the
+        page puts a refusal is the page's answer and not this harness's.
+        `notes` is every `.opshell-note` among the card's own children;
+        `said` is every child's markup together, so a refusal left anywhere
+        in the card -- the body included -- is found.
+        """
+        return self._node(
+            "els['main'] = el('main'); els['content'] = el('content');\n"
+            "els['main'].appendChild(els['content']);\n"
+            "replies = [{ok:true, status:200, body:%s}];\n"
+            "await showOperatorShell();\n"
+            "els['opshell-agent'] = el('opshell-agent');\n"
+            "%s\n"
+            "const card = els['opshell-card'];\n"
+            "console.log(JSON.stringify({\n"
+            " body: els['opshell-body'].innerHTML,\n"
+            " notes: card.children.filter(c =>"
+            " c.classList.contains('opshell-note')).map(c => c.innerHTML),\n"
+            " said: card.children.map(c => c.innerHTML).join('\\n'),\n"
+            " rejected: said.includes('token-rejected')}));"
+            % (json.dumps(self.IDLE), script))
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_refusal_is_still_there_after_the_poll_redraws_the_body(self):
+        """Reported by the operator: the message went too fast to read.
+
+        It was written into `#opshell-body`, and the next poll -- two
+        seconds later, while nothing is attached -- rebuilt that node from
+        the state, which does not carry it. Measured: both refusals this
+        branch added were gone one tick after they were shown.
+        """
+        got = self._refusal_card(
+            "els['opshell-agent'].value = 'badger';\n"
+            "replies = [{ok:false, status:404, body:{error:'no such agent',"
+            " refused:'badger'}}, {ok:true, status:200, body:%s}];\n"
+            "await opshellOpen();\n"
+            "await opshellPoll();" % json.dumps(self.IDLE))
+        self.assertEqual(len(got["notes"]), 1, got["said"])
+        self.assertIn("no such agent: badger", got["notes"][0],
+                      "the poll took the refusal off the page")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_refusal_is_not_written_into_the_body_the_poll_owns(self):
+        # The property that makes the one above hold for every tick and not
+        # just the first: the poll can only erase what is inside its node.
+        got = self._refusal_card(
+            "els['opshell-agent'].value = '';\n"
+            "replies = [];\n"
+            "await opshellOpen();")
+        self.assertNotIn("choose a device first", got["body"])
+        self.assertEqual(len(got["notes"]), 1, got["said"])
+        self.assertIn("choose a device first", got["notes"][0])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_second_attempt_takes_back_what_the_first_one_said(self):
+        # A refusal is about the press that earned it. Left standing over an
+        # Open that went through, it says that press failed.
+        got = self._refusal_card(
+            "els['opshell-agent'].value = '';\n"
+            "replies = [];\n"
+            "await opshellOpen();\n"
+            "els['opshell-agent'].value = 'badger';\n"
+            "replies = [{ok:true, status:200, body:{state:'waiting'}}];\n"
+            "await opshellOpen();")
+        self.assertNotIn("choose a device first", got["said"])
+        self.assertEqual(got["notes"], [],
+                         "an empty note is still drawn, padding and all")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_two_refusals_leave_one_note(self):
+        got = self._refusal_card(
+            "els['opshell-agent'].value = '';\n"
+            "replies = [];\n"
+            "await opshellOpen();\n"
+            "els['opshell-agent'].value = 'badger';\n"
+            "replies = [{ok:false, status:404, body:{error:'no such agent',"
+            " refused:'badger'}}];\n"
+            "await opshellOpen();")
+        self.assertEqual(len(got["notes"]), 1, got["said"])
+        self.assertIn("no such agent: badger", got["notes"][0])
+        self.assertNotIn("choose a device first", got["said"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_an_attempt_the_token_stops_still_takes_back_the_last_refusal(self):
+        # Why the clear is the first thing `opshellOpen` does and not beside
+        # `opshellLast = null`: a 401 returns before that line, so the token
+        # prompt came up under a refusal from a press that is no longer the
+        # one being answered.
+        got = self._refusal_card(
+            "els['opshell-agent'].value = '';\n"
+            "replies = [];\n"
+            "await opshellOpen();\n"
+            "els['opshell-agent'].value = 'badger';\n"
+            "replies = [{ok:false, status:401, body:{}}];\n"
+            "await opshellOpen();")
+        self.assertTrue(got["rejected"], "the second attempt never reached "
+                        "the 401 path, so this proves nothing")
+        self.assertNotIn("choose a device first", got["said"],
+                         "a refusal outlived the attempt that followed it")
+        self.assertEqual(got["notes"], [])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_minimising_twice_parks_one_card(self):
         # The guard `showOperatorShell` holds itself to. Two docks share an
         # id, so a restore removes the one it finds and the other stays:
@@ -7461,14 +7781,19 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "await showOperatorShell();\n"
             "const first = document.getElementById('opshell-card')"
             ".children.map(c => c.innerHTML).join(' ');\n"
+            "const firstNotes = document.getElementById('opshell-card')"
+            ".children.filter(c => c.classList.contains('opshell-note'))"
+            ".map(c => c.innerHTML);\n"
             "const cleared = sessionStorage.getItem(opshellStore + '_gone');\n"
             "await opshellTeardown(document.getElementById('opshell-card'));\n"
             "await showOperatorShell();\n"
             "const card = document.getElementById('opshell-card');\n"
             "console.log(JSON.stringify({resumed, atLoad, kept: !!kept,"
-            " first, cleared,"
+            " first, firstNotes, cleared,"
             " second: card.children.map(c => c.innerHTML).join(' '),"
-            " parts: card.children.length}));")
+            " parts: card.children.length,"
+            " notes: card.children.filter(c =>"
+            " c.classList.contains('opshell-note')).length}));")
         self.assertFalse(got["resumed"])
         # Nothing opens itself at load: that is the feature's own rule.
         self.assertFalse(got["atLoad"], "a card opened itself at load")
@@ -7476,10 +7801,20 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         # The next open says it, and says what the page actually knows.
         self.assertRegex(got["first"], r"(?i)gone|no longer")
         self.assertRegex(got["first"], r"(?i)team server")
+        # And as a note: the class is what places a node outside
+        # `#opshell-body`, and the text alone would pass without it.
+        self.assertEqual(len(got["firstNotes"]), 1,
+                         "the reason is shown, but not as an .opshell-note")
+        self.assertRegex(got["firstNotes"][0], r"(?i)gone|no longer")
         self.assertIsNone(got["cleared"])
         # The one after that does not.
         self.assertNotRegex(got["second"], r"(?i)gone|no longer")
-        self.assertEqual(got["parts"], 2, "the note outlived its one open")
+        # Two properties, kept apart. The count is chrome, the empty
+        # `#opshell-refused` and the body: anything more is a child nobody
+        # drew on purpose, whatever its class.
+        self.assertEqual(got["parts"], 3, "the card carries a child beyond "
+                         "chrome, #opshell-refused and the body")
+        self.assertEqual(got["notes"], 0, "the note outlived its one open")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_a_parked_panel_with_no_session_does_not_claim_a_shell(self):
@@ -7574,6 +7909,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "opshellSession = 'sid-1'; opshellStarted = Date.now() - 92000;\n"
             "els['opshell-body'] = el('opshell-body');\n"
             "els['opshell-agent'] = el('opshell-agent');\n"
+            "els['opshell-agent'].value = 'parrot';\n"
             "replies = [{ok:true, status:200, body:{reason:'another view is "
             "holding this channel'}},"
             " {ok:true, status:200, body:{session:'sid-2'}},"
@@ -7654,10 +7990,15 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "const card = document.getElementById('opshell-card');\n"
             "console.log(JSON.stringify({resumed,"
             " parts: card.children.length,"
+            " notes: card.children.filter(c =>"
+            " c.classList.contains('opshell-note')).length,"
             " html: card.children.map(c => c.innerHTML).join(' '),"
             " gone: sessionStorage.getItem(opshellStore + '_gone')}));")
         self.assertTrue(got["resumed"])
-        self.assertEqual(got["parts"], 2,
+        # Two properties, kept apart, as in the test above.
+        self.assertEqual(got["parts"], 3, "the card carries a child beyond "
+                         "chrome, #opshell-refused and the body")
+        self.assertEqual(got["notes"], 0,
                          "the note was drawn over a card that came back")
         self.assertNotRegex(got["html"], r"(?i)is gone")
         self.assertIsNone(got["gone"])

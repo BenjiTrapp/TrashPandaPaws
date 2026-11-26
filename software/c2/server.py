@@ -1801,6 +1801,11 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 logger.error("opshell: %s", _opshell["record_error"])
         return _opshell["claims"]
 
+    def _named(value) -> str:
+        # The request body and the hand-editable designation file can both
+        # hold a non-string; either one names nothing rather than crashing.
+        return value.strip() if isinstance(value, str) else ""
+
     def opshell_target():
         try:
             with open(opshell_target_path) as handle:
@@ -2120,10 +2125,12 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @require_auth
     def api_opshell_open():
         body = request.get_json(silent=True) or {}
-        agent_name = (body.get("agent") or opshell_target() or "").strip()
-        if not agent_name or agent_name not in agents:
+        agent_name = _named(body.get("agent")) or _named(opshell_target())
+        if not agent_name:
+            return jsonify({"error": "choose a device first"}), 400
+        if agent_name not in agents:
             return jsonify({"error": "no such agent",
-                            "refused": str(agent_name)[:64]}), 404
+                            "refused": agent_name[:64]}), 404
         claims = opshell_claims()
         if _opshell["record_error"]:
             # `opshell_claims()` first, on purpose: the error is filled in
@@ -8960,6 +8967,14 @@ async function showOperatorShell(){
     note.innerHTML = '<p class="loot-empty">' + esc(gone) + '</p>';
     card.appendChild(note);
   }
+  // What the last press of Open was refused with, beside the body for the
+  // same reason as the note above: written into the body, the next poll
+  // took it off the page in under two seconds. Drawn here, empty and with
+  // no class, so it takes no room until `opshellOpen` has something to
+  // say -- and one node, so a second refusal replaces the first.
+  const refused = document.createElement("div");
+  refused.id = "opshell-refused";
+  card.appendChild(refused);
   card.appendChild(body);
   main.appendChild(card);
   // Hidden and not emptied: `renderAgentView` rewrites its children on
@@ -9396,7 +9411,19 @@ async function opshellPoll(){
     // every open-end-open cycle in a long-lived card leaked an xterm and
     // its observers.
     if(opshellTerm){ opshellTerm.dispose(); opshellTerm = null; }
+    // The operator's pick survives the redraw. The markup selects only
+    // `state.target`, and `opshellOpen` reads the list's value and nothing
+    // else, so a device picked a moment before this tick snapped back to
+    // the designation and Open acted on a device nobody had just named.
+    // Put back after the write rather than drawn into it, so the markup
+    // stays what `opshellRender` says it is.
+    const was = document.getElementById("opshell-agent");
+    const picked = was ? was.value : "";
     body.innerHTML = opshellRender(state);
+    const pick = document.getElementById("opshell-agent");
+    if(pick && picked && (state.candidates || []).includes(picked)){
+      pick.value = picked;
+    }
   } else {
     // The body is not redrawn under an attached terminal, so everything
     // this view learns -- the channel going `unknown`, a queued shutdown,
@@ -9419,7 +9446,10 @@ async function opshellPoll(){
 }
 
 function opshellPicker(state){
-  const pick = (state.candidates || []).map(a =>
+  const fleet = state.candidates || [];
+  const none = fleet.some(a => a === state.target) ? "" :
+    '<option value="">choose a device</option>';
+  const pick = none + fleet.map(a =>
     '<option value="' + esc(a) + '"' + (a === state.target ? ' selected' : '')
     + '>' + esc(a) + '</option>').join("");
   return '<div class="opshell-row">'
@@ -9545,10 +9575,28 @@ async function opshellOpen(ev){
   }
   const pick = document.getElementById("opshell-agent");
   const agent = pick ? pick.value : null;
-  const body = document.getElementById("opshell-body");
-  const fail = why => {
-    if(body) body.innerHTML = '<p class="loot-empty">' + esc(why) + '</p>';
+  const refused = document.getElementById("opshell-refused");
+  const refuse = why => {
+    if(!refused) return;
+    refused.classList.add("opshell-note");
+    refused.innerHTML = '<p class="loot-empty">' + esc(why) + '</p>';
   };
+  const clear = () => {
+    if(!refused) return;
+    refused.classList.remove("opshell-note");
+    refused.innerHTML = "";
+  };
+  // Taken back first, for the reason `opshellLast` is below: this is a new
+  // attempt, and what the last one was refused with is no longer the
+  // answer. First and not beside that line, because a 401 returns before
+  // it. Not on a timer -- the operator reads at their own pace, and the
+  // next press is what makes it stale.
+  clear();
+  // A list showing its placeholder names nothing, and posting `{}` would
+  // let the server fall back to whatever designation exists *now* -- one
+  // another tab could have written since this view was drawn. No list at
+  // all is Attach, which names nothing on purpose and is left alone.
+  if(pick && !agent){ refuse("choose a device first"); return false; }
   // Raw fetch and `r.ok`, the pattern `drawListeners` already uses, not
   // `api()`: that helper throws only on 401, so a 404 ("no such agent") or
   // a 409 ("the tunnel server would not start: ...") resolved normally,
@@ -9560,11 +9608,12 @@ async function opshellOpen(ev){
     r = await fetch("/api/opshell/open", {method:"POST", headers:H(),
       body: JSON.stringify(agent ? {agent} : {})});
     answer = await r.json();
-  } catch(e) { fail(String((e && e.message) || e)); return false; }
+  } catch(e) { refuse(String((e && e.message) || e)); return false; }
   if(r.status === 401){ tokenRejected(); return false; }
   if(!r.ok || !answer || answer.error){
-    fail((answer && answer.error) || ("the server refused this: HTTP "
-                                      + r.status));
+    refuse((answer && answer.error
+            ? answer.error + (answer.refused ? ": " + answer.refused : "")
+            : "") || ("the server refused this: HTTP " + r.status));
     return false;
   }
   // Above the `if`, and not inside it: the operator picked a device and
