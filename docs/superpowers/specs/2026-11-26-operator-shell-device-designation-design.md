@@ -147,6 +147,17 @@ The final review added three, all in the page and none in its markup:
    it back afterwards when it is non-empty and still a candidate. The
    markup `opshellRender` produces is unchanged.
 
+Using the shell found one more, also in the page:
+
+6. **A refusal from `Open` stays until the next attempt.** It was written
+   into `#opshell-body`, which the poll rebuilds every two seconds, so
+   `choose a device first` and `no such agent: <name>` were gone within one
+   tick. It goes into one `#opshell-refused` node instead, a sibling of the
+   body drawn by `showOperatorShell`, which gets the existing `.opshell-note`
+   class only while it holds a refusal. The same reason as the resume note
+   beside it: the refusal is not state. `opshellOpen` empties it at its next
+   attempt. It has no timer and no dismiss button.
+
 Nothing else. The strip, `opshellRender`, the styles and the remembered
 designation are not touched, so `TestTheViewDoesNotOverclaim` and the
 prose-pinning tests have nothing to answer for.
