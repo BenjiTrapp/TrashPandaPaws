@@ -368,7 +368,7 @@ have. These say how the markup lays out, not that the view reaches them:
   with no `selected` option makes `Open` act on the alphabetically first
   device, one nobody chose. And the worse half was not named: when a
   designation exists but its device is not in the fleet (a server restart
-  not yet followed by that device's check-in, say), the strip names that
+  not yet followed by that device re-registering, say), the strip names that
   device while the picker still hands back the first candidate, so
   `Open` opened a shell on a *different* device than the one the view named.
   The condition is therefore not "`state.target` is empty" but "no candidate

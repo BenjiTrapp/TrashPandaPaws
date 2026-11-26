@@ -41,18 +41,19 @@ target is empty" — it is **no candidate equals the target**
 fleet: `opshell_state` reads `candidates` from `agents` and `target` from a
 file written at the first successful open (`:1850`, `:1849`, `:2160`).
 
-The window is narrow but not rare: row one lasts until the first open on a
-server. Row two needs no device to have gone quiet, because `agents` is
-never pruned for a silent device: one that stops checking in stays in the
-fleet, labelled `stale` and then `offline`, and the picker still selects it.
-A designation is missing from the fleet when the server was restarted and
-the device has not yet checked in again, or when the file names a device
-this server has never seen. The restart case is the likely one. `_load_state`
-restores the fleet from `state.json`, but `_save_state` (which writes the
-whole fleet) runs only on the scan route and the result path, so a device
-that registered after the last of those is not in the file, while its
-designation, written at the first successful open, is. At the default
-300 s beacon interval the window after a restart is minutes wide.
+Both rows arise in ordinary use: row one lasts until the first open on a
+server. Row two needs no device to have gone quiet, because `agents` is never
+pruned for a silent device: one that stops checking in stays in the fleet,
+labelled `stale` and then `offline`, and the picker still selects it. A
+designation is missing from the fleet when the server was restarted and the
+device has not re-registered, or when the file names a device this server has
+never seen. The reason is structural: the designation is on disk and the
+fleet is not. `_load_state` restores the fleet from `state.json`, but
+`_save_state` (which writes the whole fleet) runs only on the scan route and
+the result path, so a device that registered after the last of those is not
+in the file, while its designation, written at the first successful open, is.
+Only `_handle_register` and `_load_state` put a device in the fleet; a
+check-in from a device the server does not hold adds nothing.
 
 ## Intent
 
@@ -82,7 +83,7 @@ operator.
 - A second mechanism that keeps `target` and `candidates` in step. The file
   is the operator's designation, not a cache of the fleet; pruning it when a
   device is missing from the fleet would discard the designation exactly
-  when the operator is waiting for that device to check in again.
+  when the operator is waiting for that device to come back.
 
 ## Approaches
 
