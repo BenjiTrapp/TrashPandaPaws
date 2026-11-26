@@ -1835,6 +1835,21 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return None
         if not isinstance(designation, dict):
             return None
+        if "id" in designation:
+            # The device, not the name: fleet names are reused when a
+            # restart that no save recorded rewinds the counter, so the
+            # name on file may now belong to a different host. An id that
+            # is not a usable string names nothing, rather than falling
+            # back to the name it was written to outlive.
+            implant = designation["id"]
+            if not isinstance(implant, str) or not implant:
+                return None
+            for name, entry in list(agents.items()):
+                if entry.get("id") == implant:
+                    return name
+            return None
+        # Written before the id was recorded; upgraded by the next open,
+        # never here, because this is read by a GET that is polled.
         return _named(designation.get("agent")) or None
 
     def opshell_remember(agent_name: str):
@@ -1849,10 +1864,16 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         # host is the operator working on" does not belong to everyone with
         # a login, and one of the two files being laxer than the other
         # invites someone to relax the other to match.
+        designation = {"agent": agent_name}
+        # The id travels with the name: names are reused, the id is the
+        # host's. Missing when the agent left the fleet since the open.
+        implant = (agents.get(agent_name) or {}).get("id")
+        if implant:
+            designation["id"] = implant
         tmp = opshell_target_path.with_suffix(".tmp")
         handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(handle, "w") as out:
-            json.dump({"agent": agent_name}, out)
+            json.dump(designation, out)
         os.replace(tmp, opshell_target_path)
 
     def opshell_queue(agent_name: str, action: str):
