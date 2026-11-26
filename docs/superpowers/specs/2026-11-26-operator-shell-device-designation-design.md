@@ -2,15 +2,19 @@
 
 **Date:** 2026-11-26
 **Branch:** `fix/opshell-device-designation`, on `main` at `db84655`
-**Status:** short design, pending approval
+**Status:** approved, planned (`docs/superpowers/plans/2026-11-26-operator-shell-device-designation.md`)
 **Predecessors:** `2026-11-17-operator-shell-design.md` (part one, PR #9),
 `2026-11-19-operator-shell-window-design.md` (part two, PR #13),
 `2026-11-23-operator-shell-window-look-design.md` (part three). Part three
 recorded half of this defect under *Found by looking, and covered by no
 test* and left it: "a rendered sentence, so not changed here."
 
-This is a small change. It touches the picker and one route, and it changes
-no sentence in the status strip.
+This is a small change. It touches the picker and one route — and, after the
+final review, the open and the poll beside them — and it changes no sentence
+in the status strip.
+
+Every line reference in this document is against `db84655`, the commit this
+work started from.
 
 ## Why now
 
@@ -41,9 +45,9 @@ target is empty" — it is **no candidate equals the target**
 fleet: `opshell_state` reads `candidates` from `agents` and `target` from a
 file written at the first successful open (`:1850`, `:1849`, `:2160`).
 
-Both rows arise in ordinary use: row one lasts until the first open on a
-server. Row two needs no device to have gone quiet, because `agents` is never
-pruned for a silent device: one that stops checking in stays in the fleet,
+Both rows follow from the same structure: row one lasts until the first open
+on a server. Row two needs no device to have gone quiet, because `agents` is
+never pruned for a silent device: one that stops checking in stays in the fleet,
 labelled `stale` and then `offline`, and the picker still selects it. A
 designation is missing from the fleet when the server was restarted and the
 device has not re-registered, or when the file names a device this server has
@@ -125,15 +129,39 @@ A is the only one that changes the behaviour rather than the description.
    neighbour's own precedent — the close route answers `session is
    required` the same way (`:2196`).
 
+The final review added three, all in the page and none in its markup:
+
+3. **`opshellOpen` guards the empty pick.** When the picker exists and its
+   value is empty, the page shows `choose a device first` and posts nothing.
+   Without the guard the placeholder posted an empty body, and the route
+   fell back to whatever designation existed *at the click* — which another
+   tab, or any other client of the route, could have written after the
+   render, so a device the view never showed. With no picker on the page at all, which is Attach,
+   the guard does not apply and the empty body still goes to the route.
+4. **`opshellOpen` shows `refused`.** A refusal that carries the field is
+   drawn as `no such agent: <name>`.
+5. **`opshellPoll` keeps the operator's pick.** The idle body is redrawn
+   every two seconds and the markup selects only `state.target`, so a pick
+   made a moment before a tick snapped back to the designation and `Open`
+   acted on it. The poll reads the list's value before the redraw and puts
+   it back afterwards when it is non-empty and still a candidate. The
+   markup `opshellRender` produces is unchanged.
+
 Nothing else. The strip, `opshellRender`, the styles and the remembered
 designation are not touched, so `TestTheViewDoesNotOverclaim` and the
 prose-pinning tests have nothing to answer for.
 
-A deliberate consequence of splitting the route rather than guarding the
-button: in row two, pressing `Open` without choosing still posts an empty
-body, the route still falls back to the remembered designation, and the
-operator is told `no such agent: raccoon-bandit`. That names the dead
-designation, which is more than a client-side guard could have said.
+The route split stays alongside the client guard, for two reasons. It is the
+API's own honesty: any client other than this page that names nothing is told
+so, and one that names a device the fleet does not hold — directly, or
+through the designation fallback — is told `404 no such agent` with the name
+in `refused`. And Attach renders no picker and depends on that fallback.
+
+An earlier draft argued against the client guard, on the ground that the
+route's answer names the dead designation, "which is more than a client-side
+guard could have said". That reason was wrong: `opshellOpen` drew only
+`answer.error` and never `answer.refused`, so the operator saw a bare `no such
+agent`. The page now draws `refused` when the server sends it.
 
 ## Left by decision
 
@@ -142,6 +170,18 @@ designation, which is more than a client-side guard could have said.
   is the designated device — and the operator can see it is absent from the
   list. Saying more means new rendered prose, which is what this change set
   was chosen to avoid.
+- **A designation can come to name a different device.** Names are
+  assigned by the server from a global counter, `_name_counter`
+  (`server.py:175`), as `AGENT_NAMES[_name_counter % len(AGENT_NAMES)]`
+  (`_assign_name`, `:199`). The counter is restored from `state.json`
+  (`:264`) and written there only by `_save_state` (`:251`), so a restart
+  after registrations that no save recorded rewinds it, and a name is handed
+  out again, to whichever host registers first. A designation naming the old device then matches the new
+  one, the picker marks it `selected`, and nothing on the page says so. The
+  file already records the rewind, for the tunnel identity (`:272-275`).
+  Not fixed here: pinning a designation to the implant id changes what a
+  designation *is* and touches the register path, so it is its own piece of
+  work.
 - **One device in the fleet is not special-cased.** It costs one click, once
   per server, because the first open writes the designation and every later
   render marks it `selected`. An auto-pick for a fleet of one would

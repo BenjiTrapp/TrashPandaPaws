@@ -7280,7 +7280,9 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_placeholder_is_told_by_its_empty_value_not_its_label(self):
-        # Hostnames come from the device, so a beacon can be called this.
+        # Names are the server's own `raccoon-<word>` (`_assign_name`), not
+        # hostnames, so only a hand-edited `state.json` holds this one --
+        # which is why the placeholder is told by its value, not its label.
         html = self.render(state="idle", channel="closed",
                            candidates=["choose a device"])
         self.assertEqual(html.count('<option value="">'), 1, html)

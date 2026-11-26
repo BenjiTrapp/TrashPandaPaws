@@ -28,7 +28,7 @@ Five inputs the spec implies and no task's happy path exercises, most likely fir
 2. **An empty fleet.** No beacon has checked in, so `candidates` is `[]`. The picker must still offer nothing to open rather than an empty list the browser reads as nothing at all. → Task 1. (The route needs no test of its own here: its answer to an unnamed device does not depend on the fleet's size.)
 3. **`{"agent": "   "}`** — a whitespace name is not a device. It must land in "nothing named", not in "unknown device". → Task 2.
 4. **A body that names a device while another is remembered.** The split must not break the fallback that makes the placeholder work: a body naming nothing still opens the remembered designation. → Task 2.
-5. **A beacon whose hostname is literally `choose a device`.** Agent names come from the device. The placeholder must be identifiable by its empty value, never by its label. → Task 1.
+5. **A device whose name is literally `choose a device`.** Agent names are assigned by the server as `raccoon-<word>` (`_assign_name`, `server.py:197-201`), not taken from hostnames, so the clash is reachable only through a hand-edited `state.json`. That is why the placeholder must be identifiable by its empty value, never by its label. → Task 1.
 
 ---
 
@@ -93,7 +93,8 @@ def test_an_empty_fleet_offers_only_the_placeholder(self):
     self.assertIn('<option value="">', html)
 
 def test_the_placeholder_is_told_by_its_empty_value_not_its_label(self):
-    # Hostnames come from the device, so a beacon can be called this.
+    # Names are the server's own `raccoon-<word>`, so only a hand-edited
+    # `state.json` holds this one -- which is why the value tells, not the label.
     html = self.render(state="idle", channel="closed",
                        candidates=["choose a device"])
     self.assertEqual(html.count('<option value="">'), 1, html)
@@ -274,9 +275,9 @@ Open `http://127.0.0.1:18500`, give it `demo-token`, press `>_`, and check in or
 4. **A designation that left the fleet.** Stop the server, point the designation at a device that is not in the fleet, start it again:
 
 ```bash
-printf '{"agent":"raccoon-bandit"}' > /tmp/opshell-check/opshell-target.json
+printf '{"agent":"no-such-raccoon"}' > /tmp/opshell-check/opshell-target.json
 ```
 
-   The picker reads `choose a device` again, the strip names `raccoon-bandit`, and `Open` without choosing answers `no such agent` with `raccoon-bandit` — which names the dead designation instead of silently opening a shell on another device.
+   The picker reads `choose a device` again, the strip names `no-such-raccoon`, and `Open` without choosing says `choose a device first` and opens nothing — instead of silently opening a shell on another device. The name is one `_assign_name` can never produce (every name it gives begins `raccoon-`), so no device on this server can take it: `raccoon-bandit` is what the first device on a fresh server is called, and writing it here would show row three and pass for the wrong reason.
 
 If `tools/capture_gui.py` is used for a screenshot, kill its headless Chrome afterwards: it leaks one per failed step, and six of them reddened this suite once (project note of 2026-11-25).
