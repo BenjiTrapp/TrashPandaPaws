@@ -7264,6 +7264,69 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(html.count('<option value="">'), 1, html)
         self.assertIn('<option value="choose a device">', html)
 
+    # What a browser does with a `<select>` drawn into `#opshell-body`: the
+    # write destroys the old one, and the new one holds the value the markup
+    # selects -- the `selected` option, else the first. The harness does not
+    # parse markup, so without this the list would outlive the redraw that
+    # destroys it, and a pick could not be lost however the poll was written.
+    _REDRAWN_PICKER = (
+        "const body = el('opshell-body');\n"
+        "body.appendChild(el('opshell-agent'));\n"
+        "const write = Object.getOwnPropertyDescriptor(body, 'innerHTML');\n"
+        "Object.defineProperty(body, 'innerHTML', {get: write.get,\n"
+        "  set(v){\n"
+        "    write.set.call(body, v);\n"
+        "    const list = /<select id=\"opshell-agent\"[^>]*>(.*?)<\\/select>/"
+        ".exec(v);\n"
+        "    if(!list) return;\n"
+        "    const on = /<option value=\"([^\"]*)\" selected>/.exec(list[1])\n"
+        "      || /<option value=\"([^\"]*)\"/.exec(list[1]);\n"
+        "    const node = makeNode('opshell-agent');\n"
+        "    node.value = on ? on[1] : '';\n"
+        "    body.appendChild(node);\n"
+        "  }});\n")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_the_poll_does_not_take_back_the_operators_pick(self):
+        # The final review's Critical. The poll redraws the idle body every
+        # two seconds, and the markup selects the designation: the operator
+        # picked `badger`, the tick put `parrot` back, and Open took a shell
+        # on `parrot`. The markup is checked too, because the fix must not
+        # reach it -- the ordinary path renders as it did.
+        idle = {"state": "idle", "channel": "closed",
+                "candidates": self.FLEET, "target": "parrot"}
+        got = self._node(
+            self._REDRAWN_PICKER
+            + "body.innerHTML = opshellRender(%s);\n"
+            "els['opshell-agent'].value = 'badger';\n"
+            "replies = [{ok:true, status:200, body:%s}];\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({value: els['opshell-agent'].value,"
+            " html: body.innerHTML, drawn: opshellRender(%s)}));"
+            % (json.dumps(idle), json.dumps(idle), json.dumps(idle)))
+        self.assertEqual(got["value"], "badger",
+                         "the poll put the designation back over the pick")
+        self.assertEqual(got["html"], got["drawn"])
+        self.assertIn('<option value="parrot" selected>', got["html"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_pick_that_left_the_fleet_is_not_put_back(self):
+        # The other half: a value that is no longer an option is one a
+        # browser would refuse anyway, and keeping it would leave the list
+        # showing nothing selected. The markup's own selection stands.
+        before = {"state": "idle", "channel": "closed",
+                  "candidates": self.FLEET, "target": "parrot"}
+        after = dict(before, candidates=["clumsy-raccoon", "parrot"])
+        got = self._node(
+            self._REDRAWN_PICKER
+            + "body.innerHTML = opshellRender(%s);\n"
+            "els['opshell-agent'].value = 'badger';\n"
+            "replies = [{ok:true, status:200, body:%s}];\n"
+            "await opshellPoll();\n"
+            "console.log(JSON.stringify({value: els['opshell-agent'].value}));"
+            % (json.dumps(before), json.dumps(after)))
+        self.assertEqual(got["value"], "parrot")
+
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_minimising_twice_parks_one_card(self):
         # The guard `showOperatorShell` holds itself to. Two docks share an

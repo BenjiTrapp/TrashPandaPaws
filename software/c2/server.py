@@ -9403,7 +9403,19 @@ async function opshellPoll(){
     // every open-end-open cycle in a long-lived card leaked an xterm and
     // its observers.
     if(opshellTerm){ opshellTerm.dispose(); opshellTerm = null; }
+    // The operator's pick survives the redraw. The markup selects only
+    // `state.target`, and `opshellOpen` reads the list's value and nothing
+    // else, so a device picked a moment before this tick snapped back to
+    // the designation and Open acted on a device nobody had just named.
+    // Put back after the write rather than drawn into it, so the markup
+    // stays what `opshellRender` says it is.
+    const was = document.getElementById("opshell-agent");
+    const picked = was ? was.value : "";
     body.innerHTML = opshellRender(state);
+    const pick = document.getElementById("opshell-agent");
+    if(pick && picked && (state.candidates || []).includes(picked)){
+      pick.value = picked;
+    }
   } else {
     // The body is not redrawn under an attached terminal, so everything
     // this view learns -- the channel going `unknown`, a queued shutdown,
