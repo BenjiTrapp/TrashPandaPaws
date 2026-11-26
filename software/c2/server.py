@@ -9571,6 +9571,11 @@ async function opshellOpen(ev){
   const fail = why => {
     if(body) body.innerHTML = '<p class="loot-empty">' + esc(why) + '</p>';
   };
+  // A list showing its placeholder names nothing, and posting `{}` would
+  // let the server fall back to whatever designation exists *now* -- one
+  // another tab could have written since this view was drawn. No list at
+  // all is Attach, which names nothing on purpose and is left alone.
+  if(pick && !agent){ fail("choose a device first"); return false; }
   // Raw fetch and `r.ok`, the pattern `drawListeners` already uses, not
   // `api()`: that helper throws only on 401, so a 404 ("no such agent") or
   // a 409 ("the tunnel server would not start: ...") resolved normally,
@@ -9585,8 +9590,9 @@ async function opshellOpen(ev){
   } catch(e) { fail(String((e && e.message) || e)); return false; }
   if(r.status === 401){ tokenRejected(); return false; }
   if(!r.ok || !answer || answer.error){
-    fail((answer && answer.error) || ("the server refused this: HTTP "
-                                      + r.status));
+    fail((answer && answer.error
+          ? answer.error + (answer.refused ? ": " + answer.refused : "")
+          : "") || ("the server refused this: HTTP " + r.status));
     return false;
   }
   // Above the `if`, and not inside it: the operator picked a device and

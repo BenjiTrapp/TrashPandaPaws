@@ -6498,6 +6498,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "sessionStorage.setItem(opshellStore + '_min', '1');\n"
             "els['opshell-body'] = el('opshell-body');\n"
             "els['opshell-agent'] = el('opshell-agent');\n"
+            "els['opshell-agent'].value = 'parrot';\n"
             "nextReply = {ok:true, status:200, body:{session:'new-one'}};\n"
             "await opshellOpen();\n"
             "const stale = sessionStorage.getItem(opshellStore + '_min');\n"
@@ -7328,6 +7329,53 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertEqual(got["value"], "parrot")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_list_showing_its_placeholder_opens_nothing(self):
+        # Posting `{}` from the placeholder let the server fall back to
+        # whatever designation existed by then -- one another tab could
+        # have written after this view was drawn, and so a device the
+        # operator was never shown. Nothing is posted; the reason is said.
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "els['opshell-agent'] = el('opshell-agent');\n"
+            "replies = [];\n"
+            "const opened = await opshellOpen();\n"
+            "console.log(JSON.stringify({opened, posted,"
+            " shown: els['opshell-body'].innerHTML}));")
+        self.assertFalse(got["opened"])
+        self.assertEqual(got["posted"], [])
+        self.assertIn("choose a device first", got["shown"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_attach_which_has_no_list_still_names_nothing_and_opens(self):
+        # The guard's boundary. Attach is drawn with no picker and relies
+        # on the server's fallback to the designation, so a view with no
+        # list at all must still post `{}`.
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "replies = [{ok:true, status:200, body:{session:'adopted'}}];\n"
+            "const opened = await opshellOpen();\n"
+            "console.log(JSON.stringify({opened, posted,"
+            " session: opshellSession}));")
+        self.assertTrue(got["opened"])
+        self.assertEqual([p["body"] for p in got["posted"]], ["{}"])
+        self.assertEqual(got["session"], "adopted")
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
+    def test_a_refused_name_is_shown_with_the_refusal(self):
+        # The route answers `no such agent` with the name in `refused`, and
+        # the page drew only the first half -- so a designation that had
+        # left the fleet was refused without saying which one.
+        got = self._node(
+            "els['opshell-body'] = el('opshell-body');\n"
+            "replies = [{ok:false, status:404, body:{error:'no such agent',"
+            " refused:'no-such-raccoon'}}];\n"
+            "const opened = await opshellOpen();\n"
+            "console.log(JSON.stringify({opened,"
+            " shown: els['opshell-body'].innerHTML}));")
+        self.assertFalse(got["opened"])
+        self.assertIn("no such agent: no-such-raccoon", got["shown"])
+
+    @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_minimising_twice_parks_one_card(self):
         # The guard `showOperatorShell` holds itself to. Two docks share an
         # id, so a restore removes the one it finds and the other stays:
@@ -7709,6 +7757,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "opshellSession = 'sid-1'; opshellStarted = Date.now() - 92000;\n"
             "els['opshell-body'] = el('opshell-body');\n"
             "els['opshell-agent'] = el('opshell-agent');\n"
+            "els['opshell-agent'].value = 'parrot';\n"
             "replies = [{ok:true, status:200, body:{reason:'another view is "
             "holding this channel'}},"
             " {ok:true, status:200, body:{session:'sid-2'}},"
