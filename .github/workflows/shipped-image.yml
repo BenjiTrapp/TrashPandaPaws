@@ -43,7 +43,7 @@ jobs:
     # from a cold cache.
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: What docker is here
         run: |
