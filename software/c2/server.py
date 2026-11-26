@@ -39,7 +39,8 @@ from pathlib import Path
 from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from flask import Flask, request, jsonify, send_file, send_from_directory, Response
+from flask import (Flask, request, jsonify, send_file, send_from_directory,
+                   Response, abort)
 
 # Only the exception, deliberately. See listeners/errors.py: importing the
 # supervisor would load all three protocol parsers into this process, and
@@ -184,6 +185,26 @@ def _clean_caps(payload: dict) -> list:
     # Only a list counts: `"batch" in "batch-ish"` would be a substring match.
     caps = payload.get("caps")
     return [c for c in caps if isinstance(c, str)] if isinstance(caps, list) else []
+
+
+def _json_object() -> dict:
+    """The operator request's JSON body as a dict, or a 400 if it is not one.
+
+    `get_json(silent=True)` turns only JSON that does not parse into None.
+    The crash was a *truthy* non-object: `[1]`, `"x"` and `7` parse, got
+    past `or {}`, and met `.get`, which answered 500. Those are refused.
+    Anything falsy -- an absent or unparseable body, but also `[]`, `0`,
+    `""` and `false` -- still means `{}`, the meaning `or {}` always gave
+    it; refusing those would be a validation change, not a crash fix.
+    """
+    body = request.get_json(silent=True)
+    if not body:
+        return {}
+    if not isinstance(body, dict):
+        refusal = jsonify({"error": "the request body must be a JSON object"})
+        refusal.status_code = 400
+        abort(refusal)
+    return body
 
 
 def _as_text(data) -> str:
@@ -1809,9 +1830,12 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     def opshell_target():
         try:
             with open(opshell_target_path) as handle:
-                return (json.load(handle) or {}).get("agent") or None
+                designation = json.load(handle)
         except (OSError, ValueError):
             return None
+        if not isinstance(designation, dict):
+            return None
+        return _named(designation.get("agent")) or None
 
     def opshell_remember(agent_name: str):
         """Persist the designation, so the glyph opens onto the same host.
@@ -2124,7 +2148,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/opshell/open", methods=["POST"])
     @require_auth
     def api_opshell_open():
-        body = request.get_json(silent=True) or {}
+        body = _json_object()
         agent_name = _named(body.get("agent")) or _named(opshell_target())
         if not agent_name:
             return jsonify({"error": "choose a device first"}), 400
@@ -2191,8 +2215,8 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/opshell/close", methods=["POST"])
     @require_auth
     def api_opshell_close():
-        body = request.get_json(silent=True) or {}
-        target = (body.get("agent") or opshell_target() or "").strip()
+        body = _json_object()
+        target = _named(body.get("agent")) or _named(opshell_target())
         if not target:
             return jsonify({"error": "nothing is open"}), 404
         session_id = body.get("session")
@@ -2343,7 +2367,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/opshell/keys", methods=["POST"])
     @require_auth
     def api_opshell_keys():
-        body = request.get_json(silent=True) or {}
+        body = _json_object()
         # The ceiling before the lookup: it is the cheaper check, and it is
         # the one that stops a request holding a worker thread.
         raw = body.get("data") or ""
@@ -2385,7 +2409,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/server/exec", methods=["POST"])
     @require_auth
     def api_server_exec():
-        body = request.get_json(silent=True) or {}
+        body = _json_object()
         tool = body.get("tool", "custom")
         origin = body.get("origin", "operator")
         timeout = body.get("timeout", 300)
@@ -2680,7 +2704,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/server/avenum", methods=["POST"])
     @require_auth
     def api_server_avenum():
-        body = request.get_json(silent=True) or {}
+        body = _json_object()
         target = body.get("target", "")
         username = body.get("username", "")
         password = body.get("password", "")
@@ -2703,7 +2727,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/server/rdp", methods=["POST"])
     @require_auth
     def api_server_rdp():
-        body = request.get_json(silent=True) or {}
+        body = _json_object()
         target = body.get("target", "").strip()
         mode = body.get("mode", "xfreerdp")
         username = body.get("username", "").strip()
@@ -2802,7 +2826,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @require_auth
     def api_beacon_gen():
         import random as _r, string
-        body = request.get_json(silent=True) or {}
+        body = _json_object()
         c2_url = body.get("c2_url", "").strip()
         enc_key = body.get("enc_key", "").strip()
         interval = int(body.get("interval", 300))
@@ -2912,7 +2936,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         except FileNotFoundError:
             return jsonify({"error": "gh CLI not found. Install from https://cli.github.com"}), 400
 
-        body = request.get_json(silent=True) or {}
+        body = _json_object()
         c2_url = body.get("c2_url", "").strip()
         enc_key = body.get("enc_key", "").strip()
         interval = int(body.get("interval", 300))
@@ -3070,7 +3094,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/server/c2-profile/from-burp", methods=["POST"])
     @require_auth
     def api_burp_to_profile():
-        body = request.get_json(silent=True) or {}
+        body = _json_object()
         raw_req = body.get("request", "").replace("\r\n", "\n").replace('"', "'")
         raw_res = body.get("response", "").replace("\r\n", "\n").replace('"', "'")
         if not raw_req.strip():
@@ -3241,7 +3265,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/server/c2-profile/lint", methods=["POST"])
     @require_auth
     def api_c2_profile_lint():
-        body = request.get_json(silent=True) or {}
+        body = _json_object()
         source = body.get("source", "")
         if not source.strip():
             return jsonify({"errors": [], "warnings": [], "info": []})
@@ -3597,7 +3621,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @require_auth
     def api_c2_profile_save():
         global _active_c2_profile, _active_c2_profile_source
-        body = request.get_json(silent=True) or {}
+        body = _json_object()
         source = body.get("source", "").strip()
         if not source:
             return jsonify({"error": "No profile source provided"}), 400
@@ -3622,7 +3646,7 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/server/c2-profile/push", methods=["POST"])
     @require_auth
     def api_c2_profile_push():
-        body = request.get_json(silent=True) or {}
+        body = _json_object()
         agent_ids = body.get("agent_ids", [])
         if not _active_c2_profile:
             return jsonify({"error": "No active profile — save one first"}), 400

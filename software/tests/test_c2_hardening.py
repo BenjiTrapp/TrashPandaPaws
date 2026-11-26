@@ -2686,5 +2686,115 @@ class TestNoMethodIsDefinedTwice(unittest.TestCase):
         self.assertIn("A.f", found[0])
 
 
+class TestTheTwelveBodyReadersUseTheHelper(unittest.TestCase):
+    """The twelve `get_json(silent=True) or {}` routes read their body
+    through one helper.
+
+    `request.get_json(silent=True) or {}` turns JSON that does not parse
+    into `{}` and lets JSON that parses into anything else straight
+    through: `[1]` met `.get` and answered 500. The route tests send that
+    body to each route; this proves none of the twelve was missed and
+    that a revert of any one of them is caught without a request for it.
+
+    Not the whole class: `/api/agents/<id>/task` reads `request.json`,
+    which raises on unparseable JSON instead of returning None, and still
+    meets `.get` with a parsed non-object. It is left for its own change.
+    """
+
+    SERVER = Path("software") / "c2" / "server.py"
+    HELPER = "_json_object"
+    ROUTES = ("api_opshell_open", "api_opshell_close", "api_opshell_keys",
+              "api_server_exec", "api_server_avenum", "api_server_rdp",
+              "api_beacon_gen", "api_beacon_gist", "api_burp_to_profile",
+              "api_c2_profile_lint", "api_c2_profile_save",
+              "api_c2_profile_push")
+
+    @staticmethod
+    def _is_get_json(node):
+        return (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get_json")
+
+    def _faults(self, source):
+        tree = ast.parse(source)
+        faults = []
+        # The shape itself, anywhere in the file: a new route that copies
+        # the old line is caught along with a reverted one.
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or)
+                    and any(self._is_get_json(v) for v in node.values)):
+                faults.append("line %d: get_json(...) or ..." % node.lineno)
+        functions = {node.name: node for node in ast.walk(tree)
+                     if isinstance(node, ast.FunctionDef)}
+        for name in self.ROUTES:
+            route = functions.get(name)
+            if route is None:
+                faults.append("%s: not found" % name)
+                continue
+            calls = [node for node in ast.walk(route)
+                     if isinstance(node, ast.Call)]
+            if not any(isinstance(c.func, ast.Name)
+                       and c.func.id == self.HELPER for c in calls):
+                faults.append("%s: does not call %s" % (name, self.HELPER))
+            if any(self._is_get_json(c) for c in calls):
+                faults.append("%s: reads the body itself" % name)
+        return faults
+
+    def _helper_callers(self, source):
+        """Each function that calls the helper, with the lines it does so on.
+
+        Keyed by the innermost enclosing `def`: `ast.walk` is breadth
+        first, so a route is visited after `create_app` around it and its
+        name overwrites the outer one. No reliance on source order.
+        """
+        owner = {}
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.FunctionDef):
+                for inner in ast.walk(node):
+                    if (isinstance(inner, ast.Call)
+                            and isinstance(inner.func, ast.Name)
+                            and inner.func.id == self.HELPER):
+                        owner[inner] = node.name
+        callers = {}
+        for call, name in owner.items():
+            callers.setdefault(name, []).append(call.lineno)
+        return callers
+
+    def test_all_twelve_routes_read_the_body_through_the_helper(self):
+        self.assertEqual(self._faults(self.SERVER.read_text()), [])
+
+    def test_the_routes_listed_are_the_routes_using_the_helper(self):
+        callers = set(self._helper_callers(self.SERVER.read_text()))
+        unlisted = sorted(callers - set(self.ROUTES))
+        self.assertEqual(
+            unlisted, [],
+            "%s read%s the body through %s() but %s not in ROUTES. That "
+            "is the right way to read it; add the name to ROUTES above so "
+            "this check also fails if the route ever stops using it. Order "
+            "does not matter." % (", ".join(unlisted),
+                                  "s" if len(unlisted) == 1 else "",
+                                  self.HELPER,
+                                  "is" if len(unlisted) == 1 else "are"))
+
+    def test_the_check_catches_one_reverted_route(self):
+        # A guard that cannot fail is not a guard. Put the old line back in
+        # each route in turn, at the line the AST says that route calls the
+        # helper on, and watch the check name that route.
+        lines = self.SERVER.read_text().splitlines(keepends=True)
+        callers = self._helper_callers("".join(lines))
+        new = "body = %s()" % self.HELPER
+        old = "body = request.get_json(silent=True) or {}"
+        for name in self.ROUTES:
+            self.assertIn(name, callers, "%s: does not call %s"
+                          % (name, self.HELPER))
+            reverted = list(lines)
+            for lineno in callers[name]:
+                self.assertIn(new, reverted[lineno - 1], name)
+                reverted[lineno - 1] = reverted[lineno - 1].replace(new, old)
+            faults = self._faults("".join(reverted))
+            self.assertEqual(len(faults), 3, faults)
+            self.assertEqual(sum(name in f for f in faults), 2, faults)
+
+
 if __name__ == "__main__":
     unittest.main()
