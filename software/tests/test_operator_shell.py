@@ -1273,6 +1273,27 @@ class TestOpeningTheChannel(_RouteCase):
         answer = self.post(self.url("/api/opshell/open"), {})
         self.assertEqual(answer.status_code, 200)
 
+    def test_a_designation_that_left_the_fleet_is_refused_by_its_name(self):
+        # The API's half of the dead-designation row: a body naming nothing
+        # falls back to the file, and a name the fleet does not hold is a
+        # `404` that says which name, not the `400` for naming nothing.
+        # The page's own guard does not reach this; any other client does.
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": "no-such-raccoon"}))
+        answer = self.post(self.url("/api/opshell/open"), {})
+        self.assertEqual(answer.status_code, 404)
+        self.assertEqual(answer.get_json()["refused"], "no-such-raccoon")
+        self.assertEqual(self.sm.task_queues, {})
+
+    def test_a_designation_file_that_names_no_string_names_nothing(self):
+        # The file is hand-editable, and a number in it reached `[:64]`.
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": 123}))
+        answer = self.post(self.url("/api/opshell/open"), {})
+        self.assertEqual(answer.status_code, 400)
+        self.assertEqual(answer.get_json()["error"], "choose a device first")
+        self.assertEqual(self.sm.task_queues, {})
+
     def test_an_agent_field_that_is_not_a_string_is_refused_not_a_crash(self):
         # `.strip()` on an int answered 500. The same shape as the
         # `c2.fallback: true` crash on the beacon.
