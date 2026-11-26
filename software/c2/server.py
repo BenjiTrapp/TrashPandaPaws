@@ -1835,22 +1835,31 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return None
         if not isinstance(designation, dict):
             return None
+        named = _named(designation.get("agent"))
         if "id" in designation:
             # The device, not the name: fleet names are reused when a
             # restart that no save recorded rewinds the counter, so the
-            # name on file may now belong to a different host. An id that
-            # is not a usable string names nothing, rather than falling
-            # back to the name it was written to outlive.
+            # name on file may now belong to a different host.
             implant = designation["id"]
-            if not isinstance(implant, str) or not implant:
-                return None
-            for name, entry in list(agents.items()):
-                if entry.get("id") == implant:
-                    return name
-            return None
+            # An id that is not a usable string is an id that matches
+            # nothing -- not "no id", which would make damaging the file a
+            # way past the check below.
+            if isinstance(implant, str) and implant:
+                fleet = list(agents.items())
+                for name, entry in fleet:
+                    if name == named and entry.get("id") == implant:
+                        return name
+                for name, entry in fleet:
+                    if entry.get("id") == implant:
+                        return name
+            # The device is not here. Its name is still the answer unless
+            # another device holds it: `/state` says "unknown, no longer
+            # in the fleet" about a name, and has nothing to say about
+            # nothing.
+            return named if named and named not in agents else None
         # Written before the id was recorded; upgraded by the next open,
         # never here, because this is read by a GET that is polled.
-        return _named(designation.get("agent")) or None
+        return named or None
 
     def opshell_remember(agent_name: str):
         """Persist the designation, so the glyph opens onto the same host.

@@ -1440,10 +1440,41 @@ class TestADesignationFollowsTheDevice(_RouteCase):
         self.designate(agent="the-old-name", id=self.IMPLANT)
         self.assertEqual(self.target(), "new-name")
 
-    def test_a_device_that_is_absent_resolves_to_nothing(self):
+    def test_a_device_that_is_gone_keeps_its_name_so_the_view_says_unknown(self):
+        # Two absences the view tells apart: nothing designated, and
+        # something designated that is not here. Nobody holds the name, so
+        # it cannot belong to a different device, and it is the answer --
+        # `/state` then reports `unknown`, never `closed`.
         self.rebuild_fleet(**{"someone-else": self.OTHER})
         self.designate(agent=self.AGENT, id=self.IMPLANT)
+        self.assertEqual(self.target(), self.AGENT)
+        state = self.get("/api/opshell/state").get_json()
+        self.assertEqual(state["channel"], "unknown")
+        self.assertIn("no longer in the fleet", state["reason"])
+
+    def test_a_gone_device_is_refused_by_name_not_as_nothing_chosen(self):
+        self.rebuild_fleet(**{"someone-else": self.OTHER})
+        self.designate(agent=self.AGENT, id=self.IMPLANT)
+        answer = self.post(self.url("/api/opshell/open"), {})
+        self.assertEqual(answer.status_code, 404)
+        self.assertEqual(answer.get_json()["refused"], self.AGENT)
+        self.assertEqual(self.sm.task_queues, {})
+
+    def test_a_designation_that_names_nobody_is_nothing_chosen(self):
+        # An id and no name, over a fleet that does not match: there is no
+        # name to be unknown about.
+        self.rebuild_fleet(**{"someone-else": self.OTHER})
+        self.designate(id=self.IMPLANT)
         self.assertIsNone(self.target())
+
+    def test_two_hosts_sharing_an_id_keep_the_one_the_name_is_on(self):
+        # The documented collision: the id does not tell them apart, so
+        # the name on file does, rather than whichever sorts first.
+        self.rebuild_fleet(**{"a-twin": self.IMPLANT, self.AGENT: self.IMPLANT})
+        self.designate(agent=self.AGENT, id=self.IMPLANT)
+        self.assertEqual(self.target(), self.AGENT)
+        self.designate(agent="a-twin", id=self.IMPLANT)
+        self.assertEqual(self.target(), "a-twin")
 
     def test_the_name_handed_to_a_different_device_is_not_that_device(self):
         # The whole point. Device A was designated as `AGENT`; the counter
@@ -1476,12 +1507,32 @@ class TestADesignationFollowsTheDevice(_RouteCase):
         del self.sm.agents[self.AGENT]["id"]
         self.assertIsNone(self.target())
 
-    def test_an_id_that_is_not_a_string_names_nothing(self):
-        # Hand-editable. Falling back to the name here would be the very
-        # thing the id exists to stop.
-        for bad in (None, 123, ["x"], {"a": 1}, True, ""):
+    UNUSABLE_IDS = (None, 123, ["x"], {"a": 1}, True, "")
+
+    def test_an_unusable_id_with_the_name_held_by_another_device_is_nothing(self):
+        # An id that cannot be checked is an id that matches nothing, and
+        # the safety rule applies to it. Treating it as "no id" would make
+        # damaging the file a way past the check.
+        for bad in self.UNUSABLE_IDS:
             self.designate(agent=self.AGENT, id=bad)
             self.assertIsNone(self.target(), repr(bad))
+
+    def test_an_unusable_id_with_the_name_free_is_the_name(self):
+        # The same row's other half: an unverifiable id must not be safer
+        # than a correct one, and a correct one over a free name answers
+        # with the name.
+        self.rebuild_fleet(**{"someone-else": self.OTHER})
+        for bad in self.UNUSABLE_IDS:
+            self.designate(agent=self.AGENT, id=bad)
+            self.assertEqual(self.target(), self.AGENT, repr(bad))
+
+    def test_a_file_with_no_id_is_not_judged_by_who_holds_the_name(self):
+        # Ruled: the safety rule is not applied to a pre-change file. Its
+        # device is usually the one holding the name, and the window closes
+        # at the next open.
+        self.rebuild_fleet(**{self.AGENT: self.OTHER})
+        self.designate(agent=self.AGENT)
+        self.assertEqual(self.target(), self.AGENT)
 
     # ── a file written before this change ──
 
