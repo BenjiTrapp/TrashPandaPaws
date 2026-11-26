@@ -7765,6 +7765,7 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "console.log(JSON.stringify({resumed, atLoad, kept: !!kept,"
             " first, cleared,"
             " second: card.children.map(c => c.innerHTML).join(' '),"
+            " parts: card.children.length,"
             " notes: card.children.filter(c =>"
             " c.classList.contains('opshell-note')).length}));")
         self.assertFalse(got["resumed"])
@@ -7777,6 +7778,11 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
         self.assertIsNone(got["cleared"])
         # The one after that does not.
         self.assertNotRegex(got["second"], r"(?i)gone|no longer")
+        # Two properties, kept apart. The count is chrome, the empty
+        # `#opshell-refused` and the body: anything more is a child nobody
+        # drew on purpose, whatever its class.
+        self.assertEqual(got["parts"], 3, "the card carries a child beyond "
+                         "chrome, #opshell-refused and the body")
         self.assertEqual(got["notes"], 0, "the note outlived its one open")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
@@ -7952,11 +7958,15 @@ class TestTheViewRunsAndIsNotJustRead(_GuiCase):
             "const resumed = await opshellResume();\n"
             "const card = document.getElementById('opshell-card');\n"
             "console.log(JSON.stringify({resumed,"
+            " parts: card.children.length,"
             " notes: card.children.filter(c =>"
             " c.classList.contains('opshell-note')).length,"
             " html: card.children.map(c => c.innerHTML).join(' '),"
             " gone: sessionStorage.getItem(opshellStore + '_gone')}));")
         self.assertTrue(got["resumed"])
+        # Two properties, kept apart, as in the test above.
+        self.assertEqual(got["parts"], 3, "the card carries a child beyond "
+                         "chrome, #opshell-refused and the body")
         self.assertEqual(got["notes"], 0,
                          "the note was drawn over a card that came back")
         self.assertNotRegex(got["html"], r"(?i)is gone")
