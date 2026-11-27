@@ -1,0 +1,37 @@
+[Unit]
+Description=Raccoon Implant — Way-out Scout
+# After the implant, because the bridge it captures on is that process's
+# work: a scout that started first would sniff an interface that does not
+# exist yet, log a failure and restart until it did.
+After=network-online.target raccoon-implant.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/raccoon
+ExecStart=/opt/raccoon/venv/bin/python -m software.scout -c /opt/raccoon/configs/raccoon.yaml
+# It exits 0 when c2.way_out is off, which is how this ships. Restart=on-
+# failure and not always, so a drop box that does not want a scout is not a
+# unit restarting for ever on a device nobody can reach.
+Restart=on-failure
+RestartSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=raccoon-scout
+
+# NOT PrivateTmp-dependent: the handoff lives under c2.way_out.state_dir,
+# which is a real directory, because raccoon-beacon.service and
+# raccoon-implant.service both set PrivateTmp=true and each would get its
+# own /tmp. This unit sets it too, for the same hygiene, and the handoff is
+# unaffected.
+PrivateTmp=true
+
+Environment="PYTHONPATH=/opt/raccoon"
+Environment="PATH=/opt/raccoon/venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+[Install]
+WantedBy=multi-user.target

