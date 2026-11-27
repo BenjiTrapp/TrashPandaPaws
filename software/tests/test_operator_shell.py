@@ -1369,6 +1369,235 @@ class TestOpeningTheChannel(_RouteCase):
             self.assertEqual(self.sm.task_queues, {}, repr(content))
 
 
+class TestADesignationFollowsTheDevice(_RouteCase):
+    """The designation names a device, not a slot in the list.
+
+    Fleet names are reused: the name counter is rewound by a restart that no
+    save recorded, and the next device to register is handed a name that is
+    already on disk as somebody's designation. The implant id is what
+    identifies the host, so the file carries it and `opshell_target()`
+    resolves through it -- and still answers with a name, so nothing that
+    reads the designation changes.
+    """
+
+    OTHER = "implant-2"
+
+    def designate(self, **fields):
+        (self.data_dir / "opshell-target.json").write_text(json.dumps(fields))
+
+    def designation(self):
+        return json.loads((self.data_dir / "opshell-target.json").read_text())
+
+    def target(self):
+        answer = self.get("/api/opshell/state")
+        self.assertEqual(answer.status_code, 200)
+        return answer.get_json()["target"]
+
+    def rebuild_fleet(self, **devices):
+        """The fleet as a restarted server would have it: name -> id."""
+        self.sm.agents.clear()
+        for name, implant in devices.items():
+            self.sm.agents[name] = {
+                "id": implant, "agent_id": name, "hostname": name,
+                "interval": 300, "_last_seen_ts": time.time(),
+                "caps": ["batch"],
+            }
+
+    # ── what is written ──
+
+    def test_a_successful_open_writes_the_implant_id_with_the_name(self):
+        self.post(self.url("/api/opshell/open"), {"agent": self.AGENT})
+        self.assertEqual(self.designation(),
+                         {"agent": self.AGENT, "id": self.IMPLANT})
+
+    def test_an_agent_that_has_no_id_is_written_by_name_alone(self):
+        # The agent vanished between the open and the write, or never had
+        # one: today's behaviour, not a crash and not an invented id.
+        del self.sm.agents[self.AGENT]["id"]
+        answer = self.post(self.url("/api/opshell/open"),
+                           {"agent": self.AGENT})
+        self.assertEqual(answer.status_code, 200)
+        self.assertEqual(self.designation(), {"agent": self.AGENT})
+
+    def test_the_designation_is_still_0600_with_an_id_in_it(self):
+        self.post(self.url("/api/opshell/open"), {"agent": self.AGENT})
+        target = self.data_dir / "opshell-target.json"
+        self.assertEqual(oct(target.stat().st_mode & 0o777), "0o600")
+        self.assertFalse(target.with_suffix(".tmp").exists())
+
+    # ── what is resolved ──
+
+    def test_the_file_over_the_ordinary_fleet_is_the_device_holding_the_name(self):
+        # Row one of the table, with nothing unusual going on: the id
+        # matches the entry that holds the name, and that name is the answer.
+        self.designate(agent=self.AGENT, id=self.IMPLANT)
+        self.assertEqual(self.target(), self.AGENT)
+
+    def test_an_id_the_reader_would_refuse_is_never_written(self):
+        # The writer and the reader must agree on what a usable id is. A
+        # truthy non-string id written to the file reads back as `None`
+        # even over its own name, so the designation would be dead the
+        # moment it was made. Written by name alone it still works.
+        target = self.data_dir / "opshell-target.json"
+        for bad in (123, ["x"], {"a": 1}, True, 0, None, ""):
+            if target.exists():
+                target.unlink()
+            self.sm.agents[self.AGENT]["id"] = bad
+            answer = self.post(self.url("/api/opshell/open"),
+                               {"agent": self.AGENT})
+            self.assertEqual(answer.status_code, 200, repr(bad))
+            self.assertEqual(self.designation(), {"agent": self.AGENT},
+                             repr(bad))
+            self.assertEqual(self.target(), self.AGENT, repr(bad))
+
+    def test_the_device_returning_under_a_new_name_is_found_by_its_id(self):
+        self.designate(agent="the-old-name", id=self.IMPLANT)
+        self.assertEqual(self.target(), self.AGENT)
+
+    def test_an_id_that_matches_beats_a_name_that_differs(self):
+        # The case the change exists for: the file holds an id *and* a
+        # name, the id matches one entry, and that entry's name is not the
+        # file's. The device wins, whatever the name says.
+        self.rebuild_fleet(**{"new-name": self.IMPLANT,
+                              "the-old-name": self.OTHER})
+        self.designate(agent="the-old-name", id=self.IMPLANT)
+        self.assertEqual(self.target(), "new-name")
+
+    def test_a_device_that_is_gone_keeps_its_name_so_the_view_says_unknown(self):
+        # Two absences the view tells apart: nothing designated, and
+        # something designated that is not here. Nobody holds the name, so
+        # it cannot belong to a different device, and it is the answer --
+        # `/state` then reports `unknown`, never `closed`.
+        self.rebuild_fleet(**{"someone-else": self.OTHER})
+        self.designate(agent=self.AGENT, id=self.IMPLANT)
+        self.assertEqual(self.target(), self.AGENT)
+        state = self.get("/api/opshell/state").get_json()
+        self.assertEqual(state["channel"], "unknown")
+        self.assertIn("no longer in the fleet", state["reason"])
+
+    def test_a_gone_device_is_refused_by_name_not_as_nothing_chosen(self):
+        self.rebuild_fleet(**{"someone-else": self.OTHER})
+        self.designate(agent=self.AGENT, id=self.IMPLANT)
+        answer = self.post(self.url("/api/opshell/open"), {})
+        self.assertEqual(answer.status_code, 404)
+        self.assertEqual(answer.get_json()["refused"], self.AGENT)
+        self.assertEqual(self.sm.task_queues, {})
+
+    def test_a_designation_that_names_nobody_is_nothing_chosen(self):
+        # An id and no name, over a fleet that does not match: there is no
+        # name to be unknown about.
+        self.rebuild_fleet(**{"someone-else": self.OTHER})
+        self.designate(id=self.IMPLANT)
+        self.assertIsNone(self.target())
+
+    def test_two_hosts_sharing_an_id_keep_the_one_the_name_is_on(self):
+        # The documented collision: the id does not tell them apart, so
+        # the name on file does, rather than whichever sorts first.
+        self.rebuild_fleet(**{"a-twin": self.IMPLANT, self.AGENT: self.IMPLANT})
+        self.designate(agent=self.AGENT, id=self.IMPLANT)
+        self.assertEqual(self.target(), self.AGENT)
+        self.designate(agent="a-twin", id=self.IMPLANT)
+        self.assertEqual(self.target(), "a-twin")
+
+    def test_the_name_handed_to_a_different_device_is_not_that_device(self):
+        # The whole point. Device A was designated as `AGENT`; the counter
+        # rewound and the name now belongs to a device with another id.
+        self.designate(agent=self.AGENT, id=self.IMPLANT)
+        self.rebuild_fleet(**{self.AGENT: self.OTHER})
+        self.assertIsNone(self.target())
+
+    def test_a_reused_name_is_not_opened_onto_either(self):
+        # What the operator would have met: the picker marking the reused
+        # name `selected`, and `Open` taking a shell on that host.
+        self.designate(agent=self.AGENT, id=self.IMPLANT)
+        self.rebuild_fleet(**{self.AGENT: self.OTHER})
+        answer = self.post(self.url("/api/opshell/open"), {})
+        self.assertEqual(answer.status_code, 400)
+        self.assertEqual(answer.get_json()["error"], "choose a device first")
+        self.assertEqual(self.sm.task_queues, {})
+
+    def test_the_same_story_end_to_end_through_a_real_open(self):
+        # Written by the route rather than by hand, so the writer and the
+        # reader are held to each other.
+        self.post(self.url("/api/opshell/open"), {"agent": self.AGENT})
+        self.rebuild_fleet(**{self.AGENT: self.OTHER})
+        self.assertIsNone(self.target())
+        self.rebuild_fleet(**{"renamed": self.IMPLANT, self.AGENT: self.OTHER})
+        self.assertEqual(self.target(), "renamed")
+
+    def test_an_entry_with_no_id_is_never_the_device(self):
+        self.designate(agent=self.AGENT, id=self.IMPLANT)
+        del self.sm.agents[self.AGENT]["id"]
+        self.assertIsNone(self.target())
+
+    UNUSABLE_IDS = (None, 123, ["x"], {"a": 1}, True, "")
+
+    def test_an_unusable_id_with_the_name_held_by_another_device_is_nothing(self):
+        # An id that cannot be checked is an id that matches nothing, and
+        # the safety rule applies to it. Treating it as "no id" would make
+        # damaging the file a way past the check.
+        for bad in self.UNUSABLE_IDS:
+            self.designate(agent=self.AGENT, id=bad)
+            self.assertIsNone(self.target(), repr(bad))
+
+    def test_an_unusable_id_with_the_name_free_is_the_name(self):
+        # The same row's other half: an unverifiable id must not be safer
+        # than a correct one, and a correct one over a free name answers
+        # with the name.
+        self.rebuild_fleet(**{"someone-else": self.OTHER})
+        for bad in self.UNUSABLE_IDS:
+            self.designate(agent=self.AGENT, id=bad)
+            self.assertEqual(self.target(), self.AGENT, repr(bad))
+
+    def test_a_file_with_no_id_is_not_judged_by_who_holds_the_name(self):
+        # Ruled: the safety rule is not applied to a pre-change file. Its
+        # device is usually the one holding the name, and the window closes
+        # at the next open.
+        self.rebuild_fleet(**{self.AGENT: self.OTHER})
+        self.designate(agent=self.AGENT)
+        self.assertEqual(self.target(), self.AGENT)
+
+    # ── a file written before this change ──
+
+    def test_a_file_with_only_a_name_resolves_as_it_always_did(self):
+        self.designate(agent=self.AGENT)
+        self.assertEqual(self.target(), self.AGENT)
+
+    def test_a_file_with_only_a_name_the_fleet_lacks_still_reports_it(self):
+        # As before: the name comes back, and `open` refuses it by name
+        # (`test_a_designation_that_left_the_fleet_is_refused_by_its_name`).
+        self.designate(agent="no-such-raccoon")
+        self.assertEqual(self.target(), "no-such-raccoon")
+
+    # ── a read does not write ──
+
+    def test_reading_never_writes_the_designation(self):
+        # `/state` is a GET, polled every two seconds. A pre-change file is
+        # upgraded by the next open and not before, and that includes the
+        # shapes the resolver answers differently for.
+        target = self.data_dir / "opshell-target.json"
+        shapes = ({"agent": self.AGENT},
+                  {"agent": "the-old-name", "id": self.IMPLANT},
+                  {"agent": self.AGENT, "id": self.OTHER},
+                  {"agent": "no-such-raccoon"})
+        for shape in shapes:
+            self.designate(**shape)
+            before = (target.read_bytes(), target.stat().st_mtime_ns)
+            self.get("/api/opshell/state")
+            self.get("/api/opshell/state?session=s")
+            self.get("/api/opshell/stream")
+            self.post(self.url("/api/opshell/close"), {"session": "s"})
+            self.assertEqual(
+                (target.read_bytes(), target.stat().st_mtime_ns), before,
+                repr(shape))
+            self.assertFalse(target.with_suffix(".tmp").exists(), repr(shape))
+        # And the next open is what upgrades a pre-change file.
+        self.designate(agent=self.AGENT)
+        self.post(self.url("/api/opshell/open"), {})
+        self.assertEqual(self.designation(),
+                         {"agent": self.AGENT, "id": self.IMPLANT})
+
+
 class TestClosingTheChannel(_RouteCase):
     def test_close_reports_closing_and_never_closed(self):
         client, session, _ = self.raised_and_up()

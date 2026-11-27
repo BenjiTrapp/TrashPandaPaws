@@ -1835,7 +1835,32 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return None
         if not isinstance(designation, dict):
             return None
-        return _named(designation.get("agent")) or None
+        named = _named(designation.get("agent"))
+        if "id" in designation:
+            # The device, not the name: fleet names are reused when a
+            # restart that no save recorded rewinds the counter, so the
+            # name on file may now belong to a different host.
+            implant = designation["id"]
+            # An id that is not a usable string is an id that matches
+            # nothing -- not "no id", which would make damaging the file a
+            # way past the check below. `opshell_remember` must write only
+            # ids this accepts.
+            if isinstance(implant, str) and implant:
+                fleet = list(agents.items())
+                for name, entry in fleet:
+                    if name == named and entry.get("id") == implant:
+                        return name
+                for name, entry in fleet:
+                    if entry.get("id") == implant:
+                        return name
+            # The device is not here. Its name is still the answer unless
+            # another device holds it: `/state` says "unknown, no longer
+            # in the fleet" about a name, and has nothing to say about
+            # nothing.
+            return named if named and named not in agents else None
+        # Written before the id was recorded; upgraded by the next open,
+        # never here, because this is read by a GET that is polled.
+        return named or None
 
     def opshell_remember(agent_name: str):
         """Persist the designation, so the glyph opens onto the same host.
@@ -1849,10 +1874,19 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         # host is the operator working on" does not belong to everyone with
         # a login, and one of the two files being laxer than the other
         # invites someone to relax the other to match.
+        designation = {"agent": agent_name}
+        # The id travels with the name: names are reused, the id is the
+        # host's. Missing when the agent left the fleet since the open.
+        # Usable means what `opshell_target()` accepts -- a non-empty
+        # string -- and the two must agree: an id written here that the
+        # reader refuses would make the designation dead on arrival.
+        implant = (agents.get(agent_name) or {}).get("id")
+        if isinstance(implant, str) and implant:
+            designation["id"] = implant
         tmp = opshell_target_path.with_suffix(".tmp")
         handle = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(handle, "w") as out:
-            json.dump({"agent": agent_name}, out)
+            json.dump(designation, out)
         os.replace(tmp, opshell_target_path)
 
     def opshell_queue(agent_name: str, action: str):
