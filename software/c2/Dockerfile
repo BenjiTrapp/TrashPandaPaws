@@ -11,7 +11,7 @@
 # ── Stage 1: the one wheel PyPI will not give us ──
 #
 # `aardwolf` is NetExec's RDP library and a hard dependency of it
-# (`aardwolf>=0.2.16`, not an extra), and at 0.2.17 it publishes a macOS
+# (`aardwolf>=0.2.17`, not an extra), and at 0.2.17 it publishes a macOS
 # arm64 wheel, a manylinux x86_64 wheel, a Windows wheel -- and no Linux
 # aarch64 one. Its own pyproject builds two PyO3 extensions through
 # setuptools-rust, so on arm64 pip has to compile Rust or give up.
@@ -25,32 +25,54 @@
 # judgement -- that carrying cargo in the image an operator runs is the
 # wrong trade -- still holds; this stage is how both can be true. The
 # base is the same image as the final stage on purpose, so the wheel is
-# built against the very interpreter that will import it.
+# built against the very interpreter that will import it, and a test
+# fails if the two FROM lines ever drift apart.
 #
-# `--no-deps`: only aardwolf is built here. Its dependency `arc4` has no
-# aarch64 wheel either, but it is a plain C extension and the final stage
-# already carries gcc and python3-dev for exactly that. On x86_64 this
-# stage downloads the published wheel in seconds and compiles nothing, so
-# the same file is cheap on the architecture that never had the problem.
+# Both versions are pinned. `docs/AGENT.md` carries "nothing is pinned"
+# as an open finding, and a stage that fetched a toolchain of the day
+# would have made it worse; a fixed toolchain also means the wheel this
+# produces is reproducible rather than whatever stable was on build day.
 FROM python:3.12-slim-bookworm AS wheels
+
+ENV AARDWOLF_VERSION=0.2.17 RUST_VERSION=1.100.0
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:$PATH
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc libffi-dev libssl-dev python3-dev \
         curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# rustup rather than Debian's `cargo`, and that is measured too: bookworm
-# ships rustc 1.63, and the PyO3 that aardwolf's crates build against
-# wants newer. A stable toolchain from rustup is the version the upstream
-# wheels are built with.
-ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
-ENV PATH=/usr/local/cargo/bin:$PATH
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain stable \
-    && rustc --version && cargo --version
-
-RUN pip wheel --no-cache-dir --no-deps --wheel-dir /wheels aardwolf \
-    && ls -1 /wheels
+# The architecture decides, not a build argument. `ARG TARGETARCH` would
+# read empty under the classic builder -- which is what this project's
+# own development machine has, where `docker compose` does not exist at
+# all -- and the arm64 path would then be skipped on the one machine that
+# needs it. Asking pip first costs nothing and answers the same question:
+# if a published wheel fits, there is nothing to compile.
+#
+# Nothing here may fail the image. The first version of this stage had no
+# tolerance at all, so a `sh.rustup.rs` outage or a crate that stopped
+# building would have cost *every* architecture its image -- the inverse
+# of what the `||` on the NetExec install below exists to guarantee. Now
+# the worst case is an empty wheelhouse, the install below falls back to
+# PyPI, and CI is what says the tool is missing.
+#
+# rustup rather than Debian's `cargo`: bookworm ships rustc 1.63 and
+# aardwolf's crates build against pyo3 0.27, whose MSRV is far above it.
+RUN if pip wheel --no-cache-dir --no-deps --wheel-dir /wheels \
+            "aardwolf==${AARDWOLF_VERSION}"; then \
+        echo "aardwolf: a published wheel fits $(uname -m), nothing compiled"; \
+    elif curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal \
+                  --default-toolchain "${RUST_VERSION}" \
+            && pip wheel --no-cache-dir --no-deps --wheel-dir /wheels \
+                  "aardwolf==${AARDWOLF_VERSION}"; then \
+        echo "aardwolf: built from source with $(rustc --version)"; \
+    else \
+        echo "WARNING: no aardwolf wheel for $(uname -m) and none could be"; \
+        echo "WARNING: built -- nxc will be ABSENT from the shipped image"; \
+    fi; \
+    ls -1 /wheels 2>/dev/null || true
 
 # ── Stage 2: what ships ──
 FROM python:3.12-slim-bookworm
@@ -58,11 +80,15 @@ FROM python:3.12-slim-bookworm
 LABEL maintainer="TrashPandaPaws" \
       description="Raccoon C2 Team Server with Impacket, NetExec, RelayKing & Responder"
 
-# python3-dev is here for the architectures PyPI has no wheel for. `arc4`,
-# a NetExec dependency, publishes manylinux x86_64 wheels and no Linux
-# aarch64 one, so pip compiles it from source on arm64 and needs Python.h.
-# Without this the build succeeded on amd64 and failed on arm64, which is
-# why it went unnoticed.
+# gcc and the -dev packages are here for the architectures PyPI has no
+# wheel for: `arc4`, a NetExec dependency, publishes manylinux x86_64
+# wheels and no Linux aarch64 one, so pip compiles it from source there.
+# Measured in the built arm64 image, the artefact is
+# `arc4.cpython-312-aarch64-linux-gnu.so` -- compiled against this base
+# image's own headers under /usr/local/include/python3.12, not against
+# Debian's, which `python3-dev` installs for its own 3.11 interpreter.
+# The package is left in place because nothing here has measured a build
+# without it, but the reason to keep it is gcc's company, not Python.h.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc libffi-dev libssl-dev python3-dev \
         nmap iputils-ping net-tools \
@@ -81,35 +107,49 @@ RUN pip install --no-cache-dir \
 
 # The wheelhouse from stage 1, and the variable that makes pip look in it.
 # PIP_FIND_LINKS is additive: it adds a place to resolve from, it does not
-# cut PyPI off, so every other dependency resolves exactly as before. The
-# directory stays in the image rather than being deleted after the install
-# -- it is a few megabytes, the variable would otherwise point at nothing,
-# and it is the honest record of what was injected.
+# cut PyPI off, so every other dependency resolves exactly as before, and
+# a newer release on PyPI still wins on version. It applies to the pip
+# calls further down and to anything an operator runs after `docker exec`
+# too, which is harmless -- one wheel, the same version PyPI publishes,
+# and a tag-incompatible wheel is ignored rather than preferred.
+#
+# The directory stays in the image rather than being deleted after the
+# install: it is 2.2 MB, the variable would otherwise point at nothing,
+# and it is the honest record of what was injected. Nothing but this
+# directory crosses the stage boundary -- a test pins that, because a
+# `COPY --from=wheels /usr/local/ /usr/local/` would ship the toolchain
+# while naming none of it.
 COPY --from=wheels /wheels /wheels
 ENV PIP_FIND_LINKS=/wheels
 
 ENV PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin
+# pipx runs its own pip, which never saw `--no-cache-dir`, so the shipped
+# image carried 60 MB of wheel cache for packages it will never install
+# again. Measured; the variable is the only way to reach that pip.
+ENV PIP_NO_CACHE_DIR=1
 # `--python` is not tidiness, it is the difference between an image with
 # NetExec and one without. pipx comes from apt, so it runs under
-# `#!/usr/bin/python3`, which `python3-dev` above pulled in as Debian's
-# 3.11.2 -- while this image's own interpreter is 3.12.16. Left to its
-# default, pipx built the venv with 3.11, the cp312 wheel from the wheels
-# stage did not match it, pip went back to the sdist and died with
-# "can't find Rust compiler", and the `||` below swallowed that: a green
-# build with no nxc in it, exactly the defect the stage was added to fix.
-# Upstream's published wheels are cp311-abi3 and fit either, which is why
-# only the architecture without a wheel ever showed this.
+# `#!/usr/bin/python3`, which on this base is Debian's 3.11.2 -- while the
+# image's own interpreter is 3.12.16. (Both `python3-dev` above and pipx
+# itself, through `python3-venv`, pull that interpreter in; removing
+# either would not remove it.) Left to its default, pipx built the venv
+# with 3.11, the cp312 wheel from the wheels stage did not match it, pip
+# went back to the sdist and died with "can't find Rust compiler", and the
+# `||` below swallowed that: a green build with no nxc in it, exactly the
+# defect the stage was added to fix. Upstream's published wheels are
+# cp311-abi3 and fit either, which is why only the architecture without a
+# wheel ever showed this.
 #
 # The `||` stays, and its reason has changed. It used to mean "this
 # architecture cannot have NetExec"; the wheels stage removed that. It
 # now means one tool that fails to install must not cost every
 # architecture its image -- a network hiccup, an upstream yank, a crate
 # that stops building. What it must not do is hide the absence, so the
-# shipped-image workflow asserts `nxc --version` instead of merely
-# reporting it.
+# shipped-image workflow asserts the tool and its RDP library, on both
+# architectures.
 RUN pipx install --python /usr/local/bin/python3 \
         git+https://github.com/Pennyw0rth/NetExec \
-    || echo "NetExec not installed: see the wheels stage and /wheels"
+    || echo "WARNING: nxc is NOT in this image -- the NetExec install failed"
 
 # Install Responder
 #

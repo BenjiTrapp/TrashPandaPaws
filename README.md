@@ -826,19 +826,25 @@ docker compose logs -f raccoon-c2
 ```
 
 The Docker image (`python:3.12-slim-bookworm`) includes all tools
-pre-installed: Impacket, Lsassy, RelayKing, and Responder, plus NetExec on
-the architectures PyPI serves it for. The start-up banner lists what is
-actually present rather than what is intended, so read it rather than this
-paragraph. It runs with `network_mode: host` and `NET_RAW`/`NET_ADMIN`
-capabilities (required for Responder).
+pre-installed: Impacket, Lsassy, RelayKing, Responder and NetExec. The
+start-up banner lists what is actually present rather than what is intended,
+so read it rather than this paragraph. It runs with `network_mode: host` and
+`NET_RAW`/`NET_ADMIN` capabilities (required for Responder).
 
 The Debian release in that tag is deliberate. The image used to say
 `python:3.12-slim`, which moved from Debian 12 to Debian 13 underneath it;
 `freerdp2-x11` does not exist in 13, and the build stopped working for
-everyone without a commit in this repository. NetExec is the one tool that
-may be missing: its RDP library `aardwolf` publishes no Linux `aarch64`
-wheel and wants a Rust toolchain, so on arm64 the install is skipped and
-the image builds without it.
+everyone without a commit in this repository.
+
+NetExec used to be the one tool that could be missing, and on arm64 it
+always was: its RDP library `aardwolf` publishes no Linux `aarch64` wheel
+and builds two Rust extensions from source. The image now builds that one
+wheel in a first stage and ships only the wheel, so `nxc` is present on
+both architectures and no compiler is in the image an operator runs. Both
+architectures are built in CI, because the defect was invisible on x86_64 —
+where PyPI does publish a wheel. If the install ever does fail, the build
+still succeeds rather than costing every architecture its image, the banner
+says the tool is absent, and the CI job for that architecture goes red.
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|

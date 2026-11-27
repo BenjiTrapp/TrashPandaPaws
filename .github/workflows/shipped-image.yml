@@ -36,11 +36,32 @@ permissions:
 
 jobs:
   image:
-    name: build and start (docker, linux)
-    runs-on: ubuntu-latest
+    name: build and start (docker, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # Both architectures, because the defect this file now guards was
+    # arm64-only and invisible on x86_64. aardwolf has a published
+    # manylinux x86_64 wheel, so the Dockerfile's wheels stage compiles
+    # nothing there -- an x86-only job would have stayed green with the
+    # whole stage deleted, and would have proved the fix on the one
+    # architecture that never needed it.
+    #
+    # `ubuntu-24.04-arm` is a standard GitHub-hosted runner, free and
+    # unlimited on public repositories. Native, not QEMU: under emulation
+    # the two PyO3 crates plus the toolchain download would be a real
+    # risk against the timeout below, and a timeout reads like a product
+    # fault.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     # The apt step alone pulls ~140 MB and the NetExec install compiles,
     # so this is not a two-minute job. Measured locally at 8-14 minutes
-    # from a cold cache.
+    # from a cold cache, and the arm64 run also builds aardwolf's two
+    # Rust crates.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
@@ -116,13 +137,43 @@ jobs:
       # one tool must not cost every architecture its image. This step is
       # the other half of that bargain. A failed wheel build now turns
       # one job red instead of shipping a quietly incomplete image.
-      # Through `sh -c`, not `--entrypoint nxc ... --version`: the latter
-      # let the Docker CLI on this project's development machine take
-      # `--version` for its own and print `docker run --help`. A check
-      # that cannot be run the same way locally is a check nobody trusts.
-      - name: NetExec resolves and runs
+      # ── NetExec, asserted ──
+      #
+      # This was a report line until the wheels stage existed. aardwolf
+      # publishes no Linux aarch64 wheel, so on arm64 the image built
+      # green with no `nxc` in it -- and the agent runs admitted commands
+      # on this host (software/agent/executor/server_tool.py), so an
+      # eight-phase campaign hit "command not found" at run time.
+      #
+      # The Dockerfile's install still ends in `|| echo`, which is right:
+      # one tool must not cost every architecture its image. This step is
+      # the other half of that bargain. A failed wheel build turns a job
+      # red instead of shipping a quietly incomplete image.
+      #
+      # Three checks, and none of them gates on nxc's exit status.
+      # Measured in the built image: `nxc --version` prints the version
+      # and then exits 1, because upstream's nxc/cli.py calls
+      # sys.exit(1) right after the print. A `run:` step is bash -e, so
+      # gating on the status would fail this job on every run, including
+      # a perfect one -- and the first person to see that would append
+      # `|| true` and reopen the hole. docker-entrypoint.sh already knew
+      # this about relayking and ignores its status for the same reason.
+      #
+      # The import is the point of the whole change and is checked
+      # separately because the version is not enough: with aardwolf moved
+      # aside inside the venv, `nxc --version` still prints and `nxc rdp
+      # --help` still exits 0. Only an import sees it.
+      - name: NetExec resolves, and carries the library this stage builds
         run: |
-          docker run --rm --entrypoint sh raccoon-c2:ci -c 'nxc --version'
+          docker run --rm --entrypoint sh raccoon-c2:ci -c '
+            command -v nxc >/dev/null 2>&1 || {
+              echo "nxc is absent from the image"; exit 1; }
+            nxc --version 2>&1 | grep -qE "[0-9]+\.[0-9]+\.[0-9]+" || {
+              echo "nxc did not print a version"; exit 1; }
+            /opt/pipx/venvs/netexec/bin/python -c "import aardwolf, arc4" || {
+              echo "NetExec is installed without its RDP library"; exit 1; }
+            echo "nxc: $(nxc --version 2>&1 | head -1)"
+          '
 
       # The compose file is the documented way to run this, and its build
       # context is part of the defect that stopped the server from

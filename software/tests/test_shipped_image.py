@@ -50,6 +50,11 @@ def _stages(path):
     test went on passing only because the word also appears in the echo
     message beside it. A line-based question about a multi-line
     instruction answers by accident.
+
+    Two limits worth knowing, neither of which this Dockerfile reaches: a
+    `#` inside a `RUN <<EOF` heredoc is stripped as if it were a Dockerfile
+    comment, and `foo\` with no space before the backslash glues to the
+    next word rather than keeping them apart.
     """
     stages = []
     for line in _logical_lines(_instructions(path)):
@@ -126,7 +131,7 @@ class NetExecIsBuiltForThisArchitectureNotHopedFor(unittest.TestCase):
     Measured, not assumed. `aardwolf` 0.2.17 publishes a macOS arm64
     wheel, a manylinux x86_64 wheel, a Windows wheel and an sdist -- and
     no Linux aarch64 wheel. It is a hard dependency of NetExec
-    (`aardwolf>=0.2.16` in its pyproject, not an extra), so it cannot be
+    (`aardwolf>=0.2.17` in its pyproject, not an extra), so it cannot be
     dropped, and its own pyproject builds two PyO3 extensions through
     setuptools-rust, so the sdist needs cargo.
 
@@ -138,71 +143,147 @@ class NetExecIsBuiltForThisArchitectureNotHopedFor(unittest.TestCase):
     So the toolchain is present where the wheel is built and absent from
     what ships -- which is what the earlier judgement ("adding Rust to a
     slim image is the wrong trade") was protecting, and it still holds.
+
+    Every test here couples two places rather than spotting a name in
+    one, because a review measured what name-spotting lets through: with
+    the wheel copied to a path `PIP_FIND_LINKS` did not name, with the
+    `ENV` moved after the install, with a builder stage that built no
+    wheel at all, and with the builder on 3.11 under a shipped 3.12 --
+    four mutations that each cost arm64 its `nxc` -- the earlier versions
+    of these tests stayed green on all four.
     """
 
     TOOLCHAIN = r"\b(rustup|cargo|rustc|rust-all)\b"
 
     def setUp(self):
         self.stages = _stages(DOCKERFILE)
-        self.assertTrue(self.stages, "no FROM line at all")
+        self.assertTrue(len(self.stages) > 1, "no builder stage at all")
+        self.shipped = self.stages[-1][1]
+        self.earlier = [body for _, body in self.stages[:-1]]
+        self.netexec = [line for line in _logical_lines(self.shipped)
+                        if "NetExec" in line and "pipx" in line]
+        self.assertTrue(self.netexec, "the NetExec install vanished entirely")
 
-    def test_a_builder_stage_compiles_the_wheel_pypi_does_not_publish(self):
-        earlier = self.stages[:-1]
+    def _wheelhouse(self):
+        """The one path the three places must agree on."""
+        copied = re.search(r"COPY\s+--from=\S+\s+(\S+)\s+(\S+)", self.shipped)
+        self.assertIsNotNone(
+            copied,
+            "the shipped stage takes nothing from the builder, so whatever "
+            "was compiled there was compiled for nothing")
+        return copied.group(2).rstrip("/")
+
+    def test_a_builder_stage_builds_the_wheel_pypi_does_not_publish(self):
+        # The earlier version asked only whether some earlier stage
+        # mentioned a toolchain. A stage that installed rustup and built
+        # nothing passed it, which is a stage that costs build time and
+        # changes nothing.
+        house = self._wheelhouse()
+        builds = [line for body in self.earlier
+                  for line in _logical_lines(body)
+                  if "pip wheel" in line and "aardwolf" in line]
         self.assertTrue(
-            earlier,
-            "one stage only, so any Rust needed for aardwolf would have to "
-            "ship in the image that runs the team server")
+            builds,
+            "no earlier stage runs `pip wheel` for aardwolf, so there is "
+            "no wheel for the architecture PyPI publishes none for")
         self.assertTrue(
-            any(re.search(self.TOOLCHAIN, body) for _, body in earlier),
-            "no stage builds aardwolf, so on an architecture PyPI serves "
-            "no wheel for, NetExec is simply absent")
+            any(house in line for line in builds),
+            "the wheel is built somewhere other than %s, the path the "
+            "shipped stage copies -- so the copy brings nothing" % house)
+        self.assertTrue(
+            any(re.search(self.TOOLCHAIN, body) for body in self.earlier),
+            "nothing in the builder can compile Rust, and aardwolf's two "
+            "PyO3 extensions cannot be built without it")
 
     def test_the_shipped_stage_carries_no_rust_toolchain(self):
-        name, body = self.stages[-1]
-        found = re.search(self.TOOLCHAIN, body)
+        found = re.search(self.TOOLCHAIN, self.shipped)
         self.assertIsNone(
             found,
             "the shipped stage installs %s: a compiler toolchain in the "
             "image an operator runs is the trade this file already "
             "refused" % (found.group(0) if found else ""))
+        # A review got cargo into the image past the check above with
+        # `COPY --from=wheels /usr/local/ /usr/local/`, which names no
+        # toolchain at all. So what may cross the stage boundary is the
+        # wheelhouse, and nothing else.
+        house = self._wheelhouse()
+        crossing = re.findall(r"COPY\s+--from=\S+\s+(\S+)\s+(\S+)",
+                              self.shipped)
+        self.assertEqual(
+            [dest.rstrip("/") for _, dest in crossing], [house],
+            "more than the wheelhouse is copied out of the builder, and "
+            "the builder is where the Rust toolchain lives")
 
     def test_the_netexec_install_can_see_the_built_wheel(self):
-        name, body = self.stages[-1]
-        self.assertRegex(
-            body, r"COPY\s+--from=",
-            "the shipped stage takes nothing from the builder, so whatever "
-            "was compiled there was compiled for nothing")
-        netexec = [line for line in body.splitlines() if "NetExec" in line]
-        self.assertTrue(netexec, "the NetExec install vanished entirely")
-        self.assertTrue(
-            any(re.search(r"--find-links|PIP_FIND_LINKS", line)
-                for line in netexec) or
-            re.search(r"ENV\s+[^\n]*PIP_FIND_LINKS", body),
-            "nothing points pip at the built wheel, so it resolves "
-            "aardwolf from PyPI again and needs the toolchain it has not "
-            "got")
+        house = self._wheelhouse()
+        find_links = re.search(r"ENV\s+PIP_FIND_LINKS=(\S+)", self.shipped)
+        self.assertIsNotNone(
+            find_links,
+            "nothing points pip at the wheelhouse, so it resolves aardwolf "
+            "from PyPI again and needs the toolchain it has not got")
+        self.assertEqual(
+            find_links.group(1).rstrip("/"), house,
+            "pip is pointed at a different directory than the wheel was "
+            "copied to, so the wheel is in the image and invisible")
+        # Order matters and is invisible at run time: an `ENV` after the
+        # install leaves the install resolving from PyPI, and the image
+        # still ends up with the variable set, so nothing downstream can
+        # tell.
+        body = self.shipped
+        self.assertLess(
+            body.index(find_links.group(0)), body.index(self.netexec[0][:40]),
+            "PIP_FIND_LINKS is set after the NetExec install, so the "
+            "install could not see the wheel")
+
+    def test_every_stage_names_the_same_base_image(self):
+        # The wheel is tagged for the interpreter that built it (cp312
+        # here), and the venv it must fit is built by the shipped stage's
+        # interpreter. Those are two FROM lines, and a drift between them
+        # reproduces the exact defect this file already carries a fix for
+        # -- with the `||` still there to swallow it.
+        bases = re.findall(r"^FROM\s+(\S+)", _instructions(DOCKERFILE), re.M)
+        self.assertEqual(
+            len(set(bases)), 1,
+            "the stages are built on different bases (%s), so the wheel's "
+            "interpreter tag and the venv's interpreter can differ"
+            % ", ".join(sorted(set(bases))))
 
     def test_the_netexec_venv_uses_the_interpreter_the_wheel_was_built_for(self):
         # This one cost a full build to find, and the wheelhouse alone did
-        # not fix it. pipx comes from apt, so its shebang is
-        # `#!/usr/bin/python3`, and in this base image that is Debian's
-        # 3.11.2 while `python3` is the image's own 3.12.16. pipx
-        # therefore built the NetExec venv with 3.11, the cp312 wheel from
-        # the wheels stage did not match it, pip fell back to the sdist
-        # and died with "can't find Rust compiler" -- and the `||`
-        # swallowed that, so the image shipped green with no nxc in it,
-        # exactly as before the stage existed.
+        # not fix it. pipx comes from apt, so it runs under
+        # `#!/usr/bin/python3`, and in this image that is Debian's 3.11.2
+        # while `python3` is the image's own 3.12.16. pipx therefore built
+        # the NetExec venv with 3.11, the cp312 wheel did not match it,
+        # pip fell back to the sdist and died with "can't find Rust
+        # compiler" -- and the `||` swallowed that, so the image shipped
+        # green with no nxc in it, exactly as before the stage existed.
         #
         # Upstream's own wheels are cp311-abi3 and so fit both, which is
         # why this never bit the architecture PyPI serves.
-        name, body = self.stages[-1]
-        netexec = [line for line in body.splitlines() if "NetExec" in line]
-        self.assertTrue(netexec, "the NetExec install vanished entirely")
         self.assertTrue(
-            any("--python" in line for line in netexec),
+            any("--python" in line for line in self.netexec),
             "the NetExec venv is built with whatever interpreter pipx "
             "defaults to, which is apt's and not the one the wheel in "
-            "/wheels was built for")
+            "the wheelhouse was built for")
+
+    def test_the_wheel_build_cannot_fail_the_whole_image(self):
+        # The first version of this stage had no tolerance anywhere, so a
+        # `sh.rustup.rs` outage, a PyPI hiccup or a crate that stopped
+        # building failed the image on *every* architecture -- including
+        # the one that never needed the stage. That is the inverse of what
+        # TheBuildHasWhatItCompilesWith asks for, and the `||` on the
+        # NetExec install could not reach any of it, because the build
+        # died a stage earlier.
+        building = [line for body in self.earlier
+                    for line in _logical_lines(body)
+                    if "pip wheel" in line]
+        self.assertTrue(building, "no stage builds a wheel")
+        self.assertTrue(
+            all(re.search(r"\|\||^RUN\s+set\s|if\s", line)
+                for line in building),
+            "the wheel build is not tolerated, so one upstream outage "
+            "costs every architecture its image")
+
 
 
 class LinksDoNotFightWhatPipInstalled(unittest.TestCase):
@@ -330,6 +411,23 @@ class TheBannerDoesNotLie(unittest.TestCase):
                          _instructions(ENTRYPOINT))
 
 
+class TheReadmeDescribesTheImageThatExists(unittest.TestCase):
+    def test_the_readme_does_not_say_an_architecture_ships_without_nxc(self):
+        # The README's Docker section said "on arm64 the install is
+        # skipped and the image builds without it" and stayed saying it
+        # after that stopped being true. By this file's own standard that
+        # is a stale comment, in the most-read file in the repository, and
+        # nothing read it -- so this does.
+        readme = _text(REPO / "README.md")
+        for claim in ("the install is skipped",
+                      "NetExec on\nthe architectures PyPI serves it for",
+                      "NetExec is the one tool that\nmay be missing"):
+            self.assertNotIn(
+                claim, readme,
+                "the README still describes the image that existed before "
+                "the wheels stage: %r" % claim)
+
+
 class RdpDoesNotHardcodeOneBinaryName(unittest.TestCase):
     def test_the_rdp_client_is_looked_up_not_assumed(self):
         # freerdp2 ships `xfreerdp`, freerdp3 ships `xfreerdp3`. server.py
@@ -360,7 +458,14 @@ class CiBuildsAndStartsTheImage(unittest.TestCase):
         self.files = sorted(workflows.glob("*.yml")) + \
             sorted(workflows.glob("*.yaml"))
         self.assertTrue(self.files, "no workflows at all")
-        self.ci = "\n".join(_text(path) for path in self.files)
+        # Instructions, not comments. A review deleted the asserting step
+        # outright and the nxc test below stayed green, because the word
+        # it looked for also appears in the comment above the step. This
+        # file has been bitten by that shape before -- test_docs.py says
+        # `_nothing_is_pinned` "was defeated once by a continuation
+        # backslash and reported an open finding as fixed".
+        self.ci = "\n".join(_instructions(path) for path in self.files)
+        self.commented = "\n".join(_text(path) for path in self.files)
 
     def test_a_job_builds_the_shipped_image(self):
         self.assertTrue(
@@ -383,14 +488,48 @@ class CiBuildsAndStartsTheImage(unittest.TestCase):
         # unbuildable tool cannot cost every architecture its image. That
         # same resilience is a way to ship a quietly incomplete image:
         # the build goes green, and the agent later runs `nxc` on the C2
-        # host and gets "command not found". Reporting which tools
-        # resolved was not enough -- a report nobody fails on is a report
-        # nobody reads. So a job asserts this one, which is where a
-        # broken wheel build is meant to become loud.
+        # host and gets "command not found". So a job asserts it.
+        #
+        # Not on nxc's exit status. Measured in the built image: `nxc
+        # --version` prints the version and then exits 1, because
+        # upstream's cli.py calls sys.exit(1) there. A `run:` step is
+        # bash -e, so gating on the status would have failed the job on
+        # every run, including a perfect one -- and the first person to
+        # see that would have appended `|| true` and reopened the hole.
+        # docker-entrypoint.sh already knew this about relayking.
         self.assertTrue(
-            re.search(r"nxc\b[^\n]*--version", self.ci),
+            re.search(r"command -v nxc", self.ci),
             "no workflow checks that NetExec resolves inside the built "
             "image, so the install's own `||` can hide its absence")
+
+    def test_the_netexec_check_also_proves_the_library_is_there(self):
+        # `nxc --version` passes without aardwolf: measured by moving the
+        # package aside inside the venv, after which the version still
+        # printed and `nxc rdp --help` still exited 0. aardwolf is the
+        # whole reason the wheels stage exists, so a check that cannot
+        # see it is not checking this change.
+        self.assertTrue(
+            re.search(r"import aardwolf", self.ci),
+            "the check cannot tell a complete NetExec from one whose RDP "
+            "library is missing, which is the thing the wheels stage is "
+            "for")
+
+    def test_the_image_is_built_on_the_architecture_that_was_broken(self):
+        # The whole defect was arm64-only: on x86_64 aardwolf has a
+        # published wheel, so the wheels stage compiles nothing there. A
+        # single ubuntu-latest job therefore proves the fix on the one
+        # architecture that never needed it, and would stay green with
+        # the wheels stage deleted. `ubuntu-24.04-arm` is a standard
+        # GitHub-hosted runner, free and unlimited on public repositories.
+        self.assertTrue(
+            re.search(r"ubuntu-\d+\.\d+-arm", self.ci),
+            "nothing builds this image on arm64, so nothing ever builds "
+            "the Rust wheel the change exists to build")
+        self.assertNotIn(
+            "ubuntu-24.04-arm", _text(REPO / ".github" / "workflows" /
+                                      "shipped-image.yml").split("jobs:")[0],
+            "the arm runner is named before any job, which cannot run "
+            "anything")
 
 
 if __name__ == "__main__":
