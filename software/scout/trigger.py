@@ -16,7 +16,11 @@ it inside the one-second loop it already runs.
 **A request stays pending until it is taken.** `main.py` can be restarted
 between reading a request and acting on it, and a request that cleared
 itself on being read would be a rung spent on nothing. `taken` is what
-closes it, and what it records is read back by the scout for the trail.
+closes it: the scout reads that one field to publish
+`identity_pre_spent`, and `detail` is for whoever recovers the device --
+"the bypass was started" and "no ebtables" are different things to be
+told, and the second is the one worth keeping. The beacon never reads
+either; the file *existing* is its own one-shot latch.
 
 **Nothing here raises.** It is polled from a loop with no guard of its
 own, and an exception would take the whole implant down over a file.
@@ -95,9 +99,9 @@ class IdentityTrigger(object):
     def taken(self, detail: str) -> None:
         """Close the request, recording what happened. Raises nothing.
 
-        `detail` is read back by the scout and by whoever recovers the
-        device: "the bypass was started" and "no ebtables" are different
-        things to be told, and the second is the one worth keeping.
+        `detail` is read by whoever recovers the device: "the bypass was
+        started" and "no ebtables" are different things to be told, and
+        the second is the one worth keeping.
         """
         request = handoff.read_document_at(self.path, handoff.STATE_VERSION)
         if request is None:

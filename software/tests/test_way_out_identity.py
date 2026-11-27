@@ -101,6 +101,56 @@ class TestTheVerb(IdentityCase):
         self.assertIn("[error]", answer)
         self.assertIn("once", answer)
 
+    def test_a_restart_of_the_beacon_does_not_re_arm_it(self):
+        # The latch lived only in memory, on a unit with `Restart=always`,
+        # for the one move the page says in bold ends this implant's
+        # connectivity **for good**. The window's budget was made durable
+        # and this was not.
+        first = self.beacon()
+        self.assertNotIn("[error]", first._exec_egress("identity"))
+
+        restarted = self.beacon()
+        answer = restarted._exec_egress("identity")
+        self.assertIn("[error]", answer)
+        self.assertIn("once", answer)
+
+    def test_a_second_ask_does_not_erase_what_came_of_the_first(self):
+        # The second write was a fresh dict over the same path, so it
+        # deleted the `taken` and `detail` keys `main.py` had written --
+        # destroying the only durable record that the bypass had already
+        # been started, which is what an operator reads on a recovered
+        # device, and making the scout publish `identity_pre_spent: false`
+        # for the rest of the deployment.
+        from software.scout.trigger import IdentityTrigger
+
+        self.beacon()._exec_egress("identity")
+        IdentityTrigger(self.state).taken("nac_bypass was started")
+
+        self.beacon()._exec_egress("identity")
+        record = self.request()
+        self.assertEqual(record["detail"], "nac_bypass was started")
+        self.assertIn("taken", record)
+        self.assertIsNone(IdentityTrigger(self.state).pending())
+
+    def test_a_request_that_could_not_be_written_is_still_spent(self):
+        # The file is the latch across restarts, and the flag is the latch
+        # when there is no file: a read-only /opt or a full disk must not
+        # turn the one irreversible move into one this implant retries
+        # every cycle for as long as the outage lasts. Failed for real
+        # rather than patched -- a directory at the request's own name,
+        # which `os.replace` cannot move a file onto -- because
+        # `_way_out_write` raises nothing, so a silent failure and a
+        # no-op are the same thing to every caller.
+        os.mkdir(handoff.identity_path(self.state))
+        beacon = self.beacon()
+
+        self.assertNotIn("[error]", beacon._exec_egress("identity"))
+        self.assertIsNone(self.request(), "the write was supposed to fail")
+
+        answer = beacon._exec_egress("identity")
+        self.assertIn("[error]", answer)
+        self.assertIn("once", answer)
+
     def test_a_delivering_leg_does_not_re_arm_it(self):
         beacon = self.beacon()
         beacon._exec_egress("identity")
@@ -181,7 +231,16 @@ class TestTheTrigger(IdentityCase):
 
 
 class TestMainStartsTheBypassOnRequest(IdentityCase):
-    """The poll in `software/main.py`, which owns the component."""
+    """The poll in `software/main.py`, which owns the component.
+
+    `NACBypass` is patched on **its own module** and not on `main`'s
+    namespace, because `main.py` imports it inside the branch that uses
+    it -- every component there is imported that way, and this one pulls
+    in scapy, so a module-level import would make a build that never
+    touches this rung fail to start without it. These tests used
+    `create=True` on `main`, which is what let that import be hoisted to
+    the top of the file without any of them noticing.
+    """
 
     def config(self, enabled=True, nac=False):
         return {
@@ -191,8 +250,29 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
             "c2": {"way_out": {"enabled": enabled, "state_dir": self.state}},
         }
 
+    def test_importing_main_does_not_import_the_bypass(self):
+        # The cost this lazy import exists for, measured rather than
+        # asserted about the source: `nac_bypass` pulls in scapy, every
+        # other component in `main.py` is imported inside the branch that
+        # uses it, and a module-level import would make a build that never
+        # touches rung 4 pay for it at startup -- and fail to start at all
+        # on an image without scapy. A fresh interpreter, because this one
+        # has imported it already.
+        import subprocess
+
+        source = ("import sys; import software.main; "
+                  "print('software.nac_bypass' in sys.modules)")
+        done = subprocess.run(
+            [sys.executable, "-c", source], capture_output=True, text=True,
+            cwd=str(REPO_ROOT), timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertEqual(done.stdout.strip(), "False",
+                         "importing software.main imported nac_bypass, and "
+                         "with it scapy, on every build there is")
+
     def test_a_pending_request_starts_the_bypass_once(self):
         from software import main as main_mod
+        from software import nac_bypass as nac_mod
         self.beacon()._exec_egress("identity")
         started = []
 
@@ -206,8 +286,7 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
             def stop(self):
                 pass
 
-        with mock.patch.object(main_mod, "NACBypass", FakeBypass,
-                               create=True):
+        with mock.patch.object(nac_mod, "NACBypass", FakeBypass):
             poller = main_mod.way_out_identity_poller(self.config())
             self.assertIsNotNone(poller)
             component = poller()
@@ -232,9 +311,9 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
 
     def test_no_request_starts_nothing(self):
         from software import main as main_mod
-        with mock.patch.object(main_mod, "NACBypass",
-                               mock.Mock(side_effect=AssertionError),
-                               create=True):
+        from software import nac_bypass as nac_mod
+        with mock.patch.object(nac_mod, "NACBypass",
+                               mock.Mock(side_effect=AssertionError)):
             poller = main_mod.way_out_identity_poller(self.config())
             self.assertIsNone(poller())
 
@@ -242,10 +321,10 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
         # This runs in `main.py`'s one-second loop, which has no guard: an
         # exception here would take the whole implant down.
         from software import main as main_mod
+        from software import nac_bypass as nac_mod
         self.beacon()._exec_egress("identity")
-        with mock.patch.object(main_mod, "NACBypass",
-                               mock.Mock(side_effect=OSError("no ebtables")),
-                               create=True):
+        with mock.patch.object(nac_mod, "NACBypass",
+                               mock.Mock(side_effect=OSError("no ebtables"))):
             poller = main_mod.way_out_identity_poller(self.config())
             self.assertIsNone(poller())
         record = handoff.read_document_at(handoff.identity_path(self.state), 1)

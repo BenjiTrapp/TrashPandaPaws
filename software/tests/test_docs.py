@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -3386,6 +3387,131 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
                 self.assertIn(name, self.guide,
                               "the page does not name %r, which this "
                               "feature writes to the implant's disk" % name)
+
+    def test_the_writer_column_of_that_table_is_the_process_that_writes(self):
+        # The trail's row said "the scout" for as long as the scout wrote
+        # it, and went on saying so after a review moved the writer to the
+        # beacon. Nothing was red. So the column is held against what the
+        # beacon actually produces: run the three paths that write, and
+        # the files that appear are the beacon's -- the rest of the table
+        # may not claim it, and the two the scout owns may not be missing
+        # from its side either.
+        import base64
+        import shutil
+
+        from software.c2.beacon import Beacon, read_way_out_policy
+        from software.scout import handoff
+
+        rows = {}
+        for line in self.guide.splitlines():
+            found = re.match(r"\|\s*`(way_out_[a-z_.]+)`\s*\|([^|]*)\|",
+                             line.strip())
+            if found:
+                rows[found.group(1)] = found.group(2).strip().lower()
+        self.assertEqual(len(rows), 6,
+                         "the table has %d file rows, not six: %r"
+                         % (len(rows), sorted(rows)))
+
+        state = tempfile.mkdtemp(prefix="raccoon-doc-")
+        self.addCleanup(shutil.rmtree, state, ignore_errors=True)
+        beacon = Beacon({"c2": {
+            "beacon_interval_seconds": 300, "jitter_percent": 0,
+            "encryption_key": base64.b64encode(b"\x24" * 32).decode(),
+            "proxy": {"mode": "auto"}, "https": {"enabled": False},
+            "dns": {"enabled": False}, "smb": {"enabled": False},
+            "quic": {"enabled": False},
+            "way_out": read_way_out_policy({"enabled": True,
+                                            "state_dir": state}),
+        }})
+        beacon._running = False
+        beacon._stuck_cycles = 24 * 12
+        handoff.write_document(state, {
+            "version": handoff.DOCUMENT_VERSION, "published": time.time(),
+            "evidence": {}, "tap": {"flags": []},
+            "identity_pre_spent": False, "recommendation": None})
+        beacon._way_out_publish_state()
+        beacon._way_out_record_attempt({"verb": "rediscover"})
+        self.assertNotIn("[error]", beacon._exec_egress("identity"))
+
+        written = {name for name in os.listdir(state)
+                   if name.startswith("way_out")}
+        # The document the beacon was given to read is not something it
+        # wrote, so it is not evidence either way about that row.
+        written.discard(handoff.DOCUMENT_NAME)
+        self.assertEqual(written, {handoff.STATE_NAME, handoff.TRAIL_NAME,
+                                   handoff.IDENTITY_NAME},
+                         "the beacon wrote %r, which is not the set this "
+                         "test reasons from" % sorted(written))
+
+        for name, writer in sorted(rows.items()):
+            with self.subTest(name=name):
+                if name in written:
+                    self.assertIn("beacon", writer,
+                                  "the beacon writes %s and the table says "
+                                  "%r" % (name, writer))
+                else:
+                    self.assertNotIn("beacon", writer,
+                                     "the table says the beacon writes %s, "
+                                     "and running the beacon's three writing "
+                                     "paths did not produce it" % name)
+        self.assertIn("scout", rows[handoff.DOCUMENT_NAME])
+        self.assertIn("scout", rows[handoff.BORROW_NAME])
+        self.assertIn("dhclient", rows["way_out_radio.lease"])
+
+    def test_the_measurement_summary_matches_the_design_it_summarises(self):
+        # Every number in the summary is a rounding of one in the design's
+        # `## Measurements`, and the page had three that were not: a
+        # handoff of 1.3 ms (the measurement is 1.0, with 1.3 the top of
+        # its spread), an arithmetic of 5 µs (4.2), and "eleven of twelve"
+        # with no mention that an earlier run measured nine -- which is
+        # the one this design says out loud is still a measurement. Held
+        # as a pair per claim, so moving the design's figure turns this
+        # red rather than leaving the page quietly stale.
+        design = " ".join(_read(
+            "docs", "superpowers", "specs",
+            "2026-11-27-implant-way-out-design.md").split()).lower()
+        for on_the_page, in_the_design in (
+                ("about **24 µs** of cpu per packet", "24.2 µs cpu per packet"),
+                ("the handoff about **1 ms**", "1000 µs per write-and-read"),
+                ("between 0.7 and 1.3 ms", "between 697 and 1286 µs"),
+                ("about **4 µs** per decision", "4.2 µs per decision"),
+                ("**0.49–3.34 seconds**", "0.49 s to 3.34 s"),
+                ("**eleven of twelve**", "accepted eleven of twelve"),
+                ("**nine of twelve**", "nine of twelve")):
+            with self.subTest(claim=on_the_page):
+                self.present(on_the_page, "a measurement the design took")
+                self.assertIn(" ".join(in_the_design.split()).lower(), design,
+                              "the page summarises %r, and the design no "
+                              "longer measures it: %r"
+                              % (on_the_page, in_the_design))
+
+    def test_the_sender_anchor_on_the_page_is_the_one_the_scout_uses(self):
+        # The page said the host's MAC was "learned from the first request
+        # it sees" for a release after a review replaced that with the
+        # bridge's own forwarding table, and the residual-risk paragraph
+        # went on describing the weaker version -- which understates the
+        # defence to the one reader who is deciding whether to switch this
+        # on. The sentence names a command, so the command is checked.
+        from software.scout.scout import Scout
+
+        self.present("bridge fdb show", "the command the anchor comes from")
+        self.present("re-read on every publish",
+                     "that a bridge learns and ages while the implant is "
+                     "dark")
+        self.present("fall back to the first request it sees",
+                     "what happens when the bridge cannot be read")
+
+        scout = Scout.__new__(Scout)
+        scout.bridge = "br0"
+        scout.downstream = "eth1"
+        asked = []
+        scout._run = lambda argv, **kwargs: (asked.append(argv) or
+                                             (1, "no such device"))
+        self.assertIsNone(scout._host_macs(),
+                          "an unreadable bridge must be `None`, which is the "
+                          "fallback the page describes")
+        self.assertEqual(asked, [["bridge", "fdb", "show", "br", "br0",
+                                  "dev", "eth1"]])
 
     def test_it_states_what_enabling_it_costs_the_old_verbs(self):
         for phrase, what in (

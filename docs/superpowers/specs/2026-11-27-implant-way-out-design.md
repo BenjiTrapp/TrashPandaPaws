@@ -556,8 +556,12 @@ are the Pi 4 Model B's four cores and 4 GB. Rebuild and re-run it with
 ```
 docker build -f tools/way_out_bench.Dockerfile -t raccoon-way-out-bench .
 docker run --rm --platform linux/arm64 --cpus 4 --memory 4g \
-    -v "$PWD:/repo" -w /repo raccoon-way-out-bench --json
+    -v "$PWD:/repo" -w /repo raccoon-way-out-bench --packets 4000 --json
 ```
+
+`--packets 4000` is what the parse row below was measured with, and the
+default is 2000: the command has to be the one that produces the number
+beside it, or the next person re-runs it and reads a different one.
 
 **Every second below is an optimistic bound, not a result.** A
 Cortex-A72's clock is not an aarch64 container host's, and nothing in the

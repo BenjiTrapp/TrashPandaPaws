@@ -27,10 +27,13 @@ themselves and the portal request to replay; only a borrow verb opens it.
 A handoff carrying passwords would be a second place they can be found on
 a device built to look like an IP phone.
 
-**The trail is the scout's.** The beacon records its attempts into the one
-file it writes, and that file is removed when a leg delivers. This copies
-each new attempt onto an append-only trail, which is what makes a burned
-implant a lesson instead of a mystery.
+**The trail is not the scout's.** It was, and a review moved it: the
+beacon records its attempts into the one file it writes, that file is
+removed when a leg delivers, and this process copied the new lines onto
+an append-only trail on its own publishing clock -- which lost every
+attempt made in a window's last interval and duplicated the rest on a
+restart. `Beacon._way_out_record_attempt` appends the line itself now.
+The section "the trail is not here" below has the whole reasoning.
 
 **Nothing here raises.** It runs unattended on a device nobody can reach.
 """
@@ -59,6 +62,11 @@ _CAPTURE_SLICE = 15
 # scans for wireless networks four times a minute for ever is its own
 # detection signature. Raised to the publishing interval when `run` starts.
 _SCAN_EVERY = 300
+# How long after the beacon last wrote its window this process still
+# believes it. Generous, because a stuck window is the case this exists
+# for and the beacon rewrites the file every cycle: at the shipped 300 s
+# interval that is twelve missed cycles.
+_WINDOW_STALE_AFTER = 3600
 
 
 def _parse_scan(output: str) -> List[dict]:
@@ -128,8 +136,12 @@ class Scout(object):
     def __init__(self, config: dict, state_dir: str):
         self.config = config if isinstance(config, dict) else {}
         self.state_dir = state_dir
-        self.bridge = (_block(self.config, "network").get("bridge_name")
-                       or "br0")
+        network = _block(self.config, "network")
+        self.bridge = network.get("bridge_name") or "br0"
+        # The port the host is on, which is what makes "from the host" a
+        # wire fact rather than a guess about a frame. `configs/raccoon.yaml`
+        # names it, because the bridge is built from it.
+        self.downstream = network.get("downstream_iface") or "eth1"
         # When the radio was last scanned, and what it saw. The scan is a
         # command per publish otherwise, and a device shaped like an IP
         # phone scanning for wireless networks four times a minute for
@@ -137,14 +149,35 @@ class Scout(object):
         self._scanned_at = 0.0
         self._ssids = []            # type: List[dict]
         self._scan_interval = float(_SCAN_EVERY)
-        self.evidence = Evidence(own_mac=self._own_mac())
+        self.evidence = Evidence(own_mac=self._own_mac(),
+                                 host_macs=self._host_macs())
         self._running = True
 
     # ── the question the loop asks ──
 
     def wanted(self) -> bool:
-        """Whether there is a stuck window to collect evidence for."""
-        return handoff.read_state(self.state_dir) is not None
+        """Whether there is a stuck window to collect evidence for.
+
+        **And whether the beacon is still writing it.** The window file is
+        removed when a leg delivers and at no other time -- not on a
+        `kill`, a crash, an OOM kill or a `systemctl stop` -- so without
+        the age check below a dead beacon left this process capturing and
+        scanning the radio for ever, which is the detection signature
+        `docs/WAY_OUT.md` spends a paragraph on. The beacon's own
+        fresh-or-ignore rule protects it from a dead scout; this is the
+        same rule in the other direction.
+
+        A window with no `touched` stamp is a beacon older than that
+        field, and is believed: reading it as dead would turn an upgrade
+        into a scout that never starts.
+        """
+        state = handoff.read_state(self.state_dir)
+        if state is None:
+            return False
+        touched = state.get("touched")
+        if not isinstance(touched, (int, float)) or isinstance(touched, bool):
+            return True
+        return abs(time.time() - float(touched)) <= _WINDOW_STALE_AFTER
 
     def observe(self, packet) -> None:
         """One captured frame. Raises nothing, whatever it is."""
@@ -174,9 +207,18 @@ class Scout(object):
             return None
 
     def _publish_once(self) -> Optional[dict]:
+        if not self.wanted():
+            # `wanted` and not `read_state`: a window the beacon has
+            # stopped writing is a window nobody will read a document
+            # for, and publishing one would keep a dead deployment's last
+            # evidence looking current.
+            return None
         state = handoff.read_state(self.state_dir)
         if state is None:
             return None
+        # The bridge may have learned a new device, or aged one out, since
+        # the last publish.
+        self.refresh_identity()
         # Computed once and handed to both: the scan costs a radio command,
         # and the model is asked about the same reading the beacon is given.
         tap = self._tap_fields()
@@ -267,6 +309,54 @@ class Scout(object):
             return 1, str(exc)
         return done.returncode, (done.stdout or "") + (done.stderr or "")
 
+    def refresh_identity(self) -> None:
+        """Re-read which MACs the bridge has on the downstream port.
+
+        Per publish, because the bridge learns and ages entries while the
+        implant is dark and a reading taken once at construction would go
+        stale over a window the design's worst case puts at a week.
+        """
+        self.evidence.host_macs = self.evidence.__class__(
+            host_macs=self._host_macs()).host_macs
+
+    def _host_macs(self) -> Optional[List[str]]:
+        """The MACs the bridge learned on the downstream port, or None.
+
+        `None` and not `[]`: an empty list would mean "the host is nobody"
+        and the scout would collect nothing at all, which is worse on a
+        host whose bridge cannot be read than an anchor that can be lied
+        to. `Evidence` says which it has.
+
+        Group and broadcast addresses are skipped -- they are `self
+        permanent` entries the bridge keeps for its own multicast
+        handling, not a device behind the port. One check, not two: the
+        broadcast address has the group bit set, so a second test for it
+        by name would be a branch no input can reach.
+        """
+        code, output = self._run(["bridge", "fdb", "show", "br",
+                                  self.bridge, "dev", self.downstream])
+        if code != 0:
+            logger.debug("scout: the bridge's forwarding table could not be "
+                         "read (%s), so the host side is whoever speaks "
+                         "first", output.strip()[:200])
+            return None
+        found = []
+        for line in output.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            mac = parts[0].strip().lower()
+            if len(mac.split(":")) != 6:
+                continue
+            try:
+                if int(mac.split(":", 1)[0], 16) & 0x01:
+                    continue            # a group address, broadcast included
+            except ValueError:
+                continue
+            if mac not in found:
+                found.append(mac)
+        return found or None
+
     def _own_mac(self) -> Optional[str]:
         """The bridge's own address, so the implant is not read as the host.
 
@@ -350,7 +440,18 @@ class Scout(object):
                 # A window that closed is a window whose evidence is spent:
                 # the next one starts from nothing, or a failure from three
                 # outages ago would drive a decision today.
-                self.evidence = Evidence(own_mac=self._own_mac())
+                self.evidence = Evidence(own_mac=self._own_mac(),
+                                         host_macs=self._host_macs())
+                # And the borrow file goes with it, because it is the one
+                # file in this handoff that carries a **secret**: a third
+                # party's proxy password, taken off the wire. The beacon
+                # removes its own window when a leg delivers and then
+                # stops writing, so nothing else here would ever have
+                # removed this -- a captured password sat on the disk of a
+                # device built to look like an IP phone until somebody
+                # reimaged it. Removed rather than overwritten empty, so
+                # there is no file to find at all. Raises nothing.
+                handoff.remove(handoff.borrow_path(self.state_dir))
                 self._sleep(min(interval, 30))
 
     def _sleep(self, seconds: float) -> None:

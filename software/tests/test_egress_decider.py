@@ -568,6 +568,54 @@ class TestTheRuleThatWins(DeciderCase):
         self.assertEqual(beacon._egress_decide(), "gsocket")
 
 
+class TestADeclinedVerbDoesNotSilenceTheRulesBelowIt(DeciderCase):
+    """A rule with nothing to work on must not end the cycle either.
+
+    The twin of the gate's own fall-through, in the one other place where
+    a candidate can come to nothing. `egress proxy` declines when
+    discovery has found nothing on this host to select -- the rule is
+    right and there is no candidate -- and that decline used to be read
+    as "this cycle is over", so a `proxy` rule above a `rediscover` rule
+    meant the rediscovery that would have *given* it a candidate was
+    never reached. The policy is the operator's order, and a verb with
+    nothing to do is not a veto over the orders below it.
+    """
+
+    def rules(self, *verbs):
+        return self.policy([{"when": {"https": ["not_attempted"]},
+                             "try": verb} for verb in verbs])
+
+    def test_a_proxy_rule_with_nothing_to_select_falls_through(self):
+        beacon = self.a_beacon(policy=self.rules("proxy", "rediscover"))
+        asked = self.record_attempts(beacon)
+        beacon._stuck_cycles = beacon._EGRESS_FIRST_ACTING_CYCLE
+
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["rediscover"])
+        self.assertEqual(beacon._egress_spent, 1)
+
+    def test_the_proxy_rule_still_wins_once_there_is_one_to_select(self):
+        # The fall-through is a decline and not a demotion: the same two
+        # rules in the same order pick the first one the moment discovery
+        # has a candidate for it.
+        beacon = self.a_beacon(policy=self.rules("proxy", "rediscover"))
+        beacon._proxy.proxies.append({"url": "http://10.0.0.9:3128"})
+        asked = self.record_attempts(beacon)
+        beacon._stuck_cycles = beacon._EGRESS_FIRST_ACTING_CYCLE
+
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["proxy http://10.0.0.9:3128"])
+
+    def test_every_rule_declining_is_still_no_attempt(self):
+        beacon = self.a_beacon(policy=self.rules("proxy"))
+        asked = self.record_attempts(beacon)
+        beacon._stuck_cycles = beacon._EGRESS_FIRST_ACTING_CYCLE
+
+        self.assertFalse(beacon._egress_act())
+        self.assertEqual(asked, [])
+        self.assertEqual(beacon._egress_spent, 0)
+
+
 class TestTheGateTheOperatorCannotWiden(DeciderCase):
     """`c2.proxy.mode: none` is an instruction, not an absence of one."""
 

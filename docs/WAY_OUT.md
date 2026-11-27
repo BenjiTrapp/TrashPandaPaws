@@ -65,7 +65,12 @@ suspects a tap can write them. Two of the rungs act on it, so both are
 narrowed:
 
 - all of it is read only from frames whose sender is the **host behind the
-  tap**, whose MAC the scout learns from the first request it sees;
+  tap**, and which addresses those are is read off the bridge's own
+  forwarding table (`bridge fdb show br <bridge> dev <downstream>`) — the
+  kernel's record of what it has actually seen on the port the host is on,
+  re-read on every publish because a bridge learns and ages entries while
+  the implant is dark. Only when that cannot be read at all does the scout
+  fall back to the first request it sees;
 - a credential is borrowed only from a `CONNECT` to a proxy on this
   network that **answered `407`** on an earlier `CONNECT` of its own — the
   rung answers a refusal, so the refusal has to have happened;
@@ -74,14 +79,18 @@ narrowed:
   sequence — a redirect, a POST on one flow, and a 2xx on that same flow.
 
 What is left is a residual risk and it is stated rather than implied. The
-sender check is a MAC comparison, so somebody who can both see the host's
-traffic and spoof its address defeats it; and a portal **named rather than
-addressed** cannot be checked by an implant that cannot resolve names, so a
-forger who names their canary `portal.example` and plants all three frames
-on one flow gets one replayed POST — and sets `portal_answered`, which moves
-the borrow rung's crossing earlier. Both flags the tap sets reach the
-operator's panel, so a forged one is a false bit in a record somebody reads.
-The design's risk table carries that row.
+sender check is a MAC comparison against addresses the bridge learned on
+the downstream port, so a forger **on the upstream segment** is not enough
+any more — but anybody who can put frames on the host's own port with the
+host's address still passes it, and so does anybody at all on a build whose
+bridge cannot be read, where the anchor falls back to whoever speaks first.
+And a portal **named rather than addressed** cannot be checked by an
+implant that cannot resolve names, so a forger who names their canary
+`portal.example` and plants all three frames on one flow gets one replayed
+POST — and sets `portal_answered`, which moves the borrow rung's crossing
+earlier. Both flags the tap sets reach the operator's panel, so a forged
+one is a false bit in a record somebody reads. The design's risk table
+carries that row.
 
 Every container the scout keeps is bounded — 256 published entries and 2048
 waiting for an answer — because it runs for as long as the outage does, and
@@ -298,14 +307,18 @@ deployment that can be power-cycled.
 
 What *was* measured, in an arm64 container with `--cpus 4 --memory 4g`, is in
 the design's *Measurements* section. In short: the scout's parse costs about
-24 µs of CPU per packet at a real tap's cardinality, the handoff about 1.3 ms
-per round, the arithmetic about 5 µs per decision, and a real `qwen2.5:0.5b`
-answered in 0.5–3.3 seconds with the validator accepting eleven of twelve
-answers. It also named `identity` — the irreversible rung — on hour-old
-evidence, and the arithmetic refused it. **Every second there is an
-optimistic bound, not a result** — a container is not a Cortex-A72 under a
-13 W budget — and watts and thermals are named as not measurable rather than
-assumed away.
+**24 µs** of CPU per packet at a real tap's cardinality, the handoff about
+**1 ms** per write-and-read round — an `fsync`, so that number is the bench's
+storage as much as the code, and it moved between 0.7 and 1.3 ms across runs
+— the arithmetic about **4 µs** per decision, and a real `qwen2.5:0.5b`
+answered in **0.49–3.34 seconds**. The validator took **eleven of twelve**
+answers in the run recorded there, and **nine of twelve** in an earlier one;
+both numbers are kept, because the refusal is the point: it costs one log
+line and a policy decision, not a rescue. The model also named `identity` —
+the irreversible rung — on hour-old evidence, and the arithmetic refused it.
+**Every second there is an optimistic bound, not a result** — a container is
+not a Cortex-A72 under a 13 W budget — and watts and thermals are named as
+not measurable rather than assumed away.
 
 ## What you learn, and when
 
@@ -325,7 +338,10 @@ cat /opt/raccoon/state/way_out_trail.jsonl
 ```
 
 The trail holds no password: a line names the verb, its argument, the rung
-and the gate's numbers.
+and the gate's numbers. The one file that *does* hold one — a proxy
+credential the scout took off the wire — is `way_out_borrow.json`, and the
+scout removes it when the window closes, so a captured password does not
+outlive the outage it was captured for.
 
 **What this puts on the implant's disk**, under `state_dir`, 0600 in a 0700
 directory — six files and not the "two" an earlier draft of this page
@@ -334,9 +350,9 @@ phone is the one number that has to be right:
 
 | File | Written by | What it is |
 |---|---|---|
-| `way_out_state.json` | the beacon | the open stuck window and its attempts; removed when a leg delivers |
+| `way_out_state.json` | the beacon | the open stuck window: how long, on what evidence, and how much of the budget it has spent; removed when a leg delivers |
 | `way_out_scout.json` | the scout | the handoff: the tap's reading, and a recommendation if the model is on |
-| `way_out_borrow.json` | the scout | the credentials and the portal request — the only one that can carry a secret |
+| `way_out_borrow.json` | the scout | the credentials and the portal request — the only one that can carry a secret, and removed when the window closes |
 | `way_out_trail.jsonl` | the beacon | the trail, append-only, which outlives the window |
 | `way_out_identity.json` | the beacon | rung 4's request, and what came of it |
 | `way_out_radio.lease` | `dhclient` | rung 3's lease, which a later rollback reads to undo a rule it did not install |

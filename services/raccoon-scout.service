@@ -5,8 +5,14 @@ Description=Raccoon Implant — Way-out Scout
 # exist yet, log a failure and restart until it did.
 After=network-online.target raccoon-implant.service
 Wants=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# No rate limit, as `raccoon-beacon.service` has none and for the same
+# reason: with `RestartSec=60` the shipped `StartLimitBurst=5` was five
+# restarts in exactly the 300 s window, so a scout that kept failing --
+# an interface that has not appeared yet, a tap tool missing from the
+# image -- would be given up on **permanently** by systemd, on a device
+# nobody can reach, and the way out would be gone for the rest of the
+# deployment. A unit that retries for ever costs a log line a minute.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
