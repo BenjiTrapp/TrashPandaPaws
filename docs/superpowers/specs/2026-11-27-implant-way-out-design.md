@@ -126,10 +126,13 @@ hungriest USB peripherals at the same time"*, and `OPEN_QUESTIONS.md:184`
 adds: *"This board is that case."*
 
 What a model costs on this hardware — watts, seconds, thermal headroom — is
-**not measured anywhere in this repository**. `docs/AGENT.md:491-493` says a
-local link is allowed 300 seconds per call against 120 for a hosted one, and
-that *"how much of that a Pi uses has not been measured for this page."*
-Measuring it is the first task of the plan, not an assumption of this design.
+**not measured anywhere in this repository**, and cannot be: there is no
+device. `docs/AGENT.md:491-493` says a local link is allowed 300 seconds per
+call against 120 for a hosted one, and that *"how much of that a Pi uses has
+not been measured for this page."* `OPEN_QUESTIONS.md:20-22` says nothing has
+been built or measured on a bench at all. Stage 1 therefore measures what a
+container can measure and names what it cannot, and the power question is
+carried as a named risk rather than as an assumption.
 
 ### 3. The cover identity argues against a model here, and that objection is overridden knowingly
 
@@ -469,35 +472,60 @@ provisioned a device for it.
 
 ## Stages
 
-1. **Measure the device.** What the scout's capture *and* a small model cost
-   on a PoE-powered Pi 4 with the bridge up: watts, seconds, thermal
-   headroom. Two measurements, not one — the second promiscuous reader is a
-   cost of this design whether or not a model ever runs, and the earlier
-   draft of this stage measured only inference. **Open: which device this is
-   measured on, and what counts as a pass** — see the question below the
-   stages. Nothing in stage 4 is worth building if the model half comes back
-   impossible; stages 2 and 3 stand even then.
+1. **Measure what a container can measure, and name what it cannot.** There
+   is no device: the human has none, and a container is the bench. That
+   splits stage 1 in two honest halves.
+
+   *Measurable in a container, and fully:* the scout's capture and parse
+   (CPU time per packet against a replayed capture), the document handoff,
+   the beacon's fresh-or-ignore rule, the arithmetic, and whether a small
+   model answers the question at all in a form the validator accepts.
+
+   *Measurable only as a proxy:* latency. An arm64 container with `--cpus`
+   and `--memory` limits approximates the Pi's four cores and 4 GB, but not
+   an A72's clock — so every second it reports is **optimistic by a factor
+   nobody here can pin down**, and the number goes in the plan as a bound,
+   not as a result.
+
+   *Not measurable at all:* watts and thermals. `OPEN_QUESTIONS.md:20-22` —
+   *"Nothing has been ordered, built or measured on a bench"* — and a
+   container cannot fix that. It is carried as a named risk below instead of
+   being quietly assumed away.
+
 2. **Evidence.** The scout, the tap-derived fields, the two dead flags
    alive, the document the beacon reads, the beacon's stuck-window state
-   file, and the fresh-or-ignore rule. Policy still decides, ungated rungs
-   are not yet reachable.
+   file, and the fresh-or-ignore rule. Policy still decides, and the loud
+   rungs are not yet reachable.
 3. **Rungs and gate.** The borrow and radio rungs, the rung-4 trigger into
    the existing `NACBypass`, the risk-table rows, the stdlib copy of the
    arithmetic in `beacon.py` with its copy-comparison test, the one-shot
    latch, and the trail. Still no model: the system is complete and useful
    at the end of this stage.
 4. **The model.** The scout asks Ollama, validates the answer against the
-   allowed verbs, publishes it. Stage 3's behaviour is the fallback, so this
-   stage can fail without taking the rest.
+   allowed verbs, publishes it. **Ships default-off**, and that is not
+   timidity: without a device, nobody can say what inference costs on PoE,
+   so the first operator to switch it on is the first measurement.
 
-**The one question this document cannot answer by itself:** stage 1 is the
-gate for the model half, and its pass mark needs a device.
-`hardware/OPEN_QUESTIONS.md:20-22` says *"Nothing has been ordered, built or
-measured on a bench"* — so whether a PoE-powered Pi 4 with the bridge up
-exists to measure on is the operator's knowledge, not the code's. If it does
-not, the honest options are to stop after stage 3 until it does, or to accept
-a bench proxy measurement on mains power and carry the PoE headroom as an
-unmeasured risk.
+**Why the missing device does not block stage 4, and what it does cost.**
+The beacon reads a file and ignores a stale one; it never calls the model and
+never waits for it. A model too slow for the hardware therefore degrades to
+the policy — the rescue still happens, with the decision today's evaluator
+would have made — instead of blocking it. That property was chosen for
+Constraint 1, and it happens to absorb the unmeasured latency as well. What
+it does *not* absorb is power: inference drawing more than the 802.3af budget
+leaves while the device is bridging is a hardware failure mode, not a
+software one, and no architecture here makes it safe.
+
+## Risks, and what each would look like
+
+| Risk | What it looks like | What this design does about it |
+|---|---|---|
+| The model is too slow on real hardware | The scout's document is always stale; the trail has only policy decisions | Nothing needed: the beacon degrades to the policy. The cost is the effort of stage 4, not a failed rescue |
+| Inference exceeds the PoE budget | A Pi that resets, throttles, or drops the bridge while the scout runs — on a device nobody can reach | Stage 4 is default-off and the risk is written here. The first deployment that enables it is an experiment and should be one that can be power-cycled |
+| The second capture reader costs too much CPU while bridging | Dropped packets in the tap, or a visibly slower bridge | Measured in stage 1's functional half, which a container does honestly. If it is too expensive, the BPF filter narrows or the scout samples |
+| The blob and the inference port are a forensic artefact | An IP phone with several gigabytes of model on disk and a listener with no authentication | Accepted by the human, over this project's written objection (Constraint 3). The listener binds loopback only; the blob has no mitigation |
+| A rung succeeds and the channel still does not carry | A verb that reports success while the implant stays dark | Unchanged from the decider: no verb tests its own result, and the next cycle's evidence is the only verdict |
+| Rung 4 kills the port | A device that never returns | One-shot until re-armed, last in the arithmetic, and the human chose this trade explicitly: dark is useless |
 
 ## What is left to the builder
 
@@ -520,6 +548,12 @@ unmeasured risk.
 - **Staging, with the measurement first.** Mine. The human asked for the
   whole thing; the order puts the unmeasured risk last and leaves three
   stages that stand on their own.
+- **A container as the bench, and the model half default-off.** Theirs that
+  there is no device (*"ich habe kein gerät zur Hand dafür war der Docker
+  Container gedacht"*); mine what follows from it: stage 1 splits into what
+  a container measures honestly, what it can only approximate, and what it
+  cannot touch at all. The power question stays open in the risk table
+  instead of being answered by a number from the wrong machine.
 - **The model outside `beacon.py`, reached through a file.** Mine. It is the
   only shape that keeps the stdlib promise *and* never makes the beacon wait
   on inference.
