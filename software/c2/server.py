@@ -69,6 +69,7 @@ from software.c2 import opshell
 # import this one: `tools/build_interpreter_bundle.py` is its other
 # consumer and has no business loading a web application.
 from software.c2.stagers.stager import drop_list, render_stager
+from werkzeug.exceptions import NotFound
 from werkzeug.serving import generate_adhoc_ssl_context, make_server
 
 try:
@@ -1397,11 +1398,33 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     @app.route("/api/loot/<agent_id>/<filename>", methods=["GET"])
     @require_auth
     def api_loot_download(agent_id, filename):
+        # Both halves, because neither covers the other. `send_from_directory`
+        # refuses a name that traverses -- this route used to join the two URL
+        # segments by hand and give the result to `send_file`, which serves
+        # whatever path it is handed, so `/api/loot/%2e%2e/key.pem` read out of
+        # the data directory itself. And a name that traverses is not the only
+        # way out: a symlink inside the agent's own directory has a name that
+        # stays put and a target that does not, which `send_from_directory`'s
+        # own string check cannot see. So the path is resolved first and
+        # required to sit directly in an agent directory under the base --
+        # which is the check that answers for the symlink. A directory and a
+        # missing file both come back from `send_from_directory` as
+        # `NotFound`, so they need no condition of their own here; the 404
+        # below is this route's answer either way.
         for sub in ("loot", "downloads"):
-            fp = data_dir / sub / agent_id / filename
-            if fp.exists() and fp.is_file():
-                return send_file(str(fp), as_attachment=True,
-                                download_name=filename)
+            base = (data_dir / sub).resolve()
+            try:
+                resolved = (base / agent_id / filename).resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if resolved.parent.parent != base:
+                continue
+            try:
+                return send_from_directory(
+                    str(base / agent_id), filename,
+                    as_attachment=True, download_name=filename)
+            except NotFound:
+                continue
         return jsonify({"error": "not found"}), 404
 
     # ── Server-side tool execution (Impacket, NXC) ──

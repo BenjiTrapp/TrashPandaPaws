@@ -618,6 +618,108 @@ class TestLootWriteIsContained(unittest.TestCase):
         self.assertEqual(len(self._written_files()), 1)
 
 
+class TestLootDownloadIsContained(TestLootWriteIsContained):
+    """The read side of the same directory, which the write side does not cover.
+
+    `TestLootWriteIsContained` above proves that nothing an agent sends
+    lands outside `loot/<agent>` or `downloads/<agent>`. That says nothing
+    about what the *download* route will hand back: it took the agent id
+    and the file name out of the URL, joined them and gave the result to
+    `send_file`, which serves whatever path it is given. So a file the
+    write side had refused to create could still be read if it was already
+    there -- and in the container layout `docker-compose.yml` documents,
+    the data directory holds the server's TLS private key.
+
+    It inherits the write side's fixture because the containment property
+    is the same directory's, and because a download test that built its own
+    server could drift from the one the writes are checked against.
+    """
+
+    def _outside(self, name="key.pem", body="outside-loot"):
+        # Both subdirectories exist, because that is the state the server
+        # puts itself in the first time any loot arrives -- and because
+        # `Path("…/loot/../key.pem").exists()` is False while `loot/` is
+        # absent, so a test without them would prove nothing and pass.
+        for sub, _loot in self.SUBS:
+            (self.data_dir / sub).mkdir(exist_ok=True)
+        (self.data_dir / name).write_text(body)
+        return body
+
+    def _get(self, path):
+        return self.client.get(path, headers={
+            "Authorization": "Bearer " + self.TOKEN})
+
+    def test_a_dotdot_agent_id_does_not_reach_the_data_directory(self):
+        body = self._outside()
+        # Both spellings: Flask's router normalises a literal `..` segment,
+        # so the encoded form is the one that reached the join.
+        for agent_id in ("%2e%2e", "..", "%2E%2E", "%2e%2e%2f%2e%2e"):
+            with self.subTest(agent_id=agent_id):
+                reply = self._get("/api/loot/%s/key.pem" % agent_id)
+                self.assertNotEqual(
+                    reply.status_code, 200,
+                    "GET /api/loot/%s/key.pem served a file" % agent_id)
+                self.assertNotIn(body.encode(), reply.data)
+
+    def test_a_traversing_filename_does_not_reach_the_data_directory(self):
+        body = self._outside()
+        agent_id = self._register()
+        for filename in ("%2e%2e%2fkey.pem", "%2e%2e%2f%2e%2e%2fkey.pem",
+                         "..%5ckey.pem"):
+            with self.subTest(filename=filename):
+                reply = self._get("/api/loot/%s/%s" % (agent_id, filename))
+                self.assertNotEqual(reply.status_code, 200)
+                self.assertNotIn(body.encode(), reply.data)
+
+    def test_an_absolute_filename_is_not_served(self):
+        self._outside(body="root-passwd-stand-in")
+        agent_id = self._register()
+        reply = self._get("/api/loot/%s/%%2fetc%%2fhosts" % agent_id)
+        self.assertNotEqual(reply.status_code, 200)
+
+    def test_a_symlink_inside_the_agent_directory_is_not_followed(self):
+        # The containment that a string check alone does not give: the
+        # name stays inside, and the path it resolves to does not.
+        body = self._outside(name="tls.key", body="private-key-stand-in")
+        agent_id = self._register()
+        agent_dir = self.data_dir / "loot" / agent_id
+        agent_dir.mkdir(parents=True)
+        os.symlink(self.data_dir / "tls.key", agent_dir / "notes.txt")
+        reply = self._get("/api/loot/%s/notes.txt" % agent_id)
+        self.assertNotIn(body.encode(), reply.data)
+
+    def test_the_route_still_serves_a_real_loot_file(self):
+        agent_id = self._register()
+        self._send_file(agent_id, True, filename="creds.txt", body=b"spoils")
+        written = list((self.data_dir / "loot" / agent_id).iterdir())
+        self.assertEqual(len(written), 1)
+        reply = self._get("/api/loot/%s/%s" % (agent_id, written[0].name))
+        self.assertEqual(reply.status_code, 200)
+        self.assertEqual(reply.data, b"spoils")
+
+    def test_a_download_outside_loot_is_still_served_from_downloads(self):
+        agent_id = self._register()
+        self._send_file(agent_id, False, filename="hosts.txt", body=b"fetched")
+        written = list((self.data_dir / "downloads" / agent_id).iterdir())
+        reply = self._get("/api/loot/%s/%s" % (agent_id, written[0].name))
+        self.assertEqual(reply.status_code, 200)
+        self.assertEqual(reply.data, b"fetched")
+
+    def test_an_unknown_file_is_a_404_and_not_a_500(self):
+        agent_id = self._register()
+        reply = self._get("/api/loot/%s/nothing-here.txt" % agent_id)
+        self.assertEqual(reply.status_code, 404)
+
+    def test_a_directory_is_a_404_and_not_a_500(self):
+        # The route no longer asks `is_file()` -- `send_from_directory`
+        # answers `NotFound` for a directory, and one guard that is exercised
+        # beats two where only one is. This is what says so.
+        agent_id = self._register()
+        (self.data_dir / "loot" / agent_id / "subdir").mkdir(parents=True)
+        reply = self._get("/api/loot/%s/subdir" % agent_id)
+        self.assertEqual(reply.status_code, 404)
+
+
 _REPO = Path(__file__).resolve().parents[2]
 _BOOTSTRAP = _REPO / "software" / "setup" / "bootstrap.sh"
 _UNIT_DIR = _REPO / "services"

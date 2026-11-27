@@ -524,14 +524,6 @@ def _rdp_hands_request_text_to_a_shell():
             and "echo '{password}' | vncpasswd -f" in text)
 
 
-def _the_loot_download_reaches_the_data_directory():
-    with _ProbeServer() as srv:
-        (srv.data_dir / "loot").mkdir()
-        (srv.data_dir / "key.pem").write_text("outside-loot")
-        reply = srv.client.get("/api/loot/%2e%2e/key.pem", headers=srv.auth)
-        return reply.status_code == 200 and reply.data == b"outside-loot"
-
-
 def _the_server_image_is_root_with_net_admin():
     image = _read("software", "c2", "Dockerfile")
     compose = _read("software", "c2", "docker-compose.yml")
@@ -798,8 +790,6 @@ _OPEN_FINDINGS = {
         ("No replay protection", _a_replayed_result_is_applied_again),
         ("staged-implant download", _the_staged_download_is_unchecked),
         ("`shell=True`", _rdp_hands_request_text_to_a_shell),
-        ("loot download escapes its directory",
-         _the_loot_download_reaches_the_data_directory),
         ("server image runs as root", _the_server_image_is_root_with_net_admin),
     ],
     "Would stop a release": [

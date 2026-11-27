@@ -1146,12 +1146,6 @@ more.
   visible in the process table in clear text, and the generated
   `/tmp/.vnc_pass_*` file is never removed. The route requires the operator
   token, so the input is whoever holds it.
-- **The loot download escapes its directory.** `/api/loot/<agent_id>/<filename>`
-  joins an unvalidated path and gives it to `send_file` rather than
-  `send_from_directory`, so `/api/loot/%2e%2e/<name>` reaches the data
-  directory. Confirmed against the Flask test client, with the operator
-  token. In the container layout `docker-compose.yml` documents, that
-  directory holds the server's TLS private key when TLS is on.
 - **The server image runs as root.** `software/c2/Dockerfile` has no `USER`
   directive, and the compose file grants `NET_ADMIN` and mounts the host's
   X11 socket. The agent image gets this right and says why in a comment; the
