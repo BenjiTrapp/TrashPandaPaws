@@ -55,6 +55,7 @@ from software.agent import safety
 from software.c2 import beacon as beacon_mod
 from software.c2.beacon import read_egress_policy, read_way_out_policy
 from software.tests import test_egress_decider as _decider
+from software.tests import way_out_scratch
 
 _KEY = b"\x24" * 32
 # The shipped beacon interval, which is how a cycle count becomes an hour.
@@ -119,7 +120,7 @@ class GateCase(_decider.DeciderCase):
             state = getattr(self, "_state", None)
             if state is None:
                 import tempfile
-                state = self._state = tempfile.mkdtemp(prefix="raccoon-gate-")
+                state = self._state = way_out_scratch("raccoon-gate-")
                 self.addCleanup(__import__("shutil").rmtree, state,
                                 ignore_errors=True)
             block = {"enabled": True, "state_dir": state}

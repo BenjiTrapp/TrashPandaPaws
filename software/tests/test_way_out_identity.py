@@ -47,12 +47,13 @@ from software.c2.beacon import read_way_out_policy
 from software.scout import handoff
 from software.scout.trigger import IdentityTrigger
 from software.tests import test_egress_decider as _decider
+from software.tests import way_out_scratch
 
 
 class IdentityCase(_decider.DeciderCase):
     def setUp(self):
         super().setUp()
-        self.state = tempfile.mkdtemp(prefix="raccoon-identity-")
+        self.state = way_out_scratch("raccoon-identity-")
         self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
 
     def beacon(self, hours_dark=24.0, document=True, pre_spent=False,

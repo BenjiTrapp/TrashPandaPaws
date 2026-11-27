@@ -38,6 +38,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -47,6 +48,7 @@ from software.c2 import dns_rescue
 from software.c2.beacon import Beacon, read_egress_policy, read_way_out_policy
 from software.scout import handoff
 from software.tests import test_egress_decider as _decider
+from software.tests import way_out_scratch
 
 _KEY = b"\x24" * 32
 
@@ -55,7 +57,7 @@ class WayOutCase(unittest.TestCase):
     """A beacon whose state directory is this test's own."""
 
     def setUp(self):
-        self.root = tempfile.mkdtemp(prefix="raccoon-way-out-")
+        self.root = way_out_scratch("raccoon-way-out-")
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         self.logged = _decider._Collected()
         logger = beacon_mod.logger
@@ -230,7 +232,7 @@ class TestTheLoopItself(_decider.DeciderCase):
 
     def setUp(self):
         super().setUp()
-        self.state = tempfile.mkdtemp(prefix="raccoon-way-out-loop-")
+        self.state = way_out_scratch("raccoon-way-out-loop-")
         self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
 
     def beacon(self, policy=None):
@@ -319,7 +321,7 @@ class TestTheCostOfSwitchingItOn(_decider.DeciderCase):
 
     def setUp(self):
         super().setUp()
-        self.state = tempfile.mkdtemp(prefix="raccoon-way-out-cost-")
+        self.state = way_out_scratch("raccoon-way-out-cost-")
         self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
 
     def attempts(self, enabled, cycles, flags=()):
@@ -1053,6 +1055,72 @@ class TestTheScoutsReaderAndWriter(WayOutCase):
         handoff.write_borrow(self.root, {"credentials": [], "portal": None})
         self.assertEqual(
             os.stat(handoff.borrow_path(self.root)).st_mode & 0o777, 0o600)
+
+
+class TestTheFixturesCannotHandTheReaderARefusedPath(unittest.TestCase):
+    """The rule above, turned on the tests that have to live with it.
+
+    `tempfile.gettempdir()` is `/tmp` on Linux and `/var/folders/...` on
+    macOS. Five modules minted their state directory with a bare
+    `tempfile.mkdtemp()`, so on the machine they were written on the reader
+    accepted it and on every Linux runner it did not: 71 failures and 24
+    errors in CI, every one of them the fixture raising. Reproduced here by
+    setting `TMPDIR=/tmp`, which gives the same 71 and 24.
+
+    Two checks, because only the second would have caught it. The first
+    says the helper is right; the second says the helper is the only thing
+    the fixtures use.
+    """
+
+    MODULES = ("test_way_out_gate", "test_way_out_handoff",
+               "test_way_out_identity", "test_way_out_rungs",
+               "test_way_out_trail")
+
+    def test_the_helper_answers_with_a_path_the_reader_accepts(self):
+        import shutil
+
+        # `tempfile.gettempdir()` is patched rather than `TMPDIR` set:
+        # tempfile caches its answer in `tempfile.tempdir` on the first
+        # call, so by the time any test runs the environment no longer
+        # decides. The first version of this test set TMPDIR, read
+        # `/var/folders/...` back and would have passed against the defect.
+        with mock.patch("tempfile.gettempdir", return_value="/tmp"):
+            path = way_out_scratch("raccoon-reader-floor-")
+        self.addCleanup(shutil.rmtree, path, True)
+        self.assertFalse(path == "/tmp" or path.startswith("/tmp/"), path)
+        policy = read_way_out_policy({"enabled": True, "state_dir": path})
+        self.assertEqual(policy["state_dir"], path)
+
+    def test_no_way_out_fixture_mints_its_state_directory_itself(self):
+        # By source, not by running: a module that goes back to
+        # `tempfile.mkdtemp()` for a state directory is green on macOS and
+        # red on Linux, so the thing to catch is the call, not the result.
+        # Read with `ast` rather than by scanning lines, because this file
+        # is one of the five and a line scan matched its own message text.
+        # `test_way_out_rungs` keeps one `mkdtemp` for a sysfs tree it
+        # builds, which no reader ever sees, so the name it is assigned to
+        # is what decides.
+        import ast
+
+        here = Path(__file__).resolve().parent
+        for name in self.MODULES:
+            tree = ast.parse((here / (name + ".py")).read_text())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Assign):
+                    continue
+                call = node.value
+                if not (isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "mkdtemp"):
+                    continue
+                kept = ast.dump(ast.Module(body=[node], type_ignores=[])) \
+                    if hasattr(ast, "Module") else ""
+                with self.subTest(module=name, line=node.lineno):
+                    self.assertIn(
+                        "sysfs", kept,
+                        "%s:%d mints a directory with mkdtemp; a state_dir "
+                        "has to come from way_out_scratch, or this module is "
+                        "red on Linux and green here" % (name, node.lineno))
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ from software.c2 import beacon as beacon_mod
 from software.c2.beacon import read_way_out_policy
 from software.scout import handoff
 from software.tests import test_egress_decider as _decider
+from software.tests import way_out_scratch
 
 A_CREDENTIAL = {"kind": "proxy-basic", "user": "corp\\alice",
                 "secret": "s3cret", "where": "10.0.0.1:3128"}
@@ -56,7 +57,7 @@ class RungCase(_decider.DeciderCase):
 
     def setUp(self):
         super().setUp()
-        self.state = tempfile.mkdtemp(prefix="raccoon-rung-")
+        self.state = way_out_scratch("raccoon-rung-")
         self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
 
     def beacon(self, hours_dark=24.0, tap=None, borrow=None, **extra):

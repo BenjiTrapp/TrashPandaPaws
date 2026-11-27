@@ -34,6 +34,7 @@ from software.c2.beacon import read_way_out_policy
 from software.scout import handoff
 from software.scout.scout import Scout
 from software.tests import test_egress_decider as _decider
+from software.tests import way_out_scratch
 
 
 class TrailCase(_decider.DeciderCase):
@@ -43,7 +44,7 @@ class TrailCase(_decider.DeciderCase):
 
     def setUp(self):
         super().setUp()
-        self.state = tempfile.mkdtemp(prefix="raccoon-trail-")
+        self.state = way_out_scratch("raccoon-trail-")
         self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
 
     def beacon(self, hours_dark=24.0, policy=None):
