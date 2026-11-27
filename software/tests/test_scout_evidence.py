@@ -329,6 +329,103 @@ class TestTheEvidenceIsAdversaryWritable(EvidenceCase):
     is a frame sequence a defender who suspected a tap could plant.
     """
 
+    def forged(self, where="203.0.113.9:3128", mac="de:ad:be:ef:00:01"):
+        """The whole sequence, from a sender that is not the host.
+
+        A review found the `407` precondition does not bind a forger,
+        because the forger sends the 407 too. So the frames have to come
+        from the host the tap learned, and the proxy has to be on the
+        network the implant is on.
+        """
+        host, port = where.split(":")
+
+        def connect(*headers):
+            lines = ["CONNECT a:443 HTTP/1.1", "Host: %s" % where]
+            lines.extend(headers)
+            return ("\r\n".join(lines) + "\r\n\r\n").encode()
+
+        head = connect()
+        auth = connect(
+            "Proxy-Authorization: Basic QURNSU5cc3ZjOlN1bW1lcg==")
+        frame = (Ether(src=mac, dst="11:22:33:44:55:66")
+                 / IP(src="10.0.0.99", dst=host)
+                 / TCP(sport=55555, dport=int(port)))
+        self.evidence.observe(frame / Raw(head))
+        self.evidence.observe(
+            (Ether(src="11:22:33:44:55:66", dst=mac)
+             / IP(src=host, dst="10.0.0.99")
+             / TCP(sport=int(port), dport=55555))
+            / Raw(b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                  b"Proxy-Authenticate: Basic realm=\"corp\"\r\n\r\n"))
+        self.evidence.observe(frame / Raw(auth))
+
+    def test_a_forged_sequence_from_another_sender_is_not_borrowed(self):
+        # The implant knows which MAC the host behind the tap has, and
+        # until now it learned it and used it for nothing. The proxy is on
+        # the **local** network here, so this test turns on the sender and
+        # nothing else: `_is_local` must not be what refuses it.
+        self.evidence.observe(self.http_request("GET", "intranet.lan", "/"))
+        self.assertEqual(self.evidence.host_mac, "aa:bb:cc:dd:ee:ff")
+        self.forged(where="10.0.0.66:3128")
+        self.assertEqual(self.evidence.credentials, [])
+        self.assertEqual(self.evidence.proxies, [])
+
+    def test_the_same_sequence_from_the_host_is_borrowed(self):
+        # The control for the two tests around it: with the sender right
+        # and the address local, the credential *is* taken -- so neither
+        # refusal above is passing for the wrong reason.
+        self.evidence.observe(self.http_request("GET", "intranet.lan", "/"))
+        self.forged(where="10.0.0.66:3128", mac="aa:bb:cc:dd:ee:ff")
+        self.assertEqual([c["where"] for c in self.evidence.credentials],
+                         ["10.0.0.66:3128"])
+
+    def test_a_proxy_off_the_local_network_is_not_borrowed(self):
+        # Even from the host: a proxy at a public address is not this
+        # network's proxy, and the rung would point the implant's whole
+        # channel at it.
+        self.evidence.observe(self.http_request("GET", "intranet.lan", "/"))
+        self.forged(mac="aa:bb:cc:dd:ee:ff")
+        self.assertEqual(self.evidence.credentials, [])
+
+    def test_the_hosts_own_sequence_is_still_borrowed(self):
+        self.evidence.observe(self.http_request("GET", "intranet.lan", "/"))
+        self.refused_proxy()
+        self.evidence.observe(self.http_request(
+            "CONNECT", "proxy.lan:3128", "a:443", dport=3128,
+            headers=["Proxy-Authorization: Basic Y29ycFxhbGljZTpzM2NyZXQ="]))
+        self.assertEqual([c["where"] for c in self.evidence.credentials],
+                         ["10.0.0.1:3128"])
+
+    def test_a_portal_redirect_is_bound_to_the_flow_that_answered_it(self):
+        # The commit that narrowed this claimed "the whole
+        # redirect/POST/2xx sequence on one flow" and `_portal_host` was
+        # global, so a redirect seen on any flow blessed a POST on any
+        # other.
+        self.evidence.observe(self.http_response(
+            302, ["Location: http://10.0.0.1/login"], sport=80))
+        other = (Ether(src="aa:bb:cc:dd:ee:ff", dst="11:22:33:44:55:66")
+                 / IP(src=self.HOST, dst="10.0.0.1")
+                 / TCP(sport=33333, dport=80))
+        self.evidence.observe(other / Raw(
+            b"POST /x HTTP/1.1\r\nHost: 10.0.0.1\r\n\r\na=1"))
+        self.evidence.observe(
+            (Ether() / IP(src="10.0.0.1", dst=self.HOST)
+             / TCP(sport=80, dport=33333))
+            / Raw(b"HTTP/1.1 200 OK\r\n\r\n"))
+        self.assertFalse(self.evidence.portal_answered)
+
+    def test_what_the_407s_leave_behind_is_bounded(self):
+        # The one container the bounding pass missed, and the fix commit
+        # added it: two frames per entry, from anyone on the segment.
+        self.evidence.observe(self.http_request("GET", "intranet.lan", "/"))
+        for index in range(evidence_mod.MAX_ENTRIES * 4):
+            port = 3000 + index
+            self.evidence.observe(self.http_request(
+                "CONNECT", "proxy.lan:%d" % port, "a:443", dport=port))
+            self.evidence.observe(self.http_response(407, sport=port))
+        self.assertLessEqual(len(self.evidence._refused_by),
+                             evidence_mod.MAX_ENTRIES)
+
     def test_a_credential_needs_a_proxy_the_host_really_used(self):
         # `Proxy-Authorization` on an ordinary request to an arbitrary
         # host is one frame. Recorded only against a `CONNECT` whose

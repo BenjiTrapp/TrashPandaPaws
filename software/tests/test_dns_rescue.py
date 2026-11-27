@@ -428,12 +428,18 @@ class _Sent:
 
     def __init__(self, answer=None):
         self.names = []
+        # The local address each query left by, which is empty for every
+        # beacon here: the way out's radio rung is the only thing that
+        # binds one, and `test_way_out_rungs.py` drives that.
+        self.sources = []
         self._answer = answer
 
-    def __call__(self, name, qtype, server, timeout=10, status=None):
+    def __call__(self, name, qtype, server, timeout=10, status=None,
+                 source=""):
         if status is not None:
             status["rcode"] = 0
         self.names.append(name)
+        self.sources.append(source)
         return [self._answer] if self._answer else []
 
 
@@ -663,7 +669,8 @@ class TestTheLoopIsWired(unittest.TestCase):
 
         sent = _Sent()
 
-        def query(name, qtype, server, timeout=10, status=None):
+        def query(name, qtype, server, timeout=10, status=None,
+                  source=""):
             if status is not None:
                 status["rcode"] = 0
             if "." + dns_rescue.MARKER + "." in name:
@@ -726,7 +733,8 @@ class TestTheLoopIsWired(unittest.TestCase):
             # Delivers in cycle 1, gone from cycle 2 on.
             return {"cmd": "noop"} if cycle["n"] == 0 else None
 
-        def query(name, qtype, server, timeout=10, status=None):
+        def query(name, qtype, server, timeout=10, status=None,
+                  source=""):
             if "." + dns_rescue.MARKER + "." in name:
                 sent.append(name)
                 return []
@@ -781,7 +789,8 @@ class TestTheLatchSurvivesItsOwnReply(unittest.TestCase):
 
         sent = []
 
-        def query(name, qtype, server, timeout=10, status=None):
+        def query(name, qtype, server, timeout=10, status=None,
+                  source=""):
             if status is not None:
                 status["rcode"] = 0
             if "." + dns_rescue.MARKER + "." in name:
@@ -823,7 +832,8 @@ class TestTheLatchSurvivesItsOwnReply(unittest.TestCase):
 
         sent = []
 
-        def query(name, qtype, server, timeout=10, status=None):
+        def query(name, qtype, server, timeout=10, status=None,
+                  source=""):
             if status is not None:
                 status["rcode"] = 0
             if "." + dns_rescue.MARKER + "." in name:
@@ -858,7 +868,8 @@ class TestTheResolverMustReallyHaveAnswered(unittest.TestCase):
     def test_a_servfail_is_not_recorded_as_answered(self):
         beacon = _rescue_beacon()
 
-        def query(name, qtype, server, timeout=10, status=None):
+        def query(name, qtype, server, timeout=10, status=None,
+                  source=""):
             if status is not None:
                 status["rcode"] = 2        # SERVFAIL
             return []
@@ -873,7 +884,8 @@ class TestTheResolverMustReallyHaveAnswered(unittest.TestCase):
     def test_an_nxdomain_carries_its_rcode(self):
         beacon = _rescue_beacon()
 
-        def query(name, qtype, server, timeout=10, status=None):
+        def query(name, qtype, server, timeout=10, status=None,
+                  source=""):
             if status is not None:
                 status["rcode"] = 3        # NXDOMAIN
             return []
@@ -887,7 +899,8 @@ class TestTheResolverMustReallyHaveAnswered(unittest.TestCase):
     def test_rcode_zero_with_no_records_is_still_an_answer(self):
         beacon = _rescue_beacon()
 
-        def query(name, qtype, server, timeout=10, status=None):
+        def query(name, qtype, server, timeout=10, status=None,
+                  source=""):
             if status is not None:
                 status["rcode"] = 0
             return []
@@ -903,7 +916,8 @@ class TestTheResolverMustReallyHaveAnswered(unittest.TestCase):
         beacon = _rescue_beacon()
         sent = []
 
-        def query(name, qtype, server, timeout=10, status=None):
+        def query(name, qtype, server, timeout=10, status=None,
+                  source=""):
             if status is not None:
                 status["rcode"] = 2
             if "." + dns_rescue.MARKER + "." in name:
@@ -2660,7 +2674,8 @@ class TestOnlyAnUpstreamLegReArmsTheLatch(unittest.TestCase):
         pending = {"task": False}
         task = beacon._encrypt({"cmd": "proxy http://10.0.0.9:3128"})
 
-        def query(name, qtype, server, timeout=10, status=None):
+        def query(name, qtype, server, timeout=10, status=None,
+                  source=""):
             if status is not None:
                 status["rcode"] = 0
             if "." + dns_rescue.MARKER + "." in name:
@@ -2711,7 +2726,8 @@ class TestOnlyAnUpstreamLegReArmsTheLatch(unittest.TestCase):
         cycle = {"n": 0}
         rescues = []
 
-        def query(name, qtype, server, timeout=10, status=None):
+        def query(name, qtype, server, timeout=10, status=None,
+                  source=""):
             if status is not None:
                 status["rcode"] = 0
             if "." + dns_rescue.MARKER + "." in name:
@@ -2764,7 +2780,8 @@ class TestBeingStuckIsNotTheSameAsGettingNothing(unittest.TestCase):
         sent = []
         count = {"n": 0}
 
-        def query(name, qtype, server, timeout=10, status=None):
+        def query(name, qtype, server, timeout=10, status=None,
+                  source=""):
             if status is not None:
                 status["rcode"] = 0
             if "." + dns_rescue.MARKER + "." in name:

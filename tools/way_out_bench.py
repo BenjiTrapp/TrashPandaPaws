@@ -167,12 +167,27 @@ def _replay(count):
     """
     from scapy.all import DNS, DNSQR, DNSRR, IP, TCP, UDP, Ether, Raw
 
+    # Both on this network: the scout refuses a proxy at a public address,
+    # because the rung would point the implant's whole channel at it.
     host, gateway = "10.0.0.50", "10.0.0.1"
 
     def tcp(src, dst, sport, dport, payload):
         return (Ether(src="aa:bb:cc:dd:ee:ff", dst="11:22:33:44:55:66")
                 / IP(src=src, dst=dst) / TCP(sport=sport, dport=dport)
                 / Raw(payload))
+
+    def host_frame(dst, proto, **fields):
+        """One frame from the host's own MAC, whatever the layer.
+
+        One MAC for every frame, which is not cosmetic: the scout reads
+        evidence a rung acts on only from the host it learned, and the
+        first version of this used `Ether()` for the DNS frames -- so the
+        bench's own machine's MAC became "the host", every CONNECT was
+        refused as a forgery, and the parse measured no proxy and no
+        credential at all. The narrowing working is why that was visible.
+        """
+        return (Ether(src="aa:bb:cc:dd:ee:ff", dst="11:22:33:44:55:66")
+                / IP(src=host, dst=dst) / proto(**fields))
 
     out = []
     index = 0
@@ -185,11 +200,10 @@ def _replay(count):
         out.extend([
             (Ether(src="aa:bb:cc:dd:ee:ff", dst="01:80:c2:00:00:03",
                    type=0x888E) / Raw(b"\x01\x01\x00\x00")),
-            (Ether() / IP(src=host, dst=resolver)
-             / UDP(sport=port, dport=53)
+            (host_frame(resolver, UDP, sport=port, dport=53)
              / DNS(rd=1, id=index % 65535, qd=DNSQR(qname=name))),
-            (Ether() / IP(src=resolver, dst=host)
-             / UDP(sport=53, dport=port)
+            (Ether(src="11:22:33:44:55:66", dst="aa:bb:cc:dd:ee:ff")
+             / IP(src=resolver, dst=host) / UDP(sport=53, dport=port)
              / DNS(qr=1, id=index % 65535, qd=DNSQR(qname=name),
                    an=DNSRR(rrname=name, rdata="93.184.216.34"))),
             # A ClientHello and the ServerHello that makes it count.
@@ -198,21 +212,25 @@ def _replay(count):
                 b"\x16\x03\x03\x00\x04\x02\x00\x00\x00"),
             # ...and one that is never answered, which is the ordinary case
             # on a tap and the one that used to grow without a bound.
-            tcp(host, gateway, port + 1, 443,
+            # `port + 40000` and not `port + 1`: the ports walk by one per
+            # round, so `+ 1` was answered by the *next* round's
+            # ServerHello and the pending growth this measures was still
+            # not measured -- the second iteration of the same error.
+            tcp(host, gateway, port + 40000, 443,
                 _client_hello("unanswered%d.example.com" % index)),
             tcp(host, gateway, port, 3128,
-                b"CONNECT a:443 HTTP/1.1\r\nHost: proxy.lan:3128\r\n\r\n"),
+                b"CONNECT a:443 HTTP/1.1\r\nHost: 10.0.0.1:3128\r\n\r\n"),
             tcp(gateway, host, 3128, port,
                 b"HTTP/1.1 407 Proxy Authentication Required\r\n"
                 b"Proxy-Authenticate: Basic realm=\"corp\"\r\n\r\n"),
             tcp(host, gateway, port, 3128,
-                b"CONNECT a:443 HTTP/1.1\r\nHost: proxy.lan:3128\r\n"
+                b"CONNECT a:443 HTTP/1.1\r\nHost: 10.0.0.1:3128\r\n"
                 b"Proxy-Authorization: Basic Y29ycFxhbGljZTpzM2NyZXQ=\r\n\r\n"),
             tcp(gateway, host, 80, port,
                 b"HTTP/1.1 302 Found\r\n"
-                b"Location: http://portal.lan/login\r\n\r\n"),
+                b"Location: http://10.0.0.1/login\r\n\r\n"),
             tcp(host, gateway, port, 80,
-                b"POST /login HTTP/1.1\r\nHost: portal.lan\r\n"
+                b"POST /login HTTP/1.1\r\nHost: 10.0.0.1\r\n"
                 b"Content-Type: application/x-www-form-urlencoded\r\n\r\n"
                 b"user=guest&accept=1"),
             tcp(gateway, host, 80, port, b"HTTP/1.1 200 OK\r\n\r\n"),

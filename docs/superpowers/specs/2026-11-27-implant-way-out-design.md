@@ -569,15 +569,16 @@ the two is not something anybody in this project can pin down.
 
 | What | Number | Reading |
 |---|---|---|
-| The scout's parse | **24.4 µs CPU per packet** over 4000 replayed frames | At 1000 packets/s through the filter that is about 2.4% of one core. Every row of the evidence table, TLS included, with a **distinct** destination, resolver and flow per round: the run read both flags, 256 resolvers, 256 TLS destinations and one credential, and ended with 333 unanswered CONNECTs still waiting. So this is the cost of reading at a real tap's cardinality -- the first version of this measurement replayed seven frames in a loop and reported 14.3 µs, which was the cost of the loop |
-| The handoff | **1286 µs per write-and-read round**, 500 rounds | Includes an `fsync`, so it measures the bench's storage as much as the code. Against a 300 s beacon interval it is noise |
-| The arithmetic | **4.9 µs per decision**, 500 rounds | The gate costs nothing worth naming |
+| The scout's parse | **24.2 µs CPU per packet** over 4000 replayed frames | At 1000 packets/s through the filter that is about 2.4% of one core. Every row of the evidence table, TLS included, with a **distinct** destination, resolver and flow per round: the run read both flags, 256 resolvers, 256 TLS destinations, one proxy and one credential, and ended with 333 unanswered CONNECTs and 334 unanswered ClientHellos still waiting. So this is the cost of reading at a real tap's cardinality -- the first version of this measurement replayed seven frames in a loop and reported 14.3 µs, which was the cost of the loop |
+| The handoff | **1000 µs per write-and-read round**, 500 rounds | Includes an `fsync`, so it measures the bench's storage as much as the code, and it moved between 697 and 1286 µs across runs on a loaded machine for that reason. Against a 300 s beacon interval it is noise either way |
+| The arithmetic | **4.2 µs per decision**, 500 rounds | The gate costs nothing worth naming |
 | Fresh-or-ignore | all three rules hold: a fresh document is read, a stale one is ignored, one from the future is ignored | This is the property that makes a dead scout -- or a model too slow for the hardware -- harmless |
 | The ladder's crossings | borrow at **1 h** dark, radio at **5 h**, identity at **7 h**; `portal_answered` moves borrow to **0 h**, `dot1x_seen` moves identity to **9 h** | Read out of `beacon.py`'s own numbers by the bench, not typed into it. The ladder is ordered, and the evidence moves the crossings in the directions the design argues for |
 
 And what the bounds look like under that load: both published lists hit
 their 256-entry ceiling and stayed there, and what was waiting for an
-answer stayed two orders of magnitude below its 2048 ceiling. Before the
+answer -- 333 unanswered CONNECTs and 334 unanswered ClientHellos --
+stayed well below its 2048 ceiling. Before the
 bounds the same 4000 frames left every one of those collections growing,
 and 40,000 frames of ordinary traffic measured 400 MB resident.
 

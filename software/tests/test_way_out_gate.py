@@ -115,8 +115,16 @@ class GateCase(_decider.DeciderCase):
 
     def beacon(self, hours_dark=0.0, flags=(), policy=None, way_out=True,
                **extra):
-        block = {"enabled": True, "state_dir": "/opt/raccoon/state"} \
-            if way_out is True else way_out
+        if way_out is True:
+            state = getattr(self, "_state", None)
+            if state is None:
+                import tempfile
+                state = self._state = tempfile.mkdtemp(prefix="raccoon-gate-")
+                self.addCleanup(__import__("shutil").rmtree, state,
+                                ignore_errors=True)
+            block = {"enabled": True, "state_dir": state}
+        else:
+            block = way_out
         beacon = self.a_beacon(
             policy=policy,
             way_out=read_way_out_policy(block) if block else
@@ -134,6 +142,16 @@ class GateCase(_decider.DeciderCase):
     def numbers(self, verb, p_success=None, **kwargs):
         return self.beacon(**kwargs)._way_out_allows(verb,
                                                      p_success=p_success)
+
+    def publish(self, beacon, recommendation):
+        """A fresh scout document carrying one recommendation."""
+        import time
+
+        from software.scout import handoff
+        handoff.write_document(beacon._way_out_state_dir, {
+            "version": handoff.DOCUMENT_VERSION, "published": time.time(),
+            "evidence": beacon._egress_state(), "tap": {"flags": []},
+            "identity_pre_spent": False, "recommendation": recommendation})
 
 
 class TestTheCurve(GateCase):
@@ -381,6 +399,64 @@ class TestWithNoScoutNothingChanges(GateCase):
         self.assertTrue(any("c2.way_out" in message
                             for message in self.logged.warnings),
                         "nothing said why: %r" % (self.logged.warnings,))
+
+
+class TestARefusedRungDoesNotSilenceTheOnesBelowIt(GateCase):
+    """A loud first rule must not shadow every quiet rule under it.
+
+    A review found `_egress_act` returning False the moment the
+    arithmetic refused whatever was chosen, so one `radio` rule -- or a
+    model that keeps naming `identity`, which the design's own
+    measurements record it doing -- silenced the whole policy for hours.
+    The page's "the quiet moves are allowed almost immediately" was false
+    for any policy whose first matching rule is loud.
+    """
+
+    def rules(self, *verbs):
+        return self.policy([{"when": {"https": ["not_attempted"]},
+                             "try": verb} for verb in verbs])
+
+    def test_a_loud_rule_is_skipped_for_the_quiet_one_below_it(self):
+        beacon = self.beacon(hours_dark=2,
+                             policy=self.rules("radio", "gsocket"))
+        asked = self.record_attempts(beacon)
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["gsocket"])
+
+    def test_the_loud_rule_still_fires_once_the_curve_reaches_it(self):
+        beacon = self.beacon(hours_dark=5,
+                             policy=self.rules("radio", "gsocket"))
+        asked = self.record_attempts(beacon)
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["radio"])
+
+    def test_every_rule_being_refused_is_still_no_attempt(self):
+        beacon = self.beacon(hours_dark=0, policy=self.rules("radio",
+                                                             "identity"))
+        asked = self.record_attempts(beacon)
+        self.assertFalse(beacon._egress_act())
+        self.assertEqual(asked, [])
+        self.assertEqual(beacon._egress_spent, 0)
+
+    def test_a_refused_recommendation_falls_back_to_the_policy(self):
+        # The design says of this case: "the beacon decided on its
+        # policy, which is the degradation this design relies on". It
+        # did not -- the policy was never evaluated.
+        beacon = self.beacon(hours_dark=2, policy=self.rules("gsocket"))
+        asked = self.record_attempts(beacon)
+        self.publish(beacon, {"verb": "identity", "chose": "model"})
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["gsocket"])
+
+    def test_each_refusal_is_logged_with_its_own_numbers(self):
+        beacon = self.beacon(hours_dark=2,
+                             policy=self.rules("identity", "radio",
+                                               "gsocket"))
+        self.record_attempts(beacon)
+        beacon._egress_act()
+        message = "\n".join(self.logged.warnings)
+        self.assertIn("way_out_identity", message)
+        self.assertIn("way_out_radio", message)
 
 
 class TestBothPathsGoThroughIt(GateCase):

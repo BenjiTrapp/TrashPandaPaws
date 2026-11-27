@@ -281,7 +281,8 @@ class DeciderCase(unittest.TestCase):
         """
         sent = []
 
-        def query(name, qtype, server, timeout=10, status=None):
+        def query(name, qtype, server, timeout=10, status=None,
+                  source=""):
             if status is not None:
                 status["rcode"] = 0
             if "." + beacon_mod._RESCUE_MARKER + "." in name:

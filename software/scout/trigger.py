@@ -62,15 +62,14 @@ class IdentityTrigger(object):
         the device and nothing here changes that -- which is a limit, and
         it is written down rather than implied.
         """
-        if not self._ours(self.path) or not self._ours(self.state_dir,
-                                                       directory=True):
+        if not self._ours(self.path) or not self._ours(self.state_dir):
             return None
         request = handoff.read_document_at(self.path, handoff.STATE_VERSION)
         if request is None or request.get("taken"):
             return None
         return request
 
-    def _ours(self, path: str, directory: bool = False) -> bool:
+    def _ours(self, path: str) -> bool:
         """Whether this euid wrote it and nobody else can. Raises nothing."""
         try:
             found = os.lstat(path)

@@ -147,7 +147,7 @@ class Evidence(object):
         # header is one frame anybody on the segment can send, and the
         # borrow rung answers a *refusal*, so the refusal has to have
         # happened. Keyed by `host:port`.
-        self._refused_by = set()
+        self._refused_by = collections.OrderedDict()
         # CONNECTs waiting for their answer, so a 407 can be attributed to
         # the proxy the host was really talking to.
         self._connect_pending = collections.OrderedDict()
@@ -156,7 +156,11 @@ class Evidence(object):
         self._tls_pending = collections.OrderedDict()
         # The portal noticed, and the request to it that is waiting to be
         # called answered.
-        self._portal_host = None        # type: Optional[str]
+        # The portal a redirect named, **per flow**: it was one global
+        # name, so a 302 seen on any flow blessed a POST on any other --
+        # which is not "the whole sequence on one flow", whatever the
+        # commit that narrowed it said.
+        self._portal_host = collections.OrderedDict()
         self._portal_pending = collections.OrderedDict()
 
     # ── the one entry point ──
@@ -274,8 +278,18 @@ class Evidence(object):
             return
         method, target = parts[0], parts[1]
         self._note_identity(packet)
+        if not self._from_the_host(packet):
+            # Everything below is evidence a *rung acts on*, so it has to
+            # come from the host behind the tap. A review found the `407`
+            # precondition did not bind a forger, because the forger sends
+            # the 407 too -- and the MAC this class carefully learns was
+            # used for nothing. Three frames from anyone on the segment
+            # pointed the implant's whole channel at their own proxy.
+            return
         where = "%s:%d" % (packet[IP].dst, int(packet[TCP].dport))
-        if method == "CONNECT":
+        if method == "CONNECT" and _is_local(str(packet[IP].dst)):
+            # And on this network. A proxy at a public address is not this
+            # network's proxy, whoever sent the frame.
             _append(self.proxies, where)
             _remember(self._connect_pending, _reverse_flow(packet), where)
             # Only against a CONNECT, and only to a proxy that has already
@@ -284,7 +298,8 @@ class Evidence(object):
         host = headers.get("host", "")
         if method == "GET":
             self._note_pac(host, target)
-        if method == "POST" and host and host == self._portal_host:
+        if (method == "POST" and host
+                and host == self._portal_host.get(_flow(packet))):
             text = body.decode("utf-8", "replace")
             if len(text) <= MAX_PORTAL_BODY:
                 _remember(self._portal_pending, _reverse_flow(packet), {
@@ -311,16 +326,17 @@ class Evidence(object):
             # redirect to a public address is one frame anybody on the
             # segment can send, and the rung would replay it -- which is a
             # request to somebody else's canary URL from the one host that
-            # cannot afford to make one.
+            # cannot afford to make one. Keyed by the flow the host would
+            # answer it on, which is this response's reverse.
             if host and _is_local(host):
-                self._portal_host = host
+                _remember(self._portal_host, _reverse_flow(packet), host)
             return
         if status == 407:
             # The proxy demanded authentication. That is what makes a
             # credential on the next CONNECT worth borrowing.
             proxy = self._connect_pending.pop(flow, None)
             if proxy:
-                self._refused_by.add(proxy)
+                _remember(self._refused_by, proxy, True, limit=MAX_ENTRIES)
             return
         pending = self._portal_pending.pop(flow, None)
         if pending is not None and status in _PORTAL_ACCEPTED:
@@ -381,6 +397,22 @@ class Evidence(object):
                 _append(self.tls_destinations, name)
 
     # ── identity ──
+
+    def _from_the_host(self, packet) -> bool:
+        """Whether this frame came from the host behind the tap.
+
+        True while the host is unknown -- the first request is how it
+        becomes known -- and a comparison afterwards. It is a MAC and
+        therefore spoofable by somebody who can also see the host's
+        traffic; what it stops is the cheap case, which is the one a
+        defender who merely suspects a tap can run.
+        """
+        if self.host_mac is None:
+            return True
+        try:
+            return str(packet[Ether].src or "").lower() == self.host_mac
+        except Exception:
+            return False
 
     def _note_identity(self, packet) -> None:
         """The first client-side sender, which is the host behind the tap.
@@ -542,16 +574,24 @@ def _append(sequence: list, item) -> None:
     sequence.append(item)
 
 
-def _remember(pending, key, value) -> None:
+def _remember(pending, key, value, limit=None) -> None:
     """Record something waiting for an answer, oldest evicted first.
 
     The opposite policy from `_append`, and deliberately: a query from ten
     minutes ago is not going to be answered, so the newest are the ones
     worth keeping room for.
+
+    `limit` is `MAX_PENDING` for the things that really are waiting, and
+    `MAX_ENTRIES` for the one that is a *finding* -- the proxies that
+    answered a 407. That one is small in reality and growable by anyone on
+    the segment at two frames an entry, which is how it got missed by the
+    bounding pass and then added, unbounded, by the pass that narrowed
+    the credential arm.
     """
     pending[key] = value
     pending.move_to_end(key)
-    while len(pending) > MAX_PENDING:
+    ceiling = MAX_PENDING if limit is None else limit
+    while len(pending) > ceiling:
         pending.popitem(last=False)
 
 

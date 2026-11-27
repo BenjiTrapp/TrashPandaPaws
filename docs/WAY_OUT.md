@@ -64,18 +64,24 @@ what the host proves; it is what frames on a wire say, and a defender who
 suspects a tap can write them. Two of the rungs act on it, so both are
 narrowed:
 
-- a credential is borrowed only from a `CONNECT` to a proxy that **answered
-  `407`** on an earlier `CONNECT` of its own — the rung answers a refusal,
-  so the refusal has to have happened;
+- all of it is read only from frames whose sender is the **host behind the
+  tap**, whose MAC the scout learns from the first request it sees;
+- a credential is borrowed only from a `CONNECT` to a proxy on this
+  network that **answered `407`** on an earlier `CONNECT` of its own — the
+  rung answers a refusal, so the refusal has to have happened;
 - a captive portal is recorded only at a **private or link-local address**,
   or at a name, with a body capped at 4 kB, and only after the whole
   sequence — a redirect, a POST on one flow, and a 2xx on that same flow.
 
-What is left is a residual risk and it is stated rather than implied: a
-portal **named rather than addressed** cannot be checked by an implant that
-cannot resolve names, so a forger who names their canary `portal.example`
-and plants all three frames gets one replayed POST. The design's risk table
-carries that row.
+What is left is a residual risk and it is stated rather than implied. The
+sender check is a MAC comparison, so somebody who can both see the host's
+traffic and spoof its address defeats it; and a portal **named rather than
+addressed** cannot be checked by an implant that cannot resolve names, so a
+forger who names their canary `portal.example` and plants all three frames
+on one flow gets one replayed POST — and sets `portal_answered`, which moves
+the borrow rung's crossing earlier. Both flags the tap sets reach the
+operator's panel, so a forged one is a false bit in a record somebody reads.
+The design's risk table carries that row.
 
 Every container the scout keeps is bounded — 256 published entries and 2048
 waiting for an answer — because it runs for as long as the outage does, and
@@ -128,6 +134,19 @@ routes this implant's own traffic through it. Three bounds, all in code:
   by the implant, because dhclient's own script installs a default route —
   the one thing this rung may never do. An implant that stranded itself off
   the path it still has is the worst outcome available here.
+- **And the implant's own sockets are bound to that address**, which is what
+  makes the rule mean anything: `ip rule from <address>` matches only
+  packets whose source *is* that address, and a locally-generated connection
+  has no source until something binds it. Without the bind the rung
+  installed a route nothing could ever select and reported that it had
+  changed how the implant gets out. Every HTTP session and every DNS query
+  the beacon makes leaves by the leased address until a leg delivers.
+
+Repeating the rung is the ordinary case — no verb tests its own result — so
+`ip addr replace` and `ip route replace` are used rather than `add`, and the
+source rule is deleted before it is added. Nothing flushes the interface: a
+management address an operator keeps on the onboard radio is not this rung's
+to delete.
 
 A failure at any step rolls back every step it took, and says so.
 
@@ -186,6 +205,16 @@ With the shipped numbers — risk coefficient `33`, threshold `0` — that is:
 Those hours are not typed into this page twice: a test computes them from the
 implant's own code and fails if the page and the code disagree.
 
+Every number in that block is floored or bounded so that none of them can
+make the gate meaningless: `points_per_hour` below 1 would close it for
+ever — including for the three verbs that worked before this existed — and
+`risk_coefficient: 1` or a very negative `ev_threshold` would open the
+irreversible rung on the first cycle the decider may act. The two modifiers
+are checked for **direction** as well as range: `dot1x_detect` may only
+raise and `portal_detect` may only lower, because one legal sign put rung 4
+two hours ahead of rung 3, which is the inversion this section promises
+cannot happen.
+
 `points` is floored by the **cycle count** as well as by the clock: a cycle
 is worth at most one step of the curve, whatever `beacon_interval_seconds`
 says. Without that, a long interval made two stuck cycles read as two days
@@ -201,10 +230,14 @@ cycles** at the shipped 300-second interval. A portal the host got past buys
 that hour back. It is the same shape as the decider's own one-cycle cost,
 and it is the price of the ladder.
 
-**Both paths go through it.** Your policy's choice and the model's
-recommendation are both proposals; the arithmetic decides whether the move may
-be taken. A rung it refuses costs no budget, and the refusal is logged with
-its numbers. A recommendation may also carry an **argument** — which SSID,
+**Both paths go through it, and a refusal is not the end of the cycle.**
+Your policy's choice and the model's recommendation are both proposals; the
+arithmetic decides whether each may be taken, and when it refuses one the
+**next** candidate of that cycle is tried — the model's answer first, then
+your rules in your own order. So a policy whose first matching rule is loud
+does not silence the quiet rules below it, and a model that keeps naming
+`identity` falls back to your policy rather than taking the cycle with it. A
+refused rung costs no budget, and every refusal is logged with its numbers. A recommendation may also carry an **argument** — which SSID,
 which account — and it is passed to the verb; one with whitespace in it is
 dropped, because the task string is split on whitespace and a model wrote
 that string.
@@ -277,11 +310,14 @@ assumed away.
 ## What you learn, and when
 
 Nothing while the implant is dark; that is unchanged and deliberate. Each
-attempt is one line in the beacon's log, as the decider's already are, and the
-scout keeps a **trail**: one line per attempt with the evidence that drove it,
-the rung, the verb and its argument, the gate's numbers, and whether your
-policy or the model chose. It outlives the stuck window, which is what makes a
-burned implant a lesson instead of a mystery.
+attempt is one line in the beacon's log, as the decider's already are, and
+the beacon keeps a **trail**: one line per attempt with the evidence that
+drove it, the rung, the verb and its argument, the gate's numbers, and
+whether your policy or the model chose. It is written at the moment the
+attempt is made and it outlives the stuck window, which is what makes a
+burned implant a lesson instead of a mystery. (The scout kept it at first,
+copying lines on its own clock — which lost every attempt made in a window's
+last interval, and on a recovered implant that is the attempt that worked.)
 
 ```
 cat /opt/raccoon/logs/raccoon.log
@@ -301,7 +337,7 @@ phone is the one number that has to be right:
 | `way_out_state.json` | the beacon | the open stuck window and its attempts; removed when a leg delivers |
 | `way_out_scout.json` | the scout | the handoff: the tap's reading, and a recommendation if the model is on |
 | `way_out_borrow.json` | the scout | the credentials and the portal request — the only one that can carry a secret |
-| `way_out_trail.jsonl` | the scout | the trail, append-only, which outlives the window |
+| `way_out_trail.jsonl` | the beacon | the trail, append-only, which outlives the window |
 | `way_out_identity.json` | the beacon | rung 4's request, and what came of it |
 | `way_out_radio.lease` | `dhclient` | rung 3's lease, which a later rollback reads to undo a rule it did not install |
 

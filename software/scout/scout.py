@@ -139,12 +139,6 @@ class Scout(object):
         self._scan_interval = float(_SCAN_EVERY)
         self.evidence = Evidence(own_mac=self._own_mac())
         self._running = True
-        # Which of the open window's attempts have reached the trail, and
-        # which window those are counted for. Keyed by the window's
-        # `opened` stamp, so a new window starts counting again rather than
-        # silently dropping its first attempts.
-        self._trailed_window = None     # type: Optional[float]
-        self._trailed = 0
 
     # ── the question the loop asks ──
 
@@ -206,7 +200,6 @@ class Scout(object):
                 "scout: nothing could be published to %s (%s), so the beacon "
                 "will decide on its policy alone", self.state_dir, exc)
             return None
-        self._append_trail(state, document)
         return document
 
     def _tap_fields(self) -> dict:
@@ -252,37 +245,16 @@ class Scout(object):
     def _model_block(self) -> dict:
         return _block(self.config, "c2", "way_out", "model")
 
-    # ── the trail ──
-
-    def _append_trail(self, state: dict, document: dict) -> None:
-        """Copy this window's new attempts onto the append-only trail.
-
-        The beacon's file is removed when a leg delivers, so without this
-        a rescue that ended in a burned port would leave nothing to read.
-        A failure to append costs the trail and not the document: the
-        beacon's next decision matters more than the record of the last.
-        """
-        window = state.get("opened")
-        if window != self._trailed_window:
-            self._trailed_window = window
-            self._trailed = 0
-        raw = state.get("attempts")
-        attempts = [entry for entry in (raw if isinstance(raw, list) else [])
-                    if isinstance(entry, dict)]
-        for entry in attempts[self._trailed:]:
-            line = dict(entry)
-            line["window"] = window
-            line.setdefault("evidence", state.get("evidence"))
-            try:
-                handoff.append_trail(self.state_dir, line)
-            except (OSError, ValueError) as exc:
-                logger.warning("scout: the trail could not be appended to "
-                               "(%s); the attempt is in the beacon's log",
-                               exc)
-                return
-            # Counted per line that got through, so a failure does not
-            # re-append everything that already had.
-            self._trailed += 1
+    # ── the trail is not here ──
+    #
+    # It was: the beacon recorded each attempt into the window's own file
+    # and this copied new lines onto an append-only trail on the
+    # publishing clock. That lost every attempt made in the last interval
+    # of a window -- a leg delivering removes the window's file, and on a
+    # recovered implant the lost line is the attempt that worked -- and
+    # duplicated what it had already copied whenever this unit restarted.
+    # `Beacon._way_out_record_attempt` writes the trail now, in the same
+    # call that records the attempt.
 
     # ── the radio ──
 

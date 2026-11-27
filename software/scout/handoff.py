@@ -108,7 +108,15 @@ def read_state(state_dir: str) -> Optional[dict]:
 
 
 def read_document(state_dir: str) -> Optional[dict]:
-    """The scout's own document, for the scout and for tests."""
+    """The scout's own document.
+
+    Nothing in production calls this: the scout writes the document and
+    the beacon reads it through its own copy of the reader, which is the
+    whole point of the copies. It exists for this package's tests and for
+    `tools/way_out_bench.py`, and that is said out loud because "a
+    documented thing nothing calls" is exactly the shape of the worst
+    defect this branch shipped.
+    """
     return read_document_at(document_path(state_dir), DOCUMENT_VERSION)
 
 
@@ -129,6 +137,10 @@ def read_borrow(state_dir: str) -> Optional[dict]:
     Versioned like the other two, and for the sharpest form of the same
     reason: this is the file that selects a *credential*, and the two
     halves are upgraded by two different installs.
+
+    The beacon reads this file through `Beacon._egress_borrow`, which
+    carries its own copy of the reader; this one is for this package's
+    tests, and the version it checks is the one that matters.
     """
     return read_document_at(borrow_path(state_dir), BORROW_VERSION)
 
@@ -199,7 +211,11 @@ def write_private_json(path: str, document: dict) -> None:
 
 
 def remove(path: str) -> None:
-    """Delete a handoff file if it is there. Raises nothing."""
+    """Delete a handoff file if it is there. Raises nothing.
+
+    For this package's tests. The beacon removes its own window with
+    `Beacon._way_out_clear_state`, and nothing else here deletes.
+    """
     try:
         os.unlink(path)
     except OSError:
@@ -245,7 +261,7 @@ def _ensure_dir(directory: str) -> None:
 
 
 def is_private(path: str) -> bool:
-    """Whether a handoff file is 0600, for a check that wants to say so."""
+    """Whether a handoff file is 0600. For this package's tests."""
     try:
         return stat.S_IMODE(os.stat(path).st_mode) == _PRIVATE_FILE
     except OSError:
