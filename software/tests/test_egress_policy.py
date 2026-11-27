@@ -361,44 +361,60 @@ class TestTheConditionsARuleMayName(PolicyCase):
         self.assertEqual(policy["rules"][1]["when"],
                          {"flags": ["dns_answered"]})
 
-    def test_dot1x_seen_and_portal_answered_are_refused_as_flag_names(self):
-        # Both are declared in `dns_rescue.py` and both are rendered by
-        # the team server, so an operator reading the panel has every
-        # reason to think they are usable. Nothing in the beacon sets
-        # them: `_rescue_flags` ORs in `proxy_found` and `dns_answered`
-        # and nothing else, because no 802.1X sensing and no
-        # captive-portal detection exists on this implant. A rule naming
-        # one could never match, and a rule that can never fire is a trap
-        # in the one file nobody can debug remotely.
+    def test_dot1x_seen_and_portal_answered_are_accepted_now(self):
+        # They used to be refused by name. Both are declared in
+        # `dns_rescue.py` and both are rendered by the team server, so an
+        # operator reading the panel had every reason to think they were
+        # usable -- and nothing in the beacon set them, because no 802.1X
+        # sensing and no captive-portal detection existed on this implant.
+        # A rule naming one could never match, and a rule that can never
+        # fire is a trap in the one file nobody can debug remotely.
+        #
+        # The scout sets them: it watches the tapped port for EAPOL and
+        # for a captive portal the host got *past*, and
+        # `Beacon._way_out_absorb_flags` ORs what it found into the
+        # record. So the names are live, and the premise test below holds
+        # the claim. That a rule naming one on a build with **no** scout
+        # is said out loud rather than refused is in
+        # `test_way_out_handoff.py`: this reader cannot see `c2.way_out`.
         for flag in ("dot1x_seen", "portal_answered"):
             with self.subTest(flag=flag):
-                message = self.refused(
-                    {"enabled": True,
+                logged = self.warnings()
+                policy = beacon_mod.read_egress_policy(
+                    {"enabled": True, "budget": 1,
                      "rules": [{"when": {"flags": [flag]},
                                 "try": "gsocket"}]})
-                self.assertIn(flag, message)
-                # The reason, not only the refusal: an operator who reads
-                # "not a flag" will look for a typo and find none.
-                self.assertIn("proxy_found", message)
-                self.assertIn("dns_answered", message)
+                self.assertEqual(logged.messages, [])
+                self.assertTrue(policy["enabled"])
+                self.assertEqual(policy["rules"][0]["when"]["flags"], [flag])
 
-    def test_the_premise_nothing_in_the_beacon_sets_those_two_flags(self):
-        # The refusal above is only right while this holds. A rescue flag
-        # is only ever set by an `|=` on `_rescue_flags`, so the premise is
-        # checked as the text of the file: the behavioural alternative is
-        # driving all five legs of a beacon through every failure and
-        # asserting a byte, which would test the legs and not this.
+    def test_no_flag_name_is_refused_as_dead_any_more(self):
+        # Kept as an empty mapping rather than deleted: the day the record
+        # declares a fifth flag that nothing sets, it belongs there with
+        # its reason, and `_egress_check_flag` still reads it.
+        self.assertEqual(beacon_mod._EGRESS_DEAD_FLAGS, {})
+
+    def test_the_premise_something_in_the_beacon_sets_all_four_flags(self):
+        # The acceptance above is only right while this holds. The two
+        # leg flags are set by an `|=` on `_rescue_flags` in the leg that
+        # learns them, so that half is checked as the text of the file:
+        # the behavioural alternative is driving all five legs of a beacon
+        # through every failure and asserting a byte, which would test the
+        # legs and not this.
+        #
+        # The two tap flags come from the scout's document instead, which
+        # is why they are checked as the mapping that absorbs them --
+        # `test_way_out_handoff.py` drives the absorbing itself.
         source = BEACON_SOURCE.read_text(encoding="utf-8")
         for live in ("_RESCUE_FLAG_PROXY_FOUND", "_RESCUE_FLAG_DNS_ANSWERED"):
             self.assertIn("|= " + live, source,
                           "%s is no longer set; the policy's live flag names "
                           "are out of date" % live)
-        for dead in ("_RESCUE_FLAG_DOT1X_SEEN",
-                     "_RESCUE_FLAG_PORTAL_ANSWERED"):
-            self.assertNotIn(
-                "|= " + dead, source,
-                "%s is set now, so it is a flag a rule could match and the "
-                "refusal of its name is wrong" % dead)
+        self.assertEqual(sorted(beacon_mod._WAY_OUT_TAP_FLAGS),
+                         ["dot1x_seen", "portal_answered"])
+        self.assertIn("self._rescue_flags |= bit", source,
+                      "nothing absorbs the tap's flags into the record any "
+                      "more, so a rule naming one could never match")
 
     def test_an_unknown_flag_name_is_refused(self):
         message = self.refused({"enabled": True,

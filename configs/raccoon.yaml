@@ -258,6 +258,88 @@ c2:
       - when: {any: [timed_out, unreachable]}
         try: gsocket
 
+  # ── The way out: THE SCOUT, AND THE LADDER THAT IS ARITHMETIC ──
+  #
+  # The egress decider above reads five lines of evidence and orders three
+  # verbs by hand. This block widens both: a second process -- the scout,
+  # software/scout/, started by services/raccoon-scout.service -- watches a
+  # narrow slice of the tapped port, and the beacon gates every move behind
+  # an expected-value inequality instead of behind the operator's ordering.
+  #
+  # Read docs/WAY_OUT.md before enabling it. The quiet rungs are reversible;
+  # the last one takes the downstream host's identity and can end this
+  # implant's connectivity for good, with nobody's hand on the device.
+  #
+  # Drop-box only, like the decider: a build the team server generates is a
+  # single file with no raccoon.yaml, no venv and no scout, and keeps exactly
+  # today's behaviour.
+  #
+  # Ships disabled, and the rest of the block is read and validated anyway,
+  # so a typo surfaces now rather than on the stuck cycle it would have
+  # fired.
+  way_out:
+    enabled: false
+    # Where the beacon and the scout meet. Two files: the beacon writes one
+    # saying a stuck window is open, the scout writes one saying what the tap
+    # shows.
+    #
+    # NOT under /tmp, and the beacon refuses a /tmp path by name:
+    # raccoon-beacon.service and raccoon-implant.service both set
+    # PrivateTmp=true, so each process would get its own private /tmp and
+    # the handoff would silently never happen.
+    state_dir: "/opt/raccoon/state"
+    # Fresh or ignored. A scout document older than this is not read, so a
+    # dead scout degrades to the five lines of evidence the decider already
+    # had rather than to a stale decision -- and so a model too slow for
+    # this hardware costs the rescue nothing.
+    document_max_age_seconds: 900
+    # The curve. `points` in the risk table is the value of what an action
+    # unlocks, and the value of a restored channel is not constant: a
+    # channel back in the first hour is worth a check-in, and one back after
+    # a week is the difference between an operation and a dead device in a
+    # rack. This is what makes the ladder move -- the quiet rungs are
+    # allowed almost immediately and the loud ones cross the threshold
+    # later, by arithmetic rather than by a policy line.
+    points_per_hour: 5
+    points_max: 100
+    # The inequality is `points * p_success > risk_coefficient * p_detect`.
+    # These two are the shipped agent profile's numbers; a drop-box has no
+    # campaign configuration, so they are here rather than in a risk
+    # profile.
+    risk_coefficient: 33
+    ev_threshold: 0
+    # How the tap's two flags move the detection probability. A port that
+    # authenticates is a port somebody configured and therefore watches, so
+    # dot1x_seen pushes the identity rung later; a network that redirects
+    # every browser sees credential prompts answered all day, so
+    # portal_answered brings the borrow rung earlier.
+    dot1x_detect: 0.15
+    portal_detect: -0.10
+    # ── The local model ──
+    #
+    # The scout asks one question -- which rung, on this evidence -- and
+    # validates the answer against the verbs the implant actually has. The
+    # beacon never calls the model and never waits for it: it reads the file
+    # above, and ignores a stale one.
+    #
+    # SHIPS OFF, and not out of timidity. What inference costs on a Pi
+    # powered over PoE -- watts, seconds, thermal headroom -- is not
+    # measured anywhere in this repository and cannot be: there is no
+    # device. So the first operator to switch this on is the first
+    # measurement, and it should be a deployment that can be power-cycled.
+    model:
+      enabled: false
+      # Loopback only, and the beacon refuses anything else by name. The
+      # model exists for this implant's own decision; a listener reachable
+      # from the target segment would hand it to anyone on the network the
+      # implant is hiding in.
+      endpoint: "http://127.0.0.1:11434"
+      # Pulled by hand on the device, as the gsocket secret is. Empty, and
+      # an enabled model with no name is refused: the scout would have
+      # nothing to ask.
+      name: ""
+      timeout_seconds: 120
+
   beacon_interval_seconds: 300
   jitter_percent: 20
   # The shared secret for beacon traffic: a base64-encoded 32-byte AES-256-GCM
