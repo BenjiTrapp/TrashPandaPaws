@@ -1239,19 +1239,49 @@ class TestTranscripts(ShellFrontTestCase):
     def folder(self, directory):
         return os.path.join(directory, self.identity)
 
-    def written(self, directory, count=2):
+    def written(self, directory, count=2, timeout=20.0):
         """The one session's files under `directory`, as paths.
 
         `count` is how many are expected, so a missing sidecar is a named
         failure rather than an `IndexError` three lines later.
+
+        **Waited for, not asserted once**, and the reason is measured.
+        `ShellFront._pump` joins the output direction with a **5 second
+        ceiling** (`_JOIN_TIMEOUT`) and releases the session slot
+        afterwards either way -- so a machine slow enough to miss that
+        join reports "no live session" while the recorder's `close` is
+        still writing the sidecar. Nine callers here read `written` right
+        after `ended`, and every one of them had that race.
+
+        Reproduced rather than guessed: with a 6 second delay in front of
+        `_write_private_json`, the shape without this wait fails
+        `1 != 2 : expected 2 file(s) ... found [...typescript]`, and with
+        it the test passes. That is the test being early, not the port
+        being wrong, and a guard that cries wolf under load is one people
+        learn to ignore.
+
+        The deadline is the point: a file that never arrives still fails,
+        and the failure still says what was found and for how long it was
+        waited for.
         """
         folder = self.folder(directory)
+
+        def there():
+            try:
+                return len(os.listdir(folder)) == count
+            except OSError:
+                return False
+
+        if not there():
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and not there():
+                time.sleep(0.01)
         self.assertTrue(os.path.isdir(folder),
                         "no directory was made for %r" % self.identity)
         names = sorted(os.listdir(folder))
         self.assertEqual(len(names), count,
-                         "expected %d file(s) under %s, found %r"
-                         % (count, folder, names))
+                         "expected %d file(s) under %s after %.0fs, found %r"
+                         % (count, folder, timeout, names))
         return [os.path.join(folder, name) for name in names]
 
     def flushed(self, path, size):
@@ -1274,13 +1304,48 @@ class TestTranscripts(ShellFrontTestCase):
     def ended(self, front, client):
         """Close a client and wait until its session is finished.
 
-        A session's slot is given back after the output direction has been
-        joined, and the recorder is closed by that direction's own
-        teardown -- so a port reporting no live session has written the
-        sidecar already, and nothing here has to poll for the file.
+        A session's slot is given back around the same time the recorder is
+        closed by the output direction's teardown. **Around**, not after,
+        and that is measured rather than suspected: `_pump` joins the
+        output thread with a 5 second ceiling and decrements the live count
+        in its `finally` either way, so a machine that misses the join
+        reports no live session while the sidecar is still being written.
+
+        The slot is this method's claim and nothing more. The sidecar is
+        `sidecar`'s and the typescript is `written`'s, and both wait for
+        bytes.
         """
         client.close()
         self.wait_for(lambda: front.stats()["sessions"] == 0)
+
+    def sidecar(self, path, timeout=20.0):
+        """The sidecar beside `path`, once it is on the disk and whole.
+
+        Waits for the **bytes** and not for the directory entry.
+        `_write_private_json` writes a scratch file and renames it over the
+        target, so a reader never sees half a document -- but it has to see
+        it at all, and `ended` returning does not promise that: the session
+        slot is given back on one thread and the recorder is closed on
+        another.
+
+        The flake this replaces: `assertTrue(os.path.exists(...))` followed
+        by `json.loads(open(...).read())`. Reproduced with a 6 second delay
+        in front of `_write_private_json`: the old shape raises
+        `FileNotFoundError` on the sidecar, and this one passes. Both are
+        the test being early, not the code being wrong.
+        """
+        def whole():
+            try:
+                with open(path + ".json", "rb") as handle:
+                    json.loads(handle.read().decode("utf-8"))
+            except (OSError, ValueError):
+                return False
+            return True
+
+        _wait_until(whole, "the sidecar %s.json to be written whole" % path,
+                    timeout=timeout)
+        with open(path + ".json", "rb") as handle:
+            return json.loads(handle.read().decode("utf-8"))
 
     def degradations(self):
         """This port's warnings, which is where a degradation says why.
@@ -1435,9 +1500,7 @@ class TestTranscripts(ShellFrontTestCase):
         self.assertFalse(os.path.exists(path + ".json"))
 
         self.ended(front, client)
-        self.assertTrue(os.path.exists(path + ".json"))
-        with open(path + ".json", "rb") as handle:
-            facts = json.loads(handle.read().decode("utf-8"))
+        facts = self.sidecar(path)
         self.assertEqual(facts["bytes"], len(b"120x40|echo\n"))
         self.assertFalse(facts["truncated"])
         self.assertTrue(facts["ended"])
@@ -1517,8 +1580,7 @@ class TestTranscripts(ShellFrontTestCase):
             self.assertEqual(handle.read(), b"120x40|012345678")
         self.ended(front, client)
 
-        with open(path + ".json", "rb") as handle:
-            facts = json.loads(handle.read().decode("utf-8"))
+        facts = self.sidecar(path)
         self.assertTrue(facts["truncated"],
                         "a reader of a short transcript has to be told")
         self.assertEqual(facts["bytes"], 16)
