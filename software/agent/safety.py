@@ -473,6 +473,81 @@ RISK_TABLE = {
 }
 
 
+# ── The way out: the implant's own rungs ──
+#
+# A table of its own, and **not** rows of `RISK_TABLE`, for a reason that is
+# about modelling and not about tidiness.
+#
+# `classify()` turns a *command string* into a row, and these three price
+# something no command carries: a move an implant makes for itself while it
+# cannot reach this server. Nothing here could ever return one of them, and
+# a row the server can never reach would still appear in the operator's gate
+# lists and in the "reachable unattended" counts measured in docs/AGENT.md
+# -- as an action they might be asked to approve, which they never will be.
+#
+# Sharper still: the benefit term of these rows is not constant. `points` is
+# the value of what the action unlocks, and the value of a restored channel
+# grows with how long the implant has been dark -- a term this gate has no
+# way to know, because the whole case is that the implant cannot be reached.
+# `beacon.py` carries the curve, applies it to the `points` below, and
+# decides with the same inequality this module's `gate.py` uses:
+#
+#     points(hours dark) * p_success > risk_coefficient * p_detect
+#
+# It is a stdlib **copy** there, because `beacon.py` is served to a target as
+# source text and may import only the standard library -- the arrangement the
+# rescue record already has. `software/tests/test_way_out_gate.py` holds the
+# copy against this table and fails when they drift.
+#
+# The campaign model's own refusal does not change: `egress` and `tunnel`
+# stay tier 1 to it (`egress_control`, `tunnel_control`), because on the
+# server there is an operator to be asked.
+#
+# `points` is deliberately the same for all three: the outcome they unlock is
+# the same outcome -- a channel back to the team server. What orders them is
+# the probability pair, and what *moves* them is the curve. An earlier draft
+# of the design had the pair alone do the ordering, which made the inequality
+# a constant per rung and ordered nothing.
+#
+# The probabilities, and where each comes from:
+#
+#   borrow    the host's own proxy with a credential it handed over in the
+#             clear, or a captive portal answered the way the host answered
+#             it. Reversible. It leaves lines in logs a human *could* read --
+#             a proxy auth, an account that locked out -- so p_detect is low
+#             but not negligible, and `portal_answered` lowers it further:
+#             a network that redirects every browser sees credential prompts
+#             answered all day.
+#   radio     an open SSID, which leaves the tapped port altogether. Less
+#             likely to work at all (there may be no open SSID in range, and
+#             the onboard radio is the only one the power budget allows), and
+#             more visible when it does: a new association is an event on
+#             somebody's wireless controller.
+#   identity  the downstream host's MAC and IP. The likeliest of the three to
+#             restore a channel, and the loudest by far: `dot1x_seen` raises
+#             it further, because a port that authenticates is a port
+#             somebody configured and therefore watches. It is also the only
+#             one that can end the implant's connectivity for good, which is
+#             why it is one-shot in the implant rather than cheaper here.
+WAY_OUT_TABLE = {
+    "way_out_borrow": _row(
+        TIER_KNOCK, "way_out_borrow", "lifecycle",
+        "borrows the host's own way out -- its proxy with a credential the "
+        "tap saw, or a captive portal answered as the host answered it",
+        points=20, p_success=0.5, p_detect=0.35),
+    "way_out_radio": _row(
+        TIER_KNOCK, "way_out_radio", "lifecycle",
+        "associates the implant's onboard radio with an open SSID and "
+        "routes its own traffic off the tapped port",
+        points=20, p_success=0.4, p_detect=0.5),
+    "way_out_identity": _row(
+        TIER_KNOCK, "way_out_identity", "lifecycle",
+        "takes the downstream host's MAC and IP, which a sticky-MAC or "
+        "port-security violation answers by turning the port off for good",
+        points=20, p_success=0.5, p_detect=0.8),
+}
+
+
 # ── Classification rules ──
 #
 # Ordered, and the order is a correctness property rather than a style

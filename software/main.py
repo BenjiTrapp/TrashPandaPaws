@@ -102,6 +102,61 @@ def _check_agent_beacon_conflict(config) -> None:
         "c2.sliver.enabled off.")
 
 
+from software.nac_bypass import NACBypass        # noqa: E402
+
+
+def way_out_identity_poller(config):
+    """A callable that starts the NAC bypass when the beacon asks, or None.
+
+    Rung 4 of the way out is a **trigger**: the beacon decides, and this
+    process -- which owns `NACBypass` as a component -- acts. The two are
+    `raccoon-beacon.service` and `raccoon-implant.service`, so they meet
+    over one file under `c2.way_out.state_dir`.
+
+    None, and no polling at all, in the two cases where there is nothing
+    to do: `c2.way_out` off, and `nac_bypass.enabled` already true. In the
+    second case the identity was taken at boot and the rung is pre-spent,
+    which the scout reports to the beacon so the rung is never offered.
+
+    The callable answers the component it started, or None. It is called
+    from the one-second loop below and **never raises**: a failure to start
+    the bypass is recorded in the request file, where the scout and whoever
+    recovers the device can read it, and the implant carries on. An
+    exception here would cost the whole process over a file.
+    """
+    from software.c2.beacon import read_way_out_policy
+
+    policy = read_way_out_policy((config.get("c2") or {}).get("way_out"))
+    if not policy["enabled"] or not policy["state_dir"]:
+        return None
+    if (config.get("nac_bypass") or {}).get("enabled"):
+        return None
+
+    from software.scout.trigger import IdentityTrigger
+    trigger = IdentityTrigger(policy["state_dir"])
+    logger = logging.getLogger("raccoon")
+
+    def poll():
+        if trigger.pending() is None:
+            return None
+        logger.warning(
+            "The way out's rung 4 was requested by this host's own beacon: "
+            "starting nac_bypass, which forwards EAPOL and then originates "
+            "this implant's traffic as the downstream host. Once per "
+            "deployment.")
+        try:
+            bypass = NACBypass(config)
+            bypass.start()
+        except Exception as exc:
+            logger.error("nac_bypass could not be started: %s", exc)
+            trigger.taken("nac_bypass could not be started: %s" % exc)
+            return None
+        trigger.taken("nac_bypass was started by the way out's rung 4")
+        return bypass
+
+    return poll
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Raccoon Implant")
@@ -134,7 +189,6 @@ def main():
         components.append(("bridge", bridge))
 
     if config.get("nac_bypass", {}).get("enabled"):
-        from software.nac_bypass import NACBypass
         nac = NACBypass(config)
         nac.start()
         components.append(("nac_bypass", nac))
@@ -205,10 +259,21 @@ def main():
         sniff_thread = threading.Thread(target=bridge.start_capture, daemon=True, name="sniffer")
         sniff_thread.start()
 
+    # Rung 4 of the way out, if this build has it: the beacon decides in
+    # its own process and this one owns the component, so they meet over a
+    # file. None, and no polling at all, unless c2.way_out is on and the
+    # bypass is not already configured -- see `way_out_identity_poller`.
+    identity_poller = way_out_identity_poller(config)
+
     logger.info("All components started — operational")
 
     while not shutdown:
         time.sleep(1)
+        if identity_poller is not None:
+            started = identity_poller()
+            if started is not None:
+                components.append(("nac_bypass", started))
+                identity_poller = None
 
     logger.info("Shutdown initiated")
     for name, component in reversed(components):

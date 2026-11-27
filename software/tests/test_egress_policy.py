@@ -269,11 +269,23 @@ class TestABlockThatCannotBeUsed(PolicyCase):
 
 
 class TestTheVerbsAPolicyMayName(PolicyCase):
-    """Three, and a policy may order them and choose from them, not add."""
+    """Seven, and a policy may order them and choose from them, not add."""
 
-    def test_the_allowed_verbs_are_exactly_three(self):
+    def test_the_allowed_verbs_are_exactly_the_rungs(self):
+        # In cost order, which is the design's backbone. The first three
+        # are rung 2 and are what this file has always had; `credential`
+        # and `portal` are rung 2 as well and arrived with the tap's
+        # evidence; `radio` is rung 3 and `identity` is rung 4. Rung 1 --
+        # observe -- has no verb at all: what it produces is the target a
+        # louder rung aims at.
+        #
+        # Naming one is not reaching it. The loud rungs are reachable only
+        # through the arithmetic in `_way_out_allows`, which
+        # `test_way_out_gate.py` holds; this is only the set a policy may
+        # choose from.
         self.assertEqual(beacon_mod.EGRESS_VERBS,
-                         ("proxy", "rediscover", "gsocket"))
+                         ("proxy", "rediscover", "gsocket", "credential",
+                          "portal", "radio", "identity"))
 
     def test_a_rule_naming_a_verb_the_gate_refuses_is_refused_when_read(self):
         # `sleep` is the one that matters: it is a verb the beacon really
