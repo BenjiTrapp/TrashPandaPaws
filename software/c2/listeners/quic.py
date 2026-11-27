@@ -63,9 +63,23 @@ class _Partial:
         self.bytes = 0
         self.touched = time.monotonic()
 
+    def increment(self, index: int, chunk: bytes) -> int:
+        """What keeping this chunk would add to `bytes`.
+
+        A replacement is the difference and not the whole chunk, because an
+        index that arrives twice is held once. Negative when the
+        replacement is smaller, which is why a caller adds this rather than
+        comparing lengths.
+        """
+        return len(chunk) - len(self.chunks.get(index, b""))
+
     def add(self, index: int, chunk: bytes) -> None:
-        if index not in self.chunks:
-            self.bytes += len(chunk)
+        # `increment` rather than `if index not in self.chunks`: the old
+        # form counted the first chunk an index arrived with and then
+        # replaced it, so one byte followed by 1200 under the same index
+        # left 1200 bytes held and 1 accounted -- and the caps are checked
+        # against the accounting, not against the dictionary.
+        self.bytes += self.increment(index, chunk)
         self.chunks[index] = chunk
         self.touched = time.monotonic()
 
@@ -225,19 +239,18 @@ class QuicListener:
 
         with self._lock:
             partial = self._partials.get(key)
+            if self._refuses(partial, index, chunk):
+                # Full. Reclaim what has gone stale and judge again; if it
+                # is still full, this datagram is dropped rather than
+                # letting a cap be exceeded. The partial is re-read after
+                # the expiry, because the expiry may have taken it.
+                self._expire_locked(self.partial_ttl)
+                partial = self._partials.get(key)
+                if self._refuses(partial, index, chunk):
+                    logger.debug("listener: at capacity, dropping from %s",
+                                 addr)
+                    return
             if partial is None:
-                if (len(self._partials) >= self.max_partials
-                        or self._buffered_locked() >= self.max_buffered_bytes):
-                    # Full. Reclaim what has gone stale and try once more;
-                    # if it is still full, this datagram is dropped rather
-                    # than letting the caps be exceeded.
-                    self._expire_locked(self.partial_ttl)
-                    if (len(self._partials) >= self.max_partials
-                            or self._buffered_locked()
-                            >= self.max_buffered_bytes):
-                        logger.debug("listener: at capacity, dropping from %s",
-                                     addr)
-                        return
                 partial = _Partial(total)
                 self._partials[key] = partial
             partial.add(index, chunk)
@@ -273,6 +286,31 @@ class QuicListener:
 
     def _buffered_locked(self) -> int:
         return sum(p.bytes for p in self._partials.values())
+
+    def _refuses(self, partial, index: int, chunk: bytes) -> bool:
+        """Whether this datagram cannot be kept under the caps. Lock held.
+
+        Both caps, and growth as well as creation. Until 2026-11-27 the
+        byte cap was read only where a partial is *created*, so a sender
+        that kept one stream id and walked the fragment index was bounded
+        by nothing this class states: measured, 8 of 9 fragments held 9600
+        bytes against a cap of 8192, and with four partials and the same
+        cap the listener held 38400. With the shipped caps the ceiling was
+        `max_partials` times what one frame may claim, and
+        `total * frag_size <= max_frame_bytes` allows 55924 fragments of up
+        to 65499 bytes each.
+
+        Nothing is inserted before this says yes, which is what keeps a
+        refused datagram from leaving an empty partial holding a slot for
+        `partial_ttl` seconds.
+        """
+        if partial is None:
+            if len(self._partials) >= self.max_partials:
+                return True
+            needs = len(chunk)
+        else:
+            needs = partial.increment(index, chunk)
+        return self._buffered_locked() + needs > self.max_buffered_bytes
 
     def _expire_locked(self, ttl: float) -> None:
         cutoff = time.monotonic() - ttl

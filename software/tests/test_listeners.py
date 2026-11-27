@@ -1075,6 +1075,109 @@ class TestTheUdpListener(unittest.TestCase):
         self.assertEqual(listener.partial_count(), 0,
                          "expiry left partials behind")
 
+    def test_the_byte_cap_bounds_a_partial_that_keeps_growing(self):
+        """The cap is checked when a partial is *created*, not when it grows.
+
+        Found on 2026-11-27 while writing a test that reaches the byte cap
+        rather than merely observing it. `_on_datagram` guards
+        `max_buffered_bytes` inside `if partial is None:`, so a sender that
+        keeps one stream id and walks the fragment index is bounded by
+        nothing: measured against caps of four partials and 8192 bytes, the
+        listener held **38400** bytes, and with the shipped caps the
+        ceiling is `max_partials` times what one frame may claim --
+        `total * frag_size <= max_frame_bytes` allows 55924 fragments, and
+        a fragment may carry 65499 bytes.
+
+        The caps are lowered on the instance rather than the flood being
+        made huge: they are plain attributes, and a 16 MiB flood through a
+        socket would measure the kernel's buffers more than this code.
+        """
+        listener = self._listener()
+        listener.max_buffered_bytes = 8192
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(probe.close)
+
+        # One stream, eight of nine fragments: 9600 bytes against the cap,
+        # and never complete, so nothing is relayed and nothing is freed.
+        for index in range(8):
+            probe.sendto(self.HEADER.pack(0x5EED, index, 9) + b"z" * 1200,
+                         listener.address)
+        _wait_until(lambda: listener.datagrams_seen() >= 8,
+                    "the eight fragments to be read")
+
+        held = listener.buffered_bytes()
+        self.assertLessEqual(held, listener.max_buffered_bytes,
+                             "buffered bytes grew past the cap: %d" % held)
+        self.assertGreater(held, listener.max_buffered_bytes - 1200,
+                           "the flood stopped more than a fragment short of "
+                           "the cap, so the cap is not what bound it")
+
+    def test_a_fragment_resent_larger_cannot_hide_bytes_from_the_cap(self):
+        """`_Partial.add` counts the first chunk an index arrives with.
+
+        `if index not in self.chunks` adds the length once and then
+        *replaces* the chunk, so a one-byte fragment followed by a
+        1200-byte fragment under the same index leaves 1200 bytes held and
+        1 byte accounted. The cap is checked against the accounting, so
+        this is the number that decides whether the cap holds at all.
+        """
+        listener = self._listener()
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(probe.close)
+
+        probe.sendto(self.HEADER.pack(0x5EEE, 0, 9) + b"z", listener.address)
+        _wait_until(lambda: listener.datagrams_seen() >= 1,
+                    "the one-byte fragment to be read")
+        probe.sendto(self.HEADER.pack(0x5EEE, 0, 9) + b"z" * 1200,
+                     listener.address)
+        _wait_until(lambda: listener.datagrams_seen() >= 2,
+                    "the replacement fragment to be read")
+
+        self.assertGreaterEqual(
+            listener.buffered_bytes(), 1200,
+            "the listener holds 1200 bytes and accounts for %d"
+            % listener.buffered_bytes())
+
+    def test_a_datagram_refused_for_bytes_leaves_no_empty_partial(self):
+        """Two mistakes in one place: today's, and the fix's own hazard.
+
+        Today: creation is guarded by `buffered >= cap`, so with 7200 bytes
+        held against a cap of 8192 a second stream *is* created and its
+        1200 bytes take the total to 8400. The cap is passed through the
+        one path that was guarded, because the guard asked whether the
+        buffer was already full rather than whether this chunk would fill
+        it.
+
+        After the fix the datagram is refused, and the hazard moves: a
+        partial inserted before the refusal would hold one of
+        `max_partials` slots for `partial_ttl` seconds while holding no
+        bytes at all. So nothing is inserted until the caps have said yes,
+        and this test fails against either mistake.
+        """
+        listener = self._listener()
+        listener.max_buffered_bytes = 8192
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(probe.close)
+
+        # Six fragments: 7200 bytes, under the cap, so the buffer is not
+        # full -- but one more fragment would pass it.
+        for index in range(6):
+            probe.sendto(self.HEADER.pack(0x5EEF, index, 9) + b"z" * 1200,
+                         listener.address)
+        _wait_until(lambda: listener.datagrams_seen() >= 6,
+                    "the six fragments to be read")
+        self.assertEqual(listener.partial_count(), 1)
+
+        probe.sendto(self.HEADER.pack(0x5EF0, 0, 9) + b"z" * 1200,
+                     listener.address)
+        _wait_until(lambda: listener.datagrams_seen() >= 7,
+                    "the refused fragment to be read")
+
+        self.assertEqual(listener.partial_count(), 1,
+                         "a refused datagram left a partial behind")
+        self.assertLessEqual(listener.buffered_bytes(),
+                             listener.max_buffered_bytes)
+
     # ── the deliverable ──
 
     def test_a_real_beacon_completes_a_full_cycle_over_udp_alone(self):
