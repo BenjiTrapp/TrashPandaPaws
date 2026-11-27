@@ -46,6 +46,73 @@ A_TAP = {"flags": ["portal_answered"], "proxies": ["10.0.0.1:3128"],
          "tls_destinations": ["updates.example.com"], "ssids": []}
 
 
+# Every form a loopback check has to answer, and the answer. Two
+# implementations read it -- `beacon.py`'s `_way_out_is_loopback` in the
+# beacon's process and `software/scout/model.py`'s `_is_loopback` in the
+# scout's -- and a review found two mutations that survived the whole
+# suite: accepting `0.0.0.0`, which this design's anti-goal names in so
+# many words, and stripping userinfo the wrong way so that
+# `http://127.0.0.1@evil.com/` dialled `evil.com`.
+LOOPBACK_ENDPOINTS = (
+    ("http://127.0.0.1:11434", True),
+    ("http://127.0.0.1", True),
+    ("http://localhost:11434", True),
+    ("HTTP://LOCALHOST:11434", True),
+    ("http://[::1]:11434", True),
+    ("https://127.0.0.1:11434", True),
+    ("http://evil.com@127.0.0.1/", True),
+    ("http://127.0.0.1:11434/api/generate", True),
+    # 0.0.0.0 is "every interface", which is the one address the design's
+    # anti-goal names: a listener there is handed to anyone on the network
+    # the implant is hiding in.
+    ("http://0.0.0.0:11434", False),
+    ("http://[::]:11434", False),
+    # Userinfo. The host is what follows the last `@`, not what precedes
+    # the first.
+    ("http://127.0.0.1@evil.com/", False),
+    ("http://127.0.0.1:11434@evil.com/", False),
+    # Hosts that merely mention loopback.
+    ("http://127.0.0.1.evil.lan:11434", False),
+    ("http://model.lan/?at=127.0.0.1", False),
+    ("http://localhost.evil.lan", False),
+    # Forms this check deliberately does not resolve into loopback: a
+    # conservative "no" on something unusual is the safe answer here.
+    ("http://127.1:11434", False),
+    ("http://2130706433:11434", False),
+    ("http://[::ffff:127.0.0.1]:11434", False),
+    ("http://localhost.:11434", False),
+    # Not a URL this may dial at all.
+    ("ws://127.0.0.1:11434", False),
+    ("127.0.0.1:11434", False),
+    ("", False),
+    (None, False),
+)
+
+
+class TestOnlyLoopback(unittest.TestCase):
+    """The one address the model may live at, and every near miss."""
+
+    def test_each_form_is_answered_the_same_way_by_both_checkers(self):
+        from software.c2.beacon import _way_out_is_loopback
+        for endpoint, allowed in LOOPBACK_ENDPOINTS:
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(bool(model_mod._is_loopback(endpoint)),
+                                 allowed, "the scout's checker")
+                self.assertEqual(bool(_way_out_is_loopback(endpoint)),
+                                 allowed, "the beacon's checker")
+
+    def test_a_refused_endpoint_is_never_dialled(self):
+        asked = []
+        with mock.patch.object(model_mod.urllib.request, "urlopen",
+                               lambda *a, **k: asked.append(1)):
+            for endpoint, allowed in LOOPBACK_ENDPOINTS:
+                if allowed:
+                    continue
+                self.assertIsNone(model_mod.ask(
+                    dict(A_MODEL, endpoint=endpoint), A_STATE, A_TAP))
+        self.assertEqual(asked, [])
+
+
 class ValidationCase(unittest.TestCase):
     def validated(self, answer):
         return model_mod.validate(answer, EGRESS_VERBS)

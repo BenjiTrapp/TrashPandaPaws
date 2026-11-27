@@ -54,17 +54,90 @@ _SYSFS_NET = "/sys/class/net"
 # on a device that is bridging at the same time.
 _SCAN_TIMEOUT = 20
 _CAPTURE_SLICE = 15
+# How often the radio may be scanned, at the most. A scan is a command and
+# a burst of probe requests, and a device shaped like an IP phone that
+# scans for wireless networks four times a minute for ever is its own
+# detection signature. Raised to the publishing interval when `run` starts.
+_SCAN_EVERY = 300
+
+
+def _parse_scan(output: str) -> List[dict]:
+    """`iw scan`'s output as `[{"ssid", "open"}]`, in the order seen.
+
+    Parsed from the tool's own text rather than through a library: the two
+    facts needed are the name and whether the capability line says
+    Privacy, and a dependency for that would be a package to install on a
+    device nobody can reach.
+
+    **Per `BSS ` block, and not line-pairwise.** `capability:` is a fixed
+    BSS field and comes *before* `SSID:`, which is an information element
+    printed after it. A reader that emitted on the capability line took
+    each network's privacy bit from the block above it and dropped the last
+    network entirely -- and it passed a hand-written fixture in the wrong
+    order until a review read real output. So each block is collected and
+    emitted when the next one starts.
+
+    A block with no capability line is **not** guessed at: half a scan is
+    an interface that went down mid-scan, and "probably open" would spend
+    rung 3's attempt on a network that may not be joinable. A block with an
+    empty SSID is a hidden network, which `iw connect` has nothing to be
+    given. The same name on two bands is one candidate.
+    """
+    found = []
+    seen = set()
+    ssid = capability = None
+
+    def emit():
+        if ssid and capability is not None and ssid not in seen:
+            seen.add(ssid)
+            found.append({"ssid": ssid, "open": "Privacy" not in capability})
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if line.startswith("BSS "):
+            emit()
+            ssid = capability = None
+        elif stripped.startswith("capability:"):
+            capability = stripped
+        elif stripped.startswith("SSID:"):
+            ssid = stripped[5:].strip()
+    emit()
+    return found
+
+
+def _block(config, *keys) -> dict:
+    """A nested mapping out of the config, or an empty one.
+
+    `(x or {}).get(...)` guards `None` and `[]` and **not a scalar**, and
+    a review found three raises reachable from one config typo --
+    `nac_bypass: enabled` instead of `nac_bypass: {enabled: true}`. The
+    unit is `Restart=on-failure` with a burst limit, so five of those in
+    five minutes and systemd stops trying, on a device nobody can reach.
+    """
+    found = config
+    for key in keys:
+        if not isinstance(found, dict):
+            return {}
+        found = found.get(key)
+    return found if isinstance(found, dict) else {}
 
 
 class Scout(object):
     """One stuck window's evidence, and the document that carries it."""
 
     def __init__(self, config: dict, state_dir: str):
-        self.config = config or {}
+        self.config = config if isinstance(config, dict) else {}
         self.state_dir = state_dir
-        self.bridge = ((self.config.get("network") or {})
-                       .get("bridge_name") or "br0")
-        self.evidence = Evidence()
+        self.bridge = (_block(self.config, "network").get("bridge_name")
+                       or "br0")
+        # When the radio was last scanned, and what it saw. The scan is a
+        # command per publish otherwise, and a device shaped like an IP
+        # phone scanning for wireless networks four times a minute for
+        # ever is its own signature. One scan per publishing interval.
+        self._scanned_at = 0.0
+        self._ssids = []            # type: List[dict]
+        self._scan_interval = float(_SCAN_EVERY)
+        self.evidence = Evidence(own_mac=self._own_mac())
         self._running = True
         # Which of the open window's attempts have reached the trail, and
         # which window those are counted for. Keyed by the window's
@@ -95,6 +168,18 @@ class Scout(object):
         and the beacon degrades to its policy, which is the property that
         makes a dead scout harmless.
         """
+        try:
+            return self._publish_once()
+        except Exception as exc:
+            # The stance `Evidence.observe` already takes, for the same
+            # reason one step further out: this process is the only thing
+            # that could explain the rescue afterwards, and its unit stops
+            # retrying after five failures.
+            logger.warning("scout: nothing was published this round (%s); "
+                           "the beacon decides on its policy alone", exc)
+            return None
+
+    def _publish_once(self) -> Optional[dict]:
         state = handoff.read_state(self.state_dir)
         if state is None:
             return None
@@ -126,8 +211,17 @@ class Scout(object):
 
     def _tap_fields(self) -> dict:
         fields = self.evidence.as_document_fields()
-        fields["ssids"] = self._scan_ssids()
+        fields["ssids"] = self._ssids_now()
         return fields
+
+    def _ssids_now(self) -> List[dict]:
+        """What the radio saw, scanned at most once per interval."""
+        now = time.time()
+        if self._scanned_at and now - self._scanned_at < self._scan_interval:
+            return list(self._ssids)
+        self._scanned_at = now
+        self._ssids = self._scan_ssids()
+        return list(self._ssids)
 
     def _identity_spent(self) -> bool:
         """Whether rung 4 is already spent, which only this side can know.
@@ -136,7 +230,7 @@ class Scout(object):
         operator set `nac_bypass.enabled`, so the identity was taken at
         boot; or a request was made and taken in an earlier window.
         """
-        if (self.config.get("nac_bypass") or {}).get("enabled"):
+        if _block(self.config, "nac_bypass").get("enabled"):
             return True
         request = handoff.read_document_at(
             handoff.identity_path(self.state_dir), handoff.STATE_VERSION)
@@ -156,8 +250,7 @@ class Scout(object):
         return ask(model, state, tap)
 
     def _model_block(self) -> dict:
-        return (((self.config.get("c2") or {}).get("way_out") or {})
-                .get("model") or {})
+        return _block(self.config, "c2", "way_out", "model")
 
     # ── the trail ──
 
@@ -173,7 +266,8 @@ class Scout(object):
         if window != self._trailed_window:
             self._trailed_window = window
             self._trailed = 0
-        attempts = [entry for entry in (state.get("attempts") or [])
+        raw = state.get("attempts")
+        attempts = [entry for entry in (raw if isinstance(raw, list) else [])
                     if isinstance(entry, dict)]
         for entry in attempts[self._trailed:]:
             line = dict(entry)
@@ -186,7 +280,9 @@ class Scout(object):
                                "(%s); the attempt is in the beacon's log",
                                exc)
                 return
-        self._trailed = len(attempts)
+            # Counted per line that got through, so a failure does not
+            # re-append everything that already had.
+            self._trailed += 1
 
     # ── the radio ──
 
@@ -198,6 +294,20 @@ class Scout(object):
         except (OSError, subprocess.SubprocessError) as exc:
             return 1, str(exc)
         return done.returncode, (done.stdout or "") + (done.stderr or "")
+
+    def _own_mac(self) -> Optional[str]:
+        """The bridge's own address, so the implant is not read as the host.
+
+        Read once from sysfs, and None when it cannot be: a scout that
+        refused to collect because it could not find its own MAC would be
+        worse than one that occasionally reads its own traffic.
+        """
+        try:
+            with open(os.path.join(_SYSFS_NET, self.bridge,
+                                   "address")) as handle:
+                return handle.read().strip().lower() or None
+        except OSError:
+            return None
 
     def _radio_iface(self) -> Optional[str]:
         """The first wireless interface, or None.
@@ -217,13 +327,7 @@ class Scout(object):
         return None
 
     def _scan_ssids(self) -> List[dict]:
-        """What the radio can see, and which of it is open. Never raises.
-
-        Parsed from `iw scan`'s own output rather than through a library:
-        the two facts needed are the name and whether the capability line
-        says Privacy, and a dependency for that would be a package to
-        install on a device nobody can reach.
-        """
+        """What the radio can see, and which of it is open. Never raises."""
         iface = self._radio_iface()
         if iface is None:
             return []
@@ -232,18 +336,7 @@ class Scout(object):
             logger.debug("scout: the radio scan on %s failed: %s", iface,
                          output.strip()[:200])
             return []
-        found = []
-        ssid = None
-        for line in output.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("SSID: "):
-                ssid = stripped[6:].strip()
-                continue
-            if ssid and stripped.startswith("capability:"):
-                found.append({"ssid": ssid,
-                              "open": "Privacy" not in stripped})
-                ssid = None
-        return found
+        return _parse_scan(output)
 
     # ── the capture ──
 
@@ -269,16 +362,28 @@ class Scout(object):
         process on an implant that never loses its channel is one
         `read_state` per interval.
         """
+        self._scan_interval = max(float(interval), float(_SCAN_EVERY))
         while self._running:
             if self.wanted():
                 self.capture_slice()
                 self.publish_once()
+                # On a clock, and that is the cost control. Without this
+                # the loop captured continuously and scanned the radio
+                # every capture slice, for as long as the outage lasted --
+                # on a device whose whole budget is about 13 W and which
+                # is already bridging. The slice already spent part of the
+                # interval, so only the rest is waited out.
+                self._sleep(max(1.0, interval - _CAPTURE_SLICE))
             else:
                 # A window that closed is a window whose evidence is spent:
                 # the next one starts from nothing, or a failure from three
                 # outages ago would drive a decision today.
-                self.evidence = Evidence()
-                time.sleep(min(interval, 30))
+                self.evidence = Evidence(own_mac=self._own_mac())
+                self._sleep(min(interval, 30))
+
+    def _sleep(self, seconds: float) -> None:
+        """The one place this process waits, so a test can stand in for it."""
+        time.sleep(seconds)
 
 
 def main(argv=None) -> int:

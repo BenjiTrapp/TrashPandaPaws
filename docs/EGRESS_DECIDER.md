@@ -22,14 +22,26 @@ rule in it is an action the implant takes with nobody watching.
 
 ## What it may never do
 
-The decider chooses from exactly three verbs: select a discovered proxy
-(`proxy`), re-run proxy discovery (`rediscover`), or bring the gsocket carrier
-up now (`gsocket`). That set is fixed **in code**, in `beacon.py`, and your
-policy cannot widen it — configuration chooses from these three and orders
-them, and **cannot add to it**. A `raccoon.yaml` somebody pasted in from a
-ticket cannot authorise a new class of action, because there is nothing in the
-file that the gate reads. These four things are refused always, whatever the
-policy says:
+The decider chooses from a fixed set of verbs: select a discovered proxy
+(`proxy`), re-run proxy discovery (`rediscover`), bring the gsocket carrier up
+now (`gsocket`), borrow a credential the tap captured (`credential`), answer a
+captive portal as the host answered it (`portal`), associate the implant's own
+radio with an open network (`radio`), or take the downstream host's identity
+(`identity`). That set is fixed **in code**, in `beacon.py`, and your policy
+cannot widen it — configuration chooses from it and orders it, and **cannot
+add to it**. A `raccoon.yaml` somebody pasted in from a ticket cannot
+authorise a new class of action, because there is nothing in the file that the
+gate reads.
+
+The last four arrived with the way out, and they are not simply four more
+rows you may write. `radio` and `identity` are reachable only through the
+arithmetic in [`docs/WAY_OUT.md`](WAY_OUT.md), which prices them by how long
+the implant has been dark; `credential` and `portal` need the scout, so on a
+build whose `c2.way_out` is off they are **dropped when the policy is read**,
+with the reason, rather than left to spend your whole budget on refusals the
+build guarantees. Read that page before you write any of the four.
+
+These four things are refused always, whatever the policy says:
 
 - **It may never `sleep`.** This is the pointed one. `sleep` is the only verb
   the server-side model has for a stuck beacon — on the team server, where an

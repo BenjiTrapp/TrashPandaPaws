@@ -263,6 +263,48 @@ class TestAModelsEstimateIsAdvisory(GateCase):
         self.assertFalse(allowed)
 
 
+class TestTheOperatorDoesNotSetTheClock(GateCase):
+    """A long beacon interval must not hand the loud rungs the first cycle.
+
+    "A rescue that starts loud" is a named anti-goal, and the whole
+    quiet-first argument rests on `points` growing with time dark. Time
+    dark was `stuck_cycles * interval`, and `interval` has a floor but no
+    ceiling and is settable from the config *and* from the `sleep` task
+    verb -- so `beacon_interval_seconds: 86400` made two stuck cycles
+    read as 48 hours dark and the identity rung passed on the first cycle
+    the decider may act. The design's analysis of why `points` must move
+    never noticed that the operator controls the clock it moves on.
+    """
+
+    def beacon_at(self, interval, cycles):
+        beacon = self.beacon(hours_dark=0)
+        beacon.interval = interval
+        beacon._stuck_cycles = cycles
+        return beacon
+
+    def test_a_long_interval_does_not_buy_the_identity_rung(self):
+        for interval in (300, 3600, 86400, 10 ** 7):
+            with self.subTest(interval=interval):
+                beacon = self.beacon_at(interval, 2)
+                self.assertFalse(beacon._way_out_allows("identity")[0],
+                                 "two stuck cycles reached the irreversible "
+                                 "rung at interval %d" % interval)
+
+    def test_the_curve_is_bounded_by_cycles_as_well_as_by_hours(self):
+        # Whichever is the slower clock. An hour of wall time is an hour,
+        # and a cycle is at most one step of the curve -- so the ladder
+        # needs both time *and* evidence of repeated failure.
+        beacon = self.beacon_at(86400, 2)
+        self.assertEqual(beacon._way_out_points(), 30)
+        self.assertEqual(self.beacon_at(300, 2)._way_out_points(), 20)
+
+    def test_a_short_interval_still_reaches_the_loud_rungs(self):
+        # The other direction: a 60 s interval must not make the ladder
+        # unreachable. Nine hours dark is 540 cycles either way.
+        beacon = self.beacon_at(60, 9 * 60)
+        self.assertTrue(beacon._way_out_allows("identity")[0])
+
+
 class TestWithNoScoutNothingChanges(GateCase):
     """Today's behaviour exactly, and the loud rungs out of reach."""
 
@@ -281,6 +323,52 @@ class TestWithNoScoutNothingChanges(GateCase):
                                                 way_out=self.OFF)
                 self.assertFalse(allowed)
                 self.assertIn("c2.way_out", numbers["why"])
+
+    def test_a_borrow_verb_that_needs_the_scout_is_dropped(self):
+        # `credential` and `portal` are rung 2, so the arithmetic lets
+        # them through on a build with no scout -- and then every attempt
+        # is a refusal the build *guarantees*, which spends the whole
+        # budget and suppresses the gsocket latch with it. Dropped when
+        # the policy is read, the way a proxy verb is dropped on a build
+        # whose `c2.proxy.mode` is none, and for the same reason.
+        for verb in ("credential", "portal"):
+            with self.subTest(verb=verb):
+                beacon = self.beacon(
+                    hours_dark=5, way_out=self.OFF,
+                    policy=self.policy([{"when": {"https": ["not_attempted"]},
+                                         "try": verb}]))
+                self.assertEqual(beacon._egress_rules, [])
+                self.assertTrue(
+                    any(verb in message and "c2.way_out" in message
+                        for message in self.logged.warnings),
+                    "nothing said why rule 1 will never fire: %r"
+                    % (self.logged.warnings,))
+
+    def test_a_dropped_borrow_verb_does_not_renumber_the_rest(self):
+        beacon = self.beacon(
+            hours_dark=5, way_out=self.OFF,
+            policy=self.policy([
+                {"when": {"https": ["not_attempted"]}, "try": "portal"},
+                {"when": {"https": ["not_attempted"]}, "try": "gsocket"}]))
+        self.assertEqual([number for number, _ in beacon._egress_rules], [2])
+
+    def test_a_dropped_verb_costs_no_budget(self):
+        beacon = self.beacon(
+            hours_dark=5, way_out=self.OFF,
+            policy=self.policy([{"when": {"https": ["not_attempted"]},
+                                 "try": "credential"}]))
+        asked = self.record_attempts(beacon)
+        for _ in range(5):
+            beacon._egress_act()
+        self.assertEqual(asked, [])
+        self.assertEqual(beacon._egress_spent, 0)
+
+    def test_with_a_scout_those_verbs_are_kept(self):
+        beacon = self.beacon(
+            hours_dark=5,
+            policy=self.policy([{"when": {"https": ["not_attempted"]},
+                                 "try": "portal"}]))
+        self.assertEqual([number for number, _ in beacon._egress_rules], [1])
 
     def test_a_policy_rule_naming_a_loud_verb_never_fires(self):
         beacon = self.beacon(

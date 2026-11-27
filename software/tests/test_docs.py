@@ -3298,16 +3298,37 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
                     return hours
             return None
 
-        for verb, flags, what in (
-                ("proxy", (), "the borrow rung's crossing"),
-                ("radio", (), "the radio rung's crossing"),
-                ("identity", (), "the identity rung's crossing"),
-                ("identity", ("dot1x_seen",),
-                 "where dot1x_seen moves the identity rung")):
-            hours = crosses(verb, flags)
-            with self.subTest(verb=verb, flags=flags):
-                self.assertIsNotNone(hours, what)
-                self.present("%d hour" % hours, what)
+        # Parsed out of the ladder's own table row, and not searched for
+        # anywhere on the page: `"1 hour" in "11 hours"` is True, so a
+        # substring pin let **every** hour on that table be wrong while
+        # the page told the reader a test was holding them. A review
+        # rewrote the table to 11/15/17/19 and nothing went red.
+        import re
+
+        rows = {}
+        for line in self.guide.splitlines():
+            found = re.match(
+                r"\|\s*(borrow|radio|identity)\s*\|[^|]*\|[^|]*\|(.*)\|",
+                line.strip())
+            if found:
+                rows[found.group(1)] = found.group(2)
+        self.assertEqual(sorted(rows), ["borrow", "identity", "radio"],
+                         "the ladder's table has no row per rung: %r" % rows)
+
+        def stated(row, nth=0):
+            numbers = re.findall(r"\*\*(\d+) hours?\*\*", rows[row])
+            self.assertGreater(len(numbers), nth,
+                               "the %r row states no %dth hour: %r"
+                               % (row, nth + 1, rows[row]))
+            return int(numbers[nth])
+
+        self.assertEqual(stated("borrow"), crosses("proxy"))
+        self.assertEqual(stated("radio"), crosses("radio"))
+        self.assertEqual(stated("identity"), crosses("identity"))
+        self.assertEqual(stated("identity", 1),
+                         crosses("identity", ("dot1x_seen",)))
+        self.assertEqual(stated("borrow", 1),
+                         crosses("proxy", ("portal_answered",)))
 
     def test_the_shipped_numbers_are_on_the_page_with_their_meaning(self):
         # Each number with the words that say what it is, not as a bare
@@ -3350,6 +3371,59 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
 
     def test_it_says_which_build_this_ships_in(self):
         self.present("drop-box only", "that a generated build has none")
+
+    def test_it_counts_the_files_this_puts_on_the_implants_disk(self):
+        # Five, plus a DHCP lease. The design and this page both said
+        # "two" and `beacon.py` said "the one new artefact", which
+        # understates the forensic footprint of a device built to look
+        # like an IP phone -- the one number an operator deciding whether
+        # to enable this needs to be right.
+        from software.scout import handoff
+        for name in (handoff.STATE_NAME, handoff.DOCUMENT_NAME,
+                     handoff.TRAIL_NAME, handoff.BORROW_NAME,
+                     handoff.IDENTITY_NAME, "way_out_radio.lease"):
+            with self.subTest(name=name):
+                self.assertIn(name, self.guide,
+                              "the page does not name %r, which this "
+                              "feature writes to the implant's disk" % name)
+
+    def test_it_states_what_enabling_it_costs_the_old_verbs(self):
+        for phrase, what in (
+                ("costs the borrow rung its first hour",
+                 "that switching it on delays the three verbs the decider "
+                 "already had"),
+                ("twelve cycles",
+                 "what that hour is in cycles at the shipped interval")):
+            with self.subTest(phrase=phrase):
+                self.present(phrase, what)
+
+    def test_it_does_not_claim_the_association_is_time_boxed(self):
+        # The design said "a time-boxed association" and this page
+        # quietly redefined it as "every command has a deadline".
+        # Nothing ever disassociates, so the claim is withdrawn and the
+        # limit is stated instead.
+        # Said *about* the design's withdrawn claim is fine; said as this
+        # page's own claim is not. So: it may not appear in the bounds
+        # list, which is where the reader forms the belief.
+        bounds = self.guide.split("### 3. Its own radio", 1)[1] \
+            .split("### 4.", 1)[0]
+        self.assertNotIn("**Time-boxed.**", bounds)
+        self.assertIn("not** a time box on the association", bounds)
+        self.present("until the device is restarted",
+                     "that the association is not ended by anything here")
+
+    def test_it_says_the_taps_evidence_is_adversary_writable(self):
+        # The design treated "what the host proves works" as ground
+        # truth throughout. It is unauthenticated frames, and an
+        # operator deciding whether to enable this has to be told.
+        for phrase, what in (
+                ("anybody on the tapped segment",
+                 "who can write the evidence"),
+                ("407", "the precondition on a borrowable credential"),
+                ("named rather than addressed",
+                 "the residual risk that is left")):
+            with self.subTest(phrase=phrase):
+                self.present(phrase, what)
 
     # ── the shipped block ──
 
@@ -3407,6 +3481,22 @@ class TestTheDeadFlagsAreNoLongerDocumentedAsDead(unittest.TestCase):
                 self.assertNotIn(phrase.lower(), self.decider.lower(),
                                  "docs/EGRESS_DECIDER.md still says %r"
                                  % phrase)
+
+    def test_the_decider_page_does_not_still_say_three_verbs(self):
+        # `EGRESS_VERBS` has seven, and `read_egress_policy` accepts every
+        # one of them on every build. A page that says three sends an
+        # operator looking for the four it refuses, and they are not
+        # refused -- two of them are *dropped with a reason* on a build
+        # with no scout, which is a different thing to be told.
+        from software.c2 import beacon as beacon_mod
+        flat = self.decider.lower()
+        self.assertNotIn("exactly three verbs", flat)
+        self.assertNotIn("the three verbs", flat)
+        for verb in beacon_mod.EGRESS_VERBS:
+            with self.subTest(verb=verb):
+                self.assertIn("`%s`" % verb, self.decider,
+                              "docs/EGRESS_DECIDER.md does not name the %r "
+                              "verb a policy may write" % verb)
 
     def test_the_decider_page_says_what_sets_them_now(self):
         flat = self.decider.lower()

@@ -67,6 +67,7 @@ IDENTITY_NAME = "way_out_identity.json"
 # document is a decision made on a misunderstanding.
 STATE_VERSION = 1
 DOCUMENT_VERSION = 1
+BORROW_VERSION = 1
 
 _PRIVATE_FILE = 0o600
 _PRIVATE_DIR = 0o700
@@ -123,13 +124,13 @@ def read_document_at(path: str, version: int) -> Optional[dict]:
 
 
 def read_borrow(state_dir: str) -> Optional[dict]:
-    """The private half: the credentials and the portal request."""
-    try:
-        with open(borrow_path(state_dir), "rb") as handle:
-            loaded = json.loads(handle.read().decode("utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
-        return None
-    return loaded if isinstance(loaded, dict) else None
+    """The private half: the credentials and the portal request.
+
+    Versioned like the other two, and for the sharpest form of the same
+    reason: this is the file that selects a *credential*, and the two
+    halves are upgraded by two different installs.
+    """
+    return read_document_at(borrow_path(state_dir), BORROW_VERSION)
 
 
 # ── writing ──
@@ -140,7 +141,8 @@ def write_document(state_dir: str, document: dict) -> None:
 
 
 def write_borrow(state_dir: str, fields: dict) -> None:
-    write_private_json(borrow_path(state_dir), fields)
+    write_private_json(borrow_path(state_dir),
+                       dict(fields, version=BORROW_VERSION))
 
 
 def append_trail(state_dir: str, line: dict) -> None:
@@ -153,7 +155,12 @@ def append_trail(state_dir: str, line: dict) -> None:
     """
     _ensure_dir(state_dir)
     path = trail_path(state_dir)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    # `O_NOFOLLOW`, for the reason `tunnel/shell.py` carries one: a link
+    # planted at this name would have the root scout appending the trail
+    # to whatever it pointed at. `O_APPEND` and 0600 at creation, so there
+    # is no instant in which the file is readable by anyone else.
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND
+             | getattr(os, "O_NOFOLLOW", 0))
     descriptor = os.open(path, flags, _PRIVATE_FILE)
     try:
         stream = os.fdopen(descriptor, "ab")
@@ -170,6 +177,10 @@ def write_private_json(path: str, document: dict) -> None:
     directory, name = os.path.split(path)
     _ensure_dir(directory)
     data = (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+    # Written to a scratch file and renamed, so a reader never sees half a
+    # document -- and `mkstemp` creates it 0600 and refuses an existing
+    # name, so a link planted at the *target* is replaced by the rename
+    # rather than written through.
     descriptor, scratch = tempfile.mkstemp(prefix="." + name + ".",
                                            dir=directory)
     try:
@@ -196,15 +207,41 @@ def remove(path: str) -> None:
 
 
 def _ensure_dir(directory: str) -> None:
+    """The handoff's directory, 0700 and not a symlink. Raises if it cannot.
+
+    **Tightened even when it already exists**, and that is the fix for a
+    real hole: this used to return early on a pre-existing directory, so
+    an operator who pointed `state_dir` at `/var/tmp/raccoon` -- or a
+    local process that got there first -- left a world-writable directory
+    holding 0600 files, and anybody who could write it could replace them.
+    `/tmp` is refused by name in the config reader; every other path is
+    refused here by mode.
+
+    `lstat` and not `isdir`, because a symlink to a directory answers
+    `isdir` with True: a link planted at this name would have the root
+    scout writing the handoff wherever the link pointed.
+    """
     if not directory:
         raise ValueError("a handoff file needs a directory to live in")
-    if os.path.isdir(directory):
+    try:
+        found = os.lstat(directory)
+    except OSError:
+        os.makedirs(directory, mode=_PRIVATE_DIR, exist_ok=True)
+        # `makedirs`'s mode applies to the leaf alone and is masked by the
+        # umask, so the mode is set explicitly: a parent left at the
+        # process umask would be a listable directory holding 0600 files.
+        os.chmod(directory, _PRIVATE_DIR)
         return
-    os.makedirs(directory, mode=_PRIVATE_DIR, exist_ok=True)
-    # `makedirs`'s mode applies to the leaf alone and is masked by the
-    # umask, so the mode is set explicitly: a parent left at the process
-    # umask would be a listable directory holding 0600 files.
-    os.chmod(directory, _PRIVATE_DIR)
+    if stat.S_ISLNK(found.st_mode):
+        raise ValueError(
+            "the handoff directory %s is a symbolic link, and following it "
+            "would write this implant's state wherever somebody else chose"
+            % directory)
+    if not stat.S_ISDIR(found.st_mode):
+        raise ValueError("the handoff directory %s is not a directory"
+                         % directory)
+    if stat.S_IMODE(found.st_mode) != _PRIVATE_DIR:
+        os.chmod(directory, _PRIVATE_DIR)
 
 
 def is_private(path: str) -> bool:

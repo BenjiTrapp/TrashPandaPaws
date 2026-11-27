@@ -211,17 +211,32 @@ class TestWhatItPublishes(ScoutCase):
 class TestTheCredentialsStayOutOfTheDocument(ScoutCase):
     AUTH = ("Proxy-Authorization: Basic Y29ycFxhbGljZTpzM2NyZXQ=")
 
-    def connect(self):
+    def connect(self, auth=True):
         """A CONNECT through the host's proxy, carrying a Basic credential."""
-        head = ("CONNECT a:443 HTTP/1.1\r\nHost: proxy.lan:3128\r\n"
-                + self.AUTH + "\r\n\r\n").encode()
+        head = "CONNECT a:443 HTTP/1.1\r\nHost: proxy.lan:3128\r\n"
+        if auth:
+            head += self.AUTH + "\r\n"
         return (Ether(src="aa:bb:cc:dd:ee:ff", dst="11:22:33:44:55:66")
                 / IP(src="10.0.0.50", dst="10.0.0.1")
-                / TCP(sport=44444, dport=3128) / Raw(head))
+                / TCP(sport=44444, dport=3128) / Raw((head + "\r\n").encode()))
+
+    def refused(self):
+        """The 407 that makes the credential on the next CONNECT real."""
+        head = ("HTTP/1.1 407 Proxy Authentication Required\r\n"
+                "Proxy-Authenticate: Basic realm=\"corp\"\r\n\r\n")
+        return (Ether(src="11:22:33:44:55:66", dst="aa:bb:cc:dd:ee:ff")
+                / IP(src="10.0.0.1", dst="10.0.0.50")
+                / TCP(sport=3128, dport=44444) / Raw(head.encode()))
+
+    def borrowable(self, scout):
+        """The whole sequence a borrowable credential needs on the wire."""
+        scout.observe(self.connect(auth=False))
+        scout.observe(self.refused())
+        scout.observe(self.connect())
 
     def test_they_go_to_a_file_of_their_own_and_not_to_the_handoff(self):
         scout = self.scout()
-        scout.observe(self.connect())
+        self.borrowable(scout)
         self.stuck()
         published = scout.publish_once()
 
@@ -232,7 +247,7 @@ class TestTheCredentialsStayOutOfTheDocument(ScoutCase):
 
     def test_that_file_is_private(self):
         scout = self.scout()
-        scout.observe(self.connect())
+        self.borrowable(scout)
         self.stuck()
         scout.publish_once()
         self.assertEqual(
@@ -339,6 +354,40 @@ class TestNothingItIsAskedToDoMayRaise(ScoutCase):
         self.stuck()
         self.assertEqual(scout.publish_once()["tap"]["flags"], [])
 
+    def test_a_config_that_is_not_what_it_should_be_costs_one_warning(self):
+        # The unit is `Restart=on-failure` with a burst limit, so five
+        # crashes in five minutes and systemd stops trying -- on a device
+        # nobody can reach. A review found three raises reachable from a
+        # single config typo: `(x or {}).get(...)` guards None and [] and
+        # not a scalar.
+        for config in ({"nac_bypass": "enabled"},
+                       {"network": "br0"},
+                       {"c2": "way_out"},
+                       {"nac_bypass": 17, "network": []}):
+            with self.subTest(config=config):
+                broken = _config()
+                broken.update(config)
+                broken.setdefault("c2", {})
+                if isinstance(broken["c2"], dict):
+                    broken["c2"]["way_out"] = {"enabled": True,
+                                               "state_dir": self.root}
+                scout = Scout(broken, self.root)
+                self.addCleanup(scout.stop)
+                with mock.patch.object(scout, "_scan_ssids", lambda: []):
+                    self.stuck()
+                    scout.publish_once()       # raises nothing
+
+    def test_a_state_file_whose_fields_are_the_wrong_shape_is_survived(self):
+        scout = self.scout()
+        for evidence in ("legs", 17, {"legs": []}, {"legs": "https"},
+                         {"flags": "dot1x_seen"}):
+            with self.subTest(evidence=evidence):
+                handoff.write_private_json(handoff.state_path(self.root), {
+                    "version": handoff.STATE_VERSION, "opened": time.time(),
+                    "stuck_cycles": 2, "hours_dark": 0.2,
+                    "evidence": evidence, "attempts": "not a list"})
+                scout.publish_once()           # raises nothing
+
     def test_a_trail_that_cannot_be_appended_costs_nothing_else(self):
         scout = self.scout()
         self.stuck(attempts=[{"verb": "gsocket"}])
@@ -348,18 +397,149 @@ class TestNothingItIsAskedToDoMayRaise(ScoutCase):
         self.assertIsNotNone(published, "the document was lost with the "
                                         "trail line")
 
+    def test_a_half_written_trail_does_not_repeat_what_got_through(self):
+        # The counter advances per line that landed, not per round: a
+        # failure on the second of three used to reset nothing, so the
+        # next publish re-appended the first.
+        scout = self.scout()
+        self.stuck(attempts=[{"verb": "gsocket"}, {"verb": "proxy"}])
+        calls = {"n": 0}
+        real = handoff.append_trail
+
+        def flaky(state_dir, line):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("full")
+            return real(state_dir, line)
+
+        with mock.patch.object(handoff, "append_trail", flaky):
+            scout.publish_once()
+        scout.publish_once()
+
+        lines = [json.loads(line) for line
+                 in Path(handoff.trail_path(self.root)).read_text()
+                 .splitlines()]
+        self.assertEqual([entry["verb"] for entry in lines],
+                         ["gsocket", "proxy"])
+
+    def test_anything_that_raises_in_a_publish_costs_only_that_round(self):
+        # The outer guard, which the config and state guards inside it
+        # should make unreachable -- and "should" is why it is here: this
+        # process is the only thing that could explain the rescue
+        # afterwards, and its unit stops retrying after five failures.
+        scout = self.scout()
+        self.stuck()
+        with mock.patch.object(handoff, "write_document",
+                               side_effect=RuntimeError("something new")):
+            self.assertIsNone(scout.publish_once())
+        # And the next round is unaffected.
+        self.assertIsNotNone(scout.publish_once())
+
+    def test_the_implants_own_traffic_is_not_read_as_the_hosts(self):
+        # The scout sniffs `br0`, which carries the beacon's own queries
+        # and its own TLS. Read from sysfs at construction, so the
+        # document and the model's prompt cannot describe the implant to
+        # itself.
+        sysfs = tempfile.mkdtemp(prefix="raccoon-sysfs-")
+        self.addCleanup(shutil.rmtree, sysfs, ignore_errors=True)
+        os.makedirs(os.path.join(sysfs, "br0"))
+        with open(os.path.join(sysfs, "br0", "address"), "w") as handle:
+            handle.write("AA:BB:CC:DD:EE:FF\n")
+
+        from software.scout import scout as scout_mod
+        with mock.patch.object(scout_mod, "_SYSFS_NET", sysfs):
+            scout = self.scout()
+        self.assertEqual(scout.evidence.own_mac, "aa:bb:cc:dd:ee:ff")
+
+        head = b"CONNECT a:443 HTTP/1.1\r\nHost: proxy.lan:3128\r\n\r\n"
+        scout.observe(Ether(src="aa:bb:cc:dd:ee:ff",
+                            dst="11:22:33:44:55:66")
+                      / IP(src="10.0.0.50", dst="10.0.0.1")
+                      / TCP(sport=44444, dport=3128) / Raw(head))
+        self.stuck()
+        self.assertIsNone(scout.publish_once()["tap"]["host_mac"])
+
+
+class TestWhatItCostsWhileTheImplantIsDark(ScoutCase):
+    """It publishes on a clock, and scans far less often than it publishes.
+
+    A review found the interval unimplemented: `run` slept only on the
+    healthy branch, so a stuck implant captured continuously and ran
+    `iw scan` every ~15 seconds for as long as the outage lasted. On a
+    13 W device whose power budget this design spends four paragraphs
+    worrying about -- and on a box shaped like an IP phone, where four
+    wireless scans a minute for ever is its own signature.
+    """
+
+    def test_it_sleeps_between_publishes_while_the_beacon_is_stuck(self):
+        scout = self.scout()
+        self.stuck()
+        slept = []
+        captured = []
+        with mock.patch.object(scout, "capture_slice",
+                               lambda *a, **k: captured.append(1)), \
+                mock.patch.object(scout, "_sleep",
+                                  lambda seconds: slept.append(seconds)
+                                  or scout.stop()):
+            scout.run(interval=450.0)
+        self.assertEqual(len(captured), 1)
+        self.assertTrue(slept, "it published and went straight round again")
+        self.assertGreater(slept[0], 0)
+        self.assertLessEqual(slept[0], 450.0)
+
+    def test_the_radio_is_scanned_once_per_interval_and_not_per_publish(self):
+        scout = self.scout(ssids=None)
+        self.stuck()
+        scanned = []
+        with mock.patch.object(scout, "_radio_iface", lambda: "wlan0"), \
+                mock.patch.object(
+                    scout, "_run",
+                    lambda *a, **k: scanned.append(1) or (0, "")), \
+                mock.patch.object(scout, "_scan_ssids",
+                                  Scout._scan_ssids.__get__(scout)):
+            for _ in range(5):
+                scout.publish_once()
+        self.assertEqual(len(scanned), 1,
+                         "the radio was scanned once per publish: %d scans "
+                         "for five publishes" % len(scanned))
+
+    def test_a_cached_scan_is_still_published(self):
+        scout = self.scout(ssids=[{"ssid": "GuestWifi", "open": True}])
+        self.stuck()
+        first = scout.publish_once()["tap"]["ssids"]
+        second = scout.publish_once()["tap"]["ssids"]
+        self.assertEqual(first, second)
+        self.assertEqual(first, [{"ssid": "GuestWifi", "open": True}])
+
 
 class TestTheRadioScan(ScoutCase):
+    # Verbatim `iw dev wlan0 scan`, and the order is the whole point:
+    # `capability:` is a fixed BSS field and comes **before** `SSID:`,
+    # which is an information element. A fixture with SSID first -- which
+    # is what this file shipped at first -- certifies a parser that reads
+    # each network's capability off the *next* network's block and drops
+    # the last SSID entirely. A review caught it; this is real output.
     OUTPUT = """BSS 00:11:22:33:44:55(on wlan0)
+\tTSF: 1 usec (0d, 00:00:01)
+\tfreq: 2412
+\tbeacon interval: 100 TUs
+\tcapability: ESS ShortSlotTime (0x0401)
+\tsignal: -42.00 dBm
+\tlast seen: 120 ms ago
 \tSSID: GuestWifi
-\tcapability: ESS (0x0401)
+\tSupported rates: 1.0* 2.0* 5.5* 11.0*
 BSS 66:77:88:99:aa:bb(on wlan0)
+\tfreq: 2437
+\tcapability: ESS Privacy ShortSlotTime (0x0411)
+\tsignal: -55.00 dBm
 \tSSID: CorpSecure
-\tcapability: ESS Privacy (0x0411)
 \tRSN:\t * Version: 1
+\t\t * Group cipher: CCMP
 BSS cc:dd:ee:ff:00:11(on wlan0)
-\tSSID: Visitors
+\tfreq: 5180
 \tcapability: ESS (0x0401)
+\tsignal: -71.00 dBm
+\tSSID: Visitors
 """
 
     def test_it_reads_which_networks_are_open(self):
@@ -374,6 +554,46 @@ BSS cc:dd:ee:ff:00:11(on wlan0)
                 [{"ssid": "GuestWifi", "open": True},
                  {"ssid": "CorpSecure", "open": False},
                  {"ssid": "Visitors", "open": True}])
+
+    def test_a_hidden_network_is_not_offered_as_an_ssid(self):
+        # `SSID: ` with nothing after it is a hidden network. There is
+        # nothing for `iw connect` to be given, so it is not a candidate.
+        hidden = ("BSS 00:11:22:33:44:55(on wlan0)\n"
+                  "\tcapability: ESS (0x0401)\n\tSSID: \n")
+        scout = self.scout(ssids=None)
+        with mock.patch.object(scout, "_radio_iface", lambda: "wlan0"), \
+                mock.patch.object(scout, "_run",
+                                  lambda *a, **k: (0, hidden)), \
+                mock.patch.object(scout, "_scan_ssids",
+                                  Scout._scan_ssids.__get__(scout)):
+            self.assertEqual(scout._scan_ssids(), [])
+
+    def test_a_block_with_no_capability_line_is_not_guessed_at(self):
+        # Truncated output -- the scan was cut short. "Probably open" is
+        # not a thing this may answer: rung 3 would spend an attempt on it.
+        partial = ("BSS 00:11:22:33:44:55(on wlan0)\n"
+                   "\tSSID: GuestWifi\n")
+        scout = self.scout(ssids=None)
+        with mock.patch.object(scout, "_radio_iface", lambda: "wlan0"), \
+                mock.patch.object(scout, "_run",
+                                  lambda *a, **k: (0, partial)), \
+                mock.patch.object(scout, "_scan_ssids",
+                                  Scout._scan_ssids.__get__(scout)):
+            self.assertEqual(scout._scan_ssids(), [])
+
+    def test_the_same_network_on_two_bands_is_offered_once(self):
+        twice = ("BSS 00:11:22:33:44:55(on wlan0)\n"
+                 "\tcapability: ESS (0x0401)\n\tSSID: GuestWifi\n"
+                 "BSS 00:11:22:33:44:66(on wlan0)\n"
+                 "\tcapability: ESS (0x0401)\n\tSSID: GuestWifi\n")
+        scout = self.scout(ssids=None)
+        with mock.patch.object(scout, "_radio_iface", lambda: "wlan0"), \
+                mock.patch.object(scout, "_run",
+                                  lambda *a, **k: (0, twice)), \
+                mock.patch.object(scout, "_scan_ssids",
+                                  Scout._scan_ssids.__get__(scout)):
+            self.assertEqual(scout._scan_ssids(),
+                             [{"ssid": "GuestWifi", "open": True}])
 
     def test_with_no_radio_it_scans_nothing(self):
         scout = self.scout(ssids=None)

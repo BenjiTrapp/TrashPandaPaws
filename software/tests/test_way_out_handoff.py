@@ -206,6 +206,150 @@ class TestTheBeaconsStateFile(WayOutCase):
                 self.assertIsNone(beacon._way_out_document())
 
 
+class TestTheLoopItself(_decider.DeciderCase):
+    """The seam: a stuck cycle through the real `_beacon_loop`.
+
+    Every other test here reaches into the beacon and turns the crank by
+    hand, which is how this whole feature shipped **inert** once: the two
+    methods that write the state file and absorb the tap's flags were
+    defined, tested, documented -- and called from nowhere. A review
+    caught it, and this class is what makes that impossible to repeat.
+    So: no direct calls below. The loop does it or it does not happen.
+    """
+
+    POLICY = {"enabled": True, "budget": 3,
+              "rules": [{"when": {"https": ["not_attempted"]},
+                         "try": "rediscover"}]}
+
+    def setUp(self):
+        super().setUp()
+        self.state = tempfile.mkdtemp(prefix="raccoon-way-out-loop-")
+        self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
+
+    def beacon(self, policy=None):
+        return self.a_beacon(
+            policy=policy,
+            way_out=read_way_out_policy({"enabled": True,
+                                         "state_dir": self.state}))
+
+    def test_a_stuck_cycle_writes_the_state_file_the_scout_reads(self):
+        beacon = self.beacon()
+        self.run_cycles(beacon, 2)
+
+        state = handoff.read_state(self.state)
+        self.assertIsNotNone(state, "no stuck window reached the scout: the "
+                                    "loop never published one")
+        self.assertEqual(state["stuck_cycles"], 2)
+        self.assertEqual(state["evidence"], beacon._egress_state())
+
+    def test_a_delivering_leg_removes_it_through_the_loop(self):
+        beacon = self.beacon()
+        self.run_cycles(beacon, 2)
+        self.assertIsNotNone(handoff.read_state(self.state))
+
+        # An upstream leg delivering is the one event that closes a window.
+        beacon._leg_recovered()
+        self.assertIsNone(handoff.read_state(self.state))
+
+    def test_the_taps_flags_reach_the_record_through_the_loop(self):
+        beacon = self.beacon()
+        handoff.write_document(self.state, {
+            "version": handoff.DOCUMENT_VERSION, "published": time.time(),
+            "evidence": {}, "tap": {"flags": ["dot1x_seen"]},
+            "identity_pre_spent": False, "recommendation": None})
+
+        self.run_cycles(beacon, 2)
+        self.assertTrue(beacon._rescue_flags & dns_rescue.FLAG_DOT1X_SEEN,
+                        "the scout saw 802.1X on the port and the record "
+                        "does not say so")
+        self.assertIn("dot1x_seen",
+                      handoff.read_state(self.state)["evidence"]["flags"])
+
+    def test_an_attempt_made_by_the_loop_reaches_the_state_file(self):
+        # Thirteen cycles and not two, and that is the arithmetic rather
+        # than the harness: switching `c2.way_out` on puts the three verbs
+        # the decider has always had behind the curve as well, and the
+        # borrow rung crosses at one hour dark -- twelve cycles at the
+        # shipped 300 s interval. `TestTheCostOfSwitchingItOn` below holds
+        # that cost on purpose; here it is just the reason for the count.
+        beacon = self.beacon(policy=self.POLICY)
+        self.record_attempts(beacon, answer="Proxy discovery re-run: 0")
+        beacon._stuck_cycles = 11
+        self.run_cycles(beacon, 1)
+
+        attempts = handoff.read_state(self.state)["attempts"]
+        self.assertEqual([entry["verb"] for entry in attempts],
+                         ["rediscover"])
+        self.assertEqual(attempts[0]["chose"], "policy")
+        self.assertIn("gate", attempts[0])
+
+    def test_with_the_feature_off_the_loop_writes_nothing(self):
+        beacon = self.a_beacon(
+            policy=self.POLICY,
+            way_out=read_way_out_policy({"enabled": False,
+                                         "state_dir": self.state}))
+        self.record_attempts(beacon)
+        self.run_cycles(beacon, 2)
+        self.assertEqual(os.listdir(self.state), [])
+
+
+class TestTheCostOfSwitchingItOn(_decider.DeciderCase):
+    """Enabling the way out costs the borrow rung its first hour.
+
+    With `c2.way_out` off, the three verbs the decider has always had fire
+    on the first cycle the decider may act. With it on, they are priced
+    like everything else, and the borrow rung's crossing is one hour dark
+    -- twelve cycles at the shipped interval. That is a real cost to an
+    operator who switches this on, it is the same shape as the decider's
+    own documented one-cycle cost, and the tap can buy it back: a portal
+    the host got past lowers the rung's detection probability enough to
+    cross at hour zero.
+    """
+
+    POLICY = {"enabled": True, "budget": 3,
+              "rules": [{"when": {"https": ["not_attempted"]},
+                         "try": "rediscover"}]}
+
+    def setUp(self):
+        super().setUp()
+        self.state = tempfile.mkdtemp(prefix="raccoon-way-out-cost-")
+        self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
+
+    def attempts(self, enabled, cycles, flags=()):
+        """What the loop asked `egress` to do on the `cycles`th stuck one.
+
+        `flags` arrive the way they really arrive -- through the scout's
+        document -- and not by writing `_rescue_flags`, which
+        `_start_cycle` clears at the top of every cycle. A test that set
+        the field directly would be testing nothing the loop does.
+        """
+        beacon = self.a_beacon(
+            policy=self.POLICY,
+            way_out=read_way_out_policy({"enabled": enabled,
+                                         "state_dir": self.state}))
+        if flags:
+            handoff.write_document(self.state, {
+                "version": handoff.DOCUMENT_VERSION,
+                "published": time.time(), "evidence": {},
+                "tap": {"flags": list(flags)},
+                "identity_pre_spent": False, "recommendation": None})
+        asked = self.record_attempts(beacon)
+        beacon._stuck_cycles = cycles - 1
+        self.run_cycles(beacon, 1)
+        return asked
+
+    def test_with_it_off_the_old_verbs_fire_on_the_first_acting_cycle(self):
+        self.assertEqual(self.attempts(False, 2), ["rediscover"])
+
+    def test_with_it_on_they_wait_for_the_curve(self):
+        self.assertEqual(self.attempts(True, 2), [])
+        self.assertEqual(self.attempts(True, 12), ["rediscover"])
+
+    def test_a_portal_the_host_got_past_buys_that_hour_back(self):
+        self.assertEqual(self.attempts(True, 2, flags=["portal_answered"]),
+                         ["rediscover"])
+
+
 # ── the document the beacon reads ──
 
 
@@ -301,6 +445,52 @@ class TestWhoDecides(WayOutCase):
                 self.publish(evidence=beacon._egress_state(),
                              recommendation=bad)
                 self.assertEqual(beacon._egress_decide(), "rediscover")
+
+    def test_a_recommendations_argument_reaches_the_verb(self):
+        # The design's central justification for a model on the device is
+        # that "once the moves take arguments -- which proxy, which
+        # credential, which identity, which SSID -- the policy becomes a
+        # table nobody maintains". A review found the argument collected,
+        # carried and then dropped: every verb ran bare.
+        beacon = self.beacon(policy=self.POLICY)
+        asked = []
+        beacon._exec_egress = lambda task: asked.append(task) or "recorded"
+        beacon._stuck_cycles = 24 * 12
+        self.publish(evidence=beacon._egress_state(),
+                     recommendation={"verb": "radio", "chose": "model",
+                                     "argument": "Visitors"})
+
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["radio Visitors"])
+
+    def test_an_argument_reaches_the_trail_as_well(self):
+        beacon = self.beacon(policy=self.POLICY)
+        beacon._exec_egress = lambda task: "recorded"
+        beacon._stuck_cycles = 24 * 12
+        beacon._way_out_publish_state()
+        self.publish(evidence=beacon._egress_state(),
+                     recommendation={"verb": "radio", "chose": "model",
+                                     "argument": "Visitors"})
+        beacon._egress_act()
+
+        attempt = handoff.read_state(self.root)["attempts"][-1]
+        self.assertEqual(attempt["argument"], "Visitors")
+        self.assertEqual(attempt["task"], "radio Visitors")
+
+    def test_an_argument_with_a_space_in_it_is_refused(self):
+        # The task string is split on whitespace by `_exec_egress`, so an
+        # argument carrying one would silently become a different verb's
+        # argument -- and this one comes from a model.
+        beacon = self.beacon(policy=self.POLICY)
+        asked = []
+        beacon._exec_egress = lambda task: asked.append(task) or "recorded"
+        beacon._stuck_cycles = 24 * 12
+        self.publish(evidence=beacon._egress_state(),
+                     recommendation={"verb": "radio", "chose": "model",
+                                     "argument": "Guest Wifi; rm -rf /"})
+
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["radio"], "the argument was taken as given")
 
     def test_a_document_with_no_recommendation_leaves_the_policy_alone(self):
         beacon = self.beacon(policy=self.POLICY)
@@ -537,6 +727,34 @@ class TestTheWayOutBlock(WayOutCase):
         self.assertFalse(policy["enabled"])
         self.assertEqual(policy["state_dir"], "")
 
+    def test_every_non_loopback_endpoint_is_refused(self):
+        # The table is shared with `test_scout_model.py`, which holds the
+        # scout's copy of the same check: two processes, two
+        # implementations, one answer per form.
+        from software.tests.test_scout_model import LOOPBACK_ENDPOINTS
+        for endpoint, allowed in LOOPBACK_ENDPOINTS:
+            if allowed:
+                continue
+            with self.subTest(endpoint=endpoint):
+                self.logged.records = []
+                message = self.refused(
+                    {"enabled": True, "state_dir": "/opt/raccoon/state",
+                     "model": {"endpoint": endpoint}})
+                self.assertIn("loopback", message)
+
+    def test_every_loopback_endpoint_is_accepted(self):
+        from software.tests.test_scout_model import LOOPBACK_ENDPOINTS
+        for endpoint, allowed in LOOPBACK_ENDPOINTS:
+            if not allowed:
+                continue
+            with self.subTest(endpoint=endpoint):
+                self.logged.records = []
+                policy = self.read(
+                    {"enabled": True, "state_dir": "/opt/raccoon/state",
+                     "model": {"endpoint": endpoint}})
+                self.assertEqual(self.logged.warnings, [])
+                self.assertEqual(policy["model"]["endpoint"], endpoint)
+
     def test_a_bad_model_block_is_refused_with_the_offending_value(self):
         for block, needle in (
                 ({"model": "yes"}, "'yes'"),
@@ -594,6 +812,103 @@ class TestTheConfigLoaderCarriesTheBlock(WayOutCase):
         self.assertEqual(self.logged.warnings, [])
         self.assertFalse(policy["enabled"])
         self.assertFalse(policy["model"]["enabled"])
+
+
+class TestAHostileStateDirectory(WayOutCase):
+    """The handoff's directory is a place another process can reach.
+
+    The implant runs as root and the handoff is under `/opt/raccoon`, but
+    "0600 in a 0700 directory" has to be true of a directory somebody
+    *else* made as well -- an operator who pointed `state_dir` at
+    `/var/tmp/raccoon`, or a local process that got there first. A review
+    found three ways through: a pre-existing directory kept its mode, the
+    trail followed a symlink planted at its name, and nothing
+    authenticated the identity request -- so write access to the directory
+    was write access to the one irreversible move.
+    """
+
+    def test_a_pre_existing_directory_is_tightened(self):
+        loose = os.path.join(self.root, "loose")
+        os.makedirs(loose, mode=0o777)
+        os.chmod(loose, 0o777)
+        handoff.write_private_json(os.path.join(loose, "x.json"),
+                                   {"version": 1})
+        self.assertEqual(os.stat(loose).st_mode & 0o777, 0o700,
+                         "a directory somebody else made kept its mode, and "
+                         "the 0600 files in it are reachable")
+
+    def test_a_directory_that_is_a_symlink_is_refused(self):
+        elsewhere = os.path.join(self.root, "elsewhere")
+        os.makedirs(elsewhere)
+        link = os.path.join(self.root, "link")
+        os.symlink(elsewhere, link)
+        with self.assertRaises(ValueError) as refusal:
+            handoff.write_private_json(os.path.join(link, "x.json"),
+                                       {"version": 1})
+        # And the reason names it. "not a directory" is what an operator
+        # gets from a check that merely happens to refuse a symlink, and
+        # it sends them looking for the wrong thing.
+        self.assertIn("symbolic link", str(refusal.exception))
+        self.assertEqual(os.listdir(elsewhere), [])
+
+    def test_a_trail_that_is_a_symlink_is_not_followed(self):
+        target = os.path.join(self.root, "someone-elses-file")
+        Path(target).write_text("original\n")
+        os.symlink(target, handoff.trail_path(self.root))
+        with self.assertRaises(OSError):
+            handoff.append_trail(self.root, {"attacker": "was here"})
+        self.assertEqual(Path(target).read_text(), "original\n")
+
+    def test_the_beacon_does_not_write_through_a_symlink_either(self):
+        target = os.path.join(self.root, "someone-elses-file")
+        Path(target).write_text("original\n")
+        os.symlink(target, handoff.state_path(self.root))
+        beacon = self.beacon()
+        beacon._stuck_cycles = 2
+        beacon._way_out_publish_state()
+        self.assertEqual(Path(target).read_text(), "original\n")
+
+    def test_a_request_somebody_else_wrote_is_not_acted_on(self):
+        # The one move that cannot be undone from the far side, so the
+        # file that asks for it has to have been written by this implant.
+        # Checked by **ownership and mode** and not by a shared secret:
+        # the two processes are both root on the same device, there is no
+        # key to distribute, and the attacker this answers is the
+        # unprivileged one who got to the directory first. A root attacker
+        # owns the device and no check here changes that.
+        from software.scout.trigger import IdentityTrigger
+
+        handoff.write_private_json(handoff.identity_path(self.root), {
+            "version": handoff.STATE_VERSION, "requested": time.time(),
+            "stuck_cycles": 99})
+        os.chmod(handoff.identity_path(self.root), 0o666)
+        self.assertIsNone(
+            IdentityTrigger(self.root).pending(),
+            "a group-writable request started the NAC bypass")
+
+    def test_the_beacons_own_request_is_acted_on(self):
+        from software.scout.trigger import IdentityTrigger
+
+        beacon = self.beacon()
+        self.publish()
+        beacon._stuck_cycles = 24 * 12
+        self.assertNotIn("[error]", beacon._exec_egress("identity"))
+        self.assertIsNotNone(IdentityTrigger(self.root).pending())
+
+    def test_a_request_in_a_loose_directory_is_not_acted_on(self):
+        # The window the directory mode alone leaves: pre-create the
+        # directory world-writable, drop the request in, and the first
+        # handoff write tightens the directory with the forgery already
+        # inside it.
+        from software.scout.trigger import IdentityTrigger
+
+        loose = os.path.join(self.root, "loose")
+        os.makedirs(loose, mode=0o777)
+        os.chmod(loose, 0o777)
+        handoff.write_private_json(handoff.identity_path(loose), {
+            "version": handoff.STATE_VERSION, "requested": time.time()})
+        os.chmod(loose, 0o777)
+        self.assertIsNone(IdentityTrigger(loose).pending())
 
 
 # ── the scout's side of the files ──

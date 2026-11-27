@@ -88,12 +88,39 @@ class TestWhatItMeasures(unittest.TestCase):
                         "reader refuses" % root)
 
     def test_the_parse_cost_is_per_packet_over_a_replayed_capture(self):
-        got = bench.measure_parse(packets=50)
-        self.assertEqual(got["packets"], 50)
+        got = bench.measure_parse(packets=80)
+        self.assertEqual(got["packets"], 80)
         self.assertGreater(got["cpu_us_per_packet"], 0)
         # The evidence has to have been read, or the number is the cost of
         # doing nothing.
         self.assertEqual(got["flags"], ["dot1x_seen", "portal_answered"])
+
+    def test_the_replay_exercises_every_parser_including_tls(self):
+        # A review found the replay had no TLS frame in it at all, while
+        # the design's reading column said "the frames are the five rows
+        # of the evidence table". `_sni` is the one parser that walks
+        # attacker-supplied length fields, and it was never measured.
+        got = bench.measure_parse(packets=400)
+        self.assertGreater(got["tls_destinations"], 0,
+                           "no TLS handshake was parsed, so the one parser "
+                           "that walks length fields was not measured")
+        self.assertGreater(got["resolvers"], 0)
+        self.assertGreater(got["credentials"], 0)
+
+    def test_the_replay_is_distinct_and_not_seven_frames_in_a_loop(self):
+        # The same finding's other half: with the same frames repeating,
+        # every dedup list stays length 1 and every pending collection
+        # stays size 1, so the number was the looping cost with none of
+        # the reading cost that grows. On real traffic the lists fill.
+        got = bench.measure_parse(packets=400)
+        self.assertGreater(got["tls_destinations"], 1)
+        self.assertGreater(got["resolvers"], 1)
+        # And the bounds hold, which is what stops the growth the design's
+        # risk table claimed the container had measured.
+        self.assertIn("pending", got)
+        for name, size in got["pending"].items():
+            with self.subTest(name=name):
+                self.assertLessEqual(size, bench.MAX_PENDING)
 
     def test_the_handoff_is_a_write_and_a_read(self):
         got = bench.measure_handoff(rounds=10)
@@ -155,6 +182,23 @@ class TestTheModelArm(unittest.TestCase):
         self.assertFalse(got["validated"])
         self.assertGreaterEqual(got["seconds"], 0)
         self.assertIn("optimistic", got["caveat"].lower())
+
+    def test_it_can_be_asked_more_than_once_so_a_ratio_is_reportable(self):
+        # The design's model numbers are a ratio -- "the validator
+        # accepted nine of twelve" -- and the command written beside them
+        # asked once, so a reader following the instructions got one
+        # number and no ratio.
+        answers = [{"verb": "gsocket", "chose": "model", "argument": "",
+                    "p_success": None, "why": ""}, None,
+                   {"verb": "portal", "chose": "model", "argument": "",
+                    "p_success": None, "why": ""}, None]
+        with mock.patch("software.scout.model.ask",
+                        side_effect=list(answers)):
+            got = bench.measure_model(name="qwen2.5:0.5b", asks=4)
+        self.assertEqual(got["asks"], 4)
+        self.assertEqual(got["accepted"], 2)
+        self.assertEqual(got["verbs"], ["gsocket", "portal"])
+        self.assertIn("2 of 4", got["note"])
 
     def test_an_accepted_answer_reports_what_the_validator_took(self):
         answer = {"verb": "gsocket", "chose": "model", "argument": "",

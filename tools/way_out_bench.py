@@ -53,16 +53,30 @@ sys.path.insert(0, str(REPO))
 from software.c2 import beacon as beacon_mod                   # noqa: E402
 from software.c2.beacon import Beacon, read_way_out_policy     # noqa: E402
 from software.scout import handoff                             # noqa: E402
-from software.scout.evidence import Evidence                   # noqa: E402
+from software.scout.evidence import (MAX_ENTRIES, MAX_PENDING,  # noqa: E402
+                                     Evidence)
 
 # The sentence every timing here carries. One string, so the report cannot
 # say it two different ways.
-OPTIMISTIC = (
-    "an optimistic bound, not a result: this is an arm64 container with "
-    "--cpus and --memory limits, which approximates the Pi 4's four cores "
-    "and 4 GB but not a Cortex-A72's clock, and it is not bridging a host's "
-    "traffic, drawing from a 13 W PoE budget or sharing a thermal envelope "
-    "while it runs")
+def _caveat():
+    """The sentence every timing carries, naming the bench it really ran on.
+
+    It used to assert "this **is** an arm64 container with --cpus and
+    --memory limits" unconditionally, and printed that on a laptop with 18
+    cores. The claim a reader needs is the same either way -- the number is
+    a bound, not a result -- and the machine is reported rather than
+    assumed.
+    """
+    return (
+        "an optimistic bound, not a result: measured on %s with %s CPU(s), "
+        "which is not a Cortex-A72's clock, and nothing here is bridging a "
+        "host's traffic, drawing from a 13 W PoE budget or sharing an IP "
+        "phone's thermal envelope while it runs. The bench the design asks "
+        "for is an arm64 container with --cpus 4 --memory 4g"
+        % (" ".join(os.uname()[:1] + os.uname()[4:5]), os.cpu_count()))
+
+
+OPTIMISTIC = _caveat()
 
 # What no container can answer, with the reason rather than a shrug. Carried
 # in the design's risk table as well.
@@ -116,12 +130,40 @@ def _scratch():
 # ── the packets the parse is measured against ──
 
 
+def _client_hello(sni):
+    """A TLS ClientHello record with one server_name extension.
+
+    Built by hand, as `test_scout_evidence.py` builds it: the scout parses
+    these bytes itself, and that parser -- the one that walks
+    attacker-supplied length fields -- is the one a bench without a TLS
+    frame never measures. A review found exactly that gap here.
+    """
+    name = sni.encode()
+    server_name = b"\x00" + len(name).to_bytes(2, "big") + name
+    name_list = len(server_name).to_bytes(2, "big") + server_name
+    extension = b"\x00\x00" + len(name_list).to_bytes(2, "big") + name_list
+    extensions = len(extension).to_bytes(2, "big") + extension
+    body = (b"\x03\x03" + b"\x00" * 32 + b"\x00" + b"\x00\x02\x13\x01"
+            + b"\x01\x00" + extensions)
+    handshake = b"\x01" + len(body).to_bytes(3, "big") + body
+    return b"\x16\x03\x01" + len(handshake).to_bytes(2, "big") + handshake
+
+
 def _replay(count):
     """`count` frames of exactly what the scout's filter would catch.
 
     Built rather than captured, because a committed pcap would be a file to
-    keep in step with the filter -- and the five shapes below are the five
-    rows of the design's evidence table.
+    keep in step with the filter -- and the shapes below are the rows of
+    the design's evidence table, **all** of them including TLS.
+
+    **Distinct, and that is the point.** The first version of this repeated
+    seven frames, so every dedup list stayed length 1, every pending
+    collection stayed size 1, and `_sni` never ran -- which made the
+    reported microseconds the cost of *looping* with none of the cost of
+    reading that grows with a real tap's cardinality. The design's risk
+    table claimed the container had measured the second capture reader's
+    cost; it had not, by construction. Each round here uses a new SNI, a
+    new resolver, a new query name and a new flow.
     """
     from scapy.all import DNS, DNSQR, DNSRR, IP, TCP, UDP, Ether, Raw
 
@@ -132,28 +174,49 @@ def _replay(count):
                 / IP(src=src, dst=dst) / TCP(sport=sport, dport=dport)
                 / Raw(payload))
 
-    shapes = [
-        (Ether(src="aa:bb:cc:dd:ee:ff", dst="01:80:c2:00:00:03",
-               type=0x888E) / Raw(b"\x01\x01\x00\x00")),
-        (Ether() / IP(src=host, dst="10.0.0.2") / UDP(sport=5555, dport=53)
-         / DNS(rd=1, qd=DNSQR(qname="example.com"))),
-        (Ether() / IP(src="10.0.0.2", dst=host) / UDP(sport=53, dport=5555)
-         / DNS(qr=1, qd=DNSQR(qname="example.com"),
-               an=DNSRR(rrname="example.com", rdata="93.184.216.34"))),
-        tcp(host, gateway, 44444, 3128,
-            b"CONNECT a:443 HTTP/1.1\r\nHost: proxy.lan:3128\r\n"
-            b"Proxy-Authorization: Basic Y29ycFxhbGljZTpzM2NyZXQ=\r\n\r\n"),
-        tcp(gateway, host, 80, 44444,
-            b"HTTP/1.1 302 Found\r\nLocation: http://portal.lan/login\r\n\r\n"),
-        tcp(host, gateway, 44444, 80,
-            b"POST /login HTTP/1.1\r\nHost: portal.lan\r\n"
-            b"Content-Type: application/x-www-form-urlencoded\r\n\r\n"
-            b"user=guest&accept=1"),
-        tcp(gateway, host, 80, 44444, b"HTTP/1.1 200 OK\r\n\r\n"),
-    ]
     out = []
+    index = 0
     while len(out) < count:
-        out.extend(shapes)
+        index += 1
+        name = "h%d.example.com" % index
+        resolver = "10.%d.%d.%d" % (index % 250, (index // 250) % 250,
+                                    1 + (index % 250))
+        port = 20000 + (index % 40000)
+        out.extend([
+            (Ether(src="aa:bb:cc:dd:ee:ff", dst="01:80:c2:00:00:03",
+                   type=0x888E) / Raw(b"\x01\x01\x00\x00")),
+            (Ether() / IP(src=host, dst=resolver)
+             / UDP(sport=port, dport=53)
+             / DNS(rd=1, id=index % 65535, qd=DNSQR(qname=name))),
+            (Ether() / IP(src=resolver, dst=host)
+             / UDP(sport=53, dport=port)
+             / DNS(qr=1, id=index % 65535, qd=DNSQR(qname=name),
+                   an=DNSRR(rrname=name, rdata="93.184.216.34"))),
+            # A ClientHello and the ServerHello that makes it count.
+            tcp(host, gateway, port, 443, _client_hello(name)),
+            tcp(gateway, host, 443, port,
+                b"\x16\x03\x03\x00\x04\x02\x00\x00\x00"),
+            # ...and one that is never answered, which is the ordinary case
+            # on a tap and the one that used to grow without a bound.
+            tcp(host, gateway, port + 1, 443,
+                _client_hello("unanswered%d.example.com" % index)),
+            tcp(host, gateway, port, 3128,
+                b"CONNECT a:443 HTTP/1.1\r\nHost: proxy.lan:3128\r\n\r\n"),
+            tcp(gateway, host, 3128, port,
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                b"Proxy-Authenticate: Basic realm=\"corp\"\r\n\r\n"),
+            tcp(host, gateway, port, 3128,
+                b"CONNECT a:443 HTTP/1.1\r\nHost: proxy.lan:3128\r\n"
+                b"Proxy-Authorization: Basic Y29ycFxhbGljZTpzM2NyZXQ=\r\n\r\n"),
+            tcp(gateway, host, 80, port,
+                b"HTTP/1.1 302 Found\r\n"
+                b"Location: http://portal.lan/login\r\n\r\n"),
+            tcp(host, gateway, port, 80,
+                b"POST /login HTTP/1.1\r\nHost: portal.lan\r\n"
+                b"Content-Type: application/x-www-form-urlencoded\r\n\r\n"
+                b"user=guest&accept=1"),
+            tcp(gateway, host, 80, port, b"HTTP/1.1 200 OK\r\n\r\n"),
+        ])
     return out[:count]
 
 
@@ -193,7 +256,22 @@ def measure_parse(packets=2000):
         "cpu_us_per_packet": round(spent / max(1, packets) * 1e6, 2),
         "cpu_seconds_total": round(spent, 4),
         "flags": evidence.flags(),
+        # What was actually read, so the number cannot be the cost of
+        # doing nothing and a parser that stopped running is visible.
         "credentials": len(evidence.credentials),
+        "resolvers": len(evidence.resolvers),
+        "tls_destinations": len(evidence.tls_destinations),
+        "proxies": len(evidence.proxies),
+        # And what is still waiting for an answer, which is where the
+        # memory went before the bounds: on a tap most ClientHellos and
+        # most queries are never answered.
+        "pending": {
+            "dns": len(evidence._dns_pending),
+            "tls": len(evidence._tls_pending),
+            "portal": len(evidence._portal_pending),
+            "connect": len(evidence._connect_pending),
+        },
+        "bounds": {"entries": MAX_ENTRIES, "pending": MAX_PENDING},
         "caveat": OPTIMISTIC,
     }
 
@@ -310,7 +388,8 @@ def measure_arithmetic(rounds=2000):
         shutil.rmtree(root, ignore_errors=True)
 
 
-def measure_model(name="", endpoint="http://127.0.0.1:11434", timeout=120):
+def measure_model(name="", endpoint="http://127.0.0.1:11434", timeout=120,
+                  asks=1):
     """Ask a real local model the real question, and report what came back.
 
     **A bad result is a measurement.** "It answered something the validator
@@ -342,27 +421,41 @@ def measure_model(name="", endpoint="http://127.0.0.1:11434", timeout=120):
     block = {"enabled": True, "endpoint": endpoint, "name": name,
              "timeout_seconds": timeout}
 
-    started = time.time()
+    # `asks` and not one, because the question a reader has is a ratio:
+    # "the validator accepted nine of twelve" is the measurement, and a
+    # bench that asked once could not produce it -- the design's own
+    # numbers had to be collected by running the command twelve times,
+    # which is not what the command said.
     note = ""
     answer = None
-    try:
-        answer = model_mod.ask(block, state, tap)
-    except Exception as exc:
-        note = "the call raised: %s" % exc
-    spent = time.time() - started
+    seconds = []
+    verbs = []
+    accepted = 0
+    for _ in range(max(1, int(asks))):
+        started = time.time()
+        try:
+            answer = model_mod.ask(block, state, tap)
+        except Exception as exc:
+            note = "the call raised: %s" % exc
+            answer = None
+        seconds.append(time.time() - started)
+        if answer:
+            accepted += 1
+            verbs.append(answer["verb"])
     out = {
         "asked": True,
+        "asks": max(1, int(asks)),
         "model": name,
         "endpoint": endpoint,
-        "seconds": round(spent, 2),
+        "accepted": accepted,
+        "verbs": sorted(set(verbs)),
+        "seconds": round(seconds[-1], 2),
+        "seconds_min": round(min(seconds), 2),
+        "seconds_max": round(max(seconds), 2),
         "validated": answer is not None,
         "caveat": OPTIMISTIC,
-        "note": note or ("the validator accepted the answer"
-                         if answer else
-                         "the validator refused what came back; the scout's "
-                         "log line says why, and the beacon decides on its "
-                         "policy -- which is the degradation this design "
-                         "relies on"),
+        "note": note or ("the validator accepted %d of %d"
+                         % (accepted, max(1, int(asks)))),
     }
     if answer:
         out.update({"verb": answer["verb"], "argument": answer["argument"],
@@ -371,7 +464,7 @@ def measure_model(name="", endpoint="http://127.0.0.1:11434", timeout=120):
 
 
 def report(packets=2000, rounds=500, model="",
-           endpoint="http://127.0.0.1:11434", timeout=120):
+           endpoint="http://127.0.0.1:11434", timeout=120, asks=1):
     return {
         "bench": {
             "platform": " ".join(os.uname()[:1] + os.uname()[2:3]
@@ -383,7 +476,7 @@ def report(packets=2000, rounds=500, model="",
         "handoff": measure_handoff(rounds),
         "freshness": measure_freshness(),
         "arithmetic": measure_arithmetic(rounds),
-        "model": measure_model(model, endpoint, timeout),
+        "model": measure_model(model, endpoint, timeout, asks),
         "not_measurable": NOT_MEASURABLE,
     }
 
@@ -394,9 +487,14 @@ def _print(got):
              got["bench"]["python"]))
     print()
     print("measurable, and fully")
-    print("  parse       %.2f us CPU per packet over %d frames; flags read: %s"
+    print("  parse       %.2f us CPU per packet over %d frames; read: %s"
           % (got["parse"]["cpu_us_per_packet"], got["parse"]["packets"],
-             ", ".join(got["parse"]["flags"]) or "none"))
+             ", ".join(got["parse"]["flags"]) or "no flags"))
+    print("              %d resolver(s), %d TLS destination(s), %d proxy(s), "
+          "%d credential(s); waiting: %s (bounds %s)"
+          % (got["parse"]["resolvers"], got["parse"]["tls_destinations"],
+             got["parse"]["proxies"], got["parse"]["credentials"],
+             got["parse"]["pending"], got["parse"]["bounds"]))
     print("  handoff     %.2f us per write-and-read round (%d rounds)"
           % (got["handoff"]["us_per_round"], got["handoff"]["rounds"]))
     print("  arithmetic  %.3f us per decision; rungs cross at %s hours dark"
@@ -413,12 +511,13 @@ def _print(got):
     if not got["model"]["asked"]:
         print("  not run — %s" % got["model"]["note"])
     else:
-        print("  %s at %s: %s in %.2f s"
+        print("  %s at %s: the validator accepted %d of %d, in %.2f-%.2f s"
               % (got["model"]["model"], got["model"]["endpoint"],
-                 "the validator ACCEPTED the answer"
-                 if got["model"]["validated"]
-                 else "the validator REFUSED what came back",
-                 got["model"]["seconds"]))
+                 got["model"]["accepted"], got["model"]["asks"],
+                 got["model"]["seconds_min"], got["model"]["seconds_max"]))
+        if got["model"]["verbs"]:
+            print("  verbs it named: %s"
+                  % ", ".join(got["model"]["verbs"]))
         if got["model"]["validated"]:
             print("  it answered: verb=%s argument=%r p_success=%s why=%r"
                   % (got["model"]["verb"], got["model"]["argument"],
@@ -440,11 +539,15 @@ def main(argv=None):
                         help="a model an Ollama on loopback has pulled")
     parser.add_argument("--endpoint", default="http://127.0.0.1:11434")
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--model-asks", type=int, default=1, dest="asks",
+                        help="how many times to ask, so the report can say "
+                             "how many answers the validator took")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
     got = report(packets=args.packets, rounds=args.rounds, model=args.model,
-                 endpoint=args.endpoint, timeout=args.timeout)
+                 endpoint=args.endpoint, timeout=args.timeout,
+                 asks=args.asks)
     if args.json:
         print(json.dumps(got, indent=2, sort_keys=True))
     else:
