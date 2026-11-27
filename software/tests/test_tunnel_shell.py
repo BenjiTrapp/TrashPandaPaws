@@ -94,6 +94,17 @@ _LOOPBACK = "127.0.0.1"
 _PORT_RANGE = (40300, 40399)
 
 
+def _wait_until(predicate, what, timeout=20.0):
+    """Poll until true. Named, so a failure says what never happened."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("timed out after %.0fs waiting for %s"
+                         % (timeout, what))
+
+
 def _drain(sock, timeout=3.0):
     """Everything the peer sent before it closed, and whether it closed."""
     sock.settimeout(timeout)
@@ -1243,6 +1254,23 @@ class TestTranscripts(ShellFrontTestCase):
                          % (count, folder, names))
         return [os.path.join(folder, name) for name in names]
 
+    def flushed(self, path, size):
+        """Wait until the typescript at `path` holds `size` bytes.
+
+        `written` counts files, and the file is there from the pairing on;
+        its content is not. The recorder writes after the send, so the
+        operator's terminal can have the bytes, and a test its next line,
+        before the typescript has them. Only for a session that is still
+        live: once `ended` has returned the recorder is closed and nothing
+        is pending. This waits for the bytes to arrive and judges none of
+        them -- what they are is the caller's assertion.
+        """
+        def reached():
+            return os.path.getsize(path) >= size
+
+        _wait_until(reached, "the recorder to flush %d byte(s) to %s"
+                    % (size, path))
+
     def ended(self, front, client):
         """Close a client and wait until its session is finished.
 
@@ -1401,6 +1429,7 @@ class TestTranscripts(ShellFrontTestCase):
         # and the bytes are already on the disk rather than in a buffer
         # that would die with the process.
         path = self.written(directory, count=1)[0]
+        self.flushed(path, len(b"120x40|echo\n"))
         with open(path, "rb") as handle:
             self.assertEqual(handle.read(), b"120x40|echo\n")
         self.assertFalse(os.path.exists(path + ".json"))

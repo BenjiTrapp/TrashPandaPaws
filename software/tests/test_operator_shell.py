@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from software.c2 import beacon, opshell
+from software.tests.test_c2_server import NOT_AN_OBJECT, logged_tracebacks
 
 
 class _ClaimsCase(unittest.TestCase):
@@ -1294,6 +1295,35 @@ class TestOpeningTheChannel(_RouteCase):
         self.assertEqual(answer.get_json()["error"], "choose a device first")
         self.assertEqual(self.sm.task_queues, {})
 
+    def test_a_designation_naming_no_string_reaches_no_route_as_a_name(self):
+        # One step past the reader: it stopped raising on a non-object, but
+        # handed `{"agent": ["x"]}`'s list on, and `/stream`'s
+        # `target not in agents` raised `TypeError: unhashable type`. Every
+        # route that reads the designation is asked, with and without a
+        # session, since `/state` only beats a claim when given one.
+        for bad in (["x"], {"a": 1}, 123, True):
+            (self.data_dir / "opshell-target.json").write_text(
+                json.dumps({"agent": bad}))
+            with logged_tracebacks() as tracebacks:
+                answers = {
+                    "state": self.get("/api/opshell/state"),
+                    "state?session": self.get("/api/opshell/state?session=s"),
+                    "stream": self.get("/api/opshell/stream"),
+                    "stream?session": self.get(
+                        "/api/opshell/stream?session=s"),
+                    "open": self.post(self.url("/api/opshell/open"), {}),
+                    "close": self.post(self.url("/api/opshell/close"),
+                                       {"session": "s"}),
+                }
+            for path, answer in answers.items():
+                self.assertLess(answer.status_code, 500, (bad, path))
+            for path in ("state", "state?session"):
+                self.assertIsNone(answers[path].get_json()["target"],
+                                  (bad, path))
+            self.assertEqual(answers["stream"].status_code, 404, repr(bad))
+            self.assertEqual(tracebacks, [], repr(bad))
+            self.assertEqual(self.sm.task_queues, {}, repr(bad))
+
     def test_an_agent_field_that_is_not_a_string_is_refused_not_a_crash(self):
         # `.strip()` on an int answered 500. The same shape as the
         # `c2.fallback: true` crash on the beacon.
@@ -1305,6 +1335,38 @@ class TestOpeningTheChannel(_RouteCase):
     def test_a_whitespace_name_names_nothing(self):
         answer = self.post(self.url("/api/opshell/open"), {"agent": "   "})
         self.assertEqual(answer.status_code, 400)
+
+    def test_a_body_that_is_not_an_object_is_refused_not_a_crash(self):
+        # `get_json(silent=True) or {}` only catches JSON that does not
+        # parse; `[1]` parses, is truthy, and met `.get`. A designation is
+        # on file, so a body quietly coerced to `{}` would have opened onto
+        # it: refused is the claim, not merely "not a 500".
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        for body in NOT_AN_OBJECT:
+            with logged_tracebacks() as tracebacks:
+                answer = self.post(self.url("/api/opshell/open"), body)
+            self.assertEqual(answer.status_code, 400, repr(body))
+            self.assertIn("error", answer.get_json(), repr(body))
+            self.assertEqual(tracebacks, [], repr(body))
+            self.assertEqual(self.sm.task_queues, {}, repr(body))
+
+    def test_a_designation_file_that_is_not_an_object_names_nothing(self):
+        # The file is hand-editable, and `(json.load(f) or {}).get` met a
+        # `[1]` with `.get`: the reader raised instead of answering None.
+        for content in NOT_AN_OBJECT:
+            (self.data_dir / "opshell-target.json").write_text(
+                json.dumps(content))
+            with logged_tracebacks() as tracebacks:
+                opened = self.post(self.url("/api/opshell/open"), {})
+                state = self.get("/api/opshell/state")
+            self.assertEqual(opened.status_code, 400, repr(content))
+            self.assertEqual(opened.get_json()["error"],
+                             "choose a device first", repr(content))
+            self.assertEqual(state.status_code, 200, repr(content))
+            self.assertIsNone(state.get_json()["target"], repr(content))
+            self.assertEqual(tracebacks, [], repr(content))
+            self.assertEqual(self.sm.task_queues, {}, repr(content))
 
 
 class TestClosingTheChannel(_RouteCase):
@@ -1354,6 +1416,65 @@ class TestClosingTheChannel(_RouteCase):
                     json={"session": opened["session"]}, headers=self.auth)
         queued = [t["args"] for t in self.sm.task_queues.get(self.AGENT, [])]
         self.assertIn("stop", queued)
+
+    def test_a_body_that_is_not_an_object_is_refused_not_a_crash(self):
+        # The designation is on file so that a body coerced to `{}` would
+        # have gone on to the session check: the 400 must be the body's.
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": self.AGENT}))
+        for body in NOT_AN_OBJECT:
+            with logged_tracebacks() as tracebacks:
+                answer = self.post(self.url("/api/opshell/close"), body)
+            self.assertEqual(answer.status_code, 400, repr(body))
+            self.assertNotIn("session", answer.get_json()["error"],
+                             repr(body))
+            self.assertEqual(tracebacks, [], repr(body))
+            self.assertEqual(self.sm.task_queues, {}, repr(body))
+
+    def test_an_agent_field_that_is_not_a_string_names_nothing(self):
+        # Its sibling `open` was fixed for this and `close` kept the line:
+        # `.strip()` on an int answered 500. Now a non-string names nothing,
+        # exactly as a body without `agent` does -- `open`'s rule.
+        named_nothing = self.post(self.url("/api/opshell/close"),
+                                  {"session": "s"})
+        self.assertEqual(named_nothing.status_code, 404)
+        self.assertEqual(named_nothing.get_json()["error"], "nothing is open")
+        for bad in (123, True, ["badger"], {"agent": "badger"}):
+            with logged_tracebacks() as tracebacks:
+                answer = self.post(self.url("/api/opshell/close"),
+                                   {"agent": bad, "session": "s"})
+            self.assertEqual(answer.status_code, 404, repr(bad))
+            self.assertEqual(answer.get_json(), named_nothing.get_json(),
+                             repr(bad))
+            self.assertEqual(tracebacks, [], repr(bad))
+            self.assertEqual(self.sm.task_queues, {}, repr(bad))
+
+    def test_a_whitespace_agent_falls_back_to_the_designation(self):
+        # Deliberate, and `open`'s rule: with `_named` on both sources, a
+        # name of only spaces names nothing, so the designated device is
+        # closed. It answered 404 "nothing is open" while `close` kept the
+        # `(... or "").strip()` line. The session id still guards the stop.
+        client, session, _ = self.raised_and_up()
+        answer = client.post(self.url("/api/opshell/close"),
+                             json={"agent": "   ", "session": session},
+                             headers=self.auth)
+        self.assertEqual(answer.status_code, 200)
+        self.assertEqual(answer.get_json()["target"], self.AGENT)
+        self.assertEqual(answer.get_json()["state"], "closing")
+        queued = [(t["cmd"], t["args"])
+                  for t in self.sm.task_queues[self.AGENT]]
+        self.assertIn(("tunnel", "stop"), queued)
+
+    def test_a_designation_file_that_names_no_string_names_nothing(self):
+        # The other source `open` guards: the hand-editable file. A number
+        # there reached `.strip()` through the `or` chain just the same.
+        (self.data_dir / "opshell-target.json").write_text(
+            json.dumps({"agent": 123}))
+        with logged_tracebacks() as tracebacks:
+            answer = self.post(self.url("/api/opshell/close"), {"session": "s"})
+        self.assertEqual(answer.status_code, 404)
+        self.assertEqual(answer.get_json()["error"], "nothing is open")
+        self.assertEqual(tracebacks, [])
 
 
 class TestNothingTouchesTheInterval(_RouteCase):
@@ -2555,6 +2676,13 @@ class TestTheCheapGuardsOnTheRoutes(_RouteCase):
             answer = self.post(self.url("/api/opshell/keys"),
                                {"session": "x", "data": junk})
             self.assertLess(answer.status_code, 500, repr(junk))
+
+    def test_a_body_that_is_not_an_object_is_a_bad_request_not_a_crash(self):
+        for body in NOT_AN_OBJECT:
+            with logged_tracebacks() as tracebacks:
+                answer = self.post(self.url("/api/opshell/keys"), body)
+            self.assertEqual(answer.status_code, 400, repr(body))
+            self.assertEqual(tracebacks, [], repr(body))
 
     def test_a_paste_a_person_could_make_is_not_refused(self):
         # The ceiling has to be above anything an operator would actually

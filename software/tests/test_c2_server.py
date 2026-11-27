@@ -7,7 +7,9 @@ re-registration, operator API, and evasive URL handling.
 """
 
 import base64
+import contextlib
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -15,6 +17,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -82,6 +85,31 @@ def _beacon_config(port: int = None, interval: int = 1) -> dict:
             },
         }
     }
+
+
+@contextlib.contextmanager
+def logged_tracebacks():
+    """Every log record carrying a traceback while the block runs.
+
+    On the root logger, because Flask reports an unhandled exception on
+    the app's own logger, not on `raccoon.c2.server`, and both propagate
+    there. Python 3.9 has no `assertNoLogs`.
+    """
+    seen = []
+    handler = logging.Handler(logging.DEBUG)
+    handler.emit = lambda record: (seen.append(record)
+                                   if record.exc_info else None)
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        yield seen
+    finally:
+        root.removeHandler(handler)
+
+
+# Valid JSON that is not an object: each survives `get_json(silent=True)`,
+# and each is truthy, so `or {}` let it through to `.get`.
+NOT_AN_OBJECT = ([1], "x", 7)
 
 
 def _reset_server_state():
@@ -659,6 +687,110 @@ class TestBeaconGenGsocketLeg(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["oneliner_unix"])
+
+
+class TestHowNineRoutesReadABodyThatIsNotAnObject(unittest.TestCase):
+    """Nine of the twelve `get_json(silent=True) or {}` routes, given a body
+    that parses but is not an object.
+
+    `request.get_json(silent=True) or {}` only catches JSON that does not
+    parse. `[1]`, `"x"` and `7` parse, are truthy, and reached `.get`,
+    which raised `AttributeError`: a 500 and a traceback in the log for a
+    request that is merely malformed; those are refused with 400. A falsy
+    one -- `[]`, `0`, `""`, `false` -- never crashed and still reads as an
+    empty body. The shell's three routes are covered
+    in `test_operator_shell.py`; `TestTheTwelveBodyReadersUseTheHelper` in
+    `test_c2_hardening.py` proves all twelve sites are converted. Not every
+    operator route: `/api/agents/<id>/task` reads `request.json`, a
+    different reader, and is not one of the twelve.
+
+    `TESTING` stays off, as in production: with it on Flask re-raises,
+    and the 500 and its logged traceback would never be observed.
+    """
+
+    ROUTES = ("/api/server/exec",
+              "/api/server/avenum",
+              "/api/server/rdp",
+              "/api/server/beacon-gen",
+              "/api/server/beacon-gist",
+              "/api/server/c2-profile/from-burp",
+              "/api/server/c2-profile/lint",
+              "/api/server/c2-profile/save",
+              "/api/server/c2-profile/push")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data_dir = Path(tempfile.mkdtemp())
+        cls.app = create_app(ServerCrypto(KEY), TEST_TOKEN, cls.data_dir)
+        cls.client = cls.app.test_client()
+
+    @classmethod
+    def tearDownClass(cls):
+        import shutil
+        shutil.rmtree(cls.data_dir, ignore_errors=True)
+
+    def setUp(self):
+        _reset_server_state()
+        agents["raccoon-1"] = {"id": "impl-1", "agent_id": "raccoon-1"}
+        # `beacon-gist` asks `gh` whether it is logged in before it reads
+        # the body. Answered here, so the body is what gets tested.
+        authed = mock.patch("software.c2.server.subprocess.run",
+                            return_value=mock.Mock(returncode=0))
+        authed.start()
+        self.addCleanup(authed.stop)
+
+    def test_each_route_answers_400_and_logs_no_traceback(self):
+        import software.c2.server as srv
+        with mock.patch.object(srv, "_active_c2_profile", {"mode": "x"}):
+            for route in self.ROUTES:
+                for body in NOT_AN_OBJECT:
+                    with self.subTest(route=route, body=body), \
+                            logged_tracebacks() as tracebacks:
+                        answer = self.client.post(
+                            route, json=body,
+                            headers={"Authorization": "Bearer %s"
+                                     % TEST_TOKEN})
+                        self.assertEqual(answer.status_code, 400)
+                        self.assertIn("error", answer.get_json())
+                        self.assertEqual(tracebacks, [])
+        # Refused before acting: `push` with an empty body pushes to the
+        # whole fleet, so a coerced body would have queued a task here.
+        self.assertEqual(task_queues, {})
+
+    def test_a_falsy_non_object_still_means_an_empty_body(self):
+        # Only a truthy non-object ever crashed: `or {}` already read `[]`,
+        # `0`, `""` and `false` as an empty body, and they keep that
+        # meaning. Each answers exactly what an absent body answers. `push`
+        # is left out on purpose: an empty body there means the whole fleet.
+        routes = ("/api/server/exec", "/api/server/c2-profile/lint",
+                  "/api/server/c2-profile/save", "/api/opshell/open",
+                  "/api/opshell/close", "/api/opshell/keys")
+        headers = {"Authorization": "Bearer %s" % TEST_TOKEN}
+        for route in routes:
+            absent = self.client.post(route, headers=headers)
+            for data in ("[]", "0", '""', "false"):
+                with self.subTest(route=route, data=data), \
+                        logged_tracebacks() as tracebacks:
+                    answer = self.client.post(
+                        route, data=data, content_type="application/json",
+                        headers=headers)
+                    self.assertEqual(answer.status_code, absent.status_code)
+                    self.assertEqual(answer.get_json(), absent.get_json())
+                    self.assertEqual(tracebacks, [])
+
+    def test_a_missing_or_unparseable_body_still_means_an_empty_one(self):
+        # Only a *parsed* non-object is refused. No body, or one that does
+        # not parse, still reaches the route as `{}`, exactly as before:
+        # the linter's own answer for an empty source.
+        for data in (None, "{not json"):
+            with self.subTest(data=data):
+                answer = self.client.post(
+                    "/api/server/c2-profile/lint", data=data,
+                    content_type="application/json",
+                    headers={"Authorization": "Bearer %s" % TEST_TOKEN})
+                self.assertEqual(answer.status_code, 200)
+                self.assertEqual(answer.get_json(),
+                                 {"errors": [], "warnings": [], "info": []})
 
 
 if __name__ == "__main__":

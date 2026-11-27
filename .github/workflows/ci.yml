@@ -47,14 +47,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # The requirements-floor and leak-walk tests shell out to git and
           # read what is TRACKED, so a shallow clone with no history is
           # fine but a detached blobless one is not.
           fetch-depth: 1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.9"
 
@@ -112,7 +112,7 @@ jobs:
       # So node is installed deliberately, and the step below proves it is
       # on PATH, which turns a failed setup into a loud error instead of a
       # quiet gap.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "20"
 
@@ -185,9 +185,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.9"
 
