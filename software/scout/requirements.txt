@@ -1,0 +1,32 @@
+# Dependencies of the scout only.
+#
+# Deliberately separate from software/requirements.txt, which is the C2's and
+# must not grow: the project's hard promise is that the existing C2 and beacon
+# keep working with nothing new installed. The scout is the dependency-heavy
+# half of the way-out work -- it captures, it parses, and in its model stage it
+# asks a local model -- and `software/c2/beacon.py` is served to a target as
+# source text and may import only the standard library. So the two halves meet
+# over files (software/scout/handoff.py) and what the scout needs is its own
+# business, the way the agent's and the operator tooling's are.
+#
+# On a provisioned drop box this installs into the same venv software/main.py
+# runs from, which already carries both packages:
+#
+#     /opt/raccoon/venv/bin/pip install -r software/scout/requirements.txt
+#
+# Nothing new is listed, and that is the point rather than an oversight. Both
+# floors are software/requirements.txt's, copied so this file stands alone;
+# software/tests/test_requirements_floors.py fails if the copies drift. The
+# model client adds nothing: it speaks JSON over HTTP to 127.0.0.1 and uses
+# urllib, because an inference client is one `urlopen` and a dependency on the
+# drop box is a package to install on a device nobody can reach.
+
+# The narrow second capture: EAPOL, DNS, the HTTP slice and TLS ClientHello,
+# with its own BPF filter. The sniffer beside it already uses scapy, and a
+# hand-rolled pcap reader on a 13 W device is not the place to save a package.
+scapy>=2.5.0
+
+# configs/raccoon.yaml, which the scout reads for c2.way_out, the bridge name
+# and nac_bypass.enabled -- the last of which is how rung 4 knows it is
+# pre-spent.
+pyyaml>=6.0

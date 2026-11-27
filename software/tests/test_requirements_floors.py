@@ -32,6 +32,7 @@ REPO = Path(__file__).resolve().parents[2]
 FILES = (
     "software/requirements.txt",
     "software/agent/requirements.txt",
+    "software/scout/requirements.txt",
     "tools/requirements.txt",
     "software/tests/requirements.txt",
 )
