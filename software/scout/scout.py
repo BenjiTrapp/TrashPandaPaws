@@ -98,6 +98,9 @@ class Scout(object):
         state = handoff.read_state(self.state_dir)
         if state is None:
             return None
+        # Computed once and handed to both: the scan costs a radio command,
+        # and the model is asked about the same reading the beacon is given.
+        tap = self._tap_fields()
         document = {
             "version": handoff.DOCUMENT_VERSION,
             "published": time.time(),
@@ -105,9 +108,9 @@ class Scout(object):
             # against the evidence it was made for, so a scout that
             # rewrote this would make every recommendation look stale.
             "evidence": state.get("evidence"),
-            "tap": self._tap_fields(),
+            "tap": tap,
             "identity_pre_spent": self._identity_spent(),
-            "recommendation": self._recommendation(state),
+            "recommendation": self._recommendation(state, tap),
         }
         try:
             handoff.write_document(self.state_dir, document)
@@ -139,7 +142,7 @@ class Scout(object):
             handoff.identity_path(self.state_dir), handoff.STATE_VERSION)
         return bool(request and request.get("taken"))
 
-    def _recommendation(self, state: dict) -> Optional[dict]:
+    def _recommendation(self, state: dict, tap: dict) -> Optional[dict]:
         """The model's answer, or None. Off unless configured on.
 
         Stage 4 of this work, and it ships off: without a device nobody
@@ -150,7 +153,7 @@ class Scout(object):
         if not model.get("enabled"):
             return None
         from .model import ask
-        return ask(model, state, self.evidence.as_document_fields())
+        return ask(model, state, tap)
 
     def _model_block(self) -> dict:
         return (((self.config.get("c2") or {}).get("way_out") or {})

@@ -544,6 +544,13 @@ class TestTheWayOutBlock(WayOutCase):
                 ({"model": {"nonesuch": 1}}, "'nonesuch'"),
                 ({"model": {"endpoint": "http://10.0.0.1:11434"}},
                  "loopback"),
+                # A host that merely *mentions* loopback is not loopback.
+                # A check by substring would dial whatever the file named,
+                # which is the whole thing this setting exists to stop.
+                ({"model": {"endpoint": "http://model.lan/?at=127.0.0.1"}},
+                 "loopback"),
+                ({"model": {"endpoint": "http://127.0.0.1.evil.lan"}},
+                 "loopback"),
                 ({"model": {"timeout_seconds": 0}}, "timeout_seconds")):
             with self.subTest(block=block):
                 self.logged.records = []

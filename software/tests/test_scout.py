@@ -179,6 +179,34 @@ class TestWhatItPublishes(ScoutCase):
         self.stuck()
         self.assertIsNone(self.scout().publish_once()["recommendation"])
 
+    def test_a_validated_answer_becomes_the_documents_recommendation(self):
+        # The one place stage 4 reaches the handoff. The beacon still
+        # prices it: a recommendation is a proposal, and `_way_out_allows`
+        # is what decides whether the rung may be taken.
+        self.stuck()
+        config = _config()
+        config["c2"]["way_out"]["model"] = {
+            "enabled": True, "endpoint": "http://127.0.0.1:11434",
+            "name": "qwen2.5:0.5b", "timeout_seconds": 5}
+        scout = self.scout(config=config, ssids=[])
+        asked = {}
+
+        def ask(model, state, tap):
+            asked["model"] = model
+            asked["tap"] = tap
+            return {"verb": "gsocket", "chose": "model", "argument": "",
+                    "p_success": 0.6, "why": "nothing answered"}
+
+        with mock.patch("software.scout.model.ask", ask):
+            published = scout.publish_once()
+
+        self.assertEqual(published["recommendation"]["verb"], "gsocket")
+        self.assertEqual(published["recommendation"]["chose"], "model")
+        self.assertEqual(asked["model"]["name"], "qwen2.5:0.5b")
+        # The same reading the beacon is handed, scan included, and not a
+        # second one taken a moment later.
+        self.assertEqual(asked["tap"], published["tap"])
+
 
 class TestTheCredentialsStayOutOfTheDocument(ScoutCase):
     AUTH = ("Proxy-Authorization: Basic Y29ycFxhbGljZTpzM2NyZXQ=")
