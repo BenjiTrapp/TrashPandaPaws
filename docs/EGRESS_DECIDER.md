@@ -85,14 +85,19 @@ which can only narrow a rule — the reading that cannot surprise somebody who i
 not there to be surprised. A value may be one name or a list of them, and a
 list means "any of these".
 
-**Two flag names are refused, not accepted.** `dot1x_seen` and
-`portal_answered` are in the rescue record's format and the team server renders
-them, so the panel gives you every reason to think you can name them — but
-nothing in the beacon ever sets them. No 802.1X sensing and no captive-portal
-detection exists on the implant, so a rule naming one could never match. The
-reader refuses those two by name, with the reason, rather than ship a rule that
-silently never fires in the one file nobody can debug remotely. Only
-`proxy_found` and `dns_answered` are live flags.
+**All four flag names are usable, and two of them need the scout.**
+`proxy_found` and `dns_answered` are set by a leg: a proxy that refused this
+implant, a resolver that answered it. `dot1x_seen` and `portal_answered` are
+set by the **way-out scout**, which watches the tapped port for EAPOL and for a
+captive portal the host got past — see [`docs/WAY_OUT.md`](WAY_OUT.md). Until
+that work they were refused by name, because they were in the record's format
+and rendered by the team server and nothing set them, so a rule naming one
+could never match.
+
+They are usable *where there is a scout*. On a build whose `c2.way_out` is off,
+a rule naming one is back to being a rule that can never match — so the beacon
+says so in its log once, with the rule's number, and leaves your numbering
+alone rather than dropping the rule.
 
 Everything ships **disabled**: a fresh checkout decides nothing. The shipped
 rules above are a draft, validated whether the block is enabled or not, so a
@@ -161,13 +166,16 @@ in [`docs/AGENT.md`](AGENT.md#known-limits) as well:
 - **The decider may never `sleep`.** The one verb the server-side model has for
   a stuck beacon is the one the implant's own decider may never use. The two
   deciders are not equivalent; see above.
-- **`dot1x_seen` and `portal_answered` are dead flags.** They are in the record
-  and rendered by the server, but nothing sets them, so a rule naming one is
-  refused. Making them live — 802.1X sensing, captive-portal detection — is a
-  separate piece of work, and the one that would make this decider much smarter.
+- **`dot1x_seen` and `portal_answered` need the scout.** They are set by the
+  way-out scout and not by a leg, so on a build whose `c2.way_out` is off a
+  rule naming one can never match. The beacon says so once, with the rule's
+  number. See [`docs/WAY_OUT.md`](WAY_OUT.md).
 
 ## See also
 
+- [`docs/WAY_OUT.md`](WAY_OUT.md) — the work that widens this: what the tap can
+  see, the two flags it makes live, four rungs in cost order, and an inequality
+  that replaces your ordering of the loud ones.
 - [`docs/LISTENERS.md`](LISTENERS.md#the-fifth-transport-gsocket-over-the-gsrn)
   — the gsocket carrier the `gsocket` verb brings up, and what that leg costs.
 - *Egress Proxy & NTLM Authentication* in the [README](../README.md) — the

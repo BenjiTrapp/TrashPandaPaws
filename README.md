@@ -362,6 +362,7 @@ part pages on Mouser, DigiKey and LCSC. These are stable part-number URLs.
 | **Credential Capture** | HTTP Basic Auth and Telnet login attempts |
 | **C2 Beacon** | Multi-channel beacon over HTTPS, DNS, SMB, and QUIC with jittered callbacks |
 | **Egress recovery** | When a dropped implant cannot reach the team server, an operator-written policy lets it try one connection-establishing verb per stuck cycle on its own — select a proxy, re-run discovery, or bring the gsocket carrier up — inside a gate in code it cannot widen, and off by default. See [`docs/EGRESS_DECIDER.md`](docs/EGRESS_DECIDER.md) |
+| **A way out it finds itself** | A second process watches the tapped port for what the *host* proves works — EAPOL, a captive portal the host got past, the proxy and credential it uses, open SSIDs — and the implant's moves are ordered by an expected-value check that grows with time dark instead of by the operator's list. Four rungs in cost order, the loudest one-shot and last, the local model off by default. Drop-box only, off by default. See [`docs/WAY_OUT.md`](docs/WAY_OUT.md) |
 | **Exfiltration** | Data exfil via DNS tunneling or HTTPS |
 | **Reliability** | Watchdog and systemd auto-recovery with 5 independent persistence layers |
 | **Logging** | Full Cisco IOS-style logging |

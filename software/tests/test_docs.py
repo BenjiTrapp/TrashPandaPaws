@@ -1714,15 +1714,16 @@ class TestTheEgressDeciderIsDocumentedAndShipsDisabled(unittest.TestCase):
                  "the second limit names sleep"),
                 ("the two deciders are not equivalent",
                  "that the implant decider and the server decider differ"),
-                # 3. the two dead flags.
+                # 3. the two flags that used to be dead.
                 ("dot1x_seen",
-                 "the third limit names the first dead flag"),
+                 "the third limit names the first of the two flags"),
                 ("portal_answered",
-                 "the third limit names the second dead flag"),
-                ("nothing sets them",
-                 "why the two flags are refused"),
-                ("a separate piece of work",
-                 "that making them live is a follow-up")):
+                 "the third limit names the second"),
+                ("the scout",
+                 "what sets them now: they were dead until this work, and "
+                 "the limit is no longer that nothing sets them"),
+                ("docs/way_out.md",
+                 "where the reader goes for the half that does")):
             with self.subTest(phrase=phrase):
                 self.present(flat, phrase, what, EGRESS_LIMITS_HEADING)
 
@@ -3192,6 +3193,238 @@ class TestTheRedirectorPageMatchesTheServer(unittest.TestCase):
             self.assertTrue(flag in self.options,
                             "the page names %s for the server; the server's "
                             "parser has no such option" % flag)
+
+
+WAY_OUT_GUIDE = REPO / "docs" / "WAY_OUT.md"
+
+
+class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
+    """The page an operator reads before they switch the way out on.
+
+    The decider's page is held to "say what it may never do before it says
+    a rule". This one is held to something sharper, because rung 4 can end
+    an engagement: the ladder, the numbers behind it, what was **not**
+    measured, and that the model half ships off -- all above the first
+    thing an operator could copy.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.guide = _read("docs", "WAY_OUT.md")
+        cls.flat = " ".join(cls.guide.split()).lower()
+        cls.readme = README.read_text()
+        cls.decider = _read("docs", "EGRESS_DECIDER.md")
+        cls.config = _config()
+
+    def present(self, phrase, what, where="docs/WAY_OUT.md"):
+        self.assertIn(" ".join(phrase.split()).lower(), self.flat,
+                      "%s: %r is not in %s" % (what, phrase, where))
+
+    # ── it exists and is reachable ──
+
+    def test_the_guide_exists_and_is_linked_from_both_its_neighbours(self):
+        self.assertTrue(WAY_OUT_GUIDE.is_file(), "docs/WAY_OUT.md is missing")
+        self.assertGreater(len(self.guide), 2000, "the guide is a stub")
+        self.assertIn("docs/WAY_OUT.md", self.readme,
+                      "the README does not link the guide")
+        self.assertIn("WAY_OUT.md", self.decider,
+                      "docs/EGRESS_DECIDER.md does not link the guide, and it "
+                      "is the page a reader of the decider arrives from")
+
+    # ── the ladder, in cost order, before anything to copy ──
+
+    def test_the_four_rungs_are_named_in_cost_order(self):
+        # The *headings*, parsed, and not the words anywhere on the page:
+        # "borrow" and "radio" appear in the prose too, so a first-index
+        # check would be satisfied by a page whose sections were in any
+        # order at all. The order is the design's backbone.
+        import re
+        headings = re.findall(r"^### (\d)\. ([A-Za-z][^\n—-]*)",
+                              self.guide, re.M)
+        self.assertEqual([number for number, _ in headings],
+                         ["1", "2", "3", "4"],
+                         "the ladder's four sections are not 1 to 4: %r"
+                         % (headings,))
+        named = [name.strip().lower() for _, name in headings]
+        self.assertEqual(named[0], "observe")
+        self.assertEqual(named[1], "borrow")
+        self.assertIn("radio", named[2])
+        self.assertIn("identity", named[3])
+
+    def test_the_ladder_is_above_the_first_thing_to_copy(self):
+        marks = [self.flat.index(mark) for mark in ("enabled: true", "```")
+                 if mark in self.flat]
+        self.assertTrue(marks, "the guide shows nothing to copy at all")
+        self.assertLess(self.flat.index("identity"), min(marks),
+                        "an operator reaches a block to paste before they "
+                        "have read what the loudest rung does")
+
+    def test_it_says_what_the_loudest_rung_can_cost(self):
+        for phrase, what in (
+                ("port security", "that rung 4 can trip port security"),
+                ("for good", "that the port can be turned off for good"),
+                ("once per deployment", "that rung 4 is one-shot"),
+                ("nac_bypass.enabled", "that an operator who enabled the "
+                                       "bypass has already spent it")):
+            with self.subTest(phrase=phrase):
+                self.present(phrase, what)
+
+    # ── the numbers are the code's, not the page's ──
+
+    def test_the_crossing_hours_match_the_beacons_own_arithmetic(self):
+        # Computed here and not typed here: a page with its own numbers is
+        # a page that goes stale the first time the table moves.
+        import base64
+
+        from software.c2.beacon import Beacon, read_way_out_policy
+
+        def crosses(verb, flags=()):
+            for hours in range(0, 200):
+                beacon = Beacon({"c2": {
+                    "beacon_interval_seconds": 300, "jitter_percent": 0,
+                    "encryption_key": base64.b64encode(b"\x24" * 32).decode(),
+                    "proxy": {"mode": "auto"}, "https": {"enabled": False},
+                    "dns": {"enabled": False}, "smb": {"enabled": False},
+                    "quic": {"enabled": False},
+                    "way_out": read_way_out_policy(
+                        {"enabled": True, "state_dir": "/opt/raccoon/state"}),
+                }})
+                beacon._running = False
+                beacon._stuck_cycles = hours * 12
+                from software.c2 import beacon as beacon_mod
+                for name in flags:
+                    beacon._rescue_flags |= beacon_mod._EGRESS_FLAG_BITS[name]
+                if beacon._way_out_allows(verb)[0]:
+                    return hours
+            return None
+
+        for verb, flags, what in (
+                ("proxy", (), "the borrow rung's crossing"),
+                ("radio", (), "the radio rung's crossing"),
+                ("identity", (), "the identity rung's crossing"),
+                ("identity", ("dot1x_seen",),
+                 "where dot1x_seen moves the identity rung")):
+            hours = crosses(verb, flags)
+            with self.subTest(verb=verb, flags=flags):
+                self.assertIsNotNone(hours, what)
+                self.present("%d hour" % hours, what)
+
+    def test_the_shipped_numbers_are_on_the_page_with_their_meaning(self):
+        # Each number with the words that say what it is, not as a bare
+        # digit: "7" is on this page as an hour, so a digit search would
+        # pass for a curve step of 7 as happily as for 5.
+        block = self.config["c2"]["way_out"]
+        for key, template in (
+                ("points_per_hour", "`%d` per whole hour"),
+                ("points_max", "capped at `%d`"),
+                ("risk_coefficient", "risk coefficient `%d`"),
+                ("dot1x_detect", "raises the identity rung's by `%.2f`"),
+                ("portal_detect", "lowers the borrow rung's by `%.2f`")):
+            with self.subTest(key=key):
+                # The modifiers are written on the page as a magnitude --
+                # "lowers ... by 0.10" -- so the sign lives in the verb
+                # rather than in the number.
+                value = block[key]
+                self.present(template % abs(value),
+                             "the shipped %s, with its meaning" % key)
+
+    # ── what was not measured, and that stage 4 ships off ──
+
+    def test_it_says_the_model_half_ships_off_and_why(self):
+        for phrase, what in (
+                ("ships off", "that the model half is off"),
+                ("there is no device", "why: nobody can measure it"),
+                ("first measurement", "that the first operator to switch it "
+                                      "on is the first measurement"),
+                ("loopback", "that the model is reached on loopback only")):
+            with self.subTest(phrase=phrase):
+                self.present(phrase, what)
+
+    def test_it_names_what_was_not_measured(self):
+        for phrase, what in (
+                ("watts", "that watts were not measured"),
+                ("thermal", "that thermals were not measured"),
+                ("optimistic", "that every measured second is a bound")):
+            with self.subTest(phrase=phrase):
+                self.present(phrase, what)
+
+    def test_it_says_which_build_this_ships_in(self):
+        self.present("drop-box only", "that a generated build has none")
+
+    # ── the shipped block ──
+
+    def test_the_shipped_block_is_off_and_reads_without_a_warning(self):
+        from software.c2 import beacon as beacon_mod
+
+        handler = _CountingWarnings()
+        logger = beacon_mod.logger
+        propagate = logger.propagate
+        logger.addHandler(handler)
+        logger.propagate = False
+        try:
+            policy = beacon_mod.read_way_out_policy(
+                self.config["c2"]["way_out"])
+        finally:
+            logger.removeHandler(handler)
+            logger.propagate = propagate
+
+        self.assertEqual(handler.messages, [],
+                         "the implant's reader warned about the shipped "
+                         "block: %r" % handler.messages)
+        self.assertFalse(policy["enabled"],
+                         "the shipped way out is enabled; a fresh checkout "
+                         "watches nothing and decides nothing")
+        self.assertFalse(policy["model"]["enabled"],
+                         "stage 4 must ship off")
+
+    def test_the_state_directory_is_not_under_tmp(self):
+        # The trap the block exists to avoid: both implant units set
+        # PrivateTmp=true, so each process would get its own /tmp and the
+        # handoff would silently never happen.
+        state_dir = self.config["c2"]["way_out"]["state_dir"]
+        self.assertFalse(state_dir.startswith("/tmp"), state_dir)
+
+
+class TestTheDeadFlagsAreNoLongerDocumentedAsDead(unittest.TestCase):
+    """The claim the code changed, corrected where readers find it.
+
+    `dot1x_seen` and `portal_answered` were refused by name because nothing
+    in the implant set them. The scout sets them now, so a page that still
+    says "nothing sets them" is confidently wrong -- which this file's own
+    docstring calls worse than prose that is vague.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.decider = " ".join(_read("docs", "EGRESS_DECIDER.md").split())
+        cls.limits = " ".join(AGENT_DOC.read_text().split())
+
+    def test_the_decider_page_no_longer_calls_them_dead(self):
+        for phrase in ("two flag names are refused",
+                       "are dead flags",
+                       "nothing in the beacon ever sets them"):
+            with self.subTest(phrase=phrase):
+                self.assertNotIn(phrase.lower(), self.decider.lower(),
+                                 "docs/EGRESS_DECIDER.md still says %r"
+                                 % phrase)
+
+    def test_the_decider_page_says_what_sets_them_now(self):
+        flat = self.decider.lower()
+        for phrase in ("dot1x_seen", "portal_answered", "scout",
+                       "way_out.md"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, flat,
+                              "docs/EGRESS_DECIDER.md does not mention %r"
+                              % phrase)
+
+    def test_known_limits_does_not_still_say_nothing_sets_them(self):
+        self.assertNotIn("nothing sets them", self.limits.lower())
+
+    def test_the_implants_reader_agrees_with_both_pages(self):
+        from software.c2 import beacon as beacon_mod
+        self.assertEqual(beacon_mod._EGRESS_DEAD_FLAGS, {})
+        for flag in ("dot1x_seen", "portal_answered"):
+            self.assertIn(flag, beacon_mod._EGRESS_FLAG_BITS, flag)
 
 
 if __name__ == "__main__":

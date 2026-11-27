@@ -1090,13 +1090,15 @@ are their own entries and not filed under the hardening pass's groups below.
   into silence. So the two deciders are not equivalent, and a policy cannot
   add `sleep` back, because the allowed set is fixed in the beacon rather than
   read from the file.
-- **Two rescue flags are dead, and a rule naming one is refused.** `dot1x_seen`
-  and `portal_answered` are in the rescue record's format and the team server
-  renders them, so the panel invites a rule that names them — but nothing sets
-  them in the beacon, because no 802.1X sensing and no captive-portal
-  detection exists here. A rule that could never match is refused by name when
-  the policy is read. Making them live is a separate piece of work, and the one
-  that would make this decider much smarter.
+- **Two rescue flags need a second process.** `dot1x_seen` and
+  `portal_answered` are in the rescue record's format and the team server
+  renders them, and until the way-out work nothing in the implant set them —
+  so a rule naming one was refused by name. The scout sets them now: it
+  watches the tapped port for EAPOL and for a captive portal the host got
+  past. The limit that is left is narrower and still real: on a build whose
+  `c2.way_out` is off there is no scout, so a rule naming one of those two can
+  never match, and the beacon says so in its log rather than dropping the
+  rule. See [`docs/WAY_OUT.md`](WAY_OUT.md).
 
 
 ### Left open by the security hardening
