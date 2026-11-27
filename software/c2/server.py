@@ -1168,9 +1168,16 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
 
     def check_auth():
         auth = request.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            return auth[7:] == operator_token
-        return False
+        if not auth.startswith("Bearer "):
+            return False
+        # `hmac.compare_digest`, and over bytes rather than text: it raises
+        # TypeError on two `str` arguments unless both are ASCII-only, and
+        # neither side is ours to constrain -- the presented token arrives in
+        # a request header and the real one is whatever the operator typed or
+        # `secrets.token_urlsafe` produced. `==` could not raise; a 500 on
+        # this path would be a new way to tell a good token from a bad one.
+        return hmac.compare_digest(auth[7:].encode("utf-8"),
+                                   str(operator_token).encode("utf-8"))
 
     def require_auth(f):
         from functools import wraps

@@ -1228,10 +1228,6 @@ more.
 
 #### Housekeeping, but visible
 
-- **The operator token is compared with `==`**, not `hmac.compare_digest`
-  (`check_auth` in `software/c2/server.py`). Impractical to exploit remotely
-  and free to fix. The agent service already compares correctly, and the
-  agent layer's design document records this one.
 - **Project-written files land at `0644`**: the state file, the database, the
   logs. The configuration loader refuses to read a key file looser than
   owner-only, so the project asks of others what it does not do itself. The

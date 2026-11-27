@@ -2146,6 +2146,104 @@ class TestTokenIsNotServed(unittest.TestCase):
             self.assertIn("#agent-list .agent-card", first["wait"], board)
 
 
+class TestTheOperatorTokenIsComparedInConstantTime(unittest.TestCase):
+    """`check_auth` compares the bearer token, and how it compares matters.
+
+    Impractical to exploit over a network and free to fix, which is why it
+    sat in *Known limits* under housekeeping rather than higher. The agent
+    service already compares correctly and the listener tasking route does
+    too; this was the one left on `==`.
+
+    Read from the AST, not from the text: a search for `compare_digest`
+    anywhere in the file is what the earlier probe in `test_docs` did, and
+    the listener route's correct comparison then made it report this one
+    fixed while `check_auth` still held an `==`. So the function is found by
+    name and its own comparison is the one looked at.
+    """
+
+    def _check_auth(self):
+        import ast
+
+        tree = ast.parse(_REPO.joinpath("software", "c2", "server.py")
+                         .read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "check_auth":
+                return node
+        self.fail("server.py has no check_auth")
+
+    def test_the_bearer_token_is_not_compared_with_equality(self):
+        for node in ast.walk(self._check_auth()):
+            if isinstance(node, ast.Compare):
+                self.assertFalse(
+                    any(isinstance(op, (ast.Eq, ast.NotEq))
+                        for op in node.ops),
+                    "check_auth compares the operator token with ==, which "
+                    "returns at the first wrong byte")
+
+    def test_the_bearer_token_is_compared_with_compare_digest(self):
+        names = {n.attr for n in ast.walk(self._check_auth())
+                 if isinstance(n, ast.Attribute)}
+        self.assertIn("compare_digest", names,
+                      "check_auth does not call hmac.compare_digest")
+
+    def test_the_right_token_is_still_accepted_and_a_wrong_one_is_not(self):
+        # The property the constant-time change must not cost: a comparison
+        # that is constant-time and always False would pass the two checks
+        # above.
+        data_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, data_dir, ignore_errors=True)
+        app = server_mod.create_app(server_mod.ServerCrypto(random_key()),
+                                    "right-token", data_dir)
+        app.config["TESTING"] = True
+        client = app.test_client()
+        self.assertEqual(client.get("/api/agents", headers={
+            "Authorization": "Bearer right-token"}).status_code, 200)
+        for wrong in ("right-toke", "right-tokenn", "", "RIGHT-TOKEN",
+                      "wrong", "right-token "):
+            with self.subTest(token=wrong):
+                self.assertEqual(client.get("/api/agents", headers={
+                    "Authorization": "Bearer " + wrong}).status_code, 401)
+        for header in ("", "right-token", "Basic right-token",
+                       "bearer right-token"):
+            with self.subTest(header=header):
+                self.assertEqual(
+                    client.get("/api/agents",
+                               headers={"Authorization": header}).status_code,
+                    401)
+
+    def test_a_non_ascii_token_does_not_raise(self):
+        # `hmac.compare_digest` refuses two `str` arguments unless both are
+        # ASCII-only, and the token comes from the request. `==` could not
+        # raise; this can, and a 500 on an authentication path would be a
+        # new way to tell a good token from a bad one.
+        data_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, data_dir, ignore_errors=True)
+        app = server_mod.create_app(server_mod.ServerCrypto(random_key()),
+                                    "right-token", data_dir)
+        app.config["TESTING"] = True
+        client = app.test_client()
+        for wrong in ("tökén", "right-tokeñ", "\u2028", "🦝"):
+            with self.subTest(token=wrong):
+                reply = client.get("/api/agents", headers={
+                    "Authorization": "Bearer " + wrong})
+                self.assertEqual(reply.status_code, 401)
+
+    def test_a_non_ascii_operator_token_still_authenticates(self):
+        # The other direction: the token the server was started with is not
+        # ours to constrain -- `--token` and RACCOON_TOKEN take whatever the
+        # operator typed.
+        data_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, data_dir, ignore_errors=True)
+        app = server_mod.create_app(server_mod.ServerCrypto(random_key()),
+                                    "tökén-🦝", data_dir)
+        app.config["TESTING"] = True
+        client = app.test_client()
+        self.assertEqual(client.get("/api/agents", headers={
+            "Authorization": "Bearer tökén-🦝"}).status_code, 200)
+        self.assertEqual(client.get("/api/agents", headers={
+            "Authorization": "Bearer tökén-🦊"}).status_code, 401)
+
+
 class TestCaptureCleanup(unittest.TestCase):
     """capture_figures.sh must be able to stop the stack it started.
 

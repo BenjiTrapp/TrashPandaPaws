@@ -584,20 +584,6 @@ def _the_shipped_config_carries_a_vnc_password():
                     yield value
                 yield from walk(value)
     return "raccoon" in list(walk(_config()))
-
-
-def _the_token_is_compared_with_plain_equality():
-    text = _read("software", "c2", "server.py")
-    # Only the operator token's own comparison counts. This used to also
-    # require that `compare_digest` appeared nowhere in the file, which
-    # read as a shortcut for "nothing here compares tokens properly yet".
-    # The listener tasking route then added a second, correct comparison,
-    # and the shortcut made this probe report the finding fixed while
-    # line 350 still held an `==`. A probe that names one comparison has
-    # to look at that comparison.
-    return "return auth[7:] == operator_token" in text
-
-
 def _project_files_are_world_readable():
     sources = [REPO / "software" / "main.py", REPO / "software" / "watchdog.py"]
     for sub in ("c2", "agent"):
@@ -805,7 +791,6 @@ _OPEN_FINDINGS = {
         ("implant id is one per host", _a_beacons_implant_id_is_one_per_host),
     ],
     "Housekeeping, but visible": [
-        ("compared with `==`", _the_token_is_compared_with_plain_equality),
         ("land at `0644`", _project_files_are_world_readable),
         ("no `LICENSE` file", _there_is_no_licence_file),
         ("Six commits", None),

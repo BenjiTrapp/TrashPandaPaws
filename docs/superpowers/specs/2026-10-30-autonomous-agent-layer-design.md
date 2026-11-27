@@ -96,6 +96,14 @@ Dinge, die dieses Projekt zum Scheitern bringen würden, auch wenn es technisch 
 | Python 3.9.6 in den venvs, 3.12 im Docker-Image | `Dockerfile`, `.venv` | **Zielversion 3.9.** Kein `match`, kein `X \| Y` zur Laufzeit, kein `asyncio.TaskGroup`, kein `tomllib`. |
 | FTS5 im System-sqlite3 vorhanden (geprüft) | — | Trotzdem Rückfall auf `LIKE` statt Startverweigerung. |
 
+Diese Tabelle beschreibt den Code am 2026-10-30; die Fundstellen sind
+Zeilennummern von damals. Eine Zeile ist inzwischen geschlossen und steht hier
+nur noch als Begründung des Entwurfs: **`check_auth` vergleicht den
+Operator-Token seit 2026-11-28 mit `hmac.compare_digest`** über UTF-8-Bytes,
+und der entsprechende Eintrag in *Known limits* von
+[`docs/AGENT.md`](../../AGENT.md#known-limits) ist mit ihm entfallen. Der
+eigene Agent-Token aus Abschnitt 18 hat sich dadurch nicht erledigt.
+
 ### 5.2 Die Drop-Box fährt den Python-Beacon
 
 **Entschieden.** `software/main.py:111-147` bevorzugt heute das Sliver-Implant und fällt nur auf `software/c2/beacon.py` zurück, wenn die Binary fehlt; `configs/raccoon.yaml:77` liefert `sliver.enabled: true` aus. `server.py` enthält **keine Referenz auf Sliver** — eine Sliver-verwaltete Box checkt beim Team-Server nie ein und ist für den Agenten unsichtbar.
