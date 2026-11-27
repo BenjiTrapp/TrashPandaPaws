@@ -161,8 +161,9 @@ document does not pretend the objection was wrong.
 p_detect=0.0` because *"they are never weighed, only refused"*
 (`safety.py:330-334`). So nothing in the risk table can price any of this.
 
-New tier-2 rows are needed, and after the EV calibration amendment the
-utility term is *the value of what the action unlocks*
+New tier-2 rows are needed -- in a table of their own, see the correction
+under *Where the arithmetic runs* -- and after the EV calibration amendment
+the utility term is *the value of what the action unlocks*
 (`safety.py:420-428`, `2026-11-02-ev-calibration-amendment.md:58-70`). With
 the shipped profile — `risk_coefficient = 33`, `ev_threshold = 0`
 (`config.py:652-659`), formula at `gate.py:361-363` — a rung is allowed when
@@ -238,7 +239,7 @@ the end instead of the beginning.
 
 ### What the device may see, and who collects it
 
-A new process, `software/implant/scout` (name is the builder's), running on
+A new process, `software/scout` (the name was the builder's), running on
 the Pi from the same venv as `software/main.py` — which already imports
 `scapy`, `yaml` and friends (`software/requirements.txt`,
 `bootstrap.sh:84-86`). It collects, at a low rate and only while the beacon
@@ -301,9 +302,20 @@ aims at: a destination the host proves is reachable.
 nothing of its own, and decides nothing on its own.
 
 **2. Borrow.** The host's proxy, including answering a `407` with a captured
-credential; DNS over HTTPS through a resolver that answered; a captive portal
-answered as the host answered it. Reversible. Leaves lines in logs a human
-*could* read: a proxy auth, an account that locked out.
+credential, and a captive portal answered as the host answered it.
+Reversible. Leaves lines in logs a human *could* read: a proxy auth, an
+account that locked out.
+
+*Corrected by the build.* This paragraph named a third arm -- "DNS over
+HTTPS through a resolver that answered" -- and it is **not built**, for a
+reason this document already contains: every implementable reading of it
+changes a leg's resolution path or its URL at runtime, which is this
+project's own non-goal ("what is baked into a build stays baked"). The
+evidence table above is the version that was right: the host's resolver is
+*evidence only*. The scout collects it and publishes it; nothing moves on
+it. A network that blocks plain DNS to the host's resolver but allows DoH
+is therefore not helped by rung 2, and that is a known gap rather than an
+oversight.
 
 **3. Its own radio.** An open or guest SSID, which leaves the tapped port
 altogether. There is **no wifi code in this repository today** — `--wifi` in
@@ -350,8 +362,11 @@ unchanged from the decider design.
 
 The recommendation is produced by the scout on its own clock: it collects
 evidence, asks the local model one question with the evidence and the
-allowed rungs, validates the answer against `EGRESS_VERBS` and the current
-rung ceiling, and publishes it. A model that answers something that is not
+allowed rungs, validates the answer against `EGRESS_VERBS`, and publishes
+it. The rung *ceiling* is deliberately **not** re-checked there: the
+beacon's arithmetic refuses a rung the curve has not reached whether the
+policy or the model proposed it, and a second copy of the curve in the
+scout would be a second place for the ladder to be wrong. A model that answers something that is not
 an allowed verb is a refusal, logged, not a crash — the same stance
 `read_egress_policy` takes toward a rule naming a dead flag.
 
@@ -399,8 +414,21 @@ The ladder is arithmetic, not a policy line an operator can invert.
 
 **Where the arithmetic runs.** Not in `gate.Gate`: it needs a SQLite
 connection, a `run_id`, an approvals table and an event loop
-(`gate.py:258-307`), none of which exists on an implant with no channel. The
-four rows and the inequality are a **stdlib copy inside `beacon.py`**,
+(`gate.py:258-307`), none of which exists on an implant with no channel.
+
+*Corrected by the build:* the authority is `safety.WAY_OUT_TABLE`, a table
+of its own beside `RISK_TABLE` rather than three rows inside it. Three
+reasons, and they are about modelling rather than tidiness. `classify()`
+turns a *command string* into a row and can never return one of these.
+The server's gate cannot know how long an implant it cannot reach has been
+dark, so it would price the benefit term wrongly -- and that term is the
+whole mechanism below. And a row the server can never reach would still
+appear in the operator's gate lists and in the *measured* "reachable
+unattended" counts on `docs/AGENT.md`, making a measured claim false. The
+copy-comparison test holds `beacon.py`'s copy against that table, which is
+what this paragraph's intent asks for.
+
+The three rows and the inequality are a **stdlib copy inside `beacon.py`**,
 following the pattern this file already uses for the rescue record — *"a copy
 and not an import, because the generator serves this file to a target as
 source text"* (`beacon.py:1686-1692`) — and held against the real
@@ -442,7 +470,10 @@ What the ceiling kept, and the arithmetic does not express, is **how often**:
   arithmetic looks on the next cycle.
 - A rung that was already taken outside this project is pre-spent, not
   offered again: `nac_bypass.enabled: true` means the identity was taken at
-  boot, and the scout reads that rather than counting it as available.
+  boot, and the scout reads that rather than counting it as available. A
+  consequence the build added: because that fact lives only in the scout's
+  document, rung 4 is **not offered at all** without a fresh one. The safe
+  answer to an unknown is not to make the one irreversible move.
 
 Staying stopped means the same as today: the implant hands the decision back
 rather than giving up, and the rescue record — if DNS ever answers again —
@@ -515,6 +546,84 @@ Constraint 1, and it happens to absorb the unmeasured latency as well. What
 it does *not* absorb is power: inference drawing more than the 802.3af budget
 leaves while the device is bridging is a hardware failure mode, not a
 software one, and no architecture here makes it safe.
+
+## Measurements
+
+Taken 2026-11-27 with `tools/way_out_bench.py` in the bench this document
+asks for: `python:3.9-slim` on `linux/arm64`, `--cpus 4 --memory 4g`, which
+are the Pi 4 Model B's four cores and 4 GB. Rebuild and re-run it with
+
+```
+docker build -f tools/way_out_bench.Dockerfile -t raccoon-way-out-bench .
+docker run --rm --platform linux/arm64 --cpus 4 --memory 4g \
+    -v "$PWD:/repo" -w /repo raccoon-way-out-bench --json
+```
+
+**Every second below is an optimistic bound, not a result.** A
+Cortex-A72's clock is not an aarch64 container host's, and nothing in the
+bench is bridging a host's traffic, drawing from a 13 W PoE budget, or
+sharing an IP phone's thermal envelope while it runs. The factor between
+the two is not something anybody in this project can pin down.
+
+### What the container measured fully
+
+| What | Number | Reading |
+|---|---|---|
+| The scout's parse | **14.3 µs CPU per packet** over 4000 replayed frames (0.057 s total) | At 1000 packets/s through the filter that is about 1.4% of one core. The frames are the five rows of the evidence table, and the run read both flags and one credential out of them, so the number is the cost of *reading*, not of looping |
+| The handoff | **697 µs per write-and-read round**, 500 rounds | Includes an `fsync`, so it measures the bench's storage as much as the code. Against a 300 s beacon interval it is noise |
+| The arithmetic | **2.9 µs per decision**, 500 rounds | The gate costs nothing worth naming |
+| Fresh-or-ignore | all three rules hold: a fresh document is read, a stale one is ignored, one from the future is ignored | This is the property that makes a dead scout -- or a model too slow for the hardware -- harmless |
+| The ladder's crossings | borrow at **1 h** dark, radio at **5 h**, identity at **7 h**; `portal_answered` moves borrow to **0 h**, `dot1x_seen` moves identity to **9 h** | Read out of `beacon.py`'s own numbers by the bench, not typed into it. The ladder is ordered, and the evidence moves the crossings in the directions the design argues for |
+
+### What it found that nobody was looking for
+
+The **first** container run measured a *disabled* feature and reported
+nonsense that looked plausible: the borrow rung crossing at hour 0, the two
+loud rungs never crossing, and "a fresh document is read: **false**". The
+cause is a rule of this design working exactly as written --
+`read_way_out_policy` refuses a `state_dir` under `/tmp`, because both
+implant units set `PrivateTmp=true` -- and `tempfile.gettempdir()` is
+`/tmp` on Linux and `/var/folders/...` on the macOS machine where the bench
+was written. So the bench now scratches outside `/tmp` and a test forces
+that case rather than asking the host.
+
+### The model, and what the validator took
+
+`qwen2.5:0.5b` pulled by a stock `ollama/ollama` in a second arm64
+container with the same limits, reached on **its own loopback** (the bench
+runs in that container's network namespace, because the design allows no
+other address).
+
+- **It answers, and fast enough:** **0.26 s to 3.44 s** per question over
+  twelve asks. Against a 300 s beacon interval and a 900 s freshness
+  window, a model this size is not the bottleneck. Optimistic bound.
+- **The validator accepted nine of twelve.** The three refusals were the
+  same failure: the model answered with the whole menu line --
+  `"proxy -- use a proxy this host already found"` -- instead of the verb.
+  `validate` refused it by name and the scout logged why, which is the
+  degradation this design relies on: the beacon decided on its policy.
+- **It never produced a `p_success`.** Twelve asks, no estimate. So the
+  clamp and the `override_decisive` mark exist and are tested, and a model
+  this size never exercises them.
+- **Its reasoning and its verb disagreed at least once.** One accepted
+  answer named `rediscover` while its `why` argued for bringing up a relay
+  leg. The verb is what the implant acts on, so the answer was usable --
+  and it is a measurement about what "the weakest model in the system owns
+  the decision" buys, which Constraint 3 left unanswered and still does.
+
+**A bad result is a measurement.** Nine of twelve is not a number this
+document is pleased with, and it is the number. It is also an argument for
+the shape that was chosen for another reason: a refused answer costs one
+log line and a policy decision, not a rescue.
+
+### What no container can measure
+
+| | Why |
+|---|---|
+| **Watts** | There is no device. The 802.3af budget at the board is about 13 W and has to cover bridging and capturing too; a container draws from a wall socket. Stage 4 ships off because of this |
+| **Thermals** | There is no device. A Pi 4 in an IP-phone-shaped enclosure under sustained inference is a hardware question, and a container shares its host's cooling |
+
+Both stay in the risk table below rather than being assumed away.
 
 ## Risks, and what each would look like
 
