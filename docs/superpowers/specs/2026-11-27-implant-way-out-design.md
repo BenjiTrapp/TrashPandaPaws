@@ -569,11 +569,17 @@ the two is not something anybody in this project can pin down.
 
 | What | Number | Reading |
 |---|---|---|
-| The scout's parse | **14.3 µs CPU per packet** over 4000 replayed frames (0.057 s total) | At 1000 packets/s through the filter that is about 1.4% of one core. The frames are the five rows of the evidence table, and the run read both flags and one credential out of them, so the number is the cost of *reading*, not of looping |
-| The handoff | **697 µs per write-and-read round**, 500 rounds | Includes an `fsync`, so it measures the bench's storage as much as the code. Against a 300 s beacon interval it is noise |
-| The arithmetic | **2.9 µs per decision**, 500 rounds | The gate costs nothing worth naming |
+| The scout's parse | **24.4 µs CPU per packet** over 4000 replayed frames | At 1000 packets/s through the filter that is about 2.4% of one core. Every row of the evidence table, TLS included, with a **distinct** destination, resolver and flow per round: the run read both flags, 256 resolvers, 256 TLS destinations and one credential, and ended with 333 unanswered CONNECTs still waiting. So this is the cost of reading at a real tap's cardinality -- the first version of this measurement replayed seven frames in a loop and reported 14.3 µs, which was the cost of the loop |
+| The handoff | **1286 µs per write-and-read round**, 500 rounds | Includes an `fsync`, so it measures the bench's storage as much as the code. Against a 300 s beacon interval it is noise |
+| The arithmetic | **4.9 µs per decision**, 500 rounds | The gate costs nothing worth naming |
 | Fresh-or-ignore | all three rules hold: a fresh document is read, a stale one is ignored, one from the future is ignored | This is the property that makes a dead scout -- or a model too slow for the hardware -- harmless |
 | The ladder's crossings | borrow at **1 h** dark, radio at **5 h**, identity at **7 h**; `portal_answered` moves borrow to **0 h**, `dot1x_seen` moves identity to **9 h** | Read out of `beacon.py`'s own numbers by the bench, not typed into it. The ladder is ordered, and the evidence moves the crossings in the directions the design argues for |
+
+And what the bounds look like under that load: both published lists hit
+their 256-entry ceiling and stayed there, and what was waiting for an
+answer stayed two orders of magnitude below its 2048 ceiling. Before the
+bounds the same 4000 frames left every one of those collections growing,
+and 40,000 frames of ordinary traffic measured 400 MB resident.
 
 ### What it found that nobody was looking for
 
@@ -594,27 +600,39 @@ container with the same limits, reached on **its own loopback** (the bench
 runs in that container's network namespace, because the design allows no
 other address).
 
-- **It answers, and fast enough:** **0.26 s to 3.44 s** per question over
+Reproduce it with `--model-asks 12`, which is the flag this section needed
+and did not have at first: the figures below are a ratio, and the command
+written here asked once.
+
+- **It answers, and fast enough:** **0.49 s to 3.34 s** per question over
   twelve asks. Against a 300 s beacon interval and a 900 s freshness
   window, a model this size is not the bottleneck. Optimistic bound.
-- **The validator accepted nine of twelve.** The three refusals were the
-  same failure: the model answered with the whole menu line --
-  `"proxy -- use a proxy this host already found"` -- instead of the verb.
-  `validate` refused it by name and the scout logged why, which is the
-  degradation this design relies on: the beacon decided on its policy.
+- **The validator accepted eleven of twelve.** The one refusal was the
+  failure every refusal in every run has been: the model answered with the
+  whole menu line -- `"proxy -- use a proxy this host already found"` --
+  instead of the verb. `validate` refused it by name, the scout logged
+  why, and the beacon decided on its policy, which is the degradation this
+  design relies on.
 - **It never produced a `p_success`.** Twelve asks, no estimate. So the
   clamp and the `override_decisive` mark exist and are tested, and a model
   this size never exercises them.
-- **Its reasoning and its verb disagreed at least once.** One accepted
-  answer named `rediscover` while its `why` argued for bringing up a relay
-  leg. The verb is what the implant acts on, so the answer was usable --
-  and it is a measurement about what "the weakest model in the system owns
-  the decision" buys, which Constraint 3 left unanswered and still does.
+- **It named `identity`.** Among the four verbs it chose across twelve asks
+  -- `gsocket`, `identity`, `portal`, `rediscover` -- is the irreversible
+  one, on evidence one hour old. The arithmetic refused it, which is
+  exactly what both paths going through the gate is for, and it is the
+  sharpest measurement here of Constraint 3's unanswered objection: the
+  weakest model in the system reached for the move that can end the
+  engagement, and what stopped it was a number and not the model.
+- **Its reasoning and its verb disagreed at least once.** An earlier run's
+  accepted answer named `rediscover` while its `why` argued for bringing up
+  a relay leg, and this run's `why` fields are truncated mid-sentence. The
+  verb is what the implant acts on, so the answers were usable.
 
-**A bad result is a measurement.** Nine of twelve is not a number this
-document is pleased with, and it is the number. It is also an argument for
-the shape that was chosen for another reason: a refused answer costs one
-log line and a policy decision, not a rescue.
+**A bad result is a measurement.** Eleven of twelve is better than the
+nine of twelve an earlier run measured and neither is a number this
+document is pleased with. Both are an argument for the shape that was
+chosen for another reason: a refused answer costs one log line and a
+policy decision, not a rescue.
 
 ### What no container can measure
 

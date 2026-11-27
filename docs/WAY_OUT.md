@@ -265,12 +265,14 @@ deployment that can be power-cycled.
 
 What *was* measured, in an arm64 container with `--cpus 4 --memory 4g`, is in
 the design's *Measurements* section. In short: the scout's parse costs about
-14 µs of CPU per packet, the handoff about 700 µs per round, the arithmetic
-about 3 µs per decision, and a real `qwen2.5:0.5b` answered in 0.26–3.44
-seconds with the validator accepting nine of twelve answers. **Every second
-there is an optimistic bound, not a result** — a container is not a
-Cortex-A72 under a 13 W budget — and watts and thermals are named as not
-measurable rather than assumed away.
+24 µs of CPU per packet at a real tap's cardinality, the handoff about 1.3 ms
+per round, the arithmetic about 5 µs per decision, and a real `qwen2.5:0.5b`
+answered in 0.5–3.3 seconds with the validator accepting eleven of twelve
+answers. It also named `identity` — the irreversible rung — on hour-old
+evidence, and the arithmetic refused it. **Every second there is an
+optimistic bound, not a result** — a container is not a Cortex-A72 under a
+13 W budget — and watts and thermals are named as not measurable rather than
+assumed away.
 
 ## What you learn, and when
 
