@@ -73,11 +73,13 @@ jobs:
           head -5 /tmp/help.txt
           grep -q -- "--operator-port" /tmp/help.txt
 
-      # Reported, not asserted. Which tools resolve depends on the
-      # runner's architecture -- NetExec has no aarch64 wheel and is
-      # allowed to be absent -- so this prints the truth rather than
-      # demanding a particular answer. The entrypoint's banner is built
-      # the same way for the same reason.
+      # Reported, not asserted -- with one exception. Which of these
+      # resolve depends on the runner's architecture, so this prints the
+      # truth rather than demanding a particular answer. The entrypoint's
+      # banner is built the same way for the same reason.
+      #
+      # NetExec is the exception, and it is asserted in its own step
+      # below: it used to be the thing this step was reporting as absent.
       - name: What the image actually carries
         run: |
           docker run --rm --entrypoint sh raccoon-c2:ci -c '
@@ -101,6 +103,26 @@ jobs:
                   print("  %-18s ok" % name)
           PY
           '
+
+      # ── NetExec, asserted ──
+      #
+      # This was a report line until the wheels stage existed. aardwolf
+      # publishes no Linux aarch64 wheel, so on arm64 the image built
+      # green with no `nxc` in it -- and the agent runs admitted commands
+      # on this host (software/agent/executor/server_tool.py), so an
+      # eight-phase campaign hit "command not found" at run time.
+      #
+      # The Dockerfile's install still ends in `|| echo`, which is right:
+      # one tool must not cost every architecture its image. This step is
+      # the other half of that bargain. A failed wheel build now turns
+      # one job red instead of shipping a quietly incomplete image.
+      # Through `sh -c`, not `--entrypoint nxc ... --version`: the latter
+      # let the Docker CLI on this project's development machine take
+      # `--version` for its own and print `docker run --help`. A check
+      # that cannot be run the same way locally is a check nobody trusts.
+      - name: NetExec resolves and runs
+        run: |
+          docker run --rm --entrypoint sh raccoon-c2:ci -c 'nxc --version'
 
       # The compose file is the documented way to run this, and its build
       # context is part of the defect that stopped the server from
