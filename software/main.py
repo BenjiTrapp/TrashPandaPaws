@@ -133,15 +133,54 @@ def way_out_identity_poller(config):
     from software.scout.trigger import IdentityTrigger
     trigger = IdentityTrigger(policy["state_dir"])
     logger = logging.getLogger("raccoon")
+    # What this process has done about the request, across the polls of
+    # the one-second loop below. One attempt per run, whichever of the two
+    # reasons brought it about, so a failure is not retried every second.
+    attempt = {"started": False, "bypass": None, "at": 0.0,
+               "restoring": False}
+    # How long the sequence is given to become active. It forwards EAPOL,
+    # waits ten seconds for the host's own 802.1X exchange, and then
+    # listens for the downstream host to speak -- a host that is asleep
+    # never does, which is `nac_bypass`'s own documented failure mode and
+    # is often *why* the port went quiet. Generous, and bounded, because
+    # the answer is written into the one record of an irreversible move.
+    _SEQUENCE_DEADLINE = 180
 
     def poll():
-        if trigger.pending() is None:
+        if attempt["bypass"] is not None:
+            return _watch()
+        if attempt["started"]:
             return None
+        # **Two reasons to start it, and the second is a correction.** The
+        # first is a request nobody has taken yet. The second is a request
+        # that was taken and *did* start the bypass in an earlier run of
+        # this process: `main.py` stops its components on shutdown, and
+        # `NACBypass.stop()` flushes the ebtables rules and puts this
+        # implant's own MAC back on the bridge -- so a reboot, a config
+        # change or a `systemctl restart` released the identity while the
+        # one-shot latch kept the rung spent. The implant had paid the
+        # irreversible cost (the switch has already seen the MAC move,
+        # and the port may already be latched) and kept none of the
+        # benefit, with no way back short of deleting the request file.
+        # Going back to this implant's own MAC is also the louder of the
+        # two states on a port with sticky MAC or port security: a second
+        # address on a port that has seen one is what a NAC violation
+        # *is*. A restore re-applies a move the switch has already seen;
+        # it does not decide one, which is why it needs no gate of its
+        # own and why `started` has to be *true*.
+        restoring = trigger.was_started()
+        if not restoring and trigger.pending() is None:
+            return None
+        attempt["started"] = True
+        attempt["restoring"] = restoring
         logger.warning(
-            "The way out's rung 4 was requested by this host's own beacon: "
-            "starting nac_bypass, which forwards EAPOL and then originates "
-            "this implant's traffic as the downstream host. Once per "
-            "deployment.")
+            "The way out's rung 4 %s: starting nac_bypass, which forwards "
+            "EAPOL and then originates this implant's traffic as the "
+            "downstream host. Once per deployment."
+            % ("was taken in an earlier run of this process and this "
+               "process stopped it on shutdown, so it is being restored"
+               if restoring
+               else "was requested by this host's own beacon"))
         try:
             # Imported here and not at the top of this file: every other
             # component is imported inside the branch that uses it, and
@@ -156,10 +195,69 @@ def way_out_identity_poller(config):
             bypass.start()
         except Exception as exc:
             logger.error("nac_bypass could not be started: %s", exc)
-            trigger.taken("nac_bypass could not be started: %s" % exc)
+            # And the record is left alone when this was a restore: it
+            # says the identity *was* taken, which is a fact about the
+            # switch and not about this process, and overwriting it with
+            # a failure would lose the only durable statement of it.
+            if not restoring:
+                trigger.taken("nac_bypass could not be started: %s" % exc)
             return None
-        trigger.taken("nac_bypass was started by the way out's rung 4")
-        return bypass
+        attempt["bypass"] = bypass
+        attempt["at"] = time.time()
+        return None
+
+    def _watch():
+        """Has the sequence actually taken the identity yet?
+
+        **`start()` only spawns a thread.** It returns at once, and the
+        sequence behind it forwards EAPOL, sleeps ten seconds, and then
+        *returns having taken nothing* if the downstream host does not
+        speak -- `nac_bypass`'s own "host discovery failed, bridge remains
+        transparent". Recording `started: true` when `start()` returned
+        therefore wrote a failure down as a success, which spent the
+        one-shot on nothing **and** armed the restore path: a later boot,
+        with the host awake, would have re-run the whole sequence and
+        taken the identity on a healthy implant with no outage and no
+        arithmetic. So this waits for the fact instead of inferring it.
+
+        The fact is `nac_bypass`'s own phase, read with `victim_mac`
+        beside it: the phase becomes `active` where the rewrite rules go
+        in, and `victim_mac` is the address they are built from.
+        """
+        bypass = attempt["bypass"]
+        taken = (getattr(bypass, "_phase", "") == "active"
+                 and bool(getattr(bypass, "victim_mac", "")))
+        if taken:
+            attempt["bypass"] = None
+            # Written on a restore as well as on the first take, because
+            # it is the same statement about the same switch -- and one
+            # branch fewer than a `restoring` test that nothing could
+            # distinguish. The asymmetry that *is* load-bearing is on the
+            # failure path below.
+            trigger.taken(
+                "nac_bypass took %s, the downstream host's identity"
+                % getattr(bypass, "victim_mac", "?"), started=True)
+            logger.warning(
+                "The way out's rung 4 is active: this implant's traffic now "
+                "leaves as %s.", getattr(bypass, "victim_mac", "?"))
+            return bypass
+        if time.time() - attempt["at"] < _SEQUENCE_DEADLINE:
+            return None
+        attempt["bypass"] = None
+        logger.error(
+            "nac_bypass did not take the host's identity within %d s (phase "
+            "%r): the downstream host never spoke, so the bridge is still "
+            "transparent.", _SEQUENCE_DEADLINE,
+            getattr(bypass, "_phase", "?"))
+        if not attempt["restoring"]:
+            # Recorded as the failure it is, so the rung is spent and the
+            # restore path is **not** armed: re-running this at every boot
+            # until a host happens to be awake is the per-cycle retry the
+            # one-shot exists to prevent, and it would make the move
+            # outside the ladder.
+            trigger.taken("nac_bypass did not take the host's identity: the "
+                          "downstream host never spoke")
+        return None
 
     return poll
 

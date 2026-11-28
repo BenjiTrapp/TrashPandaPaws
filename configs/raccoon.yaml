@@ -230,8 +230,8 @@ c2:
   # Read docs/EGRESS_DECIDER.md before enabling it. Every row here is an
   # action the implant takes with nobody watching, and the gate on what a
   # row may try is in the beacon's code and not in this file: configuration
-  # chooses from three verbs and orders them, and cannot add a fourth. In
-  # particular it may never `sleep` -- the one verb the server-side model
+  # chooses from the verbs `EGRESS_VERBS` names and orders them, and cannot
+  # add one. In particular it may never `sleep` -- the one verb the model
   # reaches for on a stuck beacon, and the one an implant deciding for
   # itself must not have.
   #

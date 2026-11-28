@@ -3,8 +3,8 @@
 When a dropped implant cannot reach its team server, the thing that normally
 decides what to try next sits on the far side of exactly the connection it is
 trying to establish. [`docs/EGRESS_DECIDER.md`](EGRESS_DECIDER.md) closed half
-of that hole: the implant chooses one of three verbs for itself, from a policy
-you write.
+of that hole: the implant chooses one of the verbs it already has for
+itself, from a policy you write — three of them, before this page's four.
 
 This page is the other half. It widens what the implant can *see* — it is an
 inline tap between a switch port and a host, so it can watch what gets out of
@@ -78,19 +78,22 @@ narrowed:
   or at a name, with a body capped at 4 kB, and only after the whole
   sequence — a redirect, a POST on one flow, and a 2xx on that same flow.
 
-What is left is a residual risk and it is stated rather than implied. The
-sender check is a MAC comparison against addresses the bridge learned on
-the downstream port, so a forger **on the upstream segment** is not enough
-any more — but anybody who can put frames on the host's own port with the
-host's address still passes it, and so does anybody at all on a build whose
-bridge cannot be read, where the anchor falls back to whoever speaks first.
-And a portal **named rather than addressed** cannot be checked by an
-implant that cannot resolve names, so a forger who names their canary
-`portal.example` and plants all three frames on one flow gets one replayed
-POST — and sets `portal_answered`, which moves the borrow rung's crossing
-earlier. Both flags the tap sets reach the operator's panel, so a forged
-one is a false bit in a record somebody reads. The design's risk table
-carries that row.
+What is left is a residual risk and it is stated rather than implied, and
+it is larger than an earlier version of this page admitted. Asking the
+bridge narrows **which MAC counts** — a stranger's address is refused
+however many frames it sends, so the implant can no longer be made to
+anchor on the first thing that speaks. It does **not** narrow **who may
+send that MAC**: the scout is handed frames captured on the bridge,
+nothing in that pipeline knows which interface a frame arrived on, so
+anybody who copies the host's source address off the wire still passes,
+from either side of the tap. Answering that would need a direction-aware
+capture on the downstream interface, which this does not do. And a portal
+**named rather than addressed** cannot be checked by an implant that
+cannot resolve names, so a forger who names their canary `portal.example`
+and plants all three frames on one flow gets one replayed POST — and sets
+`portal_answered`, which moves the borrow rung's crossing earlier. Both
+flags the tap sets reach the operator's panel, so a forged one is a false
+bit in a record somebody reads. The design's risk table carries that row.
 
 Every container the scout keeps is bounded — 256 published entries and 2048
 waiting for an answer — because it runs for as long as the outage does, and
@@ -114,6 +117,15 @@ Reversible, and it leaves lines in logs a human *could* read: a proxy auth, an
 account that locks out. The credentials live in a `0600` file of their own and
 never in the document the beacon reads every cycle; the verb's answer names
 the account and the proxy and never the password.
+
+**And not from a previous outage.** The scout removes that file when a stuck
+window closes, so the only way a stale one survives is a scout that died in
+an earlier outage with its capture still on disk — and the beacon refuses a
+borrow file written before the open window began, by the window's own stamp
+rather than by a second age setting. A scout that dies *during* an outage
+costs nothing here: its capture is this outage's, and the rung still works.
+`egress credential` typed by hand is not second-guessed; with no window open
+there is nothing to compare against, and the operator has already decided.
 
 **The DNS arm is not built.** An earlier draft of the design had "DNS over
 HTTPS through a resolver that answered" on this rung. Every implementable
@@ -148,8 +160,15 @@ routes this implant's own traffic through it. Three bounds, all in code:
   packets whose source *is* that address, and a locally-generated connection
   has no source until something binds it. Without the bind the rung
   installed a route nothing could ever select and reported that it had
-  changed how the implant gets out. Every HTTP session and every DNS query
-  the beacon makes leaves by the leased address until a leg delivers.
+  changed how the implant gets out. Every HTTP session the beacon builds,
+  the hop an NTLM relay makes to its upstream proxy, and every DNS query
+  the beacon composes itself leave by the leased address — and they keep
+  doing so after a leg delivers, because a leg delivering while the bind
+  holds is the moment this rung is *working*. A rollback is what unbinds.
+  The two exceptions are named rather than implied: a forward to
+  `127.0.0.1` is not bound, because its peer is on this host and no source
+  rule can match it; and `wpad` name lookups during proxy discovery go
+  through the system resolver, which takes no source address.
 
 Repeating the rung is the ordinary case — no verb tests its own result — so
 `ip addr replace` and `ip route replace` are used rather than `add`, and the
@@ -168,8 +187,20 @@ then originates this implant's traffic under that identity. The beacon and
 that component run in different processes, so the request is one file under
 the state directory and `software/main.py` polls it.
 
-- **Once per deployment.** A leg delivering does not re-arm it. Re-arming is a
-  new deployment.
+- **Once per deployment.** A leg delivering does not re-arm it, and a restart
+  of the beacon does not either: the request file on the disk is the latch,
+  not a flag in memory. Re-arming means a new deployment — or deleting
+  `way_out_identity.json` from the state directory by hand, which is the only
+  way back and is written here because nothing else says it.
+- **And it survives a restart of the implant.** `software/main.py` stops its
+  components on shutdown, which puts this implant's own MAC back on the
+  bridge — so a reboot, a config change or a `systemctl restart` used to
+  release the identity while the latch kept the rung spent: all of the
+  irreversible cost and none of the benefit. The request file records that
+  the bypass was actually started, and the next run of that process restores
+  it. Going back to this implant's own MAC is also the *louder* of the two
+  states on a port with sticky MAC: a second address on a port that has seen
+  one is what a NAC violation is.
 - **Already spent when you enabled the bypass yourself.** With
   `nac_bypass.enabled: true` the identity was taken at boot, and the rung is
   not offered again.
@@ -221,8 +252,13 @@ ever — including for the three verbs that worked before this existed — and
 irreversible rung on the first cycle the decider may act. The two modifiers
 are checked for **direction** as well as range: `dot1x_detect` may only
 raise and `portal_detect` may only lower, because one legal sign put rung 4
-two hours ahead of rung 3, which is the inversion this section promises
-cannot happen.
+two hours ahead of rung 3.
+
+**And the order is enforced, not merely arranged.** A louder rung is
+refused until every quieter rung has crossed on the table's own priors —
+so neither a configured number nor a model's estimate can offer you rung 4
+before rung 3 was available. That rule is here because the arithmetic alone
+did not keep the promise: see the clamp below.
 
 `points` is floored by the **cycle count** as well as by the clock: a cycle
 is worth at most one step of the curve, whatever `beacon_interval_seconds`
@@ -252,9 +288,16 @@ dropped, because the task string is split on whitespace and a model wrote
 that string.
 
 A model may propose its own `P(success)`. It is clamped to ±0.2 of the
-built-in prior, so it cannot talk the implant onto a rung the curve has not
-reached, and a decision that passed *only* because of the override is marked
-as such in the trail.
+built-in prior, and it can move a crossing earlier within that latitude —
+that is what it is for. What it cannot do is **reorder the ladder**: a rung
+is refused until every quieter rung has crossed on the table's own priors,
+whatever the model says about the one it named, so the clamp bounds the
+probability and this bounds the order. Without that rule an estimate of
+0.99 on `identity` moved rung 4 from hour 7 to hour 4 while rung 3 stayed
+at hour 5 — the irreversible move offered before the implant had ever been
+allowed to try its own radio. A decision that passed *only* because of the
+override is marked as such in the trail, and a refusal names the quieter
+rung that is still holding it back.
 
 ## The block you write
 
@@ -351,7 +394,7 @@ phone is the one number that has to be right:
 | File | Written by | What it is |
 |---|---|---|
 | `way_out_state.json` | the beacon | the open stuck window: how long, on what evidence, and how much of the budget it has spent; removed when a leg delivers |
-| `way_out_scout.json` | the scout | the handoff: the tap's reading, and a recommendation if the model is on |
+| `way_out_scout.json` | the scout | the handoff: the tap's reading, and a recommendation if the model is on; removed when the window closes |
 | `way_out_borrow.json` | the scout | the credentials and the portal request — the only one that can carry a secret, and removed when the window closes |
 | `way_out_trail.jsonl` | the beacon | the trail, append-only, which outlives the window |
 | `way_out_identity.json` | the beacon | rung 4's request, and what came of it |

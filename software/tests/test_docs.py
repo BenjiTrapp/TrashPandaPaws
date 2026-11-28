@@ -3120,6 +3120,46 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
         self.assertIn(" ".join(phrase.split()).lower(), self.flat,
                       "%s: %r is not in %s" % (what, phrase, where))
 
+    def sentence(self, anchor):
+        """The one sentence that contains `anchor`, flattened and lowered.
+
+        `present` above is a substring check against the whole page, and
+        that is not a pin on a *claim*: the phrases a claim is pinned by
+        occur elsewhere too, so inverting the sentence that makes the
+        claim left the pin satisfied. A review inverted six of this
+        page's bold claims one at a time and nothing went red. The page
+        already had one anchored pin -- the crossing-hours table, parsed
+        row by row after a substring pin let every hour on it be wrong --
+        and this is that lesson applied to the prose.
+        """
+        needle = " ".join(anchor.split()).lower()
+        self.assertIn(needle, self.flat,
+                      "the page no longer says %r, so the claim pinned to "
+                      "it cannot be checked" % anchor)
+        start = self.flat.index(needle)
+        self.assertEqual(self.flat.count(needle), 1,
+                         "%r appears %d times, so it does not anchor one "
+                         "sentence" % (anchor, self.flat.count(needle)))
+        left = self.flat.rfind(". ", 0, start)
+        left = 0 if left < 0 else left + 2
+        right = self.flat.find(". ", start + len(needle))
+        right = len(self.flat) if right < 0 else right + 1
+        return self.flat[left:right]
+
+    def claim(self, anchor, says, what):
+        """`says` must be in the **same sentence** as `anchor`."""
+        self.assertIn(" ".join(says.split()).lower(),
+                      self.sentence(anchor),
+                      "%s: the page's sentence about %r does not say %r"
+                      % (what, anchor, says))
+
+    def denies(self, anchor, says, what):
+        """`says` must **not** be in the same sentence as `anchor`."""
+        self.assertNotIn(" ".join(says.split()).lower(),
+                         self.sentence(anchor),
+                         "%s: the page's sentence about %r says %r"
+                         % (what, anchor, says))
+
     # ── it exists and is reachable ──
 
     def test_the_guide_exists_and_is_linked_from_both_its_neighbours(self):
@@ -3410,6 +3450,119 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
                           "fallback the page describes")
         self.assertEqual(asked, [["bridge", "fdb", "show", "br", "br0",
                                   "dev", "eth1"]])
+
+    def test_it_says_the_borrowed_half_does_not_outlive_its_outage(self):
+        # Two claims about the one file that carries a secret, and both
+        # are behaviour a reader cannot check for themselves: the scout
+        # removes it when the window closes, and the beacon refuses one
+        # written before the open window began.
+        for phrase, what in (
+                ("removed when the window closes",
+                 "that a captured password does not stay on the disk"),
+                ("not from a previous outage",
+                 "that a stale capture is not replayed"),
+                ("typed by hand is not second-guessed",
+                 "that an operator's own verb is not refused")):
+            with self.subTest(phrase=phrase):
+                self.present(phrase, what)
+
+    def test_each_claim_is_pinned_to_its_own_sentence(self):
+        # Six of this page's bold claims survived being inverted one at a
+        # time, because `present` is a substring check against the whole
+        # page and the phrases they were pinned by occur elsewhere. Three
+        # of the six were claims the code did not keep, which is how they
+        # came to be inverted in the first place. Each is now pinned to
+        # the sentence that makes it.
+        self.claim("clamped to ±0.2", "can move a crossing earlier",
+                   "that a model's estimate is allowed to move a crossing")
+        self.claim("what it cannot do is", "reorder the ladder",
+                   "that a model's estimate cannot reorder the rungs")
+        self.claim("a louder rung is refused until",
+                   "every quieter rung has crossed",
+                   "the mechanism that enforces the order")
+        self.claim("does **not** narrow", "who may send that mac",
+                   "the limit of the sender anchor")
+        self.claim("every http session the beacon builds",
+                   "leave by the leased address",
+                   "what the radio rung binds")
+        self.claim("they keep doing so after a leg delivers",
+                   "the moment this rung is *working*",
+                   "that a delivering leg does not unbind the radio")
+        self.claim("once per deployment.", "does not re-arm it",
+                   "that rung 4 is one-shot")
+        self.denies("once per deployment.", "twice",
+                   "that rung 4 is one-shot")
+        self.claim("it can turn the port off", "for good",
+                   "that rung 4 is irreversible")
+        self.denies("it can turn the port off", "reversible",
+                    "that rung 4 is irreversible")
+        self.claim("the trail holds no password", "names the verb",
+                   "what the trail holds instead of a secret")
+        self.claim("and it survives a restart of the implant",
+                   "used to release the identity",
+                   "that rung 4's effect outlives a restart")
+        self.claim("the next run of that process", "restores it",
+                   "what restores it")
+        # The rest of the page's load-bearing claims, each anchored the
+        # same way. The list is long on purpose: 18 of 22 inversions of
+        # this page passed before, and it is the only thing an operator
+        # reads before switching on a move that can end an engagement.
+        for anchor, says, what in (
+                ("drop-box only", "single file",
+                 "which builds carry this at all"),
+                ("this evidence is written by anybody",
+                 "not what the host proves",
+                 "that the tap's evidence is adversary-writable"),
+                ("a credential is borrowed only from a `connect`",
+                 "answered `407`",
+                 "the precondition on a borrowable credential"),
+                ("a captive portal is recorded only at a",
+                 "private or link-local",
+                 "where a portal may be recorded"),
+                ("and not from a previous outage",
+                 "removes that file when a stuck window closes",
+                 "that a stale capture is not replayed"),
+                ("the dns arm is not built", "an earlier draft",
+                 "that the DNS arm is absent"),
+                ("every implementable version", "stays baked",
+                 "why the DNS arm is absent"),
+                ("all of it is read only from frames whose sender is the",
+                 "host behind the",
+                 "whose frames the evidence is read from"),
+                ("the onboard radio only", "usb adapter is refused",
+                 "which radio the rung may use"),
+                ("a scoped route, never the default one", "table `100`",
+                 "where the radio's route goes"),
+                ("already spent when you enabled the bypass yourself",
+                 "not offered again",
+                 "that an operator who enabled the bypass has spent it"),
+                ("not offered at all without a fresh scout document",
+                 "pre-spent fact lives",
+                 "that rung 4 needs a fresh document"),
+                ("the two modifiers", "direction",
+                 "that the modifiers are direction-checked"),
+                ("`points` is floored by the", "cycle count",
+                 "that a long interval cannot buy a loud rung"),
+                ("switching this on costs the borrow rung its first hour",
+                 "with `c2.way_out` off",
+                 "what enabling the ladder costs the old verbs"),
+                ("a refusal is not the end of the cycle",
+                 "**next** candidate",
+                 "that a refused rung does not silence the ones below"),
+                ("rung 4's request is acted on only if",
+                 "own uid and not writable by anyone else",
+                 "who may write rung 4's request"),
+                ("the directory's mode is enforced",
+                 "every write, not only when it is created",
+                 "that the directory is re-tightened"),
+                ("it publishes on a clock", "scans the radio at most once",
+                 "what the scout costs while the implant is dark"),
+                ("the beacon never calls the model", "reads a file",
+                 "that the beacon does not wait for the model"),
+                ("the credentials live in a", "never in the document",
+                 "where a captured secret is kept")):
+            with self.subTest(anchor=anchor):
+                self.claim(anchor, says, what)
 
     def test_it_states_what_enabling_it_costs_the_old_verbs(self):
         for phrase, what in (

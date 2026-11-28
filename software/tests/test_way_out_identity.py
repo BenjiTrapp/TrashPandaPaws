@@ -132,6 +132,22 @@ class TestTheVerb(IdentityCase):
         self.assertIn("taken", record)
         self.assertIsNone(IdentityTrigger(self.state).pending())
 
+    def test_deleting_the_request_file_re_arms_it_without_a_restart(self):
+        # The page says deleting `way_out_identity.json` is the way back,
+        # and it was not: the refusal path used to set the in-memory flag
+        # as well, so the file's existence was cached and an operator who
+        # deleted it found the rung still refused until the beacon
+        # restarted. The file is the authority.
+        beacon = self.beacon()
+        self.assertNotIn("[error]", beacon._exec_egress("identity"))
+        self.assertIn("[error]", beacon._exec_egress("identity"))
+
+        os.unlink(handoff.identity_path(self.state))
+
+        self.assertNotIn("[error]", beacon._exec_egress("identity"),
+                         "the rung is still refused by this process's "
+                         "memory of a file that is gone")
+
     def test_a_request_that_could_not_be_written_is_still_spent(self):
         # The file is the latch across restarts, and the flag is the latch
         # when there is no file: a read-only /opt or a full disk must not
@@ -276,26 +292,191 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
         self.beacon()._exec_egress("identity")
         started = []
 
-        class FakeBypass(object):
-            def __init__(self, config):
-                started.append(config)
-
-            def start(self):
-                started.append("start")
-
-            def stop(self):
-                pass
-
-        with mock.patch.object(nac_mod, "NACBypass", FakeBypass):
+        with mock.patch.object(nac_mod, "NACBypass", self.fake(started)):
             poller = main_mod.way_out_identity_poller(self.config())
             self.assertIsNotNone(poller)
+            # The sequence runs on its own thread, so the first poll
+            # starts it and hands back nothing: there is no identity yet.
+            self.assertIsNone(poller())
+            self.assertIsNone(self.request().get("taken"))
+
+            self.last.become_active()
             component = poller()
             self.assertIsNotNone(component)
             self.assertIsNone(poller(), "the bypass was started twice")
 
         self.assertIn("start", started)
-        record = handoff.read_document_at(handoff.identity_path(self.state), 1)
+        record = self.request()
         self.assertIn("taken", record)
+        self.assertTrue(record["started"])
+        self.assertIn("aa:bb:cc:dd:ee:ff", record["detail"])
+
+    def fake(self, log):
+        """A stand-in shaped like the real `NACBypass` lifecycle.
+
+        **`start()` only spawns a thread**, and the sequence behind it
+        can return having taken nothing -- its own documented failure is
+        "host discovery failed, bridge remains transparent", which
+        happens whenever the downstream host is asleep, which is often
+        *why* the port went quiet. So the fake starts in `discovery` and
+        only `become_active` puts it where the real one puts itself when
+        the rewrite rules go in.
+        """
+        case = self
+
+        class FakeBypass(object):
+            def __init__(self, config):
+                self._phase = "idle"
+                self.victim_mac = None
+                log.append(config)
+                case.last = self
+
+            def start(self):
+                self._phase = "discovery"
+                log.append("start")
+
+            def discover(self):
+                """The real one learns the MAC here, before any rule."""
+                self.victim_mac = "aa:bb:cc:dd:ee:ff"
+                self._phase = "discovered"
+
+            def become_active(self):
+                self.discover()
+                self._phase = "active"
+
+            def stop(self):
+                log.append("stop")
+                self._phase = "idle"
+
+        return FakeBypass
+
+    def test_discovering_the_host_is_not_taking_its_identity(self):
+        # `victim_mac` is set where the real sequence *discovers* the
+        # host, two steps before the rewrite rules go in -- so the MAC
+        # alone is not the fact. A sequence that learned the address and
+        # then failed to apply the rules has taken nothing.
+        from software import main as main_mod
+        from software import nac_bypass as nac_mod
+        from software.scout.trigger import IdentityTrigger
+        self.beacon()._exec_egress("identity")
+
+        with mock.patch.object(nac_mod, "NACBypass", self.fake([])):
+            poller = main_mod.way_out_identity_poller(self.config())
+            self.assertIsNone(poller())
+            self.last.discover()
+            self.assertIsNone(poller(),
+                              "a discovered host was read as a taken one")
+            self.assertIsNone(self.request().get("taken"))
+
+            self.last.become_active()
+            self.assertIsNotNone(poller())
+        self.assertTrue(IdentityTrigger(self.state).was_started())
+
+    def test_a_sequence_that_takes_nothing_is_recorded_as_a_failure(self):
+        # The defect this two-step exists for: `start()` returning was
+        # read as "the identity has been taken", so a host that never
+        # spoke was written down as a success -- spending the one-shot on
+        # nothing *and* arming the restore path, which at the next boot,
+        # with the host awake, would have run the whole sequence again
+        # and taken the identity on a healthy implant with no outage and
+        # no arithmetic at all.
+        from software import main as main_mod
+        from software import nac_bypass as nac_mod
+        from software.scout.trigger import IdentityTrigger
+        self.beacon()._exec_egress("identity")
+        started = []
+
+        with mock.patch.object(nac_mod, "NACBypass", self.fake(started)):
+            poller = main_mod.way_out_identity_poller(self.config())
+            self.assertIsNone(poller())
+            # The sequence sat in discovery until the deadline passed.
+            later = time.time() + 1e6
+            with mock.patch.object(main_mod.time, "time", lambda: later):
+                self.assertIsNone(poller())
+
+        record = self.request()
+        self.assertIn("taken", record)
+        self.assertFalse(record["started"])
+        self.assertIn("never spoke", record["detail"])
+        self.assertFalse(IdentityTrigger(self.state).was_started(),
+                         "a failure armed the restore path")
+
+    def test_a_restart_of_this_process_restores_the_identity(self):
+        # `main.py` stops its components on shutdown and `NACBypass.stop()`
+        # puts this implant's own MAC back on the bridge, so a reboot, a
+        # config change or a `systemctl restart` released an identity the
+        # rung had already paid the irreversible price for -- and the
+        # one-shot latch kept it from ever being taken again. The implant
+        # kept none of the benefit and all of the cost, and going back to
+        # its own MAC is the louder of the two states on a port with
+        # sticky MAC: a second address on a port that has seen one is what
+        # a NAC violation is.
+        from software import main as main_mod
+        from software import nac_bypass as nac_mod
+        self.beacon()._exec_egress("identity")
+        started = []
+
+        with mock.patch.object(nac_mod, "NACBypass", self.fake(started)):
+            first = main_mod.way_out_identity_poller(self.config())
+            self.assertIsNone(first())
+            self.last.become_active()
+            component = first()
+            self.assertIsNotNone(component)
+            component.stop()                      # what shutdown does
+
+            del started[:]
+            restarted = main_mod.way_out_identity_poller(self.config())
+            self.assertIsNotNone(restarted)
+            self.assertIsNone(restarted())
+            self.last.become_active()
+            self.assertIsNotNone(restarted(),
+                                 "the restarted process left the identity "
+                                 "released and the rung spent")
+
+        self.assertEqual([entry for entry in started
+                          if entry == "start"], ["start"])
+        # And once per run of this process, not once per second.
+        self.assertIsNone(restarted())
+
+    def test_a_request_that_never_started_is_not_retried_on_a_restart(self):
+        # The other direction: a taken record whose detail is a failure is
+        # not a fact about the switch, and retrying it on every boot is
+        # the per-cycle retry the one-shot exists to prevent.
+        from software import main as main_mod
+        from software import nac_bypass as nac_mod
+        self.beacon()._exec_egress("identity")
+        with mock.patch.object(nac_mod, "NACBypass",
+                               mock.Mock(side_effect=OSError("no ebtables"))):
+            main_mod.way_out_identity_poller(self.config())()
+
+        asked = []
+        with mock.patch.object(nac_mod, "NACBypass",
+                               lambda config: asked.append(1)):
+            self.assertIsNone(main_mod.way_out_identity_poller(
+                self.config())())
+        self.assertEqual(asked, [])
+        self.assertIn("no ebtables", self.request()["detail"])
+
+    def test_a_restore_that_fails_does_not_erase_what_was_recorded(self):
+        # The record says the identity *was* taken, which is a fact about
+        # the switch. A restore that cannot run -- scapy gone, ebtables
+        # gone -- must not overwrite it with a failure, or the next run
+        # would read "it never started" and the one durable statement
+        # about an irreversible move would be lost.
+        from software import main as main_mod
+        from software import nac_bypass as nac_mod
+        self.beacon()._exec_egress("identity")
+        IdentityTrigger(self.state).taken("it was started", started=True)
+
+        with mock.patch.object(nac_mod, "NACBypass",
+                               mock.Mock(side_effect=OSError("no ebtables"))):
+            self.assertIsNone(main_mod.way_out_identity_poller(
+                self.config())())
+
+        record = self.request()
+        self.assertEqual(record["detail"], "it was started")
+        self.assertTrue(record["started"])
+        self.assertTrue(IdentityTrigger(self.state).was_started())
 
     def test_with_the_way_out_off_there_is_no_poller_at_all(self):
         from software import main as main_mod

