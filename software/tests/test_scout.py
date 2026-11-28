@@ -44,6 +44,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from software.scout import handoff
 from software.scout.scout import Scout
+from software.tests import way_out_scratch as _scratch
 
 
 def _config(**overrides):
@@ -63,8 +64,7 @@ def _config(**overrides):
 
 class ScoutCase(unittest.TestCase):
     def setUp(self):
-        self.root = tempfile.mkdtemp(prefix="raccoon-scout-")
-        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.root = _scratch.scratch(self, "raccoon-scout-")
 
     def scout(self, config=None, ssids=None, **overrides):
         config = config or _config(**overrides)

@@ -3397,10 +3397,10 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
         # may not claim it, and the two the scout owns may not be missing
         # from its side either.
         import base64
-        import shutil
 
         from software.c2.beacon import Beacon, read_way_out_policy
         from software.scout import handoff
+        from software.tests import way_out_scratch as _scratch
 
         rows = {}
         for line in self.guide.splitlines():
@@ -3412,8 +3412,7 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
                          "the table has %d file rows, not six: %r"
                          % (len(rows), sorted(rows)))
 
-        state = tempfile.mkdtemp(prefix="raccoon-doc-")
-        self.addCleanup(shutil.rmtree, state, ignore_errors=True)
+        state = _scratch.scratch(self, "raccoon-doc-")
         beacon = Beacon({"c2": {
             "beacon_interval_seconds": 300, "jitter_percent": 0,
             "encryption_key": base64.b64encode(b"\x24" * 32).decode(),

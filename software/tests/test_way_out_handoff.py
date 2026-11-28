@@ -46,6 +46,7 @@ from software.c2 import beacon as beacon_mod
 from software.c2 import dns_rescue
 from software.c2.beacon import Beacon, read_egress_policy, read_way_out_policy
 from software.scout import handoff
+from software.tests import way_out_scratch as _scratch
 from software.tests import test_egress_decider as _decider
 
 _KEY = b"\x24" * 32
@@ -55,8 +56,7 @@ class WayOutCase(unittest.TestCase):
     """A beacon whose state directory is this test's own."""
 
     def setUp(self):
-        self.root = tempfile.mkdtemp(prefix="raccoon-way-out-")
-        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.root = _scratch.scratch(self, "raccoon-way-out-")
         self.logged = _decider._Collected()
         logger = beacon_mod.logger
         propagate = logger.propagate
@@ -251,8 +251,7 @@ class TestTheLoopItself(_decider.DeciderCase):
 
     def setUp(self):
         super().setUp()
-        self.state = tempfile.mkdtemp(prefix="raccoon-way-out-loop-")
-        self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
+        self.state = _scratch.scratch(self, "raccoon-way-out-loop-")
 
     def beacon(self, policy=None):
         return self.a_beacon(
@@ -348,8 +347,7 @@ class TestTheCostOfSwitchingItOn(_decider.DeciderCase):
 
     def setUp(self):
         super().setUp()
-        self.state = tempfile.mkdtemp(prefix="raccoon-way-out-cost-")
-        self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
+        self.state = _scratch.scratch(self, "raccoon-way-out-cost-")
 
     def attempts(self, enabled, cycles, flags=()):
         """What the loop asked `egress` to do on the `cycles`th stuck one.
