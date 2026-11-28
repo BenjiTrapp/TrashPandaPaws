@@ -490,11 +490,22 @@ class _ProbeServer:
         return self.crypto.unwrap(reply.get_json())
 
 
-def _beacon_cannot_verify_tls():
+def _the_beacon_cannot_pin_a_certificate():
+    """What is left of that finding once `verify_ssl` is read.
+
+    The switch works now: `test_beacon_tls.py` drives both halves through
+    the real opener and the real `ProxyDiscovery`. What a fix could not
+    reach without a decision is pinning -- an operator whose team server
+    carries a self-signed certificate, which `--ssl` with no arguments
+    produces here, still has only "any CA-signed certificate" or "none".
+    Open while nothing loads a CA file or compares a fingerprint, and
+    while the shipped default is off.
+    """
     text = _read("software", "c2", "beacon.py")
-    mentions = re.findall(r"^.*\bverify_ssl\b.*$", text, re.M)
-    return (len(mentions) == 1 and "self.verify_ssl = " in mentions[0]
-            and "ssl_ctx.verify_mode = ssl.CERT_NONE" in text)
+    pins = any(name in text for name in
+               ("load_verify_locations", "pinned_sha256", "ca_bundle"))
+    shipped = _config()["c2"]["fallback"]["https"]["verify_ssl"]
+    return not pins and shipped is False
 
 
 def _a_replayed_result_is_applied_again():
@@ -705,7 +716,7 @@ def _a_beacons_implant_id_is_one_per_host():
 
 _OPEN_FINDINGS = {
     "Would stop a deployment": [
-        ("cannot verify TLS at all", _beacon_cannot_verify_tls),
+        ("it cannot pin", _the_beacon_cannot_pin_a_certificate),
         ("No replay protection", _a_replayed_result_is_applied_again),
         ("server image runs as root", _the_server_image_is_root_with_net_admin),
     ],

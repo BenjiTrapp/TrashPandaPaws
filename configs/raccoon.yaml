@@ -108,6 +108,14 @@ c2:
     https:
       enabled: true
       callback_url: "https://c2.example.com/api/v1/beacon"
+      # Read, and off. True makes the callback channel and the proxy probe
+      # check the certificate *and* the hostname -- which a team server
+      # started with a plain `--ssl` cannot pass, because that produces a
+      # self-signed certificate and nothing here pins one. So turn this on
+      # with a certificate a CA the implant trusts has signed, and not
+      # before. Written as a bare `false`, not `"false"`: a quoted boolean
+      # is read as false here rather than as true, which is the direction
+      # that cannot surprise anyone.
       verify_ssl: false
     dns:
       # Tasking only. Nothing registers over DNS and no result ever comes

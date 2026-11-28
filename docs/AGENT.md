@@ -1118,14 +1118,24 @@ more.
 
 #### Would stop a deployment
 
-- **The beacon cannot verify TLS at all.** `software/c2/beacon.py` sets
-  `ssl.CERT_NONE` unconditionally on its HTTPS opener and its proxy probe,
-  and `verify_ssl` is assigned from the configuration and never read, so the
-  setting in `configs/raccoon.yaml` cannot be turned on. (`exfil.py` does
-  pass its own copy of the flag to `requests`; the beacon's callback channel
-  is the one with no switch.) Over the internet the payload encryption is the
-  only control left. For a self-signed certificate the answer is pinning, not
-  skipping verification.
+- **The beacon can verify TLS, but it cannot pin, and it ships off.**
+  `c2.fallback.https.verify_ssl` is read now: set it and the callback
+  channel and the proxy probe both check the certificate and the hostname.
+  Two things remain, and the first is the one that matters. **There is no
+  pinning.** An operator whose team server carries a self-signed
+  certificate — which is what `--ssl` without arguments produces here — has
+  only "any certificate a CA signed" or "none", and the second is the one
+  that works for them. Closing that means a configured fingerprint or CA
+  file, which is a trust decision and a key-distribution question rather
+  than a defect. And **the shipped default is `false`**, deliberately:
+  turning it on in the file would take every existing deployment with a
+  self-signed certificate off the air at the next beacon interval.
+
+  Two channels stay unverified by decision, both stated where they are: the
+  gsocket leg's loopback forward, because no certificate names
+  `127.0.0.1` on this host, and the scanner's `_probe_ssl`, which exists to
+  report a target's certificate and would refuse exactly the hosts it is
+  run to find.
 - **No replay protection, in either direction.** There is no counter, no
   timestamp, no window and no seen-message cache. Resubmitting a captured
   result overwrites the recorded output for that task and writes its loot
