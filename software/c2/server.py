@@ -185,6 +185,11 @@ results: dict[str, dict] = {}
 # that outlived the results it is read with would answer "dispatched" for a
 # task whose result the restart had forgotten.
 dispatches: dict[str, str] = {}
+# remote address -> timestamps of recent wrong operator tokens. Module
+# state beside `agents`, with the same lifetime and the same reason: the
+# requests that feed it arrive on separate threads. Cleared by a correct
+# token for that address.
+auth_failures: dict = {}
 history: dict[str, list] = {}
 scan_store: dict[str, list] = {}
 event_log: list[dict] = []
@@ -194,6 +199,24 @@ _active_c2_profile_source: str = ""
 _name_counter = 0
 
 TASK_LANES = ("operator", "agent")
+# The largest request body the server will read, derived from the beacon's
+# own ceilings rather than picked: `_exec_download` refuses a single file
+# over 10 MiB and `_exec_loot` a zip over 50 MiB. 50 MiB of zip is 66.7 MiB
+# of base64 inside the JSON, and the JSON is encrypted and base64'd again,
+# so about 89 MiB is the largest body a beacon can legitimately produce.
+# 128 MiB leaves room for the envelope's decoy fields and for an operator
+# upload of comparable size, and still refuses a body that was sent to be
+# read into memory. A cap *below* the beacon's ceilings would be worse than
+# none: it would fail only on the engagement that collected something big.
+MAX_BODY_BYTES = 128 * 1024 * 1024
+# Wrong operator tokens, per remote address. Sixty in a row all answered
+# 401 as fast as they could be sent.
+AUTH_FAILURE_LIMIT = 10
+AUTH_FAILURE_WINDOW = 60.0
+# How many addresses are remembered. One list per address on a route
+# anybody can reach, so it is trimmed; without this the lockout would be a
+# way to grow a dict instead of a way to stop guessing.
+AUTH_FAILURE_ADDRESSES = 1024
 # How many dispatch records are kept. One dict per delivered task on a route
 # a beacon reaches as often as it likes, so it is trimmed oldest-first;
 # `results` has the same exposure and no cap, which is a finding of its own
@@ -1147,6 +1170,32 @@ def _opshell_last_tunnel(agent_name: str):
 
 
 
+def _auth_locked(address: str) -> bool:
+    """Whether this address has guessed the operator token too often.
+
+    Per address, not globally: a global counter would let anybody who can
+    reach the operator socket lock the operator out of their own C2, which
+    trades one denial for a worse one. The cost of per-address is that an
+    attacker with many addresses gets the budget many times, and against a
+    token of `secrets.token_urlsafe(24)` that is not the limit that matters.
+    """
+    now = time.time()
+    stamps = [s for s in auth_failures.get(address, ())
+              if now - s < AUTH_FAILURE_WINDOW]
+    if stamps:
+        auth_failures[address] = stamps
+    else:
+        auth_failures.pop(address, None)
+    return len(stamps) >= AUTH_FAILURE_LIMIT
+
+
+def _auth_failed(address: str) -> None:
+    """Record a wrong token from this address."""
+    auth_failures.setdefault(address, []).append(time.time())
+    while len(auth_failures) > AUTH_FAILURE_ADDRESSES:
+        auth_failures.pop(next(iter(auth_failures)))
+
+
 def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                server_config: Optional[dict] = None,
                operator_port: Optional[int] = None,
@@ -1154,6 +1203,19 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                supervisor=None, tunnel_supervisor=None,
                carrier_supervisor=None) -> Flask:
     app = Flask(__name__)
+    # Before anything reads a body. Werkzeug refuses past this with 413
+    # without buffering the rest, which is the whole point: an
+    # unauthenticated POST with a multi-gigabyte body used to be read into
+    # memory and parsed as JSON before anything asked whether it was a
+    # valid message.
+    app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
+    # The lockout record belongs to a running server, and building one
+    # starts it empty. In production this happens once; in the suite it is
+    # what keeps one test's deliberate wrong-token walk from locking
+    # 127.0.0.1 out of every test that follows it in the same process --
+    # which is exactly what happened the first time this landed, in 119
+    # tests across one module.
+    auth_failures.clear()
     static_dir = Path(__file__).parent / "static"
     _server_config = server_config or {}
 
@@ -1206,8 +1268,24 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
 
         @wraps(f)
         def wrapper(*args, **kwargs):
+            address = request.remote_addr or "-"
+            if _auth_locked(address):
+                # A lockout the right token walks through is not a lockout:
+                # the attacker's next guess might be the right one. So the
+                # address waits, whatever it presents.
+                logger.warning("Operator auth locked out for %s",
+                               repr(address[:64]))
+                refusal = jsonify({"error": "too many attempts"})
+                refusal.status_code = 429
+                refusal.headers["Retry-After"] = str(
+                    int(AUTH_FAILURE_WINDOW))
+                return refusal
             if not check_auth():
+                _auth_failed(address)
                 return jsonify({"error": "unauthorized"}), 401
+            # A correct token says this address is the operator's, so the
+            # near-misses before it were typing and not guessing.
+            auth_failures.pop(address, None)
             return f(*args, **kwargs)
 
         return wrapper

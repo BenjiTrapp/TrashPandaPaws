@@ -552,16 +552,6 @@ def _the_old_dependencies_are_still_declared():
             and "ldap3" in _read("software", "c2", "Dockerfile"))
 
 
-def _there_is_no_size_cap_and_no_rate_limit():
-    with _ProbeServer() as srv:
-        wrong = {"Authorization": "Bearer not-the-token"}
-        codes = {srv.client.get("/api/loot", headers=wrong).status_code
-                 for _ in range(60)}
-        right = srv.client.get("/api/loot", headers=srv.auth).status_code
-        return (srv.app.config.get("MAX_CONTENT_LENGTH") is None
-                and codes == {401} and right == 200)
-
-
 def _the_shipped_config_carries_a_vnc_password():
     def walk(node):
         if isinstance(node, dict):
@@ -714,8 +704,6 @@ _OPEN_FINDINGS = {
         ("handler-body injections", _file_browser_names_reach_onclick_strings),
         ("Nothing is pinned", _nothing_is_pinned),
         ("Two dependencies", _the_old_dependencies_are_still_declared),
-        ("No request-size cap and no rate limiting",
-         _there_is_no_size_cap_and_no_rate_limit),
         ("`vnc_password`", _the_shipped_config_carries_a_vnc_password),
         ("implant id is one per host", _a_beacons_implant_id_is_one_per_host),
     ],

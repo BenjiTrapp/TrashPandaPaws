@@ -1174,16 +1174,6 @@ more.
   server image and the start scripts install it by name, but `impacket` 0.13.1
   declares it as a dependency, so removing those lines would not remove it
   from the image.
-- **No request-size cap and no rate limiting.** `MAX_CONTENT_LENGTH` is never
-  set, so one unauthenticated POST with a multi-gigabyte body is read into
-  memory and parsed as JSON before anything asks whether it is a valid
-  message. (Writing it to disk needs a message that decrypts and names a
-  registered agent, so that part applies to a sender with the key, not an
-  anonymous one.) There is no lockout on the operator token either: sixty
-  wrong-token requests in a row all answer 401. A first check reported rate
-  limiting as present, because its pattern matched the `X-RateLimit-Limit`
-  and `X-RateLimit-Remaining` values in a C2 profile example in `server.py`.
-  They are example response headers, not a limiter.
 - **A beacon's implant id is one per host, not one per implant.**
   `_generate_id` hashes `platform.node()` and `platform.machine()`, plus the
   eth0 MAC where that file exists. So two implants on one machine register as
