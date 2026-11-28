@@ -789,6 +789,17 @@ class TestThePhaseIsWhatTheKernelAgreesTo(unittest.TestCase):
         # And the bridge is put back to this implant's own address.
         self.assertIn("ip link set dev br0 address 11:22:33:44:55:66",
                       recorded)
+        # And the four OUTPUT DROPs this sequence installed before the
+        # read-back are removed. `stop()` flushes `-t nat`; these are in
+        # the filter tables, so without `_go_live` they were left behind
+        # -- and the way out's restore re-runs this at every boot, so
+        # four more were appended each time and nothing removed them.
+        for table, iface in (("arptables", "eth0"), ("arptables", "eth1"),
+                             ("iptables", "eth0"), ("iptables", "eth1")):
+            with self.subTest(drop="%s %s" % (table, iface)):
+                rule = "%s -%%s OUTPUT -o %s -j DROP" % (table, iface)
+                self.assertIn(rule % "A", recorded)
+                self.assertIn(rule % "D", recorded)
 
     def test_a_refused_bridge_stops_the_sequence(self):
         # `configure_network` runs DHCP on the bridge under the host's
@@ -834,6 +845,62 @@ class TestThePhaseIsWhatTheKernelAgreesTo(unittest.TestCase):
                          "the sequence configured the network under an "
                          "identity the bridge refused: %r" % (went_on,))
         self.assertNotEqual(nac._phase, "active")
+
+    def test_a_successful_take_configures_the_network(self):
+        # The path that was *not* broken, and the one nothing drove: the
+        # whole sequence, to success. `apply_rewrite_rules` fell off its
+        # end returning None, which `_run_sequence`'s new gate read as a
+        # failure -- so every successful take stopped before
+        # `configure_network`, and `bridge_tap.setup_bridge` gives `br0`
+        # no address either. The identity taken, the one-shot spent, the
+        # record saying it worked, and no address and no default route.
+        nac = _make_nac()
+        recorded = []
+
+        def run_quiet(command, *_args, **_kwargs):
+            recorded.append(command)
+            return _completed()
+
+        def run(command, *_args, **_kwargs):
+            recorded.append(command)
+            if "tcpdump" in command:
+                return _completed(stdout=(
+                    "aa:bb:cc:dd:ee:ff > ff:ff:ff:ff:ff:ff, "
+                    "Request who-has 10.0.0.254 tell 10.0.0.9\n"
+                    "11:22:33:44:55:66 > aa:bb:cc:dd:ee:ff, "
+                    "Reply 10.0.0.254 is-at 11:22:33:44:55:66\n"))
+            return _completed()
+
+        for patcher in (patch("software.nac_bypass._run_quiet", run_quiet),
+                        patch("software.nac_bypass._run", run),
+                        patch("software.nac_bypass.time.sleep",
+                              lambda _s: None),
+                        patch.object(type(nac), "_bridge_mac",
+                                     lambda self: self.victim_mac)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        nac._running = True
+        nac._run_sequence()
+
+        self.assertEqual(nac._phase, "active")
+        addressed = [command for command in recorded
+                     if "ip addr add" in command or "dhclient" in command]
+        self.assertTrue(addressed,
+                        "the identity was taken and the bridge was never "
+                        "given an address: configure_network did not run")
+        self.assertTrue([command for command in recorded
+                         if "route add default" in command
+                         or "dhclient" in command])
+
+    def test_apply_rewrite_rules_says_it_did(self):
+        nac = _make_nac()
+        nac.victim_mac = "aa:bb:cc:dd:ee:ff"
+        nac.implant_mac = "11:22:33:44:55:66"
+        self.ran(nac, "aa:bb:cc:dd:ee:ff")
+
+        self.assertIs(nac.apply_rewrite_rules(), True,
+                      "the docstring says it returns whether it did")
 
     def test_no_victim_mac_is_not_a_success(self):
         # `_run_sequence` stops on a False, and "we never learned a MAC"

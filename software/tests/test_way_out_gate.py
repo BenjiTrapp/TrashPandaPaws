@@ -44,7 +44,9 @@ scout.
 """
 
 import base64
+import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -116,7 +118,7 @@ class GateCase(_decider.DeciderCase):
     """A beacon whose stuck window is as long as a test needs."""
 
     def beacon(self, hours_dark=0.0, flags=(), policy=None, way_out=True,
-               **extra):
+               document=True, **extra):
         if way_out is True:
             state = getattr(self, "_state", None)
             if state is None:
@@ -134,6 +136,12 @@ class GateCase(_decider.DeciderCase):
         beacon._stuck_cycles = int(round(hours_dark * _CYCLES_PER_HOUR))
         for name in flags:
             beacon._rescue_flags |= beacon_mod._EGRESS_FLAG_BITS[name]
+        if way_out is True and document:
+            # A fresh document with an open SSID, because `radio` is this
+            # class's stand-in for a loud rung and `_egress_task` declines
+            # it without one. A test about the *absence* of a document
+            # passes `document=False`.
+            self.publish(beacon, None)
         return beacon
 
     def allows(self, verb, **kwargs):
@@ -151,7 +159,11 @@ class GateCase(_decider.DeciderCase):
         from software.scout import handoff
         handoff.write_document(beacon._way_out_state_dir, {
             "version": handoff.DOCUMENT_VERSION, "published": time.time(),
-            "evidence": beacon._egress_state(), "tap": {"flags": []},
+            "evidence": beacon._egress_state(),
+            # An open network in range, as a host with a radio has. See
+            # `WayOutCase.publish` for why the default carries one.
+            "tap": {"flags": [],
+                    "ssids": [{"ssid": "GuestWifi", "open": True}]},
             "identity_pre_spent": False, "recommendation": recommendation})
 
 
@@ -601,8 +613,8 @@ class TestARefusalTheSituationGuaranteesCostsNoAttempt(GateCase):
         self.assertEqual(beacon._egress_spent, 1)
 
     def test_rung_four_with_no_document_declines(self):
-        beacon = self.beacon(hours_dark=24, policy=self.rules("identity",
-                                                              "gsocket"))
+        beacon = self.beacon(hours_dark=24, document=False,
+                             policy=self.rules("identity", "gsocket"))
         asked = self.record_attempts(beacon)
 
         self.assertTrue(beacon._egress_act())
@@ -628,12 +640,138 @@ class TestARefusalTheSituationGuaranteesCostsNoAttempt(GateCase):
                 self.assertTrue(beacon._egress_act())
                 self.assertEqual(asked, ["gsocket"])
 
+    def test_every_verb_that_would_refuse_declines_instead(self):
+        # The property rather than a list of conditions, because the list
+        # is what kept being incomplete: three rounds added conditions one
+        # at a time and two of the five were inert on the hardware and the
+        # file shapes that ship. So: for every verb the decider may name,
+        # in each of the situations below, **if the verb's own answer is a
+        # refusal then the decline must have fired** -- otherwise the
+        # refusal costs an attempt of the window's budget and suppresses
+        # the carrier latch behind it.
+        from software.c2 import beacon as module
+        from software.scout import handoff
+
+        situations = {
+            "nothing published at all": lambda beacon: None,
+            "a borrow file from a previous outage":
+                lambda beacon: (
+                    handoff.write_borrow(
+                        beacon._way_out_state_dir,
+                        {"credentials": [{"kind": "proxy-basic",
+                                          "user": "corp\\alice",
+                                          "secret": "s3cret",
+                                          "where": "10.0.0.1:3128"}],
+                         "portal": {"url": "http://portal.lan/login",
+                                    "body": "a=1"}}),
+                    beacon._way_out_write(module._WAY_OUT_STATE_NAME, {
+                        "version": module._WAY_OUT_STATE_VERSION,
+                        "opened": time.time() + 3600,
+                        "touched": time.time(), "stuck_cycles": 288,
+                        "spent": 0, "budget": 3,
+                        "evidence": beacon._egress_state()})),
+            "a document with no open SSID and an empty borrow file":
+                lambda beacon: (
+                    handoff.write_document(beacon._way_out_state_dir, {
+                        "version": handoff.DOCUMENT_VERSION,
+                        "published": time.time(),
+                        "evidence": beacon._egress_state(),
+                        "tap": {"flags": [], "ssids": [
+                            {"ssid": "CorpSecure", "open": False}]},
+                        "identity_pre_spent": False,
+                        "recommendation": None}),
+                    handoff.write_borrow(beacon._way_out_state_dir,
+                                         {"credentials": [], "portal": None})),
+            "a credential with no password":
+                lambda beacon: handoff.write_borrow(
+                    beacon._way_out_state_dir,
+                    {"credentials": [{"kind": "proxy-ntlm", "user": "",
+                                      "secret": "", "where": "10.0.0.1:3128"}],
+                     "portal": None}),
+            "a portal record this verb cannot replay":
+                lambda beacon: handoff.write_borrow(
+                    beacon._way_out_state_dir,
+                    {"credentials": [], "portal": {"url": "ftp://x/"}}),
+        }
+        for label, arrange in situations.items():
+            for verb in module.EGRESS_VERBS:
+                with self.subTest(situation=label, verb=verb):
+                    beacon = self.beacon(hours_dark=24, document=False)
+                    # A clean directory per situation: this class shares
+                    # one state directory across a test, so a window or a
+                    # borrow file left by the situation before would
+                    # decide this one.
+                    for name in sorted(os.listdir(
+                            beacon._way_out_state_dir)):
+                        os.unlink(os.path.join(beacon._way_out_state_dir,
+                                               name))
+                    arrange(beacon)
+                    # The real verb, and nothing else in this cycle.
+                    answer = beacon._exec_egress(verb)
+                    if not answer.startswith("[error] Not "):
+                        continue
+                    self.assertTrue(
+                        beacon._egress_nothing_to_work_on(verb),
+                        "`egress %s` refuses (%s) and the decider would "
+                        "spend an attempt of the budget to find out"
+                        % (verb, answer.split(".")[0][:90]))
+
+    def test_a_build_that_forbids_proxies_declines_the_credential_verb(self):
+        # Two places, because two paths reach the verb: the rule is
+        # dropped when the policy is read -- `credential`'s whole effect
+        # is to aim this implant at a proxy, which is what
+        # `c2.proxy.mode: none` forbids -- and a *model* recommendation
+        # is not filtered by that reader, so the decline has to hold too.
+        from software.scout import handoff
+
+        beacon = self.beacon(hours_dark=24, proxy_mode="none",
+                             policy=self.rules("credential", "gsocket"))
+        self.assertEqual([number for number, _ in beacon._egress_rules], [2],
+                         "the rule naming `credential` was not dropped on a "
+                         "build that forbids proxies")
+        # A borrowable credential on the disk, so the *only* reason left
+        # to decline is the build's own prohibition.
+        handoff.write_borrow(beacon._way_out_state_dir, {
+            "credentials": [{"kind": "proxy-basic", "user": "corp\\alice",
+                             "secret": "s3cret", "where": "10.0.0.1:3128"}],
+            "portal": None})
+        self.assertIn("c2.proxy.mode",
+                      beacon._egress_nothing_to_work_on("credential"))
+
+        asked = self.record_attempts(beacon)
+        self.publish(beacon, {"verb": "credential", "chose": "model"})
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["gsocket"])
+
+    def test_a_previous_outages_borrow_file_declines_as_well(self):
+        # The window stamp is `_egress_borrow`'s, so the decline asks it
+        # rather than reading the file itself -- one owner for "is this
+        # capture from this outage".
+        from software.c2 import beacon as module
+        from software.scout import handoff
+
+        beacon = self.beacon(hours_dark=24, document=False)
+        handoff.write_borrow(beacon._way_out_state_dir, {
+            "credentials": [{"kind": "proxy-basic", "user": "corp\\alice",
+                             "secret": "s3cret", "where": "10.0.0.1:3128"}],
+            "portal": {"url": "http://portal.lan/login", "body": "a=1"}})
+        beacon._way_out_write(module._WAY_OUT_STATE_NAME, {
+            "version": module._WAY_OUT_STATE_VERSION,
+            "opened": time.time() + 3600, "touched": time.time(),
+            "stuck_cycles": 288, "spent": 0, "budget": 3,
+            "evidence": beacon._egress_state()})
+
+        for verb in ("credential", "portal"):
+            with self.subTest(verb=verb):
+                self.assertIn("previous outage", beacon._exec_egress(verb))
+                self.assertTrue(beacon._egress_nothing_to_work_on(verb))
+
     def test_the_latch_still_gets_its_cycle(self):
         # The sharper half of the cost: `_egress_act` returning True on a
         # refusal suppressed the carrier latch behind it. A decline
         # returns False when nothing else matches, so the latch fires.
-        beacon = self.beacon(hours_dark=24, policy=self.rules("identity"),
-                             gsocket=True)
+        beacon = self.beacon(hours_dark=24, document=False,
+                             policy=self.rules("identity"), gsocket=True)
         self.assertFalse(beacon._egress_act())
         self.assertEqual(beacon._egress_spent, 0)
 

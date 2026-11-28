@@ -265,19 +265,28 @@ def way_out_identity_poller(config):
         if time.time() - attempt["at"] < _SEQUENCE_DEADLINE:
             return None
         attempt["bypass"] = None
+        # **What actually stopped, by the phase.** "The downstream host
+        # never spoke" is one of two outcomes and was recorded for both:
+        # a bridge that would not take the address gets there with
+        # `victim_mac` already known, so that sentence was false on the
+        # one path the read-back created -- in the field `trigger.py`
+        # calls "read by whoever recovers the device".
+        phase = getattr(bypass, "_phase", "?")
+        why = ("the downstream host never spoke, so the bridge is still "
+               "transparent" if phase in ("idle", "eapol", "discovery")
+               else "the host was found and the bridge would not take its "
+                    "address, so nothing was rewritten")
         logger.error(
             "nac_bypass did not take the host's identity within %d s (phase "
-            "%r): the downstream host never spoke, so the bridge is still "
-            "transparent.", _SEQUENCE_DEADLINE,
-            getattr(bypass, "_phase", "?"))
+            "%r): %s.", _SEQUENCE_DEADLINE, phase, why)
         if not attempt["restoring"]:
             # Recorded as the failure it is, so the rung is spent and the
             # restore path is **not** armed: re-running this at every boot
             # until a host happens to be awake is the per-cycle retry the
             # one-shot exists to prevent, and it would make the move
             # outside the ladder.
-            trigger.taken("nac_bypass did not take the host's identity: the "
-                          "downstream host never spoke")
+            trigger.taken("nac_bypass did not take the host's identity: %s"
+                          % why)
         return None
 
     return poll

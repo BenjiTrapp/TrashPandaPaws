@@ -263,6 +263,14 @@ class NACBypass:
                 "rewrite rule has been applied and everything this "
                 "sequence installed is being torn down",
                 self._bridge_mac(), self.victim_mac)
+            # `_go_live` before `stop`, because `stop` flushes `-t nat`
+            # and the four DROP rules `_go_silent` put in are in the
+            # **filter** tables: without this they were left behind, and
+            # the way out's restore path re-runs this sequence at every
+            # boot, so four more were appended each time and nothing ever
+            # removed them. "Everything this sequence installed is being
+            # torn down" has to be true of everything it installed.
+            self._go_live()
             self.stop()
             return False
         self._phase = "active"
@@ -322,6 +330,17 @@ class NACBypass:
 
         logger.info("NAC bypass active — implant can originate traffic as %s / %s",
                      self.victim_mac, self.victim_ip or "unknown IP")
+        # **And say so.** This fell off the end returning None, which
+        # `_run_sequence`'s new `if not self.apply_rewrite_rules(): return`
+        # read as a failure -- so on every *successful* take the sequence
+        # stopped before `configure_network`, and the bridge was left
+        # with the host's MAC, nine rewrite rules, and no address and no
+        # default route. `bridge_tap.setup_bridge` gives it none either,
+        # so that call is the only thing in this implant that ever
+        # addresses the bridge: the one irreversible move on the ladder
+        # was made, the one-shot spent, the record saying it worked, and
+        # the channel the whole feature exists to restore absent.
+        return True
 
     def configure_network(self):
         """Give the bridge an IP address (DHCP or static victim IP)."""

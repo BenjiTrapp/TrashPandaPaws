@@ -128,7 +128,13 @@ class WayOutCase(unittest.TestCase):
                          for name in beacon_mod._RESCUE_TRANSPORTS},
                 "flags": [],
             },
-            "tap": tap if tap is not None else {"flags": []},
+            # An open network in range by default, as a host with a
+            # radio has: `radio` is the verb these suites reach for when
+            # they need a loud one, and `_egress_task` declines it when
+            # the scout has seen nothing open -- so without this they
+            # would be measuring an empty SSID list.
+            "tap": tap if tap is not None else {
+                "flags": [], "ssids": [{"ssid": "GuestWifi", "open": True}]},
             "identity_pre_spent": identity_pre_spent,
             "recommendation": recommendation,
         }

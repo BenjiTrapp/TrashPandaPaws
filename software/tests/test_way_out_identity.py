@@ -488,6 +488,7 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
         self.assertIn("taken", record)
         self.assertFalse(record["started"])
         self.assertIn("never spoke", record["detail"])
+        self.assertEqual(self.last._phase, "discovery")
         self.assertFalse(IdentityTrigger(self.state).was_started(),
                          "a failure armed the restore path")
 
@@ -546,6 +547,28 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
                 self.config())())
         self.assertEqual(asked, [])
         self.assertIn("no ebtables", self.request()["detail"])
+
+    def test_a_bridge_that_refused_the_address_is_recorded_as_that(self):
+        # The other outcome of the same deadline, and it was recorded
+        # with the first one's sentence: a bridge that would not take the
+        # address gets here with the host already discovered, so "the
+        # downstream host never spoke" was false -- in the field
+        # `trigger.py` calls "read by whoever recovers the device".
+        from software import main as main_mod
+        from software import nac_bypass as nac_mod
+        self.beacon()._exec_egress("identity")
+
+        with mock.patch.object(nac_mod, "NACBypass", self.fake([])):
+            poller = main_mod.way_out_identity_poller(self.config())
+            self.assertIsNone(poller())
+            self.last.discover()          # the host spoke; the phase did
+            later = time.time() + 1e6     # not reach "active"
+            with mock.patch.object(main_mod.time, "time", lambda: later):
+                self.assertIsNone(poller())
+
+        detail = self.request()["detail"]
+        self.assertIn("would not take its address", detail)
+        self.assertNotIn("never spoke", detail)
 
     def test_a_restore_that_fails_does_not_erase_what_was_recorded(self):
         # The record says the identity *was* taken, which is a fact about
