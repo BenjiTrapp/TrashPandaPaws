@@ -163,9 +163,74 @@ if ! command -v pipx &>/dev/null; then
     fi
 fi
 if command -v pipx &>/dev/null && ! command -v nxc &>/dev/null; then
-    echo -e "${C}  [*]${N} ${W}Installing${N}    ${D}netexec (pipx)${N}"
-    pipx install git+https://github.com/Pennyw0rth/NetExec 2>/dev/null || \
-        echo -e "${Y}  [!]${N} ${W}netexec${N} ${Y}install failed (skipped)${N}"
+    # Which interpreter, and why it is named rather than left to pipx.
+    # NetExec requires Python >= 3.11 (its own pyproject). pipx comes from
+    # apt or from pip and runs under whatever `#!/usr/bin/python3` is, which
+    # is 3.11 on Debian 12 and older on an older host -- and the shipped
+    # image's own measured defect was this in reverse: pipx built the venv
+    # with Debian's 3.11 while the wheel it needed was cp312, pip went back
+    # to the sdist, and the `||` swallowed the whole thing. So the newest
+    # interpreter this host has that NetExec accepts is chosen explicitly.
+    NXC_PYTHON=""
+    for CANDIDATE in python3.14 python3.13 python3.12 python3.11; do
+        if command -v "$CANDIDATE" &>/dev/null; then
+            NXC_PYTHON="$(command -v "$CANDIDATE")"
+            break
+        fi
+    done
+    if [[ -z "$NXC_PYTHON" ]] && "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+        NXC_PYTHON="$PYTHON"
+    fi
+
+    if [[ -z "$NXC_PYTHON" ]]; then
+        echo -e "${Y}  [!]${N} ${W}netexec${N} ${Y}needs Python 3.11 or newer; this host has $($PYTHON -V 2>&1)${N}"
+    else
+        # Is there a published wheel for aardwolf on this interpreter and
+        # this architecture? One index lookup answers it; finding out by
+        # watching a source build fail costs minutes.
+        #
+        # Measured in a native aarch64 container, 2026-11-28:
+        #   pip download --no-deps --only-binary :all: aardwolf==0.2.17
+        #   ERROR: No matching distribution found for aardwolf==0.2.17
+        # aardwolf is a hard dependency of NetExec (aardwolf>=0.2.17, not an
+        # extra) and publishes a macOS arm64 wheel, a manylinux x86_64 wheel
+        # and a Windows wheel -- and no Linux aarch64 one. Its pyproject
+        # builds two PyO3 extensions through setuptools-rust, so without a
+        # wheel pip has to compile Rust.
+        NXC_WHEEL_DIR="$(mktemp -d)"
+        if "$NXC_PYTHON" -m pip download --no-deps --only-binary :all: \
+                -q -d "$NXC_WHEEL_DIR" "aardwolf>=0.2.17" &>/dev/null; then
+            NXC_NEEDS_RUST=""
+        else
+            NXC_NEEDS_RUST="1"
+        fi
+        rm -rf "$NXC_WHEEL_DIR"
+
+        if [[ -n "$NXC_NEEDS_RUST" ]] && ! command -v cargo &>/dev/null; then
+            # Said rather than attempted, because the attempt takes minutes
+            # and ends in "can't find Rust compiler". Nothing here installs
+            # a toolchain: the shipped image builds this wheel in a stage it
+            # throws away, and this script runs on the operator's own host.
+            echo -e "${Y}  [!]${N} ${W}netexec${N} ${Y}skipped: no aardwolf wheel for $(uname -m), and no Rust toolchain to build one${N}"
+            echo -e "${D}      aardwolf is a hard NetExec dependency and publishes no Linux aarch64 wheel.${N}"
+            echo -e "${D}      Either install Rust (https://rustup.rs) and re-run this script, or use the${N}"
+            echo -e "${D}      shipped image, which carries the wheel already built:${N}"
+            echo -e "${D}        cd software/c2 && docker compose up -d${N}"
+        else
+            echo -e "${C}  [*]${N} ${W}Installing${N}    ${D}netexec (pipx, $("$NXC_PYTHON" -V 2>&1))${N}"
+            if [[ -n "$NXC_NEEDS_RUST" ]]; then
+                echo -e "${D}      no aardwolf wheel for $(uname -m); building its two Rust extensions, which takes a few minutes${N}"
+            fi
+            # The error is shown. `2>/dev/null` here meant a network
+            # hiccup, a missing compiler and an unsupported interpreter all
+            # read "install failed (skipped)". The `||` stays: one tool that
+            # will not install must not stop the team server from starting,
+            # which is the same bargain the Dockerfile's install makes.
+            pipx install --python "$NXC_PYTHON" \
+                git+https://github.com/Pennyw0rth/NetExec || \
+                echo -e "${Y}  [!]${N} ${W}netexec${N} ${Y}install failed (skipped); the error is above${N}"
+        fi
+    fi
 fi
 
 # ── Version display ──

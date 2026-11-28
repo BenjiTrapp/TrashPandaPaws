@@ -758,6 +758,18 @@ Pass-the-Hash is supported via LM:NT or bare NT hash format.
 | [RelayKing](https://github.com/depthsecurity/RelayKing-Depth) | NTLM relay vulnerability auditing (SMB/LDAP/HTTP/MSSQL) | Dedicated dialog with domain/target config |
 | [Responder](https://github.com/lgandx/Responder) | LLMNR/NBT-NS/mDNS poisoning for credential capture | Interface selection, toggle options |
 
+All five live on the **team-server host**, not on the implant. The shipped
+image carries them; `software/c2/start_server.sh` installs them on a host
+that runs the server directly. The implant's provisioning
+(`software/setup/bootstrap.sh`, `software/setup/build_image.sh`) installs
+none of them, and NetExec in particular it cannot: `aardwolf` is a hard
+NetExec dependency and publishes no Linux `aarch64` wheel, so installing
+it on the device would mean a Rust compiler on the device — measured in a
+native aarch64 container, `pip download --only-binary :all: aardwolf` has
+no candidate at all. A command the agent writes for `nxc` therefore
+belongs on the `server_side` lane; sent to a beacon it answers "command
+not found".
+
 **AV/EDR Enumeration:**
 
 The server includes a built-in AV/EDR scanner based on
