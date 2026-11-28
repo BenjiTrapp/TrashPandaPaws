@@ -168,6 +168,20 @@ class ServerCrypto:
 agents: dict[str, dict] = {}
 task_queues: dict[str, list] = {}
 results: dict[str, dict] = {}
+# task id -> when it went out. `dispatches` and not `dispatched`, because
+# `api_dns_tasking` has a local of that name holding one task's tasking, and
+# two readable things with one name in one file is a trap.
+# Read by /api/tasks/<id> so that "still in the
+# queue" and "delivered, and on DNS you will never hear about it" stop being
+# the same answer. Kept here rather than on the history entry: seven places
+# in the operator page and three in this file read a history status of
+# "pending" to mean "in flight", and marking it dispatched would have made
+# all ten read a delivered task as finished with no output.
+#
+# Not persisted, on purpose, which matches `results` beside it -- a record
+# that outlived the results it is read with would answer "dispatched" for a
+# task whose result the restart had forgotten.
+dispatches: dict[str, str] = {}
 history: dict[str, list] = {}
 scan_store: dict[str, list] = {}
 event_log: list[dict] = []
@@ -177,6 +191,11 @@ _active_c2_profile_source: str = ""
 _name_counter = 0
 
 TASK_LANES = ("operator", "agent")
+# How many dispatch records are kept. One dict per delivered task on a route
+# a beacon reaches as often as it likes, so it is trimmed oldest-first;
+# `results` has the same exposure and no cap, which is a finding of its own
+# and not one this is going to add a second instance of.
+DISPATCHES_MAX = 500
 BATCH_MAX = 8
 TOOL_RUNS_MAX = 50
 TOOL_OUTPUT_MAX = 65536
@@ -1309,6 +1328,19 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
     def api_task_result(task_id):
         if task_id in results:
             return jsonify(results[task_id])
+        if task_id in dispatches:
+            # Delivered. Over HTTPS, SMB or QUIC a result follows and
+            # replaces this; over DNS it never will, because that channel is
+            # tasking only -- and that difference is the whole reason this
+            # status exists. The server cannot name the channel: all three
+            # of the others arrive as an HTTP POST on the agent socket and
+            # are indistinguishable, so "delivered" is reported for every
+            # transport rather than for DNS alone.
+            return jsonify({"task_id": task_id, "status": "dispatched",
+                            "dispatched": dispatches[task_id]})
+        # An unknown id and a queued one have always answered the same, and
+        # this keeps that: a 404 here would be an oracle for which task ids
+        # exist.
         return jsonify({"status": "pending"})
 
     # ── Logs API ──
@@ -4316,10 +4348,16 @@ def _dispatch_for(agent_id: str) -> Optional[dict]:
     for task in tasks:
         task["status"] = "dispatched"
         task["dispatched"] = _now()
+        # The task dict itself is off the queue and nothing reads it again,
+        # which made the two lines above a dead write; this is the copy that
+        # /api/tasks/<id> answers from.
+        dispatches[task["id"]] = task["dispatched"]
         logger.info("Dispatching task %s (%s) to %s",
                     task["id"], task["cmd"], agent_id)
         _log_event("DISPATCH", f"cmd={task['cmd']} args={task.get('args','')} "
                    f"task_id={task['id']}", agent_id=agent_id)
+    while len(dispatches) > DISPATCHES_MAX:
+        dispatches.pop(next(iter(dispatches)))
     return {"tasks": tasks} if batching else tasks[0]
 
 

@@ -694,23 +694,6 @@ def _the_sleep_floor_overrides_a_short_interval():
     return bool(slept) and abs(slept[0] - reported) > 0.01
 
 
-def _a_task_delivered_over_dns_stays_pending():
-    """`/api/tasks/<id>` answers from `results` alone.
-
-    A task that went out over DNS never produces a result, so it reports
-    `pending` for ever -- the same answer as a task still sitting in the
-    queue. Nothing distinguishes "not delivered yet" from "delivered, and
-    you will never hear about it".
-    """
-    text = _read("software", "c2", "server.py")
-    start = text.find("def api_task_result")
-    if start < 0:
-        return False
-    body = text[start:start + 400]
-    return 'return jsonify({"status": "pending"})' in body \
-        and "dispatched" not in body
-
-
 def _a_beacons_implant_id_is_one_per_host():
     """`_generate_id` hashes the hostname and architecture, not the implant.
 
@@ -741,7 +724,6 @@ _OPEN_FINDINGS = {
         ("No request-size cap and no rate limiting",
          _there_is_no_size_cap_and_no_rate_limit),
         ("`vnc_password`", _the_shipped_config_carries_a_vnc_password),
-        ("stays `pending` for ever", _a_task_delivered_over_dns_stays_pending),
         ("implant id is one per host", _a_beacons_implant_id_is_one_per_host),
     ],
     "Housekeeping, but visible": [

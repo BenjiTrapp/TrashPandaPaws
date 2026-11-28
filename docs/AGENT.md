@@ -1192,13 +1192,6 @@ more.
   limiting as present, because its pattern matched the `X-RateLimit-Limit`
   and `X-RateLimit-Remaining` values in a C2 profile example in `server.py`.
   They are example response headers, not a limiter.
-- **A task delivered over DNS stays `pending` for ever.**
-  `/api/tasks/<task_id>` answers from `results` alone, and nothing on the DNS
-  channel ever produces a result, so "not delivered yet" and "delivered, and
-  you will never hear about it" are the same answer. The interface flags the
-  agent (`VIA DNS`) and the panel states the limit, but the task's own status
-  does not distinguish the two. Reporting `dispatched` would improve this for
-  every transport and changes an API the GUI polls.
 - **A beacon's implant id is one per host, not one per implant.**
   `_generate_id` hashes `platform.node()` and `platform.machine()`, plus the
   eth0 MAC where that file exists. So two implants on one machine register as

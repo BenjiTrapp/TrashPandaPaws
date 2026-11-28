@@ -143,9 +143,13 @@ _POLL_INTERVAL_SECONDS = 2.0
 # slot forever and starves every other executor.
 _DEAD_AFTER = 3
 
-# The statuses that mean "not finished yet". A task is "pending" until the
-# beacon posts its result; a server-side tool run is "running" meanwhile.
-_TASK_IN_FLIGHT = ("pending",)
+# The statuses that mean "not finished yet". A task is "pending" while it is
+# still in the beacon's queue and "dispatched" once a check-in took it, until
+# the beacon posts its result; a server-side tool run is "running" meanwhile.
+# Both task statuses have to be here: a new in-flight status this did not
+# know would make every delivered task look like a finished one with no
+# output, which is how a status added to an API somebody polls goes wrong.
+_TASK_IN_FLIGHT = ("pending", "dispatched")
 _TOOL_IN_FLIGHT = ("pending", "running")
 
 IsAlive = Callable[[], Awaitable[bool]]
