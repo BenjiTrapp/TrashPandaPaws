@@ -217,7 +217,42 @@ cut down to it: the image installs it by name *and* would get it anyway
 through `impacket`, so those lines are redundant rather than
 load-bearing, and removing them would change nothing.
 
-## 11. The gsocket leg, the egress decider, and the deferred minors
+## 11. The hardening pass's findings, after the second pass
+
+The first pass of this sweep closed eight of the fourteen "would stop a
+deployment / would stop a release" findings and reported six as needing an
+operator. A second pass took four of those six further, because each had a
+smaller honest fix than the first reading credited:
+
+| Finding | Outcome |
+|---|---|
+| The beacon cannot verify TLS at all | **fixed** — `verify_ssl` is read; cut down to *no pinning*, default off |
+| No replay protection | **fixed** — results write-once, envelope nonce cache; cut down to *bounded by count* |
+| The server image runs as root | **fixed** — non-root default, compose asks for root in one line |
+| `on*` handler-body injections | **fixed** — handlers attached in JS, five sites (the audit named four) |
+| Nothing is pinned | **half fixed** — the image is pinned; cut down to the four requirements files |
+| Two dependencies are old | **half fixed** — netifaces removed; cut down to `ldap3`, which is impacket's |
+
+What stands after both passes, and why each needs the operator rather than
+another pass:
+
+- **Pinning for a self-signed team-server certificate.** The switch works;
+  pinning does not exist. A fingerprint or a CA file is a trust decision
+  and a key-distribution question.
+- **Replay bounded by time instead of count.** Needs a clock both ends
+  agree on; the implant is a Pi with no RTC.
+- **A per-implant identity.** `_generate_id` hashes the hostname and
+  architecture, so two implants on one host are one agent. Fixing it means
+  deciding where an implant keeps an identity that survives a restart —
+  and a build the generator produces is a single pasted file with nowhere
+  to keep one. The same decision as the replay bound.
+- **Exact pins in the four requirements files**, which is a statement
+  about what the suite and the implant may run against.
+- **`vnc_password`**, **the licence**, and **the six published commits**:
+  a shipped default, a choice of licence, and GitHub Support's removal
+  flow.
+
+## 12. The gsocket leg, the egress decider, and the deferred minors
 
 These are not parked items: they are *Known limits* entries with their own
 section in `docs/AGENT.md`, each written as a property of an arrangement
