@@ -12465,4 +12465,11 @@ def _is_loopback(host: str) -> bool:
 
 
 if __name__ == "__main__":
+    # Owner-only, before anything this process writes. The state file, the
+    # database and the logs used to land at 0644 while the configuration
+    # loader refused to *read* a key file looser than that -- the project
+    # asked of others what it did not do itself. In the guard rather than
+    # in main(): several tests call main() in this process, and a umask
+    # set there would stay set for the rest of the suite.
+    os.umask(0o077)
     main()

@@ -1228,12 +1228,6 @@ more.
 
 #### Housekeeping, but visible
 
-- **Project-written files land at `0644`**: the state file, the database, the
-  logs. The configuration loader refuses to read a key file looser than
-  owner-only, so the project asks of others what it does not do itself. The
-  operator-token file (`0600`) and the staged implant (`0700`) are the
-  exceptions. `os.umask(0o077)` at the service entry points would fix every
-  instance.
 - **There is no `LICENSE` file.** The README carries a badge, but nothing in
   the repository says what anyone may do with the code, so this is not
   cosmetic.

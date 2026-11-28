@@ -2244,6 +2244,146 @@ class TestTheOperatorTokenIsComparedInConstantTime(unittest.TestCase):
             "Authorization": "Bearer tökén-🦊"}).status_code, 401)
 
 
+class TestServiceEntryPointsNarrowTheUmask(unittest.TestCase):
+    """Every process this project starts creates its files owner-only.
+
+    The state file, the SQLite database and the logs landed at `0644`: the
+    configuration loader refuses to *read* a key file looser than
+    owner-only, so the project asked of others what it did not do itself.
+    `os.umask(0o077)` at the service entry points is what *Known limits*
+    named as the fix for every instance of it, and it is the fix taken.
+
+    In the `__main__` guard and not in `main()`, deliberately. Several
+    tests call `server_mod.main()` in-process -- `_ran_main` below, and
+    `test_docs` runs it as far as `parse_args` -- and a umask set there
+    would leak into the rest of the suite, where other modules create
+    control files whose whole point is that an ambient umask did not
+    narrow them. Run as `python -m software.c2.server`, the guard is what
+    executes, so production gets it and no test inherits it.
+
+    The entry points are read out of `services/*.service` rather than
+    listed here, so a unit added later is covered without editing a list.
+    Two are added by hand because no unit starts them, and they are the
+    two that hold credentials: the team server, started by
+    `docker-entrypoint.sh` and `start_server.sh`, and the agent service,
+    whose `ENTRYPOINT` is in `software/agent/Dockerfile`.
+    """
+
+    # module -> how it is started, for the failure message.
+    EXTRA = {"software.c2.server": "docker-entrypoint.sh and start_server.sh",
+             "software.agent": "software/agent/Dockerfile's ENTRYPOINT"}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.modules = dict(cls.EXTRA)
+        for unit in sorted((_REPO / "services").glob("*.service")):
+            for line in _joined_lines(unit.read_text()):
+                found = re.search(r"ExecStart=\S*python\S*\s+-m\s+(\S+)", line)
+                if found:
+                    cls.modules[found.group(1)] = unit.name
+
+    def _source(self, module):
+        path = _REPO / Path(*module.split("."))
+        for candidate in (path.with_suffix(".py"), path / "__main__.py"):
+            if candidate.is_file():
+                return candidate
+        self.fail("%s names no module file" % module)
+
+    def test_the_units_were_actually_read(self):
+        # A glob that matched nothing would make every assertion below
+        # vacuous, and this is the whole list the fix is held to.
+        self.assertGreaterEqual(len(self.modules), 8, self.modules)
+        for expected in ("software.main", "software.watchdog",
+                         "software.scout", "software.c2.beacon_standalone",
+                         "software.c2.listeners", "software.c2.server"):
+            self.assertIn(expected, self.modules)
+
+    def test_each_entry_point_narrows_the_umask_before_anything_else(self):
+        import ast
+
+        for module, started_by in sorted(self.modules.items()):
+            path = self._source(module)
+            with self.subTest(module=module, started_by=started_by):
+                guard = None
+                for node in ast.parse(path.read_text()).body:
+                    if isinstance(node, ast.If) and "__main__" in ast.dump(
+                            node.test):
+                        guard = node
+                self.assertIsNotNone(
+                    guard, "%s has no `if __name__` guard" % path)
+                first = guard.body[0]
+                self.assertTrue(
+                    isinstance(first, ast.Expr)
+                    and isinstance(first.value, ast.Call)
+                    and isinstance(first.value.func, ast.Attribute)
+                    and first.value.func.attr == "umask",
+                    "%s does not call os.umask as the first thing its "
+                    "__main__ guard does, so the files it writes keep the "
+                    "ambient umask (started by %s)" % (path, started_by))
+                self.assertEqual(
+                    [arg.value for arg in first.value.args], [0o077],
+                    "%s narrows the umask to something other than 0o077"
+                    % path)
+
+    def test_no_entry_point_sets_the_umask_inside_main(self):
+        # The leak this placement avoids. A umask call in `main()` runs in
+        # every test that calls `main()` in-process and stays set for the
+        # rest of the suite.
+        import ast
+
+        for module in sorted(self.modules):
+            path = self._source(module)
+            with self.subTest(module=module):
+                for node in ast.parse(path.read_text()).body:
+                    if not isinstance(node, ast.FunctionDef):
+                        continue
+                    self.assertNotIn(
+                        "umask", ast.dump(node),
+                        "%s sets the umask inside %s(), which every "
+                        "in-process caller inherits" % (path, node.name))
+
+    def test_the_server_entry_point_really_narrows_it_when_run(self):
+        # Behavioural, in a subprocess, because the point is that the guard
+        # runs and not that the call is written down. The ambient umask is
+        # set permissively first, `--help` carries the module as far as
+        # argparse, and `os.umask` reports what is in force by returning the
+        # previous value.
+        driver = (
+            "import os, runpy, sys\n"
+            "os.umask(0o022)\n"
+            "sys.argv = ['server.py', '--help']\n"
+            "try:\n"
+            "    runpy.run_module('software.c2.server', run_name='__main__')\n"
+            "except SystemExit:\n"
+            "    pass\n"
+            "sys.stderr.write('umask=%04o\\n' % os.umask(0o022))\n")
+        out = subprocess.run([sys.executable, "-c", driver],
+                             capture_output=True, text=True, timeout=120,
+                             cwd=str(_REPO))
+        self.assertIn("umask=0077", out.stderr,
+                      "stdout:\n%s\nstderr:\n%s" % (out.stdout, out.stderr))
+
+    def test_a_file_written_after_the_guard_is_owner_only(self):
+        # The consequence, not the mechanism: the same subprocess writes a
+        # file with no explicit mode and reports what it got.
+        driver = (
+            "import os, runpy, sys, tempfile\n"
+            "os.umask(0o022)\n"
+            "sys.argv = ['server.py', '--help']\n"
+            "try:\n"
+            "    runpy.run_module('software.c2.server', run_name='__main__')\n"
+            "except SystemExit:\n"
+            "    pass\n"
+            "path = os.path.join(tempfile.mkdtemp(), 'state.json')\n"
+            "open(path, 'w').write('{}')\n"
+            "sys.stderr.write('mode=%04o\\n' % (os.stat(path).st_mode & 0o777))\n")
+        out = subprocess.run([sys.executable, "-c", driver],
+                             capture_output=True, text=True, timeout=120,
+                             cwd=str(_REPO))
+        self.assertIn("mode=0600", out.stderr,
+                      "stdout:\n%s\nstderr:\n%s" % (out.stdout, out.stderr))
+
+
 class TestCaptureCleanup(unittest.TestCase):
     """capture_figures.sh must be able to stop the stack it started.
 

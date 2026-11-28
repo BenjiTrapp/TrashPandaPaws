@@ -14,6 +14,7 @@ restarted.
 
 import argparse
 import logging
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -93,4 +94,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    # Owner-only, before anything this process writes. See the longer note
+    # in software/c2/server.py; in the guard rather than in main() so that
+    # calling main() from a test does not change the test process.
+    os.umask(0o077)
     sys.exit(main())

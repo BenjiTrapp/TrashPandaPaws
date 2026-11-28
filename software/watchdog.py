@@ -5,6 +5,7 @@ Restarts the bridge if it goes down and alerts via C2 on failures.
 """
 
 import logging
+import os
 import subprocess
 import time
 import sys
@@ -164,4 +165,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # Owner-only, before anything this process writes. See the longer note
+    # in software/c2/server.py; in the guard rather than in main() so that
+    # calling main() from a test does not change the test process.
+    os.umask(0o077)
     main()

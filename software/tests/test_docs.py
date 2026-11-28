@@ -584,22 +584,6 @@ def _the_shipped_config_carries_a_vnc_password():
                     yield value
                 yield from walk(value)
     return "raccoon" in list(walk(_config()))
-def _project_files_are_world_readable():
-    sources = [REPO / "software" / "main.py", REPO / "software" / "watchdog.py"]
-    for sub in ("c2", "agent"):
-        # A virtualenv inside the tree is not the project's code, and pip's
-        # own os.umask call in one once made this report the file modes fixed.
-        sources.extend(p for p in (REPO / "software" / sub).rglob("*.py")
-                       if not {".venv", "site-packages"} & set(p.parts))
-    no_umask = not any("os.umask" in p.read_text() for p in sources)
-    before = os.umask(0o022)
-    try:
-        with _ProbeServer() as srv:
-            c2_server._save_state(srv.data_dir)
-            mode = (srv.data_dir / "state.json").stat().st_mode & 0o777
-    finally:
-        os.umask(before)
-    return no_umask and mode == 0o644
 
 
 def _there_is_no_licence_file():
@@ -791,7 +775,6 @@ _OPEN_FINDINGS = {
         ("implant id is one per host", _a_beacons_implant_id_is_one_per_host),
     ],
     "Housekeeping, but visible": [
-        ("land at `0644`", _project_files_are_world_readable),
         ("no `LICENSE` file", _there_is_no_licence_file),
         ("Six commits", None),
     ],
