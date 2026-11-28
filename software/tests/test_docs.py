@@ -3670,8 +3670,15 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
                 ("three things are **not** bound", "gsocket carrier",
                  "that the carrier does not take the radio's bind"),
                 ("not** a time box on the association",
-                 "rollback is the one thing that disassociates",
-                 "what ends the radio association")):
+                 "rolled back",
+                 "what ends the radio association"),
+                ("there are two of them", "rung 4 taking the host's identity",
+                 "the second thing that disassociates"),
+                ("every http session the beacon builds",
+                 "smb and quic legs' own sockets",
+                 "that the raw-socket legs take the bind too"),
+                ("a leg that cannot bind the lease", "fails as that leg",
+                 "what a lost lease looks like")):
             with self.subTest(anchor=anchor):
                 self.claim(anchor, says, what)
 

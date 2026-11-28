@@ -212,10 +212,22 @@ class NACBypass:
             return None
 
     def apply_rewrite_rules(self):
-        """Set up ebtables + iptables so the implant can originate traffic."""
+        """Set up ebtables + iptables so the implant can originate traffic.
+
+        Returns whether it did. **A bridge that would not take the
+        address stops the sequence here**: the read-back below was added
+        to keep `_phase` honest, and the rules then went in anyway -- all
+        nine of them, including an ebtables SNAT on the switch-facing
+        port that matches *because* the rename failed. So the identity
+        was taken while the one durable record of that irreversible move
+        said it had not been, with the restore path disarmed and the
+        one-shot spent. The error message said as much -- "the rewrite
+        rules below describe something that did not happen" -- and then
+        ran them.
+        """
         if not self.victim_mac:
             logger.error("Cannot apply rules without victim MAC")
-            return
+            return False
         logger.info("Phase 3 — applying L2/L3 rewrite rules")
         self._phase = "spoofing"
 
@@ -244,15 +256,17 @@ class NACBypass:
         # happened, and armed a restore that re-runs the sequence at
         # every boot with no outage and no arithmetic. The phase becomes
         # "active" only if the kernel agrees.
-        if self._bridge_mac() == self.victim_mac:
-            self._phase = "active"
-            logger.info("Bridge MAC spoofed to %s", self.victim_mac)
-        else:
+        if self._bridge_mac() != self.victim_mac:
             logger.error(
                 "The bridge's MAC is %s and not %s, so this implant's "
-                "traffic is not leaving under the host's identity and the "
-                "rewrite rules below describe something that did not "
-                "happen", self._bridge_mac(), self.victim_mac)
+                "traffic would not leave under the host's identity: no "
+                "rewrite rule has been applied and everything this "
+                "sequence installed is being torn down",
+                self._bridge_mac(), self.victim_mac)
+            self.stop()
+            return False
+        self._phase = "active"
+        logger.info("Bridge MAC spoofed to %s", self.victim_mac)
 
         # ── ebtables: L2 MAC rewriting ──
         _run_quiet("ebtables -t nat -F")
@@ -361,7 +375,8 @@ class NACBypass:
                             "implant's own MAC is unchanged", self.victim_mac)
                 return
 
-            self.apply_rewrite_rules()
+            if not self.apply_rewrite_rules():
+                return
             self.configure_network()
 
             from software.notifications import get_notifier

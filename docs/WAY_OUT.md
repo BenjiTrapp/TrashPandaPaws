@@ -147,9 +147,11 @@ routes this implant's own traffic through it. Three bounds, all in code:
   and a `dhclient` that never returned would cost the implant its loop.
   It is **not** a time box on the association: nothing *times out* of the
   network, so once this rung succeeds the implant stays on it until the
-  device is restarted or the rung is rolled back — a rollback is the one
-  thing that disassociates, and it runs only when a step of the rung
-  fails. The design said "a time-boxed association"; that was not built,
+  device is restarted or the rung is rolled back. A rollback is the one
+  thing that disassociates, and there are two of them — a step of this
+  rung failing, and **rung 4 taking the host's identity**, which is on
+  the tapped port and cannot share the path with a source bind to this
+  one. The design said "a time-boxed association"; that was not built,
   and this is the limit instead.
 - **A scoped route, never the default one.** The route goes into table `100`
   with a source rule for the address DHCP gave, so the host's own default
@@ -163,10 +165,15 @@ routes this implant's own traffic through it. Three bounds, all in code:
   has no source until something binds it. Without the bind the rung
   installed a route nothing could ever select and reported that it had
   changed how the implant gets out. Every HTTP session the beacon builds,
-  the hop an NTLM relay makes to its upstream proxy, and every DNS query
-  the beacon composes itself leave by the leased address — and they keep
-  doing so after a leg delivers, because a leg delivering while the bind
-  holds is the moment this rung is *working*. A rollback is what unbinds.
+  the hop an NTLM relay makes to its upstream proxy, **the SMB and QUIC
+  legs' own sockets**, and every DNS query the beacon composes itself
+  leave by the leased address — and they keep doing so after a leg
+  delivers, because a leg delivering while the bind holds is the moment
+  this rung is *working*. A rollback is what unbinds. A leg that cannot
+  bind the lease **fails as that leg** rather than leaving by the tapped
+  port quietly, so a lost lease reads as "SMB unreachable" and not as a
+  rung that stopped meaning anything.
+
   Three things are **not** bound, and they are named rather than implied: a
   forward to `127.0.0.1`, because its peer is on this host and no source
   rule can match it; `wpad` name lookups during proxy discovery, which go

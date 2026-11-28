@@ -257,7 +257,25 @@ class TestSilentPhase(unittest.TestCase):
         mock_rq.assert_has_calls(expected, any_order=False)
 
 
-class TestPhase3RewriteRules(unittest.TestCase):
+class _TheBridgeAgrees(unittest.TestCase):
+    """The kernel took the address, so these tests measure the rules.
+
+    `apply_rewrite_rules` reads the bridge's own address back and tears
+    everything down when it disagrees -- the fix for an identity taken
+    while the record said it was not. These classes are about the rules
+    themselves, so without this they would all be measuring a teardown.
+    `TestThePhaseIsWhatTheKernelAgreesTo` is where the disagreement is
+    the subject.
+    """
+
+    def setUp(self):
+        patcher = patch.object(NACBypass, "_bridge_mac",
+                               lambda self: self.victim_mac)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class TestPhase3RewriteRules(_TheBridgeAgrees):
     def _setup_nac(self):
         nac = _make_nac()
         nac.victim_mac = "de:ad:be:ef:00:01"
@@ -407,7 +425,7 @@ class TestPhase3RewriteRules(unittest.TestCase):
         self.assertEqual(len(iptables_snat), 0)
 
 
-class TestPhase3RuleOrder(unittest.TestCase):
+class TestPhase3RuleOrder(_TheBridgeAgrees):
     """Verify the exact order: silent → sysctl → MAC spoof → ebtables → iptables → arptables → live."""
 
     @patch("software.nac_bypass._run_quiet")
@@ -441,7 +459,7 @@ class TestPhase3RuleOrder(unittest.TestCase):
         self.assertLess(arptables_mangle, live_start)
 
 
-class TestTeardown(unittest.TestCase):
+class TestTeardown(_TheBridgeAgrees):
     @patch("software.nac_bypass._run")
     @patch("software.nac_bypass._run_quiet")
     @patch("builtins.open", mock_open())
@@ -600,7 +618,13 @@ class TestStopCanActuallyStopIt(unittest.TestCase):
             return _completed()
 
         # And the kernel's answer about the bridge's own address, which
-        # `apply_rewrite_rules` now reads back rather than assuming.
+        # `apply_rewrite_rules` reads back rather than assuming. A
+        # tautology inside this class on purpose: these tests are about
+        # `_running`, so the read-back must not be the thing that stops
+        # the sequence. It makes the `"active"` assertion below a
+        # statement about the flag and not about the kernel --
+        # `TestThePhaseIsWhatTheKernelAgreesTo` is where the kernel is
+        # the subject.
         return (patch("software.nac_bypass._run_quiet", run_quiet),
                 patch("software.nac_bypass._run", run),
                 patch("software.nac_bypass.time.sleep", lambda _s: None),
@@ -713,7 +737,12 @@ class TestThePhaseIsWhatTheKernelAgreesTo(unittest.TestCase):
             recorded.append(command)
             return _completed()
 
+        def run(command, *_args, **_kwargs):
+            recorded.append(command)
+            return _completed()
+
         patchers = (patch("software.nac_bypass._run_quiet", run_quiet),
+                    patch("software.nac_bypass._run", run),
                     patch.object(type(nac), "_bridge_mac", lambda _self: mac))
         for patcher in patchers:
             patcher.start()
@@ -734,14 +763,84 @@ class TestThePhaseIsWhatTheKernelAgreesTo(unittest.TestCase):
         nac = _make_nac()
         nac.victim_mac = "aa:bb:cc:dd:ee:ff"
         nac.implant_mac = "11:22:33:44:55:66"
-        self.ran(nac, "11:22:33:44:55:66")
+        recorded = self.ran(nac, "11:22:33:44:55:66")
 
-        nac.apply_rewrite_rules()
+        self.assertFalse(nac.apply_rewrite_rules())
 
         self.assertNotEqual(nac._phase, "active",
                             "the phase says the host's identity was taken "
                             "and the bridge still has this implant's own "
                             "address")
+        # **And nothing was applied.** The read-back was added to keep
+        # the phase honest and the rules went in anyway -- all nine of
+        # them, including an ebtables SNAT on the switch-facing port that
+        # matches *because* the rename failed. So the identity was taken
+        # while the one durable record of that irreversible move said it
+        # had not been.
+        # The rules, by their appends: the teardown deletes rules with
+        # the same names, and the MAC *attempt* is how the disagreement
+        # was found in the first place.
+        took = [command for command in recorded
+                if " -A " in command
+                and ("snat" in command or "SNAT" in command
+                     or "mangle-mac-s" in command or "dnat" in command)]
+        self.assertEqual(took, [],
+                         "the host's identity was taken anyway: %r" % (took,))
+        # And the bridge is put back to this implant's own address.
+        self.assertIn("ip link set dev br0 address 11:22:33:44:55:66",
+                      recorded)
+
+    def test_a_refused_bridge_stops_the_sequence(self):
+        # `configure_network` runs DHCP on the bridge under the host's
+        # identity, which is the other half of taking it -- so the
+        # sequence has to stop, not merely skip the rules.
+        nac = _make_nac()
+        recorded = []
+
+        def run_quiet(command, *_args, **_kwargs):
+            recorded.append(command)
+            return _completed()
+
+        def run(command, *_args, **_kwargs):
+            recorded.append(command)
+            if "tcpdump" in command:
+                return _completed(stdout=(
+                    "aa:bb:cc:dd:ee:ff > ff:ff:ff:ff:ff:ff, "
+                    "Request who-has 10.0.0.254 tell 10.0.0.9\n"
+                    "11:22:33:44:55:66 > aa:bb:cc:dd:ee:ff, "
+                    "Reply 10.0.0.254 is-at 11:22:33:44:55:66\n"))
+            return _completed()
+
+        for patcher in (patch("software.nac_bypass._run_quiet", run_quiet),
+                        patch("software.nac_bypass._run", run),
+                        patch("software.nac_bypass.time.sleep",
+                              lambda _s: None),
+                        patch.object(type(nac), "_bridge_mac",
+                                     lambda _self: "11:22:33:44:55:66")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        nac._running = True
+        nac._run_sequence()
+
+        # `configure_network` takes the static arm when the capture gave
+        # both addresses, so the tell is an address and a default route on
+        # the bridge under an identity the bridge refused.
+        went_on = [command for command in recorded
+                   if "dhclient" in command
+                   or "ip addr add" in command
+                   or "route add default" in command]
+        self.assertEqual(went_on, [],
+                         "the sequence configured the network under an "
+                         "identity the bridge refused: %r" % (went_on,))
+        self.assertNotEqual(nac._phase, "active")
+
+    def test_no_victim_mac_is_not_a_success(self):
+        # `_run_sequence` stops on a False, and "we never learned a MAC"
+        # has to be one of them: otherwise the sequence carries on to
+        # `configure_network`.
+        nac = _make_nac()
+        self.assertFalse(nac.apply_rewrite_rules())
 
     def test_a_bridge_that_cannot_be_read_is_not_either(self):
         nac = _make_nac()

@@ -47,6 +47,7 @@ import base64
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -538,6 +539,103 @@ class TestARefusedRungDoesNotSilenceTheOnesBelowIt(GateCase):
         message = "\n".join(self.logged.warnings)
         self.assertIn("way_out_identity", message)
         self.assertIn("way_out_radio", message)
+
+
+class TestARefusalTheSituationGuaranteesCostsNoAttempt(GateCase):
+    """The rule this branch states three times, now kept four more times.
+
+    `_egress_usable` drops a rule the *build* guarantees will refuse,
+    with the reason: "an attempt spent on a refusal the build guarantees
+    is an attempt the carrier does not get". The gate does the same for
+    the tapped-network verbs while the radio holds a lease. Four
+    refusals of exactly that species sat inside their verbs instead,
+    where `_egress_act` reaches them only after spending the budget:
+    rung 4 already asked, rung 4 pre-spent at boot, rung 4 with no
+    document to read that fact from, rung 3 on a host with no radio, and
+    the borrow verbs with nothing published to borrow.
+
+    And the cost is not only the attempt. `_egress_act` returns True on
+    a refusal, so the gsocket latch behind it does not fire -- so a
+    `budget: 3` window spent all three on "this implant has asked once
+    already", which is the state *immediately after rung 4 succeeds*,
+    and brought no carrier up either.
+    """
+
+    def rules(self, *verbs):
+        return self.policy([{"when": {"https": ["not_attempted"]},
+                             "try": verb} for verb in verbs])
+
+    def test_rung_four_already_asked_declines_and_the_next_rule_runs(self):
+        beacon = self.beacon(hours_dark=24, policy=self.rules("identity",
+                                                              "gsocket"))
+        self.publish(beacon, None)
+        # The **real** verb for the first cycle, because what makes the
+        # rung spent is the request file it writes -- a recorded attempt
+        # would leave the one-shot unspent and this test measuring
+        # nothing.
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(beacon._egress_spent, 1)
+        self.assertIsNotNone(beacon._way_out_read(
+            beacon_mod._WAY_OUT_IDENTITY_NAME,
+            beacon_mod._WAY_OUT_STATE_VERSION))
+
+        # The second cycle: the rung is spent, so it declines and the
+        # quieter rule gets the cycle instead of the refusal taking it.
+        asked = self.record_attempts(beacon)
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["gsocket"])
+        self.assertEqual(beacon._egress_spent, 2)
+
+    def test_a_pre_spent_identity_declines(self):
+        beacon = self.beacon(hours_dark=24, policy=self.rules("identity",
+                                                              "gsocket"))
+        self.publish(beacon, None)
+        from software.scout import handoff
+        document = handoff.read_document(beacon._way_out_state_dir)
+        document["identity_pre_spent"] = True
+        handoff.write_document(beacon._way_out_state_dir, document)
+        asked = self.record_attempts(beacon)
+
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["gsocket"])
+        self.assertEqual(beacon._egress_spent, 1)
+
+    def test_rung_four_with_no_document_declines(self):
+        beacon = self.beacon(hours_dark=24, policy=self.rules("identity",
+                                                              "gsocket"))
+        asked = self.record_attempts(beacon)
+
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["gsocket"])
+
+    def test_a_host_with_no_radio_declines_the_radio_rung(self):
+        beacon = self.beacon(hours_dark=24, policy=self.rules("radio",
+                                                              "gsocket"))
+        asked = self.record_attempts(beacon)
+        with mock.patch.object(beacon, "_radio_iface",
+                               lambda: (None, "no wireless interface")):
+            self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["gsocket"])
+        self.assertEqual(beacon._egress_spent, 1)
+
+    def test_nothing_to_borrow_declines_the_borrow_verbs(self):
+        for verb in ("credential", "portal"):
+            with self.subTest(verb=verb):
+                beacon = self.beacon(hours_dark=24,
+                                     policy=self.rules(verb, "gsocket"))
+                asked = self.record_attempts(beacon)
+
+                self.assertTrue(beacon._egress_act())
+                self.assertEqual(asked, ["gsocket"])
+
+    def test_the_latch_still_gets_its_cycle(self):
+        # The sharper half of the cost: `_egress_act` returning True on a
+        # refusal suppressed the carrier latch behind it. A decline
+        # returns False when nothing else matches, so the latch fires.
+        beacon = self.beacon(hours_dark=24, policy=self.rules("identity"),
+                             gsocket=True)
+        self.assertFalse(beacon._egress_act())
+        self.assertEqual(beacon._egress_spent, 0)
 
 
 class TestBothPathsGoThroughIt(GateCase):

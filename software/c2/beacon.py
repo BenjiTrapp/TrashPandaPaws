@@ -10887,13 +10887,23 @@ class Beacon:
             # Already bound, and binding again: the ordinary case, since
             # no verb tests its own result. The stash is **not** touched
             # -- re-stashing what is in use now would leave the rollback
-            # with nothing of the tapped path to put back -- and nothing
-            # is carried across either, because what is in use now
-            # belongs to this path and a fresh bound session already has
-            # it... which is to say: it has nothing, and that is right.
+            # with nothing of the tapped path to put back.
+            #
+            # A proxy on *this host* is carried, for the reason the first
+            # bind keeps one: `127.0.0.1` is reachable from every path,
+            # and on a `proxy.ntlm.enabled` build it is the relay's own
+            # listener. Dropping it here meant the relay was reconnected
+            # for exactly one cycle and then lost -- so the upstream hop
+            # two rounds of work went into binding carried nothing from
+            # the second cycle on, which is the ordinary climb.
             self._way_out_source = address
             session = self._bound_session()
             session.trust_env = False
+            if previous is not None:
+                kept = {scheme: url for scheme, url in previous.proxies.items()
+                        if self._is_loopback_base(url)}
+                if kept:
+                    session.proxies = kept
         else:
             # Unbinding with no stash: there was nothing of a tapped path
             # to keep, so this is the plain case of dropping the source.
@@ -11051,15 +11061,28 @@ class Beacon:
         # by `wlan0` -- the identity would be taken, the one-shot spent,
         # and not one byte of this beacon's traffic would use it. The two
         # rungs cannot both be the way out, and the one that cannot be
-        # undone is the one that wins. A rollback also puts the tapped
-        # path's proxy back, which is where the implant is going.
+        # undone is the one that wins *here*. A rollback also puts the
+        # tapped path's proxy back, which is where the implant is going.
+        #
+        # Nothing stops rung 3 running again afterwards, and that is
+        # deliberate rather than overlooked: if the port was shut off by
+        # the move, the identity is worthless and the radio is the only
+        # thing left. The ladder is an order of *first* attempts, not a
+        # one-way door.
         rolled = ""
         if self._way_out_source:
             iface, _why = self._radio_iface()
+            # The lease's own prefix, not the /24 every other guess would
+            # make: `ip addr del <address>/24` fails on a /22 guest
+            # network and leaves the address on the interface. The lease
+            # file is where the rung recorded it.
+            _address, prefix, _router = _radio_lease(
+                self._way_out_path(_WAY_OUT_RADIO_LEASE_NAME))
             self._radio_rollback(iface or "", self._way_out_source,
                                  "rung 4 takes the host's identity on the "
                                  "tapped port, so the radio rung's scoped "
-                                 "route and source bind cannot stay")
+                                 "route and source bind cannot stay",
+                                 prefix=prefix)
             rolled = (" The radio rung was rolled back first: this rung's "
                       "effect is on the tapped port, and a source bind to "
                       "the radio's lease would have sent every socket past "
@@ -11988,21 +12011,72 @@ class Beacon:
                 "which carries whitespace and would be read as another "
                 "verb's; the verb was run with none", verb, argument)
             argument = ""
+        nothing = self._egress_nothing_to_work_on(verb)
+        if nothing:
+            # Debug and not a warning: this is one line per stuck cycle for
+            # as long as the rule keeps holding, and the section above says
+            # what a per-cycle line costs on a channel nobody is reading.
+            logger.debug(
+                "egress decider: a rule chose `egress %s` and %s, so no "
+                "attempt was made", verb, nothing)
+            return None
         if argument:
             return "%s %s" % (verb, argument)
         if verb != "proxy":
             return verb
         target = self._egress_proxy_target()
         if target is None:
-            # Debug and not a warning: this is one line per stuck cycle for
-            # as long as the rule keeps holding, and the section above says
-            # what a per-cycle line costs on a channel nobody is reading.
             logger.debug(
                 "egress decider: a rule chose `egress proxy` and discovery "
                 "has found nothing on this host to select, so no attempt "
                 "was made")
             return None
         return "proxy %s" % target
+
+    def _egress_nothing_to_work_on(self, verb: str) -> str:
+        """Why this verb would refuse whatever happened, or "".
+
+        **A refusal the situation guarantees must not cost an attempt.**
+        This branch states that rule three times -- in `_egress_usable`
+        twice and at the gate for `_EGRESS_TAPPED_VERBS` -- and four
+        refusals of exactly that species sat inside their verbs instead,
+        where `_egress_act` reaches them only after spending the budget.
+        Measured: a `budget: 3` window spending all three on "this
+        implant has asked once already", which is the state *immediately
+        after rung 4 succeeds* and the one the design's own measurements
+        record a model walking back into. And the cost is not only the
+        attempt: `_egress_act` returns True on a refusal, so the gsocket
+        latch behind it does not fire either -- three cycles with no
+        attempt, no carrier, and a window that closes only when a leg
+        delivers.
+
+        So they are declines, through the same `None` the proxy verb
+        already used: the candidate walk moves on to the quieter rule and
+        the latch still gets its cycle. Each verb keeps its own refusal
+        for the operator who types it by hand, which is where a sentence
+        is worth more than a skipped cycle.
+        """
+        if verb == "identity":
+            if self._way_out_identity_spent or self._way_out_read(
+                    _WAY_OUT_IDENTITY_NAME, _WAY_OUT_STATE_VERSION
+            ) is not None:
+                return "the rung is one-shot and has been asked already"
+            document = self._way_out_document()
+            if document is None:
+                return "there is no fresh scout document to read the "\
+                       "pre-spent fact from"
+            if document.get("identity_pre_spent"):
+                return "this build's nac_bypass.enabled is true, so the "\
+                       "identity was taken at boot"
+        elif verb == "radio":
+            iface, why = self._radio_iface()
+            if iface is None:
+                return "this host has no radio the rung may use (%s)" % why
+        elif verb in self._EGRESS_SCOUT_VERBS:
+            if self._way_out_read(_WAY_OUT_BORROW_NAME,
+                                  _WAY_OUT_BORROW_VERSION) is None:
+                return "the scout has published nothing to borrow"
+        return ""
 
     def _egress_act(self) -> bool:
         """Make at most one autonomous attempt to get out; did it make one?

@@ -214,6 +214,17 @@ class DeciderCase(unittest.TestCase):
         config["c2"].update(transports)
         beacon = Beacon(config)
         self._beacons.append(beacon)
+        # A host with a radio, unless a test says otherwise. `radio` is
+        # the verb these suites reach for whenever they need a *loud*
+        # one, and `_egress_task` now declines it on a host that has no
+        # wireless interface -- the refusal is guaranteed for the
+        # hardware's life, so it must not cost an attempt. Without this
+        # every test that uses `radio` to stand for "loud" would be
+        # measuring this machine's lack of a radio instead.
+        patcher = mock.patch.object(beacon, "_radio_iface",
+                                    lambda: ("wlan0", ""))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # The same guard `way_out_scratch.assert_live` puts on the way
         # out, and for the reason CI found there: `read_egress_policy`
         # never raises -- it logs and hands back a *disabled* block -- so

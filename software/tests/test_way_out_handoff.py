@@ -38,6 +38,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -104,6 +105,15 @@ class WayOutCase(unittest.TestCase):
         # own: half of this file is about what the reader refuses.
         if way_out is None:
             _scratch.assert_live(self, beacon)
+        # A host with a radio, for the reason `DeciderCase.a_beacon`
+        # gives: `radio` is the verb these tests reach for when they need
+        # a loud one, and `_egress_task` declines it on a host with no
+        # wireless -- so without this they would be measuring this
+        # machine's hardware.
+        patcher = mock.patch.object(beacon, "_radio_iface",
+                                    lambda: ("wlan0", ""))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         return beacon
 
     def publish(self, state_dir=None, published=None, tap=None,

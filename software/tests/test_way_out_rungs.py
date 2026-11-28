@@ -727,7 +727,12 @@ class TestTheRadioVerb(RadioCase):
         beacon = self.beacon(tap=self.open_ssid(),
                              borrow={"credentials": [A_CREDENTIAL]})
         self.onboard(beacon)
-        ran = self.radio(beacon)
+        # A /22, so the rollback's prefix is observable: every other
+        # guess here would be /24.
+        ran = self.radio(beacon, lease=(
+            "lease {\n  fixed-address 192.168.9.42;\n"
+            "  option subnet-mask 255.255.252.0;\n"
+            "  option routers 192.168.9.1;\n}\n"))
         beacon._exec_egress("credential")
         proxies = dict(beacon._proxy_session.proxies)
         beacon._exec_egress("radio")
@@ -747,6 +752,10 @@ class TestTheRadioVerb(RadioCase):
         joined = [" ".join(command) for command in ran]
         self.assertIn("ip route flush table 100", joined)
         self.assertIn("ip rule del from 192.168.9.42 table 100", joined)
+        # The lease's own prefix, not the /24 every other guess makes:
+        # `ip addr del <address>/24` fails on a /22 guest network and
+        # leaves the address on the interface.
+        self.assertIn("ip addr del 192.168.9.42/22 dev wlan0", joined)
 
     def test_rung_four_with_no_radio_says_nothing_about_a_rollback(self):
         beacon = self.beacon(tap=self.open_ssid())
@@ -1555,6 +1564,40 @@ class TestTheBindIsASocketFactAndNotAField(unittest.TestCase):
                           "https": "http://127.0.0.1:65291"})
         self.assertEqual(beacon._proxy_session.source_address,
                          ("192.168.9.42", 0))
+
+    def test_a_loopback_relay_proxy_survives_the_second_bind(self):
+        # `_egress_radio` ends in a bind on *every* success and its own
+        # docstring says a second attempt is the ordinary case -- so a
+        # loopback proxy kept by the first bind and dropped by the second
+        # meant the relay was reconnected for exactly one cycle, and the
+        # upstream hop two rounds of work went into binding carried
+        # nothing from the second cycle on.
+        import base64
+
+        from software.c2.beacon import Beacon, read_way_out_policy
+        beacon = Beacon({"c2": {
+            "beacon_interval_seconds": 300, "jitter_percent": 0,
+            "encryption_key": base64.b64encode(b"\x24" * 32).decode(),
+            "proxy": {"mode": "auto"}, "https": {"enabled": False},
+            "dns": {"enabled": False}, "smb": {"enabled": False},
+            "quic": {"enabled": False},
+            "way_out": read_way_out_policy(None),
+        }})
+        beacon._running = False
+        self.addCleanup(setattr, beacon, "_running", False)
+        relay = {"http": "http://127.0.0.1:65291",
+                 "https": "http://127.0.0.1:65291"}
+        beacon._proxy_session = beacon._bound_session()
+        beacon._proxy_session.proxies = dict(relay)
+
+        beacon._way_out_bind("192.168.9.42")
+        self.assertEqual(beacon._proxy_session.proxies, relay)
+        beacon._way_out_bind("192.168.9.42")
+
+        self.assertEqual(beacon._proxy_session.proxies, relay,
+                         "the second bind dropped the relay's own "
+                         "listener, so nothing goes through the relay")
+        self.assertFalse(beacon._proxy_session.trust_env)
 
     def test_a_proxy_on_the_hosts_network_is_still_stashed(self):
         import base64
