@@ -26,8 +26,11 @@ import logging
 import os
 import re
 import secrets
+import shlex
+import shutil
 import ssl
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -2837,6 +2840,10 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         if not target:
             return jsonify({"error": "target required"}), 400
 
+        # The directory holding a generated VNC password file, removed when
+        # the viewer exits. None on every other path.
+        scratch = None
+
         if mode == "xfreerdp":
             # Looked up, not assumed. freerdp2 ships `xfreerdp` and
             # freerdp3 ships `xfreerdp3`; this used to hardcode the former,
@@ -2858,6 +2865,10 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 cmd_parts.append(f"/d:{domain}")
             if username:
                 cmd_parts.append(f"/u:{username}")
+            # Still on the command line, and therefore still visible in
+            # the process table to every user on this host: xfreerdp takes
+            # the password as `/p:` or `/pth:` and offers no way to read it
+            # from standard input. The VNC branch below does, and uses it.
             if use_hash and password:
                 cmd_parts.append(f"/pth:{password}")
             elif password:
@@ -2870,27 +2881,33 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
                 cmd_parts.append("/cert-ignore")
             cmd_parts.append("/sec:nla")
             cmd_parts.append("+clipboard")
-            cmd_str = " ".join(cmd_parts)
 
         elif mode == "vnc":
             cmd_parts = []
             vnc_target = f"{target}:{port}" if port else target
-            for viewer in ("vncviewer", "xvncviewer", "tigervnc", "xtigervncviewer"):
-                if subprocess.run(["which", viewer], capture_output=True).returncode == 0:
-                    cmd_parts = [viewer, vnc_target]
-                    if password:
-                        pass_file = f"/tmp/.vnc_pass_{secrets.token_hex(4)}"
-                        subprocess.run(
-                            ["bash", "-c", f"echo '{password}' | vncpasswd -f > {pass_file}"],
-                            capture_output=True, timeout=5,
-                        )
-                        cmd_parts.extend(["-passwd", pass_file])
-                    if fullscreen:
-                        cmd_parts.append("-fullscreen")
-                    break
+            for viewer in ("vncviewer", "xvncviewer", "tigervnc",
+                           "xtigervncviewer"):
+                # `shutil.which`, not `subprocess.run(["which", ...])`: one
+                # process per candidate viewer for a question the standard
+                # library answers, and the RDP branch above already does it
+                # this way.
+                if shutil.which(viewer) is None:
+                    continue
+                cmd_parts = [viewer, vnc_target]
+                if password:
+                    try:
+                        pass_file = _vnc_password_file(password)
+                    except (OSError, subprocess.SubprocessError) as exc:
+                        logger.error("vncpasswd failed: %s", exc)
+                        return jsonify({"error": "vncpasswd failed; install "
+                                                 "tigervnc-common"}), 400
+                    scratch = str(pass_file.parent)
+                    cmd_parts.extend(["-passwd", str(pass_file)])
+                if fullscreen:
+                    cmd_parts.append("-fullscreen")
+                break
             if not cmd_parts:
                 return jsonify({"error": "No VNC viewer found (install tigervnc-viewer or tightvncviewer)"}), 400
-            cmd_str = " ".join(cmd_parts)
 
         else:
             return jsonify({"error": f"Unknown mode: {mode}"}), 400
@@ -2898,14 +2915,32 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
         _log_event("TOOL", f"RDP/VNC session: {mode} → {target} (user={username or 'none'})")
 
         def _launch_rdp():
+            # No shell. This used to join `cmd_parts` into a string and give
+            # it to `Popen(..., shell=True)`, so a `;`, a `$(...)` or a
+            # backtick in any field of the request -- target, username,
+            # domain, port -- was a command on the C2 host. The list has
+            # always existed; only the join was the defect.
             try:
-                subprocess.Popen(
-                    cmd_str, shell=True,
+                process = subprocess.Popen(
+                    cmd_parts,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     start_new_session=True,
                 )
             except Exception as e:
                 logger.error("Failed to launch %s: %s", mode, e)
+                _drop_scratch(scratch)
+                return
+            if scratch is None:
+                return
+            # The viewer holds the file open only while it starts, but
+            # waiting is the one moment this process knows the secret is no
+            # longer needed. `/tmp/.vnc_pass_*` used to be left behind for
+            # ever, and `vncpasswd` turns its contents back into the real
+            # password.
+            try:
+                process.wait()
+            finally:
+                _drop_scratch(scratch)
 
         t = threading.Thread(target=_launch_rdp, daemon=True)
         t.start()
@@ -2913,7 +2948,11 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             "status": "launched",
             "mode": mode,
             "target": target,
-            "cmd": cmd_str,
+            # Quoted for a person reading the operator page, not for a
+            # shell: nothing runs this string any more, and `shlex.join`
+            # makes a hostile field visible as one argument rather than
+            # reading like something safe to paste.
+            "cmd": shlex.join(cmd_parts),
         })
 
     # ── Beacon generator (obfuscated one-liner) ──
@@ -3959,6 +3998,58 @@ def create_app(crypto: ServerCrypto, operator_token: str, data_dir: Path,
             return _fake_response()
 
     return app
+
+
+def _vnc_password_file(password: str):
+    """`vncpasswd -f` output in a private directory, 0600 in a 0700 dir.
+
+    Two things the old version got wrong, both of them with only the
+    operator token. The password went through
+    `bash -c "echo '<it>' | vncpasswd -f > /tmp/.vnc_pass_XXXX"`, so a
+    password containing `'` was a command-injection primitive and the
+    cleartext was in the process table for every user on this host to read
+    with `ps`. And the file was never removed, in a world-readable
+    directory, holding something `vncpasswd` turns back into the real
+    password.
+
+    So: no shell, the secret on standard input, and a directory of our own
+    that the caller removes when the viewer exits. `mkdtemp` is 0700 by
+    itself; the mode is set anyway, because this function's contract is the
+    modes and not what its callees default to.
+    """
+    scratch = Path(tempfile.mkdtemp(prefix=".raccoon-vnc-"))
+    os.chmod(scratch, 0o700)
+    path = scratch / "passwd"
+    try:
+        done = subprocess.run(["vncpasswd", "-f"],
+                              input=password.encode(),
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=5)
+        if done.returncode != 0 or not done.stdout:
+            raise subprocess.SubprocessError(
+                "vncpasswd -f exited %s" % done.returncode)
+        # Opened owner-only from the start rather than chmod'ed after the
+        # write: between the two there is a window in which the obfuscated
+        # password is readable, and `os.umask` at the entry point is not a
+        # guarantee this function may lean on.
+        handle = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                         0o600)
+        with os.fdopen(handle, "wb") as out:
+            out.write(done.stdout)
+    except BaseException:
+        _drop_scratch(str(scratch))
+        raise
+    return path
+
+
+def _drop_scratch(scratch) -> None:
+    """Remove a scratch directory and everything in it, quietly."""
+    if not scratch:
+        return
+    try:
+        shutil.rmtree(scratch, ignore_errors=True)
+    except Exception as exc:                        # pragma: no cover
+        logger.debug("could not remove %s: %s", scratch, exc)
 
 
 def _fake_response():

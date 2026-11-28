@@ -510,12 +510,6 @@ def _a_replayed_result_is_applied_again():
         return c2_server.results["t1"]["output"] == "first"
 
 
-def _rdp_hands_request_text_to_a_shell():
-    text = _read("software", "c2", "server.py")
-    return ("cmd_str, shell=True" in text
-            and "echo '{password}' | vncpasswd -f" in text)
-
-
 def _the_server_image_is_root_with_net_admin():
     image = _read("software", "c2", "Dockerfile")
     compose = _read("software", "c2", "docker-compose.yml")
@@ -714,7 +708,6 @@ _OPEN_FINDINGS = {
     "Would stop a deployment": [
         ("cannot verify TLS at all", _beacon_cannot_verify_tls),
         ("No replay protection", _a_replayed_result_is_applied_again),
-        ("`shell=True`", _rdp_hands_request_text_to_a_shell),
         ("server image runs as root", _the_server_image_is_root_with_net_admin),
     ],
     "Would stop a release": [
