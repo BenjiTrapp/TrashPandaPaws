@@ -81,10 +81,18 @@ c2:
     # Python beacon the agent drives.
     enabled: true
     implant_path: "/opt/raccoon/bin/implant"
-    # Optional: staging URL to download implant on first boot
+    # Optional: staging URL to download implant on first boot. Setting it
+    # REQUIRES sha256 below: the staged file is run as root, and the hash is
+    # the only check on what arrives. A staging_url with an empty sha256
+    # downloads nothing and says so in the log.
     staging_url: ""
     staging_key: ""
-    # SHA256 of the expected binary (integrity check, leave empty to skip)
+    # SHA256 of the expected binary. Empty means "do not stage", not "do not
+    # verify": it is only read when staging_url is set, and then it has to be
+    # there. Case and surrounding whitespace do not matter, so a hash pasted
+    # out of sha256sum works as it is. A binary already at implant_path --
+    # the usual case, put there by the image -- is checked against this only
+    # when it is filled in.
     sha256: ""
     restart_delay_seconds: 30
     # 0 = unlimited restarts
@@ -167,10 +175,11 @@ c2:
       # a request nobody configured, from the host that can least afford one.
       binary_path: "/opt/raccoon/bin/gs-netcat"
       # gs-netcat 1.4.43, linux-aarch64, verified before every exec. Empty
-      # would mean "do not verify", the meaning c2.sliver.sha256 has; it is
-      # filled because the leg hands this binary the secret that fronts the
-      # beacon socket, so "some gs-netcat is there" is not the question worth
-      # answering. Keep it in step with GSNETCAT_SHA256 in build_image.sh.
+      # would mean "do not verify" here, which c2.sliver.sha256 above no
+      # longer means for a download; it is filled because the leg hands this
+      # binary the secret that fronts the beacon socket, so "some gs-netcat
+      # is there" is not the question worth answering. Keep it in step with
+      # GSNETCAT_SHA256 in build_image.sh.
       sha256: "d4a7dfda2303fd0203d9bd2f29f8f2ee28dc2c42176f6a3ab37566aad1d5f117"
       # The five settings below are written out rather than left to their
       # defaults, because each is refused when written as a bare key: a

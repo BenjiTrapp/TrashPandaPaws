@@ -1132,12 +1132,6 @@ more.
   file again; replaying a check-in takes the queued task off the queue, so
   the real beacon never sees it. A captured message is enough; the key is
   not needed.
-- **The staged-implant download has no integrity control in the shipped
-  configuration.** Nothing is fetched until `c2.sliver.staging_url` is set,
-  and it ships empty. Once it is, `software/c2/sliver.py` downloads with
-  `verify=False`, and the expected hash (`c2.sliver.sha256`) also ships empty
-  and is checked only when set. The file is then run by a unit that runs as
-  root. Set `sha256` whenever you set `staging_url`.
 - **`shell=True` on a request-derived string.** `/api/server/rdp` builds a
   command line from fields of the request and runs it through a shell. The
   VNC branch also pipes the password through

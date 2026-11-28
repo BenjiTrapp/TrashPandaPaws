@@ -31,7 +31,12 @@ class SliverManager:
         self.implant_path = Path(sliver_cfg.get("implant_path", DEFAULT_IMPLANT_PATH))
         self.staging_url = sliver_cfg.get("staging_url", "")
         self.staging_key = sliver_cfg.get("staging_key", "")
-        self.expected_hash = sliver_cfg.get("sha256", "")
+        # Normalised once, here, because both readers compare against it and
+        # an operator pastes this out of `sha256sum` output or a Windows
+        # tool: upper case and a trailing newline are the same hash, and
+        # refusing them would be a refusal nobody can tell from a real
+        # mismatch. `or ""` because a bare `sha256:` key reads as None.
+        self.expected_hash = str(sliver_cfg.get("sha256") or "").strip().lower()
         self.restart_delay = sliver_cfg.get("restart_delay_seconds", 30)
         self.max_restarts = sliver_cfg.get("max_restarts", 0)
 
@@ -43,6 +48,23 @@ class SliverManager:
     def _stage_implant(self) -> bool:
         """Download the implant binary from a staging server."""
         if not self.staging_url:
+            return False
+
+        # Before the request, not after the download. This used to check the
+        # hash only `if self.expected_hash:`, and `c2.sliver.sha256` ships
+        # empty -- so in the shipped configuration setting `staging_url` was
+        # enough to download a file and run it as root with nothing checked.
+        # `verify=False` below is a separate statement and not an oversight:
+        # the staging host is usually the operator's own with a self-signed
+        # certificate, so turning verification on needs a trust decision.
+        # The hash is the part that needs no such decision -- the bytes that
+        # run are the bytes the operator named, whoever served them.
+        if not self.expected_hash:
+            logger.error(
+                "c2.sliver.staging_url is set and c2.sliver.sha256 is empty, "
+                "so nothing was downloaded: the staged binary is run as root "
+                "and this is the only check on what arrives. Put the "
+                "expected SHA-256 of the implant in c2.sliver.sha256")
             return False
 
         logger.info("Staging implant from remote server")
@@ -70,12 +92,12 @@ class SliverManager:
                 for chunk in resp.iter_content(chunk_size=8192):
                     f.write(chunk)
 
-            if self.expected_hash:
-                actual = hashlib.sha256(tmp_path.read_bytes()).hexdigest()
-                if actual != self.expected_hash:
-                    logger.error("Hash mismatch: expected %s, got %s", self.expected_hash, actual)
-                    tmp_path.unlink()
-                    return False
+            actual = hashlib.sha256(tmp_path.read_bytes()).hexdigest()
+            if actual != self.expected_hash:
+                logger.error("Hash mismatch: expected %s, got %s",
+                             self.expected_hash, actual)
+                tmp_path.unlink()
+                return False
 
             tmp_path.rename(self.implant_path)
             self.implant_path.chmod(0o700)

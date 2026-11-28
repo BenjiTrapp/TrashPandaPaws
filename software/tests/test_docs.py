@@ -20,7 +20,6 @@ the property it holds; if the new prose still holds it, move the pin.
 
 import argparse
 import asyncio
-import inspect
 import json
 import logging
 import os
@@ -43,7 +42,6 @@ from software.agent import safety  # noqa: E402
 from software.agent.executor import server_tool  # noqa: E402
 from software.agent.llm import provider  # noqa: E402
 from software.c2 import server as c2_server  # noqa: E402
-from software.c2.sliver import SliverManager  # noqa: E402
 
 AGENT_DOC = REPO / "docs" / "AGENT.md"
 DEMO_DOC = REPO / "docs" / "C2_DEMO.md"
@@ -511,13 +509,6 @@ def _a_replayed_result_is_applied_again():
         return c2_server.results["t1"]["output"] == "first"
 
 
-def _the_staged_download_is_unchecked():
-    sliver = _config()["c2"]["sliver"]
-    source = inspect.getsource(SliverManager._stage_implant)
-    return (sliver["staging_url"] == "" and sliver["sha256"] == ""
-            and "verify=False" in source and "if self.expected_hash:" in source)
-
-
 def _rdp_hands_request_text_to_a_shell():
     text = _read("software", "c2", "server.py")
     return ("cmd_str, shell=True" in text
@@ -758,7 +749,6 @@ _OPEN_FINDINGS = {
     "Would stop a deployment": [
         ("cannot verify TLS at all", _beacon_cannot_verify_tls),
         ("No replay protection", _a_replayed_result_is_applied_again),
-        ("staged-implant download", _the_staged_download_is_unchecked),
         ("`shell=True`", _rdp_hands_request_text_to_a_shell),
         ("server image runs as root", _the_server_image_is_root_with_net_admin),
     ],
