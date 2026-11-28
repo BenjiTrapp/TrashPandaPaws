@@ -29,6 +29,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from unittest import mock
+
+from software.c2 import beacon as beacon_mod
 from software.c2 import dns_rescue
 from software.c2.beacon import Beacon
 
@@ -106,10 +109,15 @@ class QuicCase(unittest.TestCase):
 
 class TestAnAnswerFromAnotherSenderIsIgnored(QuicCase):
     def test_a_fragment_from_a_third_party_does_not_end_the_exchange(self):
-        # The endpoint answers correctly; an interloper on this host sends a
-        # well-formed fragment from its own address first. Before the fix
-        # the interloper's bytes went into the reassembly and the exchange
-        # failed on a payload that did not decrypt.
+        # An interloper on this host sends a well-formed fragment from its
+        # own address, and *then* the endpoint answers properly. Before the
+        # fix the interloper's bytes took index 0 of the reassembly and the
+        # exchange failed on a payload that did not decrypt; after it, the
+        # real answer is what the beacon reads.
+        #
+        # Ordered this way rather than leaving the client to time out: the
+        # transport waits ten seconds, and a test that proves its point by
+        # waiting one of those out costs the suite more than it is worth.
         sent = {}
 
         def answer(end, sender, stream_id):
@@ -120,19 +128,16 @@ class TestAnAnswerFromAnotherSenderIsIgnored(QuicCase):
                              sender)
             finally:
                 spoof.close()
+            payload = beacon._encrypt({"tasks": [{"cmd": "whoami"}]}).encode()
+            end.sock.sendto(end.frame(payload, stream_id), sender)
 
         end = self.endpoint(answer)
         beacon = self.beacon_for(end)
-        reply = beacon._quic_send({"action": "beacon", "id": "probe"})
-        # Nothing legitimate ever came back, so the exchange still fails --
-        # but it has to fail as a *timeout*, meaning the interloper's
-        # fragment was dropped rather than reassembled and decrypted.
-        self.assertIsNone(reply)
+        self.assertEqual(beacon._quic_send({"action": "beacon", "id": "p"}),
+                         {"tasks": [{"cmd": "whoami"}]},
+                         "the third party's fragment went into the "
+                         "reassembly")
         self.assertTrue(sent, "the endpoint never saw a request")
-        self.assertEqual(beacon._leg_status.get("quic", (None,))[0],
-                         dns_rescue.CLASSES["timed_out"],
-                         "the third party's fragment was accepted: the leg "
-                         "reports a bad payload instead of a timeout")
 
     def test_the_real_endpoints_answer_is_still_accepted(self):
         # The property the check must not cost. The endpoint answers with a
@@ -153,16 +158,62 @@ class TestAnAnswerUnderAnotherStreamIdIsIgnored(QuicCase):
         # request's id and says so in its own module docstring, so a
         # mismatch is not a legitimate answer from anybody.
         def answer(end, sender, stream_id):
-            payload = beacon._encrypt({"tasks": [{"cmd": "shell"}]}).encode()
-            end.sock.sendto(end.frame(payload, stream_id ^ 0xFFFF), sender)
+            wrong = beacon._encrypt({"tasks": [{"cmd": "shell"}]}).encode()
+            end.sock.sendto(end.frame(wrong, stream_id ^ 0xFFFF), sender)
+            right = beacon._encrypt({"tasks": []}).encode()
+            end.sock.sendto(end.frame(right, stream_id), sender)
 
         end = self.endpoint(answer)
         beacon = self.beacon_for(end)
-        self.assertIsNone(beacon._quic_send({"action": "beacon"}),
-                          "a fragment under another stream id was read as "
-                          "the answer to this exchange")
-        self.assertEqual(beacon._leg_status.get("quic", (None,))[0],
-                         dns_rescue.CLASSES["timed_out"])
+        self.assertEqual(beacon._quic_send({"action": "beacon"}),
+                         {"tasks": []},
+                         "a fragment under another stream id was read as "
+                         "the answer to this exchange")
+
+
+class TestAMisconfiguredLegFailsTheSameWayEverywhere(QuicCase):
+    """An enabled QUIC leg with no server records a failure, and sends nothing.
+
+    This is where the platform crept in. `c2.fallback.quic.server` is read
+    by `Beacon`, three tests in `test_dns_rescue` said `host`, and the fake
+    socket hid the difference -- until the transport started resolving its
+    destination. Measured: `getaddrinfo("", 4433, AF_INET, SOCK_DGRAM)`
+    answers `('127.0.0.1', 4433)` on macOS and raises
+    `gaierror [Errno -2] Name or service not known` on glibc, so an empty
+    server made the leg quietly aim at loopback here and fail to resolve
+    there.
+
+    An empty server is refused by name now, so the two platforms answer
+    the same thing and this test needs no network at all -- the earlier
+    version of it sat out the transport's ten-second timeout on macOS,
+    where the resolve succeeded and the datagram went to loopback.
+    """
+
+    def test_an_empty_server_sends_nothing_and_is_recorded(self):
+        sent = []
+
+        class _Watched:
+            def settimeout(self, _):
+                pass
+
+            def sendto(self, data, addr):
+                sent.append((data, addr))
+
+            def recvfrom(self, _n):
+                raise socket.timeout()
+
+            def close(self):
+                pass
+
+        beacon = _a_beacon("")
+        with mock.patch.object(beacon_mod.socket, "socket",
+                               side_effect=lambda *a, **k: _Watched()):
+            self.assertIsNone(beacon._quic_send({"action": "beacon"}))
+        self.assertEqual(sent, [],
+                         "an implant's traffic went somewhere nobody "
+                         "configured")
+        self.assertEqual(beacon._leg_status["quic"][0],
+                         dns_rescue.CLASSES["resolve_failed"])
 
 
 class TestTheListenerDocumentationMatches(unittest.TestCase):

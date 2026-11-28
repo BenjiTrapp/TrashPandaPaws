@@ -1112,7 +1112,14 @@ class TestTheOtherLegsRecordToo(unittest.TestCase):
         # Deterministic on purpose. The earlier version pointed a real
         # socket at 127.0.0.1:1 and relied on the OS to raise, which is
         # macOS behaviour and not Linux's.
-        beacon = _a_beacon(quic={"enabled": True, "host": "127.0.0.1:4433"})
+        #
+        # The key is `server`, which is what `Beacon` reads. These three
+        # tests said `host`, so `quic_server` was "" and the fake socket
+        # hid it -- until the transport began resolving its destination,
+        # when `getaddrinfo("")` returned loopback on macOS and raised
+        # gaierror on glibc. Measured both ways; three tests green here
+        # and red on every Linux runner.
+        beacon = _a_beacon(quic={"enabled": True, "server": "127.0.0.1:4433"})
         sock = _SilentUdp()
         with _with_udp(beacon, sock):
             self.assertIsNone(beacon._beacon_quic())
@@ -1123,7 +1130,7 @@ class TestTheOtherLegsRecordToo(unittest.TestCase):
                          "reported to the operator as 'not tried'")
 
     def test_a_quic_answer_that_does_not_decrypt_is_bad_payload(self):
-        beacon = _a_beacon(quic={"enabled": True, "host": "127.0.0.1:4433"})
+        beacon = _a_beacon(quic={"enabled": True, "server": "127.0.0.1:4433"})
         with _with_udp(beacon, _AnsweringUdp(b"not encrypted at all")):
             self.assertIsNone(beacon._beacon_quic())
         self.assertEqual(beacon._leg_status.get("quic", (None,))[0],
@@ -1132,7 +1139,7 @@ class TestTheOtherLegsRecordToo(unittest.TestCase):
     def test_a_quic_failure_that_does_raise_is_still_recorded(self):
         # The path that already worked, kept so a fix to the quiet paths
         # cannot silently break it.
-        beacon = _a_beacon(quic={"enabled": True, "host": "127.0.0.1:4433"})
+        beacon = _a_beacon(quic={"enabled": True, "server": "127.0.0.1:4433"})
 
         class _Refused(_SilentUdp):
             def recvfrom(self, _n):
