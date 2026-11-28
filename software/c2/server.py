@@ -130,6 +130,24 @@ class ServerCrypto:
     def __init__(self, key: bytes):
         self._key = key
         self._aesgcm = AESGCM(key)
+        # The AES-GCM nonces of envelopes *this* object has decrypted.
+        # Twelve random bytes per message, so a repeat is either a replay
+        # of captured bytes or a nonce reuse, and both earn the same
+        # refusal. A dict and not a set because insertion order is what
+        # the bound is trimmed by.
+        #
+        # Per instance, not per module, and that is the second attempt: a
+        # module-level cache refused a *second* ServerCrypto reading the
+        # same envelope, which is what a test does when it checks what a
+        # listener relayed -- and three tests said so. There is one of
+        # these per server process, so the scope that protects the server
+        # is the same either way, and this one does not punish anybody
+        # else for holding the key.
+        #
+        # Only what was decrypted: caching what this object *encrypts*
+        # would make it refuse its own replies. The two directions do not
+        # share it.
+        self.seen_envelopes: dict = {}
 
     def encrypt(self, data: dict) -> str:
         plaintext = json.dumps(data, separators=(",", ":")).encode()
@@ -141,6 +159,19 @@ class ServerCrypto:
         raw = base64.b64decode(b64)
         nonce, ct = raw[:12], raw[12:]
         plaintext = self._aesgcm.decrypt(nonce, ct, None)
+        # After the tag has verified, so a wrong key or a corrupted body
+        # never reaches the cache -- otherwise anybody who could reach this
+        # socket could fill it with garbage and push real nonces out.
+        if nonce in self.seen_envelopes:
+            # Raised rather than returned, because every caller already
+            # treats a failed decrypt as "this was not a message": `unwrap`
+            # moves on to the next field and `beacon_handler` answers the
+            # cover response. So a replay is answered exactly as noise is,
+            # which is what keeps this from telling a prober anything.
+            raise ValueError("this envelope has already been seen")
+        self.seen_envelopes[nonce] = None
+        while len(self.seen_envelopes) > SEEN_ENVELOPES_MAX:
+            self.seen_envelopes.pop(next(iter(self.seen_envelopes)))
         return json.loads(plaintext)
 
     def unwrap(self, body: dict) -> Optional[dict]:
@@ -222,6 +253,12 @@ AUTH_FAILURE_ADDRESSES = 1024
 # `results` has the same exposure and no cap, which is a finding of its own
 # and not one this is going to add a second instance of.
 DISPATCHES_MAX = 500
+# How many decrypted envelopes are remembered, so a captured one cannot be
+# replayed. Bounded by count and not by time, because the only clock this
+# could use belongs to the implant and the implant is a Pi with no RTC --
+# so the residual is honest and stated in Known limits: a byte-identical
+# envelope replayed after this many others is accepted again.
+SEEN_ENVELOPES_MAX = 4096
 BATCH_MAX = 8
 TOOL_RUNS_MAX = 50
 TOOL_OUTPUT_MAX = 65536
@@ -4536,6 +4573,24 @@ def _handle_result(payload: dict, crypto: ServerCrypto, data_dir: Path):
     status = payload.get("status", "unknown")
     output = payload.get("output", "")
     data = payload.get("data")
+
+    if task_id in results:
+        # Written once. A holder of the key can re-encrypt a captured
+        # result, which the envelope cache above cannot see, and before
+        # this the resubmission overwrote the recorded output for that task
+        # and wrote its loot file again. A beacon has no reason to send a
+        # second result for one task: the task left the queue when it was
+        # dispatched, and if an acknowledgement was lost the server already
+        # holds what the retry carries.
+        #
+        # Refused before the bookkeeping, not after, because the history
+        # rewrite and the loot write are the two things that mattered. The
+        # answer is the same ack an acceptance gets -- this route must not
+        # let a prober tell its outcomes apart.
+        logger.warning("Refused a second result for task %s from %s",
+                       repr(task_id[:64]) if isinstance(task_id, str)
+                       else task_id, repr(str(agent_id)[:64]))
+        return jsonify(crypto.wrap({"ack": True}))
 
     results[task_id] = {
         "task_id": task_id,

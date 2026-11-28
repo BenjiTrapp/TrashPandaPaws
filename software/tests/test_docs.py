@@ -489,6 +489,14 @@ class _ProbeServer:
             self.crypto.wrap(payload)), content_type="application/json")
         return self.crypto.unwrap(reply.get_json())
 
+    def wrap_once(self, payload):
+        """One envelope's bytes, so the same ones can be sent twice."""
+        return json.dumps(self.crypto.wrap(payload))
+
+    def send(self, body):
+        return self.client.post("/b", data=body,
+                                content_type="application/json")
+
 
 def _the_beacon_cannot_pin_a_certificate():
     """What is left of that finding once `verify_ssl` is read.
@@ -508,17 +516,43 @@ def _the_beacon_cannot_pin_a_certificate():
     return not pins and shipped is False
 
 
-def _a_replayed_result_is_applied_again():
+def _the_replay_cache_is_bounded_by_count():
+    """What is left of that finding once both consequences are closed.
+
+    `test_replay.py` drives the two that were named: a result is written
+    once, and a decrypted envelope's nonce is refused a second time. Open
+    while the cache is bounded by a count rather than by a clock -- which
+    is what leaves a byte-identical envelope replayable after enough other
+    traffic, and which cannot change without a clock the implant does not
+    have or a counter it has nowhere to keep.
+
+    Behavioural: the bound is reached, and the oldest nonce is accepted
+    again afterwards.
+    """
+    def nonce_of(body):
+        """The envelope's own nonce, past the decoy fields.
+
+        `wrap` adds three to seven decoys and some of them base64-decode
+        perfectly well, so "the first long string" picks one of those.
+        The real field is named in the server's own `_PAYLOAD_FIELDS`.
+        """
+        import base64 as b64
+
+        envelope = json.loads(body)
+        for field in c2_server._PAYLOAD_FIELDS:
+            if field in envelope:
+                return b64.b64decode(envelope[field])[:12]
+        raise AssertionError("no payload field in %r" % body[:60])
+
     with _ProbeServer() as srv:
-        registered = srv.post({"action": "register", "id": "probe",
-                               "hostname": "h", "os": "L", "arch": "x",
-                               "user": "u", "pid": 1, "interval": 5})
-        captured = {"action": "result", "agent_id": registered["agent_id"],
-                    "task_id": "t1", "status": "ok", "output": "first"}
-        srv.post(captured)
-        c2_server.results["t1"]["output"] = "tampered"
-        srv.post(captured)
-        return c2_server.results["t1"]["output"] == "first"
+        first = srv.wrap_once({"action": "register", "id": "probe",
+                               "hostname": "h", "user": "u"})
+        srv.send(first)
+        assert nonce_of(first) in srv.crypto.seen_envelopes
+        for n in range(c2_server.SEEN_ENVELOPES_MAX + 1):
+            srv.send(srv.wrap_once({"action": "beacon", "id": "probe-%d" % n}))
+        return (len(srv.crypto.seen_envelopes) <= c2_server.SEEN_ENVELOPES_MAX
+                and nonce_of(first) not in srv.crypto.seen_envelopes)
 
 
 def _the_server_image_is_root_with_net_admin():
@@ -717,7 +751,8 @@ def _a_beacons_implant_id_is_one_per_host():
 _OPEN_FINDINGS = {
     "Would stop a deployment": [
         ("it cannot pin", _the_beacon_cannot_pin_a_certificate),
-        ("No replay protection", _a_replayed_result_is_applied_again),
+        ("bounded by a count, not by a clock",
+         _the_replay_cache_is_bounded_by_count),
         ("server image runs as root", _the_server_image_is_root_with_net_admin),
     ],
     "Would stop a release": [

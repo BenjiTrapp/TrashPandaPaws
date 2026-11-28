@@ -446,6 +446,13 @@ class TestLootWriteIsContained(unittest.TestCase):
         self.addCleanup(server_mod.agents.clear)
         self.addCleanup(server_mod.task_queues.clear)
         self.addCleanup(server_mod.history.clear)
+        # `results` too, and it was the one missing: a result is written
+        # once now, so a task id left behind by an earlier test in this
+        # class made the next test's write a no-op. The other three were
+        # already cleared for the same reason -- module state outlives a
+        # test method.
+        server_mod.results.clear()
+        self.addCleanup(server_mod.results.clear)
 
         self.root = Path(tempfile.mkdtemp()).resolve()
         self.addCleanup(shutil.rmtree, self.root, True)
@@ -470,8 +477,16 @@ class TestLootWriteIsContained(unittest.TestCase):
         return self.crypto.unwrap(resp.get_json())["agent_id"]
 
     def _send_file(self, agent_id, loot, filename="note.txt", body=b"payload"):
+        # A fresh task id per send. These tests walk many filenames and
+        # many agent ids through one write path, and used to put them all
+        # under `t1` -- which a beacon never does, because a task leaves
+        # the queue when it is dispatched and carries one result. Since a
+        # result is written once, reusing the id made every send after the
+        # first a no-op and the assertions vacuous.
+        self._task_number = getattr(self, "_task_number", 0) + 1
         return self._post({
-            "action": "result", "task_id": "t1", "agent_id": agent_id,
+            "action": "result", "task_id": "t%d" % self._task_number,
+            "agent_id": agent_id,
             "status": "ok", "output": "",
             "data": {"data": base64.b64encode(body).decode(),
                      "filename": filename, "loot": loot},
@@ -607,8 +622,11 @@ class TestLootWriteIsContained(unittest.TestCase):
             for _sub, loot in self.SUBS:
                 responses = []
                 for agent_id in (known, "raccoon-never-registered"):
+                    self._task_number = getattr(
+                        self, "_task_number", 0) + 1
                     resp = self._post({
-                        "action": "result", "task_id": "t1",
+                        "action": "result",
+                        "task_id": "t%d" % self._task_number,
                         "agent_id": agent_id, "status": "ok", "output": "",
                         "data": {"data": garbage, "filename": "f.txt",
                                  "loot": loot},

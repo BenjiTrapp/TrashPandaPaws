@@ -1136,12 +1136,23 @@ more.
   `127.0.0.1` on this host, and the scanner's `_probe_ssl`, which exists to
   report a target's certificate and would refuse exactly the hosts it is
   run to find.
-- **No replay protection, in either direction.** There is no counter, no
-  timestamp, no window and no seen-message cache. Resubmitting a captured
-  result overwrites the recorded output for that task and writes its loot
-  file again; replaying a check-in takes the queued task off the queue, so
-  the real beacon never sees it. A captured message is enough; the key is
-  not needed.
+- **Replay is bounded by a count, not by a clock.** Both consequences the
+  audit named are closed: a task's result is written once, so resubmitting
+  a captured result no longer overwrites the recorded output or writes its
+  loot file again; and the server remembers the AES-GCM nonce of every
+  envelope it decrypts, so the captured bytes of a check-in cannot be sent
+  twice to take a second task off the queue. Neither needed the key, and
+  the second needed nothing but the bytes.
+
+  What is left is the cache's shape. It holds **4096** nonces and is
+  trimmed oldest-first, so a byte-identical envelope replayed after that
+  many others is accepted again. Bounding it by *time* instead would need
+  a clock both ends agree on, and the implant is a Pi with no RTC; a
+  per-agent counter would need somewhere on the implant to persist it,
+  which a build that is a single pasted file does not have. Both are the
+  same decision as [the implant
+  id](#would-stop-a-release), and both are the operator's. The cache is
+  also per running server: a restart forgets it, as it forgets `results`.
 - **The server image runs as root.** `software/c2/Dockerfile` has no `USER`
   directive, and the compose file grants `NET_ADMIN` and mounts the host's
   X11 socket. The agent image gets this right and says why in a comment; the
