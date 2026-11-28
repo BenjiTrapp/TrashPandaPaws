@@ -28,13 +28,18 @@ Run it in the bench the design asks for:
 
     docker build -f tools/way_out_bench.Dockerfile -t raccoon-way-out-bench .
     docker run --rm --platform linux/arm64 --cpus 4 --memory 4g \\
-        -v "$PWD:/repo" -w /repo raccoon-way-out-bench --json
+        -v "$PWD:/repo" -w /repo raccoon-way-out-bench --packets 4000 --json
 
 and, for the model arm, with an Ollama beside it on loopback:
 
     docker run --rm --platform linux/arm64 --cpus 4 --memory 4g \\
         --network host -v "$PWD:/repo" -w /repo raccoon-way-out-bench \\
-        --model qwen2.5:0.5b --json
+        --model qwen2.5:0.5b --model-asks 12 --json
+
+`--packets` and `--model-asks` are written out because the design's
+`## Measurements` reports what *those* values produced -- 4000 frames and
+twelve asks -- and the defaults are 2000 and 1. A command that does not
+reproduce the number beside it is worse than no command.
 """
 
 import argparse

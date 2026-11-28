@@ -26,6 +26,7 @@ passwords; the verb's answer names the account and the proxy.
 """
 
 import base64
+import errno
 import io
 import socket
 import json
@@ -33,9 +34,12 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
+from urllib import error as urllib_error
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -44,7 +48,7 @@ from software.c2 import beacon as beacon_mod
 from software.c2.beacon import read_way_out_policy
 from software.scout import handoff
 from software.tests import test_egress_decider as _decider
-from software.tests import way_out_scratch
+from software.tests import way_out_scratch as _scratch
 
 A_CREDENTIAL = {"kind": "proxy-basic", "user": "corp\\alice",
                 "secret": "s3cret", "where": "10.0.0.1:3128"}
@@ -57,12 +61,12 @@ class RungCase(_decider.DeciderCase):
 
     def setUp(self):
         super().setUp()
-        self.state = way_out_scratch("raccoon-rung-")
-        self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
+        self.state = _scratch.scratch(self, "raccoon-rung-")
 
     def beacon(self, hours_dark=24.0, tap=None, borrow=None, **extra):
         block = {"enabled": True, "state_dir": self.state}
-        beacon = self.a_beacon(way_out=read_way_out_policy(block), **extra)
+        beacon = _scratch.assert_live(
+            self, self.a_beacon(way_out=read_way_out_policy(block), **extra))
         beacon._stuck_cycles = int(hours_dark * 12)
         if tap is not None:
             handoff.write_document(self.state, {
@@ -540,16 +544,46 @@ class TestTheRadioVerb(RadioCase):
                                   source=beacon._way_out_source)
         self.assertEqual(bound, [("192.168.9.42", 0)])
 
-    def test_the_source_is_dropped_when_a_leg_delivers(self):
+    def test_the_source_survives_the_leg_that_the_radio_delivered(self):
+        # This test used to assert the opposite, and it was asserting the
+        # defect. A leg delivering is the moment the rung is *working* --
+        # the delivery came through table 100 -- so unbinding there sent
+        # the next cycle back out of the dead tapped port, with
+        # `_stuck_cycles` reset to zero, so the implant had to re-climb
+        # five hours to re-run the rung. One delivering cycle per five
+        # hours, for ever: a rung that only looks like a way out, which is
+        # the design's own anti-goal.
         beacon = self.beacon(tap=self.open_ssid())
         self.onboard(beacon)
         self.radio(beacon)
         beacon._exec_egress("radio")
-        self.assertTrue(beacon._way_out_source)
+        self.assertEqual(beacon._way_out_source, "192.168.9.42")
 
         beacon._leg_recovered()
-        self.assertEqual(beacon._way_out_source, "")
-        self.assertIsNone(beacon._proxy_session.source_address)
+        self.assertEqual(beacon._way_out_source, "192.168.9.42")
+        self.assertEqual(beacon._proxy_session.source_address,
+                         ("192.168.9.42", 0))
+
+    def test_a_rung_two_verb_does_not_quietly_unbind_the_radio(self):
+        # Rung 2 crosses at one hour dark and rung 3 at five, so after
+        # `radio` succeeds the candidate walk will reach `proxy` or
+        # `credential` on a later cycle. Each of them builds a fresh
+        # session, and each used to drop the bind while `_way_out_source`
+        # went on claiming it -- so HTTP left by the dead tapped port with
+        # the log line still saying "this implant's own traffic only".
+        beacon = self.beacon(tap=self.open_ssid(),
+                             borrow={"credentials": [A_CREDENTIAL]})
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._exec_egress("radio")
+
+        beacon._proxy.proxies.append({"url": "http://10.0.0.9:3128"})
+        for task in ("credential", "proxy http://10.0.0.9:3128",
+                     "rediscover"):
+            with self.subTest(task=task):
+                beacon._exec_egress(task)
+                self.assertEqual(beacon._proxy_session.source_address,
+                                 ("192.168.9.42", 0), task)
 
     def test_a_rollback_drops_the_source_too(self):
         beacon = self.beacon(tap=self.open_ssid())
@@ -710,6 +744,176 @@ class TestTheRawPostTheReplayUses(unittest.TestCase):
         session, _ = self.captured(status=403)
         self.assertEqual(session.post_raw("http://portal.lan/login", b"a=1",
                                           {}).status_code, 403)
+
+
+class TestTheBindIsASocketFactAndNotAField(unittest.TestCase):
+    """What the kernel did, read off the far end of a real connection.
+
+    The two handlers under `_HttpSession` are the whole of the radio
+    rung's bind: `ip rule from <address>` matches only packets whose
+    source *is* that address, so a handler that forwards no
+    `source_address` leaves the rung installing a route nothing can
+    select -- which is exactly how rung 3 shipped once, and the design's
+    recorded lesson from it is that a verb whose effect is on the kernel
+    cannot be proved by asserting its argument. Every other test of the
+    bind asserts `session.source_address`, a field; these two connect to
+    a listener on this host and read the source that listener *observed*.
+
+    Loopback has one address everywhere this suite runs, so the **port**
+    carries the discrimination. `source_address` is a pair, the rung
+    passes port 0 and lets the kernel choose, and pinning the port here
+    is the same mechanism seen from the far end: with the handlers
+    dropping it, the connection arrives from an ephemeral port that is
+    not this one.
+    """
+
+    def a_free_port(self) -> int:
+        """A port nothing is listening on, for the client to bind.
+
+        Asked of the kernel rather than picked: a hard-coded port would
+        be a test that fails on whichever machine happens to be using it.
+        There is a window between this closing the probe and the client
+        binding, which `bound_to` handles by asking for another one.
+        """
+        probe = socket.socket()
+        try:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+        finally:
+            probe.close()
+
+    def bound_to(self, attempt):
+        """Run `attempt(port)` from a pinned local port; return the port.
+
+        Retried on `EADDRINUSE` alone, and three times: something else on
+        this machine taking the port between `a_free_port` and the
+        connect is the one failure here that is not about the code under
+        test, and swallowing any wider class of error would be a test
+        that passes when the bind does not work at all.
+        """
+        last = None
+        for _ in range(3):
+            port = self.a_free_port()
+            try:
+                attempt(port)
+            except OSError as exc:
+                if getattr(exc, "errno", None) != errno.EADDRINUSE:
+                    raise
+                last = exc
+                continue
+            except urllib_error.URLError as exc:
+                reason = getattr(exc, "reason", None)
+                if getattr(reason, "errno", None) != errno.EADDRINUSE:
+                    return port
+                last = exc
+                continue
+            return port
+        raise AssertionError("no free local port stayed free: %r" % (last,))
+
+    def session(self, port):
+        session = beacon_mod._HttpSession()
+        # No proxy from this machine's environment: `http_proxy` set by
+        # whoever is running the suite would send the request somewhere
+        # else entirely, and the test would be about their proxy.
+        session.trust_env = False
+        session.source_address = ("127.0.0.1", port)
+        return session
+
+    def test_an_http_request_arrives_from_the_address_it_was_bound_to(self):
+        seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append(self.client_address)
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever,
+                                  kwargs={"poll_interval": 0.05},
+                                  daemon=True)
+        thread.start()
+
+        def stop():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.addCleanup(stop)
+        url = "http://127.0.0.1:%d/x" % server.server_address[1]
+        answered = []
+
+        def attempt(port):
+            del seen[:]
+            response = self.session(port).post_raw(url, b"a=1", {}, timeout=10)
+            answered.append(response.status_code)
+
+        port = self.bound_to(attempt)
+        self.assertEqual(answered, [200])
+        self.assertEqual(seen, [("127.0.0.1", port)])
+
+    def test_an_https_request_arrives_from_the_address_it_was_bound_to(self):
+        # A plain TCP listener and not a TLS one: the handshake is not the
+        # subject and cannot be set up from the standard library, which
+        # cannot mint a certificate. The source address is carried by the
+        # connection, and the listener has read it off the accepted socket
+        # before it declines to speak TLS -- so the request failing is
+        # part of the arrangement, and what it failed *with* is checked.
+        seen = []
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(2)
+        # With a timeout, so the thread below can be asked to stop: closing
+        # a listening socket is not guaranteed to wake another thread out
+        # of `accept`, and the first draft of this test spent five seconds
+        # per run proving it.
+        listener.settimeout(0.2)
+        done = threading.Event()
+
+        def accept():
+            while not done.is_set():
+                try:
+                    connection, peer = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                seen.append(peer)
+                connection.close()
+
+        thread = threading.Thread(target=accept, daemon=True)
+        thread.start()
+
+        def stop():
+            done.set()
+            thread.join(timeout=5)
+            listener.close()
+
+        self.addCleanup(stop)
+        url = "https://127.0.0.1:%d/x" % listener.getsockname()[1]
+        refused = []
+
+        def attempt(port):
+            del seen[:]
+            try:
+                self.session(port).post_raw(url, b"a=1", {}, timeout=10)
+            except urllib_error.URLError as exc:
+                reason = getattr(exc, "reason", None)
+                if getattr(reason, "errno", None) == errno.EADDRINUSE:
+                    raise
+                refused.append(exc)
+            else:
+                raise AssertionError("the listener spoke TLS after all")
+
+        port = self.bound_to(attempt)
+        self.assertEqual(len(refused), 1, refused)
+        self.assertEqual(seen, [("127.0.0.1", port)])
 
 
 class TestWhichRadioTheImplantMayUse(unittest.TestCase):

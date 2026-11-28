@@ -23,19 +23,24 @@ reader refuses a `/tmp` path by name with that reason.
 Five files, and which side owns each:
 
     way_out_state.json      the beacon writes, the scout reads.  The stuck
-                            window: how long, on what evidence, and what
-                            has been attempted in it.
+                            window: how long, on what evidence, and how
+                            much of its budget it has spent.
     way_out_scout.json      the scout writes, the beacon reads.  The
                             evidence from the tap, the rungs the scout
                             believes are available, and -- in the model
                             stage -- one recommendation.
-    way_out_trail.jsonl     the scout writes.  One line per attempt, kept
-                            after the state file is gone, which is what
-                            makes a burned implant a lesson.
+    way_out_trail.jsonl     the beacon writes, nobody here reads.  One
+                            line per attempt, kept after the state file is
+                            gone, which is what makes a burned implant a
+                            lesson.  It was this module's to write, and a
+                            review moved it: see `trail_path` below.
     way_out_borrow.json     the scout writes, a borrow verb reads.  The
                             credentials themselves and the portal request
                             to replay: the half that can carry a secret,
-                            which is why it is not in the document.
+                            which is why it is not in the document -- and
+                            why the scout removes it when the window
+                            closes rather than leaving a captured
+                            password on the disk.
     way_out_identity.json   the beacon writes, main.py reads.  Rung 4's
                             cross-process trigger.
 
@@ -82,6 +87,20 @@ def document_path(state_dir: str) -> str:
 
 
 def trail_path(state_dir: str) -> str:
+    """Where the trail is, which is all this module still owns of it.
+
+    The writer was here -- `append_trail` -- and it is gone. The scout
+    copied new lines out of the window's file on its publishing clock,
+    which lost every attempt made in a window's last interval (a leg
+    delivering removes that file, and on a recovered implant the lost
+    line is the attempt that *worked*) and duplicated what it had already
+    copied when its unit restarted. The beacon is the only process that
+    knows an attempt happened, so it appends the line itself, in the same
+    call that records the attempt: `Beacon._way_out_append_trail`.
+
+    The name and the path stay here, because they are what the two sides
+    have to agree on, and the tests hold the beacon's copy against them.
+    """
     return os.path.join(state_dir, TRAIL_NAME)
 
 
@@ -157,33 +176,6 @@ def write_borrow(state_dir: str, fields: dict) -> None:
                        dict(fields, version=BORROW_VERSION))
 
 
-def append_trail(state_dir: str, line: dict) -> None:
-    """One line onto the trail, which is append-only.
-
-    Append and not rewrite: the trail outlives the state file on purpose,
-    so a rescue that ended in a burned port still has its record. Opened
-    0600 at creation rather than chmod-ed afterwards, so there is no
-    instant in which it is readable by anyone else.
-    """
-    _ensure_dir(state_dir)
-    path = trail_path(state_dir)
-    # `O_NOFOLLOW`, for the reason `tunnel/shell.py` carries one: a link
-    # planted at this name would have the root scout appending the trail
-    # to whatever it pointed at. `O_APPEND` and 0600 at creation, so there
-    # is no instant in which the file is readable by anyone else.
-    flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND
-             | getattr(os, "O_NOFOLLOW", 0))
-    descriptor = os.open(path, flags, _PRIVATE_FILE)
-    try:
-        stream = os.fdopen(descriptor, "ab")
-    except Exception:
-        os.close(descriptor)
-        raise
-    with stream:
-        stream.write((json.dumps(line, sort_keys=True) + "\n")
-                     .encode("utf-8"))
-
-
 def write_private_json(path: str, document: dict) -> None:
     """One small JSON file 0600: all of it, or none of it."""
     directory, name = os.path.split(path)
@@ -213,8 +205,10 @@ def write_private_json(path: str, document: dict) -> None:
 def remove(path: str) -> None:
     """Delete a handoff file if it is there. Raises nothing.
 
-    For this package's tests. The beacon removes its own window with
-    `Beacon._way_out_clear_state`, and nothing else here deletes.
+    One production caller: the scout removes the borrow file when a
+    window closes, because that is the one file here that carries a
+    secret and nothing else would ever have removed it. The beacon
+    removes its own window with `Beacon._way_out_clear_state`.
     """
     try:
         os.unlink(path)

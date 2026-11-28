@@ -75,13 +75,18 @@ class EvidenceCase(unittest.TestCase):
         target.observe(self.http_response(
             407, ['Proxy-Authenticate: Basic realm="corp"'], sport=dport))
 
-    def dns_query(self, name, resolver):
-        return (Ether() / IP(src=self.HOST, dst=resolver)
+    def dns_query(self, name, resolver, mac="aa:bb:cc:dd:ee:ff"):
+        # The sender is named rather than left to scapy's default, because
+        # every one of these tests is now about which side of the bridge a
+        # frame came from.
+        return (Ether(src=mac, dst="11:22:33:44:55:66")
+                / IP(src=self.HOST, dst=resolver)
                 / UDP(sport=55555, dport=53)
                 / DNS(rd=1, qd=DNSQR(qname=name)))
 
     def dns_answer(self, name, resolver, address="93.184.216.34"):
-        return (Ether() / IP(src=resolver, dst=self.HOST)
+        return (Ether(src="11:22:33:44:55:66", dst="aa:bb:cc:dd:ee:ff")
+                / IP(src=resolver, dst=self.HOST)
                 / UDP(sport=53, dport=55555)
                 / DNS(qr=1, qd=DNSQR(qname=name),
                       an=DNSRR(rrname=name, rdata=address)))
@@ -359,6 +364,85 @@ class TestTheEvidenceIsAdversaryWritable(EvidenceCase):
                   b"Proxy-Authenticate: Basic realm=\"corp\"\r\n\r\n"))
         self.evidence.observe(frame / Raw(auth))
 
+    def test_the_host_is_the_bridges_own_reading_and_not_the_first_frame(self):
+        # The anchor was itself one unauthenticated frame: whoever spoke
+        # first became "the host" for the window, and `_udp` latched on
+        # any DNS query with no sender check at all -- so four frames
+        # bought a borrowable credential *and* blinded the scout to the
+        # real host for a window the design says can last a week.
+        #
+        # It is a wire fact now. The bridge learns which port a MAC is on
+        # and a segment peer cannot forge that, so the scout asks the
+        # bridge rather than the frame.
+        known = evidence_mod.Evidence(host_macs=["aa:bb:cc:dd:ee:ff"])
+        known.observe(self.dns_query("evil.test", "10.9.9.53",
+                                      mac="de:ad:be:ef:00:01"))
+        self.assertIsNone(known.host_mac, "a stranger's query named the host")
+        self.assertEqual(known.resolvers, {})
+
+        known.observe(self.http_request("GET", "intranet.lan", "/"))
+        self.assertEqual(known.host_mac, "aa:bb:cc:dd:ee:ff")
+
+    def test_without_a_reading_the_first_sender_is_still_taken(self):
+        # A host whose bridge cannot be read is not a reason to collect
+        # nothing: that is the behaviour this had before, and it is better
+        # than a scout that refuses to work. The page says which it is.
+        blind = evidence_mod.Evidence(host_macs=None)
+        blind.observe(self.dns_query("x.lan", "10.0.0.2"))
+        self.assertEqual(blind.host_mac, "aa:bb:cc:dd:ee:ff")
+
+    def test_a_strangers_eapol_does_not_set_the_flag(self):
+        # `dot1x_seen` is not evidence-only: it reaches the rescue record,
+        # the operator's panel, a policy rule and rung 4's p_detect. One
+        # frame from anyone set it.
+        known = evidence_mod.Evidence(host_macs=["aa:bb:cc:dd:ee:ff"])
+        known.observe(Ether(src="de:ad:be:ef:00:01",
+                            dst="01:80:c2:00:00:03", type=0x888E)
+                      / Raw(b"\x01\x01\x00\x00"))
+        self.assertFalse(known.dot1x_seen)
+        known.observe(self.eapol())
+        self.assertTrue(known.dot1x_seen)
+
+    def test_a_strangers_resolver_and_wpad_are_not_published(self):
+        known = evidence_mod.Evidence(host_macs=["aa:bb:cc:dd:ee:ff"])
+        stranger = (Ether(src="de:ad:be:ef:00:01", dst="11:22:33:44:55:66")
+                    / IP(src="10.9.9.9", dst="10.9.9.53")
+                    / UDP(sport=5555, dport=53)
+                    / DNS(rd=1, qd=DNSQR(qname="wpad.evil.test")))
+        known.observe(stranger)
+        known.observe(Ether(src="11:22:33:44:55:66",
+                            dst="de:ad:be:ef:00:01")
+                      / IP(src="10.9.9.53", dst="10.9.9.9")
+                      / UDP(sport=53, dport=5555)
+                      / DNS(qr=1, qd=DNSQR(qname="wpad.evil.test"),
+                            an=DNSRR(rrname="wpad.evil.test",
+                                     rdata="10.9.9.9")))
+        self.assertEqual(known.resolvers, {})
+        self.assertEqual(known.wpad, [])
+
+    def test_a_strangers_tls_destination_is_not_published(self):
+        known = evidence_mod.Evidence(host_macs=["aa:bb:cc:dd:ee:ff"])
+        hello = _client_hello_bytes("evil.test")
+        known.observe(Ether(src="de:ad:be:ef:00:01", dst="11:22:33:44:55:66")
+                      / IP(src="10.9.9.9", dst="10.9.9.1")
+                      / TCP(sport=44445, dport=443) / Raw(hello))
+        known.observe(Ether(src="11:22:33:44:55:66", dst="de:ad:be:ef:00:01")
+                      / IP(src="10.9.9.1", dst="10.9.9.9")
+                      / TCP(sport=443, dport=44445)
+                      / Raw(b"\x16\x03\x03\x00\x04\x02\x00\x00\x00"))
+        self.assertEqual(known.tls_destinations, [])
+
+    def test_a_second_downstream_device_is_read_as_well(self):
+        # The bridge may have learned more than one MAC on that port --
+        # a switch, a phone with a PC behind it. All of them are the host
+        # side, so all of them count.
+        both = evidence_mod.Evidence(
+            host_macs=["aa:bb:cc:dd:ee:ff", "de:ad:be:ef:00:01"])
+        both.observe(self.dns_query("x.lan", "10.0.0.2",
+                                     mac="de:ad:be:ef:00:01"))
+        both.observe(self.dns_answer("x.lan", "10.0.0.2"))
+        self.assertEqual(both.resolvers, {"10.0.0.2": 1})
+
     def test_a_forged_sequence_from_another_sender_is_not_borrowed(self):
         # The implant knows which MAC the host behind the tap has, and
         # until now it learned it and used it for nothing. The proxy is on
@@ -583,6 +667,27 @@ class TestTheHostsIdentity(EvidenceCase):
                          / Raw(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"))))
         self.assertEqual(mine.host_mac, "de:ad:be:ef:00:01")
         self.assertEqual(mine.host_ip, "10.0.0.77")
+
+
+    def test_the_implants_own_requests_are_not_evidence_either(self):
+        # Not only "it is not the identity": the frame must contribute
+        # nothing at all. Before the host has said anything there is no
+        # anchor to compare against -- `host_mac` is None and a build
+        # whose bridge cannot be read has no table either -- so without
+        # the own-MAC check in `_from_the_host` the beacon's own queries
+        # became "a resolver the host proves answers" and its own
+        # handshakes became the host's destinations. The scout sniffs
+        # `br0`, which carries exactly that traffic.
+        mine = evidence_mod.Evidence(own_mac="aa:bb:cc:dd:ee:ff")
+        mine.observe(self.dns_query("c2.example.com", "10.0.0.2"))
+        mine.observe(self.dns_answer("c2.example.com", "10.0.0.2"))
+        mine.observe(self.client_hello("c2.example.com"))
+        mine.observe(self.eapol())
+
+        self.assertEqual(mine.resolvers, {})
+        self.assertEqual(mine.tls_destinations, [])
+        self.assertFalse(mine.dot1x_seen)
+        self.assertIsNone(mine.host_mac)
 
 
 class TestNothingObserveIsGivenMayRaise(EvidenceCase):

@@ -428,9 +428,13 @@ class _Sent:
 
     def __init__(self, answer=None):
         self.names = []
-        # The local address each query left by, which is empty for every
-        # beacon here: the way out's radio rung is the only thing that
-        # binds one, and `test_way_out_rungs.py` drives that.
+        # The local address each query left by. Empty for every beacon
+        # here -- the way out's radio rung is the only thing that binds
+        # one, and `test_way_out_rungs.py` drives that -- and asserted
+        # rather than merely collected: an unbound beacon that started
+        # passing *some* address would be sending its rescue from
+        # whatever the last outage leased, which is a dead address on a
+        # recovered implant.
         self.sources = []
         self._answer = answer
 
@@ -466,6 +470,9 @@ class TestTheTrigger(unittest.TestCase):
                 sys.modules["software.c2.beacon"], "_dns_query", sent):
             beacon._maybe_rescue()
         self.assertEqual(len(sent.names), 1)
+        self.assertEqual(sent.sources, [""],
+                         "a beacon with no radio lease must let the kernel "
+                         "choose the source of its rescue query")
         labels = sent.names[0].split(".")
         # <p1>.<p2>.<base32(id)>.r.<zone>
         self.assertEqual(labels[3], dns_rescue.MARKER)

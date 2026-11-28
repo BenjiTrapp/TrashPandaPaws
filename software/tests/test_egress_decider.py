@@ -214,6 +214,18 @@ class DeciderCase(unittest.TestCase):
         config["c2"].update(transports)
         beacon = Beacon(config)
         self._beacons.append(beacon)
+        # The same guard `way_out_scratch.assert_live` puts on the way
+        # out, and for the reason CI found there: `read_egress_policy`
+        # never raises -- it logs and hands back a *disabled* block -- so
+        # a test whose policy the reader refused would go on to assert
+        # that nothing was attempted, and pass. Rules being **dropped** is
+        # a different thing and is left alone: `c2.proxy.mode: none`
+        # removing the two rules that name a proxy is a tested behaviour.
+        if isinstance(policy, dict) and policy.get("enabled") is True:
+            self.assertTrue(
+                beacon._egress_enabled,
+                "the reader refused this test's policy, so the decider is "
+                "off and the test below is not testing it: %r" % (policy,))
         return beacon
 
     def _stop_beacons(self):
@@ -308,6 +320,37 @@ class DeciderCase(unittest.TestCase):
     def assertCarrierUp(self, beacon: Beacon):
         self.assertTrue(_alive(self.child_pid(beacon)),
                         "the carrier's child is not running")
+
+
+class TestTheHarnessNoticesARefusedPolicy(DeciderCase):
+    """`a_beacon`'s own tripwire, which is here because CI found its twin.
+
+    `read_egress_policy` never raises: it logs and hands back a disabled
+    block. So a test whose policy the reader refused would go on to
+    assert that nothing was attempted -- and pass, for the wrong reason,
+    silently. The way out's version of this mistake was total on Linux
+    for the whole branch (see `way_out_scratch.py`), so the decider's
+    helper got the same guard and this is what proves the guard fires.
+    """
+
+    def test_a_policy_the_reader_refuses_fails_the_test_that_built_it(self):
+        # A budget of zero: "on, with no attempts to spend" is a policy
+        # the reader refuses by design, because it decides nothing while
+        # the file says it is on.
+        with self.assertRaises(AssertionError) as caught:
+            self.a_beacon(policy=self.policy([_HOLDS], budget=0))
+        self.assertIn("not testing it", str(caught.exception))
+
+    def test_a_policy_it_accepts_passes(self):
+        self.assertTrue(
+            self.a_beacon(policy=self.policy([_HOLDS]))._egress_enabled)
+
+    def test_a_deliberately_disabled_policy_is_not_tripped_over(self):
+        # The shipped shape -- off, and carrying the operator's rules so
+        # that enabling it is one word -- is a case several tests are
+        # about, so the guard may not refuse it.
+        beacon = self.a_beacon(policy=self.policy([_HOLDS], enabled=False))
+        self.assertFalse(beacon._egress_enabled)
 
 
 class TestWhenItMayAct(DeciderCase):
@@ -566,6 +609,54 @@ class TestTheRuleThatWins(DeciderCase):
         self._evidence(beacon)
 
         self.assertEqual(beacon._egress_decide(), "gsocket")
+
+
+class TestADeclinedVerbDoesNotSilenceTheRulesBelowIt(DeciderCase):
+    """A rule with nothing to work on must not end the cycle either.
+
+    The twin of the gate's own fall-through, in the one other place where
+    a candidate can come to nothing. `egress proxy` declines when
+    discovery has found nothing on this host to select -- the rule is
+    right and there is no candidate -- and that decline used to be read
+    as "this cycle is over", so a `proxy` rule above a `rediscover` rule
+    meant the rediscovery that would have *given* it a candidate was
+    never reached. The policy is the operator's order, and a verb with
+    nothing to do is not a veto over the orders below it.
+    """
+
+    def rules(self, *verbs):
+        return self.policy([{"when": {"https": ["not_attempted"]},
+                             "try": verb} for verb in verbs])
+
+    def test_a_proxy_rule_with_nothing_to_select_falls_through(self):
+        beacon = self.a_beacon(policy=self.rules("proxy", "rediscover"))
+        asked = self.record_attempts(beacon)
+        beacon._stuck_cycles = beacon._EGRESS_FIRST_ACTING_CYCLE
+
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["rediscover"])
+        self.assertEqual(beacon._egress_spent, 1)
+
+    def test_the_proxy_rule_still_wins_once_there_is_one_to_select(self):
+        # The fall-through is a decline and not a demotion: the same two
+        # rules in the same order pick the first one the moment discovery
+        # has a candidate for it.
+        beacon = self.a_beacon(policy=self.rules("proxy", "rediscover"))
+        beacon._proxy.proxies.append({"url": "http://10.0.0.9:3128"})
+        asked = self.record_attempts(beacon)
+        beacon._stuck_cycles = beacon._EGRESS_FIRST_ACTING_CYCLE
+
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["proxy http://10.0.0.9:3128"])
+
+    def test_every_rule_declining_is_still_no_attempt(self):
+        beacon = self.a_beacon(policy=self.rules("proxy"))
+        asked = self.record_attempts(beacon)
+        beacon._stuck_cycles = beacon._EGRESS_FIRST_ACTING_CYCLE
+
+        self.assertFalse(beacon._egress_act())
+        self.assertEqual(asked, [])
+        self.assertEqual(beacon._egress_spent, 0)
 
 
 class TestTheGateTheOperatorCannotWiden(DeciderCase):

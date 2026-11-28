@@ -116,7 +116,7 @@ _PRIVATE_PREFIXES = ("10.", "192.168.", "169.254.", "127.")
 class Evidence(object):
     """One stuck window's reading of the tapped port."""
 
-    def __init__(self, own_mac=None):
+    def __init__(self, own_mac=None, host_macs=None):
         # This implant's own address on the bridge, so its own traffic is
         # not mistaken for the host's. The scout sniffs `br0`, which
         # carries the beacon's own queries and its own TLS -- so without
@@ -126,6 +126,26 @@ class Evidence(object):
         # read, which is the old behaviour and is still better than
         # refusing to collect anything.
         self.own_mac = (own_mac or "").strip().lower() or None
+        # Which MACs the **bridge** has learned on the downstream port,
+        # which is the side the host is on.
+        #
+        # This is the anchor for every piece of evidence a rung acts on,
+        # and three reviews running it was something an adversary could
+        # write: first anything on the wire, then "the first sender",
+        # which a single DNS query ahead of the host's first request made
+        # into the forger -- four frames bought a borrowable credential
+        # and blinded the scout to the real host for the rest of a window
+        # the design says can last a week. A port is not forgeable by a
+        # peer on the segment, so the bridge is asked instead of the
+        # frame.
+        #
+        # `None` is a host whose bridge could not be read, and then the
+        # first sender is taken as before: a scout that refused to collect
+        # because it could not find the forwarding table would be worse
+        # than one that can be lied to. `docs/WAY_OUT.md` says which.
+        self.host_macs = (frozenset(mac.strip().lower() for mac in host_macs
+                                    if mac and mac.strip())
+                          if host_macs is not None else None)
         self.dot1x_seen = False
         self.portal_answered = False
         self.resolvers = {}             # type: Dict[str, int]
@@ -211,8 +231,14 @@ class Evidence(object):
     def _observe(self, packet) -> None:
         if not packet.haslayer(Ether):
             return
+        # Every row of the evidence table is gated on the sender, and the
+        # gate is on the **request** side only -- see `_from_the_host`.
+        # `dot1x_seen` is not evidence-only: it reaches the rescue record,
+        # the operator's panel, a policy rule and rung 4's detection
+        # probability, and one frame from anyone used to set it.
         if int(packet[Ether].type) == _EAPOL_TYPE:
-            self.dot1x_seen = True
+            if self._from_the_host(packet):
+                self.dot1x_seen = True
             return
         if not packet.haslayer(IP):
             return
@@ -229,6 +255,11 @@ class Evidence(object):
                     else str(packet[IP].src))
         key = (resolver, int(dns.id))
         if not int(dns.qr):
+            # A query is a request, so it has to be the host's. The answer
+            # below is not gated: it can only settle something a query
+            # already put in `_dns_pending`.
+            if not self._from_the_host(packet):
+                return
             self._note_identity(packet)
             _remember(self._dns_pending, key, True)
             self._note_wpad(dns)
@@ -266,8 +297,13 @@ class Evidence(object):
             return
         start, headers, body = head
         if start.startswith("HTTP/"):
+            # A response is not gated on its sender: by construction it
+            # can only settle something a *request* already recorded, and
+            # a request's sender was checked. The 407 that makes a
+            # credential borrowable is such a response -- it only counts
+            # against a CONNECT in `_connect_pending`.
             self._http_response(packet, start, headers)
-        else:
+        elif self._from_the_host(packet):
             self._http_request(packet, start, headers, body)
 
     # ── HTTP ──
@@ -278,14 +314,6 @@ class Evidence(object):
             return
         method, target = parts[0], parts[1]
         self._note_identity(packet)
-        if not self._from_the_host(packet):
-            # Everything below is evidence a *rung acts on*, so it has to
-            # come from the host behind the tap. A review found the `407`
-            # precondition did not bind a forger, because the forger sends
-            # the 407 too -- and the MAC this class carefully learns was
-            # used for nothing. Three frames from anyone on the segment
-            # pointed the implant's whole channel at their own proxy.
-            return
         where = "%s:%d" % (packet[IP].dst, int(packet[TCP].dport))
         if method == "CONNECT" and _is_local(str(packet[IP].dst)):
             # And on this network. A proxy at a public address is not this
@@ -384,6 +412,10 @@ class Evidence(object):
     def _tls(self, packet, payload) -> None:
         kind = _handshake_type(payload)
         if kind == _TLS_CLIENT_HELLO:
+            # The host's handshakes, and nobody else's: this row is the
+            # target a louder rung aims at.
+            if not self._from_the_host(packet):
+                return
             name = _sni(payload)
             if name:
                 self._note_identity(packet)
@@ -399,20 +431,37 @@ class Evidence(object):
     # ── identity ──
 
     def _from_the_host(self, packet) -> bool:
-        """Whether this frame came from the host behind the tap.
+        """Whether this frame came from the host side of the bridge.
 
-        True while the host is unknown -- the first request is how it
-        becomes known -- and a comparison afterwards. It is a MAC and
-        therefore spoofable by somebody who can also see the host's
-        traffic; what it stops is the cheap case, which is the one a
-        defender who merely suspects a tap can run.
+        The bridge's own forwarding table when there is one -- a MAC it
+        learned on the downstream port, which a peer on the segment cannot
+        forge -- and otherwise the first-sender latch this used to have,
+        for a host where the table could not be read.
+
+        The implant's own frames are never the host's, whichever way the
+        question is answered: the scout sniffs `br0`, which carries the
+        beacon's own traffic.
+
+        **Asked of requests only.** A response comes from the other side
+        of the conversation by definition, and it can only settle
+        something a request already recorded -- a query in
+        `_dns_pending`, a ClientHello in `_tls_pending`, a CONNECT in
+        `_connect_pending`, a POST in `_portal_pending`. Gating responses
+        as well would have thrown away every answer and left the evidence
+        empty, which is how this was first written and what the tests
+        caught.
         """
-        if self.host_mac is None:
-            return True
         try:
-            return str(packet[Ether].src or "").lower() == self.host_mac
+            mac = str(packet[Ether].src or "").lower()
         except Exception:
             return False
+        if not mac or (self.own_mac and mac == self.own_mac):
+            return False
+        if self.host_macs is not None:
+            return mac in self.host_macs
+        if self.host_mac is None:
+            return True
+        return mac == self.host_mac
 
     def _note_identity(self, packet) -> None:
         """The first client-side sender, which is the host behind the tap.

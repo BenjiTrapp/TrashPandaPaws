@@ -20,10 +20,11 @@ it for.
 nobody can reach; a publish that threw on a full disk would end the one
 process that could have explained the rescue afterwards.
 
-The trail is the scout's and not the beacon's: the beacon records its
-attempts into the one file it writes, which is removed when a leg
-delivers, and the scout copies each new attempt onto an append-only trail
-that outlives the window.
+The trail is not the scout's: the beacon records each attempt into the
+one file it writes *and* appends the trail line in the same call, because
+it is the only process that knows an attempt happened. This file used to
+hold the scout's copy of it; the comment where those tests were says why
+they moved, and `test_way_out_trail.py` holds them now.
 """
 
 import json
@@ -43,6 +44,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from software.scout import handoff
 from software.scout.scout import Scout
+from software.tests import way_out_scratch as _scratch
 
 
 def _config(**overrides):
@@ -62,8 +64,7 @@ def _config(**overrides):
 
 class ScoutCase(unittest.TestCase):
     def setUp(self):
-        self.root = tempfile.mkdtemp(prefix="raccoon-scout-")
-        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.root = _scratch.scratch(self, "raccoon-scout-")
 
     def scout(self, config=None, ssids=None, **overrides):
         config = config or _config(**overrides)
@@ -253,6 +254,52 @@ class TestTheCredentialsStayOutOfTheDocument(ScoutCase):
         self.assertEqual(
             os.stat(handoff.borrow_path(self.root)).st_mode & 0o777, 0o600)
 
+    def test_it_is_removed_when_the_window_closes(self):
+        # The one file in this handoff that carries a **secret** -- a third
+        # party's proxy password, captured off the wire -- and it used to
+        # outlive the outage it was captured for: the beacon removes its
+        # own window when a leg delivers, the scout stops publishing
+        # because there is no window, and so the last borrow file stayed
+        # on the disk of a device built to look like an IP phone until
+        # somebody reimaged it. The page's "the trail holds no password"
+        # is true precisely because this file does, so this file does not
+        # get to be the one that is left behind.
+        scout = self.scout()
+        self.borrowable(scout)
+        self.stuck()
+        scout.publish_once()
+        self.assertTrue(os.path.exists(handoff.borrow_path(self.root)))
+
+        handoff.remove(handoff.state_path(self.root))     # a leg delivered
+        with mock.patch.object(scout, "_sleep",
+                               lambda seconds: scout.stop()):
+            scout.run(interval=300.0)
+
+        self.assertFalse(os.path.exists(handoff.borrow_path(self.root)),
+                         "a captured password is still on the disk after the "
+                         "outage it was captured for ended")
+
+    def test_the_next_window_starts_from_no_captured_secret(self):
+        # The same property from the beacon's side: a borrow verb on the
+        # next outage must not find the last outage's credential, because
+        # the evidence behind it is spent -- the scout drops its
+        # `Evidence` at the same moment and for the same reason.
+        scout = self.scout()
+        self.borrowable(scout)
+        self.stuck()
+        scout.publish_once()
+
+        handoff.remove(handoff.state_path(self.root))
+        with mock.patch.object(scout, "_sleep",
+                               lambda seconds: scout.stop()):
+            scout.run(interval=300.0)
+        self.assertIsNone(handoff.read_borrow(self.root))
+
+        scout._running = True
+        self.stuck(opened=time.time())
+        scout.publish_once()
+        self.assertEqual(handoff.read_borrow(self.root)["credentials"], [])
+
 
 # The trail used to be here, and it is not the scout's any more. It copied
 # new attempts out of the beacon's window file on this process's own
@@ -374,6 +421,133 @@ class TestNothingItIsAskedToDoMayRaise(ScoutCase):
         self.assertIsNone(scout.publish_once()["tap"]["host_mac"])
 
 
+class TestWhichSideOfTheBridgeTheHostIsOn(ScoutCase):
+    """The anchor for every piece of evidence a rung acts on.
+
+    Three reviews running it was something an adversary could write.
+    The bridge learns which port a MAC is on, and a peer on the segment
+    cannot forge the port their frames arrive on -- so the scout asks the
+    bridge.
+    """
+
+    FDB = """33:33:00:00:00:01 dev eth0 self permanent
+aa:bb:cc:dd:ee:ff dev eth1 master br0
+01:00:5e:00:00:01 dev eth1 self permanent
+de:ad:be:ef:00:02 dev eth1 master br0
+11:22:33:44:55:66 dev eth0 master br0
+ff:ff:ff:ff:ff:ff dev eth1 self permanent
+"""
+
+    def test_it_reads_the_downstream_ports_own_addresses(self):
+        scout = self.scout()
+        with mock.patch.object(scout, "_run",
+                               lambda *a, **k: (0, self.FDB)):
+            self.assertEqual(scout._host_macs(),
+                             ["aa:bb:cc:dd:ee:ff", "de:ad:be:ef:00:02"])
+
+    def test_it_asks_about_the_configured_downstream_interface(self):
+        # Both the shipped names and an operator's, because asking about
+        # the *configured* port is the whole claim: a hard-coded `eth1`
+        # satisfied a test that only ever used the default, and on a build
+        # whose host is on another port it would anchor the evidence to a
+        # port the host is not on -- which reads as "the bridge knows
+        # nobody", so every frame on the segment becomes the host's again.
+        for bridge, downstream in (("br0", "eth1"), ("raccoon0", "enp2s0")):
+            with self.subTest(downstream=downstream):
+                scout = self.scout(network={"bridge_name": bridge,
+                                            "downstream_iface": downstream})
+                asked = []
+                with mock.patch.object(
+                        scout, "_run",
+                        lambda argv, **k: asked.append(argv) or (0, self.FDB)):
+                    scout._host_macs()
+                self.assertEqual(asked, [["bridge", "fdb", "show", "br",
+                                          bridge, "dev", downstream]])
+
+    def test_a_reading_that_fails_is_no_reading_rather_than_an_empty_one(self):
+        # None and not `[]`: an empty list would mean "the host is nobody"
+        # and the scout would collect nothing at all, which is worse than
+        # a scout that can be lied to on a host whose bridge it cannot
+        # read. `Evidence` says which.
+        scout = self.scout()
+        for answer in ((1, "Cannot find device"), (0, ""), (0, "rubbish\n")):
+            with self.subTest(answer=answer):
+                with mock.patch.object(scout, "_run",
+                                       lambda *a, **k: answer):
+                    self.assertIsNone(scout._host_macs())
+
+    def test_the_evidence_is_given_the_reading(self):
+        scout = self.scout()
+        with mock.patch.object(scout, "_run",
+                               lambda *a, **k: (0, self.FDB)):
+            scout.refresh_identity()
+        self.assertEqual(scout.evidence.host_macs,
+                         frozenset(["aa:bb:cc:dd:ee:ff",
+                                    "de:ad:be:ef:00:02"]))
+
+    def test_the_reading_is_refreshed_per_publish(self):
+        # The bridge learns and ages entries while the implant is dark, so
+        # a reading taken once at construction would go stale over a
+        # window the design says can last a week.
+        scout = self.scout()
+        self.stuck()
+        seen = []
+        with mock.patch.object(
+                scout, "_run",
+                lambda *a, **k: seen.append(1) or (0, self.FDB)):
+            scout.publish_once()
+            scout.publish_once()
+        self.assertEqual(len(seen), 2)
+
+
+class TestADeadBeaconDoesNotLeaveItRunning(ScoutCase):
+    """The freshness rule, in the direction nobody had checked.
+
+    The beacon ignores a stale document, so a dead scout is harmless. The
+    scout had nothing of the kind: the window file is removed only when a
+    leg delivers, never on a `kill`, a crash, an OOM kill or a
+    `systemctl stop` -- so a dead beacon left the scout capturing and
+    scanning the radio for ever, which is the detection signature the page
+    spends a paragraph on.
+    """
+
+    def test_a_window_nobody_has_touched_for_hours_is_not_wanted(self):
+        scout = self.scout()
+        self.stuck()
+        self.assertTrue(scout.wanted())
+
+        handoff.write_private_json(handoff.state_path(self.root), {
+            "version": handoff.STATE_VERSION,
+            "opened": time.time() - 30 * 86400,
+            "touched": time.time() - 30 * 86400,
+            "stuck_cycles": 2, "hours_dark": 720.0,
+            "evidence": {}, "attempts": []})
+        self.assertFalse(scout.wanted(),
+                         "the scout is still capturing 30 days after the "
+                         "beacon stopped writing")
+        self.assertIsNone(scout.publish_once())
+
+    def test_a_window_the_beacon_is_still_writing_is_wanted(self):
+        scout = self.scout()
+        handoff.write_private_json(handoff.state_path(self.root), {
+            "version": handoff.STATE_VERSION,
+            "opened": time.time() - 30 * 86400,
+            "touched": time.time() - 60,
+            "stuck_cycles": 8640, "hours_dark": 720.0,
+            "evidence": {}, "attempts": []})
+        self.assertTrue(scout.wanted(),
+                        "a week-long outage is the case this exists for")
+
+    def test_a_window_with_no_stamp_at_all_is_wanted(self):
+        # A beacon older than this field. Reading it as dead would turn an
+        # upgrade into a scout that never starts.
+        scout = self.scout()
+        handoff.write_private_json(handoff.state_path(self.root), {
+            "version": handoff.STATE_VERSION, "opened": time.time() - 1000,
+            "stuck_cycles": 2, "evidence": {}, "attempts": []})
+        self.assertTrue(scout.wanted())
+
+
 class TestWhatItCostsWhileTheImplantIsDark(ScoutCase):
     """It publishes on a clock, and scans far less often than it publishes.
 
@@ -420,10 +594,16 @@ class TestWhatItCostsWhileTheImplantIsDark(ScoutCase):
         scout = self.scout(ssids=None)
         self.stuck()
         scanned = []
+
+        def run(argv, **_kwargs):
+            # Only `iw` is the radio scan; the bridge's forwarding table
+            # is read every publish on purpose and is not a scan.
+            if argv and argv[0] == "iw":
+                scanned.append(argv)
+            return 0, ""
+
         with mock.patch.object(scout, "_radio_iface", lambda: "wlan0"), \
-                mock.patch.object(
-                    scout, "_run",
-                    lambda *a, **k: scanned.append(1) or (0, "")), \
+                mock.patch.object(scout, "_run", run), \
                 mock.patch.object(scout, "_scan_ssids",
                                   Scout._scan_ssids.__get__(scout)):
             for _ in range(5):

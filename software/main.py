@@ -103,9 +103,6 @@ def _check_agent_beacon_conflict(config) -> None:
         "c2.sliver.enabled off.")
 
 
-from software.nac_bypass import NACBypass        # noqa: E402
-
-
 def way_out_identity_poller(config):
     """A callable that starts the NAC bypass when the beacon asks, or None.
 
@@ -146,6 +143,15 @@ def way_out_identity_poller(config):
             "this implant's traffic as the downstream host. Once per "
             "deployment.")
         try:
+            # Imported here and not at the top of this file: every other
+            # component is imported inside the branch that uses it, and
+            # `nac_bypass` pulls in scapy -- so a module-level import
+            # would make a build that never touches this rung pay for it
+            # at startup and fail to start at all without scapy. Inside
+            # the `try`, so a missing dependency is recorded in the
+            # request file like any other reason it could not start.
+            from software.nac_bypass import NACBypass
+
             bypass = NACBypass(config)
             bypass.start()
         except Exception as exc:
@@ -190,6 +196,7 @@ def main():
         components.append(("bridge", bridge))
 
     if config.get("nac_bypass", {}).get("enabled"):
+        from software.nac_bypass import NACBypass
         nac = NACBypass(config)
         nac.start()
         components.append(("nac_bypass", nac))

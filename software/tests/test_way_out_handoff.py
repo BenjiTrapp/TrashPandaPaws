@@ -47,8 +47,8 @@ from software.c2 import beacon as beacon_mod
 from software.c2 import dns_rescue
 from software.c2.beacon import Beacon, read_egress_policy, read_way_out_policy
 from software.scout import handoff
+from software.tests import way_out_scratch as _scratch
 from software.tests import test_egress_decider as _decider
-from software.tests import way_out_scratch
 
 _KEY = b"\x24" * 32
 
@@ -57,8 +57,7 @@ class WayOutCase(unittest.TestCase):
     """A beacon whose state directory is this test's own."""
 
     def setUp(self):
-        self.root = way_out_scratch("raccoon-way-out-")
-        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.root = _scratch.scratch(self, "raccoon-way-out-")
         self.logged = _decider._Collected()
         logger = beacon_mod.logger
         propagate = logger.propagate
@@ -70,6 +69,14 @@ class WayOutCase(unittest.TestCase):
             logger.propagate = propagate
 
         self.addCleanup(restore)
+
+    def trail(self, state_dir=None) -> list:
+        """The attempts, from where they are kept: the trail."""
+        path = handoff.trail_path(state_dir or self.root)
+        if not os.path.exists(path):
+            return []
+        return [json.loads(line)
+                for line in Path(path).read_text().splitlines()]
 
     def beacon(self, way_out=None, policy=None, **extra) -> Beacon:
         block = {
@@ -126,7 +133,19 @@ class TestTheBeaconsStateFile(WayOutCase):
         self.assertEqual(state["version"], handoff.STATE_VERSION)
         self.assertEqual(state["stuck_cycles"], 2)
         self.assertEqual(state["evidence"]["legs"]["https"], "timed_out")
-        self.assertEqual(state["attempts"], [])
+        self.assertEqual(state["spent"], 0)
+        # And a stamp of when this was written, which is the only thing
+        # that tells the scout a beacon has stopped: the window's file is
+        # removed when a leg *delivers* and never on a `kill`, a crash or
+        # an OOM kill, so without it a dead beacon left the scout
+        # capturing and scanning the radio for ever. `test_scout.py` holds
+        # the reading side.
+        self.assertLess(abs(time.time() - state["touched"]), 60)
+        # And not the attempts: the file is rewritten whole on every one
+        # of them, `budget` has no upper bound, and nothing read the list.
+        # The trail beside it is the record. See
+        # `Beacon._way_out_record_attempt`.
+        self.assertNotIn("attempts", state)
 
     def test_it_says_nothing_about_the_team_server(self):
         # The one new artefact on the implant's disk. A file naming the
@@ -183,11 +202,12 @@ class TestTheBeaconsStateFile(WayOutCase):
         beacon._way_out_record_attempt({"verb": "gsocket", "rung": 2})
         beacon._way_out_record_attempt({"verb": "proxy", "rung": 2})
 
-        attempts = handoff.read_state(self.root)["attempts"]
+        attempts = self.trail()
         self.assertEqual([entry["verb"] for entry in attempts],
                          ["gsocket", "proxy"])
         for entry in attempts:
             self.assertIn("at", entry)
+            self.assertIn("window", entry)
 
     def test_with_the_feature_off_nothing_is_written_at_all(self):
         beacon = self.beacon(way_out={"enabled": False,
@@ -232,8 +252,7 @@ class TestTheLoopItself(_decider.DeciderCase):
 
     def setUp(self):
         super().setUp()
-        self.state = way_out_scratch("raccoon-way-out-loop-")
-        self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
+        self.state = _scratch.scratch(self, "raccoon-way-out-loop-")
 
     def beacon(self, policy=None):
         return self.a_beacon(
@@ -274,7 +293,15 @@ class TestTheLoopItself(_decider.DeciderCase):
         self.assertIn("dot1x_seen",
                       handoff.read_state(self.state)["evidence"]["flags"])
 
-    def test_an_attempt_made_by_the_loop_reaches_the_state_file(self):
+    def trail(self) -> list:
+        """The attempts, from where they are kept: the trail."""
+        path = handoff.trail_path(self.state)
+        if not os.path.exists(path):
+            return []
+        return [json.loads(line)
+                for line in Path(path).read_text().splitlines()]
+
+    def test_an_attempt_made_by_the_loop_reaches_the_trail(self):
         # Thirteen cycles and not two, and that is the arithmetic rather
         # than the harness: switching `c2.way_out` on puts the three verbs
         # the decider has always had behind the curve as well, and the
@@ -286,7 +313,7 @@ class TestTheLoopItself(_decider.DeciderCase):
         beacon._stuck_cycles = 11
         self.run_cycles(beacon, 1)
 
-        attempts = handoff.read_state(self.state)["attempts"]
+        attempts = self.trail()
         self.assertEqual([entry["verb"] for entry in attempts],
                          ["rediscover"])
         self.assertEqual(attempts[0]["chose"], "policy")
@@ -321,8 +348,7 @@ class TestTheCostOfSwitchingItOn(_decider.DeciderCase):
 
     def setUp(self):
         super().setUp()
-        self.state = way_out_scratch("raccoon-way-out-cost-")
-        self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
+        self.state = _scratch.scratch(self, "raccoon-way-out-cost-")
 
     def attempts(self, enabled, cycles, flags=()):
         """What the loop asked `egress` to do on the `cycles`th stuck one.
@@ -482,7 +508,7 @@ class TestWhoDecides(WayOutCase):
                                      "argument": "Visitors"})
         beacon._egress_act()
 
-        attempt = handoff.read_state(self.root)["attempts"][-1]
+        attempt = self.trail()[-1]
         self.assertEqual(attempt["argument"], "Visitors")
         self.assertEqual(attempt["task"], "radio Visitors")
 
@@ -898,11 +924,16 @@ class TestAHostileStateDirectory(WayOutCase):
         self.assertEqual(os.listdir(elsewhere), [])
 
     def test_a_trail_that_is_a_symlink_is_not_followed(self):
+        # Against the beacon's writer, which is the only one there is:
+        # the scout's `append_trail` is gone, and this property had to go
+        # with it rather than be dropped. A link planted at this name
+        # would have the root beacon appending the trail wherever it
+        # pointed.
         target = os.path.join(self.root, "someone-elses-file")
         Path(target).write_text("original\n")
         os.symlink(target, handoff.trail_path(self.root))
-        with self.assertRaises(OSError):
-            handoff.append_trail(self.root, {"attacker": "was here"})
+        beacon = self.beacon()
+        beacon._way_out_record_attempt({"verb": "gsocket"})
         self.assertEqual(Path(target).read_text(), "original\n")
 
     def test_the_beacon_does_not_write_through_a_symlink_either(self):
@@ -962,6 +993,31 @@ class TestAHostileStateDirectory(WayOutCase):
         restarted._way_out_publish_state()
         self.assertEqual(restarted._egress_spent, 2,
                          "a restart refilled the window's budget")
+
+    def test_an_attempt_is_spent_on_the_disk_before_the_next_publish(self):
+        # The sharper half of the same thing, and the gap the test above
+        # left: `_way_out_publish_state` runs once per cycle and the
+        # attempt is made after it, so a beacon killed between the attempt
+        # and the next cycle left a file saying the attempt had never
+        # happened -- and the restart adopted that. One restart per attempt
+        # is an unbounded budget on a unit with `Restart=always`. So the
+        # attempt's own record writes `spent` too.
+        beacon = self.beacon(policy={
+            "enabled": True, "budget": 3,
+            "rules": [{"when": {"https": ["not_attempted"]},
+                       "try": "rediscover"}]})
+        beacon._exec_egress = lambda task: "recorded"
+        beacon._stuck_cycles = 12
+        beacon._way_out_publish_state()
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(handoff.read_state(self.root)["spent"], 1,
+                         "the window's file does not know the attempt was "
+                         "made until the next cycle publishes")
+
+        restarted = self.beacon()
+        restarted._stuck_cycles = 12
+        restarted._way_out_publish_state()
+        self.assertEqual(restarted._egress_spent, 1)
 
     def test_a_request_somebody_else_wrote_is_not_acted_on(self):
         # The one move that cannot be undone from the far side, so the
@@ -1042,8 +1098,13 @@ class TestTheScoutsReaderAndWriter(WayOutCase):
         self.assertIsNone(handoff.read_document(self.root))
 
     def test_the_trail_is_append_only_and_survives_the_state_file(self):
-        handoff.append_trail(self.root, {"verb": "gsocket"})
-        handoff.append_trail(self.root, {"verb": "proxy"})
+        # The beacon's writer, for the reason the symlink test above
+        # gives: this module's own `append_trail` is gone, because the
+        # scout lost a window's last attempts by copying them on its
+        # publishing clock. Two attempts, two lines, in order, 0600.
+        beacon = self.beacon()
+        beacon._way_out_record_attempt({"verb": "gsocket"})
+        beacon._way_out_record_attempt({"verb": "proxy"})
         lines = [json.loads(line) for line
                  in Path(handoff.trail_path(self.root)).read_text().splitlines()]
         self.assertEqual([entry["verb"] for entry in lines],
@@ -1057,19 +1118,18 @@ class TestTheScoutsReaderAndWriter(WayOutCase):
             os.stat(handoff.borrow_path(self.root)).st_mode & 0o777, 0o600)
 
 
-class TestTheFixturesCannotHandTheReaderARefusedPath(unittest.TestCase):
-    """The rule above, turned on the tests that have to live with it.
+class TestNoFixtureMintsItsOwnStateDirectory(unittest.TestCase):
+    """The source-level half of what `way_out_scratch` exists for.
 
-    `tempfile.gettempdir()` is `/tmp` on Linux and `/var/folders/...` on
-    macOS. Five modules minted their state directory with a bare
-    `tempfile.mkdtemp()`, so on the machine they were written on the reader
-    accepted it and on every Linux runner it did not: 71 failures and 24
-    errors in CI, every one of them the fixture raising. Reproduced here by
-    setting `TMPDIR=/tmp`, which gives the same 71 and 24.
+    That module's `assert_live` catches a disabled feature at run time,
+    which is the stronger guard: it fails loudly wherever a harness turns
+    the way out off. This catches the one cause of it that is visible
+    without running anything -- a fixture going back to a bare
+    `tempfile.mkdtemp()`, which is accepted by the reader on macOS and
+    refused on Linux, so the module is green here and red there.
 
-    Two checks, because only the second would have caught it. The first
-    says the helper is right; the second says the helper is the only thing
-    the fixtures use.
+    Read with `ast` rather than by scanning lines: this file is one of the
+    five, and a line scan matched its own failure message.
     """
 
     MODULES = ("test_way_out_gate", "test_way_out_handoff",
@@ -1077,29 +1137,17 @@ class TestTheFixturesCannotHandTheReaderARefusedPath(unittest.TestCase):
                "test_way_out_trail")
 
     def test_the_helper_answers_with_a_path_the_reader_accepts(self):
-        import shutil
-
-        # `tempfile.gettempdir()` is patched rather than `TMPDIR` set:
-        # tempfile caches its answer in `tempfile.tempdir` on the first
-        # call, so by the time any test runs the environment no longer
-        # decides. The first version of this test set TMPDIR, read
-        # `/var/folders/...` back and would have passed against the defect.
+        # `tempfile.gettempdir` is patched rather than TMPDIR set: tempfile
+        # caches its answer in `tempfile.tempdir` on the first call, so by
+        # the time any test runs the environment no longer decides, and a
+        # version of this test that set TMPDIR passed against the defect.
         with mock.patch("tempfile.gettempdir", return_value="/tmp"):
-            path = way_out_scratch("raccoon-reader-floor-")
-        self.addCleanup(shutil.rmtree, path, True)
+            path = _scratch.scratch(self, "raccoon-reader-floor-")
         self.assertFalse(path == "/tmp" or path.startswith("/tmp/"), path)
         policy = read_way_out_policy({"enabled": True, "state_dir": path})
         self.assertEqual(policy["state_dir"], path)
 
     def test_no_way_out_fixture_mints_its_state_directory_itself(self):
-        # By source, not by running: a module that goes back to
-        # `tempfile.mkdtemp()` for a state directory is green on macOS and
-        # red on Linux, so the thing to catch is the call, not the result.
-        # Read with `ast` rather than by scanning lines, because this file
-        # is one of the five and a line scan matched its own message text.
-        # `test_way_out_rungs` keeps one `mkdtemp` for a sysfs tree it
-        # builds, which no reader ever sees, so the name it is assigned to
-        # is what decides.
         import ast
 
         here = Path(__file__).resolve().parent
@@ -1113,14 +1161,15 @@ class TestTheFixturesCannotHandTheReaderARefusedPath(unittest.TestCase):
                         and isinstance(call.func, ast.Attribute)
                         and call.func.attr == "mkdtemp"):
                     continue
-                kept = ast.dump(ast.Module(body=[node], type_ignores=[])) \
-                    if hasattr(ast, "Module") else ""
+                kept = ast.dump(node)
                 with self.subTest(module=name, line=node.lineno):
                     self.assertIn(
                         "sysfs", kept,
                         "%s:%d mints a directory with mkdtemp; a state_dir "
-                        "has to come from way_out_scratch, or this module is "
-                        "red on Linux and green here" % (name, node.lineno))
+                        "has to come from way_out_scratch.scratch, or this "
+                        "module is red on Linux and green here"
+                        % (name, node.lineno))
+
 
 
 if __name__ == "__main__":
