@@ -28,7 +28,9 @@ Five files, and which side owns each:
     way_out_scout.json      the scout writes, the beacon reads.  The
                             evidence from the tap, the rungs the scout
                             believes are available, and -- in the model
-                            stage -- one recommendation.
+                            stage -- one recommendation.  Removed when
+                            the window closes: it names the host's MAC,
+                            its IP, its proxies and its resolvers.
     way_out_trail.jsonl     the beacon writes, nobody here reads.  One
                             line per attempt, kept after the state file is
                             gone, which is what makes a burned implant a

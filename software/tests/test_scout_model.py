@@ -26,7 +26,11 @@ least room for error.
 """
 
 import json
+import os
+import socket
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -103,7 +107,7 @@ class TestOnlyLoopback(unittest.TestCase):
 
     def test_a_refused_endpoint_is_never_dialled(self):
         asked = []
-        with mock.patch.object(model_mod.urllib.request, "urlopen",
+        with mock.patch.object(model_mod, "_open",
                                lambda *a, **k: asked.append(1)):
             for endpoint, allowed in LOOPBACK_ENDPOINTS:
                 if allowed:
@@ -172,34 +176,29 @@ class TestWhatCountsAsAnAnswer(ValidationCase):
 
 class TestAskingTheModel(unittest.TestCase):
     def reply(self, payload, status=200):
-        """Stand in for the one HTTP call, recording what went out."""
+        """Stand in for the one HTTP call, recording what went out.
+
+        `model._open` and **not** `urllib.request.urlopen`, which is
+        where this stood before: patching `urlopen` was patching the
+        defect. `urlopen` builds its opener from `getproxies()`, so the
+        prompt honoured `http_proxy` from the implant's environment and
+        was POSTed to a corporate proxy -- and no test could see it,
+        because every one of them replaced the call. `_open` is the seam
+        that owns "never through a proxy", and
+        `TestTheQuestionDoesNotLeaveThisHost` below is the only honest
+        pin on that: a real listener.
+        """
         sent = {}
 
-        def urlopen(request, timeout=None):
+        def opened(request, timeout=None):
             sent["url"] = request.full_url
             sent["body"] = json.loads(request.data.decode("utf-8"))
             sent["timeout"] = timeout
             if isinstance(payload, Exception):
                 raise payload
+            return json.dumps(payload).encode("utf-8")
 
-            class Response(object):
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *_exc):
-                    return False
-
-                @staticmethod
-                def read():
-                    return json.dumps(payload).encode("utf-8")
-
-                @staticmethod
-                def getcode():
-                    return status
-            return Response()
-
-        patcher = mock.patch.object(model_mod.urllib.request, "urlopen",
-                                    urlopen)
+        patcher = mock.patch.object(model_mod, "_open", opened)
         patcher.start()
         self.addCleanup(patcher.stop)
         return sent
@@ -268,20 +267,9 @@ class TestAskingTheModel(unittest.TestCase):
                 self.assertIsNone(model_mod.ask(A_MODEL, A_STATE, A_TAP))
 
     def test_a_reply_that_is_not_json_at_all_is_a_refusal(self):
-        def urlopen(request, timeout=None):
-            class Response(object):
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *_exc):
-                    return False
-
-                @staticmethod
-                def read():
-                    return b"<html>no model here</html>"
-            return Response()
-
-        with mock.patch.object(model_mod.urllib.request, "urlopen", urlopen):
+        with mock.patch.object(model_mod, "_open",
+                               lambda request, timeout=None:
+                               b"<html>no model here</html>"):
             self.assertIsNone(model_mod.ask(A_MODEL, A_STATE, A_TAP))
 
     def test_a_timeout_or_a_refused_connection_is_a_refusal(self):
@@ -303,10 +291,104 @@ class TestAskingTheModel(unittest.TestCase):
         self.assertIn("sleep", "\n".join(got.output))
 
 
+class TestTheQuestionDoesNotLeaveThisHost(unittest.TestCase):
+    """The claim this module makes in bold, read off a socket.
+
+    "Loopback only, checked twice" was two checks on the endpoint's
+    *text*, and the request went out through `urllib.request.urlopen`,
+    which builds its opener from `getproxies()`. With `http_proxy` in the
+    implant's environment and no `no_proxy`, the whole prompt was POSTed
+    in cleartext to that proxy -- a body that says there is an implant,
+    that it bridges a switch port and a host, how long it has been dark,
+    the host's MAC, IP, proxy and resolver, and the menu of moves
+    including taking the host's identity. A corporate proxy is the one
+    device on the network most certain to log it.
+
+    No test could see that, because every test of `ask` replaced the
+    call. So this one does not: it points `http_proxy` at a listener it
+    owns and requires that the listener sees **nothing**. The project's
+    own recorded lesson, applied to itself -- a reachable peer cannot be
+    proved by asserting a URL's text.
+    """
+
+    def listener(self):
+        """A socket standing in for the proxy, and what it saw."""
+        seen = []
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(2)
+        server.settimeout(0.2)
+        done = threading.Event()
+
+        def accept():
+            while not done.is_set():
+                try:
+                    connection, _peer = server.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                try:
+                    seen.append(connection.recv(4096))
+                finally:
+                    connection.close()
+
+        thread = threading.Thread(target=accept, daemon=True)
+        thread.start()
+
+        def stop():
+            done.set()
+            thread.join(timeout=5)
+            server.close()
+
+        self.addCleanup(stop)
+        return seen, server.getsockname()[1]
+
+    def test_the_prompt_is_not_sent_to_the_proxy_in_the_environment(self):
+        seen, port = self.listener()
+        # `no_proxy` cleared as well: this machine happens to carry one
+        # that bypasses loopback, which is exactly why the defect was
+        # invisible where it was written.
+        environment = dict(os.environ)
+        for name in ("no_proxy", "NO_PROXY", "https_proxy", "HTTPS_PROXY"):
+            environment.pop(name, None)
+        environment["http_proxy"] = "http://127.0.0.1:%d" % port
+        environment["HTTP_PROXY"] = environment["http_proxy"]
+
+        with mock.patch.dict(os.environ, environment, clear=True):
+            self.assertIsNone(model_mod.ask(
+                dict(A_MODEL, endpoint="http://127.0.0.1:1/",
+                     timeout_seconds=3),
+                A_STATE, A_TAP))
+
+        deadline = time.time() + 1.0
+        while not seen and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(seen, [],
+                         "the prompt was sent to the proxy named in the "
+                         "implant's environment: %r"
+                         % (seen[0][:400] if seen else b"",))
+
+    def test_the_question_still_reaches_a_model_on_loopback(self):
+        # The other half, so the fix cannot be "send nothing at all": a
+        # real listener on loopback gets the real request.
+        seen, port = self.listener()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            model_mod.ask(dict(A_MODEL,
+                               endpoint="http://127.0.0.1:%d/" % port,
+                               timeout_seconds=3),
+                          A_STATE, A_TAP)
+        deadline = time.time() + 5
+        while not seen and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(seen, "nothing reached the loopback listener")
+        self.assertIn(b"/api/generate", seen[0])
+
+
 class TestItIsOffUnlessSwitchedOn(unittest.TestCase):
     def test_a_block_that_is_not_enabled_is_never_asked(self):
         asked = []
-        with mock.patch.object(model_mod.urllib.request, "urlopen",
+        with mock.patch.object(model_mod, "_open",
                                lambda *a, **k: asked.append(1)):
             self.assertIsNone(model_mod.ask(dict(A_MODEL, enabled=False),
                                             A_STATE, A_TAP))

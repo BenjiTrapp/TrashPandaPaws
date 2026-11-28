@@ -263,6 +263,34 @@ class TestTheLadderIsArithmetic(GateCase):
                 self.assertTrue(allowed)
                 self.assertEqual(numbers["blocked_by"], "")
 
+    def test_a_quieter_rung_exactly_on_the_threshold_has_not_crossed(self):
+        # The ordering rule's comparison has to be strict, as the gate's
+        # own is: a quieter rung sitting *exactly* on the threshold has
+        # not crossed, and counting it as crossed would let the louder
+        # one go first -- the one asymmetry this rule exists to exclude.
+        #
+        # Reachable only at the top of the curve, which is worth knowing
+        # on its own: rung 3's EV grows more slowly than rung 4's
+        # (`p_success` 0.4 against 0.5), so the two cross at 99 points
+        # and at the cap of 100 the *irreversible* rung is worth more by
+        # the arithmetic than the radio. The first-crossing order is
+        # still right -- the sweep above holds that -- and this is why it
+        # is the ordering rule holding it and not the numbers.
+        beacon = self.beacon(hours_dark=24)
+        self.assertEqual(beacon._way_out_points(), 100)
+        coefficient = float(beacon._way_out["risk_coefficient"])
+        _, success, detect = beacon_mod._WAY_OUT_ROWS["way_out_radio"]
+        beacon._way_out["ev_threshold"] = 100 * success - coefficient * detect
+
+        self.assertFalse(beacon._way_out_allows("radio")[0],
+                         "the quieter rung is allowed at equality")
+        allowed, numbers = beacon._way_out_allows("identity")
+        self.assertGreater(numbers["ev"], numbers["threshold"],
+                           "the louder rung's own price did not pass, so "
+                           "this test is not about the ordering rule")
+        self.assertFalse(allowed)
+        self.assertEqual(numbers["blocked_by"], "way_out_radio")
+
     def test_dot1x_seen_pushes_the_identity_rung_later(self):
         self.assertFalse(self.allows("identity", hours_dark=8,
                                      flags=["dot1x_seen"]))

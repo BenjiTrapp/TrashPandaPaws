@@ -288,6 +288,29 @@ class TestTheCredentialsStayOutOfTheDocument(ScoutCase):
                          "a captured password is still on the disk after the "
                          "outage it was captured for ended")
 
+    def test_the_document_goes_with_it_when_the_window_closes(self):
+        # The one handoff file nothing ever removed. It names the host's
+        # MAC and IP, the host's proxies and resolvers, its TLS
+        # destinations and the SSIDs in range -- so it stayed on the disk
+        # of a device built to look like an IP phone after the outage it
+        # described had ended. The beacon removes its own window file; the
+        # scout owns this one and the borrow file.
+        scout = self.scout()
+        self.borrowable(scout)
+        self.stuck()
+        scout.publish_once()
+        self.assertTrue(os.path.exists(handoff.document_path(self.root)))
+
+        handoff.remove(handoff.state_path(self.root))     # a leg delivered
+        with mock.patch.object(scout, "_sleep",
+                               lambda seconds: scout.stop()):
+            scout.run(interval=300.0)
+
+        self.assertFalse(os.path.exists(handoff.document_path(self.root)),
+                         "the tap's whole reading of the host is still on "
+                         "the disk after the outage ended")
+        self.assertFalse(os.path.exists(handoff.borrow_path(self.root)))
+
     def test_the_next_window_starts_from_no_captured_secret(self):
         # The same property from the beacon's side: a borrow verb on the
         # next outage must not find the last outage's credential, because
@@ -607,11 +630,15 @@ class TestADeadBeaconDoesNotLeaveItRunning(ScoutCase):
         self.stuck()
         self.assertTrue(scout.wanted())
 
+        # Self-consistent, as the beacon writes it: 30 days of 300 s
+        # cycles. `hours_dark` over `stuck_cycles` is what tells this
+        # process how long a cycle takes, so a fixture that disagrees
+        # with itself would be testing arithmetic nothing produces.
         handoff.write_private_json(handoff.state_path(self.root), {
             "version": handoff.STATE_VERSION,
             "opened": time.time() - 30 * 86400,
             "touched": time.time() - 30 * 86400,
-            "stuck_cycles": 2, "hours_dark": 720.0,
+            "stuck_cycles": 30 * 24 * 12, "hours_dark": 720.0,
             "evidence": {}})
         self.assertFalse(scout.wanted(),
                          "the scout is still capturing 30 days after the "
@@ -638,32 +665,39 @@ class TestADeadBeaconDoesNotLeaveItRunning(ScoutCase):
             "stuck_cycles": 2, "evidence": {}})
         self.assertTrue(scout.wanted())
 
-    def test_the_ceiling_follows_the_beacons_own_interval(self):
-        # `beacon_interval_seconds` is the operator's and has no upper
-        # bound. A fixed hour made every live window on a long-interval
-        # build read as dead for most of every cycle -- and this process
-        # answers that by dropping its evidence and deleting its captured
-        # credential, so rungs 2 to 4 would have had nothing left to act
-        # on. The other side of this handoff reasons about the same
-        # control in `_way_out_points`; this side did not.
-        quiet = self.scout(config=_config(c2={
-            "beacon_interval_seconds": 7200,
-            "way_out": {"enabled": True, "state_dir": self.root}}))
-        self.assertEqual(quiet._window_ceiling(), 12 * 7200)
-        handoff.write_private_json(handoff.state_path(self.root), {
-            "version": handoff.STATE_VERSION, "opened": time.time() - 90000,
-            "touched": time.time() - 7300, "stuck_cycles": 12,
-            "evidence": {}})
-        self.assertTrue(quiet.wanted(),
+    def test_the_ceiling_follows_the_beacons_live_interval(self):
+        # `beacon_interval_seconds` is the operator's, has no upper bound,
+        # and is re-set at runtime by the `sleep` task verb -- so the yaml
+        # is only what the beacon *started* with. A fixed hour made every
+        # live window on a long-interval build read as dead for most of
+        # every cycle, and this process answers that by dropping its
+        # evidence and deleting its captured credential. The window
+        # carries the live number: `hours_dark` over `stuck_cycles` is
+        # what a cycle currently costs.
+        scout = self.scout()
+        window = {"version": handoff.STATE_VERSION,
+                  "opened": time.time() - 90000,
+                  "touched": time.time() - 7300,
+                  "stuck_cycles": 12, "hours_dark": 24.0, "evidence": {}}
+        handoff.write_private_json(handoff.state_path(self.root), window)
+
+        self.assertEqual(scout._window_ceiling(window), 12 * 7200)
+        self.assertTrue(scout.wanted(),
                         "one missed cycle read as a dead beacon")
 
         # And the hour is a floor, not a multiplier to be shrunk: a short
         # interval does not buy a short ceiling, because the window file
         # is the only thing that says an outage is still on.
-        brisk = self.scout(config=_config(c2={
-            "beacon_interval_seconds": 5,
+        brisk = dict(window, stuck_cycles=720, hours_dark=1.0)
+        self.assertEqual(scout._window_ceiling(brisk), 3600)
+
+    def test_a_window_that_does_not_say_falls_back_to_the_config(self):
+        scout = self.scout(config=_config(c2={
+            "beacon_interval_seconds": 7200,
             "way_out": {"enabled": True, "state_dir": self.root}}))
-        self.assertEqual(brisk._window_ceiling(), 3600)
+        self.assertEqual(
+            scout._window_ceiling({"version": handoff.STATE_VERSION}),
+            12 * 7200)
 
     def test_a_missing_or_rubbish_interval_is_the_floor(self):
         for value in (None, "soon", 0, True, -300):
@@ -671,7 +705,29 @@ class TestADeadBeaconDoesNotLeaveItRunning(ScoutCase):
                 scout = self.scout(config=_config(c2={
                     "beacon_interval_seconds": value,
                     "way_out": {"enabled": True, "state_dir": self.root}}))
-                self.assertEqual(scout._window_ceiling(), 3600)
+                self.assertEqual(scout._window_ceiling({}), 3600)
+
+    def test_a_cycle_the_window_claims_is_longer_than_a_day_is_capped(self):
+        # The window file is trusted, but not without bound: a file whose
+        # numbers imply a cycle of weeks would keep this process
+        # capturing and scanning the radio for ever, which is the
+        # detection signature `wanted` exists to bound.
+        scout = self.scout()
+        absurd = {"version": handoff.STATE_VERSION, "stuck_cycles": 2,
+                  "hours_dark": 720.0}
+        self.assertEqual(scout._window_ceiling(absurd), 12 * 86400)
+
+    def test_a_window_whose_own_numbers_are_rubbish_falls_back(self):
+        scout = self.scout(config=_config(c2={
+            "beacon_interval_seconds": 600,
+            "way_out": {"enabled": True, "state_dir": self.root}}))
+        for window in ({"stuck_cycles": 0, "hours_dark": 4.0},
+                       {"stuck_cycles": 12, "hours_dark": 0},
+                       {"stuck_cycles": True, "hours_dark": 4.0},
+                       {"stuck_cycles": 12, "hours_dark": "four"},
+                       {"stuck_cycles": -12, "hours_dark": 4.0}):
+            with self.subTest(window=window):
+                self.assertEqual(scout._window_ceiling(window), 12 * 600)
 
 
 class TestWhatItCostsWhileTheImplantIsDark(ScoutCase):

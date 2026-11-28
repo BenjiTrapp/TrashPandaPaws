@@ -3,8 +3,8 @@
 When a dropped implant cannot reach its team server, the thing that normally
 decides what to try next sits on the far side of exactly the connection it is
 trying to establish. [`docs/EGRESS_DECIDER.md`](EGRESS_DECIDER.md) closed half
-of that hole: the implant chooses one of three verbs for itself, from a policy
-you write.
+of that hole: the implant chooses one of the verbs it already has for
+itself, from a policy you write — three of them, before this page's four.
 
 This page is the other half. It widens what the implant can *see* — it is an
 inline tap between a switch port and a host, so it can watch what gets out of
@@ -394,7 +394,7 @@ phone is the one number that has to be right:
 | File | Written by | What it is |
 |---|---|---|
 | `way_out_state.json` | the beacon | the open stuck window: how long, on what evidence, and how much of the budget it has spent; removed when a leg delivers |
-| `way_out_scout.json` | the scout | the handoff: the tap's reading, and a recommendation if the model is on |
+| `way_out_scout.json` | the scout | the handoff: the tap's reading, and a recommendation if the model is on; removed when the window closes |
 | `way_out_borrow.json` | the scout | the credentials and the portal request — the only one that can carry a secret, and removed when the window closes |
 | `way_out_trail.jsonl` | the beacon | the trail, append-only, which outlives the window |
 | `way_out_identity.json` | the beacon | rung 4's request, and what came of it |

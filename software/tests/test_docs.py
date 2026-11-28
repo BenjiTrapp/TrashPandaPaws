@@ -3604,6 +3604,66 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
                    "that rung 4's effect outlives a restart")
         self.claim("the next run of that process", "restores it",
                    "what restores it")
+        # The rest of the page's load-bearing claims, each anchored the
+        # same way. The list is long on purpose: 18 of 22 inversions of
+        # this page passed before, and it is the only thing an operator
+        # reads before switching on a move that can end an engagement.
+        for anchor, says, what in (
+                ("drop-box only", "single file",
+                 "which builds carry this at all"),
+                ("this evidence is written by anybody",
+                 "not what the host proves",
+                 "that the tap's evidence is adversary-writable"),
+                ("a credential is borrowed only from a `connect`",
+                 "answered `407`",
+                 "the precondition on a borrowable credential"),
+                ("a captive portal is recorded only at a",
+                 "private or link-local",
+                 "where a portal may be recorded"),
+                ("and not from a previous outage",
+                 "removes that file when a stuck window closes",
+                 "that a stale capture is not replayed"),
+                ("the dns arm is not built", "an earlier draft",
+                 "that the DNS arm is absent"),
+                ("every implementable version", "stays baked",
+                 "why the DNS arm is absent"),
+                ("all of it is read only from frames whose sender is the",
+                 "host behind the",
+                 "whose frames the evidence is read from"),
+                ("the onboard radio only", "usb adapter is refused",
+                 "which radio the rung may use"),
+                ("a scoped route, never the default one", "table `100`",
+                 "where the radio's route goes"),
+                ("already spent when you enabled the bypass yourself",
+                 "not offered again",
+                 "that an operator who enabled the bypass has spent it"),
+                ("not offered at all without a fresh scout document",
+                 "pre-spent fact lives",
+                 "that rung 4 needs a fresh document"),
+                ("the two modifiers", "direction",
+                 "that the modifiers are direction-checked"),
+                ("`points` is floored by the", "cycle count",
+                 "that a long interval cannot buy a loud rung"),
+                ("switching this on costs the borrow rung its first hour",
+                 "with `c2.way_out` off",
+                 "what enabling the ladder costs the old verbs"),
+                ("a refusal is not the end of the cycle",
+                 "**next** candidate",
+                 "that a refused rung does not silence the ones below"),
+                ("rung 4's request is acted on only if",
+                 "own uid and not writable by anyone else",
+                 "who may write rung 4's request"),
+                ("the directory's mode is enforced",
+                 "every write, not only when it is created",
+                 "that the directory is re-tightened"),
+                ("it publishes on a clock", "scans the radio at most once",
+                 "what the scout costs while the implant is dark"),
+                ("the beacon never calls the model", "reads a file",
+                 "that the beacon does not wait for the model"),
+                ("the credentials live in a", "never in the document",
+                 "where a captured secret is kept")):
+            with self.subTest(anchor=anchor):
+                self.claim(anchor, says, what)
 
     def test_it_states_what_enabling_it_costs_the_old_verbs(self):
         for phrase, what in (
