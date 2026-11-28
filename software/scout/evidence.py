@@ -135,9 +135,21 @@ class Evidence(object):
         # which a single DNS query ahead of the host's first request made
         # into the forger -- four frames bought a borrowable credential
         # and blinded the scout to the real host for the rest of a window
-        # the design says can last a week. A port is not forgeable by a
-        # peer on the segment, so the bridge is asked instead of the
-        # frame.
+        # the design says can last a week.
+        #
+        # **What asking the bridge does and does not buy.** It narrows
+        # *which MAC counts* to the ones the kernel has actually seen on
+        # the host's own port, so a stranger's address is refused however
+        # many frames it sends, and the implant can no longer be made to
+        # anchor on the first thing that speaks. It does **not** narrow
+        # *who may send that MAC*: `observe` is handed a frame and nothing
+        # else, nothing in this pipeline knows which interface it arrived
+        # on, and the capture is on the bridge -- so anybody who copies
+        # the host's source address off the wire still passes, from either
+        # side. Answering that would need a direction-aware capture on the
+        # downstream interface, which is a larger change than this one;
+        # the limit is written here and in `docs/WAY_OUT.md` rather than
+        # implied.
         #
         # `None` is a host whose bridge could not be read, and then the
         # first sender is taken as before: a scout that refused to collect
@@ -431,12 +443,20 @@ class Evidence(object):
     # ── identity ──
 
     def _from_the_host(self, packet) -> bool:
-        """Whether this frame came from the host side of the bridge.
+        """Whether this frame's sender is one the host's port has.
 
-        The bridge's own forwarding table when there is one -- a MAC it
-        learned on the downstream port, which a peer on the segment cannot
-        forge -- and otherwise the first-sender latch this used to have,
-        for a host where the table could not be read.
+        A comparison of the source MAC against the bridge's own forwarding
+        table for the downstream port when there is one, and otherwise
+        against the first-sender latch this used to have, for a host where
+        the table could not be read.
+
+        **It is which MAC, not which direction.** This is handed a frame
+        and nothing else; the arrival interface is not in it, and the
+        capture is on the bridge. So a forger who copies the host's
+        address off the wire passes from either side, and what asking the
+        bridge bought is that a *stranger's* address no longer does. See
+        the comment on `host_macs` for the limit, which is stated in
+        `docs/WAY_OUT.md` too.
 
         The implant's own frames are never the host's, whichever way the
         question is answered: the scout sniffs `br0`, which carries the

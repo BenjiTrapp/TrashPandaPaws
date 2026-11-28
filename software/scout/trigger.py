@@ -96,17 +96,53 @@ class IdentityTrigger(object):
             return False
         return True
 
-    def taken(self, detail: str) -> None:
+    def was_started(self) -> bool:
+        """Whether an earlier run of this process actually started it.
+
+        The one thing the request file records that is a fact about the
+        **switch** rather than about this process: the MAC has moved, and
+        the port may already be latched to it. `main.py` stops its
+        components on shutdown, and `NACBypass.stop()` puts this implant's
+        own MAC back -- so without this a reboot released an identity the
+        rung had already paid the irreversible price for, and the one-shot
+        latch kept it from ever being taken again.
+
+        False for a request that was taken and did *not* start it: that
+        record is a failure, and retrying a failure on every boot is the
+        per-cycle retry the one-shot exists to prevent. One check and not
+        two: `started` is written only by `taken` below, so "started" and
+        "taken and started" are the same condition, and a second test for
+        `taken` would be a branch no input can reach. A *planted* file is
+        refused by the ownership check instead, which is what answers that
+        threat for `pending` too.
+
+        Raises nothing, and refuses a file this euid did not write, for
+        the reason `pending` gives.
+        """
+        if not self._ours(self.path) or not self._ours(self.state_dir):
+            return False
+        request = handoff.read_document_at(self.path, handoff.STATE_VERSION)
+        if request is None:
+            return False
+        return request.get("started") is True
+
+    def taken(self, detail: str, started: bool = False) -> None:
         """Close the request, recording what happened. Raises nothing.
 
         `detail` is read by whoever recovers the device: "the bypass was
         started" and "no ebtables" are different things to be told, and
         the second is the one worth keeping.
+
+        `started` is read by `was_started` above, and it is a separate
+        field rather than a phrase in `detail` because the restore path
+        turns on it: a sentence is for a human and a boolean is for the
+        next run of this process.
         """
         request = handoff.read_document_at(self.path, handoff.STATE_VERSION)
         if request is None:
             request = {"version": handoff.STATE_VERSION}
         request["taken"] = time.time()
+        request["started"] = bool(started)
         request["detail"] = " ".join(str(detail).split())
         try:
             handoff.write_private_json(self.path, request)

@@ -96,6 +96,14 @@ class WayOutCase(unittest.TestCase):
         block.update(extra)
         beacon = Beacon({"c2": block})
         self.addCleanup(setattr, beacon, "_running", False)
+        # The tripwire the rest of this suite's helpers carry, and the one
+        # that was missing: several tests here assert that something reads
+        # as `None` or as absent, which is exactly what a *disabled* way
+        # out produces -- so a refused block would have left them passing
+        # about nothing. Not applied when a test asked for a block of its
+        # own: half of this file is about what the reader refuses.
+        if way_out is None:
+            _scratch.assert_live(self, beacon)
         return beacon
 
     def publish(self, state_dir=None, published=None, tap=None,
@@ -140,6 +148,20 @@ class TestTheBeaconsStateFile(WayOutCase):
         # capturing and scanning the radio for ever. `test_scout.py` holds
         # the reading side.
         self.assertLess(abs(time.time() - state["touched"]), 60)
+        # And one stamp per window, carried across every cycle of it. It
+        # is the only thing either side has that *names* a window: the
+        # scout tells one outage from the next by it, and a beacon that
+        # re-stamped `opened` every cycle would make every publish look
+        # like a new window -- the scout would drop its evidence each
+        # time, and every borrow rung would find nothing to act on.
+        opened = state["opened"]
+        self.assertLess(abs(time.time() - opened), 60)
+        beacon._stuck_cycles = 3
+        beacon._way_out_publish_state()
+        again = handoff.read_state(self.root)
+        self.assertEqual(again["opened"], opened,
+                         "the window was re-stamped on the second cycle")
+        self.assertGreaterEqual(again["touched"], state["touched"])
         # And not the attempts: the file is rewritten whole on every one
         # of them, `budget` has no upper bound, and nothing read the list.
         # The trail beside it is the record. See

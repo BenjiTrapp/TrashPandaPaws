@@ -3221,6 +3221,46 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
         self.assertIn(" ".join(phrase.split()).lower(), self.flat,
                       "%s: %r is not in %s" % (what, phrase, where))
 
+    def sentence(self, anchor):
+        """The one sentence that contains `anchor`, flattened and lowered.
+
+        `present` above is a substring check against the whole page, and
+        that is not a pin on a *claim*: the phrases a claim is pinned by
+        occur elsewhere too, so inverting the sentence that makes the
+        claim left the pin satisfied. A review inverted six of this
+        page's bold claims one at a time and nothing went red. The page
+        already had one anchored pin -- the crossing-hours table, parsed
+        row by row after a substring pin let every hour on it be wrong --
+        and this is that lesson applied to the prose.
+        """
+        needle = " ".join(anchor.split()).lower()
+        self.assertIn(needle, self.flat,
+                      "the page no longer says %r, so the claim pinned to "
+                      "it cannot be checked" % anchor)
+        start = self.flat.index(needle)
+        self.assertEqual(self.flat.count(needle), 1,
+                         "%r appears %d times, so it does not anchor one "
+                         "sentence" % (anchor, self.flat.count(needle)))
+        left = self.flat.rfind(". ", 0, start)
+        left = 0 if left < 0 else left + 2
+        right = self.flat.find(". ", start + len(needle))
+        right = len(self.flat) if right < 0 else right + 1
+        return self.flat[left:right]
+
+    def claim(self, anchor, says, what):
+        """`says` must be in the **same sentence** as `anchor`."""
+        self.assertIn(" ".join(says.split()).lower(),
+                      self.sentence(anchor),
+                      "%s: the page's sentence about %r does not say %r"
+                      % (what, anchor, says))
+
+    def denies(self, anchor, says, what):
+        """`says` must **not** be in the same sentence as `anchor`."""
+        self.assertNotIn(" ".join(says.split()).lower(),
+                         self.sentence(anchor),
+                         "%s: the page's sentence about %r says %r"
+                         % (what, anchor, says))
+
     # ── it exists and is reachable ──
 
     def test_the_guide_exists_and_is_linked_from_both_its_neighbours(self):
@@ -3526,6 +3566,44 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
                  "that an operator's own verb is not refused")):
             with self.subTest(phrase=phrase):
                 self.present(phrase, what)
+
+    def test_each_claim_is_pinned_to_its_own_sentence(self):
+        # Six of this page's bold claims survived being inverted one at a
+        # time, because `present` is a substring check against the whole
+        # page and the phrases they were pinned by occur elsewhere. Three
+        # of the six were claims the code did not keep, which is how they
+        # came to be inverted in the first place. Each is now pinned to
+        # the sentence that makes it.
+        self.claim("clamped to ±0.2", "can move a crossing earlier",
+                   "that a model's estimate is allowed to move a crossing")
+        self.claim("what it cannot do is", "reorder the ladder",
+                   "that a model's estimate cannot reorder the rungs")
+        self.claim("a louder rung is refused until",
+                   "every quieter rung has crossed",
+                   "the mechanism that enforces the order")
+        self.claim("does **not** narrow", "who may send that mac",
+                   "the limit of the sender anchor")
+        self.claim("every http session the beacon builds",
+                   "leave by the leased address",
+                   "what the radio rung binds")
+        self.claim("they keep doing so after a leg delivers",
+                   "the moment this rung is *working*",
+                   "that a delivering leg does not unbind the radio")
+        self.claim("once per deployment.", "does not re-arm it",
+                   "that rung 4 is one-shot")
+        self.denies("once per deployment.", "twice",
+                   "that rung 4 is one-shot")
+        self.claim("it can turn the port off", "for good",
+                   "that rung 4 is irreversible")
+        self.denies("it can turn the port off", "reversible",
+                    "that rung 4 is irreversible")
+        self.claim("the trail holds no password", "names the verb",
+                   "what the trail holds instead of a secret")
+        self.claim("and it survives a restart of the implant",
+                   "used to release the identity",
+                   "that rung 4's effect outlives a restart")
+        self.claim("the next run of that process", "restores it",
+                   "what restores it")
 
     def test_it_states_what_enabling_it_costs_the_old_verbs(self):
         for phrase, what in (

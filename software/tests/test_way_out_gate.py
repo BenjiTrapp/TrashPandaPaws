@@ -200,15 +200,68 @@ class TestTheLadderIsArithmetic(GateCase):
     def test_the_rungs_cross_in_cost_order(self):
         # The property, not three numbers: whatever the table says, a
         # louder rung may never become available before a quieter one.
-        first = {}
-        for verb in ("proxy", "radio", "identity"):
-            for hours in range(0, 40):
-                if self.allows(verb, hours_dark=hours):
-                    first[verb] = hours
-                    break
-        self.assertEqual(sorted(first), ["identity", "proxy", "radio"])
-        self.assertLess(first["proxy"], first["radio"])
-        self.assertLess(first["radio"], first["identity"])
+        #
+        # **Swept over the model's estimate as well**, which is how this
+        # test used to pass while the property was false. With
+        # `p_success=None` the table's own ordering holds trivially; a
+        # model's 0.99 on `identity`, clamped to the prior + 0.2, moved
+        # rung 4's crossing from hour 7 to hour **4** while rung 3 stayed
+        # at hour 5 -- the irreversible move available before the implant
+        # had ever been allowed to try its own radio. The clamp bounds the
+        # probability and was never going to bound the ordering, because
+        # it applies only to the verb that was named.
+        for proposed in (None, 0.99, 0.5, 0.01):
+            for flags in ((), ("dot1x_seen",), ("portal_answered",)):
+                with self.subTest(p_success=proposed, flags=flags):
+                    first = {}
+                    for verb in ("proxy", "radio", "identity"):
+                        for hours in range(0, 60):
+                            if self.beacon(hours_dark=hours, flags=flags) \
+                                    ._way_out_allows(verb, proposed)[0]:
+                                first[verb] = hours
+                                break
+                    # A rung that never crosses is the rule working, not a
+                    # gap: a model pessimistic about `identity` on a port
+                    # that authenticates should never reach it. What may
+                    # not happen is a louder rung crossing first.
+                    self.assertIn("proxy", first,
+                                  "the quietest rung never crossed at all")
+                    ladder = ("proxy", "radio", "identity")
+                    crossed = [first[verb] for verb in ladder
+                               if verb in first]
+                    self.assertEqual(crossed, sorted(crossed),
+                                     "the rungs cross out of cost order: %r"
+                                     % (first,))
+                    for louder, quieter in (("radio", "proxy"),
+                                            ("identity", "radio")):
+                        if louder in first:
+                            self.assertIn(quieter, first,
+                                          "%s crossed and %s never did: %r"
+                                          % (louder, quieter, first))
+
+    def test_a_quieter_rung_that_has_not_crossed_blocks_the_louder_one(self):
+        # The mechanism, named in the refusal so the trail says it: the
+        # ordering is checked against each quieter rung's own prior, never
+        # against a proposed estimate, because a model's opinion about one
+        # verb says nothing about another.
+        allowed, numbers = self.numbers("identity", hours_dark=4,
+                                        p_success=0.99)
+        self.assertFalse(allowed)
+        self.assertEqual(numbers["blocked_by"], "way_out_radio")
+        self.assertIn("quieter", numbers["why"])
+        # And the price itself did pass, which is what makes this the
+        # ordering rule doing the work rather than the arithmetic.
+        self.assertGreater(numbers["ev"], numbers["threshold"])
+
+    def test_the_ordering_rule_does_not_hold_back_a_rung_on_the_table(self):
+        # It is a floor and not a second curve: with no estimate at all
+        # the crossings are exactly the table's, which the rest of this
+        # class pins number by number.
+        for verb, hours in (("proxy", 1), ("radio", 5), ("identity", 7)):
+            with self.subTest(verb=verb):
+                allowed, numbers = self.numbers(verb, hours_dark=hours)
+                self.assertTrue(allowed)
+                self.assertEqual(numbers["blocked_by"], "")
 
     def test_dot1x_seen_pushes_the_identity_rung_later(self):
         self.assertFalse(self.allows("identity", hours_dark=8,

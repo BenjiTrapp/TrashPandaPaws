@@ -297,6 +297,88 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
         record = handoff.read_document_at(handoff.identity_path(self.state), 1)
         self.assertIn("taken", record)
 
+    def test_a_restart_of_this_process_restores_the_identity(self):
+        # `main.py` stops its components on shutdown and `NACBypass.stop()`
+        # puts this implant's own MAC back on the bridge, so a reboot, a
+        # config change or a `systemctl restart` released an identity the
+        # rung had already paid the irreversible price for -- and the
+        # one-shot latch kept it from ever being taken again. The implant
+        # kept none of the benefit and all of the cost, and going back to
+        # its own MAC is the louder of the two states on a port with
+        # sticky MAC: a second address on a port that has seen one is what
+        # a NAC violation is.
+        from software import main as main_mod
+        from software import nac_bypass as nac_mod
+        self.beacon()._exec_egress("identity")
+        started = []
+
+        class FakeBypass(object):
+            def __init__(self, config):
+                started.append("constructed")
+
+            def start(self):
+                started.append("started")
+
+            def stop(self):
+                started.append("stopped")
+
+        with mock.patch.object(nac_mod, "NACBypass", FakeBypass):
+            first = main_mod.way_out_identity_poller(self.config())
+            component = first()
+            self.assertIsNotNone(component)
+            component.stop()                      # what shutdown does
+
+            del started[:]
+            restarted = main_mod.way_out_identity_poller(self.config())
+            self.assertIsNotNone(restarted)
+            self.assertIsNotNone(restarted(),
+                                 "the restarted process left the identity "
+                                 "released and the rung spent")
+
+        self.assertEqual(started, ["constructed", "started"])
+        # And once per run of this process, not once per second.
+        self.assertIsNone(restarted())
+
+    def test_a_request_that_never_started_is_not_retried_on_a_restart(self):
+        # The other direction: a taken record whose detail is a failure is
+        # not a fact about the switch, and retrying it on every boot is
+        # the per-cycle retry the one-shot exists to prevent.
+        from software import main as main_mod
+        from software import nac_bypass as nac_mod
+        self.beacon()._exec_egress("identity")
+        with mock.patch.object(nac_mod, "NACBypass",
+                               mock.Mock(side_effect=OSError("no ebtables"))):
+            main_mod.way_out_identity_poller(self.config())()
+
+        asked = []
+        with mock.patch.object(nac_mod, "NACBypass",
+                               lambda config: asked.append(1)):
+            self.assertIsNone(main_mod.way_out_identity_poller(
+                self.config())())
+        self.assertEqual(asked, [])
+        self.assertIn("no ebtables", self.request()["detail"])
+
+    def test_a_restore_that_fails_does_not_erase_what_was_recorded(self):
+        # The record says the identity *was* taken, which is a fact about
+        # the switch. A restore that cannot run -- scapy gone, ebtables
+        # gone -- must not overwrite it with a failure, or the next run
+        # would read "it never started" and the one durable statement
+        # about an irreversible move would be lost.
+        from software import main as main_mod
+        from software import nac_bypass as nac_mod
+        self.beacon()._exec_egress("identity")
+        IdentityTrigger(self.state).taken("it was started", started=True)
+
+        with mock.patch.object(nac_mod, "NACBypass",
+                               mock.Mock(side_effect=OSError("no ebtables"))):
+            self.assertIsNone(main_mod.way_out_identity_poller(
+                self.config())())
+
+        record = self.request()
+        self.assertEqual(record["detail"], "it was started")
+        self.assertTrue(record["started"])
+        self.assertTrue(IdentityTrigger(self.state).was_started())
+
     def test_with_the_way_out_off_there_is_no_poller_at_all(self):
         from software import main as main_mod
         self.assertIsNone(main_mod.way_out_identity_poller(

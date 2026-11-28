@@ -35,6 +35,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -562,6 +563,30 @@ class TestTheRadioVerb(RadioCase):
         self.assertIn("lease", answer.lower())
         self.assertIn("ip link set wlan0 down", [" ".join(a) for a in ran])
 
+    def test_a_lease_whose_values_are_not_addresses_rolls_back(self):
+        # dhclient is the only writer today, but the lease lives in the
+        # state directory this project hardens against a local attacker
+        # who got there first -- and what is read from it goes into
+        # `ip rule add from <x>` and `ip addr replace <x>/<n>`. Nothing
+        # here runs a shell, so the cost is a confusing argv rather than
+        # an injection; it is refused anyway, because "the lease is
+        # incomplete" is a failure the rung already knows how to undo.
+        for text in ("lease {\n  fixed-address not-an-address;\n"
+                     "  option routers 10.0.0.1;\n}\n",
+                     "lease {\n  fixed-address 10.77.0.5;\n"
+                     "  option routers 999.1.1.1;\n}\n",
+                     "lease {\n  fixed-address 10.77.0.5;\n"
+                     "  option routers ; rm -rf /;\n}\n"):
+            with self.subTest(lease=text.split("\n")[1].strip()):
+                beacon = self.beacon(tap=self.open_ssid())
+                self.onboard(beacon)
+                ran = self.radio(beacon, lease=text)
+                answer = beacon._exec_egress("radio")
+                self.assertIn("[error]", answer)
+                self.assertIn("lease", answer.lower())
+                self.assertIn("ip link set wlan0 down",
+                              [" ".join(a) for a in ran])
+
     def test_it_takes_the_ssid_it_is_given_when_that_one_is_open(self):
         beacon = self.beacon(tap={"ssids": [
             {"ssid": "GuestWifi", "open": True},
@@ -892,6 +917,20 @@ class TestTheBindIsASocketFactAndNotAField(unittest.TestCase):
             return port
         raise AssertionError("no free local port stayed free: %r" % (last,))
 
+    def observed(self, seen):
+        """Wait for the listener thread to record its peer, with a deadline.
+
+        The accept happens on another thread, so asserting straight after
+        the connect is a race -- the lesson `tunnel/shell.py`'s sidecar
+        cost this project once already: wait for the thing, not for the
+        call to return.
+        """
+        deadline = time.time() + 5
+        while not seen and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(seen, "the listener recorded no connection in 5 s")
+        return list(seen)
+
     def session(self, port):
         session = beacon_mod._HttpSession()
         # No proxy from this machine's environment: `http_proxy` set by
@@ -995,7 +1034,81 @@ class TestTheBindIsASocketFactAndNotAField(unittest.TestCase):
 
         port = self.bound_to(attempt)
         self.assertEqual(len(refused), 1, refused)
-        self.assertEqual(seen, [("127.0.0.1", port)])
+        self.assertEqual(self.observed(seen), [("127.0.0.1", port)])
+
+
+    def test_the_ntlm_relays_upstream_hop_leaves_by_it_too(self):
+        # On a `proxy.ntlm.enabled` build this is the hop that actually
+        # leaves the device: the session the rung binds connects to
+        # `127.0.0.1`, which is the relay's own listener. Binding the
+        # session alone left rung 3 installing its source rule, reporting
+        # "this implant's own traffic only", and sending HTTP out of the
+        # dead tapped port -- round two's Critical, on the one proxy
+        # configuration nobody had checked.
+        seen = []
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(2)
+        listener.settimeout(0.2)
+        done = threading.Event()
+
+        def accept():
+            while not done.is_set():
+                try:
+                    connection, peer = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                seen.append(peer)
+                connection.close()
+
+        thread = threading.Thread(target=accept, daemon=True)
+        thread.start()
+
+        def stop():
+            done.set()
+            thread.join(timeout=5)
+            listener.close()
+
+        self.addCleanup(stop)
+        host, upstream_port = listener.getsockname()
+        relay = beacon_mod._NtlmProxyRelay(host, upstream_port,
+                                           "CORP\\alice", "s3cret")
+
+        def attempt(port):
+            del seen[:]
+            relay.source_address = ("127.0.0.1", port)
+            relay._connect_upstream().close()
+
+        port = self.bound_to(attempt)
+        self.assertEqual(self.observed(seen), [("127.0.0.1", port)])
+
+    def test_the_rung_hands_its_lease_to_a_relay_that_is_already_serving(self):
+        # The relay is started by `_init_proxy`, long before any rung
+        # runs, so the rung has to reach one that is already serving --
+        # which is why the address is a field on it and not a constructor
+        # argument.
+        import base64
+
+        from software.c2.beacon import Beacon, read_way_out_policy
+        beacon = Beacon({"c2": {
+            "beacon_interval_seconds": 300, "jitter_percent": 0,
+            "encryption_key": base64.b64encode(b"\x24" * 32).decode(),
+            "proxy": {"mode": "auto"}, "https": {"enabled": False},
+            "dns": {"enabled": False}, "smb": {"enabled": False},
+            "quic": {"enabled": False},
+            "way_out": read_way_out_policy(None),
+        }})
+        beacon._running = False
+        self.addCleanup(setattr, beacon, "_running", False)
+        relay = beacon_mod._NtlmProxyRelay("10.0.0.1", 8080, "a", "b")
+        beacon._ntlm_relay = relay
+
+        beacon._way_out_bind("192.168.9.42")
+        self.assertEqual(relay.source_address, ("192.168.9.42", 0))
+        beacon._way_out_bind("")
+        self.assertIsNone(relay.source_address)
 
 
 class TestWhichRadioTheImplantMayUse(unittest.TestCase):

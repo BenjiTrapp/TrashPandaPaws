@@ -132,15 +132,41 @@ def way_out_identity_poller(config):
     from software.scout.trigger import IdentityTrigger
     trigger = IdentityTrigger(policy["state_dir"])
     logger = logging.getLogger("raccoon")
+    # One attempt per run of this process, whichever of the two reasons
+    # brought it about. Set before the attempt, so a failure is not retried
+    # every second from the loop below.
+    attempted = {"it": False}
 
     def poll():
-        if trigger.pending() is None:
+        if attempted["it"]:
             return None
+        # **Two reasons to start it, and the second is a correction.** The
+        # first is a request nobody has taken yet. The second is a request
+        # that was taken and *did* start the bypass in an earlier run of
+        # this process: `main.py` stops its components on shutdown, and
+        # `NACBypass.stop()` flushes the ebtables rules and puts this
+        # implant's own MAC back on the bridge -- so a reboot, a config
+        # change or a `systemctl restart` released the identity while the
+        # one-shot latch kept the rung spent. The implant had paid the
+        # irreversible cost (the switch has already seen the MAC move,
+        # and the port may already be latched) and kept none of the
+        # benefit, with no way back short of deleting the request file.
+        # Going back to this implant's own MAC is also the louder of the
+        # two states on a port with sticky MAC or port security: a second
+        # address on a port that has seen one is what a NAC violation
+        # *is*.
+        restoring = trigger.was_started()
+        if not restoring and trigger.pending() is None:
+            return None
+        attempted["it"] = True
         logger.warning(
-            "The way out's rung 4 was requested by this host's own beacon: "
-            "starting nac_bypass, which forwards EAPOL and then originates "
-            "this implant's traffic as the downstream host. Once per "
-            "deployment.")
+            "The way out's rung 4 %s: starting nac_bypass, which forwards "
+            "EAPOL and then originates this implant's traffic as the "
+            "downstream host. Once per deployment."
+            % ("was taken in an earlier run of this process and this "
+               "process stopped it on shutdown, so it is being restored"
+               if restoring
+               else "was requested by this host's own beacon"))
         try:
             # Imported here and not at the top of this file: every other
             # component is imported inside the branch that uses it, and
@@ -155,9 +181,16 @@ def way_out_identity_poller(config):
             bypass.start()
         except Exception as exc:
             logger.error("nac_bypass could not be started: %s", exc)
-            trigger.taken("nac_bypass could not be started: %s" % exc)
+            # And the record is left alone when this was a restore: it
+            # says the identity *was* taken, which is a fact about the
+            # switch and not about this process, and overwriting it with
+            # a failure would lose the only durable statement of it.
+            if not restoring:
+                trigger.taken("nac_bypass could not be started: %s" % exc)
             return None
-        trigger.taken("nac_bypass was started by the way out's rung 4")
+        if not restoring:
+            trigger.taken("nac_bypass was started by the way out's rung 4",
+                          started=True)
         return bypass
 
     return poll
