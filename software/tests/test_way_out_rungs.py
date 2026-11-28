@@ -713,6 +713,31 @@ class TestTheRadioVerb(RadioCase):
                          "the environment's proxies are the host "
                          "network's too")
 
+    def test_a_delivering_leg_drops_the_stashed_credential(self):
+        # The bind survives a delivering leg on purpose, so the stash did
+        # too -- and it holds a third party's `Proxy-Authorization`. A
+        # rollback in a later outage would have put a weeks-old Basic
+        # token back on the session and replayed it against the host's
+        # proxy, which is how "an account that locks out" happens. The
+        # two guards against a capture crossing outages are both about
+        # the *file*, not about this copy in memory.
+        beacon = self.beacon(tap=self.open_ssid(),
+                             borrow={"credentials": [A_CREDENTIAL]})
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._exec_egress("credential")
+        beacon._exec_egress("radio")
+        self.assertIsNotNone(beacon._way_out_tapped_path)
+
+        beacon._leg_recovered()
+
+        self.assertIsNone(beacon._way_out_tapped_path)
+        self.assertEqual(beacon._way_out_source, "192.168.9.42",
+                         "the bind is still meant to survive this")
+        beacon._radio_rollback("wlan0", "192.168.9.42", "a later outage")
+        self.assertEqual(beacon._proxy_session.headers, {})
+        self.assertEqual(beacon._proxy_session.proxies, {})
+
     def test_a_rollback_puts_the_tapped_paths_proxy_back(self):
         # The rung leaves the implant as it found it: back on the tapped
         # port, the borrowed proxy was the right one, and an implant that
@@ -732,6 +757,54 @@ class TestTheRadioVerb(RadioCase):
         self.assertEqual(beacon._proxy_session.proxies, proxies)
         self.assertEqual(beacon._proxy_session.headers, headers)
         self.assertIsNone(beacon._proxy_session.source_address)
+
+    def test_every_tapped_network_verb_refuses_while_the_lease_holds(self):
+        # Round six closed `credential` and `portal` inside
+        # `_egress_borrow`; `proxy` and `rediscover` reached around it,
+        # which is the same defect through the third door. `egress proxy`
+        # put the host's RFC1918 proxy back on the radio-bound session
+        # *and* turned `trust_env` back on, undoing both halves of what
+        # the bind had done -- and the shipped example policy's second
+        # rule is `when: {flags: [proxy_found]} / try: proxy`.
+        beacon = self.beacon(tap=self.open_ssid(),
+                             borrow={"credentials": [A_CREDENTIAL],
+                                     "portal": A_PORTAL})
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._proxy.proxies.append({"url": "http://10.0.0.1:3128",
+                                      "source": "env:http_proxy"})
+        beacon._exec_egress("radio")
+
+        for task in ("credential", "portal", "rediscover",
+                     "proxy http://10.0.0.1:3128", "proxy 1"):
+            with self.subTest(task=task):
+                answer = beacon._exec_egress(task)
+                self.assertIn("[error]", answer)
+                self.assertIn("own radio", answer)
+                self.assertEqual(beacon._proxy_session.proxies, {})
+                self.assertEqual(beacon._proxy_session.headers, {})
+                self.assertFalse(beacon._proxy_session.trust_env)
+                self.assertEqual(beacon._proxy_session.source_address,
+                                 ("192.168.9.42", 0))
+
+    def test_the_gate_skips_them_so_no_budget_is_spent(self):
+        # Refused by the arithmetic's own gate and not only inside each
+        # verb, so the candidate walk moves on: a refusal the situation
+        # guarantees must not cost an attempt the quieter rules below it
+        # do not get.
+        beacon = self.beacon(tap=self.open_ssid())
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._exec_egress("radio")
+
+        for verb in ("proxy", "rediscover", "credential", "portal"):
+            with self.subTest(verb=verb):
+                allowed, numbers = beacon._way_out_allows(verb)
+                self.assertFalse(allowed)
+                self.assertEqual(numbers["blocked_by"],
+                                 "the radio rung's lease")
+        # And the carrier is deliberately not among them.
+        self.assertTrue(beacon._way_out_allows("gsocket")[0])
 
     def test_the_borrow_verbs_refuse_while_the_radio_holds_a_lease(self):
         # Round five stopped the bind from *carrying* a borrowed proxy

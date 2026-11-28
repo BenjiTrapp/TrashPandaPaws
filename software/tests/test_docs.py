@@ -3668,7 +3668,10 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
                 ("a scout that is killed", "until somebody reimages",
                  "what happens to it when the scout dies"),
                 ("three things are **not** bound", "gsocket carrier",
-                 "that the carrier does not take the radio's bind")):
+                 "that the carrier does not take the radio's bind"),
+                ("not** a time box on the association",
+                 "rollback is the one thing that disassociates",
+                 "what ends the radio association")):
             with self.subTest(anchor=anchor):
                 self.claim(anchor, says, what)
 

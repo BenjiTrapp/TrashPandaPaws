@@ -470,6 +470,14 @@ class Evidence(object):
         as well would have thrown away every answer and left the evidence
         empty, which is how this was first written and what the tests
         caught.
+
+        That is a statement about *which* conversations can be settled
+        and **not** a safety argument about the outcome: what a response
+        settles is decided by an unauthenticated frame. A forged `200` on
+        a flow where the host posted to a real portal and got a `403`
+        sets `portal_answered` with no MAC spoofing at all. The design's
+        risk table carries that row and `docs/WAY_OUT.md` states it; this
+        comment used to read as though the request check covered it.
         """
         try:
             mac = str(packet[Ether].src or "").lower()

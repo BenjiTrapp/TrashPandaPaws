@@ -559,6 +559,117 @@ class TestConfigureNetwork(unittest.TestCase):
         mock_rq.assert_any_call("dhclient -nw br0")
 
 
+class TestStopCanActuallyStopIt(unittest.TestCase):
+    """`stop()` sets a flag, and the sequence has to read it.
+
+    It did not. `start()` spawns a thread; `_run_sequence` forwards
+    EAPOL, sleeps, and then discovers the downstream host with a tcpdump
+    that runs for up to a minute **after** the MAC is known -- and then
+    applied the rewrite rules whatever had happened in between. So a
+    caller that stopped the bypass during discovery had the rules
+    applied afterwards anyway, on the identity it had just refused.
+
+    The way out's rung 4 restore is that caller: it refuses a host the
+    arithmetic never priced, logs "nac_bypass has been stopped", and
+    calls `stop()`. Driven with the real sequence here rather than a fake
+    whose `stop()` appends to a list, because "stop was called" is a fact
+    about this process and "the MAC did not move" is a fact about the
+    kernel.
+    """
+
+    def driven(self, nac, ran, stop_during_capture=False):
+        """Replace only the shell, and record every command."""
+        def run_quiet(command, *_args, **_kwargs):
+            ran.append(command)
+            return _completed()
+
+        def run(command, *_args, **_kwargs):
+            ran.append(command)
+            if stop_during_capture and "tcpdump" in command:
+                # What the caller does while the capture is running: the
+                # MAC is about to be known and the identity refused.
+                nac._running = False
+            # Enough for `_discover_via_arp` to learn a victim and a
+            # gateway from one capture.
+            if "tcpdump" in command:
+                return _completed(stdout=(
+                    "aa:bb:cc:dd:ee:ff > ff:ff:ff:ff:ff:ff, "
+                    "Request who-has 10.0.0.254 tell 10.0.0.9\n"
+                    "11:22:33:44:55:66 > aa:bb:cc:dd:ee:ff, "
+                    "Reply 10.0.0.254 is-at 11:22:33:44:55:66\n"))
+            return _completed()
+
+        return (patch("software.nac_bypass._run_quiet", run_quiet),
+                patch("software.nac_bypass._run", run),
+                patch("software.nac_bypass.time.sleep", lambda _s: None))
+
+    def test_a_stop_during_discovery_leaves_the_mac_where_it_was(self):
+        # The sharp case, and the one the way out's rung 4 restore
+        # creates: the sequence is *inside* its capture when the caller
+        # refuses the identity, so discovery completes and learns a MAC
+        # either way. What may not happen is the rules going in.
+        nac = _make_nac()
+        ran = []
+        patchers = self.driven(nac, ran, stop_during_capture=True)
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        nac._running = True
+        nac._run_sequence()
+
+        self.assertTrue([command for command in ran if "tcpdump" in command],
+                        "discovery never ran, so this test is not about the "
+                        "check after it")
+        self.assertEqual(nac.victim_mac, "aa:bb:cc:dd:ee:ff",
+                         "the MAC was not learned, so there was nothing to "
+                         "refuse")
+        moved = [command for command in ran
+                 if "link set dev br0 address" in command]
+        self.assertEqual(moved, [],
+                         "the bridge's MAC was changed after the caller "
+                         "stopped the bypass: %r" % (ran,))
+        self.assertEqual([command for command in ran if "snat" in command],
+                         [])
+        self.assertNotEqual(nac._phase, "active")
+
+    def test_a_stop_before_discovery_does_not_even_capture(self):
+        # The cheaper check, and a separate one: a bypass stopped while
+        # it was still waiting out the host's 802.1X exchange should not
+        # spend a minute of tcpdump on a port it has been told to leave
+        # alone.
+        nac = _make_nac()
+        ran = []
+        patchers = self.driven(nac, ran)
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        nac._running = False
+        nac._run_sequence()
+
+        self.assertEqual([command for command in ran if "tcpdump" in command],
+                         [], "discovery ran after the bypass was stopped")
+        self.assertIsNone(nac.victim_mac)
+
+    def test_a_sequence_nobody_stopped_still_applies_its_rules(self):
+        # The other half, so the guard cannot be "do nothing ever".
+        nac = _make_nac()
+        ran = []
+        patchers = self.driven(nac, ran)
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        nac._running = True
+        nac._run_sequence()
+
+        self.assertTrue([command for command in ran
+                         if "link set dev br0 address" in command],
+                        "the sequence took nothing at all: %r" % (ran,))
+        self.assertEqual(nac._phase, "active")
+
+
 class TestStatus(unittest.TestCase):
     def test_status_returns_all_fields(self):
         nac = _make_nac()

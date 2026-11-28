@@ -145,10 +145,12 @@ routes this implant's own traffic through it. Three bounds, all in code:
   quite enough for the hungriest USB peripherals.
 - **A deadline per command**, because this runs on the beacon's own thread
   and a `dhclient` that never returned would cost the implant its loop.
-  It is **not** a time box on the association: nothing here disassociates,
-  so once this rung succeeds the implant stays on that network until the
-  device is restarted. The design said "a time-boxed association"; that
-  was not built, and this is the limit instead.
+  It is **not** a time box on the association: nothing *times out* of the
+  network, so once this rung succeeds the implant stays on it until the
+  device is restarted or the rung is rolled back — a rollback is the one
+  thing that disassociates, and it runs only when a step of the rung
+  fails. The design said "a time-boxed association"; that was not built,
+  and this is the limit instead.
 - **A scoped route, never the default one.** The route goes into table `100`
   with a source rule for the address DHCP gave, so the host's own default
   route is untouched. DHCP runs with `-sf /bin/true` and the lease is parsed

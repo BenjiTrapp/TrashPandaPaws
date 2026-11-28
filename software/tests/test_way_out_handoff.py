@@ -861,6 +861,102 @@ class TestTheWayOutBlock(WayOutCase):
         # typed: 17 with these rows.
         self.assertIn("at least 17", message)
 
+    def test_the_model_stage_raises_the_bar_it_is_checked_against(self):
+        # `p_success` is the one term a model may move, by the clamp
+        # span, and the check looked at the prior alone -- so with the
+        # model on there were accepted coefficients (16 to 24) and
+        # accepted thresholds (-8 to -5, one line inside the documented
+        # meaning of that setting) under which a model's estimate opened
+        # **rung 3** on the first cycle the decider may act. Rung 4 was
+        # already safe by the ordering rule; "the loudest rung is safe"
+        # was never the claim.
+        from software.c2 import beacon as module
+
+        model = {"enabled": True, "name": "m",
+                 "endpoint": "http://127.0.0.1:11434"}
+        for extra in ({"risk_coefficient": 16}, {"risk_coefficient": 24},
+                      {"ev_threshold": -8}, {"ev_threshold": -5}):
+            with self.subTest(**extra):
+                self.logged.records = []
+                off = beacon_mod.read_way_out_policy(dict(
+                    {"enabled": True, "state_dir": "/opt/raccoon/state"},
+                    **extra))
+                on = beacon_mod.read_way_out_policy(dict(
+                    {"enabled": True, "state_dir": "/opt/raccoon/state",
+                     "model": model}, **extra))
+                self.assertTrue(off["enabled"],
+                                "this value is refused with the model off "
+                                "too, so it is not about the clamp")
+                self.assertFalse(on["enabled"],
+                                 "a model's estimate opens a loud rung "
+                                 "with no time dark under %r" % (extra,))
+
+        # And the property, over every accepted configuration with the
+        # model on: a loud rung may not be available at the clamp's
+        # ceiling either.
+        for extra in ({}, {"risk_coefficient": 25},
+                      {"risk_coefficient": 33}, {"ev_threshold": -4},
+                      {"ev_threshold": 0}, {"points_per_hour": 100}):
+            with self.subTest(model=True, **extra):
+                policy = beacon_mod.read_way_out_policy(dict(
+                    {"enabled": True, "state_dir": "/opt/raccoon/state",
+                     "model": model}, **extra))
+                if not policy["enabled"]:
+                    continue
+                for rung in sorted(module._WAY_OUT_ROW_OF):
+                    if rung <= module._WAY_OUT_UNGATED_RUNG:
+                        continue
+                    row = module._WAY_OUT_ROW_OF[rung]
+                    points, prior, detect = module._WAY_OUT_ROWS[row]
+                    reach = min(module._WAY_OUT_P_MAX,
+                                prior + module._WAY_OUT_CLAMP_SPAN)
+                    self.assertLessEqual(
+                        points * reach
+                        - policy["risk_coefficient"] * detect,
+                        policy["ev_threshold"],
+                        "rung %d is one model estimate from being "
+                        "available with no time dark under %r"
+                        % (rung, extra))
+
+    def test_the_refusal_is_built_without_counting_to_it(self):
+        # `_way_out_least_coefficient` counted up by one over a quantity
+        # derived from `points_max` and `ev_threshold`, neither of which
+        # has an upper bound: ten seconds at `points_max: 200000000` and
+        # linear from there, on the startup path of three processes,
+        # inside a reader whose stance is "log a reason and never cost a
+        # process its loop".
+        import time
+
+        started = time.time()
+        policy = beacon_mod.read_way_out_policy(
+            {"enabled": True, "state_dir": "/opt/raccoon/state",
+             "points_max": 200000000, "ev_threshold": -200000000})
+        spent = time.time() - started
+
+        self.assertFalse(policy["enabled"])
+        self.assertLess(spent, 1.0,
+                        "the reader took %.1f s to build its refusal" % spent)
+        self.assertEqual(beacon_mod._way_out_least_coefficient(0), 17)
+        self.assertEqual(beacon_mod._way_out_least_coefficient(0, 0.2), 25)
+
+    def test_the_suggestion_accounts_for_the_model_too(self):
+        # Otherwise the message tells an operator with the model on to
+        # write 17, which it then refuses: the suggestion has to be the
+        # same arithmetic as the rule.
+        message = self.refused({"enabled": True,
+                                "state_dir": "/opt/raccoon/state",
+                                "risk_coefficient": 16,
+                                "model": {"enabled": True, "name": "m",
+                                          "endpoint": "http://127.0.0.1:1"}})
+        self.assertIn("at least 25", message)
+        self.assertIn("this model's estimate", message)
+        suggested = beacon_mod.read_way_out_policy(
+            {"enabled": True, "state_dir": "/opt/raccoon/state",
+             "risk_coefficient": 25,
+             "model": {"enabled": True, "name": "m",
+                       "endpoint": "http://127.0.0.1:11434"}})
+        self.assertTrue(suggested["enabled"])
+
     def test_the_number_the_refusal_suggests_is_one_the_reader_takes(self):
         # Otherwise the message sends an operator to write something that
         # is refused again -- and the quiet rung *is* allowed at hour 0

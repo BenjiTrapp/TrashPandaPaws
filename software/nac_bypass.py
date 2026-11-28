@@ -305,8 +305,28 @@ class NACBypass:
             logger.info("Waiting 10s for 802.1X auth to complete...")
             time.sleep(10)
 
+            if not self._running:
+                logger.info("NAC bypass was stopped before discovery; the "
+                            "bridge remains transparent")
+                return
+
             if not self.discover_hosts():
                 logger.error("Host discovery failed — bridge remains transparent")
+                return
+
+            # **`stop()` can stop it, and this is what makes that true.**
+            # `stop()` sets `_running` false and tears down whatever is
+            # installed; nothing here read the flag, so a caller that
+            # stopped the bypass during discovery -- which runs tcpdump
+            # for up to a minute after the MAC is known -- had the rules
+            # applied afterwards anyway, on the identity it had just
+            # refused. The way out's rung 4 restore does exactly that
+            # when it finds a different host on the port than the one its
+            # arithmetic priced, and the refusal was a no-op.
+            if not self._running:
+                logger.info("NAC bypass was stopped after discovering %s, "
+                            "so no rewrite rule was applied and this "
+                            "implant's own MAC is unchanged", self.victim_mac)
                 return
 
             self.apply_rewrite_rules()

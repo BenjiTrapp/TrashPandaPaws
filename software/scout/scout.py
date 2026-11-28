@@ -170,6 +170,13 @@ class Scout(object):
         # None before the first one is seen. `_window_turned` is where it
         # matters and why.
         self._window = None
+        # Whether this process has cleaned up after a window at least
+        # once. A process that *starts* holding a borrow file and a
+        # document -- from a window it never saw open, which is what a
+        # reboot of a healthy implant looks like -- has `_window` None
+        # for ever, so the transition it would forget on never happens.
+        # The first healthy poll of a process's life counts as one.
+        self._swept = False
         self._running = True
 
     # ── the question the loop asks ──
@@ -583,17 +590,26 @@ class Scout(object):
                 # which this arm cannot see at all. `_window_turned` has
                 # that story.
                 #
-                # **On the transition only.** This arm runs every 30 s for
-                # the whole life of a healthy implant, and `_forget`
-                # re-reads the bridge -- a `bridge fdb show` **subprocess**
-                # -- and unlinks two files. That was 2,880 process spawns a
-                # day on a 13 W device, on the one process whose stated
-                # cost is "one `read_state` per interval" and whose whole
-                # design rationale is that a periodic command is its own
-                # detection signature.
-                if self._window is not None:
+                # **On a transition, and on the first poll of this
+                # process.** This arm runs every 30 s for the whole life
+                # of a healthy implant, and `_forget` re-reads the bridge
+                # -- a `bridge fdb show` **subprocess** -- and unlinks two
+                # files: on every poll that was 2,880 process spawns a
+                # day on a 13 W device, against this loop's own stated
+                # cost of one `read_state` per interval.
+                #
+                # But "a transition this process watched" is not the only
+                # way a window ends. A reboot of a *healthy* implant
+                # leaves the last outage's files on the disk and starts a
+                # scout that never sees a window at all -- so a captured
+                # proxy password sat there until somebody reimaged the
+                # device, which is the artefact `docs/WAY_OUT.md` tells
+                # the operator to look for first. One sweep per process
+                # start, which is one subprocess and not 2,880.
+                if self._window is not None or not self._swept:
                     self._forget()
                     self._window = None
+                self._swept = True
                 self._sleep(min(interval, 30))
 
     def _sleep(self, seconds: float) -> None:

@@ -217,9 +217,11 @@ def write_private_json(path: str, document: dict) -> None:
 def remove(path: str) -> None:
     """Delete a handoff file if it is there. Raises nothing.
 
-    One production caller, `Scout._forget`, reached from both places a
-    window can end -- one it watched close and one that turned over
-    between two polls. It removes the borrow file, which is the only one
+    One production caller, `Scout._forget`, reached from all three places
+    a window can end: one this process watched close, one that turned
+    over between two of its polls, and one it never saw at all -- a
+    process that *starts* holding the last outage's files, which is what
+    a reboot of a healthy implant looks like. It removes the borrow file, which is the only one
     here that carries a secret, and the document, which names the host's
     MAC, IP, proxies and resolvers; nothing else would ever have removed
     either. The beacon removes its own window with

