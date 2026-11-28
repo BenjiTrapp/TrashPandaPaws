@@ -3512,6 +3512,21 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
         self.assertEqual(asked, [["bridge", "fdb", "show", "br", "br0",
                                   "dev", "eth1"]])
 
+    def test_it_says_the_borrowed_half_does_not_outlive_its_outage(self):
+        # Two claims about the one file that carries a secret, and both
+        # are behaviour a reader cannot check for themselves: the scout
+        # removes it when the window closes, and the beacon refuses one
+        # written before the open window began.
+        for phrase, what in (
+                ("removed when the window closes",
+                 "that a captured password does not stay on the disk"),
+                ("not from a previous outage",
+                 "that a stale capture is not replayed"),
+                ("typed by hand is not second-guessed",
+                 "that an operator's own verb is not refused")):
+            with self.subTest(phrase=phrase):
+                self.present(phrase, what)
+
     def test_it_states_what_enabling_it_costs_the_old_verbs(self):
         for phrase, what in (
                 ("costs the borrow rung its first hour",

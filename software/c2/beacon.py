@@ -10136,6 +10136,37 @@ class Beacon:
                           "missing, unreadable, or of a version this "
                           "implant does not know. Nothing was changed."
                           % (what, _WAY_OUT_BORROW_NAME))
+        # **And not from a previous outage.** The scout removes this file
+        # when a window closes, so a borrow file older than the open
+        # window means the scout died -- in an earlier outage, with its
+        # capture still on the disk. Replaying a third party's credential
+        # that this implant has no current evidence for is the one thing
+        # the quiet rung should not do on a guess, and the operator's own
+        # `egress credential` is still there for somebody who decides
+        # otherwise.
+        #
+        # The window's own stamp and not a configured age: a scout that is
+        # alive rewrites this file every publish, so "written before this
+        # window opened" is exact, needs no second freshness rule beside
+        # `document_max_age_seconds`, and leaves rung 2 working for the
+        # whole of an outage the scout died in the middle of. A file with
+        # no stamp at all is a scout older than the field and is believed,
+        # for the reason `wanted()` believes a window with no `touched`.
+        written = loaded.get("written")
+        state = self._way_out_read(_WAY_OUT_STATE_NAME,
+                                   _WAY_OUT_STATE_VERSION) or {}
+        opened = state.get("opened")
+        if (isinstance(written, (int, float))
+                and not isinstance(written, bool)
+                and isinstance(opened, (int, float))
+                and not isinstance(opened, bool)
+                and written < opened):
+            return None, ("[error] Not borrowing %s: the scout's %s was "
+                          "written %.0f s before this stuck window opened, "
+                          "so it is a previous outage's capture and the "
+                          "scout that took it is no longer publishing. "
+                          "Nothing was changed."
+                          % (what, _WAY_OUT_BORROW_NAME, opened - written))
         return loaded, ""
 
     def _egress_credential(self, target: str) -> str:
