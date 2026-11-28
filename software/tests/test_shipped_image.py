@@ -494,7 +494,8 @@ class TheShippedImageDoesNotRunAsRootByDefault(unittest.TestCase):
         # A USER before the apt and pip steps would break the build rather
         # than harden the image.
         position = self.instructions.rindex("USER ")
-        for earlier in ("apt-get install", "pipx install", "git clone"):
+        for earlier in ("apt-get install", "pipx install", "pip install",
+                        "git fetch"):
             self.assertLess(self.instructions.rindex(earlier), position,
                             "%r runs after the USER directive" % earlier)
 
@@ -530,6 +531,144 @@ class TheShippedImageDoesNotRunAsRootByDefault(unittest.TestCase):
                          "the banner does not mention privilege at all, so "
                          "an operator running unprivileged finds out from "
                          "Responder failing")
+
+
+class TheShippedImageIsReproducible(unittest.TestCase):
+    """What the image installs is a version, not "whatever is newest".
+
+    The finding's own words: "A rebuild a month later is a different
+    image." Six pip packages had no constraint at all and three source
+    builds pulled a moving branch, so two builds of the same commit of
+    this repository produced different images -- and on the day one of
+    those upstreams breaks, the break arrives without a commit here.
+
+    This is the half of *Nothing is pinned* that a fix could reach: it
+    touches no requirements file, so no floor is raised and the suite's
+    own dependencies are untouched. The four requirements files are the
+    other half and stay open, because pinning them exactly is a decision
+    about what the suite is allowed to run against.
+
+    The versions are the ones an unpinned install resolved to when this
+    was written, and the commits are the ones the three branches were at:
+    pinning what is known to work rather than choosing something new.
+    """
+
+    PIP_PACKAGES = ("flask", "cryptography", "impacket", "lsassy", "ldap3",
+                    "requests-ntlm")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.image = _text(DOCKERFILE)
+        cls.instructions = _instructions(DOCKERFILE)
+
+    def _pip_block(self):
+        body = self.instructions.split("RUN pip install", 1)[1]
+        return body.split("\n\n", 1)[0]
+
+    def test_every_pip_package_carries_an_exact_version(self):
+        block = self._pip_block()
+        for package in self.PIP_PACKAGES:
+            with self.subTest(package=package):
+                self.assertRegex(
+                    block, r"%s==\d" % re.escape(package),
+                    "%s is installed with no version, so a rebuild "
+                    "resolves whatever is newest that day" % package)
+
+    def test_no_package_is_installed_with_a_floor_instead(self):
+        # A floor is not a pin: `>=` still resolves differently tomorrow.
+        block = self._pip_block()
+        self.assertNotIn(">=", block)
+        self.assertNotIn("<", block)
+
+    def test_no_source_build_pulls_a_moving_ref(self):
+        # Two shapes, because there are two mechanisms. pip takes the ref
+        # in the URL (`...@<commit>`); a git remote cannot, so the line
+        # that adds it has to fetch a named commit. Either counts; neither
+        # being there does not.
+        lines = _logical_lines(self.instructions)
+        sources = [(line, url) for line in lines
+                   for url in re.findall(
+                       r"(?:git\+https://|https://)github\.com/\S+", line)]
+        self.assertGreaterEqual(len(sources), 3,
+                                "the image stopped building from source; "
+                                "this test's premise is gone")
+        for line, url in sources:
+            tail = url.split("github.com/", 1)[1]
+            with self.subTest(url=url):
+                pinned = "@" in tail or re.search(
+                    r"git fetch[^\n]*\b[0-9a-f]{40}\b", line) or re.search(
+                    r"git fetch[^\n]*\$\{[A-Z_]+_COMMIT\}", line)
+                self.assertTrue(
+                    pinned,
+                    "%s names no ref and its line fetches no commit, so it "
+                    "builds whatever that branch is on the day" % url)
+
+    def test_each_pinned_commit_is_a_full_sha(self):
+        # A short sha or a tag-looking string would resolve differently
+        # later; `git fetch <sha>` needs the full one anyway.
+        commits = re.findall(r"^ENV\s+(\w+_COMMIT)=(\S+)",
+                             self.instructions, re.M)
+        self.assertGreaterEqual(len(commits), 3, commits)
+        for name, value in commits:
+            with self.subTest(pin=name):
+                self.assertRegex(value, r"^[0-9a-f]{40}$")
+
+    def test_each_cloned_repository_is_checked_out_at_that_ref(self):
+        # A `git clone --depth 1` cannot take a commit, so a pinned clone
+        # has to fetch the commit and check it out. Without this, pinning
+        # the URL would be decoration.
+        for name in ("Responder", "RelayKing"):
+            block = [line for line in _logical_lines(self.instructions)
+                     if name in line]
+            self.assertTrue(block, "nothing installs %s" % name)
+            joined = " ".join(block)
+            with self.subTest(repository=name):
+                self.assertRegex(joined, r"git fetch[^|]*--depth 1",
+                                 "%s is cloned, not fetched at a commit"
+                                 % name)
+                self.assertIn("FETCH_HEAD", joined)
+
+    def test_the_netexec_install_still_tolerates_failure(self):
+        # The property the pinning must not cost: one tool that will not
+        # install must not cost every architecture its image.
+        netexec = [line for line in _logical_lines(self.instructions)
+                   if "Pennyw0rth/NetExec" in line]
+        self.assertTrue(netexec)
+        self.assertTrue(any("||" in line for line in netexec))
+
+    def test_no_rust_toolchain_reaches_the_shipped_stage(self):
+        # Asserted again here because this change edits the stage that
+        # must not have one.
+        shipped = _stages(DOCKERFILE)[-1]
+        for forbidden in ("rustup", "cargo", "rustc"):
+            self.assertNotIn(forbidden, shipped)
+
+    def test_responders_own_requirements_are_installed(self):
+        # Responder's requirements.txt at the pinned commit is `aioquic`
+        # and `netifaces>=0.10.4`, and the image installed neither -- so
+        # `responder --help` answered "You need to install
+        # python3-netifaces" and, once that was there, "You need to
+        # install aioquic". The workflow runs the tool; this is the part a
+        # suite that cannot build an image can still say.
+        #
+        # A mutation that drops one of these was the only one of eight
+        # this class did not catch until this test existed.
+        block = self._pip_block()
+        for required in ("netifaces", "aioquic"):
+            with self.subTest(package=required):
+                self.assertRegex(
+                    block, r"%s==\d" % required,
+                    "Responder imports %s and the image does not install "
+                    "it, so `responder` resolves and cannot start"
+                    % required)
+
+    def test_the_pins_are_dated_so_a_reader_knows_how_old_they_are(self):
+        # A pinned commit ages, and the only thing worse than a moving ref
+        # is a frozen one nobody knows the age of.
+        block = self.image.split("RUN pip install", 1)[0]
+        self.assertRegex(self.image, r"20\d\d-\d\d-\d\d",
+                         "nothing beside the pins says when they were taken")
+        del block
 
 
 class CiBuildsAndStartsTheImage(unittest.TestCase):
@@ -601,6 +740,24 @@ class CiBuildsAndStartsTheImage(unittest.TestCase):
             "the check cannot tell a complete NetExec from one whose RDP "
             "library is missing, which is the thing the wheels stage is "
             "for")
+
+    def test_the_build_job_proves_responder_starts(self):
+        # `command -v responder` reads a symlink the image makes whether or
+        # not the tool can start, and that is how Responder shipped unable
+        # to run: its two requirements, netifaces and aioquic, were not
+        # installed. The step has to run it.
+        self.assertRegex(self.ci, r"responder --help",
+                         "no job runs responder; the tool list only reads "
+                         "its symlink")
+        self.assertRegex(self.ci, r"import netifaces, aioquic",
+                         "no job checks Responder's two requirements")
+
+    def test_the_build_job_proves_the_image_is_not_root(self):
+        self.assertRegex(self.ci, r"entrypoint id raccoon-c2:ci",
+                         "no job asks who the image runs as")
+        self.assertRegex(self.ci, r'\[ "\$who" != "root" \]',
+                         "nothing fails the job when the image defaults to "
+                         "root")
 
     def test_the_image_is_built_on_the_architecture_that_was_broken(self):
         # The whole defect was arm64-only: on x86_64 aardwolf has a

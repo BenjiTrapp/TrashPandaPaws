@@ -97,13 +97,39 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tigervnc-viewer \
     && rm -rf /var/lib/apt/lists/*
 
+# `netifaces` and `aioquic` are Responder's own two requirements, from its
+# requirements.txt at the commit pinned below, and neither was installed.
+# Measured in this image, one at a time: `responder --help` answered "You
+# need to install python3-netifaces", then "You need to install aioquic".
+# So Responder had never been able to run in the shipped image -- and the
+# CI step that printed the tool list could not see it, because
+# `command -v responder` reads a symlink that is made whether or not the
+# tool can start. The assertion added for this runs it.
+#
+# `netifaces` is a C extension, which the gcc and python3-dev above are
+# already there for; 0.11.0 is its last release (May 2021) and the version
+# NetExec's own venv builds here.
+#
+# This is not the `netifaces` that left `software/requirements.txt`. That
+# one was the *implant's*, where nothing imported it, and the implant does
+# not run Responder; this one has a consumer in this image.
+#
+# Pinned, and the versions are the ones an unpinned install resolved to on
+# 2026-11-28 -- what is known to work rather than something newly chosen.
+# Without them, two builds of the same commit of this repository produced
+# different images, and the day one of these breaks the break arrives with
+# no commit here. Bump them deliberately; a frozen pin nobody knows the age
+# of is the only thing worse than a moving one, which is why the date is
+# written down.
 RUN pip install --no-cache-dir \
-        flask \
-        cryptography \
-        impacket \
-        lsassy \
-        ldap3 \
-        requests-ntlm
+        flask==3.1.3 \
+        cryptography==50.0.2 \
+        impacket==0.13.1 \
+        lsassy==3.1.16 \
+        ldap3==2.9.1 \
+        requests-ntlm==1.3.0 \
+        netifaces==0.11.0 \
+        aioquic==1.3.0
 
 # The wheelhouse from stage 1, and the variable that makes pip look in it.
 # PIP_FIND_LINKS is additive: it adds a place to resolve from, it does not
@@ -147,8 +173,15 @@ ENV PIP_NO_CACHE_DIR=1
 # that stops building. What it must not do is hide the absence, so the
 # shipped-image workflow asserts the tool and its RDP library, on both
 # architectures.
+# The commit `main` was at on 2026-11-25, which is the build this image's
+# own CI assertion has passed on: netexec 1.5.1+1294.3999b0ab. A tag would
+# read better and `v1.5.1` is 1294 commits behind this, with its own
+# dependency set -- so the pin is the commit that is known to work with the
+# aardwolf version the wheels stage builds. The `||` stays, for the reason
+# it has always been there.
+ENV NETEXEC_COMMIT=3999b0ab405b7c9e24128e2cd8eb919a35133867
 RUN pipx install --python /usr/local/bin/python3 \
-        git+https://github.com/Pennyw0rth/NetExec \
+        "git+https://github.com/Pennyw0rth/NetExec@${NETEXEC_COMMIT}" \
     || echo "WARNING: nxc is NOT in this image -- the NetExec install failed"
 
 # Install Responder
@@ -156,7 +189,17 @@ RUN pipx install --python /usr/local/bin/python3 \
 # `ln -sf`, not `ln -s`. A plain link fails with "File exists" the moment
 # pip installs its own console script at the same path, which means the
 # step could only succeed when pip had FAILED.
-RUN git clone --depth 1 https://github.com/lgandx/Responder.git /opt/Responder \
+# `git clone --depth 1` cannot take a commit, so a pinned checkout fetches
+# the one commit and checks out FETCH_HEAD. Pinning only the URL would be
+# decoration -- the clone would still land on whatever the branch is.
+# master at 2026-06-10.
+ENV RESPONDER_COMMIT=424fbe53d6a61824e3c7685fe5f69668721b821e
+RUN mkdir -p /opt/Responder \
+    && cd /opt/Responder \
+    && git init -q \
+    && git remote add origin https://github.com/lgandx/Responder.git \
+    && git fetch -q --depth 1 origin "${RESPONDER_COMMIT}" \
+    && git checkout -q FETCH_HEAD \
     && chmod +x /opt/Responder/Responder.py \
     && ln -sf /opt/Responder/Responder.py /usr/local/bin/responder
 
@@ -166,8 +209,16 @@ RUN git clone --depth 1 https://github.com/lgandx/Responder.git /opt/Responder \
 # installing a `relayking` entry point, so the following `ln -s` died on
 # "File exists" and broke the build on every architecture. The
 # `2>/dev/null` on the pip call hid which of the two branches had run.
-RUN git clone --depth 1 https://github.com/depthsecurity/RelayKing-Depth.git /opt/RelayKing \
-    && cd /opt/RelayKing && pip install --no-cache-dir -e . 2>/dev/null \
+# master at 2026-03-31. This repository publishes no tags at all, so a
+# commit is the only thing there is to pin to.
+ENV RELAYKING_COMMIT=74e15350ff3610ed083d8886fa804f84c9a66238
+RUN mkdir -p /opt/RelayKing \
+    && cd /opt/RelayKing \
+    && git init -q \
+    && git remote add origin https://github.com/depthsecurity/RelayKing-Depth.git \
+    && git fetch -q --depth 1 origin "${RELAYKING_COMMIT}" \
+    && git checkout -q FETCH_HEAD \
+    && pip install --no-cache-dir -e . 2>/dev/null \
     || pip install --no-cache-dir -r /opt/RelayKing/requirements.txt \
     && ln -sf /opt/RelayKing/relayking.py /usr/local/bin/relayking \
     && chmod +x /opt/RelayKing/relayking.py

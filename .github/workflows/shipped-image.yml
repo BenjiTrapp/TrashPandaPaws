@@ -182,6 +182,50 @@ jobs:
             echo "nxc: $(nxc --version 2>&1 | head -1)"
           '
 
+      # ── Responder, asserted, and the reason it is a step of its own ──
+      #
+      # The step above prints what `command -v` finds, and for Responder
+      # that reads a symlink the image makes whether or not the tool can
+      # start. Measured in the built image on 2026-11-28: `responder
+      # --help` answered "You need to install python3-netifaces", and then
+      # "You need to install aioquic" -- its two requirements, neither of
+      # which the image installed. So Responder had never been able to run
+      # in the shipped image, and nothing here could tell.
+      #
+      # It is asserted on both architectures because `netifaces` is a C
+      # extension and builds from source on aarch64, which is exactly the
+      # shape of the defect the NetExec assertion below exists for.
+      - name: Responder starts, not just resolves
+        run: |
+          docker run --rm --user 0:0 --entrypoint sh raccoon-c2:ci -c '
+            command -v responder >/dev/null 2>&1 || {
+              echo "responder is absent from the image"; exit 1; }
+            responder --help > /tmp/r.txt 2>&1 || {
+              echo "responder --help failed:"; cat /tmp/r.txt; exit 1; }
+            grep -qi "responder" /tmp/r.txt || {
+              echo "responder printed nothing it should"; cat /tmp/r.txt;
+              exit 1; }
+            python3 -c "import netifaces, aioquic" || {
+              echo "Responder is installed without its requirements";
+              exit 1; }
+            echo "responder: starts, and its two requirements import"
+          '
+
+      # ── The image does not run as root by default ──
+      #
+      # The compose service asks for root in one line because Responder
+      # needs raw sockets; the image's own default must not. A plain
+      # `docker run` is what this checks, which is the path that does not
+      # go through compose.
+      - name: The image's default user is not root
+        run: |
+          who=$(docker run --rm --entrypoint id raccoon-c2:ci -un)
+          echo "default user: $who"
+          [ "$who" != "root" ] || { echo "the image defaults to root"; exit 1; }
+          docker run --rm --entrypoint sh raccoon-c2:ci -c \
+            'touch /data/raccoon-c2/probe' || {
+              echo "that user cannot write the data directory"; exit 1; }
+
       # The compose file is the documented way to run this, and its build
       # context is part of the defect that stopped the server from
       # starting. A config parse catches a broken context or a renamed

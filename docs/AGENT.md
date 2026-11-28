@@ -1156,17 +1156,28 @@ more.
 
 #### Would stop a release
 
-- **Nothing is pinned.** All four requirements files
-  (`software/requirements.txt`, `software/agent/requirements.txt`,
-  `tools/requirements.txt` and `software/tests/requirements.txt`) use lower
-  bounds or none at all, and no file pins an exact version. The
-  server image installs six packages with no version constraint at all and
-  builds NetExec, Responder and RelayKing from moving git branches with no
-  tag. A rebuild a month later is a different image. The base image's
-  Debian release is now pinned, and that is not a fix for this: it was
-  pinned because `python:3.12-slim` had already moved from Debian 12 to
-  13, taking `freerdp2-x11` with it and breaking the build on every
-  architecture. The dependencies above are still unpinned.
+- **The four requirements files are not pinned.**
+  `software/requirements.txt`, `software/agent/requirements.txt`,
+  `tools/requirements.txt` and `software/tests/requirements.txt` use lower
+  bounds or none at all, so what a fresh checkout installs is whatever is
+  newest that day. Pinning them exactly is a decision rather than a defect:
+  it is a statement about what the suite and the implant are allowed to run
+  against, and an exact pin that nobody bumps becomes a stale floor on
+  purpose. `test_requirements_floors.py` holds the files to agreeing with
+  each other, which is the part that can be checked without installing
+  every floor.
+
+  **The shipped image is pinned**, and that half is closed: the eight pip
+  packages carry exact versions, and NetExec, Responder and RelayKing are
+  built from named commits (a `git clone --depth 1` cannot take one, so
+  those two fetch the commit and check out `FETCH_HEAD`). The versions and
+  commits are the ones an unpinned build resolved to on 2026-11-28 — what
+  was known to work rather than something newly chosen — and the date is
+  written beside them, because a frozen pin nobody knows the age of is the
+  only thing worse than a moving one. The base image's Debian release was
+  already pinned, for a different reason: `python:3.12-slim` had moved from
+  Debian 12 to 13, taking `freerdp2-x11` with it and breaking the build on
+  every architecture.
 - **`ldap3` is old, and cannot be removed from the image.** Its last stable
   release is 2.9.1 (July 2021), with only release candidates of 2.10.2 since,
   the newest in April 2026: slow rather than abandoned, which is softer than

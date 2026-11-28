@@ -304,6 +304,14 @@ class TestNetifacesIsGone(unittest.TestCase):
     softer than "unmaintained", and the Known-limits entry says only that
     now.
 
+    The shipped **image** does install it, and that is not a contradiction:
+    Responder imports it (its own requirements.txt names it), and Responder
+    is a vendored tool in that image rather than code under `software/`.
+    Measured when the image was pinned -- `responder --help` answered "You
+    need to install python3-netifaces" -- so the image had been shipping a
+    Responder that could not start. `test_shipped_image.py` holds that
+    install in place.
+
     What is **not** closed, and is out of this work's reach:
     `hardware/tests/firstboot_test.sh` checks for `netifaces` among the
     modules it expects on a provisioned device. That file is under

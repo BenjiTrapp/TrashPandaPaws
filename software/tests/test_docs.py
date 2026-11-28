@@ -555,30 +555,24 @@ def _the_replay_cache_is_bounded_by_count():
                 and nonce_of(first) not in srv.crypto.seen_envelopes)
 
 
-def _nothing_is_pinned():
+def _the_requirements_files_are_not_pinned():
+    """What is left of that finding once the image is pinned.
+
+    The image half is closed and `test_shipped_image.py` holds it: exact
+    versions for every pip package, and a named commit for each of the
+    three source builds. The four requirements files are the half that is
+    a decision -- an exact pin there is a statement about what the suite
+    and the implant may run against -- so this watches only them.
+
+    `==` anywhere in one of them, outside a comment, closes it.
+    """
     reqs = [_read("software", "requirements.txt"),
             _read("software", "agent", "requirements.txt"),
             _read("tools", "requirements.txt"),
             _read("software", "tests", "requirements.txt")]
-    image = _read("software", "c2", "Dockerfile")
-    pip_block = image.split("RUN pip install", 1)[1].split("\n\n", 1)[0]
-    # The third clause used to be `re.search(r"NetExec\s*$", image, re.M)`:
-    # the NetExec line happening to end the line was read as "its git ref
-    # carries no tag". Adding a `\` continuation to that line defeated the
-    # probe without changing a thing about pinning, and the suite reported
-    # this finding as fixed. So ask the question the finding actually
-    # asks -- are the three source builds pulling a moving ref? -- which a
-    # reformat cannot answer differently.
-    sources = re.findall(r"(?:git\+https://|https://)github\.com/\S+", image)
-    moving = [url for url in sources
-              if "@" not in url.split("github.com/", 1)[1]]
-    return (not any("==" in line for text in reqs
-                    for line in text.splitlines()
-                    if not line.lstrip().startswith("#"))
-            and not re.search(r"[<>=]", pip_block)
-            and len(moving) >= 3)
-
-
+    return not any("==" in line for text in reqs
+                   for line in text.splitlines()
+                   if not line.lstrip().startswith("#"))
 def _ldap3_is_still_declared_by_impacket():
     """Only the half of that finding that a fix could not reach.
 
@@ -742,7 +736,8 @@ _OPEN_FINDINGS = {
          _the_replay_cache_is_bounded_by_count),
     ],
     "Would stop a release": [
-        ("Nothing is pinned", _nothing_is_pinned),
+        ("four requirements files are not pinned",
+         _the_requirements_files_are_not_pinned),
         ("`ldap3` is old", _ldap3_is_still_declared_by_impacket),
         ("`vnc_password`", _the_shipped_config_carries_a_vnc_password),
         ("implant id is one per host", _a_beacons_implant_id_is_one_per_host),
