@@ -801,6 +801,31 @@ class TestThePhaseIsWhatTheKernelAgreesTo(unittest.TestCase):
                 self.assertIn(rule % "A", recorded)
                 self.assertIn(rule % "D", recorded)
 
+        # **And they come off last of all.** `_go_silent` exists to keep
+        # traffic off the wire while the rewrite is being configured, and
+        # `stop()` is what puts this implant's own address back at the end
+        # of it -- so removing the DROPs before the teardown would let
+        # traffic leave under the host's address on a path whose own
+        # record says the take failed.
+        def first(fragment):
+            for position, command in enumerate(recorded):
+                if fragment in command:
+                    return position
+            self.fail("%r was never run: %r" % (fragment, recorded))
+
+        self.assertLess(
+            first("ip link set dev br0 address 11:22:33:44:55:66"),
+            first("arptables -D OUTPUT -o eth0 -j DROP"),
+            "the DROPs came off before the teardown put this implant's own "
+            "address back, so traffic could leave under the host's: %r"
+            % (recorded,))
+        self.assertEqual(
+            [command for command in recorded[-4:]
+             if " -D OUTPUT " in command and command.endswith("-j DROP")],
+            recorded[-4:],
+            "the last thing this path does is not letting traffic out "
+            "again: %r" % (recorded[-4:],))
+
     def test_a_refused_bridge_stops_the_sequence(self):
         # `configure_network` runs DHCP on the bridge under the host's
         # identity, which is the other half of taking it -- so the

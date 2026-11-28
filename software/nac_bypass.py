@@ -263,15 +263,20 @@ class NACBypass:
                 "rewrite rule has been applied and everything this "
                 "sequence installed is being torn down",
                 self._bridge_mac(), self.victim_mac)
-            # `_go_live` before `stop`, because `stop` flushes `-t nat`
-            # and the four DROP rules `_go_silent` put in are in the
-            # **filter** tables: without this they were left behind, and
-            # the way out's restore path re-runs this sequence at every
-            # boot, so four more were appended each time and nothing ever
-            # removed them. "Everything this sequence installed is being
-            # torn down" has to be true of everything it installed.
-            self._go_live()
+            # `stop` first and `_go_live` last, so output stays dropped
+            # for the whole teardown: `_go_silent` exists to keep traffic
+            # off the wire "while rewrite rules are being configured",
+            # and `stop` restores this implant's own MAC at the end of
+            # it. Going live first would have let traffic out under the
+            # host's address while the record says the take failed.
+            #
+            # And `_go_live` at all, because `stop` flushes `-t nat` and
+            # those four DROP rules are in the **filter** tables: without
+            # this they were left behind, and the way out's restore
+            # re-runs this sequence at every boot, so four more were
+            # appended each time and nothing ever removed them.
             self.stop()
+            self._go_live()
             return False
         self._phase = "active"
         logger.info("Bridge MAC spoofed to %s", self.victim_mac)

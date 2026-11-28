@@ -554,6 +554,15 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
         # address gets here with the host already discovered, so "the
         # downstream host never spoke" was false -- in the field
         # `trigger.py` calls "read by whoever recovers the device".
+        #
+        # **And the fake is stopped, because the real sequence is.**
+        # `apply_rewrite_rules` calls `stop()` on the path that refuses,
+        # and `stop()` ends at `_phase = "idle"` -- the same phase as
+        # "never got that far". So the first fix tested the phase, the
+        # phase was `idle` in the field, and the sentence was still
+        # wrong; the test passed only because this fake stopped at
+        # `discovered`, which that list happened not to name. The MAC is
+        # the fact a teardown does not overwrite.
         from software import main as main_mod
         from software import nac_bypass as nac_mod
         self.beacon()._exec_egress("identity")
@@ -561,11 +570,38 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
         with mock.patch.object(nac_mod, "NACBypass", self.fake([])):
             poller = main_mod.way_out_identity_poller(self.config())
             self.assertIsNone(poller())
-            self.last.discover()          # the host spoke; the phase did
-            later = time.time() + 1e6     # not reach "active"
+            self.last.discover()          # the host spoke; the rules were
+            self.last.stop()              # refused, so the sequence tore
+            later = time.time() + 1e6     # itself down -- back to `idle`
             with mock.patch.object(main_mod.time, "time", lambda: later):
                 self.assertIsNone(poller())
 
+        self.assertEqual(self.last._phase, "idle",
+                         "this case is only the one it is for while the "
+                         "refused path ends where `stop()` leaves it")
+        detail = self.request()["detail"]
+        self.assertIn("would not take its address", detail)
+        self.assertNotIn("never spoke", detail)
+
+    def test_a_host_found_with_the_sequence_unfinished_is_recorded_as_that(
+            self):
+        # The deadline landing *before* the rules were attempted at all:
+        # the host spoke, the phase is `discovered`, and nothing has been
+        # torn down. The same sentence, because it is the same fact --
+        # the host was found and this implant is not wearing its address.
+        from software import main as main_mod
+        from software import nac_bypass as nac_mod
+        self.beacon()._exec_egress("identity")
+
+        with mock.patch.object(nac_mod, "NACBypass", self.fake([])):
+            poller = main_mod.way_out_identity_poller(self.config())
+            self.assertIsNone(poller())
+            self.last.discover()
+            later = time.time() + 1e6
+            with mock.patch.object(main_mod.time, "time", lambda: later):
+                self.assertIsNone(poller())
+
+        self.assertEqual(self.last._phase, "discovered")
         detail = self.request()["detail"]
         self.assertIn("would not take its address", detail)
         self.assertNotIn("never spoke", detail)

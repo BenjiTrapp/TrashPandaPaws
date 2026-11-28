@@ -271,11 +271,18 @@ def way_out_identity_poller(config):
         # `victim_mac` already known, so that sentence was false on the
         # one path the read-back created -- in the field `trigger.py`
         # calls "read by whoever recovers the device".
+        # Keyed on `victim_mac` and **not** on the phase: the refused
+        # bridge calls `stop()`, which ends at `_phase = "idle"` -- the
+        # same phase as "never got that far" -- so a phase test was dead
+        # on the one path it was written for. The MAC is the fact a
+        # teardown does not overwrite: it is set where the host is
+        # discovered and nothing clears it.
         phase = getattr(bypass, "_phase", "?")
-        why = ("the downstream host never spoke, so the bridge is still "
-               "transparent" if phase in ("idle", "eapol", "discovery")
-               else "the host was found and the bridge would not take its "
-                    "address, so nothing was rewritten")
+        why = ("the host was found and the bridge would not take its "
+               "address, so nothing was rewritten"
+               if getattr(bypass, "victim_mac", None)
+               else "the downstream host never spoke, so the bridge is "
+                    "still transparent")
         logger.error(
             "nac_bypass did not take the host's identity within %d s (phase "
             "%r): %s.", _SEQUENCE_DEADLINE, phase, why)

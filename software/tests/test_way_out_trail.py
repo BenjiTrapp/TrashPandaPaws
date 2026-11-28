@@ -47,8 +47,13 @@ class TrailCase(_decider.DeciderCase):
         self.state = _scratch.scratch(self, "raccoon-trail-")
 
     def beacon(self, hours_dark=24.0, policy=None):
+        # The carrier on, because this class's policy names `gsocket`
+        # and a `gsocket` rule on a build with no carrier is dropped when
+        # the policy is read -- the refusal is one the build guarantees,
+        # and it would have cost an attempt of the budget every cycle.
         beacon = _scratch.assert_live(self, self.a_beacon(
             policy=policy if policy is not None else self.POLICY,
+            gsocket=True,
             way_out=read_way_out_policy({"enabled": True,
                                          "state_dir": self.state})))
         beacon._stuck_cycles = int(hours_dark * 12)

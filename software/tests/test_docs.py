@@ -1647,6 +1647,40 @@ class TestTheEgressDeciderIsDocumentedAndShipsDisabled(unittest.TestCase):
                     "may never do has to be read before a policy is written"
                     % phrase)
 
+    # ── a rule this build can never run ──
+
+    def test_the_page_says_such_a_rule_is_dropped_when_the_policy_is_read(
+            self):
+        flat = " ".join(self.guide.split()).lower()
+        for phrase, what in (
+                ("can never run is dropped the same way",
+                 "that a rule naming a verb this build cannot run is "
+                 "dropped when the policy is read"),
+                ("`gsocket` on one whose `c2.fallback.gsocket` is off",
+                 "the setting that drops a gsocket rule"),
+                ("spent all three attempts of every stuck window",
+                 "what carrying such a rule cost before it was dropped"),
+                ("suppressed the carrier latch",
+                 "the second half of the cost")):
+            with self.subTest(phrase=phrase):
+                self.present(flat, phrase, what, "docs/EGRESS_DECIDER.md")
+
+    def test_the_shipped_policy_names_a_verb_the_shipped_build_has_not(self):
+        # The paragraph above is about *this* build and not a
+        # hypothetical one: the third shipped rule names `gsocket` and the
+        # shipped carrier is off. If a later change switches the carrier
+        # on or drops that rule, this fails and the page is corrected
+        # with it instead of going quietly stale.
+        verbs = [rule.get("try") for rule
+                 in self.config["c2"]["egress_decider"]["rules"]]
+        self.assertIn("gsocket", verbs,
+                      "the shipped policy no longer names `gsocket`: %r"
+                      % (verbs,))
+        self.assertFalse(
+            self.config["c2"]["fallback"]["gsocket"].get("enabled"),
+            "the shipped build now carries a carrier, so the page's "
+            "sentence about the shipped pair is no longer true")
+
     # ── the one-cycle cost ──
 
     def test_the_guide_states_the_one_cycle_cost(self):
@@ -3581,6 +3615,13 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
         self.claim("a louder rung is refused until",
                    "every quieter rung has crossed",
                    "the mechanism that enforces the order")
+        self.claim("on a floor with no open ssid",
+                   "rung 4 still crosses at hour 7",
+                   "that a quieter rung with nothing to work on does not "
+                   "hold the ladder shut")
+        self.claim("`beacon.log` and not `raccoon.log`",
+                   "skips its embedded beacon",
+                   "why the attempts are in the standalone beacon's own log")
         self.claim("does **not** narrow", "who may send that mac",
                    "the limit of the sender anchor")
         self.claim("every http session the beacon builds",

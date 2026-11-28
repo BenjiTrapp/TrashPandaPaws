@@ -276,6 +276,37 @@ class TestTheLadderIsArithmetic(GateCase):
                 self.assertTrue(allowed)
                 self.assertEqual(numbers["blocked_by"], "")
 
+    def test_a_quieter_rung_with_nothing_to_work_on_blocks_nothing(self):
+        # The page says this out loud, because it is the question an
+        # operator asks of an ordering rule: the rule is about the
+        # **arithmetic** and not about the hardware. On a floor with no
+        # open SSID the radio rung declines every cycle it is named --
+        # and rung 4 still crosses at hour 7, because what the rule
+        # requires of a quieter rung is that it *crossed*, which a rung
+        # with nothing to work on did.
+        from software.scout import handoff
+
+        beacon = self.beacon(hours_dark=7, document=False)
+        handoff.write_document(beacon._way_out_state_dir, {
+            "version": handoff.DOCUMENT_VERSION, "published": time.time(),
+            "evidence": beacon._egress_state(),
+            "tap": {"flags": [],
+                    "ssids": [{"ssid": "CorpSecure", "open": False}]},
+            "identity_pre_spent": False, "recommendation": None})
+
+        # The radio rung has crossed by the arithmetic and declines in
+        # fact -- both halves, or this is not the situation the page
+        # describes.
+        self.assertTrue(beacon._way_out_allows("radio")[0])
+        self.assertIn("open SSID",
+                      beacon._egress_nothing_to_work_on("radio"))
+        self.assertIsNone(beacon._egress_task("radio"))
+
+        allowed, numbers = beacon._way_out_allows("identity")
+        self.assertTrue(allowed, "rung 4 was held shut by a rung that had "
+                                 "crossed and had nothing to work on")
+        self.assertEqual(numbers["blocked_by"], "")
+
     def test_a_quieter_rung_exactly_on_the_threshold_has_not_crossed(self):
         # The ordering rule's comparison has to be strict, as the gate's
         # own is: a quieter rung sitting *exactly* on the threshold has
@@ -457,8 +488,12 @@ class TestWithNoScoutNothingChanges(GateCase):
                     % (self.logged.warnings,))
 
     def test_a_dropped_borrow_verb_does_not_renumber_the_rest(self):
+        # The carrier on, so rule 2 is one this build can use: a
+        # `gsocket` rule is dropped too when there is no carrier, and a
+        # test where *both* rules are dropped would not be about
+        # numbering.
         beacon = self.beacon(
-            hours_dark=5, way_out=self.OFF,
+            hours_dark=5, way_out=self.OFF, gsocket=True,
             policy=self.policy([
                 {"when": {"https": ["not_attempted"]}, "try": "portal"},
                 {"when": {"https": ["not_attempted"]}, "try": "gsocket"}]))
@@ -495,6 +530,61 @@ class TestWithNoScoutNothingChanges(GateCase):
                         "nothing said why: %r" % (self.logged.warnings,))
 
 
+class TestAVerbTheBuildGuaranteesWillRefuseIsDropped(GateCase):
+    """`gsocket` on a build with no carrier, which is what ships.
+
+    A review round found this one: `configs/raccoon.yaml` carries a
+    `try: gsocket` rule and ships `c2.fallback.gsocket` off, so every
+    cycle of a stuck window spent an attempt of the budget on
+    `_egress_gsocket`'s "this build has no gsocket leg to start" -- three
+    cycles, and the window was over before rung 2 had crossed. The rule
+    is dropped when the policy is read, exactly as a borrow verb is on a
+    build with no scout and a proxy verb is on a build that forbids
+    proxies.
+    """
+
+    def rule(self):
+        return self.policy([{"when": {"https": ["not_attempted"]},
+                             "try": "gsocket"}])
+
+    def test_the_rule_is_dropped_and_the_reason_is_said_out_loud(self):
+        beacon = self.beacon(hours_dark=5, policy=self.rule())
+        self.assertFalse(beacon.gsocket_enabled,
+                         "this case needs a build with no carrier")
+        self.assertEqual(beacon._egress_rules, [])
+        self.assertTrue(
+            any("gsocket" in message and "c2.fallback.gsocket" in message
+                for message in self.logged.warnings),
+            "nothing said why rule 1 will never fire: %r"
+            % (self.logged.warnings,))
+
+    def test_the_dropped_rule_costs_no_budget(self):
+        beacon = self.beacon(hours_dark=5, policy=self.rule())
+        asked = self.record_attempts(beacon)
+        for _ in range(5):
+            beacon._egress_act()
+        self.assertEqual(asked, [])
+        self.assertEqual(beacon._egress_spent, 0)
+
+    def test_a_build_with_a_carrier_keeps_it(self):
+        beacon = self.beacon(hours_dark=5, gsocket=True, policy=self.rule())
+        self.assertEqual([number for number, _ in beacon._egress_rules], [1])
+
+    def test_a_model_naming_it_declines_rather_than_spending_an_attempt(self):
+        # The other path to the verb, which no reader filters: the drop
+        # above is about the operator's file, and a model's recommendation
+        # does not come through it.
+        beacon = self.beacon(hours_dark=24, policy=self.policy([
+            {"when": {"https": ["not_attempted"]}, "try": "rediscover"}]))
+        self.assertIn("carrier",
+                      beacon._egress_nothing_to_work_on("gsocket"))
+        asked = self.record_attempts(beacon)
+        self.publish(beacon, {"verb": "gsocket", "chose": "model"})
+        self.assertTrue(beacon._egress_act())
+        self.assertEqual(asked, ["rediscover"])
+        self.assertEqual(beacon._egress_spent, 1)
+
+
 class TestARefusedRungDoesNotSilenceTheOnesBelowIt(GateCase):
     """A loud first rule must not shadow every quiet rule under it.
 
@@ -511,14 +601,17 @@ class TestARefusedRungDoesNotSilenceTheOnesBelowIt(GateCase):
                              "try": verb} for verb in verbs])
 
     def test_a_loud_rule_is_skipped_for_the_quiet_one_below_it(self):
-        beacon = self.beacon(hours_dark=2,
+        # `gsocket` as the quiet rule, with the carrier on: a `gsocket`
+        # rule on a build with no carrier is dropped when the policy is
+        # read, because the refusal is one the build guarantees.
+        beacon = self.beacon(hours_dark=2, gsocket=True,
                              policy=self.rules("radio", "gsocket"))
         asked = self.record_attempts(beacon)
         self.assertTrue(beacon._egress_act())
         self.assertEqual(asked, ["gsocket"])
 
     def test_the_loud_rule_still_fires_once_the_curve_reaches_it(self):
-        beacon = self.beacon(hours_dark=5,
+        beacon = self.beacon(hours_dark=5, gsocket=True,
                              policy=self.rules("radio", "gsocket"))
         asked = self.record_attempts(beacon)
         self.assertTrue(beacon._egress_act())
@@ -536,14 +629,15 @@ class TestARefusedRungDoesNotSilenceTheOnesBelowIt(GateCase):
         # The design says of this case: "the beacon decided on its
         # policy, which is the degradation this design relies on". It
         # did not -- the policy was never evaluated.
-        beacon = self.beacon(hours_dark=2, policy=self.rules("gsocket"))
+        beacon = self.beacon(hours_dark=2, gsocket=True,
+                             policy=self.rules("gsocket"))
         asked = self.record_attempts(beacon)
         self.publish(beacon, {"verb": "identity", "chose": "model"})
         self.assertTrue(beacon._egress_act())
         self.assertEqual(asked, ["gsocket"])
 
     def test_each_refusal_is_logged_with_its_own_numbers(self):
-        beacon = self.beacon(hours_dark=2,
+        beacon = self.beacon(hours_dark=2, gsocket=True,
                              policy=self.rules("identity", "radio",
                                                "gsocket"))
         self.record_attempts(beacon)
@@ -571,6 +665,11 @@ class TestARefusalTheSituationGuaranteesCostsNoAttempt(GateCase):
     `budget: 3` window spent all three on "this implant has asked once
     already", which is the state *immediately after rung 4 succeeds*,
     and brought no carrier up either.
+
+    The quieter rule below is `rediscover` rather than `gsocket`, because
+    a `gsocket` rule is now **dropped when the policy is read** on a
+    build with no carrier -- which these beacons are, and which the
+    shipped configuration is.
     """
 
     def rules(self, *verbs):
@@ -579,7 +678,7 @@ class TestARefusalTheSituationGuaranteesCostsNoAttempt(GateCase):
 
     def test_rung_four_already_asked_declines_and_the_next_rule_runs(self):
         beacon = self.beacon(hours_dark=24, policy=self.rules("identity",
-                                                              "gsocket"))
+                                                              "rediscover"))
         self.publish(beacon, None)
         # The **real** verb for the first cycle, because what makes the
         # rung spent is the request file it writes -- a recorded attempt
@@ -595,12 +694,12 @@ class TestARefusalTheSituationGuaranteesCostsNoAttempt(GateCase):
         # quieter rule gets the cycle instead of the refusal taking it.
         asked = self.record_attempts(beacon)
         self.assertTrue(beacon._egress_act())
-        self.assertEqual(asked, ["gsocket"])
+        self.assertEqual(asked, ["rediscover"])
         self.assertEqual(beacon._egress_spent, 2)
 
     def test_a_pre_spent_identity_declines(self):
         beacon = self.beacon(hours_dark=24, policy=self.rules("identity",
-                                                              "gsocket"))
+                                                              "rediscover"))
         self.publish(beacon, None)
         from software.scout import handoff
         document = handoff.read_document(beacon._way_out_state_dir)
@@ -609,48 +708,66 @@ class TestARefusalTheSituationGuaranteesCostsNoAttempt(GateCase):
         asked = self.record_attempts(beacon)
 
         self.assertTrue(beacon._egress_act())
-        self.assertEqual(asked, ["gsocket"])
+        self.assertEqual(asked, ["rediscover"])
         self.assertEqual(beacon._egress_spent, 1)
 
     def test_rung_four_with_no_document_declines(self):
         beacon = self.beacon(hours_dark=24, document=False,
-                             policy=self.rules("identity", "gsocket"))
+                             policy=self.rules("identity", "rediscover"))
         asked = self.record_attempts(beacon)
 
         self.assertTrue(beacon._egress_act())
-        self.assertEqual(asked, ["gsocket"])
+        self.assertEqual(asked, ["rediscover"])
 
     def test_a_host_with_no_radio_declines_the_radio_rung(self):
         beacon = self.beacon(hours_dark=24, policy=self.rules("radio",
-                                                              "gsocket"))
+                                                              "rediscover"))
         asked = self.record_attempts(beacon)
         with mock.patch.object(beacon, "_radio_iface",
                                lambda: (None, "no wireless interface")):
             self.assertTrue(beacon._egress_act())
-        self.assertEqual(asked, ["gsocket"])
+        self.assertEqual(asked, ["rediscover"])
         self.assertEqual(beacon._egress_spent, 1)
 
     def test_nothing_to_borrow_declines_the_borrow_verbs(self):
         for verb in ("credential", "portal"):
             with self.subTest(verb=verb):
                 beacon = self.beacon(hours_dark=24,
-                                     policy=self.rules(verb, "gsocket"))
+                                     policy=self.rules(verb, "rediscover"))
                 asked = self.record_attempts(beacon)
 
                 self.assertTrue(beacon._egress_act())
-                self.assertEqual(asked, ["gsocket"])
+                self.assertEqual(asked, ["rediscover"])
 
     def test_every_verb_that_would_refuse_declines_instead(self):
         # The property rather than a list of conditions, because the list
         # is what kept being incomplete: three rounds added conditions one
         # at a time and two of the five were inert on the hardware and the
         # file shapes that ship. So: for every verb the decider may name,
-        # in each of the situations below, **if the verb's own answer is a
-        # refusal then the decline must have fired** -- otherwise the
+        # in each of the situations below, **the task the decider would
+        # actually run must not come back a refusal** -- otherwise the
         # refusal costs an attempt of the window's budget and suppresses
         # the carrier latch behind it.
+        #
+        # Through `_egress_task` and over every `[error]`, because the
+        # first form of this test skipped a refusal for the way it was
+        # *phrased*: it filtered on `"[error] Not "`, and
+        # `_egress_gsocket` answers "[error] This build has no gsocket leg
+        # to start" -- so the one verb whose refusal the *shipped*
+        # configuration guarantees was the one verb the property never
+        # tested, and a review found it instead. A verb whose `[error]`
+        # is a real attempt has to be named in `DIALS` below with the
+        # reason, where it cannot fall quietly out of the property again.
         from software.c2 import beacon as module
         from software.scout import handoff
+
+        # `proxy` is the one verb the decider hands an argument to, and
+        # `_egress_task` picks that argument from discovery or declines
+        # for it. So an `[error]` from `egress proxy <target>` is a proxy
+        # that was dialled and did not answer -- an attempt, and attempts
+        # are what the budget is for. It is skipped rather than asserted
+        # about because this test must not dial anything.
+        DIALS = ("proxy",)
 
         situations = {
             "nothing published at all": lambda beacon: None,
@@ -706,15 +823,18 @@ class TestARefusalTheSituationGuaranteesCostsNoAttempt(GateCase):
                         os.unlink(os.path.join(beacon._way_out_state_dir,
                                                name))
                     arrange(beacon)
-                    # The real verb, and nothing else in this cycle.
-                    answer = beacon._exec_egress(verb)
-                    if not answer.startswith("[error] Not "):
+                    # The decider's own call, which is the whole point:
+                    # None here *is* the decline, and it costs no budget.
+                    task = beacon._egress_task(verb)
+                    if task is None or verb in DIALS:
                         continue
-                    self.assertTrue(
-                        beacon._egress_nothing_to_work_on(verb),
+                    # The real verb, and nothing else in this cycle.
+                    answer = beacon._exec_egress(task)
+                    self.assertFalse(
+                        answer.startswith("[error]"),
                         "`egress %s` refuses (%s) and the decider would "
                         "spend an attempt of the budget to find out"
-                        % (verb, answer.split(".")[0][:90]))
+                        % (task, answer.split(".")[0][:90]))
 
     def test_a_build_that_forbids_proxies_declines_the_credential_verb(self):
         # Two places, because two paths reach the verb: the rule is
@@ -724,7 +844,10 @@ class TestARefusalTheSituationGuaranteesCostsNoAttempt(GateCase):
         # is not filtered by that reader, so the decline has to hold too.
         from software.scout import handoff
 
-        beacon = self.beacon(hours_dark=24, proxy_mode="none",
+        # The carrier, because `rediscover` is a proxy verb and this
+        # build forbids those: the quieter rule has to be one the build
+        # can actually use.
+        beacon = self.beacon(hours_dark=24, proxy_mode="none", gsocket=True,
                              policy=self.rules("credential", "gsocket"))
         self.assertEqual([number for number, _ in beacon._egress_rules], [2],
                          "the rule naming `credential` was not dropped on a "
@@ -764,7 +887,15 @@ class TestARefusalTheSituationGuaranteesCostsNoAttempt(GateCase):
         for verb in ("credential", "portal"):
             with self.subTest(verb=verb):
                 self.assertIn("previous outage", beacon._exec_egress(verb))
-                self.assertTrue(beacon._egress_nothing_to_work_on(verb))
+                # And the decline says the *same* thing, which is why it
+                # passes `_egress_borrow`'s own sentence through:
+                # that helper refuses for four different reasons -- no
+                # file, a version this implant does not know, a capture
+                # from a previous outage, a radio lease held -- and one
+                # sentence standing in for all four sends whoever reads
+                # the log after the wrong thing.
+                self.assertIn("previous outage",
+                              beacon._egress_nothing_to_work_on(verb))
 
     def test_the_latch_still_gets_its_cycle(self):
         # The sharper half of the cost: `_egress_act` returning True on a

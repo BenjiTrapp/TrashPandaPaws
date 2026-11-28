@@ -255,6 +255,12 @@ c2:
       # rather than waiting for the latch. A first rule of `gsocket` instead
       # would bring it up a cycle sooner, at the cost of not trying a proxy
       # first -- see the one-cycle cost in docs/EGRESS_DECIDER.md.
+      #
+      # This rule needs `c2.fallback.gsocket: true`, which is NOT the
+      # default below: with the carrier off the rule is dropped when the
+      # policy is read, with a line naming it, because every attempt would
+      # be a refusal this build guarantees -- and three of those spend the
+      # whole budget of a stuck window.
       - when: {any: [timed_out, unreachable]}
         try: gsocket
 

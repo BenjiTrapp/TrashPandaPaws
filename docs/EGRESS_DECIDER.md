@@ -41,6 +41,16 @@ build whose `c2.way_out` is off they are **dropped when the policy is read**,
 with the reason, rather than left to spend your whole budget on refusals the
 build guarantees. Read that page before you write any of the four.
 
+**A rule whose verb this build can never run is dropped the same way**,
+whichever verb it is: a proxy verb on a build whose `c2.proxy.mode` is
+`none`, and `gsocket` on one whose `c2.fallback.gsocket` is off. That last
+one is why the rule exists in this shape — the shipped policy's third rule
+names `gsocket` and the shipped `c2.fallback.gsocket` is `false`, so a
+decider switched on with the carrier left off spent all three attempts of
+every stuck window on "this build has no gsocket leg to start", and
+suppressed the carrier latch behind each of them. The line naming the
+dropped rule says which setting to change.
+
 These four things are refused always, whatever the policy says:
 
 - **It may never `sleep`.** This is the pointed one. `sleep` is the only verb

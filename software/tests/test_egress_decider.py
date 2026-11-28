@@ -616,7 +616,8 @@ class TestTheRuleThatWins(DeciderCase):
                 "try": "gsocket"}
         one_wrong = {"when": {"https": ["auth_required"], "quic": ["refused"]},
                      "try": "proxy"}
-        beacon = self.a_beacon(policy=self.policy([one_wrong, both]))
+        beacon = self.a_beacon(policy=self.policy([one_wrong, both]),
+                               gsocket=True)
         self._evidence(beacon)
 
         self.assertEqual(beacon._egress_decide(), "gsocket")
@@ -682,7 +683,8 @@ class TestTheGateTheOperatorCannotWiden(DeciderCase):
         rules = [{"when": {"https": ["not_attempted"]}, "try": "proxy"},
                  _HOLDS,
                  {"when": {"https": ["not_attempted"]}, "try": "gsocket"}]
-        beacon = self.a_beacon(policy=self.policy(rules), proxy_mode="none")
+        beacon = self.a_beacon(policy=self.policy(rules), proxy_mode="none",
+                               gsocket=True)
 
         self.assertEqual([rule["try"] for _number, rule
                           in beacon._egress_rules], ["gsocket"])
@@ -698,7 +700,7 @@ class TestTheGateTheOperatorCannotWiden(DeciderCase):
         survives = {"when": {"https": ["not_attempted"]}, "try": "gsocket"}
         beacon = self.a_beacon(
             policy=self.policy([_NEVER, _HOLDS, survives]),
-            proxy_mode="none")
+            proxy_mode="none", gsocket=True)
 
         self.assertEqual(beacon._egress_rules, [(3, survives)])
 

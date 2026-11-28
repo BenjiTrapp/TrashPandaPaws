@@ -270,8 +270,12 @@ two hours ahead of rung 3.
 **And the order is enforced, not merely arranged.** A louder rung is
 refused until every quieter rung has crossed on the table's own priors —
 so neither a configured number nor a model's estimate can offer you rung 4
-before rung 3 was available. That rule is here because the arithmetic alone
-did not keep the promise: see the clamp below.
+before rung 3's *crossing*. It is about the arithmetic and not about the
+hardware: on a floor with no open SSID the radio rung declines every cycle
+while rung 4 still crosses at hour 7, because a rung that has crossed and
+has nothing to work on costs no attempt and blocks nothing. That rule is
+here because the arithmetic alone did not keep the promise: see the clamp
+below.
 
 `points` is floored by the **cycle count** as well as by the clock: a cycle
 is worth at most one step of the curve, whatever `beacon_interval_seconds`
@@ -389,9 +393,16 @@ copying lines on its own clock — which lost every attempt made in a window's
 last interval, and on a recovered implant that is the attempt that worked.)
 
 ```
-cat /opt/raccoon/logs/raccoon.log
+cat /opt/raccoon/logs/beacon.log            # the attempts, and every refusal
+cat /opt/raccoon/logs/raccoon.log           # rung 4's side, from main.py
 cat /opt/raccoon/state/way_out_trail.jsonl
 ```
+
+**`beacon.log` and not `raccoon.log`** for the attempts: `install.sh`
+enables `raccoon-beacon.service` as well, `main.py` skips its embedded
+beacon when that unit is running, and the standalone beacon logs to a
+file of its own. `raccoon.log` carries rung 4's poller — the request
+being taken, and what came of it — and nothing else of this.
 
 The trail holds no password: a line names the verb, its argument, the rung
 and the gate's numbers. The one file that *does* hold one — a proxy
