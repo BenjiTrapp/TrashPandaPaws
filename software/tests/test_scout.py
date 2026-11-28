@@ -802,6 +802,72 @@ class TestWhatItCostsWhileTheImplantIsDark(ScoutCase):
                          "a healthy implant forked once per poll: %r"
                          % (ran,))
 
+    def test_a_second_window_is_swept_as_well_as_the_first(self):
+        # The branch that matters in production, and the one the
+        # condition this replaced did not cover: a long-lived scout
+        # watching its *second* window close. Every test of "the window
+        # closed, so the files go" ran on a scout whose first sweep had
+        # not happened yet, so the first-poll sweep covered them all.
+        scout = self.scout()
+        polls = []
+
+        def two_polls(seconds):
+            polls.append(seconds)
+            if len(polls) >= 2:
+                scout.stop()
+
+        for number in (1, 2):
+            with self.subTest(window=number):
+                scout._running = True
+                del polls[:]
+                self.stuck(opened=time.time() + number)
+                scout.publish_once()
+                self.assertTrue(
+                    os.path.exists(handoff.borrow_path(self.root)))
+
+                handoff.remove(handoff.state_path(self.root))
+                with mock.patch.object(scout, "_sleep", two_polls):
+                    scout.run(interval=300.0)
+
+                self.assertFalse(
+                    os.path.exists(handoff.borrow_path(self.root)),
+                    "window %d's files survived its close" % number)
+                self.assertFalse(
+                    os.path.exists(handoff.document_path(self.root)))
+
+    def test_an_unstamped_window_is_swept_every_time_as_well(self):
+        # A beacon older than the `opened` field, which `handoff.py`'s own
+        # version rationale says is the case to plan for: `_window_turned`
+        # returns early on it, so `_window` never moves and the condition
+        # this replaced swept only the *first* such window, ever.
+        scout = self.scout()
+        polls = []
+
+        def two_polls(seconds):
+            polls.append(seconds)
+            if len(polls) >= 2:
+                scout.stop()
+
+        for number in (1, 2):
+            with self.subTest(window=number):
+                scout._running = True
+                del polls[:]
+                handoff.write_private_json(handoff.state_path(self.root), {
+                    "version": handoff.STATE_VERSION,
+                    "touched": time.time(), "stuck_cycles": 2,
+                    "evidence": {}})
+                scout.publish_once()
+                self.assertTrue(
+                    os.path.exists(handoff.borrow_path(self.root)))
+
+                handoff.remove(handoff.state_path(self.root))
+                with mock.patch.object(scout, "_sleep", two_polls):
+                    scout.run(interval=300.0)
+
+                self.assertFalse(
+                    os.path.exists(handoff.borrow_path(self.root)),
+                    "unstamped window %d's files survived" % number)
+
     def test_a_restarted_scout_sweeps_the_last_outages_files(self):
         # The ordinary trigger is a **reboot of a healthy implant**: both
         # units come back, the beacon starts with no outage, no window is

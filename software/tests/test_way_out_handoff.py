@@ -1146,7 +1146,7 @@ class TestAHostileStateDirectory(WayOutCase):
 
     def test_the_beacon_tightens_a_pre_existing_directory_too(self):
         # The scout's writer was hardened and the beacon's was not, and
-        # two of the six files are the beacon's -- including rung 4's
+        # three of the six files are the beacon's -- including rung 4's
         # request. The page tells the operator the mode is enforced "on
         # every write".
         loose = os.path.join(self.root, "loose")

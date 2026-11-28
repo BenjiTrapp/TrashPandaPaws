@@ -327,11 +327,13 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
         class FakeBypass(object):
             def __init__(self, config):
                 self._phase = "idle"
+                self._running = False
                 self.victim_mac = None
                 log.append(config)
                 case.last = self
 
             def start(self):
+                self._running = True
                 self._phase = "discovery"
                 log.append("start")
 
@@ -342,7 +344,13 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
 
             def become_active(self):
                 self.discover()
-                self._phase = "active"
+                # As the real sequence does: a bypass that has been
+                # stopped applies nothing. The fake used to go active
+                # regardless, so "stop was called" was all the restore
+                # test could assert -- a fact about this process where
+                # the fact needed is about the kernel.
+                if self._running:
+                    self._phase = "active"
 
             def become_active_as(self, mac):
                 """A different host on the port: a swapped laptop."""
@@ -351,6 +359,7 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
 
             def stop(self):
                 log.append("stop")
+                self._running = False
                 self._phase = "idle"
 
         return FakeBypass
@@ -408,6 +417,11 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
 
         self.assertIn("stop", log, "the bypass was left running on the "
                                    "wrong identity")
+        # And the stop *took*: the fake honours `_running` the way the
+        # real sequence does now, so a refusal that only logged would
+        # leave this phase active.
+        self.assertNotEqual(self.last._phase, "active")
+        self.assertFalse(self.last._running)
         self.assertEqual(self.request()["detail"], taken["detail"])
         self.assertEqual(self.request()["victim_mac"], "aa:bb:cc:dd:ee:ff")
         self.assertEqual(IdentityTrigger(self.state).identity_taken(),

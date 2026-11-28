@@ -280,9 +280,12 @@ c2:
   way_out:
     enabled: false
     # Where the beacon and the scout meet. SIX files live here -- the
-    # beacon's stuck window and its rung-4 request, the scout's document,
-    # borrow file and trail, and dhclient's lease -- all 0600 in a 0700
-    # directory. docs/WAY_OUT.md has the table and says what each one is.
+    # beacon's stuck window, its rung-4 request and the trail, the
+    # scout's document and borrow file, and dhclient's lease -- all 0600
+    # in a 0700 directory. docs/WAY_OUT.md has the table and says what
+    # each one is, and which of the two processes removes it. The trail
+    # is the beacon's: it is the only process that knows an attempt
+    # happened, and it is the one artefact meant to outlive the window.
     #
     # NOT under /tmp, and the beacon refuses a /tmp path by name:
     # raccoon-beacon.service and raccoon-implant.service both set

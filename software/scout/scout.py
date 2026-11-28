@@ -170,12 +170,15 @@ class Scout(object):
         # None before the first one is seen. `_window_turned` is where it
         # matters and why.
         self._window = None
-        # Whether this process has cleaned up after a window at least
-        # once. A process that *starts* holding a borrow file and a
-        # document -- from a window it never saw open, which is what a
-        # reboot of a healthy implant looks like -- has `_window` None
-        # for ever, so the transition it would forget on never happens.
-        # The first healthy poll of a process's life counts as one.
+        # Whether there is nothing of a window left to clean up. False
+        # at construction and after every publish; True once `_forget`
+        # has run. It replaced a condition on `_window`, which is
+        # in-memory and None in two cases that both matter: a process
+        # that *starts* holding the last outage's files (a reboot of a
+        # healthy implant) and a window with no `opened` stamp at all (a
+        # beacon older than that field). Keyed on "is there anything to
+        # sweep" rather than on "did I watch it close", so all three ways
+        # a window can end reach the same place exactly once.
         self._swept = False
         self._running = True
 
@@ -315,6 +318,9 @@ class Scout(object):
             handoff.write_document(self.state_dir, document)
             handoff.write_borrow(self.state_dir,
                                  self.evidence.as_borrow_fields())
+            # There is something on the disk again, so the next time this
+            # loop finds no window it has work to do. See `run`.
+            self._swept = False
         except (OSError, ValueError) as exc:
             logger.warning(
                 "scout: nothing could be published to %s (%s), so the beacon "
@@ -590,26 +596,28 @@ class Scout(object):
                 # which this arm cannot see at all. `_window_turned` has
                 # that story.
                 #
-                # **On a transition, and on the first poll of this
-                # process.** This arm runs every 30 s for the whole life
-                # of a healthy implant, and `_forget` re-reads the bridge
-                # -- a `bridge fdb show` **subprocess** -- and unlinks two
-                # files: on every poll that was 2,880 process spawns a
-                # day on a 13 W device, against this loop's own stated
-                # cost of one `read_state` per interval.
+                # **Once per window, and not once per poll.** This arm
+                # runs every 30 s for the whole life of a healthy implant,
+                # and `_forget` re-reads the bridge -- a `bridge fdb show`
+                # **subprocess** -- and unlinks two files: on every poll
+                # that was 2,880 process spawns a day on a 13 W device,
+                # against this loop's own stated cost of one `read_state`
+                # per interval.
                 #
-                # But "a transition this process watched" is not the only
-                # way a window ends. A reboot of a *healthy* implant
-                # leaves the last outage's files on the disk and starts a
-                # scout that never sees a window at all -- so a captured
-                # proxy password sat there until somebody reimaged the
-                # device, which is the artefact `docs/WAY_OUT.md` tells
-                # the operator to look for first. One sweep per process
-                # start, which is one subprocess and not 2,880.
-                if self._window is not None or not self._swept:
+                # `_swept` and not `_window`, because "a transition this
+                # process watched" is only one of three ways a window
+                # ends. A reboot of a *healthy* implant leaves the last
+                # outage's files and starts a scout that never sees a
+                # window -- so a captured proxy password sat there until
+                # somebody reimaged the device, which is the artefact
+                # `docs/WAY_OUT.md` tells the operator to look for first.
+                # And a window with no `opened` stamp never moves
+                # `_window` at all, so on the condition this replaced
+                # only the *first* such window was ever swept.
+                if not self._swept:
                     self._forget()
                     self._window = None
-                self._swept = True
+                    self._swept = True
                 self._sleep(min(interval, 30))
 
     def _sleep(self, seconds: float) -> None:
