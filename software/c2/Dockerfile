@@ -186,7 +186,26 @@ COPY software/__init__.py ./software/
 COPY software/c2/ ./software/c2/
 ENV PYTHONPATH=/opt/raccoon-c2
 
-RUN mkdir -p /data/raccoon-c2
+# The image's default is unprivileged, and the agent image has had this
+# right from the start with the same reasoning: this container holds the
+# beacon encryption key and the operator token, and it runs commands on a
+# C2 for a living -- there is no reason for it to be root as well.
+#
+# What it cannot do is give up root *and* keep Responder. That needs raw
+# sockets, and Docker's `cap_add` adds to the bounding set rather than to
+# a non-root process's effective one, so NET_RAW does not reach this user.
+# So the default here is unprivileged and `docker-compose.yml` -- the
+# documented way to run this, and the one that grants NET_RAW -- asks for
+# root in one line a reader can see, with Responder named beside it. The
+# difference that makes is not arithmetic: privilege stops being the
+# default nobody chose.
+#
+# Everything the server writes lives under RACCOON_DATA: the state file,
+# the SQLite database and logs/. The chown is what lets a named volume
+# take that ownership when it is first mounted.
+RUN useradd --create-home --shell /usr/sbin/nologin raccoon \
+    && mkdir -p /data/raccoon-c2 \
+    && chown -R raccoon:raccoon /data/raccoon-c2 /opt/raccoon-c2
 
 ENV RACCOON_PORT=8443 \
     RACCOON_HOST=0.0.0.0 \
@@ -200,5 +219,9 @@ VOLUME ["/data/raccoon-c2"]
 
 COPY software/c2/docker-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# Last, after every apt, pip, pipx and git step: a USER above them would
+# break the build rather than harden the image. A test holds that order.
+USER raccoon
 
 ENTRYPOINT ["/entrypoint.sh"]

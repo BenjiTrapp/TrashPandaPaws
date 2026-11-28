@@ -444,6 +444,94 @@ class RdpDoesNotHardcodeOneBinaryName(unittest.TestCase):
             "move to freerdp3 without breaking RDP silently")
 
 
+class TheShippedImageDoesNotRunAsRootByDefault(unittest.TestCase):
+    """The image's own default user, and where privilege is asked for.
+
+    The agent image has had this right from the start and says why in a
+    comment: it holds an API key and the C2 token and runs commands on a
+    C2 for a living, so there is no reason for it to be root as well. The
+    server image held the same credential, ran the same commands, and had
+    no `USER` directive at all.
+
+    What it cannot do is give up root *and* keep Responder: that needs raw
+    sockets, and Docker does not put `cap_add` capabilities into a
+    non-root process's effective set. So the image's default is
+    unprivileged and the compose service -- the documented way to run
+    this, and the one that grants NET_RAW for Responder -- asks for root
+    explicitly, in one line a reader can see and delete. That is the
+    difference this makes: privilege stops being the default nobody chose.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.image = _text(DOCKERFILE)
+        cls.instructions = _instructions(DOCKERFILE)
+        cls.compose = _text(COMPOSE)
+
+    def test_the_image_declares_a_non_root_user(self):
+        users = re.findall(r"^\s*USER\s+(\S+)", self.instructions, re.M)
+        self.assertTrue(users, "the shipped image has no USER directive, so "
+                               "its default is root")
+        for user in users:
+            self.assertNotIn(user, ("root", "0", "0:0"),
+                             "the USER directive names root")
+
+    def test_the_user_exists_and_owns_what_the_server_writes(self):
+        user = re.findall(r"^\s*USER\s+(\S+)",
+                          self.instructions, re.M)[-1]
+        self.assertRegex(self.instructions,
+                         r"useradd[^\n]*\b%s\b" % re.escape(user),
+                         "the USER directive names an account the image "
+                         "never creates")
+        # Everything the server writes lives under RACCOON_DATA: the state
+        # file, the database and logs/. Without the chown the container
+        # starts and dies on the first write.
+        self.assertRegex(self.instructions,
+                         r"chown[^\n]*/data/raccoon-c2",
+                         "nothing hands the data directory to that user")
+
+    def test_the_user_directive_comes_after_everything_it_installs(self):
+        # A USER before the apt and pip steps would break the build rather
+        # than harden the image.
+        position = self.instructions.rindex("USER ")
+        for earlier in ("apt-get install", "pipx install", "git clone"):
+            self.assertLess(self.instructions.rindex(earlier), position,
+                            "%r runs after the USER directive" % earlier)
+
+    def test_the_compose_service_asks_for_root_in_one_visible_line(self):
+        # Responder needs raw sockets and `cap_add` does not reach a
+        # non-root process, so the service that grants NET_RAW is the one
+        # that has to run as root. The point is that it says so.
+        service = self.compose.split("raccoon-c2:", 1)[1].split(
+            "\n  agent:", 1)[0]
+        self.assertRegex(service, r"\n\s+user:\s*[\"']?0",
+                         "the compose service grants NET_RAW and does not "
+                         "say that it runs as root")
+        self.assertIn("NET_RAW", service)
+        flat = " ".join(service.split())
+        self.assertRegex(flat, r"(?i)responder",
+                         "nothing beside that line names what needs the "
+                         "privilege")
+
+    def test_the_listeners_are_still_unprivileged(self):
+        # They were already right, and this change must not read as
+        # permission to make them match the server.
+        for name in ("raccoon-listener-smb", "raccoon-listener-quic",
+                     "raccoon-listener-dns"):
+            block = self.compose.split(name + ":", 1)[1][:600]
+            with self.subTest(service=name):
+                self.assertIn("65534:65534", block)
+                self.assertIn("cap_drop", block)
+
+    def test_the_entrypoint_says_which_tools_need_root(self):
+        entrypoint = _text(C2 / "docker-entrypoint.sh")
+        flat = " ".join(entrypoint.split())
+        self.assertRegex(flat, r"(?i)root",
+                         "the banner does not mention privilege at all, so "
+                         "an operator running unprivileged finds out from "
+                         "Responder failing")
+
+
 class CiBuildsAndStartsTheImage(unittest.TestCase):
     """Some workflow must build this image. Which file is not the point.
 

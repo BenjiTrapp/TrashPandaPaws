@@ -11,6 +11,14 @@ services:
       dockerfile: software/c2/Dockerfile
     container_name: raccoon-c2
     restart: unless-stopped
+    # Root, asked for here rather than baked into the image, and this line
+    # is the whole decision. The image's own default user is `raccoon`;
+    # Responder needs raw sockets, and `cap_add` below adds NET_RAW to the
+    # container's bounding set and not to a non-root process's effective
+    # one, so an unprivileged user cannot use it. Delete this line and the
+    # team server, the GUI, the API and every Impacket tool still work --
+    # Responder and a raw-socket `nmap -sS` are what stop.
+    user: "0:0"
     network_mode: host
     volumes:
       - raccoon-data:/data/raccoon-c2

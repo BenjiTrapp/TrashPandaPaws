@@ -53,7 +53,7 @@ or an HP network printer to blend into enterprise infrastructure.
 | **SMBLoot** | Pure-Python SMB2 browser for remote share enumeration, file read, and download — no impacket on target |
 | **Automated Attack** | Optional LLM agent mode inside the operator GUI: eight-phase campaigns, a gate where eight irreversible actions are refused outright and eleven are asked about every time, fail-closed scope, a provider chain so one dead key does not end a run, and a Markdown report with every finding's proof basis and every refusal |
 | **Two listening sockets** | The agent endpoint (`--port`, `8443`) and the operator interface (`--operator-port`, `8444`, loopback only) are separate sockets, and the server decides by the socket a request arrived on, not by its path — so a request arriving on the agent side **cannot** reach the interface or the `/api/*` routes. A valid operator token does not help it, and neither does anything else: it gets the same cover reply as an unrecognised request. The token is never served in the page either; the GUI asks for it once. See [`docs/REDIRECTOR.md`](docs/REDIRECTOR.md) for putting a redirector in front of it |
-| **What is still open** | A hardening pass closed most of what an audit of the C2 found. What it did not close is written down, grouped by consequence, in *Known limits* in [`docs/AGENT.md`](docs/AGENT.md#known-limits) — and for the ten of those the code can answer for, a test fails if one is fixed and its entry left in the list |
+| **What is still open** | A hardening pass closed most of what an audit of the C2 found. What it did not close is written down, grouped by consequence, in *Known limits* in [`docs/AGENT.md`](docs/AGENT.md#known-limits) — and for the nine of those the code can answer for, a test fails if one is fixed and its entry left in the list |
 
 ## Architecture
 
@@ -843,6 +843,16 @@ pre-installed: Impacket, Lsassy, RelayKing, Responder and NetExec. The
 start-up banner lists what is actually present rather than what is intended,
 so read it rather than this paragraph. It runs with `network_mode: host` and
 `NET_RAW`/`NET_ADMIN` capabilities (required for Responder).
+
+The image's own default user is **not root** — it is `raccoon`, as the
+agent image's has always been. The compose service asks for root in one
+line (`user: "0:0"`), because Responder needs raw sockets and `cap_add`
+adds NET_RAW to the container's bounding set rather than to a non-root
+process's effective one. Delete that line and the team server, the GUI,
+the API and every Impacket tool still work; Responder and a raw-socket
+`nmap -sS` are what stop. The start-up banner says which of the two it
+is, so an operator who dropped the line does not learn it from Responder
+failing.
 
 The Debian release in that tag is deliberate. The image used to say
 `python:3.12-slim`, which moved from Debian 12 to Debian 13 underneath it;

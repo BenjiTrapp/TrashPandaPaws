@@ -555,13 +555,6 @@ def _the_replay_cache_is_bounded_by_count():
                 and nonce_of(first) not in srv.crypto.seen_envelopes)
 
 
-def _the_server_image_is_root_with_net_admin():
-    image = _read("software", "c2", "Dockerfile")
-    compose = _read("software", "c2", "docker-compose.yml")
-    return (not re.search(r"^\s*USER\s", image, re.M)
-            and "NET_ADMIN" in compose and "/tmp/.X11-unix" in compose)
-
-
 def _file_browser_names_reach_onclick_strings():
     text = _read("software", "c2", "server.py")
     return bool(re.search(
@@ -753,7 +746,6 @@ _OPEN_FINDINGS = {
         ("it cannot pin", _the_beacon_cannot_pin_a_certificate),
         ("bounded by a count, not by a clock",
          _the_replay_cache_is_bounded_by_count),
-        ("server image runs as root", _the_server_image_is_root_with_net_admin),
     ],
     "Would stop a release": [
         ("handler-body injections", _file_browser_names_reach_onclick_strings),

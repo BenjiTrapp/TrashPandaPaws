@@ -118,6 +118,15 @@ done
 python3 -c "import impacket" 2>/dev/null && _present="${_present} impacket"
 python3 -c "import lsassy" 2>/dev/null && _present="${_present} lsassy"
 echo -e "${D}  │${N}  ${C}Tools${N}   ${W}${_present# }${N}"
+# Who this is, because the image's default user is `raccoon` and two of
+# the tools above need raw sockets. An operator who dropped the
+# `user: "0:0"` line from docker-compose.yml would otherwise find out
+# from Responder failing, which says nothing about why.
+if [ "$(id -u)" = "0" ]; then
+  echo -e "${D}  │${N}  ${C}User${N}    ${W}root${N} ${D}(Responder and nmap -sS can use NET_RAW)${N}"
+else
+  echo -e "${D}  │${N}  ${C}User${N}    ${W}$(id -un)${N} ${Y}— not root: Responder and nmap -sS cannot open raw sockets${N}"
+fi
 echo -e "${D}  └──────────────────────────────────────────────┘${N}"
 echo ""
 

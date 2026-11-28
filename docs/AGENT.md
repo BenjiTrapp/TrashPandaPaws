@@ -1153,11 +1153,6 @@ more.
   same decision as [the implant
   id](#would-stop-a-release), and both are the operator's. The cache is
   also per running server: a restart forgets it, as it forgets `results`.
-- **The server image runs as root.** `software/c2/Dockerfile` has no `USER`
-  directive, and the compose file grants `NET_ADMIN` and mounts the host's
-  X11 socket. The agent image gets this right and says why in a comment; the
-  server image holds the same credential and is the one running the
-  commands.
 
 #### Would stop a release
 
