@@ -8853,16 +8853,24 @@ function fbRenderList(){
     if(ftype && !isDir) html += '<span class="ftype '+esc(ftype)+'">'+esc(ftype)+'</span>';
     html += '<span class="size">'+esc(sizeStr)+'</span>'
       +'<span class="mtime">'+esc(mtime)+'</span>';
+    // No name in an attribute. A directory entry's name comes from the
+    // target's file system, and an `onclick` is a JavaScript string inside
+    // an HTML attribute: the HTML parser decodes `&#39;` before the
+    // JavaScript parser sees it, so `esc` could not help here and the
+    // backslash the old code added was itself never escaped. The path
+    // rides in `data-fb-path`, where it is only ever text, and
+    // `fbBindActions` below attaches the handler.
     html += '<span class="actions">';
     if(isDir){
-      html += '<button onclick="event.stopPropagation();fbLootDir(\''+esc(fullPath.replace(/'/g,"\\'"))+'\')">&#128142;</button>';
+      html += '<button data-fb-act="loot" data-fb-path="'+esc(fullPath)+'">&#128142;</button>';
     } else {
-      html += '<button onclick="event.stopPropagation();fbDownloadFile(\''+esc(fullPath.replace(/'/g,"\\'"))+'\')">&#11015;</button>'
-        +'<button onclick="event.stopPropagation();document.getElementById(\'cmd-input\').value=\'cat '+esc(fullPath)+'\';document.getElementById(\'cmd-input\').focus()">&#128065;</button>';
+      html += '<button data-fb-act="download" data-fb-path="'+esc(fullPath)+'">&#11015;</button>'
+        +'<button data-fb-act="cat" data-fb-path="'+esc(fullPath)+'">&#128065;</button>';
     }
     html += '</span>';
     html += '<span class="perm">'+esc(f.mode||"")+'</span>';
     entry.innerHTML = html;
+    fbBindActions(entry);
 
     entry.onclick = e => {
       if(e.target.closest(".actions")) return;
@@ -8896,18 +8904,50 @@ function fbShowDetail(f, fullPath){
   if(f.is_link) html += '<span class="fd-lbl">Link</span><span class="fd-val warn">→ '+esc(f.link_target||"?")+'</span>';
   if(f.type==="cert") html += '<span class="fd-lbl">⚠</span><span class="fd-val warn">Certificate / Key file</span>';
   html += '</div>';
-  const ep = esc(fullPath.replace(/'/g,"\\'"));
+  const ep = esc(fullPath);
   html += '<div class="fd-actions">';
   if(f.is_dir){
-    html += '<button class="fd-btn loot" onclick="fbLootDir(\''+ep+'\')">&#128142; Loot (zip)</button>';
-    html += '<button class="fd-btn" onclick="fbLoadDir(\''+ep+'\')">&#128194; Open</button>';
+    html += '<button class="fd-btn loot" data-fb-act="loot" data-fb-path="'+ep+'">&#128142; Loot (zip)</button>';
+    html += '<button class="fd-btn" data-fb-act="open" data-fb-path="'+ep+'">&#128194; Open</button>';
   } else {
-    html += '<button class="fd-btn dl" onclick="fbDownloadFile(\''+ep+'\')">&#11015; Download</button>';
-    html += '<button class="fd-btn" onclick="document.getElementById(\'cmd-input\').value=\'cat '+ep+'\';document.getElementById(\'cmd-input\').focus()">&#128065; View</button>';
+    html += '<button class="fd-btn dl" data-fb-act="download" data-fb-path="'+ep+'">&#11015; Download</button>';
+    html += '<button class="fd-btn" data-fb-act="cat" data-fb-path="'+ep+'">&#128065; View</button>';
   }
-  html += '<button class="fd-btn up" onclick="fbUploadTo(\''+ep+'\')">&#11014; Upload here</button>';
+  html += '<button class="fd-btn up" data-fb-act="upload" data-fb-path="'+ep+'">&#11014; Upload here</button>';
   html += '</div>';
   detail.innerHTML = html;
+  fbBindActions(detail);
+}
+
+// One handler per container, attached after the markup is in the DOM, and
+// the only place that turns a `data-fb-act` into a call. The path is read
+// with `dataset`, which hands back the text the attribute holds and never
+// parses it -- which is the whole point of the change: there is no
+// context in which a file name is code.
+const FB_ACTIONS = {
+  loot: path => fbLootDir(path),
+  open: path => fbLoadDir(path),
+  download: path => fbDownloadFile(path),
+  upload: path => fbUploadTo(path),
+  cat: path => {
+    const input = document.getElementById("cmd-input");
+    if(!input) return;
+    input.value = "cat " + path;
+    input.focus();
+  },
+};
+
+function fbBindActions(root){
+  if(!root) return;
+  root.querySelectorAll("[data-fb-act]").forEach(el => {
+    el.onclick = ev => {
+      // The entry row has its own click handler for selection; the
+      // buttons used to stop propagation inline.
+      ev.stopPropagation();
+      const act = FB_ACTIONS[el.dataset.fbAct];
+      if(act) act(el.dataset.fbPath || "");
+    };
+  });
 }
 
 function fbDownloadFile(path){
@@ -10705,14 +10745,25 @@ async function showLootViewer(){
       html += '<div class="loot-item">'
         + '<span class="loot-ico">'+icon+'</span>'
         + '<div class="loot-info">'
-        + '<a class="loot-name" href="#" onclick="event.preventDefault();lootSave(\''+esc(dlUrl)+'\',\''+esc(item.filename)+'\')">'+esc(item.filename)+'</a>'
+        + '<a class="loot-name" href="#" data-loot-url="'+esc(dlUrl)+'" data-loot-name="'+esc(item.filename)+'">'+esc(item.filename)+'</a>'
         + '<span class="loot-meta">'+esc(item.agent_id)+' &middot; '+sizeStr+(item.type==="download"?" &middot; download":"")+'</span>'
         + '</div>'
-        + '<button class="loot-dl" onclick="lootSave(\''+esc(dlUrl)+'\',\''+esc(item.filename)+'\')" title="Download">⬇</button>'
+        + '<button class="loot-dl" data-loot-url="'+esc(dlUrl)+'" data-loot-name="'+esc(item.filename)+'" title="Download">⬇</button>'
         + '</div>';
     });
     html += '</div>';
     panel.innerHTML = html;
+    // The same shape as the file browser's, and for the same reason. A
+    // loot file's name is flattened to [A-Za-z0-9._-] when it is written,
+    // so this list was reachable only through a file written before that
+    // change -- but "only reachable through old data" is not a property
+    // worth keeping when the fix is one listener.
+    panel.querySelectorAll("[data-loot-url]").forEach(el => {
+      el.onclick = ev => {
+        ev.preventDefault();
+        lootSave(el.dataset.lootUrl, el.dataset.lootName);
+      };
+    });
   } catch(e) {
     panel.innerHTML = '<h2>&#128142; Loot Vault</h2><p class="loot-empty">Error loading loot: '+esc(e.message)+'</p>';
   }
@@ -10738,10 +10789,11 @@ function fbUpdateTree(){
   if(!tree) return;
   const dirs = fbData.filter(e => e.is_dir).sort((a,b) => a.name.localeCompare(b.name));
   fbTreeDirs[fbPath] = dirs.map(d => d.name);
-  let html = '<div class="fb-tree-node'+(fbPath==="/"?" active":"")+'" onclick="fbLoadDir(\'/\')">'
+  let html = '<div class="fb-tree-node'+(fbPath==="/"?" active":"")+'" data-fb-act="open" data-fb-path="/">'
     +'<span class="t-ico">💻</span><span class="t-name">/</span></div>';
   html += fbBuildTreeHTML("/", 0);
   tree.innerHTML = html;
+  fbBindActions(tree);
 }
 
 function fbBuildTreeHTML(path, depth){
@@ -10753,7 +10805,7 @@ function fbBuildTreeHTML(path, depth){
     const full = path.endsWith("/") ? path+name : path+"/"+name;
     const isActive = fbPath === full;
     const hasChildren = fbTreeDirs[full];
-    html += '<div class="fb-tree-node'+(isActive?" active":"")+'" onclick="fbLoadDir(\''+esc(full.replace(/'/g,"\\'"))+'\')">'
+    html += '<div class="fb-tree-node'+(isActive?" active":"")+'" data-fb-act="open" data-fb-path="'+esc(full)+'">'
       +'<span class="t-ico">'+(hasChildren?"📂":"📁")+'</span>'
       +'<span class="t-name">'+esc(name)+'</span></div>';
     if(hasChildren) html += fbBuildTreeHTML(full, depth+1);
@@ -11911,11 +11963,21 @@ function showNxcMenu(btn){
   menu.className = "nxc-menu";
   let html = '<div class="nxc-title">NetExec Scans</div>';
   html += '<div class="nxc-section">Subnet Discovery</div>';
-  html += '<button onclick="nxcRun(\'smb\',\''+esc(subnet)+'\',\'\')">SMB hosts (signing, OS)</button>';
-  html += '<button onclick="nxcRun(\'rdp\',\''+esc(subnet)+'\',\'\')">RDP hosts (NLA, screenshot)</button>';
-  html += '<button onclick="nxcRun(\'winrm\',\''+esc(subnet)+'\',\'\')">WinRM hosts</button>';
-  html += '<button onclick="nxcRun(\'ssh\',\''+esc(subnet)+'\',\'\')">SSH hosts</button>';
-  html += '<button onclick="nxcRun(\'mssql\',\''+esc(subnet)+'\',\'\')">MSSQL instances</button>';
+  // `subnet` is derived from `pivotScanData`, which is scan output the
+  // beacon reported from the target network -- so it is a target-controlled
+  // string in a JavaScript literal inside an attribute, the same shape as
+  // the file browser's names. Found by the test written for those; the
+  // audit's finding named the file browser and the loot list and not this.
+  // One data attribute per button, bound below.
+  const subnetScans = [["smb", "SMB hosts (signing, OS)"],
+                       ["rdp", "RDP hosts (NLA, screenshot)"],
+                       ["winrm", "WinRM hosts"],
+                       ["ssh", "SSH hosts"],
+                       ["mssql", "MSSQL instances"]];
+  subnetScans.forEach(([proto, label]) => {
+    html += '<button data-nxc-proto="'+esc(proto)+'" data-nxc-target="'
+      + esc(subnet)+'">'+label+'</button>';
+  });
   html += '<div class="nxc-section">Enumeration (select host)</div>';
   html += '<div class="nxc-host-pick"><select id="nxc-target">';
   if(!hosts.length) html += '<option value="">No hosts discovered</option>';
@@ -11933,6 +11995,9 @@ function showNxcMenu(btn){
   html += '<div class="nxc-custom"><input id="nxc-custom-args" placeholder="e.g. smb 10.0.0.0/24 --gen-relay-list /tmp/r.txt" style="width:100%"><button onclick="nxcCustomRun()">Run</button></div>';
   html += '<div class="nxc-note">Requires nxc/netexec on beacon host</div>';
   menu.innerHTML = html;
+  menu.querySelectorAll("[data-nxc-proto]").forEach(el => {
+    el.onclick = () => nxcRun(el.dataset.nxcProto, el.dataset.nxcTarget, "");
+  });
   btn.parentElement.appendChild(menu);
   document.addEventListener("click", function closeNxc(e){
     if(!e.target.closest("#nxc-menu") && !e.target.closest("[onclick*=showNxcMenu]")){

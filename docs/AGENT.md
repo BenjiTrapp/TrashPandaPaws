@@ -1156,18 +1156,6 @@ more.
 
 #### Would stop a release
 
-- **`on*` handler-body injections remain, in the file browser.** A
-  directory-entry name that a beacon reports from the target's file system
-  reaches a JavaScript string literal inside an `onclick` attribute: the
-  download, loot and `cat` buttons and the directory tree, in the operator
-  page in `server.py`. The escaping helper escapes `'` as `&#39;`, which does
-  not help there, because the HTML parser decodes it before the JavaScript
-  parser sees it; and the sites that put a backslash before `'` never escape
-  the backslash. The loot list has the same shape, but names are flattened to
-  `[A-Za-z0-9._-]` when they are written, so it is reachable only through a
-  file written before that change. The fix is to attach handlers in
-  JavaScript instead of building them as strings. That is a GUI refactor,
-  which is why it was scoped out. Read from the code, not run in a browser.
 - **Nothing is pinned.** All four requirements files
   (`software/requirements.txt`, `software/agent/requirements.txt`,
   `tools/requirements.txt` and `software/tests/requirements.txt`) use lower

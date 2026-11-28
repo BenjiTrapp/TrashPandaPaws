@@ -555,12 +555,6 @@ def _the_replay_cache_is_bounded_by_count():
                 and nonce_of(first) not in srv.crypto.seen_envelopes)
 
 
-def _file_browser_names_reach_onclick_strings():
-    text = _read("software", "c2", "server.py")
-    return bool(re.search(
-        r"""onclick="[^"\n]*\\'\s*'\s*\+\s*esc\(full""", text))
-
-
 def _nothing_is_pinned():
     reqs = [_read("software", "requirements.txt"),
             _read("software", "agent", "requirements.txt"),
@@ -748,7 +742,6 @@ _OPEN_FINDINGS = {
          _the_replay_cache_is_bounded_by_count),
     ],
     "Would stop a release": [
-        ("handler-body injections", _file_browser_names_reach_onclick_strings),
         ("Nothing is pinned", _nothing_is_pinned),
         ("`ldap3` is old", _ldap3_is_still_declared_by_impacket),
         ("`vnc_password`", _the_shipped_config_carries_a_vnc_password),
