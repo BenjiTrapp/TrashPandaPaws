@@ -656,7 +656,7 @@ class TestTheCopiesAreHeldTogether(WayOutCase):
             return found
 
         third_party = ("scapy", "requests", "flask", "cryptography",
-                       "aiohttp", "croniter", "numpy", "netifaces")
+                       "aiohttp", "croniter", "numpy")
         module_level = roots(tree.body)
         anywhere = roots(ast.walk(tree))
         for name in third_party + ("software", "yaml"):

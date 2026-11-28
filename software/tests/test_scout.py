@@ -744,7 +744,7 @@ class TestItBringsNothingNewToInstall(unittest.TestCase):
                  for line in implant.splitlines()
                  if line.split("#", 1)[0].strip()]
         self.assertEqual(sorted(names),
-                         ["colorama", "cryptography", "dnspython", "netifaces",
+                         ["colorama", "cryptography", "dnspython",
                           "numpy", "pyaudio", "pyyaml", "requests", "scapy"])
 
 

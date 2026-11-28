@@ -285,5 +285,75 @@ class TestTheRepositoryFiles(unittest.TestCase):
         self.assertEqual(disagreements(self.files), {})
 
 
+class TestNetifacesIsGone(unittest.TestCase):
+    """The implant's dependency surface no longer declares what nothing uses.
+
+    `netifaces` 0.11.0 is its last release, from May 2021, and being a C
+    extension it breaks on a new CPython rather than merely ageing -- so on
+    the implant it was a build failure waiting for an upgrade. It was
+    declared in `software/requirements.txt`, demanded by the two cover
+    launchers' `REQUIRED_PKGS`, and imported **nowhere**: measured by
+    walking every tracked `.py` for an import of it, which is what this
+    test keeps doing.
+
+    `ldap3` is a different answer and stays: the server image and the start
+    scripts install it by name, but `impacket` 0.13.1 declares it as a
+    dependency, so removing those lines would not remove it from the image.
+    Its last stable release is 2.9.1 (July 2021) with release candidates
+    since, the newest in April 2026 -- slow rather than abandoned, which is
+    softer than "unmaintained", and the Known-limits entry says only that
+    now.
+
+    What is **not** closed, and is out of this work's reach:
+    `hardware/tests/firstboot_test.sh` checks for `netifaces` among the
+    modules it expects on a provisioned device. That file is under
+    `hardware/`, which nothing here may change, and its list was already
+    stale in the same way before this -- it also checks for `pyroute2`,
+    which `software/requirements.txt` has never declared.
+    """
+
+    def test_it_is_not_declared_for_the_implant(self):
+        text = (REPO / "software" / "requirements.txt").read_text()
+        self.assertNotIn("netifaces", text)
+
+    def test_no_cover_launcher_demands_it(self):
+        for name in ("start_cisco_phone.sh", "start_hp_printer.sh"):
+            text = (REPO / "software" / "cover" / name).read_text()
+            with self.subTest(launcher=name):
+                self.assertNotIn("netifaces", text)
+
+    def test_nothing_in_the_tree_imports_it(self):
+        # The claim the removal rests on, re-measured rather than trusted.
+        import ast
+
+        offenders = []
+        for path in (REPO / "software").rglob("*.py"):
+            if {".venv", "site-packages"} & set(path.parts):
+                continue
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError:                        # pragma: no cover
+                continue
+            for node in ast.walk(tree):
+                names = []
+                if isinstance(node, ast.Import):
+                    names = [a.name.split(".")[0] for a in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                    names = [(node.module or "").split(".")[0]]
+                if "netifaces" in names:
+                    offenders.append("%s:%d" % (path, node.lineno))
+        self.assertEqual(offenders, [],
+                         "netifaces is imported after all, so removing it "
+                         "from the implant's requirements breaks those")
+
+    def test_ldap3_is_still_declared_and_the_reason_is_recorded(self):
+        image = (REPO / "software" / "c2" / "Dockerfile").read_text()
+        self.assertIn("ldap3", image)
+        limits = (REPO / "docs" / "AGENT.md").read_text()
+        self.assertIn("impacket", limits,
+                      "Known limits no longer says why removing the ldap3 "
+                      "lines would not remove it from the image")
+
+
 if __name__ == "__main__":
     unittest.main()

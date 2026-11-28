@@ -91,7 +91,7 @@ echo -e "${G}  [✓]${N} ${W}Venv${N}            ${D}$VENV_DIR${N}"
 # ── Dependencies ──
 $PYTHON -m pip install --upgrade pip --quiet 2>/dev/null || true
 
-REQUIRED_PKGS="pyyaml netifaces scapy"
+REQUIRED_PKGS="pyyaml scapy"
 MISSING=""
 for pkg in $REQUIRED_PKGS; do
     if ! $PYTHON -c "import ${pkg//-/_}" 2>/dev/null; then

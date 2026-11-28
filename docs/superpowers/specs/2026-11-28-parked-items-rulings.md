@@ -196,7 +196,28 @@ Of those four:
   defect. The fix belongs with whoever next touches that fixture. — If
   wrong, a module run stays noisy.
 
-## 10. The gsocket leg, the egress decider, and the deferred minors
+## 10. `netifaces`, and the one place that still names it
+
+**Fixed, with a residual that is out of reach.** `netifaces` was declared
+in `software/requirements.txt`, demanded by both cover launchers'
+`REQUIRED_PKGS`, and imported nowhere -- re-measured by walking every
+tracked module under `software/`. Removed from all three; the implant's
+dependency surface went from nine lines to eight.
+
+`hardware/tests/firstboot_test.sh` still checks for it among the modules
+it expects on a provisioned device. **Ruled: left, and named.** That file
+is under `hardware/`, which this work may not change, and its list was
+already stale in the same way -- it also checks for `pyroute2`, which
+`software/requirements.txt` has never declared. Nothing has ever run it,
+because no device has ever been built. — If wrong, a first-boot test that
+has never been run reports one more module as missing.
+
+`ldap3` is the half a fix could not reach and the Known-limits entry is
+cut down to it: the image installs it by name *and* would get it anyway
+through `impacket`, so those lines are redundant rather than
+load-bearing, and removing them would change nothing.
+
+## 11. The gsocket leg, the egress decider, and the deferred minors
 
 These are not parked items: they are *Known limits* entries with their own
 section in `docs/AGENT.md`, each written as a property of an arrangement

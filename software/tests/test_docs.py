@@ -547,9 +547,18 @@ def _nothing_is_pinned():
             and len(moving) >= 3)
 
 
-def _the_old_dependencies_are_still_declared():
-    return ("netifaces" in _read("software", "requirements.txt")
-            and "ldap3" in _read("software", "c2", "Dockerfile"))
+def _ldap3_is_still_declared_by_impacket():
+    """Only the half of that finding that a fix could not reach.
+
+    `netifaces` was the removable half and is gone from the three places
+    under `software/` that named it; `test_requirements_floors.py` holds it
+    gone and re-measures that nothing imports it. `ldap3` stays, because
+    `impacket` declares it: the image installs it by name *and* would get
+    it anyway, so the lines are redundant rather than load-bearing and
+    removing them changes nothing. Open while that is true.
+    """
+    return ("ldap3" in _read("software", "c2", "Dockerfile")
+            and "netifaces" not in _read("software", "requirements.txt"))
 
 
 def _the_shipped_config_carries_a_vnc_password():
@@ -703,7 +712,7 @@ _OPEN_FINDINGS = {
     "Would stop a release": [
         ("handler-body injections", _file_browser_names_reach_onclick_strings),
         ("Nothing is pinned", _nothing_is_pinned),
-        ("Two dependencies", _the_old_dependencies_are_still_declared),
+        ("`ldap3` is old", _ldap3_is_still_declared_by_impacket),
         ("`vnc_password`", _the_shipped_config_carries_a_vnc_password),
         ("implant id is one per host", _a_beacons_implant_id_is_one_per_host),
     ],

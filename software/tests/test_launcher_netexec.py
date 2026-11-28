@@ -232,9 +232,11 @@ class TestTheImplantProvisioningIsHonestAboutNxc(unittest.TestCase):
                 self.assertNotIn(name.lower()[:7], ("netexec", "aardwol"))
         self.assertEqual(
             len([ln for ln in text.splitlines()
-                 if ln.split("#", 1)[0].strip()]), 9,
+                 if ln.split("#", 1)[0].strip()]), 8,
             "software/requirements.txt changed size; it is the implant's "
-            "whole dependency surface and the one file that must not grow")
+            "whole dependency surface and the one file that must not grow. "
+            "It went from nine to eight when netifaces left, which nothing "
+            "imported")
 
 
 if __name__ == "__main__":

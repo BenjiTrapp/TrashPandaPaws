@@ -1163,17 +1163,24 @@ more.
   pinned because `python:3.12-slim` had already moved from Debian 12 to
   13, taking `freerdp2-x11` with it and breaking the build on every
   architecture. The dependencies above are still unpinned.
-- **Two dependencies are old, and neither is imported here.** `netifaces`
-  0.11.0 (May 2021) is its last release, and being a C extension it breaks on
-  new CPython rather than merely ageing. Nothing in the repository imports it:
-  it is declared in `software/requirements.txt`, listed as required by the two
-  cover launchers, and checked by the first-boot test, so it can probably go,
-  from those four places. `ldap3`'s last stable release is 2.9.1 (July 2021),
-  with only release candidates of 2.10.2 since, the newest in April 2026: slow
-  rather than abandoned, which is softer than "effectively unmaintained". The
-  server image and the start scripts install it by name, but `impacket` 0.13.1
-  declares it as a dependency, so removing those lines would not remove it
-  from the image.
+- **`ldap3` is old, and cannot be removed from the image.** Its last stable
+  release is 2.9.1 (July 2021), with only release candidates of 2.10.2 since,
+  the newest in April 2026: slow rather than abandoned, which is softer than
+  "effectively unmaintained". The server image and the start scripts install
+  it by name, but `impacket` 0.13.1 declares it as a dependency, so removing
+  those lines would not remove it from the image. Nothing here imports it
+  either; it is `impacket`'s to drop.
+
+  This entry used to name `netifaces` as well, and that half is **closed**:
+  it was declared in `software/requirements.txt`, demanded by the two cover
+  launchers, and imported nowhere — measured by walking every tracked
+  module — so it is gone from all three, and the implant's dependency
+  surface went from nine lines to eight. One place still names it and is
+  out of reach: `hardware/tests/firstboot_test.sh` checks for it among the
+  modules it expects on a provisioned device. That list was already stale
+  in the same way — it also checks for `pyroute2`, which
+  `software/requirements.txt` has never declared — and nothing has ever run
+  it, because no device has ever been built.
 - **A beacon's implant id is one per host, not one per implant.**
   `_generate_id` hashes `platform.node()` and `platform.machine()`, plus the
   eth0 MAC where that file exists. So two implants on one machine register as
