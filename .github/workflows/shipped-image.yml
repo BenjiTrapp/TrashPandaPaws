@@ -55,7 +55,14 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            # Pinned, like ci.yml's two jobs. This one floated on
+            # `ubuntu-latest` while the arm64 row beside it named a
+            # release, and a floating runner is how this repository's CI
+            # already changed underneath it once (ce6a73e). This job needs
+            # no particular Python, so the specific failure cannot repeat
+            # -- but the pattern is the scar, and the asymmetry with the
+            # row below was the recorded leftover.
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     # The apt step alone pulls ~140 MB and the NetExec install compiles,
