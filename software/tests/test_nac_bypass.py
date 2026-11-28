@@ -559,6 +559,213 @@ class TestConfigureNetwork(unittest.TestCase):
         mock_rq.assert_any_call("dhclient -nw br0")
 
 
+class TestStopCanActuallyStopIt(unittest.TestCase):
+    """`stop()` sets a flag, and the sequence has to read it.
+
+    It did not. `start()` spawns a thread; `_run_sequence` forwards
+    EAPOL, sleeps, and then discovers the downstream host with a tcpdump
+    that runs for up to a minute **after** the MAC is known -- and then
+    applied the rewrite rules whatever had happened in between. So a
+    caller that stopped the bypass during discovery had the rules
+    applied afterwards anyway, on the identity it had just refused.
+
+    The way out's rung 4 restore is that caller: it refuses a host the
+    arithmetic never priced, logs "nac_bypass has been stopped", and
+    calls `stop()`. Driven with the real sequence here rather than a fake
+    whose `stop()` appends to a list, because "stop was called" is a fact
+    about this process and "the MAC did not move" is a fact about the
+    kernel.
+    """
+
+    def driven(self, nac, ran, stop_during_capture=False):
+        """Replace only the shell, and record every command."""
+        def run_quiet(command, *_args, **_kwargs):
+            ran.append(command)
+            return _completed()
+
+        def run(command, *_args, **_kwargs):
+            ran.append(command)
+            if stop_during_capture and "tcpdump" in command:
+                # What the caller does while the capture is running: the
+                # MAC is about to be known and the identity refused.
+                nac._running = False
+            # Enough for `_discover_via_arp` to learn a victim and a
+            # gateway from one capture.
+            if "tcpdump" in command:
+                return _completed(stdout=(
+                    "aa:bb:cc:dd:ee:ff > ff:ff:ff:ff:ff:ff, "
+                    "Request who-has 10.0.0.254 tell 10.0.0.9\n"
+                    "11:22:33:44:55:66 > aa:bb:cc:dd:ee:ff, "
+                    "Reply 10.0.0.254 is-at 11:22:33:44:55:66\n"))
+            return _completed()
+
+        # And the kernel's answer about the bridge's own address, which
+        # `apply_rewrite_rules` now reads back rather than assuming.
+        return (patch("software.nac_bypass._run_quiet", run_quiet),
+                patch("software.nac_bypass._run", run),
+                patch("software.nac_bypass.time.sleep", lambda _s: None),
+                patch.object(type(nac), "_bridge_mac",
+                             lambda self: self.victim_mac))
+
+    def test_a_stop_during_discovery_leaves_the_mac_where_it_was(self):
+        # The sharp case, and the one the way out's rung 4 restore
+        # creates: the sequence is *inside* its capture when the caller
+        # refuses the identity, so discovery completes and learns a MAC
+        # either way. What may not happen is the rules going in.
+        nac = _make_nac()
+        ran = []
+        patchers = self.driven(nac, ran, stop_during_capture=True)
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        nac._running = True
+        nac._run_sequence()
+
+        self.assertTrue([command for command in ran if "tcpdump" in command],
+                        "discovery never ran, so this test is not about the "
+                        "check after it")
+        self.assertEqual(nac.victim_mac, "aa:bb:cc:dd:ee:ff",
+                         "the MAC was not learned, so there was nothing to "
+                         "refuse")
+        moved = [command for command in ran
+                 if "link set dev br0 address" in command]
+        self.assertEqual(moved, [],
+                         "the bridge's MAC was changed after the caller "
+                         "stopped the bypass: %r" % (ran,))
+        self.assertEqual([command for command in ran if "snat" in command],
+                         [])
+        self.assertNotEqual(nac._phase, "active")
+
+    def test_a_stop_before_discovery_does_not_even_capture(self):
+        # The cheaper check, and a separate one: a bypass stopped while
+        # it was still waiting out the host's 802.1X exchange should not
+        # spend a minute of tcpdump on a port it has been told to leave
+        # alone.
+        nac = _make_nac()
+        ran = []
+        patchers = self.driven(nac, ran)
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        nac._running = False
+        nac._run_sequence()
+
+        self.assertEqual([command for command in ran if "tcpdump" in command],
+                         [], "discovery ran after the bypass was stopped")
+        self.assertIsNone(nac.victim_mac)
+
+    def test_stop_clears_the_flag_the_sequence_reads(self):
+        # The link the two halves hang on, and it had no test: the
+        # restore's refusal calls `stop()`, `stop()` clears `_running`,
+        # and the sequence reads it. Deleting one line of `stop()`
+        # reinstated the whole defect with the suite green.
+        nac = _make_nac()
+        nac.victim_mac = "aa:bb:cc:dd:ee:ff"
+        nac.implant_mac = "11:22:33:44:55:66"
+        with patch("software.nac_bypass._run_quiet", lambda *a, **k:
+                   _completed()), \
+                patch("software.nac_bypass._run", lambda *a, **k:
+                      _completed()):
+            nac._running = True
+            nac.stop()
+        self.assertFalse(nac._running,
+                         "stop() left the sequence believing it may "
+                         "continue")
+
+    def test_a_sequence_nobody_stopped_still_applies_its_rules(self):
+        # The other half, so the guard cannot be "do nothing ever".
+        nac = _make_nac()
+        ran = []
+        patchers = self.driven(nac, ran)
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        nac._running = True
+        nac._run_sequence()
+
+        self.assertTrue([command for command in ran
+                         if "link set dev br0 address" in command],
+                        "the sequence took nothing at all: %r" % (ran,))
+        self.assertEqual(nac._phase, "active")
+
+
+class TestThePhaseIsWhatTheKernelAgreesTo(unittest.TestCase):
+    """"active" is a claim about the bridge, so the bridge is asked.
+
+    Every command in `apply_rewrite_rules` goes through `_run_quiet`,
+    which discards its exit status -- a missing `ip`, a kernel that
+    refuses the address, an interface that would not come up, all of them
+    looked like success -- and `_phase` was set to "active" before the
+    first of them. The way out's rung 4 reads that phase as its one
+    durable statement that the switch has seen the MAC move, so it would
+    have recorded an irreversible move that never happened and armed a
+    restore that re-runs the sequence at every boot with no outage and no
+    arithmetic.
+    """
+
+    def ran(self, nac, mac):
+        recorded = []
+
+        def run_quiet(command, *_args, **_kwargs):
+            recorded.append(command)
+            return _completed()
+
+        patchers = (patch("software.nac_bypass._run_quiet", run_quiet),
+                    patch.object(type(nac), "_bridge_mac", lambda _self: mac))
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return recorded
+
+    def test_a_bridge_that_took_the_address_is_active(self):
+        nac = _make_nac()
+        nac.victim_mac = "aa:bb:cc:dd:ee:ff"
+        nac.implant_mac = "11:22:33:44:55:66"
+        self.ran(nac, "aa:bb:cc:dd:ee:ff")
+
+        nac.apply_rewrite_rules()
+
+        self.assertEqual(nac._phase, "active")
+
+    def test_a_bridge_that_did_not_is_not(self):
+        nac = _make_nac()
+        nac.victim_mac = "aa:bb:cc:dd:ee:ff"
+        nac.implant_mac = "11:22:33:44:55:66"
+        self.ran(nac, "11:22:33:44:55:66")
+
+        nac.apply_rewrite_rules()
+
+        self.assertNotEqual(nac._phase, "active",
+                            "the phase says the host's identity was taken "
+                            "and the bridge still has this implant's own "
+                            "address")
+
+    def test_a_bridge_that_cannot_be_read_is_not_either(self):
+        nac = _make_nac()
+        nac.victim_mac = "aa:bb:cc:dd:ee:ff"
+        nac.implant_mac = "11:22:33:44:55:66"
+        self.ran(nac, None)
+
+        nac.apply_rewrite_rules()
+
+        self.assertNotEqual(nac._phase, "active")
+
+    def test_it_reads_a_real_address_lower_cased(self):
+        nac = _make_nac()
+        with patch("software.nac_bypass.open",
+                   mock_open(read_data="AA:BB:CC:DD:EE:FF\n"),
+                   create=True):
+            self.assertEqual(nac._bridge_mac(), "aa:bb:cc:dd:ee:ff")
+
+    def test_a_bridge_with_no_sysfs_entry_reads_as_none(self):
+        nac = _make_nac(config=_make_config())
+        nac.bridge = "no-such-bridge-here"
+        self.assertIsNone(nac._bridge_mac())
+
+
 class TestStatus(unittest.TestCase):
     def test_status_returns_all_fields(self):
         nac = _make_nac()

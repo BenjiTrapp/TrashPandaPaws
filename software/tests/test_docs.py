@@ -3586,7 +3586,17 @@ class TestTheWayOutIsDocumentedAndShipsOff(unittest.TestCase):
                 ("the beacon never calls the model", "reads a file",
                  "that the beacon does not wait for the model"),
                 ("the credentials live in a", "never in the document",
-                 "where a captured secret is kept")):
+                 "where a captured secret is kept"),
+                ("the scout is the only thing that deletes it",
+                 "when the window closes",
+                 "who removes the captured password"),
+                ("a scout that is killed", "until somebody reimages",
+                 "what happens to it when the scout dies"),
+                ("three things are **not** bound", "gsocket carrier",
+                 "that the carrier does not take the radio's bind"),
+                ("not** a time box on the association",
+                 "rollback is the one thing that disassociates",
+                 "what ends the radio association")):
             with self.subTest(anchor=anchor):
                 self.claim(anchor, says, what)
 

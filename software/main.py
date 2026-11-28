@@ -137,7 +137,7 @@ def way_out_identity_poller(config):
     # the one-second loop below. One attempt per run, whichever of the two
     # reasons brought it about, so a failure is not retried every second.
     attempt = {"started": False, "bypass": None, "at": 0.0,
-               "restoring": False}
+               "restoring": False, "was": None}
     # How long the sequence is given to become active. It forwards EAPOL,
     # waits ten seconds for the host's own 802.1X exchange, and then
     # listens for the downstream host to speak -- a host that is asleep
@@ -173,6 +173,7 @@ def way_out_identity_poller(config):
             return None
         attempt["started"] = True
         attempt["restoring"] = restoring
+        attempt["was"] = trigger.identity_taken() if restoring else None
         logger.warning(
             "The way out's rung 4 %s: starting nac_bypass, which forwards "
             "EAPOL and then originates this implant's traffic as the "
@@ -225,8 +226,29 @@ def way_out_identity_poller(config):
         in, and `victim_mac` is the address they are built from.
         """
         bypass = attempt["bypass"]
-        taken = (getattr(bypass, "_phase", "") == "active"
-                 and bool(getattr(bypass, "victim_mac", "")))
+        found = getattr(bypass, "victim_mac", "") or ""
+        # **And the same host, on a restore.** The sequence re-discovers
+        # the downstream host rather than restoring a remembered one, so
+        # a laptop swapped between two boots would have been a *new*
+        # irreversible move -- on a port already latched to the first
+        # address, a second one is what a port-security violation is, and
+        # the one-shot means there is nothing left to try. Checked as soon
+        # as the MAC is known, which is two steps before the rules go in.
+        if (attempt["was"] and found
+                and found.strip().lower() != attempt["was"]):
+            attempt["bypass"] = None
+            logger.error(
+                "The way out's rung 4 was taken as %s, and the host on the "
+                "port now is %s: that is a different identity and taking it "
+                "would be a second irreversible move the arithmetic never "
+                "priced. nac_bypass has been stopped and the record is "
+                "unchanged.", attempt["was"], found)
+            try:
+                bypass.stop()
+            except Exception as exc:
+                logger.error("nac_bypass could not be stopped: %s", exc)
+            return None
+        taken = (getattr(bypass, "_phase", "") == "active" and bool(found))
         if taken:
             attempt["bypass"] = None
             # Written on a restore as well as on the first take, because
@@ -236,7 +258,7 @@ def way_out_identity_poller(config):
             # failure path below.
             trigger.taken(
                 "nac_bypass took %s, the downstream host's identity"
-                % getattr(bypass, "victim_mac", "?"), started=True)
+                % (found or "?"), started=True, victim_mac=found)
             logger.warning(
                 "The way out's rung 4 is active: this implant's traffic now "
                 "leaves as %s.", getattr(bypass, "victim_mac", "?"))

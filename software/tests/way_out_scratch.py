@@ -24,10 +24,12 @@ The bench's `_scratch` is the same function as this one, and the design's
 `## Measurements` records that finding. This file is the test suite
 finally learning it.
 
-The other half of the lesson is `assert_live` below: a helper that hands
-back a beacon or a scout **asserts that the feature is on**, so a
-harness that disables it again fails loudly instead of quietly checking
-nothing.
+The other half of the lesson is `assert_live` below: every helper that
+hands back a **beacon** with `c2.way_out` enabled asserts that the reader
+accepted it, so a harness that disables the feature again fails loudly
+instead of quietly checking nothing. There is deliberately no scout
+equivalent: `Scout` is handed its `state_dir` directly and never consults
+`read_way_out_policy`, so there is no refusal for it to hide.
 """
 
 import os

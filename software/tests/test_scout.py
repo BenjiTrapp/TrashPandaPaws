@@ -759,6 +759,163 @@ class TestWhatItCostsWhileTheImplantIsDark(ScoutCase):
         # duty cycle on the 13 W device this cost control exists for.
         self.assertAlmostEqual(slept[0], 450.0 - 15, delta=1.0)
 
+    def test_the_model_block_is_the_one_the_beacons_reader_gives(self):
+        # Two processes disagreed about one block: `model: {enabled: true,
+        # name: ...}` with no `endpoint` is a legal configuration the
+        # beacon's reader completes with the default loopback endpoint,
+        # and this side read the raw yaml -- so the whole stage was dead
+        # and the only log line blamed an endpoint of `''`, which the
+        # operator never wrote.
+        scout = self.scout(config=_config(c2={
+            "way_out": {"enabled": True, "state_dir": self.root,
+                        "model": {"enabled": True, "name": "qwen2.5:0.5b"}}}))
+        block = scout._model_block()
+
+        self.assertTrue(block["enabled"])
+        self.assertEqual(block["name"], "qwen2.5:0.5b")
+        self.assertEqual(block["endpoint"], "http://127.0.0.1:11434")
+        self.assertIn("timeout_seconds", block)
+
+    def test_a_healthy_implant_costs_one_sweep_and_then_nothing(self):
+        # The claim in `run`'s own docstring, and it was wrong by a
+        # subprocess per poll: the healthy arm called `_forget` every
+        # time, which re-reads the bridge with a `bridge fdb show` child
+        # and unlinks two files -- 2,880 spawns a day on a 13 W device,
+        # on the one process whose design rationale is that a periodic
+        # command is its own detection signature.
+        #
+        # One sweep, though, and not zero: a process that starts holding
+        # the last outage's files has no transition to forget on. See
+        # `test_a_restarted_scout_sweeps_the_last_outages_files`.
+        scout = self.scout()
+        ran = []
+        polls = []
+        with mock.patch.object(scout, "_run",
+                               lambda argv, **k: ran.append(argv) or (0, "")), \
+                mock.patch.object(scout, "_sleep",
+                                  lambda seconds: polls.append(seconds)
+                                  or (len(polls) >= 4 and scout.stop())):
+            scout.run(interval=300.0)
+
+        self.assertEqual(len(polls), 4)
+        self.assertEqual(len(ran), 1,
+                         "a healthy implant forked once per poll: %r"
+                         % (ran,))
+
+    def test_a_second_window_is_swept_as_well_as_the_first(self):
+        # The branch that matters in production, and the one the
+        # condition this replaced did not cover: a long-lived scout
+        # watching its *second* window close. Every test of "the window
+        # closed, so the files go" ran on a scout whose first sweep had
+        # not happened yet, so the first-poll sweep covered them all.
+        scout = self.scout()
+        polls = []
+
+        def two_polls(seconds):
+            polls.append(seconds)
+            if len(polls) >= 2:
+                scout.stop()
+
+        for number in (1, 2):
+            with self.subTest(window=number):
+                scout._running = True
+                del polls[:]
+                self.stuck(opened=time.time() + number)
+                scout.publish_once()
+                self.assertTrue(
+                    os.path.exists(handoff.borrow_path(self.root)))
+
+                handoff.remove(handoff.state_path(self.root))
+                with mock.patch.object(scout, "_sleep", two_polls):
+                    scout.run(interval=300.0)
+
+                self.assertFalse(
+                    os.path.exists(handoff.borrow_path(self.root)),
+                    "window %d's files survived its close" % number)
+                self.assertFalse(
+                    os.path.exists(handoff.document_path(self.root)))
+
+    def test_an_unstamped_window_is_swept_every_time_as_well(self):
+        # A beacon older than the `opened` field, which `handoff.py`'s own
+        # version rationale says is the case to plan for: `_window_turned`
+        # returns early on it, so `_window` never moves and the condition
+        # this replaced swept only the *first* such window, ever.
+        scout = self.scout()
+        polls = []
+
+        def two_polls(seconds):
+            polls.append(seconds)
+            if len(polls) >= 2:
+                scout.stop()
+
+        for number in (1, 2):
+            with self.subTest(window=number):
+                scout._running = True
+                del polls[:]
+                handoff.write_private_json(handoff.state_path(self.root), {
+                    "version": handoff.STATE_VERSION,
+                    "touched": time.time(), "stuck_cycles": 2,
+                    "evidence": {}})
+                scout.publish_once()
+                self.assertTrue(
+                    os.path.exists(handoff.borrow_path(self.root)))
+
+                handoff.remove(handoff.state_path(self.root))
+                with mock.patch.object(scout, "_sleep", two_polls):
+                    scout.run(interval=300.0)
+
+                self.assertFalse(
+                    os.path.exists(handoff.borrow_path(self.root)),
+                    "unstamped window %d's files survived" % number)
+
+    def test_a_restarted_scout_sweeps_the_last_outages_files(self):
+        # The ordinary trigger is a **reboot of a healthy implant**: both
+        # units come back, the beacon starts with no outage, no window is
+        # ever opened -- and the previous outage's borrow file, with a
+        # third party's cleartext proxy password in it, sat 0600 on a
+        # device built to look like an IP phone until somebody reimaged
+        # it. The document went with it: the host's MAC, IP, proxies,
+        # resolvers and the SSIDs in range. `_window` is in-memory, so
+        # the transition this used to wait for never came.
+        first = self.scout()
+        self.stuck()
+        first.publish_once()
+        self.assertTrue(os.path.exists(handoff.borrow_path(self.root)))
+        handoff.remove(handoff.state_path(self.root))     # a leg delivered
+
+        restarted = self.scout()
+        polls = []
+        with mock.patch.object(restarted, "_sleep",
+                               lambda seconds: polls.append(seconds)
+                               or (len(polls) >= 3 and restarted.stop())):
+            restarted.run(interval=300.0)
+
+        self.assertFalse(os.path.exists(handoff.borrow_path(self.root)),
+                         "a captured password survived the restart")
+        self.assertFalse(os.path.exists(handoff.document_path(self.root)))
+
+    def test_a_window_that_ends_is_forgotten_once_and_not_per_poll(self):
+        scout = self.scout()
+        self.stuck()
+        scout.publish_once()
+        self.assertTrue(os.path.exists(handoff.borrow_path(self.root)))
+        handoff.remove(handoff.state_path(self.root))
+
+        ran = []
+        polls = []
+        with mock.patch.object(scout, "_run",
+                               lambda argv, **k: ran.append(argv) or (0, "")), \
+                mock.patch.object(scout, "_sleep",
+                                  lambda seconds: polls.append(seconds)
+                                  or (len(polls) >= 3 and scout.stop())):
+            scout.run(interval=300.0)
+
+        self.assertEqual(len(polls), 3)
+        self.assertEqual(len(ran), 1,
+                         "the bridge was re-read on every poll of a closed "
+                         "window: %r" % (ran,))
+        self.assertFalse(os.path.exists(handoff.borrow_path(self.root)))
+
     def test_the_scan_interval_is_the_publishing_interval_at_least(self):
         # `max` and not `min`: a short publishing interval must not buy a
         # short scan interval, because the scan is the part that is

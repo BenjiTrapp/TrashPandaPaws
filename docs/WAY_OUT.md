@@ -145,10 +145,12 @@ routes this implant's own traffic through it. Three bounds, all in code:
   quite enough for the hungriest USB peripherals.
 - **A deadline per command**, because this runs on the beacon's own thread
   and a `dhclient` that never returned would cost the implant its loop.
-  It is **not** a time box on the association: nothing here disassociates,
-  so once this rung succeeds the implant stays on that network until the
-  device is restarted. The design said "a time-boxed association"; that
-  was not built, and this is the limit instead.
+  It is **not** a time box on the association: nothing *times out* of the
+  network, so once this rung succeeds the implant stays on it until the
+  device is restarted or the rung is rolled back — a rollback is the one
+  thing that disassociates, and it runs only when a step of the rung
+  fails. The design said "a time-boxed association"; that was not built,
+  and this is the limit instead.
 - **A scoped route, never the default one.** The route goes into table `100`
   with a source rule for the address DHCP gave, so the host's own default
   route is untouched. DHCP runs with `-sf /bin/true` and the lease is parsed
@@ -165,10 +167,14 @@ routes this implant's own traffic through it. Three bounds, all in code:
   the beacon composes itself leave by the leased address — and they keep
   doing so after a leg delivers, because a leg delivering while the bind
   holds is the moment this rung is *working*. A rollback is what unbinds.
-  The two exceptions are named rather than implied: a forward to
-  `127.0.0.1` is not bound, because its peer is on this host and no source
-  rule can match it; and `wpad` name lookups during proxy discovery go
-  through the system resolver, which takes no source address.
+  Three things are **not** bound, and they are named rather than implied: a
+  forward to `127.0.0.1`, because its peer is on this host and no source
+  rule can match it; `wpad` name lookups during proxy discovery, which go
+  through the system resolver and it takes no source address; and the
+  gsocket carrier, because `gs-netcat` is a **child process** and a
+  parent cannot bind its sockets — so `egress gsocket` while the radio
+  holds a lease starts a relay that dials out of the tapped port. The
+  verb says so in its answer.
 
 Repeating the rung is the ordinary case — no verb tests its own result — so
 `ip addr replace` and `ip route replace` are used rather than `add`, and the
@@ -382,9 +388,14 @@ cat /opt/raccoon/state/way_out_trail.jsonl
 
 The trail holds no password: a line names the verb, its argument, the rung
 and the gate's numbers. The one file that *does* hold one — a proxy
-credential the scout took off the wire — is `way_out_borrow.json`, and the
-scout removes it when the window closes, so a captured password does not
-outlive the outage it was captured for.
+credential the scout took off the wire — is `way_out_borrow.json`, and **the
+scout is the only thing that deletes it**: it does so when the window
+closes, so in the ordinary case a captured password does not outlive the
+outage it was captured for. A scout that is killed, OOM-killed or whose
+unit gave up leaves that file on the disk until somebody reimages the
+device, and the beacon's own guard against replaying it — a capture older
+than the open window — is written precisely because that happens. If you
+pull a device for any reason, that file is the one to look for.
 
 **What this puts on the implant's disk**, under `state_dir`, 0600 in a 0700
 directory — six files and not the "two" an earlier draft of this page

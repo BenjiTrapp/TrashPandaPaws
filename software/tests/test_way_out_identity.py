@@ -327,11 +327,13 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
         class FakeBypass(object):
             def __init__(self, config):
                 self._phase = "idle"
+                self._running = False
                 self.victim_mac = None
                 log.append(config)
                 case.last = self
 
             def start(self):
+                self._running = True
                 self._phase = "discovery"
                 log.append("start")
 
@@ -342,10 +344,22 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
 
             def become_active(self):
                 self.discover()
+                # As the real sequence does: a bypass that has been
+                # stopped applies nothing. The fake used to go active
+                # regardless, so "stop was called" was all the restore
+                # test could assert -- a fact about this process where
+                # the fact needed is about the kernel.
+                if self._running:
+                    self._phase = "active"
+
+            def become_active_as(self, mac):
+                """A different host on the port: a swapped laptop."""
+                self.victim_mac = mac
                 self._phase = "active"
 
             def stop(self):
                 log.append("stop")
+                self._running = False
                 self._phase = "idle"
 
         return FakeBypass
@@ -371,6 +385,82 @@ class TestMainStartsTheBypassOnRequest(IdentityCase):
             self.last.become_active()
             self.assertIsNotNone(poller())
         self.assertTrue(IdentityTrigger(self.state).was_started())
+
+    def test_a_restore_that_finds_a_different_host_takes_nothing(self):
+        # The restore runs the whole sequence again, and that sequence
+        # *re-discovers* the downstream host -- it takes whatever speaks
+        # on the port now. A laptop swapped between two boots would
+        # therefore have been a new irreversible move, on a host nothing
+        # priced, repeated at every boot, with the record of the one that
+        # *was* priced overwritten. On a port already latched to the
+        # first address, a second one is what a port-security violation
+        # is, and the one-shot means there is nothing left to try.
+        from software import main as main_mod
+        from software import nac_bypass as nac_mod
+        from software.scout.trigger import IdentityTrigger
+        self.beacon()._exec_egress("identity")
+        log = []
+
+        with mock.patch.object(nac_mod, "NACBypass", self.fake(log)):
+            first = main_mod.way_out_identity_poller(self.config())
+            first()
+            self.last.become_active()
+            self.assertIsNotNone(first())
+            taken = self.request()
+
+            restarted = main_mod.way_out_identity_poller(self.config())
+            self.assertIsNone(restarted())
+            self.last.become_active_as("de:ad:be:ef:00:01")
+            self.assertIsNone(restarted(),
+                              "a different host's identity was taken as a "
+                              "restore")
+
+        self.assertIn("stop", log, "the bypass was left running on the "
+                                   "wrong identity")
+        # And the stop *took*: the fake honours `_running` the way the
+        # real sequence does now, so a refusal that only logged would
+        # leave this phase active.
+        self.assertNotEqual(self.last._phase, "active")
+        self.assertFalse(self.last._running)
+        self.assertEqual(self.request()["detail"], taken["detail"])
+        self.assertEqual(self.request()["victim_mac"], "aa:bb:cc:dd:ee:ff")
+        self.assertEqual(IdentityTrigger(self.state).identity_taken(),
+                         "aa:bb:cc:dd:ee:ff")
+
+    def test_a_restore_of_the_same_host_is_allowed(self):
+        from software import main as main_mod
+        from software import nac_bypass as nac_mod
+        self.beacon()._exec_egress("identity")
+        log = []
+
+        with mock.patch.object(nac_mod, "NACBypass", self.fake(log)):
+            first = main_mod.way_out_identity_poller(self.config())
+            first()
+            self.last.become_active()
+            first()
+
+            restarted = main_mod.way_out_identity_poller(self.config())
+            self.assertIsNone(restarted())
+            self.last.become_active()
+            self.assertIsNotNone(restarted())
+        self.assertEqual(self.request()["victim_mac"], "aa:bb:cc:dd:ee:ff")
+
+    def test_a_record_with_no_mac_at_all_does_not_block_a_restore(self):
+        # A request written by a build older than the field. Refusing
+        # every restore on it would lose the identity on the first
+        # upgrade, which is the cost this whole path exists to avoid.
+        from software import main as main_mod
+        from software import nac_bypass as nac_mod
+        from software.scout.trigger import IdentityTrigger
+        self.beacon()._exec_egress("identity")
+        IdentityTrigger(self.state).taken("it was started", started=True)
+        self.assertIsNone(IdentityTrigger(self.state).identity_taken())
+
+        with mock.patch.object(nac_mod, "NACBypass", self.fake([])):
+            poller = main_mod.way_out_identity_poller(self.config())
+            self.assertIsNone(poller())
+            self.last.become_active_as("de:ad:be:ef:00:01")
+            self.assertIsNotNone(poller())
 
     def test_a_sequence_that_takes_nothing_is_recorded_as_a_failure(self):
         # The defect this two-step exists for: `start()` returning was

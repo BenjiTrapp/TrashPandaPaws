@@ -96,6 +96,27 @@ class IdentityTrigger(object):
             return False
         return True
 
+    def identity_taken(self) -> Optional[str]:
+        """The MAC an earlier run actually took, or None. Raises nothing.
+
+        **Which host**, and not only whether. The restore path runs the
+        whole sequence again, and that sequence *re-discovers* the
+        downstream host -- it takes whatever speaks on the port now. So
+        `started: true` alone would make a swapped laptop, a re-cabled
+        desk or a visitor's machine into a **new** irreversible move: on
+        a port already latched to the first host, a second address is
+        what a port-security violation is, and the one-shot latch means
+        the implant has no further moves. Recorded here so the restore
+        can refuse a host nothing priced.
+        """
+        if not self._ours(self.path) or not self._ours(self.state_dir):
+            return None
+        request = handoff.read_document_at(self.path, handoff.STATE_VERSION)
+        if request is None or request.get("started") is not True:
+            return None
+        mac = request.get("victim_mac")
+        return mac if isinstance(mac, str) and mac else None
+
     def was_started(self) -> bool:
         """Whether an earlier run of this process actually started it.
 
@@ -126,7 +147,8 @@ class IdentityTrigger(object):
             return False
         return request.get("started") is True
 
-    def taken(self, detail: str, started: bool = False) -> None:
+    def taken(self, detail: str, started: bool = False,
+              victim_mac: str = "") -> None:
         """Close the request, recording what happened. Raises nothing.
 
         `detail` is read by whoever recovers the device: "the bypass was
@@ -143,6 +165,11 @@ class IdentityTrigger(object):
             request = {"version": handoff.STATE_VERSION}
         request["taken"] = time.time()
         request["started"] = bool(started)
+        # Which host's identity was taken, so a restore can refuse a
+        # different one. Kept rather than overwritten with "" by a later
+        # write, because it is the record of an irreversible move.
+        if victim_mac:
+            request["victim_mac"] = str(victim_mac).strip().lower()
         request["detail"] = " ".join(str(detail).split())
         try:
             handoff.write_private_json(self.path, request)

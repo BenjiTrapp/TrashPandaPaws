@@ -170,6 +170,16 @@ class Scout(object):
         # None before the first one is seen. `_window_turned` is where it
         # matters and why.
         self._window = None
+        # Whether there is nothing of a window left to clean up. False
+        # at construction and after every publish; True once `_forget`
+        # has run. It replaced a condition on `_window`, which is
+        # in-memory and None in two cases that both matter: a process
+        # that *starts* holding the last outage's files (a reboot of a
+        # healthy implant) and a window with no `opened` stamp at all (a
+        # beacon older than that field). Keyed on "is there anything to
+        # sweep" rather than on "did I watch it close", so all three ways
+        # a window can end reach the same place exactly once.
+        self._swept = False
         self._running = True
 
     # ── the question the loop asks ──
@@ -308,6 +318,9 @@ class Scout(object):
             handoff.write_document(self.state_dir, document)
             handoff.write_borrow(self.state_dir,
                                  self.evidence.as_borrow_fields())
+            # There is something on the disk again, so the next time this
+            # loop finds no window it has work to do. See `run`.
+            self._swept = False
         except (OSError, ValueError) as exc:
             logger.warning(
                 "scout: nothing could be published to %s (%s), so the beacon "
@@ -404,7 +417,20 @@ class Scout(object):
         return ask(model, state, tap)
 
     def _model_block(self) -> dict:
-        return _block(self.config, "c2", "way_out", "model")
+        """The model block as the **reader** gives it, defaults included.
+
+        This read the raw yaml, so the two processes disagreed about one
+        block: `model: {enabled: true, name: "qwen2.5:0.5b"}` is a legal
+        configuration the beacon's reader completes with the default
+        loopback endpoint, and this side saw no endpoint at all -- so the
+        whole stage was dead and the only log line blamed an endpoint of
+        `''`, which the operator never wrote. The scout may import the
+        beacon; `model.py` already does, for `EGRESS_VERBS`.
+        """
+        from software.c2.beacon import read_way_out_policy
+
+        return read_way_out_policy(_block(self.config, "c2", "way_out"))\
+            .get("model") or {}
 
     # ── the trail is not here ──
     #
@@ -569,8 +595,29 @@ class Scout(object):
                 # a window that turned over between two of these polls,
                 # which this arm cannot see at all. `_window_turned` has
                 # that story.
-                self._forget()
-                self._window = None
+                #
+                # **Once per window, and not once per poll.** This arm
+                # runs every 30 s for the whole life of a healthy implant,
+                # and `_forget` re-reads the bridge -- a `bridge fdb show`
+                # **subprocess** -- and unlinks two files: on every poll
+                # that was 2,880 process spawns a day on a 13 W device,
+                # against this loop's own stated cost of one `read_state`
+                # per interval.
+                #
+                # `_swept` and not `_window`, because "a transition this
+                # process watched" is only one of three ways a window
+                # ends. A reboot of a *healthy* implant leaves the last
+                # outage's files and starts a scout that never sees a
+                # window -- so a captured proxy password sat there until
+                # somebody reimaged the device, which is the artefact
+                # `docs/WAY_OUT.md` tells the operator to look for first.
+                # And a window with no `opened` stamp never moves
+                # `_window` at all, so on the condition this replaced
+                # only the *first* such window was ever swept.
+                if not self._swept:
+                    self._forget()
+                    self._window = None
+                    self._swept = True
                 self._sleep(min(interval, 30))
 
     def _sleep(self, seconds: float) -> None:
