@@ -733,6 +733,42 @@ class TestTheRadioVerb(RadioCase):
         self.assertEqual(beacon._proxy_session.headers, headers)
         self.assertIsNone(beacon._proxy_session.source_address)
 
+    def test_the_borrow_verbs_refuse_while_the_radio_holds_a_lease(self):
+        # Round five stopped the bind from *carrying* a borrowed proxy
+        # onto the radio. This is the same defect from the other side:
+        # nothing stopped a `credential` rule from putting one there
+        # afterwards, and that is the ordinary climb -- rung 2 crosses at
+        # hour 1, the window closes only when a leg **delivers**, so a
+        # radio that associates and still cannot reach the team server
+        # leaves the candidate walk running every cycle with rung 2 at
+        # the top of it. The captured credential would then be offered to
+        # whatever answers at an RFC1918 address on the guest network.
+        beacon = self.beacon(tap=self.open_ssid(),
+                             borrow={"credentials": [A_CREDENTIAL],
+                                     "portal": A_PORTAL})
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._exec_egress("radio")
+
+        for task in ("credential", "portal"):
+            with self.subTest(task=task):
+                answer = beacon._exec_egress(task)
+                self.assertIn("[error]", answer)
+                self.assertIn("own radio", answer)
+                self.assertIn("192.168.9.42", answer)
+        self.assertEqual(beacon._proxy_session.proxies, {})
+        self.assertEqual(beacon._proxy_session.headers, {})
+
+    def test_they_work_again_once_the_rung_is_rolled_back(self):
+        beacon = self.beacon(tap=self.open_ssid(),
+                             borrow={"credentials": [A_CREDENTIAL]})
+        self.onboard(beacon)
+        self.radio(beacon)
+        beacon._exec_egress("radio")
+        beacon._radio_rollback("wlan0", "192.168.9.42", "a test")
+
+        self.assertNotIn("[error]", beacon._exec_egress("credential"))
+
     def test_a_second_radio_attempt_does_not_lose_the_stash(self):
         # Repeating the rung is the ordinary case -- no verb tests its own
         # result -- so the second attempt must not re-stash the empty
@@ -747,6 +783,13 @@ class TestTheRadioVerb(RadioCase):
 
         beacon._exec_egress("radio")
         beacon._exec_egress("radio")
+        # And the second bind leaves the radio's own session as bare as
+        # the first did: nothing of the tapped path, and the
+        # environment's proxies still off.
+        self.assertEqual(beacon._proxy_session.proxies, {})
+        self.assertEqual(beacon._proxy_session.headers, {})
+        self.assertFalse(beacon._proxy_session.trust_env)
+
         beacon._radio_rollback("wlan0", "192.168.9.42", "a test")
 
         self.assertEqual(beacon._proxy_session.proxies, proxies)
@@ -873,10 +916,11 @@ class TestTheDirectRetryWhenAProxyIsStale(RungCase):
     stopped answering.
     """
 
-    def a_beacon_posting_through(self, proxies):
+    def a_beacon_posting_through(self, proxies, leased="192.168.9.42"):
         """A beacon whose every POST is refused, and what each one used."""
         beacon = self.beacon()
         beacon._registered = True
+        beacon._way_out_source = leased
         # `_init_proxy` runs in `start()`, which these tests do not call.
         beacon._proxy_session = beacon._bound_session()
         beacon._proxy_session.proxies = dict(proxies)
@@ -909,6 +953,19 @@ class TestTheDirectRetryWhenAProxyIsStale(RungCase):
         # twice, which is a second round trip on a monitored network for
         # no new chance of delivery.
         beacon, tried = self.a_beacon_posting_through({})
+
+        beacon._https_post("beacon", {"a": 1})
+
+        self.assertEqual(len(tried), 1)
+
+    def test_a_build_with_no_lease_is_not_retried_either(self):
+        # The gate that keeps this out of every proxied build that never
+        # enabled the way out: ungated, a proxy timeout on an ordinary
+        # cycle produced a direct 443 to the team server on a proxy-only
+        # network -- a blocked-egress log line to a known destination,
+        # once per beacon interval, for ever.
+        beacon, tried = self.a_beacon_posting_through(
+            {"https": "http://10.0.0.1:3128"}, leased="")
 
         beacon._https_post("beacon", {"a": 1})
 

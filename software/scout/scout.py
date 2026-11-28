@@ -404,7 +404,20 @@ class Scout(object):
         return ask(model, state, tap)
 
     def _model_block(self) -> dict:
-        return _block(self.config, "c2", "way_out", "model")
+        """The model block as the **reader** gives it, defaults included.
+
+        This read the raw yaml, so the two processes disagreed about one
+        block: `model: {enabled: true, name: "qwen2.5:0.5b"}` is a legal
+        configuration the beacon's reader completes with the default
+        loopback endpoint, and this side saw no endpoint at all -- so the
+        whole stage was dead and the only log line blamed an endpoint of
+        `''`, which the operator never wrote. The scout may import the
+        beacon; `model.py` already does, for `EGRESS_VERBS`.
+        """
+        from software.c2.beacon import read_way_out_policy
+
+        return read_way_out_policy(_block(self.config, "c2", "way_out"))\
+            .get("model") or {}
 
     # ── the trail is not here ──
     #
@@ -569,8 +582,18 @@ class Scout(object):
                 # a window that turned over between two of these polls,
                 # which this arm cannot see at all. `_window_turned` has
                 # that story.
-                self._forget()
-                self._window = None
+                #
+                # **On the transition only.** This arm runs every 30 s for
+                # the whole life of a healthy implant, and `_forget`
+                # re-reads the bridge -- a `bridge fdb show` **subprocess**
+                # -- and unlinks two files. That was 2,880 process spawns a
+                # day on a 13 W device, on the one process whose stated
+                # cost is "one `read_state` per interval" and whose whole
+                # design rationale is that a periodic command is its own
+                # detection signature.
+                if self._window is not None:
+                    self._forget()
+                    self._window = None
                 self._sleep(min(interval, 30))
 
     def _sleep(self, seconds: float) -> None:

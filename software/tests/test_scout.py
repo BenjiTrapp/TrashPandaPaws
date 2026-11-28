@@ -759,6 +759,66 @@ class TestWhatItCostsWhileTheImplantIsDark(ScoutCase):
         # duty cycle on the 13 W device this cost control exists for.
         self.assertAlmostEqual(slept[0], 450.0 - 15, delta=1.0)
 
+    def test_the_model_block_is_the_one_the_beacons_reader_gives(self):
+        # Two processes disagreed about one block: `model: {enabled: true,
+        # name: ...}` with no `endpoint` is a legal configuration the
+        # beacon's reader completes with the default loopback endpoint,
+        # and this side read the raw yaml -- so the whole stage was dead
+        # and the only log line blamed an endpoint of `''`, which the
+        # operator never wrote.
+        scout = self.scout(config=_config(c2={
+            "way_out": {"enabled": True, "state_dir": self.root,
+                        "model": {"enabled": True, "name": "qwen2.5:0.5b"}}}))
+        block = scout._model_block()
+
+        self.assertTrue(block["enabled"])
+        self.assertEqual(block["name"], "qwen2.5:0.5b")
+        self.assertEqual(block["endpoint"], "http://127.0.0.1:11434")
+        self.assertIn("timeout_seconds", block)
+
+    def test_a_healthy_implant_costs_one_state_read_per_poll(self):
+        # The claim in `run`'s own docstring, and it was wrong by a
+        # subprocess: the healthy arm called `_forget` on every poll,
+        # which re-reads the bridge with a `bridge fdb show` child and
+        # unlinks two files -- 2,880 spawns a day on a 13 W device, on
+        # the one process whose design rationale is that a periodic
+        # command is its own detection signature. Nothing in a window
+        # needs re-reading when there is no window.
+        scout = self.scout()
+        ran = []
+        polls = []
+        with mock.patch.object(scout, "_run",
+                               lambda argv, **k: ran.append(argv) or (0, "")), \
+                mock.patch.object(scout, "_sleep",
+                                  lambda seconds: polls.append(seconds)
+                                  or (len(polls) >= 3 and scout.stop())):
+            scout.run(interval=300.0)
+
+        self.assertEqual(len(polls), 3)
+        self.assertEqual(ran, [], "a healthy implant forked %r" % (ran,))
+
+    def test_a_window_that_ends_is_forgotten_once_and_not_per_poll(self):
+        scout = self.scout()
+        self.stuck()
+        scout.publish_once()
+        self.assertTrue(os.path.exists(handoff.borrow_path(self.root)))
+        handoff.remove(handoff.state_path(self.root))
+
+        ran = []
+        polls = []
+        with mock.patch.object(scout, "_run",
+                               lambda argv, **k: ran.append(argv) or (0, "")), \
+                mock.patch.object(scout, "_sleep",
+                                  lambda seconds: polls.append(seconds)
+                                  or (len(polls) >= 3 and scout.stop())):
+            scout.run(interval=300.0)
+
+        self.assertEqual(len(polls), 3)
+        self.assertEqual(len(ran), 1,
+                         "the bridge was re-read on every poll of a closed "
+                         "window: %r" % (ran,))
+        self.assertFalse(os.path.exists(handoff.borrow_path(self.root)))
+
     def test_the_scan_interval_is_the_publishing_interval_at_least(self):
         # `max` and not `min`: a short publishing interval must not buy a
         # short scan interval, because the scan is the part that is

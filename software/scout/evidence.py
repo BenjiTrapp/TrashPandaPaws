@@ -671,12 +671,21 @@ def _is_local(host: str) -> bool:
     allowed -- a portal usually has one, and this implant cannot resolve
     it to check -- but a public address is not: that is a frame pointing
     the implant at somebody else's URL.
+
+    The digits are checked against ASCII and not with `str.isdigit`,
+    which answers True for Unicode digits: a fullwidth quad would have
+    been read as "a name" here, which is the *safe* answer, so this cost
+    nothing -- but it is the one place `beacon.py::_is_ipv4`'s lesson had
+    not been applied, and a reader comparing the two should not have to
+    work out which way each one fails.
     """
     name = host.split(":", 1)[0].strip().lower().rstrip(".")
     if not name:
         return False
     parts = name.split(".")
-    if not all(part.isdigit() for part in parts) or len(parts) != 4:
+    numeric = all(part and not (set(part) - set("0123456789"))
+                  for part in parts)
+    if not numeric or len(parts) != 4:
         return True            # a name, not an address
     if name.startswith(_PRIVATE_PREFIXES):
         return True

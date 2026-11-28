@@ -217,10 +217,13 @@ def write_private_json(path: str, document: dict) -> None:
 def remove(path: str) -> None:
     """Delete a handoff file if it is there. Raises nothing.
 
-    One production caller: the scout removes the borrow file when a
-    window closes, because that is the one file here that carries a
-    secret and nothing else would ever have removed it. The beacon
-    removes its own window with `Beacon._way_out_clear_state`.
+    One production caller, `Scout._forget`, reached from both places a
+    window can end -- one it watched close and one that turned over
+    between two polls. It removes the borrow file, which is the only one
+    here that carries a secret, and the document, which names the host's
+    MAC, IP, proxies and resolvers; nothing else would ever have removed
+    either. The beacon removes its own window with
+    `Beacon._way_out_clear_state`.
     """
     try:
         os.unlink(path)
