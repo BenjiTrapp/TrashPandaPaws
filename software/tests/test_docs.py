@@ -694,25 +694,6 @@ def _the_sleep_floor_overrides_a_short_interval():
     return bool(slept) and abs(slept[0] - reported) > 0.01
 
 
-def _the_quic_client_trusts_any_sender():
-    """The beacon reassembles datagrams without checking where they came from.
-
-    `_quic_send` reads answers with `recvfrom` and ignores the returned
-    address, so anything that can reach the beacon's source port can
-    inject fragments into a reassembly in progress. The listener cannot
-    compensate: the client is the one that trusts.
-    """
-    text = _read("software", "c2", "beacon.py")
-    start = text.find("def _quic_send")
-    if start < 0:
-        return False
-    body = text[start:start + 4000]
-    uses_recvfrom = "recvfrom(" in body
-    # A fix would compare the address it got against the one it sent to.
-    compares = "addr ==" in body or "address ==" in body or "src ==" in body
-    return uses_recvfrom and not compares
-
-
 def _a_task_delivered_over_dns_stays_pending():
     """`/api/tasks/<id>` answers from `results` alone.
 
@@ -760,8 +741,6 @@ _OPEN_FINDINGS = {
         ("No request-size cap and no rate limiting",
          _there_is_no_size_cap_and_no_rate_limit),
         ("`vnc_password`", _the_shipped_config_carries_a_vnc_password),
-        ("QUIC client accepts fragments from any sender",
-         _the_quic_client_trusts_any_sender),
         ("stays `pending` for ever", _a_task_delivered_over_dns_stays_pending),
         ("implant id is one per host", _a_beacons_implant_id_is_one_per_host),
     ],

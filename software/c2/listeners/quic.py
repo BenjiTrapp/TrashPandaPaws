@@ -13,11 +13,13 @@ Eight bytes of header, not sixteen. The chunk size the beacon sends is
 1200, and its receive buffer is 1500, so an answer datagram must stay
 under that including its own header.
 
-Two details of the client's receive loop shape this module. It ignores the
-stream_id it gets back, and it takes `expected` from whichever datagram it
-last parsed -- so every answer datagram must carry the same total_frags,
-and echoing the request's stream_id costs nothing while making concurrent
-exchanges legible in a capture.
+Two details of the client's receive loop shape this module. It drops an
+answer whose `stream_id` is not the one it sent -- so echoing the
+request's id is required and not a courtesy -- and it takes `expected`
+from whichever datagram it last parsed, so every answer datagram must
+carry the same total_frags. It also drops an answer that did not come from
+the address it sent to, which this module satisfies by replying from the
+socket the request arrived on.
 
 What this module does *not* do is as important as what it does. It does
 not hold the encryption key, so it cannot read or forge beacon traffic. It

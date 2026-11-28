@@ -1045,8 +1045,12 @@ class _SilentUdp:
     def settimeout(self, _):
         pass
 
-    def sendto(self, data, _addr):
+    def sendto(self, data, addr):
+        # The address is kept, not dropped: the client requires an answer to
+        # come from the address it sent to, so a fake that answers from
+        # somewhere else is testing the check rather than the leg.
         self.sent.append(data)
+        self.addressed = addr
 
     def recvfrom(self, _n):
         raise socket.timeout()
@@ -1056,19 +1060,27 @@ class _SilentUdp:
 
 
 class _AnsweringUdp(_SilentUdp):
-    """Answers with one well-formed fragment carrying the given bytes."""
+    """Answers with one well-formed fragment carrying the given bytes.
+
+    From the address it was sent to, and under the stream id it was sent --
+    which is what `listeners/quic.py` does. It used to answer under a fixed
+    stream id of 1 and from a fixed address, both of which the client now
+    checks.
+    """
 
     def __init__(self, body: bytes):
         super().__init__()
-        frame = struct.pack(">I", len(body)) + body
-        self._dgram = struct.pack(">IHH", 1, 0, 1) + frame
+        self._body = body
         self._given = False
 
     def recvfrom(self, _n):
         if self._given:
             raise socket.timeout()
         self._given = True
-        return self._dgram, ("127.0.0.1", 4433)
+        stream_id = struct.unpack(">IHH", self.sent[0][:8])[0]
+        frame = struct.pack(">I", len(self._body)) + self._body
+        dgram = struct.pack(">IHH", stream_id, 0, 1) + frame
+        return dgram, self.addressed
 
 
 def _with_udp(beacon, sock):
@@ -1077,6 +1089,10 @@ def _with_udp(beacon, sock):
     stub.AF_INET = socket.AF_INET
     stub.SOCK_DGRAM = socket.SOCK_DGRAM
     stub.timeout = socket.timeout
+    # The real resolver, because `_quic_send` resolves its destination once
+    # and holds the answer to it. A Mock here would hand back a Mock, every
+    # answer would mismatch, and these tests would pass for the wrong reason.
+    stub.getaddrinfo = socket.getaddrinfo
     stub.socket.return_value = sock
     return unittest.mock.patch.object(
         sys.modules["software.c2.beacon"], "socket", stub)

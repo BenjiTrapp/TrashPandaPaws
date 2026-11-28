@@ -1192,13 +1192,6 @@ more.
   limiting as present, because its pattern matched the `X-RateLimit-Limit`
   and `X-RateLimit-Remaining` values in a C2 profile example in `server.py`.
   They are example response headers, not a limiter.
-- **The QUIC client accepts fragments from any sender.** `_quic_send` reads
-  its answer with `recvfrom` and ignores the address it came from, so anything
-  that can reach the beacon's source port can inject fragments into a
-  reassembly in progress and make the exchange fail. It cannot inject
-  *tasking* without the key, so this denies a channel rather than opening a
-  command path. The listener keys reassembly on the source address; a listener
-  cannot compensate for a client that does not.
 - **A task delivered over DNS stays `pending` for ever.**
   `/api/tasks/<task_id>` answers from `results` alone, and nothing on the DNS
   channel ever produces a result, so "not delivered yet" and "delivered, and

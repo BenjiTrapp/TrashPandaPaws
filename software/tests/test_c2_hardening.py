@@ -88,24 +88,36 @@ def _one_checkin(b):
 
 class _FakeUdp:
     """Stands in for the QUIC transport's UDP socket: swallows the request
-    and answers with one datagram carrying the given payload."""
+    and answers with one datagram carrying the given payload.
+
+    From the address it was sent to, and under the stream id it was sent.
+    Both are what `listeners/quic.py` really does, and both are now checked
+    by `_quic_send`: it drops an answer from another source or under another
+    stream id. The earlier fake answered from `("quic.test", 4433)` under a
+    fixed stream id of 1, which no listener would have done.
+    """
 
     def __init__(self, response_payload: bytes):
-        frame = struct.pack(">I", len(response_payload)) + response_payload
-        self._datagram = struct.pack(">IHH", 1, 0, 1) + frame
+        self._payload = response_payload
         self._sent = False
+        self._request = None
+        self._addressed = None
 
     def settimeout(self, _t):
         pass
 
-    def sendto(self, _data, _addr):
-        pass
+    def sendto(self, data, addr):
+        if self._request is None:
+            self._request, self._addressed = data, addr
 
     def recvfrom(self, _n):
-        if self._sent:
+        if self._sent or self._request is None:
             raise socket.timeout()
         self._sent = True
-        return self._datagram, ("quic.test", 4433)
+        stream_id = struct.unpack(">IHH", self._request[:8])[0]
+        frame = struct.pack(">I", len(self._payload)) + self._payload
+        datagram = struct.pack(">IHH", stream_id, 0, 1) + frame
+        return datagram, self._addressed
 
     def close(self):
         pass
@@ -124,7 +136,15 @@ class TestAeadIsNotOptional(unittest.TestCase):
                 patch.object(b, "_smb_read_pipe", return_value=response))
 
     def _quic_returning(self, b, response: bytes):
+        # `getaddrinfo` as well as `socket`: the transport resolves its
+        # destination once and holds the answer to it, and `quic.test` is a
+        # stand-in name with no DNS behind it. The tuple is what a resolver
+        # would have returned for it.
         return (patch.object(b, "_encrypt", return_value="req"),
+                patch.object(beacon_mod.socket, "getaddrinfo",
+                             return_value=[(socket.AF_INET,
+                                            socket.SOCK_DGRAM, 0, "",
+                                            ("203.0.113.9", 4433))]),
                 patch.object(beacon_mod.socket, "socket",
                              side_effect=lambda *a, **k: _FakeUdp(response)))
 
